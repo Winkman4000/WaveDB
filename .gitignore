@@ -1,0 +1,11 @@
+# data and segments never go in git (large, regenerable)
+*.wdb
+*.parquet
+*.db
+*.pkl
+# compiled kernels (built locally via make)
+src/wdb_kernel
+src/wdb_kernel_count
+*.o
+__pycache__/
+*.pyc

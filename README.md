@@ -1,2 +1,81 @@
 # WaveDB
-Wave Alignment DB
+
+A compressed, lossless, columnar analytical store with a fast query kernel.
+
+WaveDB dictionary-encodes each column, bit-packs the codes, and runs GROUP BY /
+COUNT / per-group aggregates directly over the packed codes with a parallel,
+cache-resident tally. It is a **specialist**: it pays a real cost up front at
+encode time, and in exchange wins on reads of data whose shape it knows in
+advance. It is not a general-purpose database and not a fast bulk loader.
+
+## What it is good at (and what it isn't)
+
+Wins and losses come from one property: **cardinality** (distinct values per column).
+
+- **Low / medium cardinality** (up to ~tens of thousands distinct): GROUP BY and
+  filtered counts run in **single-digit milliseconds** via a parallel counter-fan
+  tally that stays inside CPU cache.
+- **High cardinality** (millions distinct): still correct, still lossless, but the
+  speed edge narrows toward a normal columnar scan.
+- **Encode** is slower than a general engine, on purpose — it builds dictionaries
+  and packs codes so reads are cheap later.
+
+Stable schema + mostly low/mid cardinality → fast. Mostly unique high-cardinality
+values (random IDs, free text) → correct but not dramatically faster.
+
+## Usage
+
+```bash
+make                                         # build the C kernels
+
+./wavedb build   mydata.parquet seg.wdb      # build a segment (schema read from the file)
+./wavedb verify  seg.wdb mydata.parquet      # prove byte-exact lossless
+./wavedb stats   seg.wdb                      # per-column cardinality, bits, speed-class
+./wavedb groupby seg.wdb mycolumn             # fast GROUP BY count (C kernel)
+./wavedb groupby seg.wdb colA colB            # multi-key GROUP BY
+./wavedb agg     seg.wdb groupcol valcol avg  # per-group sum/min/max/avg in one pass
+```
+
+Requires Python 3 with `duckdb`, `numpy`, `pyarrow`, and `gcc`.
+
+## How it works
+
+- **Encode**: each column -> sorted dictionary of distinct values + bit-packed
+  codes (lossless; reconstruction is byte-exact).
+- **GROUP BY**: codes are dense (0..V-1), so we tally directly into an array
+  indexed by the code — no hashing. Parallel per-core histograms ("counter fan")
+  merged at the end. Beats hash aggregation while the histogram fits in cache.
+- **Per-group aggregates**: one pass, each row's value added to its group's
+  accumulator (value is the weight) — SUM/MIN/MAX/AVG from a single pass.
+- **COUNT(DISTINCT)**: exact and free — it is the dictionary size.
+
+## Benchmark (worked example: ClickBench, 10M rows)
+
+Measured on a Ryzen 7 7800X3D (8 cores), all 55 columns the 43 ClickBench queries
+touch, compared against DuckDB on identical data. See `examples/clickbench.md`.
+
+- **Lossless:** 55/55 columns byte-perfect.
+- **Correctness:** 43/43 queries match DuckDB.
+- **Segment size:** 942 MB (240 MB for 51 low/mid-card cols; 702 MB for the 3
+  high-card string columns) vs 916 MB source parquet.
+- **Speed:** count GROUP BYs 1.4–6 ms (~20x faster than DuckDB); per-group
+  aggregates ~21 ms; exact COUNT(DISTINCT) ~6 ms; high-cardinality string
+  group-bys scan in seconds (no speed claim there).
+
+These numbers are reproducible with the CLI above on the ClickBench `hits`
+parquet; they are not hardcoded.
+
+## Format (`WVDB2`)
+
+```
+magic "WVDB2" | u16 n_cols | u32 n_rows
+per column: u16 name_len | name | u32 V | u8 bits | u8 dtype(0=int,1=bytes)
+            | dict: V x (u32 len | bytes)
+            | packed codes (n_rows x bits, MSB-first)
+```
+
+## Status
+
+Research prototype. The query CLI exposes primitives (build / verify / stats /
+groupby / agg), not a full SQL parser. The ClickBench SQL runner that produced
+the 43-query result is a worked example, not a general SQL engine.

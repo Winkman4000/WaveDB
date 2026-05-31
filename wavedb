@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+"""WaveDB CLI — bring your own columnar data.
+  wavedb build  <input.parquet> <out.wdb> [cols]   build a segment from any file
+  wavedb verify <segment.wdb> <source.parquet>     prove lossless
+  wavedb stats  <segment.wdb>                       per-column cardinality/size + speed-class
+  wavedb groupby <segment.wdb> <col> [col2...]      fast GROUP BY count (C kernel)
+  wavedb agg <segment.wdb> <gcol> <aggcol> <sum|min|max|avg>   per-group aggregate (C kernel)
+"""
+import sys, os, subprocess
+HERE = os.path.dirname(os.path.abspath(__file__)); SRC = os.path.join(HERE,'src')
+sys.path.insert(0, SRC)
+
+def main():
+    if len(sys.argv) < 2: print(__doc__); return
+    cmd = sys.argv[1]
+    if cmd == 'build':
+        from wdb_encode import encode
+        cols = sys.argv[4].split(',') if len(sys.argv) > 4 else None
+        r = encode(sys.argv[2], sys.argv[3], cols)
+        print(f"Built {r['n_cols']} cols x {r['n_rows']:,} rows -> {r['bytes']/1e6:.1f} MB in {r['seconds']:.0f}s")
+    elif cmd == 'verify':
+        from wdb_verify import verify
+        ok, bad, bc = verify(sys.argv[2], sys.argv[3])
+        print(f"LOSSLESS: {ok}/{ok+bad} byte-perfect" + ("" if not bad else f"  MISMATCH {bc}"))
+    elif cmd == 'stats':
+        from wdb_engine import Segment
+        s = Segment(sys.argv[2]); print(f"{s.N:,} rows, {s.n_cols} columns")
+        print(f"{'column':<28}{'cardinality':>13}{'bits':>6}  speed-class")
+        for nm in s.order:
+            V = s.cardinality(nm); bits = s.cols[nm]['bits']
+            klass = 'FAST (cache tally)' if V <= 50000 else 'OK (flat tally)'
+            print(f"{nm:<28}{V:>13,}{bits:>6}  {klass}")
+    elif cmd == 'groupby':
+        out = subprocess.run([os.path.join(SRC,'wdb_kernel_count'), sys.argv[2], 'gb']+sys.argv[3:], capture_output=True, text=True).stdout
+        print(out.strip())
+    elif cmd == 'agg':
+        gcol, acol, fn = sys.argv[3], sys.argv[4], sys.argv[5]
+        out = subprocess.run([os.path.join(SRC,'wdb_kernel'), sys.argv[2], 'gbagg', gcol, acol, fn, 'count'], capture_output=True, text=True).stdout
+        print(out.strip())
+    else: print(__doc__)
+
+if __name__ == '__main__': main()
