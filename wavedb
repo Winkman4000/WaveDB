@@ -35,10 +35,14 @@ def main():
         out = subprocess.run([os.path.join(SRC,'wdb_kernel_count'), sys.argv[2], 'gb']+sys.argv[3:], capture_output=True, text=True).stdout
         print(out.strip())
     elif cmd == 'fetch':
-        from wdb_engine import Segment
-        s = Segment(sys.argv[2]); code = int(sys.argv[4])
-        v = s.fetch(sys.argv[3], code)
-        print(v.decode('utf-8','surrogatepass') if isinstance(v,(bytes,bytearray)) else v)
+        fb = os.path.join(SRC,'wdb_fetch')
+        if os.path.exists(fb):  # fast C path
+            r = subprocess.run([fb, sys.argv[2], sys.argv[3], sys.argv[4]], capture_output=True)
+            sys.stdout.buffer.write(r.stdout)
+        else:                    # python fallback
+            from wdb_engine import Segment
+            s = Segment(sys.argv[2]); v = s.fetch(sys.argv[3], int(sys.argv[4]))
+            print(v.decode('utf-8','surrogatepass') if isinstance(v,(bytes,bytearray)) else v)
     elif cmd == 'agg':
         gcol, acol, fn = sys.argv[3], sys.argv[4], sys.argv[5]
         out = subprocess.run([os.path.join(SRC,'wdb_kernel'), sys.argv[2], 'gbagg', gcol, acol, fn, 'count'], capture_output=True, text=True).stdout

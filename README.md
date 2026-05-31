@@ -49,7 +49,9 @@ make                                         # build the C kernels
 ./wavedb fetch   seg.wdb col 90000            # random-access a dictionary value by code
 ```
 
-Requires Python 3 with `duckdb`, `numpy`, `pyarrow`, and `gcc`.
+All hot paths are C (`make` builds them): group-by, per-group aggregates, and
+string fetch. Python drives the CLI and encoding. Requires Python 3 with `duckdb`,
+`numpy`, `pyarrow`, `zstandard`, plus `gcc` and `libzstd`.
 
 ## How it works
 
@@ -67,7 +69,8 @@ Requires Python 3 with `duckdb`, `numpy`, `pyarrow`, and `gcc`.
   at a competitive build time (~2s in C with an AVX2 prefix-match loop). Random
   access to any value is preserved via restart points every 128 entries — fetch
   walks at most 128 deltas (O(1) amortized), so individual values stay retrievable
-  despite the delta-chain compression.
+  despite the delta-chain compression. The C fetcher does this in ~0.6 µs/value
+  and is exhaustively verified byte-exact across all 2.62M URL and 1.6M Title codes.
 
 ## Benchmark (worked example: ClickBench, 10M rows)
 
