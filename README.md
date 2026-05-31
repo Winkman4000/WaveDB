@@ -20,9 +20,13 @@ Wins and losses come from one property: **cardinality** (distinct values per col
   3x at 50M). The dense-code array tally beats hash aggregation at every scale
   tested; DuckDB never overtakes it. The lead narrows as values approach all-unique
   but stays a multi-x win.
-- **The one slow path**: using a high-cardinality *string* column in a filter or
-  scalar pass that decodes the raw values (e.g. `WHERE url <> ...`) scans, and is
-  not faster than a normal columnar store.
+- **The one tie**: using a high-cardinality *string* column in a filter or scalar
+  pass that decodes the raw values (e.g. `WHERE url <> ...`) is a scan — but DuckDB
+  and ClickHouse scan here too, because pulling back literal high-entropy values has
+  no structure left to exploit. Everyone is memory-bandwidth bound, so it's a tie,
+  not a loss. A store could beat it only by sacrificing compression (keep the column
+  uncompressed/byte-aligned) or adding a secondary index — a different trade, not a
+  free win.
 - **Encode** is slower than a general engine, on purpose — it builds dictionaries
   and packs codes so reads are cheap later.
 
