@@ -47,46 +47,48 @@ def execute(seg: Segment, sql: str, col_map=None):
             for i in idx: out.append(tuple(_pyval(colvals[c][i]) for c in cols))
             return out, [_alias(p) for p in proj]
 
-    # ---- GROUP BY path ----
-    keys = [seg.values(seg_col(g))[mask] if mask is not None else seg.values(seg_col(g)) for g in gcols]
-    combo = np.zeros(len(keys[0]), dtype=np.int64); metas=[]
-    for k in keys:
-        u, inv = np.unique(k, return_inverse=True); metas.append(u); combo = combo*len(u)+inv
-    uc, first_idx, counts = np.unique(combo, return_index=True, return_counts=True)
+    # ---- GROUP BY path (group on CODES: NULL becomes its own group naturally) ----
+    gnames = [seg_col(g) for g in gcols]
+    combo = None; metas=[]   # metas[i] = unique code values for key i
+    for gn in gnames:
+        gc = seg.codes(gn); gc = gc[mask] if mask is not None else gc
+        u, inv = np.unique(gc, return_inverse=True); metas.append((gn, u))
+        combo = inv if combo is None else combo*len(u)+inv
+    uc, counts = np.unique(combo, return_counts=True)
     def decombo(cv):
         out=[]; x=cv
-        for u in reversed(metas): out.append(u[x%len(u)]); x//=len(u)
-        return list(reversed(out))
-    # build each output row
+        for _,u in reversed(metas): out.append(u[x%len(u)]); x//=len(u)
+        return list(reversed(out))   # per-key CODE values, original order
+    def codeval(colname, code):
+        c=seg.cols[colname]
+        if c['has_null'] and int(code)==c['V']-1: return None
+        return seg.fetch(colname, int(code))
     agg_specs = [(p, _agg_kind(p)) for p in proj]
-    # precompute per-group aggregate values where needed
-    rows=[]
-    # group membership for aggregates
     order = np.argsort(combo, kind='stable'); combo_s=combo[order]
-    gstarts = np.searchsorted(combo_s, uc)
-    gends = np.r_[gstarts[1:], len(combo_s)]
+    gstarts = np.searchsorted(combo_s, uc); gends = np.r_[gstarts[1:], len(combo_s)]
     aggcache={}
     def groupagg(colname, fn, gi):
-        key=(colname,fn)
-        if key not in aggcache:
-            vals = seg.values(seg_col(colname)).astype(np.float64)
-            vals = vals[mask] if mask is not None else vals
-            vs = vals[order]
-            aggcache[key]=vs
-        vs=aggcache[key]; seg_v=vs[gstarts[gi]:gends[gi]]
-        return {'SUM':seg_v.sum(),'AVG':seg_v.mean(),'MIN':seg_v.min(),'MAX':seg_v.max(),'COUNT':len(seg_v)}[fn]
+        if colname not in aggcache:
+            arr, nm = _col(seg, seg_col(colname))
+            if mask is not None:
+                arr = arr[mask]; nm = nm[mask] if nm is not None else None
+            arrf = arr.astype(np.float64)
+            aggcache[colname]=(arrf[order], (nm[order] if nm is not None else None))
+        vs, vn = aggcache[colname]; sl=slice(gstarts[gi],gends[gi]); seg_v=vs[sl]
+        if vn is not None: seg_v = seg_v[~vn[sl]]      # SQL: aggregates ignore NULLs
+        if fn=='COUNT': return len(seg_v)
+        if len(seg_v)==0: return None
+        return {'SUM':seg_v.sum(),'AVG':seg_v.mean(),'MIN':seg_v.min(),'MAX':seg_v.max()}[fn]
+    rows=[]
     for gi,cv in enumerate(uc):
-        keyvals = decombo(cv)
-        rowout=[]
-        ki=0
+        keycodes = decombo(cv); rowout=[]; ki=0
         for p,kind in agg_specs:
-            if kind is None:  # group key column
-                rowout.append(_pyval(keyvals[ki])); ki+=1
+            if kind is None:
+                rowout.append(_pyval(codeval(metas[ki][0], keycodes[ki]))); ki+=1
             elif kind[0]=='COUNT_STAR':
                 rowout.append(int(counts[gi]))
             else:
-                fn,cn=kind
-                rowout.append(_pyval(groupagg(cn, fn, gi)))
+                fn,cn=kind; rowout.append(_pyval(groupagg(cn, fn, gi)))
         rows.append(tuple(rowout))
 
     # ---- HAVING ----
@@ -128,12 +130,38 @@ def _limit(tree):
     lim = tree.args.get('limit')
     if lim is None: return None
     return int(lim.expression.this) if hasattr(lim.expression,'this') else int(lim.text('expression'))
+def _col(seg, name):
+    """Typed array + null mask. arr is int64/float64/object(bytes); nulls filled with a
+    sentinel and flagged in nmask (or None if the column has no nulls)."""
+    import struct as _st
+    c = seg.cols[name]; codes = seg.codes(name); dv = seg._typed_dict(name)
+    if c['has_null']:
+        nullcode = c['V'] - 1; nmask = (codes == nullcode)
+        if c['dt'] == 0:   lut = np.array(dv + [0], dtype=np.int64)
+        elif c['dt'] == 2: lut = np.array(dv + [np.nan], dtype=np.float64)
+        else:
+            lut = np.empty(c['V'], dtype=object)
+            for i,v in enumerate(dv): lut[i]=v
+            lut[nullcode] = b''
+        return lut[codes], nmask
+    if c['dt'] == 0:   return np.array(dv, dtype=np.int64)[codes], None
+    if c['dt'] == 2:   return np.array(dv, dtype=np.float64)[codes], None
+    lut = np.empty(len(dv), dtype=object)
+    for i,v in enumerate(dv): lut[i]=v
+    return lut[codes], None
+
 def _agg_scalar(seg, p, mask, seg_col):
     kind=_agg_kind(p)
     if kind[0]=='COUNT_STAR': return int(mask.sum()) if mask is not None else seg.N
-    fn,cn=kind; vals=seg.values(seg_col(cn)).astype(np.float64); vals=vals[mask] if mask is not None else vals
-    if kind[0]=='COUNT': return int(len(vals))
-    return _pyval({'SUM':vals.sum(),'AVG':vals.mean(),'MIN':vals.min(),'MAX':vals.max()}[fn])
+    fn,cn=kind
+    arr, nm = _col(seg, seg_col(cn))
+    if mask is not None:
+        arr = arr[mask]; nm = nm[mask] if nm is not None else None
+    if nm is not None: arr = arr[~nm]            # SQL: aggregates ignore NULLs
+    if kind[0]=='COUNT': return int(len(arr))    # COUNT(col) = non-null count
+    arr = arr.astype(np.float64)
+    if len(arr)==0: return None
+    return _pyval({'SUM':arr.sum(),'AVG':arr.mean(),'MIN':arr.min(),'MAX':arr.max()}[fn])
 
 def _eval_pred(seg, node, seg_col):
     if isinstance(node, E.And): return _eval_pred(seg,node.this,seg_col) & _eval_pred(seg,node.expression,seg_col)
@@ -142,35 +170,39 @@ def _eval_pred(seg, node, seg_col):
     if isinstance(node, E.Paren): return _eval_pred(seg,node.this,seg_col)
     if isinstance(node, (E.EQ,E.NEQ,E.GT,E.LT,E.GTE,E.LTE)):
         col=_colname(node.this); lit=node.expression
-        a=seg.values(seg_col(col))
+        a, nmask = _col(seg, seg_col(col))
         if isinstance(lit,E.Literal) and not lit.is_string: v=int(lit.this) if a.dtype.kind in 'iu' else float(lit.this)
         elif isinstance(lit,E.Literal): v=lit.this.encode()
         else: raise NotImplementedError("non-literal RHS")
         if a.dtype.kind not in 'iuf' and isinstance(v,int): v=str(v).encode()
         import operator
         op={E.EQ:operator.eq,E.NEQ:operator.ne,E.GT:operator.gt,E.LT:operator.lt,E.GTE:operator.ge,E.LTE:operator.le}[type(node)]
-        return op(a,v)
+        res = op(a,v)
+        if nmask is not None: res = res & ~nmask   # SQL: NULL fails any comparison
+        return res
     if isinstance(node, E.Between):
-        col=_colname(node.this); a=seg.values(seg_col(col))
+        col=_colname(node.this); a, nmask = _col(seg, seg_col(col))
         lo=int(node.args['low'].this); hi=int(node.args['high'].this)
-        return (a>=lo)&(a<=hi)
+        res=(a>=lo)&(a<=hi)
+        if nmask is not None: res = res & ~nmask
+        return res
     if isinstance(node, E.In):
-        col=_colname(node.this); a=seg.values(seg_col(col))
+        col=_colname(node.this); a, nmask = _col(seg, seg_col(col))
         lits=node.args.get('expressions') or []
         vals=[]
         for L in lits:
             if not isinstance(L,E.Literal): raise NotImplementedError("IN with non-literal / subquery")
             if L.is_string: vals.append(L.this.encode() if a.dtype.kind not in 'iuf' else L.this)
             else: vals.append(int(L.this) if a.dtype.kind in 'iu' else (float(L.this) if a.dtype.kind=='f' else str(L.this).encode()))
-        # membership mask
         if a.dtype.kind in 'iuf':
             m=np.isin(a, np.array(vals, dtype=a.dtype))
         else:
             sv=set(vals); m=np.fromiter((x in sv for x in a), dtype=bool, count=len(a))
+        if nmask is not None: m = m & ~nmask
         return m
     if isinstance(node, E.Like) or isinstance(node, E.ILike):
         import re
-        col=_colname(node.this); a=seg.values(seg_col(col))
+        col=_colname(node.this); a, nmask = _col(seg, seg_col(col))
         pat=node.expression.this  # the LIKE pattern string
         # SQL LIKE -> regex. re.escape leaves % and _ bare (not special), so replace
         # them AFTER escaping: % => .*  (any run),  _ => .  (single char).
@@ -178,7 +210,14 @@ def _eval_pred(seg, node, seg_col):
         flags=re.DOTALL|(re.IGNORECASE if isinstance(node,E.ILike) else 0)
         cre=re.compile(rx, flags)
         def tostr(x): return x.decode('utf-8','surrogatepass') if isinstance(x,(bytes,bytearray)) else ('' if x is None else str(x))
-        return np.fromiter((bool(cre.match(tostr(x))) for x in a), dtype=bool, count=len(a))
+        m = np.fromiter((bool(cre.match(tostr(x))) for x in a), dtype=bool, count=len(a))
+        if nmask is not None: m = m & ~nmask
+        return m
+    if isinstance(node, E.Is):
+        col=_colname(node.this); a, nmask = _col(seg, seg_col(col))
+        if isinstance(node.expression, E.Null):
+            return nmask if nmask is not None else np.zeros(len(a), dtype=bool)  # IS NULL
+        raise NotImplementedError("IS <non-null-literal>")
     raise NotImplementedError(f"predicate {type(node).__name__}")
 
 def _apply_having(rows, proj, node, seg_col):

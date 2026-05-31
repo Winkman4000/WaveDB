@@ -104,3 +104,30 @@ per column: u16 name_len | name | u32 V | u8 bits | u8 dtype(0=int,1=bytes)
 Research prototype. The query CLI exposes primitives (build / verify / stats /
 groupby / agg), not a full SQL parser. The ClickBench SQL runner that produced
 the 43-query result is a worked example, not a general SQL engine.
+
+
+## Column types & nulls
+
+WaveDB dictionary-encodes every column; the dtype tag records how dict values are stored:
+- **int** — integer values
+- **float** — raw 8-byte IEEE doubles (lossless)
+- **bytes** — strings (front-coded + zstd when high-cardinality)
+
+**NULLs** are handled as a reserved highest code per column; the dict stores only the
+real values. Decoders map that code back to NULL. GROUP BY puts NULLs in their own
+group; WHERE predicates treat NULL as not-matching (SQL semantics); aggregates skip
+NULLs; `IS NULL` / `IS NOT NULL` are supported. Verified lossless on all 105 ClickBench
+columns (floats, nulls, and all-null columns included).
+
+**Known gap — temporal types:** date/timestamp columns are currently stored losslessly
+as their ISO-8601 string form and queried as strings. Date-literal predicate semantics
+(e.g. `d = '2013-07-15'` matching a whole day) need a real temporal type — that's a
+planned next step, not yet implemented.
+
+## SQL coverage (single-table)
+
+Supported and verified against DuckDB on 10M rows: `SELECT` with projection, `WHERE`
+(`=, !=, <, >, <=, >=`, `AND/OR/NOT`, `BETWEEN`, `IN`/`NOT IN`, `LIKE`/`ILIKE`,
+`IS [NOT] NULL`), `GROUP BY` (multi-key), aggregates (`COUNT`, `COUNT(*)`, `SUM`, `AVG`,
+`MIN`, `MAX`), `HAVING`, `ORDER BY`, `LIMIT`. Unsupported shapes (JOIN, subquery, CTE,
+window functions) raise `NotImplementedError` — never a silent wrong answer.

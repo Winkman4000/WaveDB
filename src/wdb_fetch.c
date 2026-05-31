@@ -14,7 +14,7 @@ extern unsigned ZSTD_isError(size_t code);
 static double now_ms(){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1000.0+t.tv_nsec/1e6;}
 
 typedef struct {
-    char name[128]; uint32_t V; uint8_t bits, dt, mode;
+    char name[128]; uint32_t V; uint8_t bits, dt, mode, has_null;
     // mode 0:
     const uint8_t* plain_dict;   // points at V*(u32 len|bytes)
     // mode 1:
@@ -32,11 +32,11 @@ static int load(const char* path){
     uint32_t off=5; NC=*(uint16_t*)(gbuf+off); off+=2; N=*(uint32_t*)(gbuf+off); off+=4;
     for(int c=0;c<NC;c++){
         uint16_t nl=*(uint16_t*)(gbuf+off); off+=2; memcpy(cols[c].name,gbuf+off,nl); cols[c].name[nl]=0; off+=nl;
-        cols[c].V=*(uint32_t*)(gbuf+off); off+=4; cols[c].bits=gbuf[off++]; cols[c].dt=gbuf[off++]; cols[c].mode=gbuf[off++];
+        cols[c].V=*(uint32_t*)(gbuf+off); off+=4; cols[c].bits=gbuf[off++]; cols[c].dt=gbuf[off++]; cols[c].mode=gbuf[off++]; cols[c].has_null=gbuf[off++];
         cols[c].fc=NULL;
         if(cols[c].mode==0){
             cols[c].plain_dict=gbuf+off;
-            for(uint32_t v=0;v<cols[c].V;v++){ uint32_t vl=*(uint32_t*)(gbuf+off); off+=4+vl; }
+            for(uint32_t v=0;v<cols[c].V-cols[c].has_null;v++){ uint32_t vl=*(uint32_t*)(gbuf+off); off+=4+vl; }
         } else {
             cols[c].R=*(uint16_t*)(gbuf+off); off+=2;
             cols[c].n_restart=*(uint32_t*)(gbuf+off); off+=4;
@@ -91,7 +91,7 @@ int main(int argc,char**argv){
         // ground truth: sequential full decode of the whole front-coded block
         uint8_t* seq=malloc(1<<20); uint32_t o=0; int slen=0; long bad=0;
         uint8_t* got=malloc(1<<20);
-        for(uint32_t code=0; code<c->V; code++){
+        for(uint32_t code=0; code<c->V - c->has_null; code++){
             if(code % c->R==0) slen=0; // restart
             uint16_t cp=*(uint16_t*)(c->fc+o); o+=2; uint16_t sl=*(uint16_t*)(c->fc+o); o+=2;
             memcpy(seq+cp, c->fc+o, sl); o+=sl; slen=cp+sl;
@@ -99,7 +99,7 @@ int main(int argc,char**argv){
             int gl=fetch(c, code, got);
             if(gl!=slen || memcmp(got,seq,slen)){ bad++; if(bad<=3) fprintf(stderr,"mismatch code %u\n",code); }
         }
-        printf("verify: %u/%u byte-exact (%ld mismatches)\n", c->V-(uint32_t)bad, c->V, bad);
+        printf("verify: %u/%u byte-exact (%ld mismatches)\n", (c->V - c->has_null)-(uint32_t)bad, c->V - c->has_null, bad);
         return bad?1:0;
     } else {
         uint32_t code=atoi(argv[3]); int len=fetch(c,code,out);

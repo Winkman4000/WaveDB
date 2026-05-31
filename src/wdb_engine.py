@@ -16,10 +16,12 @@ class Segment:
             nm = buf[off:off+nl].decode(); off += nl
             V = struct.unpack_from('<I',buf,off)[0]; off += 4
             bits = buf[off]; off += 1; dt = buf[off]; off += 1; mode = buf[off]; off += 1
-            meta = dict(V=V, bits=bits, dt=dt, mode=mode)
+            has_null = buf[off]; off += 1
+            n_dict = V - has_null
+            meta = dict(V=V, bits=bits, dt=dt, mode=mode, has_null=has_null, n_dict=n_dict)
             if mode == 0:
                 vals = []
-                for _ in range(V):
+                for _ in range(n_dict):
                     vl = struct.unpack_from('<I',buf,off)[0]; off += 4
                     vals.append(buf[off:off+vl]); off += vl
                 meta['vals'] = vals
@@ -51,17 +53,32 @@ class Segment:
         b = np.unpackbits(raw)[:self.N*c['bits']].reshape(self.N, c['bits'])
         w = (1 << np.arange(c['bits']-1,-1,-1)).astype(np.uint64)
         cc = (b*w).sum(1).astype(np.int64); self._codes[nm] = cc; return cc
-    def values(self, nm):
+    def _typed_dict(self, nm):
         c = self.cols[nm]
-        if c['dt'] == 0:
-            iv = np.array([int(v) for v in c['vals']], dtype=np.int64); return iv[self.codes(nm)]
-        vb = self.dict_vals(nm); return np.array(vb, dtype=object)[self.codes(nm)]
+        if c['dt'] == 0: return [int(v) for v in c['vals']]
+        if c['dt'] == 2: return [struct.unpack('<d', v)[0] for v in c['vals']]
+        return self.dict_vals(nm)  # bytes
+    def values(self, nm):
+        c = self.cols[nm]; codes = self.codes(nm); dvals = self._typed_dict(nm)
+        if c['has_null']:
+            nullcode = c['V'] - 1
+            lut = np.empty(c['V'], dtype=object)
+            for i, v in enumerate(dvals): lut[i] = v
+            lut[nullcode] = None
+            return lut[codes]
+        if c['dt'] == 0: return np.array(dvals, dtype=np.int64)[codes]
+        if c['dt'] == 2: return np.array(dvals, dtype=np.float64)[codes]
+        return np.array(dvals, dtype=object)[codes]
     def fetch(self, nm, code):
         """Random-access the dictionary value for a given code. O(1) for plain columns,
         O(R) for front-coded columns (jump to restart block, walk <=R deltas)."""
         c = self.cols[nm]
+        if c['has_null'] and code == c['V'] - 1: return None
         if c['mode'] == 0:
-            return c['vals'][code]
+            v = c['vals'][code]
+            if c['dt'] == 0: return int(v)
+            if c['dt'] == 2: return struct.unpack('<d', v)[0]
+            return v
         if c.get('raw') is None: c['raw'] = self._dz.decompress(c['z'])
         raw = c['raw']; R = c['R']; o = int(c['restarts'][code // R]); prev = b''
         for _ in range(code % R + 1):

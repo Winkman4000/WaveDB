@@ -1,24 +1,60 @@
 #!/usr/bin/env python3
 """
 WaveDB encoder — schema-driven, works on ANY columnar file.
-Reads column names + types directly from the input (parquet/csv); no hardcoded schema.
 
 Segment format "WVDB3":
   magic "WVDB3" | u16 n_cols | u32 n_rows
-  per column: u16 name_len | name | u32 V | u8 bits | u8 dtype(0=int,1=bytes) | u8 mode
-    mode 0 (plain):       dict = V * (u32 len | bytes)
-    mode 1 (front-coded): u16 R | u32 n_restart | restart_offsets(u32*) | u32 fclen | u32 zlen | zstd(front-coded dict)
+  per column: u16 name_len | name | u32 V | u8 bits | u8 dtype | u8 mode | u8 has_null
+    dtype: 0=int, 1=bytes, 2=float(8-byte IEEE double)
+    mode:  0=plain dict, 1=front-coded dict (dtype 1 only)
+    has_null: 1 if column has NULLs. NULL is the reserved highest code (V-1);
+              the dict stores V-has_null real values (codes 0..V-1-has_null).
+    plain dict (mode 0):       (V-has_null) * (u32 len | bytes)   [float: bytes = 8-byte double]
+    front-coded (mode 1):      u16 R | u32 n_restart | restart_offsets(u32*) | u32 fclen | u32 zlen | zstd(dict)
   then: packed codes (n_rows * bits, MSB-first)
-
-High-cardinality string columns (V > threshold) are front-coded + zstd: store each
-distinct value as (shared-prefix-len, suffix) against the previous sorted value, with
-restart points every R for random access. Lossless; codes already index sorted order.
 """
-import duckdb, numpy as np, zstandard as zstd, struct, time, sys
+import duckdb, numpy as np, numpy.ma as ma, zstandard as zstd, struct, time, sys
 
-FC_THRESHOLD = 50000   # front-code string columns with more distinct values than this
-R = 128                # restart point interval (random-access granularity)
-ZSTD_LEVEL = 9         # build-time/size knob; 9 is the sweet spot (19 costs ~15x time for ~10% size)
+FC_THRESHOLD = 50000
+R = 128
+ZSTD_LEVEL = 9
+
+def _encode_column(col):
+    """Return (dtype, has_null, V, uniq_value_bytes_list, codes:int64[N], mode_is_string)."""
+    if isinstance(col, ma.MaskedArray):
+        null_mask = ma.getmaskarray(col); data = np.asarray(col.data)
+    else:
+        null_mask = None; data = np.asarray(col)
+    has_null = 1 if (null_mask is not None and null_mask.any()) else 0
+    k = data.dtype.kind
+    dtype = 0 if k in 'iu' else (2 if k == 'f' else 1)
+    N = len(data)
+    codes = np.empty(N, dtype=np.int64)
+    if dtype in (0, 2):
+        if has_null:
+            nn = data[~null_mask]
+            uniq, inv = np.unique(nn, return_inverse=True)
+            codes[~null_mask] = inv; codes[null_mask] = len(uniq)
+        else:
+            uniq, inv = np.unique(data, return_inverse=True); codes[:] = inv
+        if dtype == 0: valb = [str(int(v)).encode() for v in uniq]
+        else:          valb = [struct.pack('<d', float(v)) for v in uniq]
+    else:
+        def to_b(x):
+            if isinstance(x,(bytes,bytearray)): return bytes(x)
+            if isinstance(x,str): return x.encode('utf-8','surrogatepass')
+            return str(x).encode('utf-8','surrogatepass')  # datetime64, etc.
+        if has_null:
+            nn_idx = np.nonzero(~null_mask)[0]
+            asb = np.array([to_b(data[i]) for i in nn_idx], dtype=object)
+            uniq, inv = np.unique(asb, return_inverse=True)
+            codes[nn_idx] = inv; codes[null_mask] = len(uniq)
+        else:
+            asb = np.array([to_b(x) for x in data], dtype=object)
+            uniq, inv = np.unique(asb, return_inverse=True); codes[:] = inv
+        valb = [bytes(u) for u in uniq]
+    V = len(valb) + has_null
+    return dtype, has_null, V, valb, codes
 
 def encode(input_path, out_path, columns=None):
     con = duckdb.connect(); con.execute("PRAGMA threads=8")
@@ -32,18 +68,14 @@ def encode(input_path, out_path, columns=None):
     sizes = {}
     for nm in cols:
         col = con.execute(f'SELECT "{nm}" FROM {src}').fetchnumpy()[nm]
-        if col.dtype.kind in 'iuf':
-            uniq, codes = np.unique(col, return_inverse=True)
-            valb = [str(int(v)).encode() if col.dtype.kind in 'iu' else repr(float(v)).encode() for v in uniq]
-            dtype = 0
-        else:
-            asb = np.array([x if isinstance(x,(bytes,bytearray)) else (b'' if x is None else str(x).encode('utf-8','surrogatepass')) for x in col], dtype=object)
-            uniq, codes = np.unique(asb, return_inverse=True); valb = [bytes(u) for u in uniq]; dtype = 1
-        V = len(uniq); bits = max(1, int(np.ceil(np.log2(max(V,2))))); codes = codes.astype(np.uint64)
-        mode = 1 if (dtype == 1 and V > FC_THRESHOLD) else 0
+        dtype, has_null, V, valb, codes = _encode_column(col)
+        bits = max(1, int(np.ceil(np.log2(max(V,2)))))
+        codes = codes.astype(np.uint64)
+        mode = 1 if (dtype == 1 and (V-has_null) > FC_THRESHOLD) else 0
         start = len(out)
         hb = nm.encode()
-        out += struct.pack('<H', len(hb)) + hb + struct.pack('<I', V) + struct.pack('<B', bits) + struct.pack('<B', dtype) + struct.pack('<B', mode)
+        out += struct.pack('<H', len(hb)) + hb + struct.pack('<I', V)
+        out += struct.pack('<B', bits) + struct.pack('<B', dtype) + struct.pack('<B', mode) + struct.pack('<B', has_null)
         if mode == 0:
             for u in valb: out += struct.pack('<I', len(u)) + u
         else:
@@ -58,7 +90,7 @@ def encode(input_path, out_path, columns=None):
             out += struct.pack('<I', len(fc)) + struct.pack('<I', len(z)) + z
         bitsarr = ((codes[:,None] >> np.arange(bits-1,-1,-1,dtype=np.uint64)) & 1).astype(np.uint8).reshape(-1)
         out += np.packbits(bitsarr).tobytes()
-        sizes[nm] = (len(out)-start, V, bits, dtype, mode)
+        sizes[nm] = (len(out)-start, V, bits, dtype, mode, has_null)
     open(out_path,'wb').write(out)
     return dict(n_rows=N, n_cols=len(cols), bytes=len(out), seconds=time.time()-t0, sizes=sizes)
 
@@ -67,5 +99,5 @@ if __name__ == '__main__':
         print("usage: wdb_encode.py <input.parquet|csv> <out.wdb> [col1,col2,...]"); sys.exit(1)
     cols = sys.argv[3].split(',') if len(sys.argv) > 3 else None
     r = encode(sys.argv[1], sys.argv[2], cols)
-    fc = sum(1 for v in r['sizes'].values() if v[4]==1)
-    print(f"Encoded {r['n_cols']} cols x {r['n_rows']:,} rows -> {r['bytes']/1e6:.1f} MB in {r['seconds']:.0f}s ({fc} front-coded)")
+    fc = sum(1 for v in r['sizes'].values() if v[4]==1); fl = sum(1 for v in r['sizes'].values() if v[3]==2); nu = sum(1 for v in r['sizes'].values() if v[5]==1)
+    print(f"Encoded {r['n_cols']} cols x {r['n_rows']:,} rows -> {r['bytes']/1e6:.1f} MB in {r['seconds']:.0f}s ({fc} front-coded, {fl} float, {nu} nullable)")
