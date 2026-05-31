@@ -46,6 +46,7 @@ make                                         # build the C kernels
 ./wavedb groupby seg.wdb mycolumn             # fast GROUP BY count (C kernel)
 ./wavedb groupby seg.wdb colA colB            # multi-key GROUP BY
 ./wavedb agg     seg.wdb groupcol valcol avg  # per-group sum/min/max/avg in one pass
+./wavedb fetch   seg.wdb col 90000            # random-access a dictionary value by code
 ```
 
 Requires Python 3 with `duckdb`, `numpy`, `pyarrow`, and `gcc`.
@@ -63,7 +64,10 @@ Requires Python 3 with `duckdb`, `numpy`, `pyarrow`, and `gcc`.
 - **High-cardinality strings**: front-coded (shared-prefix delta vs the previous
   sorted value) + zstd, with restart points for random access. On URL this is
   ~7x smaller than the plain dictionary and beats ClickHouse's best ZSTD mode,
-  at a competitive build time (~2s in C with an AVX2 prefix-match loop).
+  at a competitive build time (~2s in C with an AVX2 prefix-match loop). Random
+  access to any value is preserved via restart points every 128 entries — fetch
+  walks at most 128 deltas (O(1) amortized), so individual values stay retrievable
+  despite the delta-chain compression.
 
 ## Benchmark (worked example: ClickBench, 10M rows)
 

@@ -26,11 +26,11 @@ class Segment:
             else:
                 Rr = struct.unpack_from('<H',buf,off)[0]; off += 2
                 nr = struct.unpack_from('<I',buf,off)[0]; off += 4
-                off += nr*4  # restart offsets (for random access; full decode not needed here)
+                meta['restarts'] = np.frombuffer(buf, dtype=np.uint32, count=nr, offset=off); off += nr*4
                 fclen = struct.unpack_from('<I',buf,off)[0]; off += 4
                 zlen = struct.unpack_from('<I',buf,off)[0]; off += 4
                 meta['R'] = Rr; meta['z'] = buf[off:off+zlen]; off += zlen
-                meta['vals'] = None  # decoded lazily
+                meta['vals'] = None; meta['raw'] = None  # decoded lazily
             nb = (self.N*bits+7)//8; meta['cstart'] = off; off += nb
             self.cols[nm] = meta; self.order.append(nm)
         self.buf = np.frombuffer(buf, dtype=np.uint8); self._codes = {}
@@ -56,6 +56,18 @@ class Segment:
         if c['dt'] == 0:
             iv = np.array([int(v) for v in c['vals']], dtype=np.int64); return iv[self.codes(nm)]
         vb = self.dict_vals(nm); return np.array(vb, dtype=object)[self.codes(nm)]
+    def fetch(self, nm, code):
+        """Random-access the dictionary value for a given code. O(1) for plain columns,
+        O(R) for front-coded columns (jump to restart block, walk <=R deltas)."""
+        c = self.cols[nm]
+        if c['mode'] == 0:
+            return c['vals'][code]
+        if c.get('raw') is None: c['raw'] = self._dz.decompress(c['z'])
+        raw = c['raw']; R = c['R']; o = int(c['restarts'][code // R]); prev = b''
+        for _ in range(code % R + 1):
+            cp, sl = struct.unpack_from('<HH', raw, o); o += 4
+            suf = raw[o:o+sl]; o += sl; prev = prev[:cp] + suf
+        return prev
     def cardinality(self, nm): return self.cols[nm]['V']
     def group_by_count(self, nm):
         return np.bincount(self.codes(nm), minlength=self.cols[nm]['V'])

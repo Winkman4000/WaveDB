@@ -5,6 +5,7 @@
   wavedb stats  <segment.wdb>                       per-column cardinality/size + speed-class
   wavedb groupby <segment.wdb> <col> [col2...]      fast GROUP BY count (C kernel)
   wavedb agg <segment.wdb> <gcol> <aggcol> <sum|min|max|avg>   per-group aggregate (C kernel)
+  wavedb fetch <segment.wdb> <col> <code>          random-access a dictionary value by code
 """
 import sys, os, subprocess
 HERE = os.path.dirname(os.path.abspath(__file__)); SRC = os.path.join(HERE,'src')
@@ -33,6 +34,11 @@ def main():
     elif cmd == 'groupby':
         out = subprocess.run([os.path.join(SRC,'wdb_kernel_count'), sys.argv[2], 'gb']+sys.argv[3:], capture_output=True, text=True).stdout
         print(out.strip())
+    elif cmd == 'fetch':
+        from wdb_engine import Segment
+        s = Segment(sys.argv[2]); code = int(sys.argv[4])
+        v = s.fetch(sys.argv[3], code)
+        print(v.decode('utf-8','surrogatepass') if isinstance(v,(bytes,bytearray)) else v)
     elif cmd == 'agg':
         gcol, acol, fn = sys.argv[3], sys.argv[4], sys.argv[5]
         out = subprocess.run([os.path.join(SRC,'wdb_kernel'), sys.argv[2], 'gbagg', gcol, acol, fn, 'count'], capture_output=True, text=True).stdout
