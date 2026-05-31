@@ -154,6 +154,31 @@ def _eval_pred(seg, node, seg_col):
         col=_colname(node.this); a=seg.values(seg_col(col))
         lo=int(node.args['low'].this); hi=int(node.args['high'].this)
         return (a>=lo)&(a<=hi)
+    if isinstance(node, E.In):
+        col=_colname(node.this); a=seg.values(seg_col(col))
+        lits=node.args.get('expressions') or []
+        vals=[]
+        for L in lits:
+            if not isinstance(L,E.Literal): raise NotImplementedError("IN with non-literal / subquery")
+            if L.is_string: vals.append(L.this.encode() if a.dtype.kind not in 'iuf' else L.this)
+            else: vals.append(int(L.this) if a.dtype.kind in 'iu' else (float(L.this) if a.dtype.kind=='f' else str(L.this).encode()))
+        # membership mask
+        if a.dtype.kind in 'iuf':
+            m=np.isin(a, np.array(vals, dtype=a.dtype))
+        else:
+            sv=set(vals); m=np.fromiter((x in sv for x in a), dtype=bool, count=len(a))
+        return m
+    if isinstance(node, E.Like) or isinstance(node, E.ILike):
+        import re
+        col=_colname(node.this); a=seg.values(seg_col(col))
+        pat=node.expression.this  # the LIKE pattern string
+        # SQL LIKE -> regex. re.escape leaves % and _ bare (not special), so replace
+        # them AFTER escaping: % => .*  (any run),  _ => .  (single char).
+        rx='^'+re.escape(pat).replace('%','.*').replace('_','.')+'$'
+        flags=re.DOTALL|(re.IGNORECASE if isinstance(node,E.ILike) else 0)
+        cre=re.compile(rx, flags)
+        def tostr(x): return x.decode('utf-8','surrogatepass') if isinstance(x,(bytes,bytearray)) else ('' if x is None else str(x))
+        return np.fromiter((bool(cre.match(tostr(x))) for x in a), dtype=bool, count=len(a))
     raise NotImplementedError(f"predicate {type(node).__name__}")
 
 def _apply_having(rows, proj, node, seg_col):
