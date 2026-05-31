@@ -6,6 +6,7 @@
 # compiled kernels (built locally via make)
 src/wdb_kernel
 src/wdb_kernel_count
+src/wdb_fetch
 *.o
 __pycache__/
 *.pyc
