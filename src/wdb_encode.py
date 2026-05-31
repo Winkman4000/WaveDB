@@ -15,6 +15,9 @@ Segment format "WVDB3":
 """
 import duckdb, numpy as np, numpy.ma as ma, zstandard as zstd, struct, time, sys
 
+_DT_UNITS = ['us','ns','ms','s','D','h','m','M','Y','W']   # code = index; aux byte stores it
+def _unit_code(u): return _DT_UNITS.index(u) if u in _DT_UNITS else 0
+
 FC_THRESHOLD = 50000
 R = 128
 ZSTD_LEVEL = 9
@@ -27,10 +30,19 @@ def _encode_column(col):
         null_mask = None; data = np.asarray(col)
     has_null = 1 if (null_mask is not None and null_mask.any()) else 0
     k = data.dtype.kind
-    dtype = 0 if k in 'iu' else (2 if k == 'f' else 1)
+    dtype = 0 if k in 'iu' else (2 if k == 'f' else (3 if k == 'M' else 1))
     N = len(data)
-    codes = np.empty(N, dtype=np.int64)
-    if dtype in (0, 2):
+    codes = np.empty(N, dtype=np.int64); aux = 0
+    if dtype == 3:
+        aux = _unit_code(np.datetime_data(data.dtype)[0])   # remember the time unit
+        iv = data.view('int64')                              # time IS an int64 count
+        if has_null:
+            nn = iv[~null_mask]; uniq, inv = np.unique(nn, return_inverse=True)
+            codes[~null_mask] = inv; codes[null_mask] = len(uniq)
+        else:
+            uniq, inv = np.unique(iv, return_inverse=True); codes[:] = inv
+        valb = [struct.pack('<q', int(v)) for v in uniq]
+    elif dtype in (0, 2):
         if has_null:
             nn = data[~null_mask]
             uniq, inv = np.unique(nn, return_inverse=True)
@@ -54,7 +66,7 @@ def _encode_column(col):
             uniq, inv = np.unique(asb, return_inverse=True); codes[:] = inv
         valb = [bytes(u) for u in uniq]
     V = len(valb) + has_null
-    return dtype, has_null, V, valb, codes
+    return dtype, has_null, V, valb, codes, aux
 
 def encode(input_path, out_path, columns=None):
     con = duckdb.connect(); con.execute("PRAGMA threads=8")
@@ -68,14 +80,14 @@ def encode(input_path, out_path, columns=None):
     sizes = {}
     for nm in cols:
         col = con.execute(f'SELECT "{nm}" FROM {src}').fetchnumpy()[nm]
-        dtype, has_null, V, valb, codes = _encode_column(col)
+        dtype, has_null, V, valb, codes, aux = _encode_column(col)
         bits = max(1, int(np.ceil(np.log2(max(V,2)))))
         codes = codes.astype(np.uint64)
         mode = 1 if (dtype == 1 and (V-has_null) > FC_THRESHOLD) else 0
         start = len(out)
         hb = nm.encode()
         out += struct.pack('<H', len(hb)) + hb + struct.pack('<I', V)
-        out += struct.pack('<B', bits) + struct.pack('<B', dtype) + struct.pack('<B', mode) + struct.pack('<B', has_null)
+        out += struct.pack('<B', bits) + struct.pack('<B', dtype) + struct.pack('<B', mode) + struct.pack('<B', has_null) + struct.pack('<B', aux)
         if mode == 0:
             for u in valb: out += struct.pack('<I', len(u)) + u
         else:
@@ -90,7 +102,7 @@ def encode(input_path, out_path, columns=None):
             out += struct.pack('<I', len(fc)) + struct.pack('<I', len(z)) + z
         bitsarr = ((codes[:,None] >> np.arange(bits-1,-1,-1,dtype=np.uint64)) & 1).astype(np.uint8).reshape(-1)
         out += np.packbits(bitsarr).tobytes()
-        sizes[nm] = (len(out)-start, V, bits, dtype, mode, has_null)
+        sizes[nm] = (len(out)-start, V, bits, dtype, mode, has_null, aux)
     open(out_path,'wb').write(out)
     return dict(n_rows=N, n_cols=len(cols), bytes=len(out), seconds=time.time()-t0, sizes=sizes)
 
@@ -99,5 +111,5 @@ if __name__ == '__main__':
         print("usage: wdb_encode.py <input.parquet|csv> <out.wdb> [col1,col2,...]"); sys.exit(1)
     cols = sys.argv[3].split(',') if len(sys.argv) > 3 else None
     r = encode(sys.argv[1], sys.argv[2], cols)
-    fc = sum(1 for v in r['sizes'].values() if v[4]==1); fl = sum(1 for v in r['sizes'].values() if v[3]==2); nu = sum(1 for v in r['sizes'].values() if v[5]==1)
-    print(f"Encoded {r['n_cols']} cols x {r['n_rows']:,} rows -> {r['bytes']/1e6:.1f} MB in {r['seconds']:.0f}s ({fc} front-coded, {fl} float, {nu} nullable)")
+    fc=sum(1 for v in r['sizes'].values() if v[4]==1); fl=sum(1 for v in r['sizes'].values() if v[3]==2); dt=sum(1 for v in r['sizes'].values() if v[3]==3); nu=sum(1 for v in r['sizes'].values() if v[5]==1)
+    print(f"Encoded {r['n_cols']} cols x {r['n_rows']:,} rows -> {r['bytes']/1e6:.1f} MB in {r['seconds']:.0f}s ({fc} front-coded, {fl} float, {dt} datetime, {nu} nullable)")

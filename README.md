@@ -119,15 +119,19 @@ group; WHERE predicates treat NULL as not-matching (SQL semantics); aggregates s
 NULLs; `IS NULL` / `IS NOT NULL` are supported. Verified lossless on all 105 ClickBench
 columns (floats, nulls, and all-null columns included).
 
-**Known gap — temporal types:** date/timestamp columns are currently stored losslessly
-as their ISO-8601 string form and queried as strings. Date-literal predicate semantics
-(e.g. `d = '2013-07-15'` matching a whole day) need a real temporal type — that's a
-planned next step, not yet implemented.
+**Temporal types** (date/timestamp) are a first-class dtype. A timestamp is just an
+integer count of time units since the epoch, so WaveDB stores the int64 count and the
+unit (e.g. microseconds); every date comparison becomes an integer comparison. Date and
+timestamp literals in SQL (`d = '2013-07-15'`, `t >= '2013-07-15 12:00:00'`, `BETWEEN`,
+`IN`, `GROUP BY`) are parsed to the same integer scale and reproduce DuckDB exactly.
+Verified lossless and correct on all 4 ClickBench temporal columns. (WaveDB stores
+datetime64[us] and does not track the DATE-vs-TIMESTAMP subtype; midnight values render
+as plain dates, otherwise as full timestamps.)
 
 ## SQL coverage (single-table)
 
 Supported and verified against DuckDB on 10M rows: `SELECT` with projection, `WHERE`
 (`=, !=, <, >, <=, >=`, `AND/OR/NOT`, `BETWEEN`, `IN`/`NOT IN`, `LIKE`/`ILIKE`,
-`IS [NOT] NULL`), `GROUP BY` (multi-key), aggregates (`COUNT`, `COUNT(*)`, `SUM`, `AVG`,
+`IS [NOT] NULL`, date/timestamp literals), `GROUP BY` (multi-key), aggregates (`COUNT`, `COUNT(*)`, `SUM`, `AVG`,
 `MIN`, `MAX`), `HAVING`, `ORDER BY`, `LIMIT`. Unsupported shapes (JOIN, subquery, CTE,
 window functions) raise `NotImplementedError` — never a silent wrong answer.

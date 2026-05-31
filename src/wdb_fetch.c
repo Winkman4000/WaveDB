@@ -32,7 +32,7 @@ static int load(const char* path){
     uint32_t off=5; NC=*(uint16_t*)(gbuf+off); off+=2; N=*(uint32_t*)(gbuf+off); off+=4;
     for(int c=0;c<NC;c++){
         uint16_t nl=*(uint16_t*)(gbuf+off); off+=2; memcpy(cols[c].name,gbuf+off,nl); cols[c].name[nl]=0; off+=nl;
-        cols[c].V=*(uint32_t*)(gbuf+off); off+=4; cols[c].bits=gbuf[off++]; cols[c].dt=gbuf[off++]; cols[c].mode=gbuf[off++]; cols[c].has_null=gbuf[off++];
+        cols[c].V=*(uint32_t*)(gbuf+off); off+=4; cols[c].bits=gbuf[off++]; cols[c].dt=gbuf[off++]; cols[c].mode=gbuf[off++]; cols[c].has_null=gbuf[off++]; off++; /* aux */
         cols[c].fc=NULL;
         if(cols[c].mode==0){
             cols[c].plain_dict=gbuf+off;

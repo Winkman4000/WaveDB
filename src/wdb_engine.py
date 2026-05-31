@@ -3,6 +3,7 @@
 Generic: knows nothing about any specific dataset. Handles plain (mode 0) and
 front-coded (mode 1) string dictionaries transparently."""
 import struct, numpy as np, zstandard as zstd
+_DT_UNITS = ['us','ns','ms','s','D','h','m','M','Y','W']
 
 class Segment:
     def __init__(self, path):
@@ -16,9 +17,9 @@ class Segment:
             nm = buf[off:off+nl].decode(); off += nl
             V = struct.unpack_from('<I',buf,off)[0]; off += 4
             bits = buf[off]; off += 1; dt = buf[off]; off += 1; mode = buf[off]; off += 1
-            has_null = buf[off]; off += 1
+            has_null = buf[off]; off += 1; aux = buf[off]; off += 1
             n_dict = V - has_null
-            meta = dict(V=V, bits=bits, dt=dt, mode=mode, has_null=has_null, n_dict=n_dict)
+            meta = dict(V=V, bits=bits, dt=dt, mode=mode, has_null=has_null, n_dict=n_dict, aux=aux)
             if mode == 0:
                 vals = []
                 for _ in range(n_dict):
@@ -57,17 +58,27 @@ class Segment:
         c = self.cols[nm]
         if c['dt'] == 0: return [int(v) for v in c['vals']]
         if c['dt'] == 2: return [struct.unpack('<d', v)[0] for v in c['vals']]
+        if c['dt'] == 3: return [struct.unpack('<q', v)[0] for v in c['vals']]   # int64 epoch
         return self.dict_vals(nm)  # bytes
+    def unit(self, nm):
+        return _DT_UNITS[self.cols[nm]['aux']]
     def values(self, nm):
         c = self.cols[nm]; codes = self.codes(nm); dvals = self._typed_dict(nm)
         if c['has_null']:
             nullcode = c['V'] - 1
             lut = np.empty(c['V'], dtype=object)
-            for i, v in enumerate(dvals): lut[i] = v
+            if c['dt'] == 3:
+                unit = _DT_UNITS[c['aux']]
+                for i, v in enumerate(dvals): lut[i] = np.int64(v).view(f'datetime64[{unit}]')
+            else:
+                for i, v in enumerate(dvals): lut[i] = v
             lut[nullcode] = None
             return lut[codes]
         if c['dt'] == 0: return np.array(dvals, dtype=np.int64)[codes]
         if c['dt'] == 2: return np.array(dvals, dtype=np.float64)[codes]
+        if c['dt'] == 3:
+            unit = _DT_UNITS[c['aux']]
+            return np.array(dvals, dtype=np.int64)[codes].view(f'datetime64[{unit}]')
         return np.array(dvals, dtype=object)[codes]
     def fetch(self, nm, code):
         """Random-access the dictionary value for a given code. O(1) for plain columns,
@@ -78,6 +89,9 @@ class Segment:
             v = c['vals'][code]
             if c['dt'] == 0: return int(v)
             if c['dt'] == 2: return struct.unpack('<d', v)[0]
+            if c['dt'] == 3:
+                unit = _DT_UNITS[c['aux']]
+                return np.int64(struct.unpack('<q', v)[0]).view(f'datetime64[{unit}]')
             return v
         if c.get('raw') is None: c['raw'] = self._dz.decompress(c['z'])
         raw = c['raw']; R = c['R']; o = int(c['restarts'][code // R]); prev = b''

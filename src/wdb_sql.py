@@ -123,6 +123,11 @@ def _pyval(v):
     if isinstance(v,(bytes,bytearray)):
         try: return v.decode('utf-8','surrogatepass')
         except: return v
+    if isinstance(v, np.datetime64):
+        s = str(v)
+        # render as plain date when the value is exactly midnight (DATE-like), else full timestamp
+        if 'T00:00:00' in s and s.endswith('00:00:00.000000'): return s[:10]
+        return s.replace('T',' ')
     if isinstance(v,(np.integer,)): return int(v)
     if isinstance(v,(np.floating,)): return float(v)
     return v
@@ -137,18 +142,31 @@ def _col(seg, name):
     c = seg.cols[name]; codes = seg.codes(name); dv = seg._typed_dict(name)
     if c['has_null']:
         nullcode = c['V'] - 1; nmask = (codes == nullcode)
-        if c['dt'] == 0:   lut = np.array(dv + [0], dtype=np.int64)
+        if c['dt'] in (0, 3): lut = np.array(dv + [0], dtype=np.int64)
         elif c['dt'] == 2: lut = np.array(dv + [np.nan], dtype=np.float64)
         else:
             lut = np.empty(c['V'], dtype=object)
             for i,v in enumerate(dv): lut[i]=v
             lut[nullcode] = b''
         return lut[codes], nmask
-    if c['dt'] == 0:   return np.array(dv, dtype=np.int64)[codes], None
+    if c['dt'] in (0, 3): return np.array(dv, dtype=np.int64)[codes], None
     if c['dt'] == 2:   return np.array(dv, dtype=np.float64)[codes], None
     lut = np.empty(len(dv), dtype=object)
     for i,v in enumerate(dv): lut[i]=v
     return lut[codes], None
+
+def _parse_temporal(litstr, unit):
+    return int(np.datetime64(str(litstr).replace(' ','T')).astype(f'datetime64[{unit}]').view('int64'))
+
+def _lit_for_col(seg, colname, lit, arr_kind):
+    """Convert a sqlglot Literal node to a value comparable with column `colname`."""
+    c = seg.cols[colname]
+    if c['dt'] == 3:                       # datetime: parse string/number to int64 epoch
+        return _parse_temporal(lit.this, seg.unit(colname))
+    if not lit.is_string:
+        return int(lit.this) if arr_kind in 'iu' else float(lit.this)
+    v = lit.this.encode()
+    return v
 
 def _agg_scalar(seg, p, mask, seg_col):
     kind=_agg_kind(p)
@@ -171,10 +189,9 @@ def _eval_pred(seg, node, seg_col):
     if isinstance(node, (E.EQ,E.NEQ,E.GT,E.LT,E.GTE,E.LTE)):
         col=_colname(node.this); lit=node.expression
         a, nmask = _col(seg, seg_col(col))
-        if isinstance(lit,E.Literal) and not lit.is_string: v=int(lit.this) if a.dtype.kind in 'iu' else float(lit.this)
-        elif isinstance(lit,E.Literal): v=lit.this.encode()
-        else: raise NotImplementedError("non-literal RHS")
-        if a.dtype.kind not in 'iuf' and isinstance(v,int): v=str(v).encode()
+        if not isinstance(lit,E.Literal): raise NotImplementedError("non-literal RHS")
+        v = _lit_for_col(seg, seg_col(col), lit, a.dtype.kind)
+        if a.dtype.kind not in 'iuf' and isinstance(v,int) and seg.cols[seg_col(col)]['dt']!=3: v=str(v).encode()
         import operator
         op={E.EQ:operator.eq,E.NEQ:operator.ne,E.GT:operator.gt,E.LT:operator.lt,E.GTE:operator.ge,E.LTE:operator.le}[type(node)]
         res = op(a,v)
@@ -182,7 +199,8 @@ def _eval_pred(seg, node, seg_col):
         return res
     if isinstance(node, E.Between):
         col=_colname(node.this); a, nmask = _col(seg, seg_col(col))
-        lo=int(node.args['low'].this); hi=int(node.args['high'].this)
+        lo=_lit_for_col(seg, seg_col(col), node.args['low'], a.dtype.kind)
+        hi=_lit_for_col(seg, seg_col(col), node.args['high'], a.dtype.kind)
         res=(a>=lo)&(a<=hi)
         if nmask is not None: res = res & ~nmask
         return res
@@ -192,7 +210,8 @@ def _eval_pred(seg, node, seg_col):
         vals=[]
         for L in lits:
             if not isinstance(L,E.Literal): raise NotImplementedError("IN with non-literal / subquery")
-            if L.is_string: vals.append(L.this.encode() if a.dtype.kind not in 'iuf' else L.this)
+            if seg.cols[seg_col(col)]['dt']==3: vals.append(_parse_temporal(L.this, seg.unit(seg_col(col))))
+            elif L.is_string: vals.append(L.this.encode() if a.dtype.kind not in 'iuf' else L.this)
             else: vals.append(int(L.this) if a.dtype.kind in 'iu' else (float(L.this) if a.dtype.kind=='f' else str(L.this).encode()))
         if a.dtype.kind in 'iuf':
             m=np.isin(a, np.array(vals, dtype=a.dtype))

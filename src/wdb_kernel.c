@@ -20,7 +20,7 @@ static int load(const char* path){
     uint32_t off=5; NC=*(uint16_t*)(gbuf+off); off+=2; N=*(uint32_t*)(gbuf+off); off+=4;
     for(int c=0;c<NC;c++){ uint16_t nl=*(uint16_t*)(gbuf+off); off+=2; memcpy(cols[c].name,gbuf+off,nl); cols[c].name[nl]=0; off+=nl;
         cols[c].V=*(uint32_t*)(gbuf+off); off+=4; cols[c].bits=gbuf[off]; off+=1; cols[c].dt=gbuf[off]; off+=1;
-        uint8_t mode=gbuf[off]; off+=1; uint8_t has_null=gbuf[off]; off+=1;
+        uint8_t mode=gbuf[off]; off+=1; uint8_t has_null=gbuf[off]; off+=1; uint8_t aux=gbuf[off]; off+=1; (void)aux;
         cols[c].ivals=malloc(sizeof(long long)*cols[c].V);
         if(mode==0){
             for(uint32_t v=0;v<cols[c].V-has_null;v++){ uint32_t vl=*(uint32_t*)(gbuf+off); off+=4; char tmp[32]; int n=vl<31?vl:31; memcpy(tmp,gbuf+off,n);tmp[n]=0; cols[c].ivals[v]=(cols[c].dt==0)?atoll(tmp):0; off+=vl; }

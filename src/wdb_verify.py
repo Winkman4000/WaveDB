@@ -11,6 +11,9 @@ def _expected(col):
     else:
         m = np.zeros(len(col), dtype=bool); data = np.asarray(col)
     k = data.dtype.kind
+    if k == 'M':
+        iv = data.view('int64')
+        return np.array([None if m[i] else int(iv[i]) for i in range(len(data))], dtype=object)
     out = np.empty(len(data), dtype=object)
     for i in range(len(data)):
         if m[i]: out[i] = None
@@ -23,7 +26,14 @@ def _expected(col):
 
 def _recon_obj(seg, nm):
     """Reconstructed values as an object array (None for null), comparable to _expected."""
-    c = seg.cols[nm]; vals = seg.values(nm)
+    c = seg.cols[nm]
+    if c['dt'] == 3:
+        dv = seg._typed_dict(nm); codes = seg.codes(nm)
+        if c['has_null']:
+            nc = c['V']-1
+            return np.array([None if cd==nc else dv[cd] for cd in codes], dtype=object)
+        return np.array(dv, dtype=np.int64)[codes]
+    vals = seg.values(nm)
     if c['has_null'] or c['dt'] == 2 or vals.dtype == object:
         # already object (nullable) or float/bytes -> normalize to python scalars
         out = np.empty(len(vals), dtype=object)
@@ -47,6 +57,9 @@ def verify(segment_path, source_path):
         if not c['has_null'] and not masked and c['dt'] == 0:
             recon = np.array([int(v) for v in c['vals']], dtype=np.int64)[seg.codes(nm)]
             match = np.array_equal(recon, orig.astype(np.int64))
+        elif not c['has_null'] and not masked and c['dt'] == 3:
+            dv = seg._typed_dict(nm); recon = np.array(dv, dtype=np.int64)[seg.codes(nm)]
+            match = np.array_equal(recon, orig.view('int64'))
         elif not c['has_null'] and not masked and c['dt'] == 1:
             recon = seg.values(nm)
             ob = np.array([bytes(x) if isinstance(x,(bytes,bytearray)) else (x.encode('utf-8','surrogatepass') if isinstance(x,str) else str(x).encode('utf-8','surrogatepass')) for x in orig], dtype=object)
