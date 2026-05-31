@@ -15,8 +15,14 @@ Wins and losses come from one property: **cardinality** (distinct values per col
 - **Low / medium cardinality** (up to ~tens of thousands distinct): GROUP BY and
   filtered counts run in **single-digit milliseconds** via a parallel counter-fan
   tally that stays inside CPU cache.
-- **High cardinality** (millions distinct): still correct, still lossless, but the
-  speed edge narrows toward a normal columnar scan.
+- **High cardinality** (millions distinct): GROUP BY / COUNT / aggregates still
+  **win 3-37x over DuckDB** (measured at 100M rows: 37x at 1M distinct, 8x at 10M,
+  3x at 50M). The dense-code array tally beats hash aggregation at every scale
+  tested; DuckDB never overtakes it. The lead narrows as values approach all-unique
+  but stays a multi-x win.
+- **The one slow path**: using a high-cardinality *string* column in a filter or
+  scalar pass that decodes the raw values (e.g. `WHERE url <> ...`) scans, and is
+  not faster than a normal columnar store.
 - **Encode** is slower than a general engine, on purpose — it builds dictionaries
   and packs codes so reads are cheap later.
 
@@ -58,9 +64,10 @@ touch, compared against DuckDB on identical data. See `examples/clickbench.md`.
 - **Correctness:** 43/43 queries match DuckDB.
 - **Segment size:** 942 MB (240 MB for 51 low/mid-card cols; 702 MB for the 3
   high-card string columns) vs 916 MB source parquet.
-- **Speed:** count GROUP BYs 1.4–6 ms (~20x faster than DuckDB); per-group
-  aggregates ~21 ms; exact COUNT(DISTINCT) ~6 ms; high-cardinality string
-  group-bys scan in seconds (no speed claim there).
+- **Speed:** low/mid-card count GROUP BYs 1.4–6 ms (~20x faster than DuckDB);
+  high-cardinality GROUP BY 3–37x faster than DuckDB (measured to 100M rows);
+  per-group SUM/MIN/MAX/AVG ~21 ms; exact COUNT(DISTINCT) ~6 ms. The only slow
+  path is decoding raw high-card *string* values in a filter/scalar pass.
 
 These numbers are reproducible with the CLI above on the ClickBench `hits`
 parquet; they are not hardcoded.

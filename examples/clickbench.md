@@ -30,7 +30,8 @@ result on a 10M-row slice, vs DuckDB on identical data, same machine
 | count GROUP BY | 1.4–6 ms | ~20x faster than DuckDB (~14 ms) |
 | per-group SUM/MIN/MAX/AVG | ~21 ms | single value-weighted pass |
 | COUNT(DISTINCT) | ~6 ms | exact, free from dictionary |
-| high-card string GROUP BY | seconds | scans; no speed advantage |
+| high-card GROUP BY (1M-50M distinct) | 3-37x faster | measured to 100M rows; DuckDB never overtakes |
+| high-card string *filter/scalar decode* | seconds | the one slow path (raw value decode) |
 
 ## Honest notes
 
