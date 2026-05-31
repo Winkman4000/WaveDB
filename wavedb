@@ -6,6 +6,7 @@
   wavedb groupby <segment.wdb> <col> [col2...]      fast GROUP BY count (C kernel)
   wavedb agg <segment.wdb> <gcol> <aggcol> <sum|min|max|avg>   per-group aggregate (C kernel)
   wavedb fetch <segment.wdb> <col> <code>          random-access a dictionary value by code
+  wavedb sql <segment.wdb> "<SQL>"                 run SQL (single-table SELECT/WHERE/GROUP BY/HAVING/ORDER BY/LIMIT)
 """
 import sys, os, subprocess
 HERE = os.path.dirname(os.path.abspath(__file__)); SRC = os.path.join(HERE,'src')
@@ -47,6 +48,14 @@ def main():
         gcol, acol, fn = sys.argv[3], sys.argv[4], sys.argv[5]
         out = subprocess.run([os.path.join(SRC,'wdb_kernel'), sys.argv[2], 'gbagg', gcol, acol, fn, 'count'], capture_output=True, text=True).stdout
         print(out.strip())
+    elif cmd == 'sql':
+        from wdb_engine import Segment
+        from wdb_sql import execute
+        seg = Segment(sys.argv[2])
+        rows, names = execute(seg, sys.argv[3])
+        print(" | ".join(names))
+        for r in rows:
+            print(" | ".join("" if v is None else str(v) for v in r))
     else: print(__doc__)
 
 if __name__ == '__main__': main()
