@@ -60,6 +60,10 @@ Requires Python 3 with `duckdb`, `numpy`, `pyarrow`, and `gcc`.
 - **Per-group aggregates**: one pass, each row's value added to its group's
   accumulator (value is the weight) — SUM/MIN/MAX/AVG from a single pass.
 - **COUNT(DISTINCT)**: exact and free — it is the dictionary size.
+- **High-cardinality strings**: front-coded (shared-prefix delta vs the previous
+  sorted value) + zstd, with restart points for random access. On URL this is
+  ~7x smaller than the plain dictionary and beats ClickHouse's best ZSTD mode,
+  at a competitive build time (~2s in C with an AVX2 prefix-match loop).
 
 ## Benchmark (worked example: ClickBench, 10M rows)
 
@@ -68,8 +72,9 @@ touch, compared against DuckDB on identical data. See `examples/clickbench.md`.
 
 - **Lossless:** 55/55 columns byte-perfect.
 - **Correctness:** 43/43 queries match DuckDB.
-- **Segment size:** 942 MB (240 MB for 51 low/mid-card cols; 702 MB for the 3
-  high-card string columns) vs 916 MB source parquet.
+- **Segment size:** 448 MB (down from 942 MB) vs 916 MB source parquet — high-card
+  string columns (URL, Title) are front-coded + zstd. On the URL column alone:
+  68 MB vs ClickHouse-ZSTD 110 MB, ClickHouse-LZ4 231 MB, DuckDB-FSST 412 MB.
 - **Speed:** low/mid-card count GROUP BYs 1.4–6 ms (~20x faster than DuckDB);
   high-cardinality GROUP BY 3–37x faster than DuckDB (measured to 100M rows);
   per-group SUM/MIN/MAX/AVG ~21 ms; exact COUNT(DISTINCT) ~6 ms. The only slow

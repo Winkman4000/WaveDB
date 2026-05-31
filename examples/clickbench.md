@@ -26,7 +26,7 @@ result on a 10M-row slice, vs DuckDB on identical data, same machine
 |---|---|---|
 | lossless | 55/55 columns | byte-exact vs parquet |
 | correctness | 43/43 queries | match DuckDB exactly |
-| segment size | 942 MB | vs 916 MB source parquet |
+| segment size | 448 MB | vs 916 MB source parquet (front-coded strings) |
 | count GROUP BY | 1.4–6 ms | ~20x faster than DuckDB (~14 ms) |
 | per-group SUM/MIN/MAX/AVG | ~21 ms | single value-weighted pass |
 | COUNT(DISTINCT) | ~6 ms | exact, free from dictionary |
