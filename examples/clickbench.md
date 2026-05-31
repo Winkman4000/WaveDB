@@ -39,7 +39,8 @@ result on a 10M-row slice, vs DuckDB on identical data, same machine
   (URL ~2.6M distinct, Title ~1.6M, UserID ~1.5M). The other 51 columns are
   240 MB total. Compression is strong where data is structured, weak where it is
   high-entropy — as expected.
-- The win is **pre-paid**: dense-code array tally beats hashing, but the
-  densification happens at encode time, which is the slow side of the trade.
-- Encode is the one place WaveDB does not beat a general engine; it does more
-  work up front so reads and updates are cheap.
+- The win is **pre-paid**: dense-code array tally beats hashing because the
+  densification happens at encode time — but that encode is itself competitive
+  (hash-dictionary + 8-core parallel: ~3s/50 cols vs DuckDB ~6s, ClickHouse ~10s).
+- Encode does more structuring work up front, but does it efficiently enough to
+  stay competitive-to-ahead on wall-clock — the work is more efficient, not just more.
