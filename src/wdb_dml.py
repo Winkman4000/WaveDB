@@ -77,15 +77,25 @@ def _encode_segment(catalog, name, src_parquet):
     if tinfo['segments'] != [seg_file]:
         tinfo['segments'] = [seg_file]; catalog.save()
 
+def _next_segment_index(catalog, name):
+    idxs = []
+    for sfile in catalog.get_table(name)['segments']:
+        base = sfile[:-4] if sfile.endswith('.wdb') else sfile
+        try: idxs.append(int(base.rsplit('_', 1)[1]))
+        except (IndexError, ValueError): pass
+    return max(idxs) + 1 if idxs else 0
+
 def flush(catalog, name):
-    """Fold the hot buffer into the cold segment, then clear hot. (buffered tables)"""
+    """Encode the hot buffer into a NEW cold segment and append it; clear hot.
+    O(hot) — existing segments are untouched (this is what produces multi-segment tables)."""
     hp = hot_path(catalog, name)
     if not os.path.exists(hp):
         return 0
     hot_df = pd.read_parquet(hp)
-    bpath = _buffer_path(catalog, name)
-    cold_df = _append_parquet(bpath, hot_df)      # buffer becomes full canonical set
-    _encode_segment(catalog, name, bpath)
+    idx = _next_segment_index(catalog, name)
+    seg_file = f"{name}_{idx}.wdb"
+    wdb_encode.encode(hp, os.path.join(catalog.dbdir, seg_file))
+    catalog.add_segment(name, seg_file)
     os.remove(hp)
     return len(hot_df)
 
