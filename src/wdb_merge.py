@@ -63,10 +63,10 @@ def _partial_sql(tree, table_ref, keys, partials):
 
 def _num(x): return 0 if x is None else x
 
-def _merge_partials(rows_a, rows_b, n_keys, plan):
-    """Merge two lists of partial rows (keys first, then partials) by group key."""
+def _merge_partials(row_lists, n_keys, plan):
+    """Merge N lists of partial rows (keys first, then partials) by group key."""
     acc = {}
-    for rows in (rows_a, rows_b):
+    for rows in row_lists:
         for r in rows:
             key = tuple(r[:n_keys]); parts = r[n_keys:]
             if key not in acc:
@@ -93,7 +93,9 @@ def _slot_op(abs_slot, plan):
             return 'sum'
     return 'sum'
 
-def merge_query(seg, hot_parquet, sql):
+def merge_query(segs, hot_parquet, sql):
+    """segs: list of cold Segments (0..N). hot_parquet: path or None."""
+    if segs is None: segs = []
     tree = sqlglot.parse_one(sql, read='duckdb')
     if not isinstance(tree, E.Select): raise NotImplementedError("merge: only SELECT")
     if tree.args.get('joins') or tree.args.get('with'):
@@ -109,8 +111,9 @@ def merge_query(seg, hot_parquet, sql):
         # strip ORDER/LIMIT for per-tier; apply post-merge
         base = copy.deepcopy(tree)
         base.set('order', None); base.set('limit', None)
-        if seg is not None:
-            r, _ = wdb_sql.execute(seg, base.sql(dialect='duckdb')); rows += list(r)
+        bsql = base.sql(dialect='duckdb')
+        for seg in segs:
+            r, _ = wdb_sql.execute(seg, bsql); rows += list(r)
         if hot_parquet is not None:
             con = duckdb.connect()
             rows += [tuple(x) for x in con.execute(_duck_from(base, hot_parquet)).fetchall()]
@@ -121,15 +124,16 @@ def merge_query(seg, hot_parquet, sql):
 
     # ---- aggregates / GROUP BY: partial merge ----
     keys, plan, partials = _classify(proj)
-    rows_cold, rows_hot = [], []
-    if seg is not None:
+    row_lists = []
+    if segs:
         psql = _partial_sql(tree, "tbl", keys, partials)
-        rows_cold, _ = wdb_sql.execute(seg, psql)
+        for seg in segs:
+            r, _ = wdb_sql.execute(seg, psql); row_lists.append(list(r))
     if hot_parquet is not None:
         psql_h = _partial_sql(tree, f"'{hot_parquet}'", keys, partials)
         con = duckdb.connect()
-        rows_hot = [tuple(x) for x in con.execute(psql_h).fetchall()]
-    acc = _merge_partials(list(rows_cold), list(rows_hot), len(keys), plan)
+        row_lists.append([tuple(x) for x in con.execute(psql_h).fetchall()])
+    acc = _merge_partials(row_lists, len(keys), plan)
 
     out = []
     for key, parts in acc.items():
