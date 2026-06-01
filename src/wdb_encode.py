@@ -11,6 +11,7 @@ Segment format "WVDB3":
               the dict stores V-has_null real values (codes 0..V-1-has_null).
     plain dict (mode 0):       (V-has_null) * (u32 len | bytes)   [float: bytes = 8-byte double]
     front-coded (mode 1):      u16 R | u32 n_restart | restart_offsets(u32*) | u32 fclen | u32 zlen | zstd(dict)
+    delta-int  (mode 2):       u32 zlen | zstd(int64 deltas of sorted dict)   [dtype 0/3, non-null, high-card]
   then: packed codes (n_rows * bits, MSB-first)
 """
 import duckdb, numpy as np, numpy.ma as ma, zstandard as zstd, struct, time, sys
@@ -19,6 +20,7 @@ _DT_UNITS = ['us','ns','ms','s','D','h','m','M','Y','W']   # code = index; aux b
 def _unit_code(u): return _DT_UNITS.index(u) if u in _DT_UNITS else 0
 
 FC_THRESHOLD = 50000
+NUM_THRESHOLD = 50000   # delta-code numeric dictionaries above this cardinality (mode 2)
 R = 128
 ZSTD_LEVEL = 9
 
@@ -66,7 +68,7 @@ def _encode_column(col):
             uniq, inv = np.unique(asb, return_inverse=True); codes[:] = inv
         valb = [bytes(u) for u in uniq]
     V = len(valb) + has_null
-    return dtype, has_null, V, valb, codes, aux
+    return dtype, has_null, V, valb, codes, aux, uniq
 
 def encode(input_path, out_path, columns=None):
     con = duckdb.connect(); con.execute("PRAGMA threads=8")
@@ -80,16 +82,26 @@ def encode(input_path, out_path, columns=None):
     sizes = {}
     for nm in cols:
         col = con.execute(f'SELECT "{nm}" FROM {src}').fetchnumpy()[nm]
-        dtype, has_null, V, valb, codes, aux = _encode_column(col)
+        dtype, has_null, V, valb, codes, aux, uniq = _encode_column(col)
         bits = max(1, int(np.ceil(np.log2(max(V,2)))))
         codes = codes.astype(np.uint64)
-        mode = 1 if (dtype == 1 and (V-has_null) > FC_THRESHOLD) else 0
+        if dtype == 1 and (V - has_null) > FC_THRESHOLD:
+            mode = 1
+        elif dtype in (0, 3) and has_null == 0 and (V - has_null) > NUM_THRESHOLD:
+            mode = 2
+        else:
+            mode = 0
         start = len(out)
         hb = nm.encode()
         out += struct.pack('<H', len(hb)) + hb + struct.pack('<I', V)
         out += struct.pack('<B', bits) + struct.pack('<B', dtype) + struct.pack('<B', mode) + struct.pack('<B', has_null) + struct.pack('<B', aux)
         if mode == 0:
             for u in valb: out += struct.pack('<I', len(u)) + u
+        elif mode == 2:
+            uniq_i = uniq.astype(np.int64)
+            deltas = np.diff(uniq_i, prepend=np.int64(0)).astype(np.int64)
+            z = zc.compress(deltas.tobytes())
+            out += struct.pack('<I', len(z)) + z
         else:
             fc = bytearray(); restarts = []; prev = b''
             for i, s in enumerate(valb):

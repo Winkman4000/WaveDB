@@ -55,7 +55,7 @@ def verify(segment_path, source_path):
         orig = con.execute(f'SELECT "{nm}" FROM \'{source_path}\'').fetchnumpy()[nm]
         c = seg.cols[nm]; masked = isinstance(orig, ma.MaskedArray)
         if not c['has_null'] and not masked and c['dt'] == 0:
-            recon = np.array([int(v) for v in c['vals']], dtype=np.int64)[seg.codes(nm)]
+            dv = seg._typed_dict(nm); recon = np.array(dv, dtype=np.int64)[seg.codes(nm)]
             match = np.array_equal(recon, orig.astype(np.int64))
         elif not c['has_null'] and not masked and c['dt'] == 3:
             dv = seg._typed_dict(nm); recon = np.array(dv, dtype=np.int64)[seg.codes(nm)]
