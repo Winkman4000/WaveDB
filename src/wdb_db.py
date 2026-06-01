@@ -11,7 +11,8 @@ Step 3a: single segment per table.
 import sqlglot, sqlglot.expressions as E
 from wdb_catalog import Catalog
 from wdb_engine import Segment
-import wdb_ddl, wdb_dml, wdb_sql
+import os
+import wdb_ddl, wdb_dml, wdb_sql, wdb_merge
 
 class Database:
     def __init__(self, catalog): self.cat = catalog
@@ -36,11 +37,24 @@ class Database:
         if isinstance(tree, E.Select):
             name = self._table_in(tree)
             paths = self.cat.segment_paths(name)
-            if not paths:
-                raise ValueError(f"table {name!r} has no data yet")
             if len(paths) > 1:
                 raise NotImplementedError("multi-segment read (step 3c)")
-            return wdb_sql.execute(Segment(paths[0]), sql)
+            seg = Segment(paths[0]) if paths else None
+            hp = wdb_dml.hot_path(self.cat, name)
+            hot = hp if os.path.exists(hp) else None
+            if hot is None:
+                if seg is None:
+                    raise ValueError(f"table {name!r} has no data yet")
+                return wdb_sql.execute(seg, sql)         # unchanged single-segment fast path
+            return wdb_merge.merge_query(seg, hot, sql)  # two-tier live merge-read
         raise NotImplementedError(f"unsupported statement: {type(tree).__name__}")
+
+    def set_table_mode(self, name, mode):
+        """Operator control: 'buffered' = high-traffic, INSERT appends to hot buffer
+        without re-encoding; SELECT merges hot+cold; call flush() to fold in."""
+        self.cat.set_table_mode(name, mode)
+
+    def flush(self, name):
+        return wdb_dml.flush(self.cat, name)
 
     def tables(self): return self.cat.list_tables()

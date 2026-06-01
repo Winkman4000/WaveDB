@@ -44,37 +44,63 @@ def parse_insert(sql):
     return name, cols, rows
 
 def _buffer_path(catalog, name): return os.path.join(catalog.dbdir, f"{name}__buffer.parquet")
+def hot_path(catalog, name):    return os.path.join(catalog.dbdir, f"{name}__hot.parquet")
 def _segment_name(name): return f"{name}_0.wdb"
+
+def _rows_to_df(schema, order, rows):
+    scol = [c[0] for c in schema]; stype = {c[0]: c[1] for c in schema}
+    if order and set(order) != set(scol):
+        raise ValueError(f"INSERT columns {order} don't match table columns {scol}")
+    order = order if order else scol
+    for r in rows:
+        if len(r) != len(order):
+            raise ValueError(f"row has {len(r)} values, expected {len(order)}")
+    data = {c: [] for c in scol}
+    for r in rows:
+        rowmap = dict(zip(order, r))
+        for c in scol:
+            data[c].append(_coerce(rowmap.get(c), stype[c]))
+    return pd.DataFrame({c: pd.array(data[c], dtype=_PD[stype[c]]) for c in scol})
+
+def _append_parquet(path, df_new):
+    if os.path.exists(path):
+        df = pd.concat([pd.read_parquet(path), df_new], ignore_index=True)
+    else:
+        df = df_new
+    df.to_parquet(path, index=False)
+    return df
+
+def _encode_segment(catalog, name, src_parquet):
+    seg_file = _segment_name(name); seg_path = os.path.join(catalog.dbdir, seg_file)
+    wdb_encode.encode(src_parquet, seg_path)
+    tinfo = catalog.get_table(name)
+    if tinfo['segments'] != [seg_file]:
+        tinfo['segments'] = [seg_file]; catalog.save()
+
+def flush(catalog, name):
+    """Fold the hot buffer into the cold segment, then clear hot. (buffered tables)"""
+    hp = hot_path(catalog, name)
+    if not os.path.exists(hp):
+        return 0
+    hot_df = pd.read_parquet(hp)
+    bpath = _buffer_path(catalog, name)
+    cold_df = _append_parquet(bpath, hot_df)      # buffer becomes full canonical set
+    _encode_segment(catalog, name, bpath)
+    os.remove(hp)
+    return len(hot_df)
 
 def insert(catalog, sql):
     name, cols, rows = parse_insert(sql)
     tinfo = catalog.get_table(name)
-    schema = tinfo['schema']                       # [[col, wtype], ...]
-    scol = [c[0] for c in schema]; stype = {c[0]: c[1] for c in schema}
-    order = cols if cols else scol
-    if cols and set(cols) != set(scol):
-        raise ValueError(f"INSERT columns {cols} don't match table columns {scol}")
-    for r in rows:
-        if len(r) != len(order):
-            raise ValueError(f"row has {len(r)} values, expected {len(order)}")
-    # build new-rows dict in schema order, coerced
-    newdata = {c: [] for c in scol}
-    for r in rows:
-        rowmap = dict(zip(order, r))
-        for c in scol:
-            newdata[c].append(_coerce(rowmap.get(c), stype[c]))
-    df_new = pd.DataFrame({c: pd.array(newdata[c], dtype=_PD[stype[c]]) for c in scol})
-    # append to buffer
-    bpath = _buffer_path(catalog, name)
-    if os.path.exists(bpath):
-        df_old = pd.read_parquet(bpath)
-        df = pd.concat([df_old, df_new], ignore_index=True)
+    schema = tinfo['schema']
+    df_new = _rows_to_df(schema, cols, rows)
+    mode = tinfo.get('mode', 'segment')
+    if mode == 'buffered':
+        # operator opted in: append to the hot buffer only, no re-encode (the win)
+        _append_parquet(hot_path(catalog, name), df_new)
     else:
-        df = df_new
-    df.to_parquet(bpath, index=False)
-    # re-encode the single segment from the buffer
-    seg_file = _segment_name(name); seg_path = os.path.join(catalog.dbdir, seg_file)
-    wdb_encode.encode(bpath, seg_path)
-    if seg_file not in tinfo['segments']:
-        tinfo['segments'] = [seg_file]; catalog.save()
+        # default: buffer is canonical; re-encode the single segment each time
+        bpath = _buffer_path(catalog, name)
+        _append_parquet(bpath, df_new)
+        _encode_segment(catalog, name, bpath)
     return len(rows)

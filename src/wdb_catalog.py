@@ -41,7 +41,7 @@ class Catalog:
         """schema = list of [col_name, type_str]. Registers an empty table."""
         if name in self.data['tables']:
             raise ValueError(f"table {name!r} already exists")
-        self.data['tables'][name] = {'schema': schema, 'segments': []}
+        self.data['tables'][name] = {'schema': schema, 'segments': [], 'mode': 'segment'}
         self.save()
 
     def drop_table(self, name):
@@ -61,6 +61,15 @@ class Catalog:
     def add_segment(self, name, segment_filename):
         self.get_table(name)['segments'].append(segment_filename)
         self.save()
+
+    def set_table_mode(self, name, mode):
+        if mode not in ('segment', 'buffered'):
+            raise ValueError(f"unknown table mode {mode!r}")
+        self.get_table(name)['mode'] = mode
+        self.save()
+
+    def table_mode(self, name):
+        return self.get_table(name).get('mode', 'segment')
 
     def segment_paths(self, name):
         t = self.get_table(name)
