@@ -36,6 +36,8 @@ class Database:
             self.cat.drop_table(tree.this.this.name); return None
         if isinstance(tree, E.Delete):
             return wdb_dml.delete(self.cat, sql)
+        if isinstance(tree, E.Update):
+            return wdb_dml.update(self.cat, sql)
         if isinstance(tree, E.Select):
             name = self._table_in(tree)
             paths = self.cat.segment_paths(name)

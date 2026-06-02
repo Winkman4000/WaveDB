@@ -174,3 +174,78 @@ def delete(catalog, sql):
             deleted += before - len(pd.read_parquet(bpath))
             _encode_segment(catalog, name, bpath)
     return deleted
+
+
+def _literal_rhs(node):
+    """Typed python value for a SET RHS that is a literal/null/bool/negative-literal.
+    Raises NotImplementedError for column references or arithmetic (deferred to step 1d)."""
+    import sqlglot.expressions as E
+    if isinstance(node, (E.Literal, E.Null, E.Boolean, E.Neg)):
+        return _litval(node)
+    raise NotImplementedError("UPDATE supports literal assignment only "
+                              "(column/expression RHS is step 1d)")
+
+def _update_parquet(path, sets, pred_sql):
+    """Apply SET assignments to matching rows of a parquet (hot buffer or canonical buffer),
+    keeping column order. sets: list of (col, typed_value, val_sql). Returns rows updated."""
+    import duckdb
+    con = duckdb.connect()
+    cond = "TRUE" if pred_sql is None else f"({pred_sql}) IS TRUE"
+    n = con.execute(f"SELECT count(*) FROM read_parquet('{path}') WHERE {cond}").fetchone()[0]
+    if n:
+        repl = ", ".join(f'CASE WHEN {cond} THEN {vsql} ELSE "{col}" END AS "{col}"'
+                         for col, _, vsql in sets)
+        df = con.execute(f"SELECT * REPLACE ({repl}) FROM read_parquet('{path}')").fetch_df()
+        df.to_parquet(path, index=False)
+    return n
+
+def update(catalog, sql):
+    """UPDATE t SET col = literal [, ...] [WHERE ...]. Strategy matches storage class:
+      buffered -> write an override sidecar per cold segment for matching rows (no rewrite)
+                  + update the hot buffer parquet;
+      segment  -> update the canonical buffer and re-encode the single segment.
+    Returns the number of rows updated. Literal assignment only (column expr is step 1d)."""
+    import wdb_sql, wdb_override
+    from wdb_engine import Segment
+    tree = sqlglot.parse_one(sql, read='duckdb')
+    name = tree.find(E.Table).name
+    assigns = tree.args.get('expressions') or []
+    if not assigns:
+        return 0
+    schema = {c[0]: c[1] for c in catalog.get_table(name)['schema']}
+    sets = []   # (col, typed_value, val_sql)
+    for a in assigns:
+        if not isinstance(a, E.EQ):
+            raise NotImplementedError(f"unsupported SET clause: {a.sql()}")
+        col = a.this.name
+        if col not in schema:
+            raise KeyError(f"no such column {col!r} in {name!r}")
+        typed = _coerce(_literal_rhs(a.expression), schema[col])
+        sets.append((col, typed, a.expression.sql(dialect='duckdb')))
+    wnode = tree.args.get('where'); pred = wnode.this if wnode is not None else None
+    pred_sql = pred.sql(dialect='duckdb') if pred is not None else None
+    mode = catalog.table_mode(name)
+    updated = 0
+
+    if mode == 'buffered':
+        segs = catalog.get_table(name)['segments']
+        for sf, sp in zip(segs, catalog.segment_paths(name)):
+            seg = Segment(sp)
+            if pred is None:
+                idx = np.arange(seg.N)
+            else:
+                idx = np.nonzero(wdb_sql._eval_pred(seg, pred, lambda x: x))[0]
+            if len(idx):
+                for col, typed, _ in sets:
+                    vals = np.empty(len(idx), dtype=object); vals[:] = [typed]*len(idx)
+                    wdb_override.set_override(sp, col, idx, vals)
+                updated += len(idx)
+        hp = hot_path(catalog, name)
+        if os.path.exists(hp):
+            updated += _update_parquet(hp, sets, pred_sql)
+    else:
+        bpath = _buffer_path(catalog, name)
+        if os.path.exists(bpath):
+            updated += _update_parquet(bpath, sets, pred_sql)
+            _encode_segment(catalog, name, bpath)
+    return updated
