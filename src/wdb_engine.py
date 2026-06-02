@@ -58,6 +58,7 @@ class Segment:
             self.cols[nm] = meta; self.order.append(nm)
         self.buf = np.frombuffer(buf, dtype=np.uint8); self._codes = {}
         self.path = path; self._presence = 0   # 0 = not yet loaded
+        self._ov = 0                            # override sidecar: 0 = not yet loaded
     def _decode_fc(self, c):
         raw = self._dz.decompress(c['z']); vals = []; prev = b''; o = 0; i = 0; R = c['R']
         while o < len(raw):
@@ -117,6 +118,19 @@ class Segment:
     def unit(self, nm):
         return _DT_UNITS[self.cols[nm]['aux']]
     def values(self, nm):
+        """Decoded column values with overrides applied. Overrides are scattered in after
+        the normal decode (vectorized, dtype-preserving where the override dtype is
+        compatible). No-override columns take the base fast path unchanged."""
+        out = self._base_values(nm)
+        ov = self._overrides(nm)
+        if ov is not None:
+            idx, vals = ov
+            try:
+                out = out.copy(); out[idx] = vals          # dtype-preserving scatter
+            except (ValueError, TypeError):
+                out = np.asarray(out, dtype=object); out[idx] = vals
+        return out
+    def _base_values(self, nm):
         c = self.cols[nm]; codes = self.codes(nm); dvals = self._typed_dict(nm)
         if c['has_null']:
             nullcode = c['V'] - 1
@@ -166,6 +180,13 @@ class Segment:
             import wdb_presence
             self._presence = wdb_presence.load(self.path, self.N)
         return self._presence
+    def _overrides(self, nm):
+        """(row_idx, vals) overriding column nm from the override sidecar, or None.
+        Lazily loaded and cached. None lets callers take the no-override fast path."""
+        if self._ov == 0:
+            import wdb_override
+            self._ov = wdb_override.load(self.path) or {}
+        return self._ov.get(nm)
     def cardinality(self, nm): return self.cols[nm]['V']
     def group_by_count(self, nm):
         return np.bincount(self.codes(nm), minlength=self.cols[nm]['V'])
