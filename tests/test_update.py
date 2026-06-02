@@ -93,14 +93,3 @@ def test_update_then_delete_consistent():
     db.run("DELETE FROM t WHERE x=99")             # delete the two updated rows
     assert _norm(db.run("SELECT g,x FROM t")[0])==_norm([('b',2),('c',3)])
     shutil.rmtree(d)
-
-def test_column_expression_rhs_deferred():
-    d=_tmpdb(); db=Database.create(d)
-    db.run("CREATE TABLE t (a INT, b INT)")
-    db.run("INSERT INTO t VALUES (1,2)")
-    for sql in ["UPDATE t SET a = b", "UPDATE t SET a = a + 1"]:
-        try:
-            db.run(sql); assert False, f"{sql} should defer to 1d"
-        except NotImplementedError:
-            pass
-    shutil.rmtree(d)

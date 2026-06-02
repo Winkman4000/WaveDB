@@ -200,11 +200,15 @@ def _update_parquet(path, sets, pred_sql):
     return n
 
 def update(catalog, sql):
-    """UPDATE t SET col = literal [, ...] [WHERE ...]. Strategy matches storage class:
-      buffered -> write an override sidecar per cold segment for matching rows (no rewrite)
-                  + update the hot buffer parquet;
-      segment  -> update the canonical buffer and re-encode the single segment.
-    Returns the number of rows updated. Literal assignment only (column expr is step 1d)."""
+    """UPDATE t SET col = <expr> [, ...] [WHERE ...]. <expr> is a literal, a column
+    reference, or arithmetic over columns/literals (+ - * / %, unary minus, parens).
+    Strategy matches storage class:
+      buffered -> evaluate each RHS per-row against the segment's (override-aware) values and
+                  write an override sidecar per cold segment for matching rows (no rewrite)
+                  + update the hot buffer parquet (DuckDB evaluates the same expression SQL);
+      segment  -> update the canonical buffer (DuckDB) and re-encode the single segment.
+    Multi-column SET uses simultaneous semantics (all RHS evaluated against the pre-update
+    row). Returns the number of rows updated."""
     import wdb_sql, wdb_override
     from wdb_engine import Segment
     tree = sqlglot.parse_one(sql, read='duckdb')
@@ -213,15 +217,14 @@ def update(catalog, sql):
     if not assigns:
         return 0
     schema = {c[0]: c[1] for c in catalog.get_table(name)['schema']}
-    sets = []   # (col, typed_value, val_sql)
+    sets = []   # (col, rhs_node, val_sql)
     for a in assigns:
         if not isinstance(a, E.EQ):
             raise NotImplementedError(f"unsupported SET clause: {a.sql()}")
         col = a.this.name
         if col not in schema:
             raise KeyError(f"no such column {col!r} in {name!r}")
-        typed = _coerce(_literal_rhs(a.expression), schema[col])
-        sets.append((col, typed, a.expression.sql(dialect='duckdb')))
+        sets.append((col, a.expression, a.expression.sql(dialect='duckdb')))
     wnode = tree.args.get('where'); pred = wnode.this if wnode is not None else None
     pred_sql = pred.sql(dialect='duckdb') if pred is not None else None
     mode = catalog.table_mode(name)
@@ -236,9 +239,11 @@ def update(catalog, sql):
             else:
                 idx = np.nonzero(wdb_sql._eval_pred(seg, pred, lambda x: x))[0]
             if len(idx):
-                for col, typed, _ in sets:
-                    vals = np.empty(len(idx), dtype=object); vals[:] = [typed]*len(idx)
-                    wdb_override.set_override(sp, col, idx, vals)
+                # simultaneous semantics: evaluate every RHS against the pre-update segment
+                # BEFORE writing any override (so SET a=b, b=a swaps correctly)
+                newvals = [(col, wdb_sql._eval_expr(seg, rhs)[idx]) for col, rhs, _ in sets]
+                for col, vals in newvals:
+                    wdb_override.set_override(sp, col, idx, np.asarray(vals, dtype=object))
                 updated += len(idx)
         hp = hot_path(catalog, name)
         if os.path.exists(hp):

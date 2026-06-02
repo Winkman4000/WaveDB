@@ -288,3 +288,30 @@ def _apply_order(rows, proj, order):
     for idx,desc in reversed(keys):
         rows=sorted(rows, key=lambda r:(r[idx] is None, r[idx]), reverse=desc)
     return rows
+
+
+def _eval_expr(seg, node):
+    """Evaluate a scalar UPDATE RHS expression to a full-column array (length seg.N),
+    reading override-aware values. Supports column references, numeric/string literals,
+    + - * / %, unary minus, and parentheses. numpy semantics are chosen to match DuckDB
+    for these operators (notably '/' is true division in both), so the cold-segment path
+    and the DuckDB-evaluated parquet path agree. NULL-in-arithmetic is a deferred edge;
+    pure column-copy (SET a=b) is null-safe via object arrays."""
+    t = type(node)
+    if t is E.Paren:
+        return _eval_expr(seg, node.this)
+    if t is E.Column:
+        return seg.values(node.name)
+    if t is E.Neg:
+        return -_eval_expr(seg, node.this)
+    if t is E.Literal:
+        if node.args.get('is_string'):
+            return np.full(seg.N, node.this, dtype=object)
+        s = node.this
+        return np.full(seg.N, float(s) if ('.' in s or 'e' in s.lower()) else int(s))
+    if t is E.Add: return _eval_expr(seg, node.left) + _eval_expr(seg, node.right)
+    if t is E.Sub: return _eval_expr(seg, node.left) - _eval_expr(seg, node.right)
+    if t is E.Mul: return _eval_expr(seg, node.left) * _eval_expr(seg, node.right)
+    if t is E.Div: return _eval_expr(seg, node.left) / _eval_expr(seg, node.right)
+    if t is E.Mod: return _eval_expr(seg, node.left) % _eval_expr(seg, node.right)
+    raise NotImplementedError(f"unsupported UPDATE expression: {node.sql()}")
