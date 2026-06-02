@@ -72,64 +72,129 @@ def _encode_column(col):
     V = len(valb) + has_null
     return dtype, has_null, V, valb, codes, aux, uniq
 
-def _encode_column_blob(nm, col):
-    """Encode ONE column into a self-contained byte blob (header + dict + packed codes).
-    Pure/independent so it can run in a worker thread; heavy ops (factorize, unique,
-    packbits, zstd) release the GIL. Concatenating blobs in column order is byte-identical
-    to the serial encoder. Returns (blob_bytes, sizes_tuple)."""
-    zc = zstd.ZstdCompressor(level=ZSTD_LEVEL)   # thread-local: zstd compressors aren't shareable
+def _pack_codes(codes, bits):
+    codes = np.asarray(codes, dtype=np.uint64)
+    bitsarr = ((codes[:,None] >> np.arange(bits-1,-1,-1,dtype=np.uint64)) & 1).astype(np.uint8).reshape(-1)
+    return np.packbits(bitsarr).tobytes()
+
+def _prep_column(nm, col):
+    """Heavy, independent per-column work (parallel-safe): dict + codes + mode choice."""
     dtype, has_null, V, valb, codes, aux, uniq = _encode_column(col)
     bits = max(1, int(np.ceil(np.log2(max(V,2)))))
-    codes = codes.astype(np.uint64)
     if dtype == 1 and (V - has_null) > FC_THRESHOLD:
         mode = 1
     elif dtype in (0, 3) and has_null == 0 and (V - has_null) > NUM_THRESHOLD:
         mode = 2
     else:
         mode = 0
-    out = bytearray()
+    return dict(nm=nm, dtype=dtype, has_null=has_null, V=V, valb=valb,
+                codes=codes.astype(np.uint64), aux=aux, uniq=uniq, bits=bits, mode=mode)
+
+def _header(nm, V, bits, dtype, mode, has_null, aux):
     hb = nm.encode()
-    out += struct.pack('<H', len(hb)) + hb + struct.pack('<I', V)
-    out += struct.pack('<B', bits) + struct.pack('<B', dtype) + struct.pack('<B', mode) + struct.pack('<B', has_null) + struct.pack('<B', aux)
-    if mode == 0:
-        for u in valb: out += struct.pack('<I', len(u)) + u
-    elif mode == 2:
-        uniq_i = uniq.astype(np.int64)
+    return (struct.pack('<H', len(hb)) + hb + struct.pack('<I', V)
+            + struct.pack('<B', bits) + struct.pack('<B', dtype) + struct.pack('<B', mode)
+            + struct.pack('<B', has_null) + struct.pack('<B', aux))
+
+def _dict_bytes_plain(valb):
+    out = bytearray()
+    for u in valb: out += struct.pack('<I', len(u)) + u
+    return out
+
+def _dict_bytes(p, zc):
+    if p['mode'] == 0:
+        return _dict_bytes_plain(p['valb'])
+    out = bytearray()
+    if p['mode'] == 2:
+        uniq_i = p['uniq'].astype(np.int64)
         deltas = np.diff(uniq_i, prepend=np.int64(0)).astype(np.int64)
         z = zc.compress(deltas.tobytes())
         out += struct.pack('<I', len(z)) + z
     else:
         fc = bytearray(); restarts = []; prev = b''
-        for i, s in enumerate(valb):
+        for i, sv in enumerate(p['valb']):
             if i % R == 0: prev = b''; restarts.append(len(fc))
-            cp = 0; m = min(len(prev), len(s))
-            while cp < m and prev[cp] == s[cp]: cp += 1
-            suf = s[cp:]; fc += struct.pack('<HH', cp, len(suf)) + suf; prev = s
+            cp = 0; m = min(len(prev), len(sv))
+            while cp < m and prev[cp] == sv[cp]: cp += 1
+            suf = sv[cp:]; fc += struct.pack('<HH', cp, len(suf)) + suf; prev = sv
         z = zc.compress(bytes(fc))
         out += struct.pack('<H', R) + struct.pack('<I', len(restarts)) + np.array(restarts, dtype=np.uint32).tobytes()
         out += struct.pack('<I', len(fc)) + struct.pack('<I', len(z)) + z
-    bitsarr = ((codes[:,None] >> np.arange(bits-1,-1,-1,dtype=np.uint64)) & 1).astype(np.uint8).reshape(-1)
-    out += np.packbits(bitsarr).tobytes()
-    return bytes(out), (len(out), V, bits, dtype, mode, has_null, aux)
+    return out
 
-def encode(input_path, out_path, columns=None, workers=None, reader='auto'):
+def _serialize_column(p, zc):
+    """Normal blob (mode 0/1/2) — byte-identical to the previous encoder."""
+    out = bytearray()
+    out += _header(p['nm'], p['V'], p['bits'], p['dtype'], p['mode'], p['has_null'], p['aux'])
+    out += _dict_bytes(p, zc)
+    out += _pack_codes(p['codes'], p['bits'])
+    return bytes(out), (len(out), p['V'], p['bits'], p['dtype'], p['mode'], p['has_null'], p['aux'])
+
+def _serialize_fd(p, det_idx, det_codes):
+    """Mode-3 blob: dependent column Y stored as y_by_xcode (Vx entries of Y-codes)
+    referencing column det_idx. No per-row codes. Y dict stored plain. Lossless iff X->Y
+    is an exact FD (the compactor only passes verified FDs)."""
+    import wdb_fdcodec
+    det_codes = np.asarray(det_codes)
+    Vx = int(det_codes.max()) + 1 if det_codes.size else 0
+    ymap = wdb_fdcodec.fd_encode(det_codes, p['codes'])   # Vx array of Y-codes
+    out = bytearray()
+    out += _header(p['nm'], p['V'], p['bits'], p['dtype'], 3, p['has_null'], p['aux'])
+    out += struct.pack('<H', det_idx) + struct.pack('<I', Vx)
+    out += _dict_bytes_plain(p['valb'])
+    out += _pack_codes(ymap, p['bits'])
+    return bytes(out), (len(out), p['V'], p['bits'], p['dtype'], 3, p['has_null'], p['aux'])
+
+def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_specs=None):
+    """fd_specs: optional {dependent_col: determinant_col} — store the dependent column as
+    a mode-3 FD-reference into the determinant (lossless iff the FD is exact; callers pass
+    only verified FDs). Determinant must be a normal (non-FD) column in the same segment."""
     import os, concurrent.futures as cf
+    fd_specs = fd_specs or {}
     t0 = time.time()
-    # read columns via the reader module (arrow for parquet, duckdb otherwise); encode in parallel
     coldata, N, cols = wdb_read.read_columns(input_path, columns, reader=reader)
     if workers is None:
         workers = min(len(cols), (os.cpu_count() or 4))
     blobs = {}; sizes = {}
-    if workers > 1 and len(cols) > 1:
-        # per-column work is independent; heavy ops (factorize/unique/packbits/zstd) release the GIL
-        with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(_encode_column_blob, nm, coldata[nm]): nm for nm in cols}
-            for fut in cf.as_completed(futs):
-                nm = futs[fut]; blobs[nm], sizes[nm] = fut.result()
+    if not fd_specs:
+        # fast path (no FDs): fused prep+serialize in one parallel pass — byte-identical to
+        # the original encoder, no two-phase overhead.
+        def _blob(nm):
+            return nm, _serialize_column(_prep_column(nm, coldata[nm]),
+                                         zstd.ZstdCompressor(level=ZSTD_LEVEL))
+        if workers > 1 and len(cols) > 1:
+            with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+                for nm, res in ex.map(_blob, cols):
+                    blobs[nm], sizes[nm] = res
+        else:
+            for nm in cols:
+                _, res = _blob(nm); blobs[nm], sizes[nm] = res
     else:
-        for nm in cols:
-            blobs[nm], sizes[nm] = _encode_column_blob(nm, coldata[nm])
-    # assemble in column order -> byte-identical to the serial encoder
+        # FD path: prep all columns first (dependents need their determinant's codes),
+        # then serialize normal columns in parallel and mode-3 dependents serially.
+        preps = {}
+        if workers > 1 and len(cols) > 1:
+            with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(_prep_column, nm, coldata[nm]): nm for nm in cols}
+                for fut in cf.as_completed(futs):
+                    nm = futs[fut]; preps[nm] = fut.result()
+        else:
+            for nm in cols: preps[nm] = _prep_column(nm, coldata[nm])
+        col_idx = {nm: i for i, nm in enumerate(cols)}
+        normal = [nm for nm in cols if nm not in fd_specs]
+        def _ser_normal(nm):
+            return nm, _serialize_column(preps[nm], zstd.ZstdCompressor(level=ZSTD_LEVEL))
+        if workers > 1 and len(normal) > 1:
+            with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+                for nm, res in ex.map(_ser_normal, normal):
+                    blobs[nm], sizes[nm] = res
+        else:
+            for nm in normal:
+                _, res = _ser_normal(nm); blobs[nm], sizes[nm] = res
+        for nm in fd_specs:
+            det = fd_specs[nm]
+            blobs[nm], sizes[nm] = _serialize_fd(preps[nm], col_idx[det], preps[det]['codes'])
+    # assemble in column order
     out = bytearray(b'WVDB3'); out += struct.pack('<H', len(cols)); out += struct.pack('<I', N)
     for nm in cols: out += blobs[nm]
     open(out_path,'wb').write(out)

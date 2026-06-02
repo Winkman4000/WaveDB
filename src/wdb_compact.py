@@ -16,6 +16,20 @@ import wdb_encode, wdb_labels
 
 _PD = {'int': 'Int64', 'float': 'float64', 'string': 'object', 'datetime': 'datetime64[ns]'}
 
+def _choose_fd_specs(kept):
+    """From verified labels, pick {dependent: determinant} to encode as mode-3 references.
+    Chain-free: a column that is a determinant for any FD stays a normal column, and each
+    dependent gets at most one determinant. This guarantees every mode-3 column references
+    a normally-stored (readable) determinant in the same segment."""
+    dets = {l['det'] for l in kept}
+    specs = {}
+    for l in sorted(kept, key=lambda l: -l.get('det_uniqueness', 0.0)):
+        dep, det = l['dep'], l['det']
+        if dep == det or dep in specs or dep in dets:
+            continue
+        specs[dep] = det
+    return specs
+
 def _segment_to_df(seg, schema):
     """Reconstruct a segment's rows as a DataFrame, using the table schema for dtypes
     (mirrors the insert path so re-encoding follows the tested route)."""
@@ -57,13 +71,14 @@ def compact(catalog, name, seg_files=None):
         if wdb_labels.holds(union, det, dep):
             kept.append({'det': det, 'dep': dep, 'det_uniqueness': dux})
 
-    # 3) re-encode the union into one new segment (normal encoding; FD-ref is stage 2b)
+    # 3) re-encode the union into one new segment, storing verified FDs as mode-3 references
     from wdb_dml import _next_segment_index
     idx = _next_segment_index(catalog, name)
     new_seg = f"{name}_{idx}.wdb"
     tmp_pq = os.path.join(catalog.dbdir, f"{name}__compact_{idx}.parquet")
     union.to_parquet(tmp_pq, index=False)
-    wdb_encode.encode(tmp_pq, os.path.join(catalog.dbdir, new_seg))
+    fd_specs = _choose_fd_specs(kept)
+    wdb_encode.encode(tmp_pq, os.path.join(catalog.dbdir, new_seg), fd_specs=fd_specs)
     os.remove(tmp_pq)
 
     # 4) update catalog: drop merged segments (list + labels + disk), add the new one
@@ -76,4 +91,5 @@ def compact(catalog, name, seg_files=None):
     fl[new_seg] = kept
     catalog.save()
     return {'merged': targets, 'new_segment': new_seg, 'rows': len(union),
-            'labels_in': len(candidate_labels), 'labels_kept': len(kept)}
+            'labels_in': len(candidate_labels), 'labels_kept': len(kept),
+            'fd_encoded': len(fd_specs)}

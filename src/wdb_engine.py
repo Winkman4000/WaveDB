@@ -30,6 +30,22 @@ class Segment:
                 zlen = struct.unpack_from('<I',buf,off)[0]; off += 4
                 meta['z2'] = bytes(buf[off:off+zlen]); off += zlen
                 meta['vals'] = None; meta['intvals'] = None
+            elif mode == 3:
+                # FD-reference: dependent column stored as y_by_xcode (Vx Y-codes) into a
+                # determinant column; no per-row codes. Y dict stored plain (mode-0 style).
+                meta['det_idx'] = struct.unpack_from('<H',buf,off)[0]; off += 2
+                Vx = struct.unpack_from('<I',buf,off)[0]; off += 4
+                meta['Vx'] = Vx
+                vals = []
+                for _ in range(n_dict):
+                    vl = struct.unpack_from('<I',buf,off)[0]; off += 4
+                    vals.append(buf[off:off+vl]); off += vl
+                meta['vals'] = vals
+                meta['map_start'] = off
+                off += (Vx*bits+7)//8      # packed y_by_xcode, NOT N per-row codes
+                meta['fdmap'] = None
+                self.cols[nm] = meta; self.order.append(nm)
+                continue
             else:
                 Rr = struct.unpack_from('<H',buf,off)[0]; off += 2
                 nr = struct.unpack_from('<I',buf,off)[0]; off += 4
@@ -59,9 +75,25 @@ class Segment:
         c = self.cols[nm]
         if c['vals'] is None: c['vals'] = self._decode_fc(c)
         return c['vals']
+    def _fd_map(self, c):
+        """Decode a mode-3 column's y_by_xcode: Vx Y-codes packed at bits, from map_start."""
+        if c['fdmap'] is None:
+            Vx = c['Vx']; bits = c['bits']; base = c['map_start']
+            w = (1 << np.arange(bits-1,-1,-1)).astype(np.uint64)
+            nbytes = (Vx*bits+7)//8
+            allb = np.unpackbits(self.buf[base:base+nbytes])
+            b = allb[:Vx*bits].reshape(Vx, bits)
+            c['fdmap'] = (b.astype(np.uint64)*w).sum(1).astype(np.int64)
+        return c['fdmap']
     def codes(self, nm):
         if nm in self._codes: return self._codes[nm]
-        c = self.cols[nm]; bits = c['bits']; N = self.N; base = c['cstart']
+        c = self.cols[nm]
+        if c['mode'] == 3:
+            # dependent column: gather Y-codes through the determinant's per-row codes
+            x_codes = self.codes(self.order[c['det_idx']])
+            cc = self._fd_map(c)[x_codes].astype(np.int64)
+            self._codes[nm] = cc; return cc
+        bits = c['bits']; N = self.N; base = c['cstart']
         w = (1 << np.arange(bits-1,-1,-1)).astype(np.uint64)
         cc = np.empty(N, dtype=np.int64)
         CH = 2_000_000  # chunk rows so we never build the full N x bits matrix
@@ -112,7 +144,7 @@ class Segment:
                 unit = _DT_UNITS[c['aux']]
                 return np.int64(arr[code]).view(f'datetime64[{unit}]')
             return int(arr[code])
-        if c['mode'] == 0:
+        if c['mode'] in (0, 3):
             v = c['vals'][code]
             if c['dt'] == 0: return int(v)
             if c['dt'] == 2: return struct.unpack('<d', v)[0]
