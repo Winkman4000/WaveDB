@@ -87,12 +87,12 @@ class Segment:
             b = allb[:Vx*bits].reshape(Vx, bits)
             c['fdmap'] = (b.astype(np.uint64)*w).sum(1).astype(np.int64)
         return c['fdmap']
-    def codes(self, nm):
+    def _raw_codes(self, nm):
         if nm in self._codes: return self._codes[nm]
         c = self.cols[nm]
         if c['mode'] == 3:
             # dependent column: gather Y-codes through the determinant's per-row codes
-            x_codes = self.codes(self.order[c['det_idx']])
+            x_codes = self._raw_codes(self.order[c['det_idx']])
             cc = self._fd_map(c)[x_codes].astype(np.int64)
             self._codes[nm] = cc; return cc
         bits = c['bits']; N = self.N; base = c['cstart']
@@ -108,6 +108,58 @@ class Segment:
             b = allb[s:s+(hi-lo)*bits].reshape(hi-lo, bits)
             cc[lo:hi] = (b.astype(np.uint64)*w).sum(1).astype(np.int64)
         self._codes[nm] = cc; return cc
+    def _effective(self, nm):
+        """Effective code space for a column with overrides. An override value that ALREADY
+        exists in the dictionary reuses that value's code (so it merges with existing rows in
+        GROUP BY); a genuinely-new value is appended as a synthetic dict entry at code V, V+1,
+        ... (above the null slot). Overridden rows' codes are patched accordingly. Returns
+        (eff_codes, ov_typed) or None when the column has no overrides. Cached. ov_typed are
+        the distinct NEW values only, in dict-typed form."""
+        ov = self._overrides(nm)
+        if ov is None: return None
+        cache = getattr(self, '_eff', None)
+        if cache is None: cache = self._eff = {}
+        if nm in cache: return cache[nm]
+        idx, vals = ov
+        c = self.cols[nm]; V = c['V']; dt = c['dt']
+        real = self._typed_dict(nm)
+        def _key(x): return bytes(x) if isinstance(x, (bytes, bytearray)) else x
+        val2code = {}
+        for code, dvv in enumerate(real):
+            k = _key(dvv)
+            if k not in val2code: val2code[k] = code
+        new_seen = {}; ov_typed = []; row_codes = np.empty(len(vals), dtype=np.int64)
+        for i, v in enumerate(list(vals)):
+            if v is None:
+                # override to NULL: use the null code (valid when this segment has a null
+                # slot). UPDATE ... SET col = NULL on a segment with no null slot is a
+                # deferred edge (the UPDATE statement does not emit it yet).
+                row_codes[i] = c['V'] - 1
+                continue
+            tv = self._coerce_override(v, dt); k = _key(tv)
+            if k in val2code:
+                row_codes[i] = val2code[k]                 # reuse existing dict code
+            else:
+                j = new_seen.get(k)
+                if j is None:
+                    j = len(ov_typed); new_seen[k] = j; ov_typed.append(tv)
+                row_codes[i] = V + j                       # synthetic code for new value
+        eff = self._raw_codes(nm).copy()
+        eff[np.asarray(idx, dtype=np.int64)] = row_codes
+        cache[nm] = (eff, ov_typed); return cache[nm]
+    @staticmethod
+    def _coerce_override(v, dt):
+        if dt == 0: return int(v)
+        if dt == 2: return float(v)
+        if dt == 1:
+            return v.encode('utf-8') if isinstance(v, str) else bytes(v)
+        return v   # dt 3 datetime: stored as-is (UPDATE on datetime is a later case)
+    def codes(self, nm):
+        eff = self._effective(nm)
+        return eff[0] if eff is not None else self._raw_codes(nm)
+    def _override_vals_typed(self, nm):
+        eff = self._effective(nm)
+        return eff[1] if eff is not None else []
     def _typed_dict(self, nm):
         c = self.cols[nm]
         if c['mode'] == 2: return self._dict_ints(c)  # int64 array (dt 0/3)
@@ -131,7 +183,7 @@ class Segment:
                 out = np.asarray(out, dtype=object); out[idx] = vals
         return out
     def _base_values(self, nm):
-        c = self.cols[nm]; codes = self.codes(nm); dvals = self._typed_dict(nm)
+        c = self.cols[nm]; codes = self._raw_codes(nm); dvals = self._typed_dict(nm)
         if c['has_null']:
             nullcode = c['V'] - 1
             lut = np.empty(c['V'], dtype=object)
@@ -150,8 +202,15 @@ class Segment:
         return np.array(dvals, dtype=object)[codes]
     def fetch(self, nm, code):
         """Random-access the dictionary value for a given code. O(1) for plain columns,
-        O(R) for front-coded columns (jump to restart block, walk <=R deltas)."""
+        O(R) for front-coded columns (jump to restart block, walk <=R deltas).
+        Synthetic codes (>= V) resolve to override values."""
         c = self.cols[nm]
+        if code >= c['V']:
+            ov = self._override_vals_typed(nm)
+            v = ov[int(code) - c['V']]
+            if c['dt'] == 3:
+                return np.int64(v).view(f"datetime64[{_DT_UNITS[c['aux']]}]")
+            return v
         if c['has_null'] and code == c['V'] - 1: return None
         if c['mode'] == 2:
             arr = self._dict_ints(c)

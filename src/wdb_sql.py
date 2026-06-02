@@ -138,22 +138,34 @@ def _limit(tree):
     return int(lim.expression.this) if hasattr(lim.expression,'this') else int(lim.text('expression'))
 def _col(seg, name):
     """Typed array + null mask. arr is int64/float64/object(bytes); nulls filled with a
-    sentinel and flagged in nmask (or None if the column has no nulls)."""
+    sentinel and flagged in nmask (or None if the column has no nulls). Override values are
+    appended to the dictionary at synthetic codes V.. so effective codes resolve correctly."""
     import struct as _st
     c = seg.cols[name]; codes = seg.codes(name); dv = seg._typed_dict(name)
+    ov = seg._override_vals_typed(name)        # [] if none; sit at codes V, V+1, ...
     if c['has_null']:
         nullcode = c['V'] - 1; nmask = (codes == nullcode)
-        if c['dt'] in (0, 3): lut = np.array(dv + [0], dtype=np.int64)
-        elif c['dt'] == 2: lut = np.array(dv + [np.nan], dtype=np.float64)
+        if c['dt'] in (0, 3):
+            lut = np.array(list(dv) + [0] + list(ov), dtype=np.int64)
+        elif c['dt'] == 2:
+            lut = np.array(list(dv) + [np.nan] + list(ov), dtype=np.float64)
         else:
-            lut = np.empty(c['V'], dtype=object)
+            lut = np.empty(c['V'] + len(ov), dtype=object)
             for i,v in enumerate(dv): lut[i]=v
             lut[nullcode] = b''
+            for k,v in enumerate(ov): lut[c['V']+k]=v
         return lut[codes], nmask
-    if c['dt'] in (0, 3): return np.array(dv, dtype=np.int64)[codes], None
-    if c['dt'] == 2:   return np.array(dv, dtype=np.float64)[codes], None
-    lut = np.empty(len(dv), dtype=object)
+    if c['dt'] in (0, 3):
+        base = np.asarray(dv, dtype=np.int64)
+        if ov: base = np.concatenate([base, np.asarray(ov, dtype=np.int64)])
+        return base[codes], None
+    if c['dt'] == 2:
+        base = np.asarray(dv, dtype=np.float64)
+        if ov: base = np.concatenate([base, np.asarray(ov, dtype=np.float64)])
+        return base[codes], None
+    lut = np.empty(len(dv) + len(ov), dtype=object)
     for i,v in enumerate(dv): lut[i]=v
+    for k,v in enumerate(ov): lut[len(dv)+k]=v
     return lut[codes], None
 
 def _parse_temporal(litstr, unit):
