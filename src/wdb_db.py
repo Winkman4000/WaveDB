@@ -12,7 +12,7 @@ import sqlglot, sqlglot.expressions as E
 from wdb_catalog import Catalog
 from wdb_engine import Segment
 import os
-import wdb_ddl, wdb_dml, wdb_sql, wdb_merge
+import wdb_ddl, wdb_dml, wdb_sql, wdb_merge, wdb_compact
 
 class Database:
     def __init__(self, catalog): self.cat = catalog
@@ -54,5 +54,9 @@ class Database:
 
     def flush(self, name):
         return wdb_dml.flush(self.cat, name)
+
+    def compact(self, name, seg_files=None):
+        """Merge cold segments into one, verifying FD labels on the union."""
+        return wdb_compact.compact(self.cat, name, seg_files)
 
     def tables(self): return self.cat.list_tables()

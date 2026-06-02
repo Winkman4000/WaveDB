@@ -39,3 +39,11 @@ def discover_fds(df, sample_size=SAMPLE_SIZE):
 
 def discover_from_parquet(path, sample_size=SAMPLE_SIZE):
     return discover_fds(pd.read_parquet(path), sample_size)
+
+
+def holds(df, det, dep):
+    """Exact check: does det -> dep hold on the FULL dataframe (not a sample)?
+    Used by the compactor to VERIFY a label on the merged union before trusting it."""
+    if det not in df.columns or dep not in df.columns:
+        return False
+    return int(df.groupby(det, sort=False, dropna=False)[dep].nunique(dropna=False).max()) <= 1
