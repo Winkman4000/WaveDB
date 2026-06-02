@@ -117,3 +117,60 @@ def insert(catalog, sql):
         _append_parquet(bpath, df_new)
         _encode_segment(catalog, name, bpath)
     return len(rows)
+
+
+def _filter_parquet_keep_complement(path, pred_sql):
+    """Rewrite a parquet keeping only rows the DELETE should NOT remove.
+    DELETE removes rows where the predicate is definitely TRUE; rows where it is FALSE or
+    NULL stay (SQL semantics) -> keep `(pred) IS NOT TRUE`. pred_sql None means delete all."""
+    import duckdb
+    if pred_sql is None:
+        df = pd.read_parquet(path).iloc[0:0]
+    else:
+        con = duckdb.connect()
+        df = con.execute(
+            f"SELECT * FROM read_parquet('{path}') WHERE ({pred_sql}) IS NOT TRUE"
+        ).fetch_df()
+    df.to_parquet(path, index=False)
+
+def delete(catalog, sql):
+    """DELETE FROM t [WHERE ...]. Strategy matches the table's storage class:
+      buffered -> tombstone matching rows in each cold segment's presence sidecar (no rewrite)
+                  + filter the hot buffer parquet;
+      segment  -> filter the canonical buffer and re-encode the single segment (buffer is
+                  source of truth; re-encoding is already how segment-mode works).
+    Returns the number of rows deleted."""
+    import wdb_sql, wdb_presence
+    from wdb_engine import Segment
+    tree = sqlglot.parse_one(sql, read='duckdb')
+    name = tree.find(E.Table).name
+    wnode = tree.args.get('where')
+    pred = wnode.this if wnode is not None else None
+    pred_sql = pred.sql(dialect='duckdb') if pred is not None else None
+    mode = catalog.table_mode(name)
+    deleted = 0
+
+    if mode == 'buffered':
+        segs = catalog.get_table(name)['segments']
+        for sf, sp in zip(segs, catalog.segment_paths(name)):
+            seg = Segment(sp)
+            if pred is None:
+                idx = np.arange(seg.N)
+            else:
+                m = wdb_sql._eval_pred(seg, pred, lambda x: x)
+                idx = np.nonzero(m)[0]
+            if len(idx):
+                deleted += wdb_presence.mark_deleted(sp, seg.N, idx)
+        hp = hot_path(catalog, name)
+        if os.path.exists(hp):
+            before = len(pd.read_parquet(hp))
+            _filter_parquet_keep_complement(hp, pred_sql)
+            deleted += before - len(pd.read_parquet(hp))
+    else:
+        bpath = _buffer_path(catalog, name)
+        if os.path.exists(bpath):
+            before = len(pd.read_parquet(bpath))
+            _filter_parquet_keep_complement(bpath, pred_sql)
+            deleted += before - len(pd.read_parquet(bpath))
+            _encode_segment(catalog, name, bpath)
+    return deleted
