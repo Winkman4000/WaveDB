@@ -19,11 +19,12 @@ def execute(seg: Segment, sql: str, col_map=None):
     def seg_col(nm): return (col_map or {}).get(nm, nm)
     N = seg.N
 
-    # ---- WHERE -> boolean mask ----
-    mask = None
+    # ---- presence (deleted rows) seeds the mask; WHERE is AND-ed onto it ----
+    mask = seg.presence_mask()          # bool[N] True=live, or None if all live
     where = tree.args.get('where')
     if where is not None:
-        mask = _eval_pred(seg, where.this, seg_col)
+        wm = _eval_pred(seg, where.this, seg_col)
+        mask = wm if mask is None else (wm & mask)
 
     # ---- projections ----
     proj = tree.expressions  # list of selected exprs

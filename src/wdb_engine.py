@@ -57,6 +57,7 @@ class Segment:
             nb = (self.N*bits+7)//8; meta['cstart'] = off; off += nb
             self.cols[nm] = meta; self.order.append(nm)
         self.buf = np.frombuffer(buf, dtype=np.uint8); self._codes = {}
+        self.path = path; self._presence = 0   # 0 = not yet loaded
     def _decode_fc(self, c):
         raw = self._dz.decompress(c['z']); vals = []; prev = b''; o = 0; i = 0; R = c['R']
         while o < len(raw):
@@ -158,6 +159,13 @@ class Segment:
             cp, sl = struct.unpack_from('<HH', raw, o); o += 4
             suf = raw[o:o+sl]; o += sl; prev = prev[:cp] + suf
         return prev
+    def presence_mask(self):
+        """Bool array (len N, True=live) from the presence sidecar, or None if all rows live.
+        Lazily loaded and cached. None lets callers take the unmasked fast path."""
+        if self._presence == 0:
+            import wdb_presence
+            self._presence = wdb_presence.load(self.path, self.N)
+        return self._presence
     def cardinality(self, nm): return self.cols[nm]['V']
     def group_by_count(self, nm):
         return np.bincount(self.codes(nm), minlength=self.cols[nm]['V'])
