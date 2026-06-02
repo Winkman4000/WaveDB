@@ -14,7 +14,8 @@ Segment format "WVDB3":
     delta-int  (mode 2):       u32 zlen | zstd(int64 deltas of sorted dict)   [dtype 0/3, non-null, high-card]
   then: packed codes (n_rows * bits, MSB-first)
 """
-import duckdb, numpy as np, numpy.ma as ma, pandas as pd, zstandard as zstd, struct, time, sys
+import numpy as np, numpy.ma as ma, pandas as pd, zstandard as zstd, struct, time, sys
+import wdb_read
 
 _DT_UNITS = ['us','ns','ms','s','D','h','m','M','Y','W']   # code = index; aux byte stores it
 def _unit_code(u): return _DT_UNITS.index(u) if u in _DT_UNITS else 0
@@ -111,16 +112,11 @@ def _encode_column_blob(nm, col):
     out += np.packbits(bitsarr).tobytes()
     return bytes(out), (len(out), V, bits, dtype, mode, has_null, aux)
 
-def encode(input_path, out_path, columns=None, workers=None):
+def encode(input_path, out_path, columns=None, workers=None, reader='auto'):
     import os, concurrent.futures as cf
-    con = duckdb.connect(); con.execute("PRAGMA threads=8")
-    src = f"'{input_path}'"
-    schema = con.execute(f"DESCRIBE SELECT * FROM {src}").fetchall()
-    cols = columns if columns else [r[0] for r in schema]
-    N = con.execute(f"SELECT count(*) FROM {src}").fetchone()[0]
     t0 = time.time()
-    # fetch columns serially (duckdb read is cheap vs encode); encode them in parallel
-    coldata = {nm: con.execute(f'SELECT "{nm}" FROM {src}').fetchnumpy()[nm] for nm in cols}
+    # read columns via the reader module (arrow for parquet, duckdb otherwise); encode in parallel
+    coldata, N, cols = wdb_read.read_columns(input_path, columns, reader=reader)
     if workers is None:
         workers = min(len(cols), (os.cpu_count() or 4))
     blobs = {}; sizes = {}
