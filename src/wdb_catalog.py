@@ -58,9 +58,18 @@ class Catalog:
     def list_tables(self):
         return sorted(self.data['tables'].keys())
 
-    def add_segment(self, name, segment_filename):
-        self.get_table(name)['segments'].append(segment_filename)
+    def add_segment(self, name, segment_filename, labels=None):
+        t = self.get_table(name)
+        t['segments'].append(segment_filename)
+        if labels is not None:
+            t.setdefault('fd_labels', {})[segment_filename] = labels
         self.save()
+
+    def segment_labels(self, name, segment_filename):
+        return self.get_table(name).get('fd_labels', {}).get(segment_filename, [])
+
+    def all_labels(self, name):
+        return self.get_table(name).get('fd_labels', {})
 
     def set_table_mode(self, name, mode):
         if mode not in ('segment', 'buffered'):

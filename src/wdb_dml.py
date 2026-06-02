@@ -7,7 +7,7 @@ appending without re-encoding every time.
 """
 import os, sqlglot, sqlglot.expressions as E
 import pandas as pd, numpy as np
-import wdb_encode
+import wdb_encode, wdb_labels
 
 _PD = {'int': 'Int64', 'float': 'float64', 'string': 'object', 'datetime': 'datetime64[ns]'}
 
@@ -95,7 +95,10 @@ def flush(catalog, name):
     idx = _next_segment_index(catalog, name)
     seg_file = f"{name}_{idx}.wdb"
     wdb_encode.encode(hp, os.path.join(catalog.dbdir, seg_file))
-    catalog.add_segment(name, seg_file)
+    # discover FD labels for this segment (sampled, ~40ms) so the compactor can later
+    # VERIFY rather than rediscover. Labels are hints, never trusted without verification.
+    labels = wdb_labels.discover_fds(hot_df)
+    catalog.add_segment(name, seg_file, labels=labels)
     os.remove(hp)
     return len(hot_df)
 
