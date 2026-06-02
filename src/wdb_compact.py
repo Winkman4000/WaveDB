@@ -12,7 +12,7 @@ Stage 2b (later): use a verified X->Y to store column Y as references into X's p
 import os
 import pandas as pd, numpy as np
 from wdb_engine import Segment
-import wdb_encode, wdb_labels
+import wdb_encode, wdb_labels, wdb_presence
 
 _PD = {'int': 'Int64', 'float': 'float64', 'string': 'object', 'datetime': 'datetime64[ns]'}
 
@@ -31,12 +31,17 @@ def _choose_fd_specs(kept):
     return specs
 
 def _segment_to_df(seg, schema):
-    """Reconstruct a segment's rows as a DataFrame, using the table schema for dtypes
-    (mirrors the insert path so re-encoding follows the tested route)."""
+    """Reconstruct a segment's LIVE rows as a DataFrame, using the table schema for dtypes
+    (mirrors the insert path so re-encoding follows the tested route). Tombstoned rows
+    (presence sidecar) are dropped here -- this is where deleted space is physically
+    reclaimed: the compacted segment never contains them."""
     stype = {c[0]: c[1] for c in schema}
+    pm = seg.presence_mask()           # bool[N] True=live, or None if all live
     data = {}
     for nm in seg.order:
         vals = seg.values(nm)
+        if pm is not None:
+            vals = vals[pm]
         wt = stype.get(nm, 'string')
         if wt == 'datetime':
             data[nm] = pd.to_datetime(pd.Series(list(vals)), errors='coerce')
@@ -88,6 +93,8 @@ def compact(catalog, name, seg_files=None):
         fl.pop(s, None)
         p = os.path.join(catalog.dbdir, s)
         if os.path.exists(p): os.remove(p)
+        sc = wdb_presence.path_for(p)               # drop the now-stale presence sidecar
+        if os.path.exists(sc): os.remove(sc)
     fl[new_seg] = kept
     catalog.save()
     return {'merged': targets, 'new_segment': new_seg, 'rows': len(union),
