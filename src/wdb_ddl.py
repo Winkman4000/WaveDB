@@ -75,16 +75,22 @@ def alter_table(catalog, sql, db=None):
                 k = getattr(con, 'kind', None)
                 if isinstance(k, E.DefaultColumnConstraint):
                     default = wdb_dml._litval(k.this)
+            pcol = _fresh_physical(catalog, name, col)   # dodge stale bytes from a prior DROP
             catalog.add_column(name, col, wt, default)
-            _materialize_added_column(catalog, name, col, wt, default)
+            if pcol != col:
+                tab = catalog.get_table(name); tab.setdefault('phys', {})[col] = pcol; catalog.save()
+            _materialize_added_column(catalog, name, pcol, wt, default)
         elif isinstance(act, E.Drop):
-            raise NotImplementedError("DROP COLUMN is ALTER step e")
+            dcol = act.this.name
+            pcol = catalog.phys_map(name).get(dcol, dcol)
+            catalog.drop_column(name, dcol)          # refuses the last column; cleans phys/defaults
+            _drop_column_from_buffer(catalog, name, pcol)
         else:
             raise NotImplementedError(f"unsupported ALTER action: {type(act).__name__}")
     return name
 
 
-def _materialize_added_column(catalog, name, col, wt, default):
+def _materialize_added_column(catalog, name, pcol, wt, default):
     """Segment-mode tables keep a canonical buffer that is re-encoded on every write; the cheapest
     correct thing is to fill the new column there (with its default) and re-encode now, so the
     single segment carries it. Buffered tables have no canonical buffer -- their cold segments
@@ -96,8 +102,37 @@ def _materialize_added_column(catalog, name, col, wt, default):
         return
     df = pd.read_parquet(bpath); n = len(df)
     if wt == 'datetime':
-        df[col] = pd.to_datetime(pd.Series([default] * n), errors='coerce')
+        df[pcol] = pd.to_datetime(pd.Series([default] * n), errors='coerce')
     else:
-        df[col] = pd.array([default] * n, dtype=wdb_dml._PD[wt])
+        df[pcol] = pd.array([default] * n, dtype=wdb_dml._PD[wt])
     df.to_parquet(bpath, index=False)
     wdb_dml._encode_segment(catalog, name, bpath)
+
+
+def _fresh_physical(catalog, name, col):
+    """A physical (storage) name for a new column that does not collide with any column still
+    present in a segment -- so re-adding a previously dropped name reads its DEFAULT (synth),
+    not the dropped column's stale bytes."""
+    from wdb_engine import Segment
+    used = set(catalog.phys_map(name).values())
+    for sp in catalog.segment_paths(name):
+        try: used |= set(Segment(sp).cols.keys())
+        except Exception: pass
+    if col not in used: return col
+    k = 1
+    while f"{col}__v{k}" in used: k += 1
+    return f"{col}__v{k}"
+
+
+def _drop_column_from_buffer(catalog, name, pcol):
+    """Segment-mode tables keep a canonical buffer re-encoded on every write; drop the column there
+    and re-encode so the single segment sheds it immediately. Buffered tables have no canonical
+    buffer -- the dead bytes in their cold segments are reclaimed at the next compaction."""
+    import os, wdb_dml
+    import pandas as pd
+    bpath = wdb_dml._buffer_path(catalog, name)
+    if not os.path.exists(bpath): return
+    df = pd.read_parquet(bpath)
+    if pcol in df.columns:
+        df = df.drop(columns=[pcol]); df.to_parquet(bpath, index=False)
+        wdb_dml._encode_segment(catalog, name, bpath)
