@@ -25,6 +25,7 @@ NUM_THRESHOLD = 50000   # delta-code numeric dictionaries above this cardinality
 R = 128
 ZSTD_LEVEL = 9
 CODE_ZSTD_LEVEL = 19    # code-stream compression: clustered/skewed code arrays compress hugely
+_INLINE_ENABLED = True  # mode-5 inline strings (toggleable for ablation/debug)
 
 def _encode_column(col):
     """Return (dtype, has_null, V, uniq_value_bytes_list, codes:int64[N], mode_is_string)."""
@@ -182,7 +183,7 @@ def _serialize_column(p, zc):
     normal = bytes(out), (len(out), p['V'], p['bits'], p['dtype'], p['mode'], p['has_null'], p['aux'])
     # mode-5 inline candidate: high-cardinality non-null string -> storing rows inline often beats
     # dict+codes (pointers are dead weight when values rarely repeat). Compute both, keep smaller.
-    if p['dtype'] == 1 and p['has_null'] == 0:
+    if _INLINE_ENABLED and p['dtype'] == 1 and p['has_null'] == 0:
         N = len(p['codes'])
         if N and (p['V'] / N) >= 0.5:
             inline = _serialize_inline(p)
