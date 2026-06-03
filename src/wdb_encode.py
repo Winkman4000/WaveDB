@@ -210,13 +210,14 @@ def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_s
         # FD path: prep all columns first (dependents need their determinant's codes),
         # then serialize normal columns in parallel and mode-3 dependents serially.
         preps = {}
+        fd_involved = set(fd_specs) | set(fd_specs.values())  # only these must avoid mode 4
         if workers > 1 and len(cols) > 1:
             with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = {ex.submit(_prep_column, nm, coldata[nm], False): nm for nm in cols}
+                futs = {ex.submit(_prep_column, nm, coldata[nm], nm not in fd_involved): nm for nm in cols}
                 for fut in cf.as_completed(futs):
                     nm = futs[fut]; preps[nm] = fut.result()
         else:
-            for nm in cols: preps[nm] = _prep_column(nm, coldata[nm], False)
+            for nm in cols: preps[nm] = _prep_column(nm, coldata[nm], nm not in fd_involved)
         col_idx = {nm: i for i, nm in enumerate(cols)}
         normal = [nm for nm in cols if nm not in fd_specs]
         def _ser_normal(nm):
