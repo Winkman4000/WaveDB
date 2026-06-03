@@ -40,3 +40,38 @@ def create_table(catalog, sql):
     name, schema = parse_create_table(sql)
     catalog.add_table(name, schema)
     return name, schema
+
+
+def alter_table(catalog, sql, db=None):
+    """Execute an ALTER TABLE statement against the catalog (metadata-only; segments are immutable
+    and reconciled at read via col_map / at compaction). Column-altering actions flush the hot
+    buffer first, so the buffer always holds current logical names and only cold segments need
+    name translation. Returns the (possibly new) table name."""
+    tree = sqlglot.parse_one(sql, read='duckdb')
+    if not isinstance(tree, E.Alter):
+        raise NotImplementedError(f"not an ALTER statement: {type(tree).__name__}")
+    name = tree.this.name
+    actions = tree.args.get('actions') or []
+    if db is not None:
+        try: db.flush(name)            # fold any hot buffer into cold before names diverge
+        except Exception: pass         # no hot buffer / nothing to flush -> fine
+    import os, wdb_dml
+    for act in actions:
+        if isinstance(act, E.AlterRename):
+            new = act.this.name
+            # the canonical buffer file's name derives from the table name and is NOT tracked in
+            # the catalog, so it must move with the table. Segment files keep their tracked
+            # filenames (so presence/override sidecars are never orphaned); the hot buffer was
+            # already folded in by the flush above.
+            src = wdb_dml._buffer_path(catalog, name); dst = wdb_dml._buffer_path(catalog, new)
+            if os.path.exists(src): os.rename(src, dst)
+            catalog.rename_table(name, new); name = new
+        elif isinstance(act, E.RenameColumn):
+            raise NotImplementedError("RENAME COLUMN is ALTER step c")
+        elif isinstance(act, E.ColumnDef):
+            raise NotImplementedError("ADD COLUMN is ALTER step d")
+        elif isinstance(act, E.Drop):
+            raise NotImplementedError("DROP COLUMN is ALTER step e")
+        else:
+            raise NotImplementedError(f"unsupported ALTER action: {type(act).__name__}")
+    return name

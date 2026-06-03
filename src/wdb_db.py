@@ -30,6 +30,8 @@ class Database:
         tree = sqlglot.parse_one(sql, read='duckdb')
         if isinstance(tree, E.Create):
             return wdb_ddl.create_table(self.cat, sql)
+        if isinstance(tree, E.Alter):
+            return wdb_ddl.alter_table(self.cat, sql, self)
         if isinstance(tree, E.Insert):
             return wdb_dml.insert(self.cat, sql)
         if isinstance(tree, E.Drop):
@@ -40,7 +42,8 @@ class Database:
             return wdb_dml.update(self.cat, sql)
         if isinstance(tree, E.Select):
             name = self._table_in(tree)
-            cmap = self.cat.phys_map(name)               # logical->physical (identity if no renames)
+            phys = self.cat.phys_map(name)
+            cmap = {c: phys.get(c, c) for c in self.cat.column_names(name)}  # complete logical->physical
             paths = self.cat.segment_paths(name)
             segs = [Segment(p) for p in paths]
             hp = wdb_dml.hot_path(self.cat, name)

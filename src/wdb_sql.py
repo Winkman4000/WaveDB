@@ -16,7 +16,10 @@ def execute(seg: Segment, sql: str, col_map=None):
     if not isinstance(tree, E.Select): raise NotImplementedError(f"top-level {type(tree).__name__}")
     if tree.args.get('joins'): raise NotImplementedError("JOIN (step 2)")
     if tree.args.get('with'): raise NotImplementedError("CTE/WITH (later)")
-    def seg_col(nm): return (col_map or {}).get(nm, nm)
+    def seg_col(nm):
+        if col_map is None: return nm                      # direct Segment use: identity, accept all
+        if nm not in col_map: raise NotImplementedError(f"unknown column: {nm!r}")
+        return col_map[nm]                                 # schema view: complete logical->physical
     N = seg.N
 
     # ---- presence (deleted rows) seeds the mask; WHERE is AND-ed onto it ----
