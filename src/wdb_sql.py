@@ -103,17 +103,23 @@ def execute(seg: Segment, sql: str, col_map=None):
     gstarts = np.searchsorted(combo_s, uc); gends = np.r_[gstarts[1:], len(combo_s)]
     aggcache={}
     def groupagg(colname, fn, gi):
+        pcol = seg_col(colname)
         if colname not in aggcache:
-            arr, nm = _col(seg, seg_col(colname))
+            arr, nm = _col(seg, pcol)              # cache NATIVE dtype; float cast only for SUM/AVG
             if mask is not None:
                 arr = arr[mask]; nm = nm[mask] if nm is not None else None
-            arrf = arr.astype(np.float64)
-            aggcache[colname]=(arrf[order], (nm[order] if nm is not None else None))
+            aggcache[colname]=(arr[order], (nm[order] if nm is not None else None))
         vs, vn = aggcache[colname]; sl=slice(gstarts[gi],gends[gi]); seg_v=vs[sl]
         if vn is not None: seg_v = seg_v[~vn[sl]]      # SQL: aggregates ignore NULLs
         if fn=='COUNT': return len(seg_v)
         if len(seg_v)==0: return None
-        return {'SUM':seg_v.sum(),'AVG':seg_v.mean(),'MIN':seg_v.min(),'MAX':seg_v.max()}[fn]
+        if fn in ('MIN', 'MAX'):                       # native min/max (datetime/string included)
+            v = seg_v.min() if fn == 'MIN' else seg_v.max()
+            if seg.cols[pcol]['dt'] == 3 and isinstance(v, (int, np.integer)):
+                v = np.int64(v).view(f"datetime64[{seg.unit(pcol)}]")
+            return v
+        segf = seg_v.astype(np.float64)
+        return {'SUM': segf.sum(), 'AVG': segf.mean()}[fn]
     rows=[]
     for gi,cv in enumerate(uc):
         keyidx = decombo(cv); rowout=[]; ki=0
@@ -233,9 +239,15 @@ def _agg_scalar(seg, p, mask, seg_col):
         arr = arr[mask]; nm = nm[mask] if nm is not None else None
     if nm is not None: arr = arr[~nm]            # SQL: aggregates ignore NULLs
     if kind[0]=='COUNT': return int(len(arr))    # COUNT(col) = non-null count
-    arr = arr.astype(np.float64)
     if len(arr)==0: return None
-    return _pyval({'SUM':arr.sum(),'AVG':arr.mean(),'MIN':arr.min(),'MAX':arr.max()}[fn])
+    if fn in ('MIN', 'MAX'):                      # MIN/MAX keep the column's native type
+        v = arr.min() if fn == 'MIN' else arr.max()
+        c = seg.cols[seg_col(cn)]
+        if c['dt'] == 3 and isinstance(v, (int, np.integer)):   # dict-mode datetime is int64 epoch
+            v = np.int64(v).view(f"datetime64[{seg.unit(seg_col(cn))}]")
+        return _pyval(v)
+    arr = arr.astype(np.float64)                  # SUM/AVG are numeric
+    return _pyval({'SUM': arr.sum(), 'AVG': arr.mean()}[fn])
 
 def _seq_eq_mask(seg, name, neg, lit):
     """O(1)-compute equality mask for a clean-affine integer mode-4 column (n_exc==0, no

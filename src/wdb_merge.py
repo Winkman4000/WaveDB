@@ -8,7 +8,8 @@ reconstruct (AVG = sum/count) and apply HAVING/ORDER/LIMIT once on the merged re
 Cold tier is queried by our own engine; hot tier (a small uncompressed parquet) by
 DuckDB. The novel WaveDB value lives entirely in the cold tier.
 """
-import copy, sqlglot, sqlglot.expressions as E
+import copy, datetime, sqlglot, sqlglot.expressions as E
+import numpy as np
 import duckdb
 import wdb_sql
 from wdb_engine import Segment
@@ -63,6 +64,14 @@ def _partial_sql(tree, table_ref, keys, partials):
 
 def _num(x): return 0 if x is None else x
 
+def _mm(v):
+    """Normalize a MIN/MAX partial for cross-tier comparison: the cold tier renders datetime as an
+    ISO string (via _pyval) while DuckDB returns a datetime object. Render the DuckDB value the same
+    way so min/max compares like-with-like (ISO strings order correctly) and the output is uniform."""
+    if isinstance(v, (datetime.datetime, datetime.date)):
+        return wdb_sql._pyval(np.datetime64(v))
+    return v
+
 def _merge_partials(row_lists, n_keys, plan):
     """Merge N lists of partial rows (keys first, then partials) by group key."""
     acc = {}
@@ -78,9 +87,11 @@ def _merge_partials(row_lists, n_keys, plan):
                 if op in ('sum', 'count_star'):
                     cur[slot] = _num(cur[slot]) + _num(val)
                 elif op == 'min':
-                    cur[slot] = val if cur[slot] is None else (cur[slot] if val is None else min(cur[slot], val))
+                    a = _mm(cur[slot]); b = _mm(val)
+                    cur[slot] = b if a is None else (a if b is None else min(a, b))
                 elif op == 'max':
-                    cur[slot] = val if cur[slot] is None else (cur[slot] if val is None else max(cur[slot], val))
+                    a = _mm(cur[slot]); b = _mm(val)
+                    cur[slot] = b if a is None else (a if b is None else max(a, b))
                 else:  # avg-sum or avg-count slots are summed
                     cur[slot] = _num(cur[slot]) + _num(val)
     return acc
