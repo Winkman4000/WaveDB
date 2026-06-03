@@ -69,22 +69,35 @@ def execute(seg: Segment, sql: str, col_map=None):
                 if lim is not None: out = out[:lim]
             return out, [_alias(p) for p in proj]
 
-    # ---- GROUP BY path (group on CODES: NULL becomes its own group naturally) ----
+    # ---- GROUP BY path ----
+    # Group keys must be VALUE-identity. For dict-style columns (modes 0/1/2/3) seg.codes() is
+    # already value-identity, and mode-5 codes are too (factorized). But mode-4 (affine) codes are
+    # arange(N) -- identity-per-row -- so grouping on them would put every row in its own group;
+    # there we factorize the decoded VALUES instead (vectorized np.unique on int64/datetime64).
+    # Each meta carries how to turn a key index back into the emitted value.
     gnames = [seg_col(g) for g in gcols]
-    combo = None; metas=[]   # metas[i] = unique code values for key i
+    combo = None; metas=[]   # metas[i] = (gn, kind, table): 'val'->unique values, 'code'->unique codes
     for gn in gnames:
-        gc = seg.codes(gn); gc = gc[mask] if mask is not None else gc
-        u, inv = np.unique(gc, return_inverse=True); metas.append((gn, u))
+        if seg.cols[gn]['mode'] == 4:
+            vals = seg.values(gn); vals = vals[mask] if mask is not None else vals
+            u, inv = np.unique(vals, return_inverse=True)      # value-identity keys
+            metas.append((gn, 'val', u))
+        else:
+            gc = seg.codes(gn); gc = gc[mask] if mask is not None else gc
+            u, inv = np.unique(gc, return_inverse=True)
+            metas.append((gn, 'code', u))
         combo = inv if combo is None else combo*len(u)+inv
     uc, counts = np.unique(combo, return_counts=True)
     def decombo(cv):
         out=[]; x=cv
-        for _,u in reversed(metas): out.append(u[x%len(u)]); x//=len(u)
-        return list(reversed(out))   # per-key CODE values, original order
-    def codeval(colname, code):
-        c=seg.cols[colname]
-        if c['has_null'] and int(code)==c['V']-1: return None
-        return seg.fetch(colname, int(code))
+        for _,_,u in reversed(metas): out.append(int(x%len(u))); x//=len(u)
+        return list(reversed(out))   # per-key INDEX into that key's table
+    def keyval(ki, idx):
+        gn, kk, u = metas[ki]
+        if kk == 'val': return u[idx]                          # typed value directly
+        code = u[idx]; c = seg.cols[gn]
+        if c['has_null'] and int(code) == c['V']-1: return None
+        return seg.fetch(gn, int(code))
     agg_specs = [(p, _agg_kind(p)) for p in proj]
     order = np.argsort(combo, kind='stable'); combo_s=combo[order]
     gstarts = np.searchsorted(combo_s, uc); gends = np.r_[gstarts[1:], len(combo_s)]
@@ -103,10 +116,10 @@ def execute(seg: Segment, sql: str, col_map=None):
         return {'SUM':seg_v.sum(),'AVG':seg_v.mean(),'MIN':seg_v.min(),'MAX':seg_v.max()}[fn]
     rows=[]
     for gi,cv in enumerate(uc):
-        keycodes = decombo(cv); rowout=[]; ki=0
+        keyidx = decombo(cv); rowout=[]; ki=0
         for p,kind in agg_specs:
             if kind is None:
-                rowout.append(_pyval(codeval(metas[ki][0], keycodes[ki]))); ki+=1
+                rowout.append(_pyval(keyval(ki, keyidx[ki]))); ki+=1
             elif kind[0]=='COUNT_STAR':
                 rowout.append(int(counts[gi]))
             else:
