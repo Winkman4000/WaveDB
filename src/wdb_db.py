@@ -12,7 +12,7 @@ import sqlglot, sqlglot.expressions as E
 from wdb_catalog import Catalog
 from wdb_engine import Segment
 import os
-import wdb_ddl, wdb_dml, wdb_sql, wdb_merge, wdb_compact
+import wdb_ddl, wdb_dml, wdb_sql, wdb_merge, wdb_compact, wdb_join
 
 class Database:
     def __init__(self, catalog): self.cat = catalog
@@ -41,6 +41,8 @@ class Database:
         if isinstance(tree, E.Update):
             return wdb_dml.update(self.cat, sql)
         if isinstance(tree, E.Select):
+            if tree.args.get('joins'):
+                return wdb_join.join_query(self, sql)
             name = self._table_in(tree)
             phys = self.cat.phys_map(name)
             cmap = {c: phys.get(c, c) for c in self.cat.column_names(name)}  # complete logical->physical
