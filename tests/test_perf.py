@@ -41,7 +41,7 @@ def _check_scaling(label, make_op, sizes, the_exp, lo, hi):
 def test_codes_decode_is_linear():
     sizes = [1_000_000, 2_000_000, 4_000_000]
     def mk(n):
-        seg, _ = roundtrip(pd.DataFrame({'x': np.arange(n, dtype=np.int64)}))
+        seg, _ = roundtrip(pd.DataFrame({'x': np.random.default_rng(0).permutation(n).astype(np.int64)}))
         def op():
             seg._codes.clear(); seg.codes('x')
         return op
@@ -51,7 +51,7 @@ def test_codes_decode_is_linear():
 def test_values_decode_is_linear():
     sizes = [1_000_000, 2_000_000, 4_000_000]
     def mk(n):
-        seg, _ = roundtrip(pd.DataFrame({'x': np.arange(n, dtype=np.int64)}))
+        seg, _ = roundtrip(pd.DataFrame({'x': np.random.default_rng(0).permutation(n).astype(np.int64)}))
         def op():
             seg._codes.clear()
             if 'intvals' in seg.cols['x']: seg.cols['x']['intvals'] = None
@@ -63,7 +63,7 @@ def test_values_decode_is_linear():
 # wide band (only flags catastrophes like the 40x scatter_add regression), never noise.
 def test_decode_throughput_floor():
     n = 4_000_000
-    seg, _ = roundtrip(pd.DataFrame({'x': np.arange(n, dtype=np.int64)}))
+    seg, _ = roundtrip(pd.DataFrame({'x': np.random.default_rng(0).permutation(n).astype(np.int64)}))
     t = _bestof(lambda: (seg._codes.clear(), seg.codes('x'))[1])
     rate = n / t / 1e6
     PROJECTED = 20.0  # M rows/s, measured baseline on this machine's bit-unpack path

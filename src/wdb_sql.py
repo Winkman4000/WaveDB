@@ -144,7 +144,10 @@ def _col(seg, name):
     sentinel and flagged in nmask (or None if the column has no nulls). Override values are
     appended to the dictionary at synthetic codes V.. so effective codes resolve correctly."""
     import struct as _st
-    c = seg.cols[name]; codes = seg.codes(name); dv = seg._typed_dict(name)
+    c = seg.cols[name]
+    if c['mode'] == 4:
+        return seg.values(name), None          # computed column; overrides already applied
+    codes = seg.codes(name); dv = seg._typed_dict(name)
     ov = seg._override_vals_typed(name)        # [] if none; sit at codes V, V+1, ...
     if c['has_null']:
         nullcode = c['V'] - 1; nmask = (codes == nullcode)

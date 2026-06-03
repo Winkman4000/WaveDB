@@ -46,6 +46,15 @@ class Segment:
                 meta['fdmap'] = None
                 self.cols[nm] = meta; self.order.append(nm)
                 continue
+            elif mode == 4:
+                # affine/sequence (WSQ1) blob: no dict, no per-row codes. Self-describing
+                # length: 32-byte fixed part + optional (4-byte zlen + zstd exception payload).
+                n_exc = struct.unpack_from('<I', buf, off+28)[0]
+                blob_len = 32 if n_exc == 0 else 36 + struct.unpack_from('<I', buf, off+32)[0]
+                meta['seqblob'] = bytes(buf[off:off+blob_len]); off += blob_len
+                meta['seqvals'] = None   # decoded lazily
+                self.cols[nm] = meta; self.order.append(nm)
+                continue
             else:
                 Rr = struct.unpack_from('<H',buf,off)[0]; off += 2
                 nr = struct.unpack_from('<I',buf,off)[0]; off += 4
@@ -87,9 +96,19 @@ class Segment:
             b = allb[:Vx*bits].reshape(Vx, bits)
             c['fdmap'] = (b.astype(np.uint64)*w).sum(1).astype(np.int64)
         return c['fdmap']
+    def _seq_decode(self, c):
+        """Decode a mode-4 affine column to its int64 array (cached). dt-3 epochs stay int64
+        here; _base_values/fetch view them as datetime64."""
+        if c.get('seqvals') is None:
+            import wdb_seqcodec
+            c['seqvals'] = wdb_seqcodec.decode(c['seqblob'])
+        return c['seqvals']
     def _raw_codes(self, nm):
         if nm in self._codes: return self._codes[nm]
         c = self.cols[nm]
+        if c['mode'] == 4:
+            cc = np.arange(self.N, dtype=np.int64)   # identity codes: value = f(position)
+            self._codes[nm] = cc; return cc
         if c['mode'] == 3:
             # dependent column: gather Y-codes through the determinant's per-row codes
             x_codes = self._raw_codes(self.order[c['det_idx']])
@@ -162,6 +181,7 @@ class Segment:
         return eff[1] if eff is not None else []
     def _typed_dict(self, nm):
         c = self.cols[nm]
+        if c['mode'] == 4: return list(self._seq_decode(c))  # decoded values (override path only)
         if c['mode'] == 2: return self._dict_ints(c)  # int64 array (dt 0/3)
         if c['dt'] == 0: return [int(v) for v in c['vals']]
         if c['dt'] == 2: return [struct.unpack('<d', v)[0] for v in c['vals']]
@@ -183,7 +203,11 @@ class Segment:
                 out = np.asarray(out, dtype=object); out[idx] = vals
         return out
     def _base_values(self, nm):
-        c = self.cols[nm]; codes = self._raw_codes(nm); dvals = self._typed_dict(nm)
+        c = self.cols[nm]
+        if c['mode'] == 4:
+            arr = self._seq_decode(c)
+            return arr.view(f"datetime64[{_DT_UNITS[c['aux']]}]") if c['dt'] == 3 else arr
+        codes = self._raw_codes(nm); dvals = self._typed_dict(nm)
         if c['has_null']:
             nullcode = c['V'] - 1
             lut = np.empty(c['V'], dtype=object)
@@ -212,6 +236,9 @@ class Segment:
                 return np.int64(v).view(f"datetime64[{_DT_UNITS[c['aux']]}]")
             return v
         if c['has_null'] and code == c['V'] - 1: return None
+        if c['mode'] == 4:
+            v = int(self._seq_decode(c)[code])
+            return np.int64(v).view(f"datetime64[{_DT_UNITS[c['aux']]}]") if c['dt'] == 3 else v
         if c['mode'] == 2:
             arr = self._dict_ints(c)
             if c['dt'] == 3:
