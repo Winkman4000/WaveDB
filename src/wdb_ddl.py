@@ -67,7 +67,7 @@ def alter_table(catalog, sql, db=None):
             if os.path.exists(src): os.rename(src, dst)
             catalog.rename_table(name, new); name = new
         elif isinstance(act, E.RenameColumn):
-            raise NotImplementedError("RENAME COLUMN is ALTER step c")
+            catalog.rename_column(name, act.this.name, act.args['to'].name)
         elif isinstance(act, E.ColumnDef):
             raise NotImplementedError("ADD COLUMN is ALTER step d")
         elif isinstance(act, E.Drop):

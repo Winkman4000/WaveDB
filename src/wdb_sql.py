@@ -10,6 +10,21 @@ def _colname(node):
     if isinstance(node, E.Column): return node.name
     return None
 
+def _to_physical(node, col_map):
+    """Deep-copy a sqlglot expression with column names remapped logical->physical. Used ONLY for
+    the DuckDB-side queries (hot buffer / canonical buffer parquet), whose columns carry the
+    physical (storage) name. Identity (returns node unchanged, no copy) when col_map has no
+    non-trivial entries -- so pre-ALTER queries pay nothing."""
+    import copy
+    if not col_map or all(k == v for k, v in col_map.items()):
+        return node
+    t = copy.deepcopy(node)
+    for col in t.find_all(E.Column):
+        nm = col.name
+        if nm in col_map and col_map[nm] != nm:
+            col.this.set('this', col_map[nm])
+    return t
+
 def execute(seg: Segment, sql: str, col_map=None):
     """col_map: optional {sql_name -> segment_name}; default identity."""
     tree = sqlglot.parse_one(sql, read='duckdb')
@@ -333,28 +348,30 @@ def _apply_order(rows, proj, order):
     return rows
 
 
-def _eval_expr(seg, node):
+def _eval_expr(seg, node, col_map=None):
     """Evaluate a scalar UPDATE RHS expression to a full-column array (length seg.N),
     reading override-aware values. Supports column references, numeric/string literals,
     + - * / %, unary minus, and parentheses. numpy semantics are chosen to match DuckDB
     for these operators (notably '/' is true division in both), so the cold-segment path
     and the DuckDB-evaluated parquet path agree. NULL-in-arithmetic is a deferred edge;
-    pure column-copy (SET a=b) is null-safe via object arrays."""
+    pure column-copy (SET a=b) is null-safe via object arrays. col_map maps a logical column
+    name to its physical name in the segment (identity when absent)."""
+    def rc(nm): return (col_map or {}).get(nm, nm)
     t = type(node)
     if t is E.Paren:
-        return _eval_expr(seg, node.this)
+        return _eval_expr(seg, node.this, col_map)
     if t is E.Column:
-        return seg.values(node.name)
+        return seg.values(rc(node.name))
     if t is E.Neg:
-        return -_eval_expr(seg, node.this)
+        return -_eval_expr(seg, node.this, col_map)
     if t is E.Literal:
         if node.args.get('is_string'):
             return np.full(seg.N, node.this, dtype=object)
         s = node.this
         return np.full(seg.N, float(s) if ('.' in s or 'e' in s.lower()) else int(s))
-    if t is E.Add: return _eval_expr(seg, node.left) + _eval_expr(seg, node.right)
-    if t is E.Sub: return _eval_expr(seg, node.left) - _eval_expr(seg, node.right)
-    if t is E.Mul: return _eval_expr(seg, node.left) * _eval_expr(seg, node.right)
-    if t is E.Div: return _eval_expr(seg, node.left) / _eval_expr(seg, node.right)
-    if t is E.Mod: return _eval_expr(seg, node.left) % _eval_expr(seg, node.right)
+    if t is E.Add: return _eval_expr(seg, node.left, col_map) + _eval_expr(seg, node.right, col_map)
+    if t is E.Sub: return _eval_expr(seg, node.left, col_map) - _eval_expr(seg, node.right, col_map)
+    if t is E.Mul: return _eval_expr(seg, node.left, col_map) * _eval_expr(seg, node.right, col_map)
+    if t is E.Div: return _eval_expr(seg, node.left, col_map) / _eval_expr(seg, node.right, col_map)
+    if t is E.Mod: return _eval_expr(seg, node.left, col_map) % _eval_expr(seg, node.right, col_map)
     raise NotImplementedError(f"unsupported UPDATE expression: {node.sql()}")

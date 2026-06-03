@@ -47,7 +47,8 @@ def _buffer_path(catalog, name): return os.path.join(catalog.dbdir, f"{name}__bu
 def hot_path(catalog, name):    return os.path.join(catalog.dbdir, f"{name}__hot.parquet")
 def _segment_name(name): return f"{name}_0.wdb"
 
-def _rows_to_df(schema, order, rows):
+def _rows_to_df(schema, order, rows, phys=None):
+    phys = phys or {}
     scol = [c[0] for c in schema]; stype = {c[0]: c[1] for c in schema}
     if order and set(order) != set(scol):
         raise ValueError(f"INSERT columns {order} don't match table columns {scol}")
@@ -60,7 +61,12 @@ def _rows_to_df(schema, order, rows):
         rowmap = dict(zip(order, r))
         for c in scol:
             data[c].append(_coerce(rowmap.get(c), stype[c]))
-    return pd.DataFrame({c: pd.array(data[c], dtype=_PD[stype[c]]) for c in scol})
+    df = pd.DataFrame({c: pd.array(data[c], dtype=_PD[stype[c]]) for c in scol})
+    # store under PHYSICAL names so buffer/hot parquet and the encoded segment all agree on one
+    # stable storage name per column (logical names live in the catalog, resolved at read time)
+    if phys:
+        df = df.rename(columns={c: phys.get(c, c) for c in scol})
+    return df
 
 def _append_parquet(path, df_new):
     if os.path.exists(path):
@@ -106,7 +112,7 @@ def insert(catalog, sql):
     name, cols, rows = parse_insert(sql)
     tinfo = catalog.get_table(name)
     schema = tinfo['schema']
-    df_new = _rows_to_df(schema, cols, rows)
+    df_new = _rows_to_df(schema, cols, rows, phys=catalog.phys_map(name))
     mode = tinfo.get('mode', 'segment')
     if mode == 'buffered':
         # operator opted in: append to the hot buffer only, no re-encode (the win)
@@ -144,9 +150,12 @@ def delete(catalog, sql):
     from wdb_engine import Segment
     tree = sqlglot.parse_one(sql, read='duckdb')
     name = tree.find(E.Table).name
+    phys = catalog.phys_map(name)
     wnode = tree.args.get('where')
     pred = wnode.this if wnode is not None else None
-    pred_sql = pred.sql(dialect='duckdb') if pred is not None else None
+    # parquet (hot/canonical buffer) carries physical names -> translate predicate for DuckDB
+    pred_sql = (wdb_sql._to_physical(pred, phys).sql(dialect='duckdb')
+                if pred is not None else None)
     mode = catalog.table_mode(name)
     deleted = 0
 
@@ -157,7 +166,7 @@ def delete(catalog, sql):
             if pred is None:
                 idx = np.arange(seg.N)
             else:
-                m = wdb_sql._eval_pred(seg, pred, lambda x: x)
+                m = wdb_sql._eval_pred(seg, pred, lambda x: phys.get(x, x))
                 idx = np.nonzero(m)[0]
             if len(idx):
                 deleted += wdb_presence.mark_deleted(sp, seg.N, idx)
@@ -213,6 +222,7 @@ def update(catalog, sql):
     from wdb_engine import Segment
     tree = sqlglot.parse_one(sql, read='duckdb')
     name = tree.find(E.Table).name
+    phys = catalog.phys_map(name)
     assigns = tree.args.get('expressions') or []
     if not assigns:
         return 0
@@ -226,7 +236,11 @@ def update(catalog, sql):
             raise KeyError(f"no such column {col!r} in {name!r}")
         sets.append((col, a.expression, a.expression.sql(dialect='duckdb')))
     wnode = tree.args.get('where'); pred = wnode.this if wnode is not None else None
-    pred_sql = pred.sql(dialect='duckdb') if pred is not None else None
+    # physical-name versions for the DuckDB/parquet path (parquet carries physical names)
+    psets = [(phys.get(col, col), rhs,
+              wdb_sql._to_physical(rhs, phys).sql(dialect='duckdb')) for col, rhs, _ in sets]
+    pred_sql = (wdb_sql._to_physical(pred, phys).sql(dialect='duckdb')
+                if pred is not None else None)
     mode = catalog.table_mode(name)
     updated = 0
 
@@ -237,20 +251,21 @@ def update(catalog, sql):
             if pred is None:
                 idx = np.arange(seg.N)
             else:
-                idx = np.nonzero(wdb_sql._eval_pred(seg, pred, lambda x: x))[0]
+                idx = np.nonzero(wdb_sql._eval_pred(seg, pred, lambda x: phys.get(x, x)))[0]
             if len(idx):
                 # simultaneous semantics: evaluate every RHS against the pre-update segment
                 # BEFORE writing any override (so SET a=b, b=a swaps correctly)
-                newvals = [(col, wdb_sql._eval_expr(seg, rhs)[idx]) for col, rhs, _ in sets]
-                for col, vals in newvals:
-                    wdb_override.set_override(sp, col, idx, np.asarray(vals, dtype=object))
+                newvals = [(phys.get(col, col), wdb_sql._eval_expr(seg, rhs, col_map=phys)[idx])
+                           for col, rhs, _ in sets]
+                for pcol, vals in newvals:
+                    wdb_override.set_override(sp, pcol, idx, np.asarray(vals, dtype=object))
                 updated += len(idx)
         hp = hot_path(catalog, name)
         if os.path.exists(hp):
-            updated += _update_parquet(hp, sets, pred_sql)
+            updated += _update_parquet(hp, psets, pred_sql)
     else:
         bpath = _buffer_path(catalog, name)
         if os.path.exists(bpath):
-            updated += _update_parquet(bpath, sets, pred_sql)
+            updated += _update_parquet(bpath, psets, pred_sql)
             _encode_segment(catalog, name, bpath)
     return updated

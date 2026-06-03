@@ -116,7 +116,8 @@ def merge_query(segs, hot_parquet, sql, col_map=None):
             r, _ = wdb_sql.execute(seg, bsql, col_map=col_map); rows += list(r)
         if hot_parquet is not None:
             con = duckdb.connect()
-            rows += [tuple(x) for x in con.execute(_duck_from(base, hot_parquet)).fetchall()]
+            base_p = wdb_sql._to_physical(base, col_map)   # hot parquet carries physical names
+            rows += [tuple(x) for x in con.execute(_duck_from(base_p, hot_parquet)).fetchall()]
         rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))
         lim = wdb_sql._limit(tree)
         if lim is not None: rows = rows[:lim]
@@ -130,7 +131,9 @@ def merge_query(segs, hot_parquet, sql, col_map=None):
         for seg in segs:
             r, _ = wdb_sql.execute(seg, psql, col_map=col_map); row_lists.append(list(r))
     if hot_parquet is not None:
-        psql_h = _partial_sql(tree, f"'{hot_parquet}'", keys, partials)
+        tree_p = wdb_sql._to_physical(tree, col_map)       # hot parquet carries physical names;
+        keys_p, _, partials_p = _classify(tree_p.expressions)  # same structure as cold, by position
+        psql_h = _partial_sql(tree_p, f"'{hot_parquet}'", keys_p, partials_p)
         con = duckdb.connect()
         row_lists.append([tuple(x) for x in con.execute(psql_h).fetchall()])
     acc = _merge_partials(row_lists, len(keys), plan)
