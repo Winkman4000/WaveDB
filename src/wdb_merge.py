@@ -93,7 +93,7 @@ def _slot_op(abs_slot, plan):
             return 'sum'
     return 'sum'
 
-def merge_query(segs, hot_parquet, sql):
+def merge_query(segs, hot_parquet, sql, col_map=None):
     """segs: list of cold Segments (0..N). hot_parquet: path or None."""
     if segs is None: segs = []
     tree = sqlglot.parse_one(sql, read='duckdb')
@@ -113,7 +113,7 @@ def merge_query(segs, hot_parquet, sql):
         base.set('order', None); base.set('limit', None)
         bsql = base.sql(dialect='duckdb')
         for seg in segs:
-            r, _ = wdb_sql.execute(seg, bsql); rows += list(r)
+            r, _ = wdb_sql.execute(seg, bsql, col_map=col_map); rows += list(r)
         if hot_parquet is not None:
             con = duckdb.connect()
             rows += [tuple(x) for x in con.execute(_duck_from(base, hot_parquet)).fetchall()]
@@ -128,7 +128,7 @@ def merge_query(segs, hot_parquet, sql):
     if segs:
         psql = _partial_sql(tree, "tbl", keys, partials)
         for seg in segs:
-            r, _ = wdb_sql.execute(seg, psql); row_lists.append(list(r))
+            r, _ = wdb_sql.execute(seg, psql, col_map=col_map); row_lists.append(list(r))
     if hot_parquet is not None:
         psql_h = _partial_sql(tree, f"'{hot_parquet}'", keys, partials)
         con = duckdb.connect()

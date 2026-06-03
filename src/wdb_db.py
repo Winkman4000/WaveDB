@@ -40,15 +40,16 @@ class Database:
             return wdb_dml.update(self.cat, sql)
         if isinstance(tree, E.Select):
             name = self._table_in(tree)
+            cmap = self.cat.phys_map(name)               # logical->physical (identity if no renames)
             paths = self.cat.segment_paths(name)
             segs = [Segment(p) for p in paths]
             hp = wdb_dml.hot_path(self.cat, name)
             hot = hp if os.path.exists(hp) else None
             if hot is None and len(segs) == 1:
-                return wdb_sql.execute(segs[0], sql)     # unchanged single-segment fast path
+                return wdb_sql.execute(segs[0], sql, col_map=cmap)
             if hot is None and not segs:
                 raise ValueError(f"table {name!r} has no data yet")
-            return wdb_merge.merge_query(segs, hot, sql) # multi-segment / two-tier merge-read
+            return wdb_merge.merge_query(segs, hot, sql, col_map=cmap)
         raise NotImplementedError(f"unsupported statement: {type(tree).__name__}")
 
     def set_table_mode(self, name, mode):
