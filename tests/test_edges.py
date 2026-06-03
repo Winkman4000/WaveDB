@@ -15,15 +15,17 @@ def test_int64_extremes_mode0():
     seg, pq = roundtrip(df); assert_lossless(seg, pq, 'x')
 
 def test_int64_extreme_range_highcard():
-    # >50k distinct spanning BOTH extremes -> mode 2; the sorted-dict gap between the low
-    # cluster and the high cluster overflows int64. Verifies diff/cumsum cancellation.
-    lo = IMIN + np.arange(30000, dtype=np.int64)
-    hi = IMAX - np.arange(30000, dtype=np.int64)
+    # high-card RANDOM values spanning BOTH extremes -> mode 2; the sorted-dict gap between
+    # the low and high clusters overflows int64. Verifies diff/cumsum cancellation in the
+    # mode-2 delta path. (Affine extreme ranges are covered by the mode-4 seqcodec tests.)
+    rng = np.random.default_rng(3)
+    lo = IMIN + rng.integers(0, 10**9, 30000).astype(np.int64)
+    hi = IMAX - rng.integers(0, 10**9, 30000).astype(np.int64)
     vals = np.unique(np.concatenate([lo, hi]))
     df = pd.DataFrame({'x': vals})
     seg, pq = roundtrip(df)
     m = assert_lossless(seg, pq, 'x')
-    assert m == 2, f"expected mode 2 for high-card, got {m}"
+    assert m == 2, f"expected mode 2 for high-card random extreme range, got {m}"
 
 def test_large_stride_near_overflow():
     # base + i*stride where the total span is enormous but each value fits int64

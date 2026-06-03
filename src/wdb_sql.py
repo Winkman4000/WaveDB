@@ -144,7 +144,10 @@ def _col(seg, name):
     sentinel and flagged in nmask (or None if the column has no nulls). Override values are
     appended to the dictionary at synthetic codes V.. so effective codes resolve correctly."""
     import struct as _st
-    c = seg.cols[name]; codes = seg.codes(name); dv = seg._typed_dict(name)
+    c = seg.cols[name]
+    if c['mode'] == 4:
+        return seg.values(name), None          # computed column; overrides already applied
+    codes = seg.codes(name); dv = seg._typed_dict(name)
     ov = seg._override_vals_typed(name)        # [] if none; sit at codes V, V+1, ...
     if c['has_null']:
         nullcode = c['V'] - 1; nmask = (codes == nullcode)
@@ -200,18 +203,48 @@ def _agg_scalar(seg, p, mask, seg_col):
     if len(arr)==0: return None
     return _pyval({'SUM':arr.sum(),'AVG':arr.mean(),'MIN':arr.min(),'MAX':arr.max()}[fn])
 
+def _seq_eq_mask(seg, name, neg, lit):
+    """O(1)-compute equality mask for a clean-affine integer mode-4 column (n_exc==0, no
+    overrides). Returns bool[N] for '= X' (or '!= X' if neg), or None to fall back to the
+    general path. Exact: a position p with base+stride*p == X exists iff (X-base) is divisible
+    by stride and 0<=p<N (stride!=0); for stride==0 the column is constant=base so all or no
+    rows match. Python-int arithmetic avoids int64 overflow. Verified vs brute force."""
+    c = seg.cols[name]
+    if c['mode'] != 4 or c['dt'] != 0:
+        return None
+    import wdb_seqcodec
+    base, stride, n, n_exc = wdb_seqcodec.header(c['seqblob'])
+    if n_exc != 0 or seg._overrides(name) is not None:
+        return None                                   # not clean-affine -> general path
+    v = _lit_for_col(seg, name, lit, 'i')
+    if not isinstance(v, (int, np.integer)):
+        return None
+    v = int(v); N = seg.N
+    mask = np.zeros(N, dtype=bool)
+    if stride == 0:
+        if v == base: mask[:] = True
+    else:
+        diff = v - base
+        if diff % stride == 0:
+            p = diff // stride
+            if 0 <= p < N: mask[p] = True
+    return ~mask if neg else mask
+
 def _eval_pred(seg, node, seg_col):
     if isinstance(node, E.And): return _eval_pred(seg,node.this,seg_col) & _eval_pred(seg,node.expression,seg_col)
     if isinstance(node, E.Or):  return _eval_pred(seg,node.this,seg_col) | _eval_pred(seg,node.expression,seg_col)
     if isinstance(node, E.Not): return ~_eval_pred(seg,node.this,seg_col)
     if isinstance(node, E.Paren): return _eval_pred(seg,node.this,seg_col)
     if isinstance(node, (E.EQ,E.NEQ,E.GT,E.LT,E.GTE,E.LTE)):
-        col=_colname(node.this); lit=node.expression
-        a, nmask = _col(seg, seg_col(col))
+        col=_colname(node.this); cn=seg_col(col); lit=node.expression
         if not (isinstance(lit,E.Literal) or (isinstance(lit,E.Neg) and isinstance(lit.this,E.Literal))):
             raise NotImplementedError("non-literal RHS")
-        v = _lit_for_col(seg, seg_col(col), lit, a.dtype.kind)
-        if a.dtype.kind not in 'iuf' and isinstance(v,int) and seg.cols[seg_col(col)]['dt']!=3: v=str(v).encode()
+        if isinstance(node, (E.EQ, E.NEQ)):
+            fm = _seq_eq_mask(seg, cn, isinstance(node, E.NEQ), lit)   # O(1) clean-affine eq
+            if fm is not None: return fm
+        a, nmask = _col(seg, cn)
+        v = _lit_for_col(seg, cn, lit, a.dtype.kind)
+        if a.dtype.kind not in 'iuf' and isinstance(v,int) and seg.cols[cn]['dt']!=3: v=str(v).encode()
         import operator
         op={E.EQ:operator.eq,E.NEQ:operator.ne,E.GT:operator.gt,E.LT:operator.lt,E.GTE:operator.ge,E.LTE:operator.le}[type(node)]
         res = op(a,v)

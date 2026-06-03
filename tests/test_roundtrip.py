@@ -7,11 +7,11 @@ def test_int_lowcard_mode0():
     seg, pq = roundtrip(df)
     assert assert_lossless(seg, pq, 'x') == 0
 
-def test_int_highcard_mode2():
-    # >50k distinct, non-null -> must select mode 2 (delta dict)
+def test_int_sequential_mode4():
+    # clean sequential int -> mode 4 (affine codec); lossless
     df = pd.DataFrame({'x': np.arange(60000, dtype=np.int64)})
     seg, pq = roundtrip(df)
-    assert assert_lossless(seg, pq, 'x') == 2, "high-card int should be mode 2"
+    assert assert_lossless(seg, pq, 'x') == 4, "clean sequence should be mode 4"
 
 def test_int_highcard_nonsequential_mode2():
     # sparse high-card ints (the orderkey-like case): mode 2, base value != 0
@@ -70,9 +70,18 @@ def test_datetime_lowcard():
     seg, pq = roundtrip(df)
     assert_lossless(seg, pq, 'x')
 
-def test_datetime_highcard_mode2():
+def test_datetime_sequential_mode4():
     base = np.datetime64('2000-01-01T00:00:00')
     df = pd.DataFrame({'x': base + np.arange(60000, dtype='timedelta64[s]')})
+    seg, pq = roundtrip(df)
+    assert assert_lossless(seg, pq, 'x') == 4   # monotonic timestamps -> affine codec
+
+def test_datetime_highcard_nonseq_mode2():
+    # high-card NON-monotonic timestamps (random gaps) -> mode 2; preserves datetime delta-dict coverage
+    rng = np.random.default_rng(5)
+    base = np.datetime64('2000-01-01T00:00:00')
+    secs = np.unique(rng.integers(0, 50_000_000, 70000))
+    df = pd.DataFrame({'x': (base + secs.astype('timedelta64[s]'))})
     seg, pq = roundtrip(df)
     assert assert_lossless(seg, pq, 'x') == 2
 

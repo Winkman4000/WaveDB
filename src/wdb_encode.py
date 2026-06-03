@@ -77,8 +77,40 @@ def _pack_codes(codes, bits):
     bitsarr = ((codes[:,None] >> np.arange(bits-1,-1,-1,dtype=np.uint64)) & 1).astype(np.uint8).reshape(-1)
     return np.packbits(bitsarr).tobytes()
 
-def _prep_column(nm, col):
+def _try_seq(nm, col, allow_seq=True):
+    """Mode-4 (affine/sequence) detection for non-null int/datetime columns. Returns a mode-4
+    prep dict (carrying the WSQ1 blob) when the column is a clear sequential win, else None
+    (caller falls through to the dict-based modes). Mandatory lossless self-check on the EXACT
+    blob that will be stored -- mode 4 is never emitted unless it round-trips."""
+    if not allow_seq:
+        return None
+    import wdb_seqcodec
+    if isinstance(col, ma.MaskedArray):
+        if ma.getmaskarray(col).any():
+            return None                               # nulls break the affine progression
+        data = np.asarray(col.data)
+    else:
+        data = np.asarray(col)
+    k = data.dtype.kind
+    if k in 'iu':
+        dtype = 0; aux = 0; iv = data.astype(np.int64, copy=False)
+    elif k == 'M':
+        dtype = 3; aux = _unit_code(np.datetime_data(data.dtype)[0]); iv = data.view('int64')
+    else:
+        return None                                   # floats / strings: not eligible
+    blob = wdb_seqcodec.encode(iv, max_exc_frac=0.2)  # fire only on clear wins (>=80% conform)
+    if blob is None:
+        return None
+    if not np.array_equal(wdb_seqcodec.decode(blob), iv):
+        return None                                   # safety: never emit a lossy mode-4
+    N = len(iv); V = N; bits = max(1, int(np.ceil(np.log2(max(V, 2)))))
+    return dict(nm=nm, dtype=dtype, has_null=0, V=V, bits=bits, aux=aux, mode=4, seqblob=blob)
+
+def _prep_column(nm, col, allow_seq=True):
     """Heavy, independent per-column work (parallel-safe): dict + codes + mode choice."""
+    seq = _try_seq(nm, col, allow_seq)
+    if seq is not None:
+        return seq
     dtype, has_null, V, valb, codes, aux, uniq = _encode_column(col)
     bits = max(1, int(np.ceil(np.log2(max(V,2)))))
     if dtype == 1 and (V - has_null) > FC_THRESHOLD:
@@ -123,7 +155,12 @@ def _dict_bytes(p, zc):
     return out
 
 def _serialize_column(p, zc):
-    """Normal blob (mode 0/1/2) — byte-identical to the previous encoder."""
+    """Normal blob (mode 0/1/2), or mode-4 affine blob (header + WSQ1 seqcodec blob)."""
+    if p['mode'] == 4:
+        out = bytearray()
+        out += _header(p['nm'], p['V'], p['bits'], p['dtype'], 4, 0, p['aux'])
+        out += p['seqblob']
+        return bytes(out), (len(out), p['V'], p['bits'], p['dtype'], 4, 0, p['aux'])
     out = bytearray()
     out += _header(p['nm'], p['V'], p['bits'], p['dtype'], p['mode'], p['has_null'], p['aux'])
     out += _dict_bytes(p, zc)
@@ -173,13 +210,14 @@ def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_s
         # FD path: prep all columns first (dependents need their determinant's codes),
         # then serialize normal columns in parallel and mode-3 dependents serially.
         preps = {}
+        fd_involved = set(fd_specs) | set(fd_specs.values())  # only these must avoid mode 4
         if workers > 1 and len(cols) > 1:
             with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = {ex.submit(_prep_column, nm, coldata[nm]): nm for nm in cols}
+                futs = {ex.submit(_prep_column, nm, coldata[nm], nm not in fd_involved): nm for nm in cols}
                 for fut in cf.as_completed(futs):
                     nm = futs[fut]; preps[nm] = fut.result()
         else:
-            for nm in cols: preps[nm] = _prep_column(nm, coldata[nm])
+            for nm in cols: preps[nm] = _prep_column(nm, coldata[nm], nm not in fd_involved)
         col_idx = {nm: i for i, nm in enumerate(cols)}
         normal = [nm for nm in cols if nm not in fd_specs]
         def _ser_normal(nm):

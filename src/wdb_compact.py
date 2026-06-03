@@ -12,7 +12,7 @@ Stage 2b (later): use a verified X->Y to store column Y as references into X's p
 import os
 import pandas as pd, numpy as np
 from wdb_engine import Segment
-import wdb_encode, wdb_labels, wdb_presence
+import wdb_encode, wdb_labels, wdb_presence, wdb_override
 
 _PD = {'int': 'Int64', 'float': 'float64', 'string': 'object', 'datetime': 'datetime64[ns]'}
 
@@ -95,6 +95,8 @@ def compact(catalog, name, seg_files=None):
         if os.path.exists(p): os.remove(p)
         sc = wdb_presence.path_for(p)               # drop the now-stale presence sidecar
         if os.path.exists(sc): os.remove(sc)
+        oc = wdb_override.path_for(p)                # drop the now-stale override sidecar
+        if os.path.exists(oc): os.remove(oc)
     fl[new_seg] = kept
     catalog.save()
     return {'merged': targets, 'new_segment': new_seg, 'rows': len(union),
