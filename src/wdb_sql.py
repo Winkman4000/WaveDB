@@ -38,14 +38,17 @@ def execute(seg: Segment, sql: str, col_map=None):
             for p in proj: row.append(_agg_scalar(seg, p, mask, seg_col))
             return [tuple(row)], [_alias(p) for p in proj]
         else:
-            # row projection (SELECT cols ... [WHERE]) -> return rows
+            # row projection (SELECT cols ... [WHERE] [ORDER BY] [LIMIT]) -> return rows
             cols = [seg_col(_colname(p if not isinstance(p,E.Alias) else p.this)) for p in proj]
             idx = np.nonzero(mask)[0] if mask is not None else np.arange(N)
-            lim = _limit(tree)
-            if lim is not None: idx = idx[:lim]
+            order = tree.args.get('order'); lim = _limit(tree)
+            if order is None and lim is not None: idx = idx[:lim]   # no ordering: limit early (fast path)
             out = []
             colvals = {c: seg.values(c) for c in cols}
             for i in idx: out.append(tuple(_pyval(colvals[c][i]) for c in cols))
+            if order is not None:                                   # ORDER BY: sort full set, then LIMIT
+                out = _apply_order(out, proj, order)
+                if lim is not None: out = out[:lim]
             return out, [_alias(p) for p in proj]
 
     # ---- GROUP BY path (group on CODES: NULL becomes its own group naturally) ----
@@ -172,7 +175,10 @@ def _parse_temporal(litstr, unit):
     return int(np.datetime64(str(litstr).replace(' ','T')).astype(f'datetime64[{unit}]').view('int64'))
 
 def _lit_for_col(seg, colname, lit, arr_kind):
-    """Convert a sqlglot Literal node to a value comparable with column `colname`."""
+    """Convert a sqlglot Literal (or negated numeric literal -5 -> Neg(Literal 5)) node to a
+    value comparable with column `colname`."""
+    if isinstance(lit, E.Neg):
+        return -_lit_for_col(seg, colname, lit.this, arr_kind)
     c = seg.cols[colname]
     if c['dt'] == 3:                       # datetime: parse string/number to int64 epoch
         return _parse_temporal(lit.this, seg.unit(colname))
@@ -202,7 +208,8 @@ def _eval_pred(seg, node, seg_col):
     if isinstance(node, (E.EQ,E.NEQ,E.GT,E.LT,E.GTE,E.LTE)):
         col=_colname(node.this); lit=node.expression
         a, nmask = _col(seg, seg_col(col))
-        if not isinstance(lit,E.Literal): raise NotImplementedError("non-literal RHS")
+        if not (isinstance(lit,E.Literal) or (isinstance(lit,E.Neg) and isinstance(lit.this,E.Literal))):
+            raise NotImplementedError("non-literal RHS")
         v = _lit_for_col(seg, seg_col(col), lit, a.dtype.kind)
         if a.dtype.kind not in 'iuf' and isinstance(v,int) and seg.cols[seg_col(col)]['dt']!=3: v=str(v).encode()
         import operator

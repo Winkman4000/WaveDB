@@ -29,7 +29,7 @@ def _check(sql_wdb, sql_duck=None):
     con = duckdb.connect()
     duck = con.execute((sql_duck or sql_wdb).replace('TBL', f"'{pq}'")).fetchall()
     rows, _hdr = wdb_sql.execute(seg, sql_wdb.replace('TBL', 'tbl'))
-    assert _norm(rows) == _norm(duck), f"mismatch\n SQL: {sql_wdb}\n wdb:  {_norm(w)[:5]}\n duck: {_norm(duck)[:5]}"
+    assert _norm(rows) == _norm(duck), f"mismatch\n SQL: {sql_wdb}\n wdb:  {_norm(rows)[:5]}\n duck: {_norm(duck)[:5]}"
 
 def test_select_where_int():
     _check("SELECT qty FROM TBL WHERE qty > 50")
