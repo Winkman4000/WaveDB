@@ -179,7 +179,32 @@ def _serialize_column(p, zc):
     out += _header(p['nm'], p['V'], p['bits'], p['dtype'], p['mode'], p['has_null'], p['aux'])
     out += _dict_bytes(p, zc)
     out += _code_section(p['codes'], p['bits'])
-    return bytes(out), (len(out), p['V'], p['bits'], p['dtype'], p['mode'], p['has_null'], p['aux'])
+    normal = bytes(out), (len(out), p['V'], p['bits'], p['dtype'], p['mode'], p['has_null'], p['aux'])
+    # mode-5 inline candidate: high-cardinality non-null string -> storing rows inline often beats
+    # dict+codes (pointers are dead weight when values rarely repeat). Compute both, keep smaller.
+    if p['dtype'] == 1 and p['has_null'] == 0:
+        N = len(p['codes'])
+        if N and (p['V'] / N) >= 0.5:
+            inline = _serialize_inline(p)
+            if len(inline[0]) < len(normal[0]):
+                return inline
+    return normal
+
+def _serialize_inline(p):
+    """Mode-5 inline string column: rows stored directly (no dict, no per-row codes). Wins when
+    values rarely repeat -- the dictionary pointers become pure overhead. Reconstructs row-order
+    bytes from the prepped dict (valb[codes]); payload = zstd(lengths u32) + zstd(concat bytes)."""
+    valb = np.array(p['valb'] + [b''], dtype=object)[:-1]   # object array of distinct byte values
+    rows = valb[np.asarray(p['codes'])]                     # row-order bytes (has_null==0 by gate)
+    lengths = np.fromiter((len(x) for x in rows), dtype=np.uint32, count=len(rows))
+    concat = b''.join(rows.tolist())
+    zc = zstd.ZstdCompressor(level=CODE_ZSTD_LEVEL)
+    zl = zc.compress(lengths.tobytes()); zv = zc.compress(concat)
+    out = bytearray()
+    out += _header(p['nm'], p['V'], p['bits'], 1, 5, 0, p['aux'])
+    out += struct.pack('<I', len(zl)) + zl
+    out += struct.pack('<I', len(zv)) + zv
+    return bytes(out), (len(out), p['V'], p['bits'], 1, 5, 0, p['aux'])
 
 def _serialize_fd(p, det_idx, det_codes):
     """Mode-3 blob: dependent column Y stored as y_by_xcode (Vx entries of Y-codes)

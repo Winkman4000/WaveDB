@@ -49,10 +49,16 @@ def test_string_lowcard_mode0():
     assert assert_lossless(seg, pq, 'x') == 0
 
 def test_string_highcard_mode1():
-    # >50k distinct strings -> front-coded mode 1
+    # >50k distinct strings WITH repetition -> front-coded mode 1 (dict beats inline)
+    df = pd.DataFrame({'x': [f'item_{i:08d}' for i in range(60000)] * 4})
+    seg, pq = roundtrip(df)
+    assert assert_lossless(seg, pq, 'x') == 1, "high-card repetitive string should be mode 1"
+
+def test_string_unique_mode5():
+    # near-unique high-card strings -> inline mode 5 (dictionary pointers are dead weight)
     df = pd.DataFrame({'x': [f'item_{i:08d}' for i in range(60000)]})
     seg, pq = roundtrip(df)
-    assert assert_lossless(seg, pq, 'x') == 1, "high-card string should be mode 1"
+    assert assert_lossless(seg, pq, 'x') == 5, "unique string column should be mode 5"
 
 def test_string_unicode():
     df = pd.DataFrame({'x': (['café','日本語','emoji😀','naïve','']*100)})

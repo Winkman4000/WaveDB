@@ -145,8 +145,8 @@ def _col(seg, name):
     appended to the dictionary at synthetic codes V.. so effective codes resolve correctly."""
     import struct as _st
     c = seg.cols[name]
-    if c['mode'] == 4:
-        return seg.values(name), None          # computed column; overrides already applied
+    if c['mode'] in (4, 5):
+        return seg.values(name), None          # computed/inline column; overrides already applied
     codes = seg.codes(name); dv = seg._typed_dict(name)
     ov = seg._override_vals_typed(name)        # [] if none; sit at codes V, V+1, ...
     if c['has_null']:
