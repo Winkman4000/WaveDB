@@ -82,6 +82,13 @@ def decode(blob):
     out[1:] += base                                         # base + cumsum(deltas)
     return out
 
+def header(blob):
+    """Cheap inspection of a WSQ1 blob without decoding: (base, stride, n, n_exc).
+    Lets callers detect a clean-affine column (n_exc == 0) for O(1) predicate fast-paths."""
+    assert blob[:4] == MAGIC, "bad WSQ1 magic"
+    base, stride, n, n_exc = _HDR.unpack_from(blob, 4)
+    return int(base), int(stride), int(n), int(n_exc)
+
 def encode(col, max_exc_frac=0.5):
     """Gated encode for the column. Returns a blob if mode 4 is BENEFICIAL for this column,
     else None (decline -> caller uses another mode). Gate: enough rows, the stride actually
