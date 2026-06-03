@@ -7,7 +7,7 @@ _DT_UNITS = ['us','ns','ms','s','D','h','m','M','Y','W']
 
 class Segment:
     def __init__(self, path):
-        buf = open(path,'rb').read(); assert buf[:5]==b'WVDB3', "not a WVDB3 segment"
+        buf = open(path,'rb').read(); assert buf[:5]==b'WVDB4', "not a WVDB3 segment"
         off = 5
         self.n_cols = struct.unpack_from('<H',buf,off)[0]; off += 2
         self.N = struct.unpack_from('<I',buf,off)[0]; off += 4
@@ -63,7 +63,13 @@ class Segment:
                 zlen = struct.unpack_from('<I',buf,off)[0]; off += 4
                 meta['R'] = Rr; meta['z'] = buf[off:off+zlen]; off += zlen
                 meta['vals'] = None; meta['raw'] = None  # decoded lazily
-            nb = (self.N*bits+7)//8; meta['cstart'] = off; off += nb
+            code_enc = buf[off]; off += 1; meta['code_enc'] = code_enc   # 0=raw bitpack, 1=zstd codes
+            if code_enc == 0:
+                nb = (self.N*bits+7)//8; meta['cstart'] = off; off += nb
+            else:
+                meta['cwidth'] = buf[off]; off += 1
+                czlen = struct.unpack_from('<I', buf, off)[0]; off += 4
+                meta['czlen'] = czlen; meta['cstart'] = off; off += czlen
             self.cols[nm] = meta; self.order.append(nm)
         self.buf = np.frombuffer(buf, dtype=np.uint8); self._codes = {}
         self.path = path; self._presence = 0   # 0 = not yet loaded
@@ -113,6 +119,11 @@ class Segment:
             # dependent column: gather Y-codes through the determinant's per-row codes
             x_codes = self._raw_codes(self.order[c['det_idx']])
             cc = self._fd_map(c)[x_codes].astype(np.int64)
+            self._codes[nm] = cc; return cc
+        if c.get('code_enc', 0) == 1:                # zstd of byte-aligned codes (clustered/skewed)
+            raw = self._dz.decompress(self.buf[c['cstart']:c['cstart']+c['czlen']].tobytes())
+            wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
+            cc = np.frombuffer(raw, dtype=wdt).astype(np.int64)
             self._codes[nm] = cc; return cc
         bits = c['bits']; N = self.N; base = c['cstart']
         w = (1 << np.arange(bits-1,-1,-1)).astype(np.uint64)

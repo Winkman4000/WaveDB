@@ -24,6 +24,7 @@ FC_THRESHOLD = 50000
 NUM_THRESHOLD = 50000   # delta-code numeric dictionaries above this cardinality (mode 2)
 R = 128
 ZSTD_LEVEL = 9
+CODE_ZSTD_LEVEL = 19    # code-stream compression: clustered/skewed code arrays compress hugely
 
 def _encode_column(col):
     """Return (dtype, has_null, V, uniq_value_bytes_list, codes:int64[N], mode_is_string)."""
@@ -154,6 +155,19 @@ def _dict_bytes(p, zc):
         out += struct.pack('<I', len(fc)) + struct.pack('<I', len(z)) + z
     return out
 
+def _code_section(codes, bits):
+    """Per-row code array (mode 0/1/2): 1 tag byte + payload. tag 0 = raw bit-packed (current);
+    tag 1 = zstd of byte-aligned codes. Picks the smaller (gated) -- clustered/skewed code
+    arrays compress hugely (measured 34x on a sorted key), incompressible ones stay raw, paying
+    only the 1-byte tag. Byte-aligned (not bit-packed) before zstd: lets its matching work."""
+    packed = _pack_codes(codes, bits)
+    width = 1 if bits <= 8 else (2 if bits <= 16 else 4)
+    wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[width]
+    z = zstd.ZstdCompressor(level=CODE_ZSTD_LEVEL).compress(np.asarray(codes, dtype=wdt).tobytes())
+    if len(z) + 6 < len(packed):                 # tag(1)+width(1)+zlen(4) overhead
+        return bytes([1, width]) + struct.pack('<I', len(z)) + z
+    return bytes([0]) + packed
+
 def _serialize_column(p, zc):
     """Normal blob (mode 0/1/2), or mode-4 affine blob (header + WSQ1 seqcodec blob)."""
     if p['mode'] == 4:
@@ -164,7 +178,7 @@ def _serialize_column(p, zc):
     out = bytearray()
     out += _header(p['nm'], p['V'], p['bits'], p['dtype'], p['mode'], p['has_null'], p['aux'])
     out += _dict_bytes(p, zc)
-    out += _pack_codes(p['codes'], p['bits'])
+    out += _code_section(p['codes'], p['bits'])
     return bytes(out), (len(out), p['V'], p['bits'], p['dtype'], p['mode'], p['has_null'], p['aux'])
 
 def _serialize_fd(p, det_idx, det_codes):
@@ -233,7 +247,7 @@ def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_s
             det = fd_specs[nm]
             blobs[nm], sizes[nm] = _serialize_fd(preps[nm], col_idx[det], preps[det]['codes'])
     # assemble in column order
-    out = bytearray(b'WVDB3'); out += struct.pack('<H', len(cols)); out += struct.pack('<I', N)
+    out = bytearray(b'WVDB4'); out += struct.pack('<H', len(cols)); out += struct.pack('<I', N)
     for nm in cols: out += blobs[nm]
     open(out_path,'wb').write(out)
     return dict(n_rows=N, n_cols=len(cols), bytes=len(out), seconds=time.time()-t0, sizes=sizes)
