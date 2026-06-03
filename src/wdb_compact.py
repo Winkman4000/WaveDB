@@ -30,23 +30,28 @@ def _choose_fd_specs(kept):
         specs[dep] = det
     return specs
 
-def _segment_to_df(seg, schema):
-    """Reconstruct a segment's LIVE rows as a DataFrame, using the table schema for dtypes
-    (mirrors the insert path so re-encoding follows the tested route). Tombstoned rows
-    (presence sidecar) are dropped here -- this is where deleted space is physically
-    reclaimed: the compacted segment never contains them."""
-    stype = {c[0]: c[1] for c in schema}
+def _segment_to_df(seg, schema, phys=None, defaults=None):
+    """Reconstruct a segment's LIVE rows as a DataFrame keyed by PHYSICAL column name, using the
+    LOGICAL schema for the column set + dtypes. Tombstoned rows (presence sidecar) are dropped here
+    -- this is where deleted space is physically reclaimed. A column the segment PREDATES (ADD
+    COLUMN) is materialized from its default; a renamed column resolves through phys; a dropped
+    column is simply absent from the schema and so reclaimed."""
+    phys = phys or {}; defaults = defaults or {}
     pm = seg.presence_mask()           # bool[N] True=live, or None if all live
+    liveN = int(pm.sum()) if pm is not None else seg.N
     data = {}
-    for nm in seg.order:
-        vals = seg.values(nm)
-        if pm is not None:
-            vals = vals[pm]
-        wt = stype.get(nm, 'string')
-        if wt == 'datetime':
-            data[nm] = pd.to_datetime(pd.Series(list(vals)), errors='coerce')
+    for c, wt in [(x[0], x[1]) for x in schema]:
+        pcol = phys.get(c, c)
+        if pcol in seg.cols:
+            vals = seg.values(pcol)
+            if pm is not None: vals = vals[pm]
+            vals = list(vals)
         else:
-            data[nm] = pd.array(list(vals), dtype=_PD.get(wt, 'object'))
+            vals = [defaults.get(c)] * liveN      # ADD COLUMN: default materialized at compaction
+        if wt == 'datetime':
+            data[pcol] = pd.to_datetime(pd.Series(vals), errors='coerce')
+        else:
+            data[pcol] = pd.array(vals, dtype=_PD.get(wt, 'object'))
     return pd.DataFrame(data)
 
 def compact(catalog, name, seg_files=None):
@@ -63,9 +68,12 @@ def compact(catalog, name, seg_files=None):
     # 1) decode + union the target segments
     dfs = []
     candidate_labels = {}   # (det,dep) -> det_uniqueness (best/any)
+    import wdb_dml
     for sf in targets:
         seg = Segment(os.path.join(catalog.dbdir, sf))
-        dfs.append(_segment_to_df(seg, schema))
+        wdb_dml.register_synth(catalog, seg, name)   # synth ADD-COLUMN defaults so overrides on
+        dfs.append(_segment_to_df(seg, schema,       # them (and the default itself) materialize
+                                  catalog.phys_map(name), tinfo.get('defaults', {})))
         for lab in catalog.segment_labels(name, sf):
             candidate_labels[(lab['det'], lab['dep'])] = lab.get('det_uniqueness', 0.0)
     union = pd.concat(dfs, ignore_index=True)

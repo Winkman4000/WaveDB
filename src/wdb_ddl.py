@@ -69,9 +69,35 @@ def alter_table(catalog, sql, db=None):
         elif isinstance(act, E.RenameColumn):
             catalog.rename_column(name, act.this.name, act.args['to'].name)
         elif isinstance(act, E.ColumnDef):
-            raise NotImplementedError("ADD COLUMN is ALTER step d")
+            import wdb_dml
+            col = act.name; wt = _wdb_type(act.args['kind']); default = None
+            for con in (act.args.get('constraints') or []):
+                k = getattr(con, 'kind', None)
+                if isinstance(k, E.DefaultColumnConstraint):
+                    default = wdb_dml._litval(k.this)
+            catalog.add_column(name, col, wt, default)
+            _materialize_added_column(catalog, name, col, wt, default)
         elif isinstance(act, E.Drop):
             raise NotImplementedError("DROP COLUMN is ALTER step e")
         else:
             raise NotImplementedError(f"unsupported ALTER action: {type(act).__name__}")
     return name
+
+
+def _materialize_added_column(catalog, name, col, wt, default):
+    """Segment-mode tables keep a canonical buffer that is re-encoded on every write; the cheapest
+    correct thing is to fill the new column there (with its default) and re-encode now, so the
+    single segment carries it. Buffered tables have no canonical buffer -- their cold segments
+    synthesize the default at read instead (and the next flush writes the column for real)."""
+    import os, wdb_dml
+    import pandas as pd
+    bpath = wdb_dml._buffer_path(catalog, name)
+    if not os.path.exists(bpath):
+        return
+    df = pd.read_parquet(bpath); n = len(df)
+    if wt == 'datetime':
+        df[col] = pd.to_datetime(pd.Series([default] * n), errors='coerce')
+    else:
+        df[col] = pd.array([default] * n, dtype=wdb_dml._PD[wt])
+    df.to_parquet(bpath, index=False)
+    wdb_dml._encode_segment(catalog, name, bpath)

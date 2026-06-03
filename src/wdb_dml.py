@@ -10,6 +10,26 @@ import pandas as pd, numpy as np
 import wdb_encode, wdb_labels
 
 _PD = {'int': 'Int64', 'float': 'float64', 'string': 'object', 'datetime': 'datetime64[ns]'}
+_DT_CODE = {'int': 0, 'string': 1, 'float': 2, 'datetime': 3}
+
+def _synth_value(default, wtype):
+    """Coerce a catalog default into the engine's per-dtype constant form (strings -> bytes)."""
+    if default is None: return None
+    if wtype == 'string': return default.encode() if isinstance(default, str) else bytes(default)
+    if wtype == 'int':    return int(default)
+    if wtype == 'float':  return float(default)
+    return default                                  # datetime: engine parses string/epoch
+
+def register_synth(catalog, seg, name):
+    """Give `seg` a synthetic constant column for any logical column it physically PREDATES
+    (ADD COLUMN): the default is materialized at read instead of rewriting the segment. No-op for
+    segments that already carry every column (segment-mode tables materialize eagerly)."""
+    tab = catalog.get_table(name); phys = catalog.phys_map(name)
+    dmap = tab.get('defaults', {})
+    for c, wt in [(x[0], x[1]) for x in tab['schema']]:
+        pcol = phys.get(c, c)
+        if pcol not in seg.cols:
+            seg.add_const_column(pcol, _synth_value(dmap.get(c), wt), _DT_CODE[wt], 0)
 
 def _litval(node):
     if isinstance(node, E.Null): return None
@@ -47,11 +67,12 @@ def _buffer_path(catalog, name): return os.path.join(catalog.dbdir, f"{name}__bu
 def hot_path(catalog, name):    return os.path.join(catalog.dbdir, f"{name}__hot.parquet")
 def _segment_name(name): return f"{name}_0.wdb"
 
-def _rows_to_df(schema, order, rows, phys=None):
-    phys = phys or {}
+def _rows_to_df(schema, order, rows, phys=None, defaults=None):
+    phys = phys or {}; defaults = defaults or {}
     scol = [c[0] for c in schema]; stype = {c[0]: c[1] for c in schema}
-    if order and set(order) != set(scol):
-        raise ValueError(f"INSERT columns {order} don't match table columns {scol}")
+    if order and not set(order).issubset(set(scol)):
+        raise ValueError(f"INSERT columns {order} include names not in table columns {scol}")
+    # omitted columns fall back to their default (ADD COLUMN ... DEFAULT) or NULL
     order = order if order else scol
     for r in rows:
         if len(r) != len(order):
@@ -60,7 +81,7 @@ def _rows_to_df(schema, order, rows, phys=None):
     for r in rows:
         rowmap = dict(zip(order, r))
         for c in scol:
-            data[c].append(_coerce(rowmap.get(c), stype[c]))
+            data[c].append(_coerce(rowmap.get(c, defaults.get(c)), stype[c]))
     df = pd.DataFrame({c: pd.array(data[c], dtype=_PD[stype[c]]) for c in scol})
     # store under PHYSICAL names so buffer/hot parquet and the encoded segment all agree on one
     # stable storage name per column (logical names live in the catalog, resolved at read time)
@@ -112,7 +133,8 @@ def insert(catalog, sql):
     name, cols, rows = parse_insert(sql)
     tinfo = catalog.get_table(name)
     schema = tinfo['schema']
-    df_new = _rows_to_df(schema, cols, rows, phys=catalog.phys_map(name))
+    df_new = _rows_to_df(schema, cols, rows, phys=catalog.phys_map(name),
+                         defaults=tinfo.get('defaults', {}))
     mode = tinfo.get('mode', 'segment')
     if mode == 'buffered':
         # operator opted in: append to the hot buffer only, no re-encode (the win)
@@ -162,7 +184,7 @@ def delete(catalog, sql):
     if mode == 'buffered':
         segs = catalog.get_table(name)['segments']
         for sf, sp in zip(segs, catalog.segment_paths(name)):
-            seg = Segment(sp)
+            seg = Segment(sp); register_synth(catalog, seg, name)
             if pred is None:
                 idx = np.arange(seg.N)
             else:
@@ -247,7 +269,7 @@ def update(catalog, sql):
     if mode == 'buffered':
         segs = catalog.get_table(name)['segments']
         for sf, sp in zip(segs, catalog.segment_paths(name)):
-            seg = Segment(sp)
+            seg = Segment(sp); register_synth(catalog, seg, name)
             if pred is None:
                 idx = np.arange(seg.N)
             else:

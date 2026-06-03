@@ -46,6 +46,7 @@ class Database:
             cmap = {c: phys.get(c, c) for c in self.cat.column_names(name)}  # complete logical->physical
             paths = self.cat.segment_paths(name)
             segs = [Segment(p) for p in paths]
+            for sg in segs: wdb_dml.register_synth(self.cat, sg, name)   # ADD COLUMN: synth old segs
             hp = wdb_dml.hot_path(self.cat, name)
             hot = hp if os.path.exists(hp) else None
             if hot is None and len(segs) == 1:

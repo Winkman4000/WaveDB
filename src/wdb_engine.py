@@ -83,6 +83,27 @@ class Segment:
         self.buf = np.frombuffer(buf, dtype=np.uint8); self._codes = {}
         self.path = path; self._presence = 0   # 0 = not yet loaded
         self._ov = 0                            # override sidecar: 0 = not yet loaded
+        self._synth = {}                        # mode-6 synthetic constant columns (ADD COLUMN)
+    def add_const_column(self, name, value, dt, aux=0):
+        """Register a synthetic constant column: `value` for ALL N live rows. Used for a logical
+        column this immutable segment PREDATES (ADD COLUMN) -- the default is materialized lazily
+        at read instead of rewriting the segment. Engine-internal mode 6; never serialized. value
+        None means the column reads as NULL everywhere. Overrides/presence ride on top normally."""
+        self.cols[name] = dict(V=1, bits=1, dt=dt, mode=6, has_null=(1 if value is None else 0),
+                               n_dict=1, aux=aux)
+        self._synth[name] = value
+
+    def _const_array(self, nm):
+        v = self._synth[nm]; c = self.cols[nm]; N = self.N
+        if v is None: return np.full(N, None, dtype=object)
+        if c['dt'] == 0: return np.full(N, int(v), dtype=np.int64)
+        if c['dt'] == 2: return np.full(N, float(v), dtype=np.float64)
+        if c['dt'] == 3:
+            unit = _DT_UNITS[c['aux']]
+            ev = int(v) if isinstance(v, (int, np.integer)) else np.datetime64(v).astype(f'datetime64[{unit}]').view('int64')
+            return np.full(N, ev, dtype=np.int64).view(f'datetime64[{unit}]')
+        return np.full(N, v, dtype=object)           # string/bytes constant
+
     def _decode_fc(self, c):
         raw = self._dz.decompress(c['z']); vals = []; prev = b''; o = 0; i = 0; R = c['R']
         while o < len(raw):
@@ -130,6 +151,9 @@ class Segment:
     def _raw_codes(self, nm):
         if nm in self._codes: return self._codes[nm]
         c = self.cols[nm]
+        if c['mode'] == 6:
+            cc = np.zeros(self.N, dtype=np.int64)    # constant column: a single group
+            self._codes[nm] = cc; return cc
         if c['mode'] == 4:
             cc = np.arange(self.N, dtype=np.int64)   # identity codes: value = f(position)
             self._codes[nm] = cc; return cc
@@ -214,6 +238,7 @@ class Segment:
         return eff[1] if eff is not None else []
     def _typed_dict(self, nm):
         c = self.cols[nm]
+        if c['mode'] == 6: return [self._synth[nm]]
         if c['mode'] == 4: return list(self._seq_decode(c))  # decoded values (override path only)
         if c['mode'] == 5: self._raw_codes(nm); return list(c['_idict'])  # factorized (override path)
         if c['mode'] == 2: return self._dict_ints(c)  # int64 array (dt 0/3)
@@ -238,6 +263,8 @@ class Segment:
         return out
     def _base_values(self, nm):
         c = self.cols[nm]
+        if c['mode'] == 6:
+            return self._const_array(nm)
         if c['mode'] == 4:
             arr = self._seq_decode(c)
             return arr.view(f"datetime64[{_DT_UNITS[c['aux']]}]") if c['dt'] == 3 else arr
@@ -272,6 +299,7 @@ class Segment:
                 return np.int64(v).view(f"datetime64[{_DT_UNITS[c['aux']]}]")
             return v
         if c['has_null'] and code == c['V'] - 1: return None
+        if c['mode'] == 6: return self._synth[nm]
         if c['mode'] == 4:
             v = int(self._seq_decode(c)[code])
             return np.int64(v).view(f"datetime64[{_DT_UNITS[c['aux']]}]") if c['dt'] == 3 else v
