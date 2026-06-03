@@ -84,6 +84,7 @@ class Segment:
         self.path = path; self._presence = 0   # 0 = not yet loaded
         self._ov = 0                            # override sidecar: 0 = not yet loaded
         self._synth = {}                        # mode-6 synthetic constant columns (ADD COLUMN)
+        self._tdict = {}                        # memo: decoded base dict per column (immutable .wdb)
     def add_const_column(self, name, value, dt, aux=0):
         """Register a synthetic constant column: `value` for ALL N live rows. Used for a logical
         column this immutable segment PREDATES (ADD COLUMN) -- the default is materialized lazily
@@ -237,13 +238,19 @@ class Segment:
         eff = self._effective(nm)
         return eff[1] if eff is not None else []
     def _typed_dict(self, nm):
+        if nm in self._tdict: return self._tdict[nm]
+        r = self._typed_dict_uncached(nm)
+        if self.cols[nm]['mode'] != 6:   # mode-6 synth value can change via register_synth; don't memo
+            self._tdict[nm] = r
+        return r
+    def _typed_dict_uncached(self, nm):
         c = self.cols[nm]
         if c['mode'] == 6: return [self._synth[nm]]
         if c['mode'] == 4: return list(self._seq_decode(c))  # decoded values (override path only)
         if c['mode'] == 5: self._raw_codes(nm); return list(c['_idict'])  # factorized (override path)
         if c['mode'] == 2: return self._dict_ints(c)  # int64 array (dt 0/3)
         if c['dt'] == 0: return [int(v) for v in c['vals']]
-        if c['dt'] == 2: return [struct.unpack('<d', v)[0] for v in c['vals']]
+        if c['dt'] == 2: return np.frombuffer(b''.join(c['vals']), dtype='<f8')   # vectorized + memoized
         if c['dt'] == 3: return [struct.unpack('<q', v)[0] for v in c['vals']]   # int64 epoch
         return self.dict_vals(nm)  # bytes
     def unit(self, nm):

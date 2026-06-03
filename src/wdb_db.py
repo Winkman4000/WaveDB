@@ -12,14 +12,47 @@ import sqlglot, sqlglot.expressions as E
 from wdb_catalog import Catalog
 from wdb_engine import Segment
 import os
-import wdb_ddl, wdb_dml, wdb_sql, wdb_merge, wdb_compact, wdb_join
+import wdb_ddl, wdb_dml, wdb_sql, wdb_merge, wdb_compact, wdb_join, wdb_fkptr
+import numpy as np
 
 class Database:
-    def __init__(self, catalog): self.cat = catalog
+    def __init__(self, catalog):
+        self.cat = catalog
+        self._seg_cache = {}   # path -> ((mtime_ns,size), Segment): immutable .wdb base, reused across queries
+        self._ptr_cache = {}   # (child_seg_path, fk_col) -> ((mtime_ns,size), int64 ptr array)
+
     @classmethod
     def create(cls, dbdir): return cls(Catalog.create(dbdir))
     @classmethod
     def open(cls, dbdir): return cls(Catalog.open(dbdir))
+
+    def open_segment(self, path, table=None):
+        """Cached Segment for an immutable .wdb. Construction reads+parses the whole file (~200ms for a
+        large segment), so caching makes repeated analytical queries pay that cost once. Reconstructs only
+        if the file changed (mtime/size). Mutable state is refreshed every call: presence (DELETE) and
+        override (UPDATE) sidecars are forced to reload, and ADD COLUMN synth columns re-registered."""
+        st = os.stat(path); key = (st.st_mtime_ns, st.st_size)
+        hit = self._seg_cache.get(path)
+        if hit is None or hit[0] != key:
+            seg = Segment(path); self._seg_cache[path] = (key, seg)
+        else:
+            seg = hit[1]
+            seg._presence = 0; seg._ov = 0   # reload DELETE/UPDATE sidecars (do not change .wdb mtime)
+        if table is not None:
+            wdb_dml.register_synth(self.cat, seg, table)
+        return seg
+
+    def fk_pointer(self, child_seg_path, fk_col):
+        """Cached FK-pointer array (absolute parent row positions). The sidecar is immutable once built
+        (only create_fk_pointer rewrites it), so decompress+cumsum is paid once, not per query. None if
+        no sidecar exists."""
+        sp = wdb_fkptr.path_for(child_seg_path, fk_col)
+        if not os.path.exists(sp): return None
+        st = os.stat(sp); key = (st.st_mtime_ns, st.st_size)
+        ck = (child_seg_path, fk_col); hit = self._ptr_cache.get(ck)
+        if hit is None or hit[0] != key:
+            arr = wdb_fkptr.load(child_seg_path, fk_col); self._ptr_cache[ck] = (key, arr); return arr
+        return hit[1]
 
     def _table_in(self, tree):
         f = tree.find(E.From)
@@ -47,8 +80,7 @@ class Database:
             phys = self.cat.phys_map(name)
             cmap = {c: phys.get(c, c) for c in self.cat.column_names(name)}  # complete logical->physical
             paths = self.cat.segment_paths(name)
-            segs = [Segment(p) for p in paths]
-            for sg in segs: wdb_dml.register_synth(self.cat, sg, name)   # ADD COLUMN: synth old segs
+            segs = [self.open_segment(p, name) for p in paths]
             hp = wdb_dml.hot_path(self.cat, name)
             hot = hp if os.path.exists(hp) else None
             if hot is None and len(segs) == 1:
@@ -57,6 +89,31 @@ class Database:
                 raise ValueError(f"table {name!r} has no data yet")
             return wdb_merge.merge_query(segs, hot, sql, col_map=cmap)
         raise NotImplementedError(f"unsupported statement: {type(tree).__name__}")
+
+    def create_fk_pointer(self, child, fk_col, parent, parent_key):
+        """Pre-resolve a foreign key into a stored parent-row pointer, turning future joins on
+        child.fk_col = parent.parent_key into a gather. Requires single-segment tables and the parent
+        stored sorted by a UNIQUE parent_key. Verifies referential integrity. Saves a sidecar."""
+        cpaths = self.cat.segment_paths(child); ppaths = self.cat.segment_paths(parent)
+        if len(cpaths) != 1 or len(ppaths) != 1:
+            raise NotImplementedError("create_fk_pointer: single-segment tables only (step 1)")
+        cseg = Segment(cpaths[0]); pseg = Segment(ppaths[0])
+        pphys = self.cat.phys_map(parent); cphys = self.cat.phys_map(child)
+        pk = pseg.values(pphys.get(parent_key, parent_key))
+        if pk.dtype.kind not in 'iufM':
+            raise NotImplementedError("create_fk_pointer: numeric/temporal parent key only (step 1)")
+        if not np.all(pk[1:] >= pk[:-1]):
+            raise ValueError(f"parent {parent!r} is not stored sorted by {parent_key!r}")
+        if len(np.unique(pk)) != len(pk):
+            raise ValueError(f"parent key {parent_key!r} is not unique")
+        fk = cseg.values(cphys.get(fk_col, fk_col))
+        ptr = np.searchsorted(pk, fk)
+        in_range = ptr < len(pk)
+        if not (in_range.all() and np.array_equal(pk[np.where(in_range, ptr, 0)], fk)):
+            raise ValueError("referential integrity violation: some child keys are absent in the parent")
+        wdb_fkptr.save(cpaths[0], fk_col, ptr.astype(np.int64))
+        self.cat.add_fk_pointer(child, fk_col, parent, parent_key)
+        return len(ptr)
 
     def set_table_mode(self, name, mode):
         """Operator control: 'buffered' = high-traffic, INSERT appends to hot buffer

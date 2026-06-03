@@ -127,6 +127,14 @@ class Catalog:
     def table_mode(self, name):
         return self.get_table(name).get('mode', 'segment')
 
+    def add_fk_pointer(self, child, fk_col, parent, parent_key):
+        """Record that child.fk_col is a pre-resolved pointer into parent (stored sorted by parent_key)."""
+        self.get_table(child).setdefault('fk_pointers', {})[fk_col] = {'parent': parent, 'parent_key': parent_key}
+        self.save()
+
+    def fk_pointers(self, name):
+        return self.get_table(name).get('fk_pointers', {})
+
     def segment_paths(self, name):
         t = self.get_table(name)
         return [os.path.join(self.dbdir, s) for s in t['segments']]
