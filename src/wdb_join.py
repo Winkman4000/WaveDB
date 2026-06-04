@@ -7,6 +7,7 @@ foreign-key POINTER into the parent's rows -- a gather join (array index, no has
 is the hash baseline + the shared post-join evaluator; the gather kernel layers on top.
 Correctness first: verified against DuckDB. Unsupported shapes raise NotImplementedError.
 """
+import re
 import sqlglot, sqlglot.expressions as E
 import numpy as np, pandas as pd, os
 from wdb_engine import Segment
@@ -209,6 +210,11 @@ class _FastUnsupported(Exception):
     pass
 
 _FAST_HITS = 0   # diagnostic: how many queries took the gather fast path
+LUT_MAX_CARD = 65536   # code-LUT predicate fusion (LIKE / string-ordering / IS NULL) precomputes
+                       # keep[code]=pred(dict_value) over the dictionary; viable only while the dict
+                       # is small. Measured precompute (LIKE regex over D dict values): 0.02ms@200,
+                       # 0.88ms@10k, 90ms@1M -- so cap at low-card categoricals; high-card (name/
+                       # comment) columns fall back to the mask/row path.
 FUSE_STR_PRED = True   # string '='/'!=' -> inline code comparison (codes[i]==target). Measured to
                        # beat both the identity-base trick and the materialised-mask path at every
                        # cardinality, fact AND gathered-parent, at sf=1 -- so no runtime switch is
@@ -499,31 +505,87 @@ def _fast_pointer_agg(db, tree, ctx):
             slot_list.append((None, np.ascontiguousarray(codes),
                               None if cptr is None else np.ascontiguousarray(cptr)))
         return f"v{slots[ckey]}", code_of, nullcode
+    def _code_lut(cseg, cpcol, cptr, fn, mark_null=False):
+        # ARBITRARY single-column string predicate -> code-LUT: precompute keep[code]=fn(dict_value) over
+        # the (small) dictionary, add it as a value slot whose base IS that bool table, predicate -> 'vk!=0'.
+        # Reuses the value-slot kernel verbatim (base[codes[i]]); gated on dict cardinality (precompute cost).
+        sc = _str_codes(cseg, cpcol)
+        if sc is None: raise _FastUnsupported
+        codes, code_of, nullcode = sc
+        ncodes = max(max(code_of.values(), default=-1),
+                     nullcode if nullcode is not None else -1) + 1
+        if ncodes == 0 or ncodes > LUT_MAX_CARD: raise _FastUnsupported
+        keep = np.zeros(ncodes, dtype=np.int8)
+        if mark_null:
+            if nullcode is not None: keep[nullcode] = 1            # IS NULL
+        else:
+            for vb, cd in code_of.items():
+                if fn(vb): keep[cd] = 1
+        slot_list.append((keep, np.ascontiguousarray(codes),
+                          None if cptr is None else np.ascontiguousarray(cptr)))
+        return f"v{len(slot_list) - 1}"
+    def _like_fn(cseg, cpcol, pat_node, ci):
+        pb = _lit_bytes(cseg, cpcol, pat_node)
+        patt = pb.decode('utf-8', 'replace') if isinstance(pb, (bytes, bytearray)) else str(pb)
+        rxsrc = '^' + re.escape(patt).replace('%', '.*').replace('_', '.') + '$'   # SQL LIKE -> regex
+        rx = re.compile(rxsrc, re.IGNORECASE if ci else 0)
+        def _f(vb):
+            v = vb.decode('utf-8', 'replace') if isinstance(vb, (bytes, bytearray)) else str(vb)
+            return rx.match(v) is not None
+        return _f
     def build_pred(node):
         # Compile a WHERE predicate to a numba boolean over the shared slots. Covers AND/OR/NOT, numeric &
-        # datetime comparisons (incl. column-vs-column and arithmetic sides), BETWEEN, and string '='/'!='/IN
-        # via inline dictionary-code comparison. Raises _FastUnsupported otherwise -> materialised mask.
+        # datetime comparisons (incl. column-vs-column and arithmetic sides), BETWEEN, string '='/'!='/IN
+        # via inline code comparison, and arbitrary single-string-column predicates (LIKE, ordering, IS NULL)
+        # via a precomputed code-LUT. Raises _FastUnsupported otherwise -> materialised mask.
         if isinstance(node, E.Paren): return build_pred(node.this)
         if isinstance(node, E.And): return f"({build_pred(node.this)} and {build_pred(node.expression)})"
         if isinstance(node, E.Or):  return f"({build_pred(node.this)} or {build_pred(node.expression)})"
         if isinstance(node, E.Not): return f"(not {build_pred(node.this)})"
+        if isinstance(node, (E.Like, E.ILike)):           # LIKE / ILIKE -> code-LUT over the dictionary
+            if not FUSE_STR_PRED: raise _FastUnsupported
+            col = node.this
+            if not isinstance(col, E.Column): raise _FastUnsupported
+            cseg, cpcol, cptr = resolve(col)
+            if cseg.cols[cpcol]['dt'] != 1: raise _FastUnsupported
+            pat = node.expression
+            if not isinstance(pat, E.Literal) or not pat.is_string: raise _FastUnsupported
+            vk = _code_lut(cseg, cpcol, cptr, _like_fn(cseg, cpcol, pat, isinstance(node, E.ILike)))
+            return f"({vk} == 0)" if node.args.get('negate') else f"({vk} != 0)"   # NOT LIKE -> negate=True
+        if isinstance(node, E.Is):                        # IS NULL (IS NOT NULL handled via E.Not)
+            col = node.this
+            if not isinstance(col, E.Column) or not isinstance(node.expression, E.Null):
+                raise _FastUnsupported
+            cseg, cpcol, cptr = resolve(col)
+            if cseg.cols[cpcol]['dt'] != 1: raise _FastUnsupported   # numeric IS NULL: presence -> later
+            vk = _code_lut(cseg, cpcol, cptr, None, mark_null=True)
+            return f"({vk} != 0)"
         if type(node) in _CMP_STR:
             op = _CMP_STR[type(node)]; a, b = node.this, node.expression
             if not _is_lit(a) and not _is_lit(b):          # value-expr vs value-expr (e.g. col < col)
                 return f"({build_fused(a)} {op} {build_fused(b)})"   # numeric/datetime; string -> raises
             if _is_lit(a) and _is_lit(b): raise _FastUnsupported
             col, lit, left = (a, b, True) if not _is_lit(a) else (b, a, False)
-            if not isinstance(col, E.Column): raise _FastUnsupported    # computed vs literal -> mask (rare)
+            if not isinstance(col, E.Column):          # computed expr vs numeric literal -> fuse both
+                if not (isinstance(lit, E.Literal) and not lit.is_string): raise _FastUnsupported
+                v = build_fused(col)
+                lv = float(lit.this) if ('.' in lit.this or 'e' in lit.this.lower()) else int(lit.this)
+                return f"({v} {op} {lv})" if left else f"({lv} {op} {v})"
             cseg, cpcol, cptr = resolve(col)
-            if cseg.cols[cpcol]['dt'] == 1:                # string -> CODE comparison
-                if not FUSE_STR_PRED: raise _FastUnsupported
-                if type(node) not in (E.EQ, E.NEQ): raise _FastUnsupported   # ordering on strings -> mask
-                if not lit.is_string: raise _FastUnsupported
-                vk, code_of, nullcode = _str_slot(cseg, cpcol, cptr)
-                target = code_of.get(_lit_bytes(cseg, cpcol, lit), -1)
-                if type(node) is E.EQ: return f"({vk} == {target})"
-                if nullcode is None:   return f"({vk} != {target})"
-                return f"(({vk} != {target}) and ({vk} != {nullcode}))"   # SQL: NULL != x is not TRUE
+            if cseg.cols[cpcol]['dt'] == 1:                # string
+                if not FUSE_STR_PRED or not lit.is_string: raise _FastUnsupported
+                if type(node) in (E.EQ, E.NEQ):            # equality -> direct code comparison
+                    vk, code_of, nullcode = _str_slot(cseg, cpcol, cptr)
+                    target = code_of.get(_lit_bytes(cseg, cpcol, lit), -1)
+                    if type(node) is E.EQ: return f"({vk} == {target})"
+                    if nullcode is None:   return f"({vk} != {target})"
+                    return f"(({vk} != {target}) and ({vk} != {nullcode}))"   # SQL: NULL != x not TRUE
+                litb = _lit_bytes(cseg, cpcol, lit)        # ordering -> code-LUT (dict not order-preserving)
+                opf = _OPS[type(node)]
+                if not left:
+                    opf = _OPS[{E.GT: E.LT, E.LT: E.GT, E.GTE: E.LTE, E.LTE: E.GTE}[type(node)]]
+                vk = _code_lut(cseg, cpcol, cptr, lambda vb, opf=opf, litb=litb: bool(opf(vb, litb)))
+                return f"({vk} != 0)"
             v = build_fused(col)
             kind = 'f' if cseg.cols[cpcol]['dt'] == 2 else 'i'
             lv = wdb_sql._lit_for_col(cseg, cpcol, lit, kind)

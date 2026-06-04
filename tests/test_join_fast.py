@@ -333,3 +333,33 @@ def test_chain_where_fused_q12_clause():
 def test_chain_where_fused_in_none_present():
     _match("SELECT l.l_returnflag, COUNT(*) " + _J3 +
            "WHERE l.l_shipmode IN ('NOSUCH','ZZZ') GROUP BY l.l_returnflag")
+
+
+# ── code-LUT predicate fusion: LIKE / string-ordering / IS NULL / computed-vs-literal ──
+def test_chain_where_fused_like_prefix():
+    _match("SELECT l.l_returnflag, COUNT(*) " + _J3 +
+           "WHERE l.l_shipmode LIKE 'A%' GROUP BY l.l_returnflag")
+def test_chain_where_fused_like_contains():
+    _match("SELECT l.l_returnflag, COUNT(*) " + _J3 +
+           "WHERE o.o_orderpriority LIKE '%URGENT%' GROUP BY l.l_returnflag")
+def test_chain_where_fused_like_underscore():
+    _match("SELECT l.l_returnflag, COUNT(*) " + _J3 +
+           "WHERE l.l_shipmode LIKE 'R_IL' GROUP BY l.l_returnflag")
+def test_chain_where_fused_not_like():
+    _match("SELECT l.l_returnflag, COUNT(*) " + _J3 +
+           "WHERE l.l_shipmode NOT LIKE 'A%' GROUP BY l.l_returnflag")
+def test_chain_where_fused_string_ordering():
+    _match("SELECT l.l_returnflag, COUNT(*) " + _J3 +
+           "WHERE o.o_orderpriority > '3-MEDIUM' GROUP BY l.l_returnflag")
+def test_chain_where_fused_like_parent():
+    _match("SELECT l.l_returnflag, COUNT(*) " + _J3 +
+           "WHERE c.c_mktsegment LIKE 'B%' GROUP BY l.l_returnflag")
+def test_chain_where_fused_is_not_null():
+    _match("SELECT l.l_returnflag, COUNT(*) " + _J3 +
+           "WHERE l.l_shipmode IS NOT NULL GROUP BY l.l_returnflag")
+def test_chain_where_fused_computed_vs_literal():
+    _match("SELECT l.l_returnflag, COUNT(*) " + _J3 +
+           "WHERE l.l_extendedprice * l.l_discount > 5000 GROUP BY l.l_returnflag")
+def test_chain_where_fused_like_and_numeric():
+    _match("SELECT l.l_returnflag, SUM(l.l_extendedprice) " + _J3 +
+           "WHERE l.l_shipmode LIKE '%AIL' AND l.l_quantity > 30 GROUP BY l.l_returnflag")
