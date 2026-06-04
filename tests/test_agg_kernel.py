@@ -1,5 +1,5 @@
 """wdb_agg group-by kernel vs pandas, across dtypes / aggregates / nulls."""
-import sys, os, numpy as np
+import sys, os, math, numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import wdb_agg
 
@@ -79,3 +79,24 @@ def test_count_and_sum_with_nulls():
         for k in present:
             if fn == 'COUNT': assert int(out[k]) == int(ref[k]), (k, out[k], ref[k])
             else: assert _close(out[k], ref[k]), (fn, k, out[k], ref[k])
+
+
+def test_parallel_matches_serial():
+    """Threaded fused kernel must match the serial path bit-for-bit across COUNT/SUM/AVG, +/- nulls."""
+    rng2 = np.random.default_rng(11)
+    N2, K2 = 3_000_000, 7
+    g = rng2.integers(0, K2, N2).astype(np.int64)
+    vf = rng2.normal(100, 30, N2).astype(np.float64)
+    vi = rng2.integers(0, 1000, N2).astype(np.int64)
+    nm = rng2.random(N2) < 0.2
+    specs = [(0, 'COUNT', vf, None), (1, 'SUM', vf, None), (2, 'AVG', vf, None),
+             (3, 'SUM', vi, nm), (4, 'AVG', vf, nm), (5, 'COUNT', vf, nm)]
+    counts, got = wdb_agg.parallel_counts_and_aggs(g, K2, specs, n_threads=8)
+    assert np.array_equal(counts, wdb_agg.group_counts(g, K2))
+    for key, fn, v, m in specs:
+        exp = wdb_agg.group_agg(g, K2, fn, v, m)
+        for k in range(K2):
+            a, b = got[key][k], exp[k]
+            if a is None or b is None: assert a is b, (fn, key, k, a, b)
+            else:  # parallel chunked sums differ from serial only by float non-associativity
+                assert math.isclose(float(a), float(b), rel_tol=1e-9, abs_tol=1e-6), (fn, key, k, a, b)

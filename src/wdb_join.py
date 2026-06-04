@@ -300,27 +300,41 @@ def _fast_pointer_agg(db, tree, child, parent, child_alias, parent_alias, fk_col
         n = int(mask.sum()) if mask is not None else len(ptr)
         gcodes = np.zeros(n, dtype=np.int64); K = 1; gseg = gpcol = None
 
-    counts = wdb_agg.group_counts(gcodes, K)
-    present = np.nonzero(counts > 0)[0]
-
     # ---- per-projection results ----
+    # COUNT/SUM/AVG are deferred into `specs` and computed in one pass (threaded above a row threshold);
+    # MIN/MAX run on the serial kernel; bare key columns map straight to the group value.
     _CLS = {E.Sum: 'SUM', E.Avg: 'AVG', E.Min: 'MIN', E.Max: 'MAX'}
     col_results = {}
+    specs = []
     for i, p in enumerate(proj):
         inner = p.this if isinstance(p, E.Alias) else p
         if isinstance(inner, E.Count) and (isinstance(inner.this, E.Star) or inner.this is None):
             col_results[i] = ('count',)
         elif isinstance(inner, E.Count):
             arr, nm, seg, pcol = col_native(inner.this)
-            col_results[i] = ('arr', wdb_agg.group_agg(gcodes, K, 'COUNT', sel(arr), sel(nm) if nm is not None else None), False, None)
+            specs.append((i, 'COUNT', sel(arr), sel(nm) if nm is not None else None))
+            col_results[i] = ('arr', None, False, None)
         elif type(inner) in _CLS:
             fn = _CLS[type(inner)]; arr, nm, seg, pcol = col_native(inner.this)
-            res = wdb_agg.group_agg(gcodes, K, fn, sel(arr), sel(nm) if nm is not None else None)
-            is_dt = seg.cols[pcol]['dt'] == 3 and fn in ('MIN', 'MAX')
-            col_results[i] = ('arr', res, is_dt, (seg.unit(pcol) if is_dt else None))
+            mv = sel(arr); mn = sel(nm) if nm is not None else None
+            if fn in ('MIN', 'MAX'):
+                is_dt = seg.cols[pcol]['dt'] == 3
+                col_results[i] = ('arr', wdb_agg.group_agg(gcodes, K, fn, mv, mn), is_dt,
+                                  (seg.unit(pcol) if is_dt else None))
+            else:
+                specs.append((i, fn, mv, mn)); col_results[i] = ('arr', None, False, None)
         else:
             if gseg is None: raise _FastUnsupported   # bare key column without GROUP BY
             col_results[i] = ('key',)
+
+    if len(gcodes) >= wdb_agg.PARALLEL_THRESHOLD:
+        counts, agg_arrays = wdb_agg.parallel_counts_and_aggs(gcodes, K, specs)
+    else:
+        counts = wdb_agg.group_counts(gcodes, K)
+        agg_arrays = {i: wdb_agg.group_agg(gcodes, K, fn, v, nm) for (i, fn, v, nm) in specs}
+    for i, arr in agg_arrays.items():
+        cr = col_results[i]; col_results[i] = ('arr', arr, cr[2], cr[3])
+    present = np.nonzero(counts > 0)[0]
 
     # ---- assemble rows ----
     rows = []
