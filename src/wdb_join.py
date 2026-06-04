@@ -247,6 +247,12 @@ def _fast_pointer_agg(db, tree, child, parent, child_alias, parent_alias, fk_col
     ptr = db.fk_pointer(csp, fk_col)
     if ptr is None: raise _FastUnsupported
 
+    _colmemo = {}
+    def _col_cached(seg, pcol):                 # decode each column once per query (multi-agg reuse)
+        k = (id(seg), pcol)
+        if k not in _colmemo: _colmemo[k] = wdb_sql._col(seg, pcol)
+        return _colmemo[k]
+
     ccols = set(db.cat.column_names(child)); pcols = set(db.cat.column_names(parent))
     cphys = db.cat.phys_map(child);          pphys = db.cat.phys_map(parent)
 
@@ -257,7 +263,7 @@ def _fast_pointer_agg(db, tree, child, parent, child_alias, parent_alias, fk_col
         raise _FastUnsupported
     def col_native(node):
         seg, pcol, gathered = resolve(node)
-        arr, nm = wdb_sql._col(seg, pcol)
+        arr, nm = _col_cached(seg, pcol)
         if gathered:
             arr = arr[ptr]; nm = nm[ptr] if nm is not None else None
         return arr, nm, seg, pcol
@@ -265,32 +271,74 @@ def _fast_pointer_agg(db, tree, child, parent, child_alias, parent_alias, fk_col
         # like col_native but un-gathered: parent columns become ('g', arr, ptr) so the gather happens
         # per-chunk inside the threaded kernel instead of materialising the full gathered array here.
         seg, pcol, gathered = resolve(node)
-        arr, nm = wdb_sql._col(seg, pcol)
+        arr, nm = _col_cached(seg, pcol)
         if gathered:
             return ('g', arr, ptr), (('g', nm, ptr) if nm is not None else None), seg, pcol
         return ('d', arr), (('d', nm) if nm is not None else None), seg, pcol
 
     # ---- WHERE -> boolean mask over child rows ----
+    # Each predicate is evaluated on the UN-gathered column (the small parent side when it is a parent
+    # column) and the resulting bool is gathered to child rows -- and string =, !=, IN compare integer
+    # CODES, never materialised strings. Both avoid touching a 6M-row object array (measured 76 -> ~3 ms).
     _OPS = {E.EQ: operator.eq, E.NEQ: operator.ne, E.GT: operator.gt, E.LT: operator.lt,
             E.GTE: operator.ge, E.LTE: operator.le}
+    def _str_codes(seg, pcol):
+        c = seg.cols[pcol]
+        if c['dt'] != 1 or c['mode'] == 4: return None        # only value-identity string dicts
+        if c['mode'] == 5: seg._raw_codes(pcol); dv = seg.cols[pcol].get('_idict')
+        else:
+            try: dv = seg.dict_vals(pcol)
+            except Exception: return None
+        if dv is None: return None
+        code_of = {(v if isinstance(v, (bytes, bytearray)) else str(v).encode()): i for i, v in enumerate(dv)}
+        return seg.codes(pcol), code_of, (c['V'] - 1 if c['has_null'] else None)
+    def _lit_bytes(seg, pcol, e):
+        b = wdb_sql._lit_for_col(seg, pcol, e, 'O')
+        return b if isinstance(b, (bytes, bytearray)) else str(b).encode()
+    def leaf(colnode, make_bool):
+        seg, pcol, gathered = resolve(colnode)   # evaluate un-gathered, then gather the bool if parent
+        b = make_bool(seg, pcol)
+        return b[ptr] if gathered else b
     def mask_eval(node):
         if isinstance(node, E.Paren): return mask_eval(node.this)
         if isinstance(node, E.And): return mask_eval(node.this) & mask_eval(node.expression)
         if isinstance(node, E.Or):  return mask_eval(node.this) | mask_eval(node.expression)
         if isinstance(node, E.Not): return ~mask_eval(node.this)
         if type(node) in _OPS:
-            arr, _, seg, pcol = col_native(node.this)
-            v = wdb_sql._lit_for_col(seg, pcol, node.expression, arr.dtype.kind)
-            return _OPS[type(node)](arr, v)
+            op = type(node)
+            def mk(seg, pcol):
+                if op in (E.EQ, E.NEQ):
+                    sc = _str_codes(seg, pcol)
+                    if sc is not None:                       # code comparison, no object materialisation
+                        codes, code_of, nullcode = sc
+                        tc = code_of.get(_lit_bytes(seg, pcol, node.expression), -1)
+                        if op is E.EQ: return codes == tc
+                        res = codes != tc
+                        if nullcode is not None: res &= (codes != nullcode)   # SQL: NULL != x is not TRUE
+                        return res
+                arr, _ = _col_cached(seg, pcol)
+                v = wdb_sql._lit_for_col(seg, pcol, node.expression, arr.dtype.kind)
+                return _OPS[op](arr, v)
+            return leaf(node.this, mk)
         if isinstance(node, E.Between):
-            arr, _, seg, pcol = col_native(node.this)
-            lo = wdb_sql._lit_for_col(seg, pcol, node.args['low'], arr.dtype.kind)
-            hi = wdb_sql._lit_for_col(seg, pcol, node.args['high'], arr.dtype.kind)
-            return (arr >= lo) & (arr <= hi)
+            def mk(seg, pcol):
+                arr, _ = _col_cached(seg, pcol)
+                lo = wdb_sql._lit_for_col(seg, pcol, node.args['low'], arr.dtype.kind)
+                hi = wdb_sql._lit_for_col(seg, pcol, node.args['high'], arr.dtype.kind)
+                return (arr >= lo) & (arr <= hi)
+            return leaf(node.this, mk)
         if isinstance(node, E.In):
-            arr, _, seg, pcol = col_native(node.this)
-            vals = [wdb_sql._lit_for_col(seg, pcol, e, arr.dtype.kind) for e in (node.args.get('expressions') or [])]
-            return np.isin(arr, vals)
+            def mk(seg, pcol):
+                exprs = node.args.get('expressions') or []
+                sc = _str_codes(seg, pcol)
+                if sc is not None:
+                    codes, code_of, _ = sc
+                    tcs = [code_of[b] for b in (_lit_bytes(seg, pcol, e) for e in exprs) if b in code_of]
+                    return np.isin(codes, tcs)
+                arr, _ = _col_cached(seg, pcol)
+                vals = [wdb_sql._lit_for_col(seg, pcol, e, arr.dtype.kind) for e in exprs]
+                return np.isin(arr, vals)
+            return leaf(node.this, mk)
         raise _FastUnsupported
     where = tree.args.get('where')
     mask = mask_eval(where.this) if where is not None else None
