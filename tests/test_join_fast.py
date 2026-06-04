@@ -254,3 +254,19 @@ def test_chain_arith_two_parent_keys():
 def test_chain_arith_multikey_avg_order():
     _match("SELECT c.c_mktsegment, l.l_returnflag, AVG(l.l_extendedprice*(1-l.l_discount)) AS a " + _J3 +
            "GROUP BY c.c_mktsegment, l.l_returnflag ORDER BY a DESC LIMIT 4", ordered=True)
+
+
+# ── unified single-pass: multiple plain value aggregates over a multi-key group (no value matrix) ──
+def test_chain_plain_multikey_multivalue():
+    _match("SELECT l.l_returnflag, l.l_linestatus, SUM(l.l_extendedprice), SUM(l.l_quantity), COUNT(*) "
+           + _J3 + "GROUP BY l.l_returnflag, l.l_linestatus")
+def test_chain_plain_multikey_parent_multivalue():
+    _match("SELECT c.c_mktsegment, o.o_orderpriority, SUM(l.l_extendedprice), COUNT(*), "
+           "AVG(l.l_quantity) " + _J3 + "GROUP BY c.c_mktsegment, o.o_orderpriority")
+def test_chain_mixed_plain_arith_onepass():
+    _match("SELECT l.l_returnflag, COUNT(*), SUM(l.l_extendedprice), SUM(l.l_quantity), "
+           "SUM(l.l_extendedprice*(1-l.l_discount)) AS rev, MIN(l.l_extendedprice), MAX(l.l_discount) "
+           + _J3 + "GROUP BY l.l_returnflag")
+def test_chain_singlekey_multivalue_distinct():
+    _match("SELECT l.l_returnflag, SUM(l.l_extendedprice), SUM(l.l_quantity), AVG(l.l_discount) "
+           + _J3 + "GROUP BY l.l_returnflag")
