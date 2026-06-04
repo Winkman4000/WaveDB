@@ -160,3 +160,183 @@ def parallel_counts_and_aggs(gcodes, K, specs, n_threads=None):
     fspecs = [(key, fn, (('d', v) if v is not None else None), (('d', nm) if nm is not None else None))
               for key, fn, v, nm in specs]
     return fused_counts_and_aggs(group_op, K, fspecs, None, len(gcodes), n_threads)
+
+
+# ── Rung 3: fused single-pass grouped aggregation (numba) ────────────────────
+# numpy does one pass PER reduction (a bincount for SUM, another for COUNT, a minimum.at for MIN, ...),
+# which is why aggregate-dense and high-cardinality group-bys lose to DuckDB's single fused scan. This
+# kernel does COUNT + per-column SUM/MIN/MAX in ONE pass over the (already gathered + masked) value
+# columns, accumulating into dense per-group arrays -- sequential data reads, L2-resident accumulators,
+# threaded with per-thread-local accumulators reduced at the end. numba is OPTIONAL: if it is not
+# importable, HAS_NUMBA is False and the caller stays on the numpy paths above.
+try:
+    from numba import njit as _njit, prange as _prange, set_num_threads as _set_nt
+    _set_nt(_NT)
+    HAS_NUMBA = True
+except Exception:
+    HAS_NUMBA = False
+
+if HAS_NUMBA:
+    # V=1 (the common case -- a single value column, incl. MIN/MAX/AVG of ONE column): flat per-group
+    # accumulators, no value matrix, no inner column loop. This is the shape the prototype clocked at
+    # ~1.6ms on 6M; the generic V>=2 kernel below is measurably slower (3-D indexing + a length-1 inner
+    # loop), so we only fall to it for genuine multi-column aggregates like SUM(a)+SUM(b).
+    @_njit(cache=True)
+    def _nb_g1_ser(gc, v, K):
+        n = gc.shape[0]
+        cnt = np.zeros(K, np.int64); s = np.zeros(K, np.float64)
+        mn = np.full(K, np.inf); mx = np.full(K, -np.inf)
+        for i in range(n):
+            c = gc[i]; x = v[i]
+            cnt[c] += 1; s[c] += x
+            if x < mn[c]: mn[c] = x
+            if x > mx[c]: mx[c] = x
+        return cnt, s, mn, mx
+
+    @_njit(parallel=True, cache=True)
+    def _nb_g1_par(gc, v, K, NT, Kp):
+        # Kp pads each thread\'s row past a cache line so the NT accumulator rows never share a line --
+        # without it small K (e.g. K=3) ping-pongs lines across cores (measured 24.8ms -> 1.4ms).
+        n = gc.shape[0]
+        cnt = np.zeros((NT, Kp), np.int64); s = np.zeros((NT, Kp), np.float64)
+        mn = np.full((NT, Kp), np.inf); mx = np.full((NT, Kp), -np.inf)
+        chunk = (n + NT - 1) // NT
+        for t in _prange(NT):
+            lo = t * chunk; hi = min(lo + chunk, n)
+            for i in range(lo, hi):
+                c = gc[i]; x = v[i]
+                cnt[t, c] += 1; s[t, c] += x
+                if x < mn[t, c]: mn[t, c] = x
+                if x > mx[t, c]: mx[t, c] = x
+        return cnt, s, mn, mx
+
+    @_njit(cache=True)
+    def _nb_g1m_ser(gc, v, m, K):       # V=1 with a WHERE mask fused in (skip rows where ~m, no copy)
+        n = gc.shape[0]
+        cnt = np.zeros(K, np.int64); s = np.zeros(K, np.float64)
+        mn = np.full(K, np.inf); mx = np.full(K, -np.inf)
+        for i in range(n):
+            if m[i]:
+                c = gc[i]; x = v[i]
+                cnt[c] += 1; s[c] += x
+                if x < mn[c]: mn[c] = x
+                if x > mx[c]: mx[c] = x
+        return cnt, s, mn, mx
+
+    @_njit(parallel=True, cache=True)
+    def _nb_g1m_par(gc, v, m, K, NT, Kp):
+        n = gc.shape[0]
+        cnt = np.zeros((NT, Kp), np.int64); s = np.zeros((NT, Kp), np.float64)
+        mn = np.full((NT, Kp), np.inf); mx = np.full((NT, Kp), -np.inf)
+        chunk = (n + NT - 1) // NT
+        for t in _prange(NT):
+            lo = t * chunk; hi = min(lo + chunk, n)
+            for i in range(lo, hi):
+                if m[i]:
+                    c = gc[i]; x = v[i]
+                    cnt[t, c] += 1; s[t, c] += x
+                    if x < mn[t, c]: mn[t, c] = x
+                    if x > mx[t, c]: mx[t, c] = x
+        return cnt, s, mn, mx
+
+    @_njit(cache=True)
+    def _nb_gN_ser(gc, vmat, K):
+        n = gc.shape[0]; V = vmat.shape[1]
+        cnt = np.zeros(K, np.int64); sums = np.zeros((V, K), np.float64)
+        mins = np.full((V, K), np.inf); maxs = np.full((V, K), -np.inf)
+        for i in range(n):
+            c = gc[i]; cnt[c] += 1
+            for j in range(V):
+                v = vmat[i, j]; sums[j, c] += v
+                if v < mins[j, c]: mins[j, c] = v
+                if v > maxs[j, c]: maxs[j, c] = v
+        return cnt, sums, mins, maxs
+
+    @_njit(parallel=True, cache=True)
+    def _nb_gN_par(gc, vmat, K, NT, Kp):
+        n = gc.shape[0]; V = vmat.shape[1]
+        cnt = np.zeros((NT, Kp), np.int64); sums = np.zeros((NT, V, Kp), np.float64)
+        mins = np.full((NT, V, Kp), np.inf); maxs = np.full((NT, V, Kp), -np.inf)
+        chunk = (n + NT - 1) // NT
+        for t in _prange(NT):
+            lo = t * chunk; hi = min(lo + chunk, n)
+            for i in range(lo, hi):
+                c = gc[i]; cnt[t, c] += 1
+                for j in range(V):
+                    v = vmat[i, j]; sums[t, j, c] += v
+                    if v < mins[t, j, c]: mins[t, j, c] = v
+                    if v > maxs[t, j, c]: maxs[t, j, c] = v
+        return cnt, sums, mins, maxs
+
+def numba_grouped(gc, cols, K, mask=None):
+    """One fused pass over group codes + value columns (mask, if any, fused into the V=1 kernel so no
+    boolean-index copy is made). cols: list of 1-D numeric arrays. Returns (count[K], sums[V,K],
+    mins[V,K], maxs[V,K]). Serial below the parallel threshold."""
+    V = len(cols); par = gc.shape[0] >= PARALLEL_THRESHOLD
+    Kp = ((K + 7) // 8) * 8 + 8                 # cache-line padding for the per-thread accumulator rows
+    if V == 1:
+        v = cols[0]
+        if mask is not None:
+            if par:
+                cnt, s, mn, mx = _nb_g1m_par(gc, v, mask, K, _NT, Kp)
+                return (cnt[:, :K].sum(0), s[:, :K].sum(0)[None, :],
+                        mn[:, :K].min(0)[None, :], mx[:, :K].max(0)[None, :])
+            cnt, s, mn, mx = _nb_g1m_ser(gc, v, mask, K)
+            return cnt, s[None, :], mn[None, :], mx[None, :]
+        if par:
+            cnt, s, mn, mx = _nb_g1_par(gc, v, K, _NT, Kp)
+            return (cnt[:, :K].sum(0), s[:, :K].sum(0)[None, :],
+                    mn[:, :K].min(0)[None, :], mx[:, :K].max(0)[None, :])
+        cnt, s, mn, mx = _nb_g1_ser(gc, v, K)
+        return cnt, s[None, :], mn[None, :], mx[None, :]
+    vmat = np.empty((gc.shape[0], V), np.float64)      # V>=2: mask already applied by caller
+    for j, c in enumerate(cols): vmat[:, j] = np.asarray(c).astype(np.float64, copy=False)
+    if par:
+        cnt, sums, mins, maxs = _nb_gN_par(gc, vmat, K, _NT, Kp)
+        return cnt[:, :K].sum(0), sums[:, :, :K].sum(0), mins[:, :, :K].min(0), maxs[:, :, :K].max(0)
+    return _nb_gN_ser(gc, vmat, K)
+
+
+def _opkey(op):
+    return (op[0], id(op[1])) + ((id(op[2]),) if op[0] == 'g' else ())
+
+def fused_numba(group_op, K, specs_all, mask_op, n):
+    """Fused-kernel replacement for the numpy agg paths, for numeric non-null operands. Materialises the
+    group codes and each distinct value column once (gather + mask), then computes every COUNT/SUM/AVG/
+    MIN/MAX in a single pass. Returns (counts, {key: length-K array}) matching the other kernels."""
+    m = _slice(mask_op, 0, n)
+    if m is not None: m = np.ascontiguousarray(m)
+    gc = _slice(group_op, 0, n)
+    gc = np.zeros(n, dtype=np.int64) if gc is None else gc.astype(np.int64, copy=False)
+    gc = np.ascontiguousarray(gc, dtype=np.int64)        # full length -- mask is fused into the kernel
+
+    col_of = {}; cols = []
+    for (key, fn, vop, nop) in specs_all:
+        if fn in ('SUM', 'AVG', 'MIN', 'MAX'):
+            k = _opkey(vop)
+            if k not in col_of:
+                col_of[k] = len(cols); cols.append(np.ascontiguousarray(_slice(vop, 0, n)))
+    V = len(cols); sums = mins = maxs = None
+    if V == 1:
+        counts, sums, mins, maxs = numba_grouped(gc, cols, K, mask=m)   # mask fused; count comes free
+    elif V == 0:
+        g = gc if m is None else gc[m]
+        counts = np.bincount(g, minlength=K) if g.size else np.zeros(K, np.int64)
+    else:                                                # V>=2 (rare): apply mask by indexing
+        if m is not None: gc = gc[m]; cols = [c[m] for c in cols]
+        if gc.size: counts, sums, mins, maxs = numba_grouped(gc, cols, K)
+        else: counts = np.zeros(K, np.int64)
+
+    finals = {}
+    for (key, fn, vop, nop) in specs_all:
+        if fn == 'COUNT':
+            finals[key] = counts.copy()
+        else:
+            j = col_of[_opkey(vop)]; o = np.full(K, None, dtype=object); nz = counts > 0
+            if sums is None: finals[key] = o; continue
+            if fn == 'SUM':   o = sums[j].astype(object); o[counts == 0] = None
+            elif fn == 'AVG': o[nz] = sums[j][nz] / counts[nz]
+            elif fn == 'MIN': o[nz] = mins[j][nz]
+            else:             o[nz] = maxs[j][nz]
+            finals[key] = o
+    return counts, finals

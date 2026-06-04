@@ -389,16 +389,20 @@ def _fast_pointer_agg(db, tree, ctx):
     _CLS = {E.Sum: 'SUM', E.Avg: 'AVG', E.Min: 'MIN', E.Max: 'MAX'}
     col_results = {}
     specs = []          # (i, fn, value_op, nullmask_op) for COUNT/SUM/AVG
-    minmax = []         # (i, fn, value_op, nullmask_op) for MIN/MAX (serial)
+    minmax = []         # (i, fn, value_op, nullmask_op) for MIN/MAX
+    numba_ok = wdb_agg.HAS_NUMBA   # cleared below if any value operand is string or nullable
     for i, p in enumerate(proj):
         inner = p.this if isinstance(p, E.Alias) else p
         if isinstance(inner, E.Count) and (isinstance(inner.this, E.Star) or inner.this is None):
             col_results[i] = ('count',)
         elif isinstance(inner, E.Count):
             vop, nop, seg, pcol = agg_arg_operand(inner.this)
+            if nop is not None: numba_ok = False
             specs.append((i, 'COUNT', vop, nop)); col_results[i] = ('arr', None, False, None)
         elif type(inner) in _CLS:
             fn = _CLS[type(inner)]; vop, nop, seg, pcol = agg_arg_operand(inner.this)
+            if nop is not None or (seg is not None and seg.cols[pcol]['dt'] == 1):
+                numba_ok = False     # nullable or string operand -> stay on the numpy reduction paths
             if fn in ('MIN', 'MAX'):
                 is_dt = (seg is not None and seg.cols[pcol]['dt'] == 3)
                 minmax.append((i, fn, vop, nop)); col_results[i] = ('arr', None, is_dt,
@@ -409,7 +413,9 @@ def _fast_pointer_agg(db, tree, ctx):
             if gseg is None: raise _FastUnsupported   # bare key column without GROUP BY
             col_results[i] = ('key',)
 
-    if n >= wdb_agg.PARALLEL_THRESHOLD and not minmax:
+    if numba_ok and (specs or minmax):
+        counts, agg_arrays = wdb_agg.fused_numba(group_op, K, specs + minmax, mask_op, n)
+    elif n >= wdb_agg.PARALLEL_THRESHOLD and not minmax:
         counts, agg_arrays = wdb_agg.fused_counts_and_aggs(group_op, K, specs, mask_op, n)
     else:
         gc = wdb_agg._slice(group_op, 0, n)
