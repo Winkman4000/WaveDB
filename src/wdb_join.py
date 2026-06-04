@@ -261,6 +261,14 @@ def _fast_pointer_agg(db, tree, child, parent, child_alias, parent_alias, fk_col
         if gathered:
             arr = arr[ptr]; nm = nm[ptr] if nm is not None else None
         return arr, nm, seg, pcol
+    def col_operand(node):
+        # like col_native but un-gathered: parent columns become ('g', arr, ptr) so the gather happens
+        # per-chunk inside the threaded kernel instead of materialising the full gathered array here.
+        seg, pcol, gathered = resolve(node)
+        arr, nm = wdb_sql._col(seg, pcol)
+        if gathered:
+            return ('g', arr, ptr), (('g', nm, ptr) if nm is not None else None), seg, pcol
+        return ('d', arr), (('d', nm) if nm is not None else None), seg, pcol
 
     # ---- WHERE -> boolean mask over child rows ----
     _OPS = {E.EQ: operator.eq, E.NEQ: operator.ne, E.GT: operator.gt, E.LT: operator.lt,
@@ -288,50 +296,61 @@ def _fast_pointer_agg(db, tree, child, parent, child_alias, parent_alias, fk_col
     mask = mask_eval(where.this) if where is not None else None
     sel = (lambda a: a if mask is None else a[mask])
 
-    # ---- group codes ----
+    # ---- group codes (as an operand; gathered per-chunk in the threaded kernel) ----
+    n = len(ptr)
+    if n == 0: return [], [wdb_sql._alias(p) for p in proj]
+    mask_op = ('d', mask) if mask is not None else None
     if gnodes:
         gseg, gpcol, ggath = resolve(gnodes[0])
         if gseg.cols[gpcol]['mode'] == 4: raise _FastUnsupported   # codes not value-identity
         full = gseg.codes(gpcol)
-        gcodes = sel(full[ptr] if ggath else full).astype(np.int64)
-        if len(gcodes) == 0: return [], [wdb_sql._alias(p) for p in proj]
-        K = int(gcodes.max()) + 1
+        if full.size == 0: return [], [wdb_sql._alias(p) for p in proj]
+        K = int(full.max()) + 1                          # safe upper bound; empty groups dropped later
+        group_op = ('g', full, ptr) if ggath else ('d', full)
     else:
-        n = int(mask.sum()) if mask is not None else len(ptr)
-        gcodes = np.zeros(n, dtype=np.int64); K = 1; gseg = gpcol = None
+        K = 1; group_op = None; gseg = gpcol = None
 
     # ---- per-projection results ----
-    # COUNT/SUM/AVG are deferred into `specs` and computed in one pass (threaded above a row threshold);
-    # MIN/MAX run on the serial kernel; bare key columns map straight to the group value.
+    # COUNT/SUM/AVG become operand specs computed in one pass (threaded + per-chunk gather above a row
+    # threshold); MIN/MAX run on the serial kernel; bare key columns map straight to the group value.
     _CLS = {E.Sum: 'SUM', E.Avg: 'AVG', E.Min: 'MIN', E.Max: 'MAX'}
     col_results = {}
-    specs = []
+    specs = []          # (i, fn, value_op, nullmask_op) for COUNT/SUM/AVG
+    minmax = []         # (i, fn, value_op, nullmask_op) for MIN/MAX (serial)
     for i, p in enumerate(proj):
         inner = p.this if isinstance(p, E.Alias) else p
         if isinstance(inner, E.Count) and (isinstance(inner.this, E.Star) or inner.this is None):
             col_results[i] = ('count',)
         elif isinstance(inner, E.Count):
-            arr, nm, seg, pcol = col_native(inner.this)
-            specs.append((i, 'COUNT', sel(arr), sel(nm) if nm is not None else None))
-            col_results[i] = ('arr', None, False, None)
+            vop, nop, seg, pcol = col_operand(inner.this)
+            specs.append((i, 'COUNT', vop, nop)); col_results[i] = ('arr', None, False, None)
         elif type(inner) in _CLS:
-            fn = _CLS[type(inner)]; arr, nm, seg, pcol = col_native(inner.this)
-            mv = sel(arr); mn = sel(nm) if nm is not None else None
+            fn = _CLS[type(inner)]; vop, nop, seg, pcol = col_operand(inner.this)
             if fn in ('MIN', 'MAX'):
                 is_dt = seg.cols[pcol]['dt'] == 3
-                col_results[i] = ('arr', wdb_agg.group_agg(gcodes, K, fn, mv, mn), is_dt,
-                                  (seg.unit(pcol) if is_dt else None))
+                minmax.append((i, fn, vop, nop)); col_results[i] = ('arr', None, is_dt,
+                                                                     (seg.unit(pcol) if is_dt else None))
             else:
-                specs.append((i, fn, mv, mn)); col_results[i] = ('arr', None, False, None)
+                specs.append((i, fn, vop, nop)); col_results[i] = ('arr', None, False, None)
         else:
             if gseg is None: raise _FastUnsupported   # bare key column without GROUP BY
             col_results[i] = ('key',)
 
-    if len(gcodes) >= wdb_agg.PARALLEL_THRESHOLD:
-        counts, agg_arrays = wdb_agg.parallel_counts_and_aggs(gcodes, K, specs)
+    if n >= wdb_agg.PARALLEL_THRESHOLD and not minmax:
+        counts, agg_arrays = wdb_agg.fused_counts_and_aggs(group_op, K, specs, mask_op, n)
     else:
+        gc = wdb_agg._slice(group_op, 0, n)
+        gcodes = np.zeros(n, dtype=np.int64) if gc is None else gc.astype(np.int64, copy=False)
+        if mask is not None: gcodes = gcodes[mask]
         counts = wdb_agg.group_counts(gcodes, K)
-        agg_arrays = {i: wdb_agg.group_agg(gcodes, K, fn, v, nm) for (i, fn, v, nm) in specs}
+        def _materialize(vop, nop):
+            v = wdb_agg._slice(vop, 0, n); v = v[mask] if mask is not None else v
+            nm = wdb_agg._slice(nop, 0, n)
+            if nm is not None and mask is not None: nm = nm[mask]
+            return v, nm
+        agg_arrays = {}
+        for (i, fn, vop, nop) in specs + minmax:
+            v, nm = _materialize(vop, nop); agg_arrays[i] = wdb_agg.group_agg(gcodes, K, fn, v, nm)
     for i, arr in agg_arrays.items():
         cr = col_results[i]; col_results[i] = ('arr', arr, cr[2], cr[3])
     present = np.nonzero(counts > 0)[0]
