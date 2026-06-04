@@ -365,15 +365,30 @@ def test_chain_where_fused_like_and_numeric():
            "WHERE l.l_shipmode LIKE '%AIL' AND l.l_quantity > 30 GROUP BY l.l_returnflag")
 
 
-# ── graceful degradation: a predicate that can't fuse (numeric IS NULL) falls to the single-join row
-# path and returns the correct result instead of crashing (used to raise NotImplementedError: Is). ──
-_J1 = "FROM lineitem l JOIN orders o ON l.l_orderkey=o.o_orderkey "
-def test_where_numeric_is_null_degrades():
-    _match("SELECT l.l_returnflag, COUNT(*) " + _J1 +
-           "WHERE l.l_quantity IS NULL GROUP BY l.l_returnflag", expect_fast=False)
-def test_where_numeric_is_not_null_degrades():
-    _match("SELECT l.l_returnflag, COUNT(*) " + _J1 +
-           "WHERE l.l_quantity IS NOT NULL GROUP BY l.l_returnflag", expect_fast=False)
-def test_where_is_not_null_and_numeric_degrades():
-    _match("SELECT l.l_returnflag, SUM(l.l_extendedprice) " + _J1 +
-           "WHERE l.l_quantity IS NOT NULL AND l.l_quantity > 30 GROUP BY l.l_returnflag", expect_fast=False)
+# ── IS NULL / IS NOT NULL / high-card LIKE resolve ON the fast path via a chain-gathered mask (mask_eval),
+# even on a multi-table chain -- previously these bailed and the single-join fallback failed the chain. ──
+def test_chain_where_numeric_is_null_fast():
+    _match("SELECT l.l_returnflag, COUNT(*) " + _J3 +
+           "WHERE l.l_quantity IS NULL GROUP BY l.l_returnflag")
+def test_chain_where_numeric_is_not_null_fast():
+    _match("SELECT l.l_returnflag, COUNT(*) " + _J3 +
+           "WHERE l.l_quantity IS NOT NULL GROUP BY l.l_returnflag")
+def test_chain_where_is_not_null_and_numeric_fast():
+    _match("SELECT l.l_returnflag, SUM(l.l_extendedprice) " + _J3 +
+           "WHERE l.l_quantity IS NOT NULL AND l.l_quantity > 30 GROUP BY l.l_returnflag")
+def test_chain_where_string_is_null_fast():
+    _match("SELECT l.l_returnflag, COUNT(*) " + _J3 +
+           "WHERE c.c_mktsegment IS NOT NULL GROUP BY l.l_returnflag")
+
+
+# ── FK-chain queries that can't take the fused fast path now resolve via the SHARED chain (gather + pandas
+# tail) instead of hitting the old single-join cliff. Plain projection across a 3-table chain is the clearest
+# case: the fast path is agg-only, so this always falls through -- and used to raise 'multi-join requires FK'. ──
+def test_chain_plain_projection_three_table():
+    _match("SELECT l.l_returnflag, o.o_orderpriority, c.c_mktsegment " + _J3 +
+           "WHERE l.l_quantity > 49 ORDER BY l.l_returnflag, o.o_orderpriority, c.c_mktsegment",
+           ordered=True, expect_fast=False)
+def test_chain_plain_projection_distinct_cols():
+    _match("SELECT l.l_orderkey, c.c_mktsegment " + _J3 +
+           "WHERE l.l_quantity > 49 ORDER BY l.l_orderkey, c.c_mktsegment LIMIT 12",
+           ordered=True, expect_fast=False)

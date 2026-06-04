@@ -38,16 +38,75 @@ def _all_columns(node):
     return [(c.table, c.name) for c in node.find_all(E.Column)]
 
 
+def _chain_pandas(db, tree, ctx):
+    """Fallback that REUSES the FK-chain resolution: gather every referenced column to fact-row space via
+    the same composed pointers the fast path uses, then run the pandas WHERE/aggregate tail on that frame.
+    So an FK-chain query that the fused fast path can't take (high-card group, non-value-identity column,
+    plain projection, exotic predicate) still resolves the SAME join -- no separate single-join engine, no
+    'multi-join' cliff. pandas only does the aggregation/predicate part that couldn't be fused."""
+    alias2t = ctx['alias2t']; seg_of = ctx['seg_of']; composed = ctx['composed']
+    cols_of = {a: set(db.cat.column_names(t)) for a, t in alias2t.items()}
+    phys_of = {a: db.cat.phys_map(t) for a, t in alias2t.items()}
+    _memo = {}
+    def gather(alias, name):
+        k = (alias, name)
+        if k not in _memo:
+            seg = seg_of[alias]; pcol = phys_of[alias].get(name, name); cptr = composed[alias]
+            arr, _nm = wdb_sql._col(seg, pcol)
+            _memo[k] = arr if cptr is None else arr[cptr]        # gather parent rows to fact rows
+        return _memo[k]
+    def owner(node):
+        a = node.table
+        if a:
+            if a not in alias2t or node.name not in cols_of[a]: raise _FastUnsupported
+            return a
+        owners = [al for al, cs in cols_of.items() if node.name in cs]
+        if len(owners) != 1: raise _FastUnsupported
+        return owners[0]
+    R = lambda node: f"{owner(node)}.{node.name}"
+
+    proj = tree.expressions
+    frame = {}
+    scan = list(proj)
+    for key in ('where', 'group', 'order'):
+        nd = tree.args.get(key)
+        if nd is not None: scan.append(nd)
+    for rootn in scan:
+        for col in rootn.find_all(E.Column):
+            a = owner(col); fk = f"{a}.{col.name}"
+            if fk not in frame: frame[fk] = gather(a, col.name)
+    df = pd.DataFrame(frame) if frame else pd.DataFrame(index=range(ctx['n']))
+    where = tree.args.get('where')
+    if where is not None: df = df[_mask(df, where.this, R)]
+    group = tree.args.get('group')
+    has_agg = any(wdb_sql._agg_kind(p) for p in proj)
+    if group is not None or has_agg:
+        rows = _aggregate(df, proj, group, R)
+    else:
+        keys = [R(p.this if isinstance(p, E.Alias) else p) for p in proj]
+        rows = [tuple(_render(v) for v in t) for t in df[keys].itertuples(index=False, name=None)]
+    rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))
+    lim = wdb_sql._limit(tree)
+    if lim is not None: rows = rows[:lim]
+    return rows, [wdb_sql._alias(p) for p in proj]
+
+
 def join_query(db, sql):
     tree = sqlglot.parse_one(sql, read='duckdb')
     joins = tree.args.get('joins')
     # FK-pointer fast path: handles 1..N joins as a chain/star of pre-resolved pointers.
     try:
-        return _fast_pointer_agg(db, tree, _build_chain(db, tree))
+        chain = _build_chain(db, tree)
     except _FastUnsupported:
-        pass   # not an FK-pointer aggregate query -> fall back to the pandas hash-join path
+        chain = None
+    if chain is not None:
+        try:
+            return _fast_pointer_agg(db, tree, chain)            # fully fused
+        except _FastUnsupported:
+            return _chain_pandas(db, tree, chain)                # same chain, pandas agg/predicate tail
+    # Not an FK chain (e.g. a join that has no stored pointer) -> single-join pandas hash merge.
     if not joins or len(joins) != 1:
-        raise NotImplementedError("join: multi-join requires FK pointers; fallback supports one INNER join")
+        raise NotImplementedError("join: non-FK multi-join needs a hash join (not yet supported)")
     jn = joins[0]
     if (jn.args.get('side') or jn.args.get('kind')):
         raise NotImplementedError("join: only INNER JOIN supported (step 1)")
@@ -418,6 +477,31 @@ def _fast_pointer_agg(db, tree, ctx):
                 arr, _ = _col_cached(seg, pcol)
                 vals = [wdb_sql._lit_for_col(seg, pcol, e, arr.dtype.kind) for e in exprs]
                 return np.isin(arr, vals)
+            return leaf(node.this, mk)
+        if isinstance(node, E.Is) and isinstance(node.expression, E.Null):   # IS NULL (Not(Is) = IS NOT NULL)
+            def mk(seg, pcol):
+                c = seg.cols[pcol]; codes = seg.codes(pcol)
+                if not c['has_null']: return np.zeros(len(codes), dtype=bool)  # non-nullable -> nothing
+                return codes == (c['V'] - 1)                                   # null is reserved code V-1
+            return leaf(node.this, mk)
+        if isinstance(node, (E.Like, E.ILike)):              # LIKE -> code-LUT over the dict, gathered
+            negate = bool(node.args.get('negate')); ci = isinstance(node, E.ILike); pnode = node.expression
+            def mk(seg, pcol):
+                sc = _str_codes(seg, pcol)
+                if sc is None: raise _FastUnsupported       # non-value-identity dict -> can't map codes
+                codes, code_of, nullcode = sc
+                pb = _lit_bytes(seg, pcol, pnode)
+                patt = pb.decode('utf-8', 'replace') if isinstance(pb, (bytes, bytearray)) else str(pb)
+                rx = re.compile('^' + re.escape(patt).replace('%', '.*').replace('_', '.') + '$',
+                                re.IGNORECASE if ci else 0)
+                ncodes = max(max(code_of.values(), default=-1),
+                             nullcode if nullcode is not None else -1) + 1
+                keep = np.zeros(ncodes, dtype=bool)
+                for vb, cd in code_of.items():
+                    v = vb.decode('utf-8', 'replace') if isinstance(vb, (bytes, bytearray)) else str(vb)
+                    if rx.match(v): keep[cd] = True
+                m = keep[codes]
+                return ~m if negate else m
             return leaf(node.this, mk)
         raise _FastUnsupported
     where = tree.args.get('where')
