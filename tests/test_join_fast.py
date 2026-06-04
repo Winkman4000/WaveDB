@@ -313,3 +313,23 @@ def test_chain_where_fused_string_and_numeric():
 def test_chain_where_fused_string_missing_value():     # literal not in dict -> matches nothing
     _match("SELECT l.l_returnflag, COUNT(*) " + _J3 +
            "WHERE l.l_shipmode = 'NOSUCHMODE' GROUP BY l.l_returnflag")
+
+
+# ── IN (string OR-of-codes / numeric OR-of-values) and column-vs-column comparison fusion ──
+def test_chain_where_fused_string_in():
+    _match("SELECT l.l_returnflag, COUNT(*) " + _J3 +
+           "WHERE l.l_shipmode IN ('MAIL','SHIP','AIR') GROUP BY l.l_returnflag")
+def test_chain_where_fused_numeric_in():
+    _match("SELECT l.l_returnflag, SUM(l.l_extendedprice) " + _J3 +
+           "WHERE l.l_quantity IN (10,20,30,40) GROUP BY l.l_returnflag")
+def test_chain_where_fused_col_vs_col():
+    _match("SELECT l.l_returnflag, COUNT(*) " + _J3 +
+           "WHERE l.l_commitdate < l.l_receiptdate GROUP BY l.l_returnflag")
+def test_chain_where_fused_q12_clause():
+    _match("SELECT l.l_shipmode, COUNT(*) " + _J3 +
+           "WHERE l.l_shipmode IN ('MAIL','SHIP') AND l.l_commitdate < l.l_receiptdate "
+           "AND l.l_shipdate < l.l_commitdate AND l.l_receiptdate >= DATE '1994-01-01' "
+           "AND l.l_receiptdate < DATE '1995-01-01' GROUP BY l.l_shipmode")
+def test_chain_where_fused_in_none_present():
+    _match("SELECT l.l_returnflag, COUNT(*) " + _J3 +
+           "WHERE l.l_shipmode IN ('NOSUCH','ZZZ') GROUP BY l.l_returnflag")

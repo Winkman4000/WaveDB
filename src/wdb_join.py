@@ -485,32 +485,42 @@ def _fast_pointer_agg(db, tree, ctx):
         raise _FastUnsupported
 
     _CMP_STR = {E.GT: '>', E.LT: '<', E.GTE: '>=', E.LTE: '<=', E.EQ: '==', E.NEQ: '!='}
+    def _is_lit(nd):
+        if isinstance(nd, E.Literal): return True
+        if isinstance(nd, (E.Neg, E.Cast, E.Paren)): return _is_lit(nd.this)
+        return False
+    def _str_slot(cseg, cpcol, cptr):                  # raw code slot for a string column (base=None)
+        sc = _str_codes(cseg, cpcol)
+        if sc is None: raise _FastUnsupported
+        codes, code_of, nullcode = sc
+        ckey = (id(cseg), cpcol, id(cptr) if cptr is not None else None)
+        if ckey not in slots:
+            slots[ckey] = len(slot_list)
+            slot_list.append((None, np.ascontiguousarray(codes),
+                              None if cptr is None else np.ascontiguousarray(cptr)))
+        return f"v{slots[ckey]}", code_of, nullcode
     def build_pred(node):
-        # Compile a WHERE predicate to a numba boolean over the shared slots (numeric/datetime comparisons,
-        # BETWEEN, AND/OR/NOT). Raises _FastUnsupported for string / IN / anything else -> materialised mask.
+        # Compile a WHERE predicate to a numba boolean over the shared slots. Covers AND/OR/NOT, numeric &
+        # datetime comparisons (incl. column-vs-column and arithmetic sides), BETWEEN, and string '='/'!='/IN
+        # via inline dictionary-code comparison. Raises _FastUnsupported otherwise -> materialised mask.
         if isinstance(node, E.Paren): return build_pred(node.this)
         if isinstance(node, E.And): return f"({build_pred(node.this)} and {build_pred(node.expression)})"
         if isinstance(node, E.Or):  return f"({build_pred(node.this)} or {build_pred(node.expression)})"
         if isinstance(node, E.Not): return f"(not {build_pred(node.this)})"
         if type(node) in _CMP_STR:
             op = _CMP_STR[type(node)]; a, b = node.this, node.expression
-            if   isinstance(a, E.Column) and not isinstance(b, E.Column): col, lit, left = a, b, True
-            elif isinstance(b, E.Column) and not isinstance(a, E.Column): col, lit, left = b, a, False
-            else: raise _FastUnsupported
+            if not _is_lit(a) and not _is_lit(b):          # value-expr vs value-expr (e.g. col < col)
+                return f"({build_fused(a)} {op} {build_fused(b)})"   # numeric/datetime; string -> raises
+            if _is_lit(a) and _is_lit(b): raise _FastUnsupported
+            col, lit, left = (a, b, True) if not _is_lit(a) else (b, a, False)
+            if not isinstance(col, E.Column): raise _FastUnsupported    # computed vs literal -> mask (rare)
             cseg, cpcol, cptr = resolve(col)
-            if cseg.cols[cpcol]['dt'] == 1:                              # string -> fuse a CODE comparison
+            if cseg.cols[cpcol]['dt'] == 1:                # string -> CODE comparison
                 if not FUSE_STR_PRED: raise _FastUnsupported
                 if type(node) not in (E.EQ, E.NEQ): raise _FastUnsupported   # ordering on strings -> mask
-                sc = _str_codes(cseg, cpcol)
-                if sc is None or not lit.is_string: raise _FastUnsupported
-                codes, code_of, nullcode = sc
+                if not lit.is_string: raise _FastUnsupported
+                vk, code_of, nullcode = _str_slot(cseg, cpcol, cptr)
                 target = code_of.get(_lit_bytes(cseg, cpcol, lit), -1)
-                ckey = (id(cseg), cpcol, id(cptr) if cptr is not None else None)
-                if ckey not in slots:                                   # raw code slot: base=None, codes only
-                    slots[ckey] = len(slot_list)
-                    slot_list.append((None, np.ascontiguousarray(codes),
-                                      None if cptr is None else np.ascontiguousarray(cptr)))
-                vk = f"v{slots[ckey]}"
                 if type(node) is E.EQ: return f"({vk} == {target})"
                 if nullcode is None:   return f"({vk} != {target})"
                 return f"(({vk} != {target}) and ({vk} != {nullcode}))"   # SQL: NULL != x is not TRUE
@@ -520,6 +530,26 @@ def _fast_pointer_agg(db, tree, ctx):
             if not isinstance(lv, (int, float, np.integer, np.floating)): raise _FastUnsupported
             lv = float(lv) if kind == 'f' else int(lv)
             return f"({v} {op} {lv})" if left else f"({lv} {op} {v})"
+        if isinstance(node, E.In):
+            col = node.this; exprs = node.args.get('expressions') or []
+            if node.args.get('query') is not None: raise _FastUnsupported   # IN (subquery) -> mask
+            if not isinstance(col, E.Column) or not exprs or len(exprs) > 256: raise _FastUnsupported
+            cseg, cpcol, cptr = resolve(col)
+            if cseg.cols[cpcol]['dt'] == 1:                # string IN -> OR of code equalities
+                if not FUSE_STR_PRED: raise _FastUnsupported
+                vk, code_of, _nc = _str_slot(cseg, cpcol, cptr)
+                tgts = []
+                for e in exprs:
+                    if not e.is_string: raise _FastUnsupported
+                    tgts.append(code_of.get(_lit_bytes(cseg, cpcol, e), -1))
+                return "(" + " or ".join(f"({vk} == {t})" for t in tgts) + ")"
+            v = build_fused(col); kind = 'f' if cseg.cols[cpcol]['dt'] == 2 else 'i'  # numeric IN
+            vals = []
+            for e in exprs:
+                lv = wdb_sql._lit_for_col(cseg, cpcol, e, kind)
+                if not isinstance(lv, (int, float, np.integer, np.floating)): raise _FastUnsupported
+                vals.append(float(lv) if kind == 'f' else int(lv))
+            return "(" + " or ".join(f"({v} == {x})" for x in vals) + ")"
         if isinstance(node, E.Between):
             col = node.this
             if not isinstance(col, E.Column): raise _FastUnsupported
