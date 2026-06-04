@@ -148,3 +148,22 @@ def test_chain_5table_where_intermediate():
     _match("SELECT r.r_name, COUNT(*) " + _J5 + "WHERE o.o_orderpriority='1-URGENT' GROUP BY r.r_name")
 def test_chain_whole_no_group():
     _match("SELECT COUNT(*), SUM(l.l_quantity) " + _J5)
+
+
+# ── arithmetic in aggregate expressions (TPC-H Q5/Q1 revenue/charge) over the chain ──
+def test_chain_revenue_by_region():
+    _match("SELECT r.r_name, SUM(l.l_extendedprice*(1-l.l_discount)) " + _J5 + "GROUP BY r.r_name")
+def test_chain_charge_by_nation():
+    _match("SELECT n.n_name, SUM(l.l_extendedprice*(1-l.l_discount)*(1+l.l_tax)) " + _J3 + "GROUP BY n.n_name")
+def test_chain_avg_expr_by_nation():
+    _match("SELECT n.n_name, AVG(l.l_extendedprice*(1-l.l_discount)) " + _J3 + "GROUP BY n.n_name")
+def test_chain_cross_table_arith():
+    _match("SELECT c.c_mktsegment, SUM(l.l_quantity*o.o_totalprice) FROM lineitem l "
+           "JOIN orders o ON l.l_orderkey=o.o_orderkey JOIN customer c ON o.o_custkey=c.c_custkey "
+           "GROUP BY c.c_mktsegment")
+def test_chain_revenue_where():
+    _match("SELECT r.r_name, SUM(l.l_extendedprice*(1-l.l_discount)) " + _J5 +
+           "WHERE o.o_orderpriority='1-URGENT' GROUP BY r.r_name")
+def test_chain_minmax_expr():
+    _match("SELECT n.n_name, MIN(l.l_extendedprice*(1-l.l_discount)), "
+           "MAX(l.l_extendedprice*(1-l.l_discount)) " + _J3 + "GROUP BY n.n_name")

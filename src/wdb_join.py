@@ -269,6 +269,38 @@ def _fast_pointer_agg(db, tree, ctx):
             return ('g', arr, cptr), (('g', nm, cptr) if nm is not None else None), seg, pcol
         return ('d', arr), (('d', nm) if nm is not None else None), seg, pcol
 
+    _ARITH = {E.Add: operator.add, E.Sub: operator.sub, E.Mul: operator.mul, E.Div: operator.truediv}
+    def eval_arith(node):
+        # Materialise an arithmetic expression to a per-fact-row value array (+ combined null mask).
+        # Each column is resolved through its composed pointer, so expressions may mix tables in the chain.
+        if isinstance(node, (E.Paren, E.Cast)): return eval_arith(node.this)
+        if isinstance(node, E.Neg):
+            a, na = eval_arith(node.this); return -a, na
+        if isinstance(node, E.Column):
+            seg, pcol, cptr = resolve(node)
+            arr, nm = _col_cached(seg, pcol)
+            if cptr is not None:
+                arr = arr[cptr]; nm = nm[cptr] if nm is not None else None
+            return arr, nm
+        if isinstance(node, E.Literal):
+            if node.is_string: raise _FastUnsupported
+            v = node.this
+            return (float(v) if ('.' in v or 'e' in v.lower()) else int(v)), None
+        if type(node) in _ARITH:
+            a, na = eval_arith(node.this); b, nb = eval_arith(node.expression)
+            out = _ARITH[type(node)](a, b)
+            nm = na if nb is None else (nb if na is None else (na | nb))   # NULL if any operand is NULL
+            return out, nm
+        raise _FastUnsupported
+    def agg_arg_operand(argnode):
+        # SUM/AVG/MIN/MAX/COUNT argument: a bare column keeps its seg/pcol (for datetime MIN/MAX); an
+        # arithmetic expression is materialised to a direct ('d', arr) operand the kernel slices per chunk.
+        if isinstance(argnode, E.Column):
+            return col_operand(argnode)
+        arr, nm = eval_arith(argnode)
+        if not hasattr(arr, 'shape'): raise _FastUnsupported          # need a per-row array, not a constant
+        return ('d', arr), (('d', nm) if nm is not None else None), None, None
+
     # ---- WHERE -> boolean mask over child rows ----
     # Each predicate is evaluated on the UN-gathered column (the small parent side when it is a parent
     # column) and the resulting bool is gathered to child rows -- and string =, !=, IN compare integer
@@ -363,12 +395,12 @@ def _fast_pointer_agg(db, tree, ctx):
         if isinstance(inner, E.Count) and (isinstance(inner.this, E.Star) or inner.this is None):
             col_results[i] = ('count',)
         elif isinstance(inner, E.Count):
-            vop, nop, seg, pcol = col_operand(inner.this)
+            vop, nop, seg, pcol = agg_arg_operand(inner.this)
             specs.append((i, 'COUNT', vop, nop)); col_results[i] = ('arr', None, False, None)
         elif type(inner) in _CLS:
-            fn = _CLS[type(inner)]; vop, nop, seg, pcol = col_operand(inner.this)
+            fn = _CLS[type(inner)]; vop, nop, seg, pcol = agg_arg_operand(inner.this)
             if fn in ('MIN', 'MAX'):
-                is_dt = seg.cols[pcol]['dt'] == 3
+                is_dt = (seg is not None and seg.cols[pcol]['dt'] == 3)
                 minmax.append((i, fn, vop, nop)); col_results[i] = ('arr', None, is_dt,
                                                                      (seg.unit(pcol) if is_dt else None))
             else:
