@@ -56,3 +56,22 @@ def test_fused_parallel_small_K_padding():
     _run(codes, K, [(0, 'SUM', price), (1, 'MIN', price), (2, 'MAX', price)])      # unmasked parallel
     m = rng.random(n) < 0.5
     _run(codes, K, [(0, 'SUM', price), (1, 'MAX', price)], m=m)                    # masked parallel
+
+def test_fused_gathered_group():
+    # gathered group (group code = pcodes[ptr[i]]), parallel path + mask, vs materialise-then-group_agg
+    if not A.HAS_NUMBA: return
+    rng = np.random.default_rng(5)
+    n_parent = 50_000; n = A.PARALLEL_THRESHOLD + 200_000; K = 2000
+    pcodes = rng.integers(0, K, n_parent).astype(np.int64)
+    ptr = rng.integers(0, n_parent, n).astype(np.int64)
+    price = rng.uniform(1, 1000, n)
+    gc = pcodes[ptr]                                   # reference gather
+    counts, sums, _, _ = A.numba_grouped_g(pcodes, ptr, [price], K)
+    assert np.array_equal(counts, A.group_counts(gc, K))
+    ref_sum = A.group_agg(gc, K, 'SUM', price)
+    for k in range(K):
+        if ref_sum[k] is None: assert counts[k] == 0
+        else: assert np.isclose(float(sums[0][k]), float(ref_sum[k]), rtol=1e-9, atol=1e-6)
+    m = rng.random(n) < 0.5                              # masked gathered path
+    counts2, _, _, _ = A.numba_grouped_g(pcodes, ptr, [price], K, mask=m)
+    assert np.array_equal(counts2, A.group_counts(gc[m], K))
