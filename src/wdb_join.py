@@ -10,7 +10,7 @@ Correctness first: verified against DuckDB. Unsupported shapes raise NotImplemen
 import sqlglot, sqlglot.expressions as E
 import numpy as np, pandas as pd, os
 from wdb_engine import Segment
-import wdb_sql, wdb_dml, wdb_agg, wdb_fkptr
+import wdb_sql, wdb_dml, wdb_agg, wdb_fkptr, wdb_exprjit
 
 _CMP = {E.EQ: '==', E.NEQ: '!=', E.GT: '>', E.LT: '<', E.GTE: '>=', E.LTE: '<='}
 
@@ -297,6 +297,37 @@ def _fast_pointer_agg(db, tree, ctx):
             nm = na if nb is None else (nb if na is None else (na | nb))   # NULL if any operand is NULL
             return out, nm
         raise _FastUnsupported
+    _ARITH_STR = {E.Add: '+', E.Sub: '-', E.Mul: '*', E.Div: '/'}
+    def fused_expr_build(argnode):
+        # Compile an arithmetic tree to (numba-source body over slot vars v0.., [(base, codes) per slot]) so
+        # wdb_exprjit can fuse decode+expression+aggregate into one pass (no materialised array). Fact (direct)
+        # dict-numeric columns only; raises _FastUnsupported on anything else so the caller materialises instead.
+        if not wdb_exprjit.HAS_NUMBA: raise _FastUnsupported
+        inputs = []; slot = {}
+        def emit(node):
+            if isinstance(node, (E.Paren, E.Cast)): return emit(node.this)
+            if isinstance(node, E.Neg): return f"(-{emit(node.this)})"
+            if isinstance(node, E.Column):
+                seg, pcol, cptr = resolve(node)
+                if cptr is not None: raise _FastUnsupported          # parent column: gathered decode not fused yet
+                raw = wdb_sql.raw_dict_col(seg, pcol)
+                if raw is None: raise _FastUnsupported               # nullable / string / computed -> fallback
+                key = (id(seg), pcol)
+                if key not in slot:
+                    slot[key] = len(inputs)
+                    inputs.append((np.ascontiguousarray(raw[0]), np.ascontiguousarray(raw[1])))
+                return f"v{slot[key]}"
+            if isinstance(node, E.Literal):
+                if node.is_string: raise _FastUnsupported
+                v = node.this
+                return f"({float(v)})" if ('.' in v or 'e' in v.lower()) else f"({int(v)})"
+            if type(node) in _ARITH_STR:
+                return f"({emit(node.this)} {_ARITH_STR[type(node)]} {emit(node.expression)})"
+            raise _FastUnsupported
+        body = emit(argnode)
+        if not inputs: raise _FastUnsupported                        # pure constant -> not an aggregation input
+        return body, inputs
+
     def agg_arg_operand(argnode):
         # SUM/AVG/MIN/MAX/COUNT argument: a bare column keeps its seg/pcol (for datetime MIN/MAX); an
         # arithmetic expression is materialised to a direct ('d', arr) operand the kernel slices per chunk.
@@ -407,6 +438,7 @@ def _fast_pointer_agg(db, tree, ctx):
     col_results = {}
     specs = []          # (i, fn, value_op, nullmask_op) for COUNT/SUM/AVG
     minmax = []         # (i, fn, value_op, nullmask_op) for MIN/MAX
+    expr_aggs = []      # (i, fn, body, inputs) -- arithmetic aggregates fused via wdb_exprjit codegen
     numba_ok = wdb_agg.HAS_NUMBA   # cleared below if any value operand is string or nullable
     for i, p in enumerate(proj):
         inner = p.this if isinstance(p, E.Alias) else p
@@ -417,7 +449,15 @@ def _fast_pointer_agg(db, tree, ctx):
             if nop is not None: numba_ok = False
             specs.append((i, 'COUNT', vop, nop)); col_results[i] = ('arr', None, False, None)
         elif type(inner) in _CLS:
-            fn = _CLS[type(inner)]; vop, nop, seg, pcol = agg_arg_operand(inner.this)
+            fn = _CLS[type(inner)]
+            if not isinstance(inner.this, E.Column):
+                try:
+                    _body, _inputs = fused_expr_build(inner.this)
+                    expr_aggs.append((i, fn, _body, _inputs)); col_results[i] = ('arr', None, False, None)
+                    continue
+                except _FastUnsupported:
+                    pass
+            vop, nop, seg, pcol = agg_arg_operand(inner.this)
             if nop is not None or (seg is not None and seg.cols[pcol]['dt'] == 1):
                 numba_ok = False     # nullable or string operand -> stay on the numpy reduction paths
             if fn in ('MIN', 'MAX'):
@@ -433,25 +473,55 @@ def _fast_pointer_agg(db, tree, ctx):
             if ki is None: raise _FastUnsupported          # projected column is not a GROUP BY key
             col_results[i] = ('key', ki)
 
-    if numba_ok and (specs or minmax):
-        counts, agg_arrays = wdb_agg.fused_numba(group_op, K, specs + minmax, mask_op, n)
-    elif n >= wdb_agg.PARALLEL_THRESHOLD and not minmax:
-        counts, agg_arrays = wdb_agg.fused_counts_and_aggs(group_op, K, specs, mask_op, n)
-    else:
+    # codegen-fused arithmetic aggregates: one pass each (decode + expression + accumulate), no array.
+    # SUM and AVG of the SAME expression share a single pass; MIN/MAX trigger the min/max accumulators.
+    expr_counts = None
+    if expr_aggs:
+        groups = {}
+        for (i, fn, body, inputs) in expr_aggs:
+            ek = (body, tuple(id(b) for b, _ in inputs))
+            g = groups.setdefault(ek, {'body': body, 'inputs': inputs, 'aggs': [], 'mm': False})
+            g['aggs'].append((i, fn))
+            if fn in ('MIN', 'MAX'): g['mm'] = True
+        for g in groups.values():
+            cE, sE, mnE, mxE = wdb_exprjit.grouped_expr(group_op, K, g['body'], g['inputs'], mask, n, g['mm'])
+            expr_counts = cE; nz = cE > 0
+            for (i, fn) in g['aggs']:
+                o = np.full(K, None, dtype=object)
+                if   fn == 'SUM': o = sE.astype(object); o[~nz] = None
+                elif fn == 'AVG': o[nz] = sE[nz] / cE[nz]
+                elif fn == 'MIN': o[nz] = mnE[nz]
+                else:             o[nz] = mxE[nz]
+                cr = col_results[i]; col_results[i] = ('arr', o, cr[2], cr[3])
+
+    # plain (column / star) aggregates via the existing fused/numpy machinery
+    if specs or minmax:
+        if numba_ok:
+            counts, agg_arrays = wdb_agg.fused_numba(group_op, K, specs + minmax, mask_op, n)
+        elif n >= wdb_agg.PARALLEL_THRESHOLD and not minmax:
+            counts, agg_arrays = wdb_agg.fused_counts_and_aggs(group_op, K, specs, mask_op, n)
+        else:
+            gc = wdb_agg._slice(group_op, 0, n)
+            gcodes = np.zeros(n, dtype=np.int64) if gc is None else gc.astype(np.int64, copy=False)
+            if mask is not None: gcodes = gcodes[mask]
+            counts = wdb_agg.group_counts(gcodes, K)
+            def _materialize(vop, nop):
+                v = wdb_agg._slice(vop, 0, n); v = v[mask] if mask is not None else v
+                nm = wdb_agg._slice(nop, 0, n)
+                if nm is not None and mask is not None: nm = nm[mask]
+                return v, nm
+            agg_arrays = {}
+            for (i, fn, vop, nop) in specs + minmax:
+                v, nm = _materialize(vop, nop); agg_arrays[i] = wdb_agg.group_agg(gcodes, K, fn, v, nm)
+        for i, arr in agg_arrays.items():
+            cr = col_results[i]; col_results[i] = ('arr', arr, cr[2], cr[3])
+    elif expr_counts is not None:
+        counts = expr_counts                                  # only arithmetic aggregates -> counts from codegen
+    else:                                                     # only COUNT(*) / key columns -> counts-only pass
         gc = wdb_agg._slice(group_op, 0, n)
         gcodes = np.zeros(n, dtype=np.int64) if gc is None else gc.astype(np.int64, copy=False)
         if mask is not None: gcodes = gcodes[mask]
         counts = wdb_agg.group_counts(gcodes, K)
-        def _materialize(vop, nop):
-            v = wdb_agg._slice(vop, 0, n); v = v[mask] if mask is not None else v
-            nm = wdb_agg._slice(nop, 0, n)
-            if nm is not None and mask is not None: nm = nm[mask]
-            return v, nm
-        agg_arrays = {}
-        for (i, fn, vop, nop) in specs + minmax:
-            v, nm = _materialize(vop, nop); agg_arrays[i] = wdb_agg.group_agg(gcodes, K, fn, v, nm)
-    for i, arr in agg_arrays.items():
-        cr = col_results[i]; col_results[i] = ('arr', arr, cr[2], cr[3])
     present = np.nonzero(counts > 0)[0]
 
     # ---- assemble rows ----

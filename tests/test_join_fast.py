@@ -191,3 +191,32 @@ def test_chain_group_multi_minmax():
 def test_chain_group_multi_order_limit():
     _match("SELECT l.l_returnflag, l.l_linestatus, SUM(l.l_extendedprice) AS rev " + _J3 +
            "GROUP BY l.l_returnflag, l.l_linestatus ORDER BY rev DESC LIMIT 3", ordered=True)
+
+
+# ── codegen-fused arithmetic aggregates (wdb_exprjit): never materialise the expression array ──
+def test_chain_arith_revenue():
+    _match("SELECT n.n_name, SUM(l.l_extendedprice*(1-l.l_discount)) AS rev " + _J3 + "GROUP BY n.n_name")
+def test_chain_arith_q1_form():
+    _match("SELECT l.l_returnflag, SUM(l.l_extendedprice*(1-l.l_discount)*(1+l.l_tax)) AS rev " + _J3 +
+           "GROUP BY l.l_returnflag")
+def test_chain_arith_multikey():
+    _match("SELECT c.c_mktsegment, l.l_returnflag, SUM(l.l_extendedprice*(1-l.l_discount)) AS rev " + _J3 +
+           "GROUP BY c.c_mktsegment, l.l_returnflag")
+def test_chain_arith_where():
+    _match("SELECT l.l_returnflag, SUM(l.l_extendedprice*(1-l.l_discount)) AS rev " + _J3 +
+           "WHERE l.l_quantity > 25 GROUP BY l.l_returnflag")
+def test_chain_arith_avg():
+    _match("SELECT l.l_returnflag, AVG(l.l_extendedprice*(1-l.l_discount)) AS a " + _J3 +
+           "GROUP BY l.l_returnflag")
+def test_chain_arith_minmax():
+    _match("SELECT l.l_returnflag, MIN(l.l_extendedprice*(1-l.l_discount)), "
+           "MAX(l.l_extendedprice*(1-l.l_discount)) " + _J3 + "GROUP BY l.l_returnflag")
+def test_chain_arith_mixed_plain():
+    _match("SELECT l.l_returnflag, COUNT(*), SUM(l.l_extendedprice), "
+           "SUM(l.l_extendedprice*(1-l.l_discount)) AS rev " + _J3 + "GROUP BY l.l_returnflag")
+def test_chain_arith_parent_group():
+    _match("SELECT o.o_orderpriority, SUM(l.l_extendedprice*(1-l.l_discount)) AS rev " + _J3 +
+           "GROUP BY o.o_orderpriority")
+def test_chain_arith_order_limit():
+    _match("SELECT l.l_returnflag, SUM(l.l_extendedprice*(1-l.l_discount)) AS rev " + _J3 +
+           "GROUP BY l.l_returnflag ORDER BY rev DESC LIMIT 2", ordered=True)
