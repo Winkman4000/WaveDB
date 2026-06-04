@@ -314,6 +314,27 @@ def _code_val(seg, pcol, code):
     return seg.fetch(pcol, int(code))
 
 
+def _bulk_keyvals(seg, pcol, codes):
+    """Vectorised decode of an array of group-key dictionary codes -> list of python values. Group keys are
+    value-identity (mode 0/2/5/6 -- mode-4 is gated out), so a single dict index replaces a per-row fetch()."""
+    c = seg.cols[pcol]; dt = c['dt']
+    td = seg._typed_dict(pcol)
+    if not isinstance(td, np.ndarray):
+        td = np.array(td, dtype=object)
+    picked = td[codes]
+    if dt == 3:                                       # int64 epochs -> datetime64 -> _pyval string
+        unit = seg.unit(pcol)
+        out = [wdb_sql._pyval(x) for x in picked.astype(np.int64).view(f'datetime64[{unit}]')]
+    elif dt == 1:                                     # bytes -> str
+        out = [wdb_sql._pyval(x) for x in picked]
+    else:                                             # int / float -> python scalars (C-level tolist)
+        out = picked.tolist()
+    if c['has_null']:
+        nc = c['V'] - 1; cl = codes.tolist()
+        out = [None if cl[i] == nc else out[i] for i in range(len(out))]
+    return out
+
+
 def _fast_pointer_agg(db, tree, ctx):
     import operator
     proj = tree.expressions
@@ -878,29 +899,35 @@ def _fast_pointer_agg(db, tree, ctx):
             counts = wdb_agg.group_counts(gcodes, K)
     present = np.nonzero(counts > 0)[0]
 
-    # ---- assemble rows ----
-    radices = [k['K'] for k in gkeys]                    # decode composite group code -> per-key codes
-    rows = []
-    for code in present:
-        if gkeys:
-            kc = [0] * len(gkeys)
-            tmp = int(code) if gid_to_comp is None else int(gid_to_comp[code])   # factorised id -> composite
-            for j in range(len(gkeys) - 1, -1, -1):
-                kc[j] = tmp % radices[j]; tmp //= radices[j]
-        row = []
-        for i, p in enumerate(proj):
-            r = col_results[i]
-            if r[0] == 'key':
-                gk = gkeys[r[1]]
-                row.append(wdb_sql._pyval(_code_val(gk['seg'], gk['pcol'], kc[r[1]])))
-            elif r[0] == 'count':
-                row.append(int(counts[code]))
+    # ---- assemble rows (vectorised) ----
+    # Decode every present group's composite code into per-key code arrays in one shot, bulk-decode each key
+    # column through its dict, and bulk-pull each aggregate -- then zip columns into row tuples. The old path
+    # was a python loop over present groups calling fetch() per cell, which dominated high-card output.
+    radices = [k['K'] for k in gkeys]
+    kc_arr = []
+    if gkeys:
+        comp = (present.astype(np.int64, copy=True) if gid_to_comp is None
+                else np.asarray(gid_to_comp, dtype=np.int64)[present].copy())   # factorised id -> composite
+        kc_arr = [None] * len(gkeys)
+        for j in range(len(gkeys) - 1, -1, -1):
+            kc_arr[j] = comp % radices[j]; comp //= radices[j]
+    col_lists = []
+    for i, p in enumerate(proj):
+        r = col_results[i]
+        if r[0] == 'key':
+            gk = gkeys[r[1]]
+            col_lists.append(_bulk_keyvals(gk['seg'], gk['pcol'], kc_arr[r[1]]))
+        elif r[0] == 'count':
+            col_lists.append(counts[present].tolist())
+        else:
+            picked = r[1][present]
+            if r[2]:                                      # datetime epoch -> datetime64 -> _pyval string
+                unit = r[3]
+                col_lists.append([(wdb_sql._pyval(np.int64(v).view(f'datetime64[{unit}]')) if v is not None
+                                   else None) for v in picked.tolist()])
             else:
-                v = r[1][code]
-                if r[2] and v is not None:   # datetime MIN/MAX: int64 epoch -> datetime64
-                    v = np.int64(v).view(f"datetime64[{r[3]}]")
-                row.append(wdb_sql._pyval(v))
-        rows.append(tuple(row))
+                col_lists.append([wdb_sql._pyval(v) for v in picked.tolist()])
+    rows = list(zip(*col_lists)) if col_lists else [() for _ in present]
 
     global _FAST_HITS; _FAST_HITS += 1
     rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))
