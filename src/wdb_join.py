@@ -153,6 +153,14 @@ def _mask(df, node, R):
     if isinstance(node, E.In):
         s = df[R(node.this)]; vals = [_coerce_lit(s, L) for L in (node.args.get('expressions') or [])]
         return s.isin(vals)
+    if isinstance(node, E.Is):                         # IS NULL (IS NOT NULL arrives as Not(Is))
+        if isinstance(node.expression, E.Null): return df[R(node.this)].isna()
+        raise NotImplementedError(f"join WHERE: Is {type(node.expression).__name__}")
+    if isinstance(node, (E.Like, E.ILike)):            # LIKE that didn't fuse (e.g. high-card column)
+        s = df[R(node.this)].astype('string')
+        rx = '^' + re.escape(str(node.expression.this)).replace('%', '.*').replace('_', '.') + '$'
+        m = s.str.match(rx, case=not isinstance(node, E.ILike), na=False)
+        return (~m) if node.args.get('negate') else m
     raise NotImplementedError(f"join WHERE: {type(node).__name__}")
 
 

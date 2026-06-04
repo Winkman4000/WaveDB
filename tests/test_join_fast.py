@@ -363,3 +363,17 @@ def test_chain_where_fused_computed_vs_literal():
 def test_chain_where_fused_like_and_numeric():
     _match("SELECT l.l_returnflag, SUM(l.l_extendedprice) " + _J3 +
            "WHERE l.l_shipmode LIKE '%AIL' AND l.l_quantity > 30 GROUP BY l.l_returnflag")
+
+
+# ── graceful degradation: a predicate that can't fuse (numeric IS NULL) falls to the single-join row
+# path and returns the correct result instead of crashing (used to raise NotImplementedError: Is). ──
+_J1 = "FROM lineitem l JOIN orders o ON l.l_orderkey=o.o_orderkey "
+def test_where_numeric_is_null_degrades():
+    _match("SELECT l.l_returnflag, COUNT(*) " + _J1 +
+           "WHERE l.l_quantity IS NULL GROUP BY l.l_returnflag", expect_fast=False)
+def test_where_numeric_is_not_null_degrades():
+    _match("SELECT l.l_returnflag, COUNT(*) " + _J1 +
+           "WHERE l.l_quantity IS NOT NULL GROUP BY l.l_returnflag", expect_fast=False)
+def test_where_is_not_null_and_numeric_degrades():
+    _match("SELECT l.l_returnflag, SUM(l.l_extendedprice) " + _J1 +
+           "WHERE l.l_quantity IS NOT NULL AND l.l_quantity > 30 GROUP BY l.l_returnflag", expect_fast=False)
