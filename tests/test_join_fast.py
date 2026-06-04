@@ -17,8 +17,8 @@ def _fixture():
     _CON = duckdb.connect(); _CON.execute("INSTALL tpch; LOAD tpch; CALL dbgen(sf=0.01)")
     d = os.path.join(tempfile.gettempdir(), f'joinfast_{uuid.uuid4().hex[:8]}')
     _DB = Database.create(d)
-    order = {'region':'r_regionkey','nation':'n_nationkey','customer':'c_custkey','orders':'o_orderkey'}
-    for tbl in ('region','nation','customer','orders'):
+    order = {'region':'r_regionkey','nation':'n_nationkey','customer':'c_custkey','orders':'o_orderkey','lineitem':'l_orderkey'}
+    for tbl in ('region','nation','customer','orders','lineitem'):
         desc = _CON.execute(f"DESCRIBE {tbl}").fetchall()
         sel = ", ".join((f"CAST({c[0]} AS DOUBLE) AS {c[0]}" if c[1].startswith('DECIMAL') else c[0]) for c in desc)
         pq = os.path.join(d, f'{tbl}.parquet')
@@ -28,6 +28,7 @@ def _fixture():
     _DB.create_fk_pointer('orders', 'o_custkey', 'customer', 'c_custkey')
     _DB.create_fk_pointer('nation', 'n_regionkey', 'region', 'r_regionkey')
     _DB.create_fk_pointer('customer', 'c_nationkey', 'nation', 'n_nationkey')
+    _DB.create_fk_pointer('lineitem', 'l_orderkey', 'orders', 'o_orderkey')
     return _DB, _CON
 
 _TS = re.compile(r'^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)(\.\d+)?$')
@@ -126,3 +127,24 @@ def test_plain_projection_falls_back():
     # no aggregate -> not eligible -> must fall back to the hash path, still correct
     _match("SELECT o.o_orderkey, c.c_name FROM orders o JOIN customer c ON o.o_custkey=c.c_custkey "
            "WHERE o.o_totalprice > 400000 ORDER BY o.o_orderkey LIMIT 5", ordered=True, expect_fast=False)
+
+
+# ── multi-table FK-pointer chains: lineitem -> orders -> customer -> nation -> region ──
+_J3 = ("FROM lineitem l JOIN orders o ON l.l_orderkey=o.o_orderkey "
+       "JOIN customer c ON o.o_custkey=c.c_custkey JOIN nation n ON c.c_nationkey=n.n_nationkey ")
+_J5 = _J3 + "JOIN region r ON n.n_regionkey=r.r_regionkey "
+
+def test_chain_3table_count_by_nation():
+    _match("SELECT n.n_name, COUNT(*) " + _J3 + "GROUP BY n.n_name")
+def test_chain_3table_sum_by_nation():
+    _match("SELECT n.n_name, SUM(l.l_quantity) " + _J3 + "GROUP BY n.n_name")
+def test_chain_3table_minmax_by_nation():
+    _match("SELECT n.n_name, MIN(l.l_quantity), MAX(l.l_quantity) " + _J3 + "GROUP BY n.n_name")
+def test_chain_5table_count_by_region():
+    _match("SELECT r.r_name, COUNT(*) " + _J5 + "GROUP BY r.r_name")
+def test_chain_5table_avg_by_region():
+    _match("SELECT r.r_name, AVG(l.l_extendedprice) " + _J5 + "GROUP BY r.r_name")
+def test_chain_5table_where_intermediate():
+    _match("SELECT r.r_name, COUNT(*) " + _J5 + "WHERE o.o_orderpriority='1-URGENT' GROUP BY r.r_name")
+def test_chain_whole_no_group():
+    _match("SELECT COUNT(*), SUM(l.l_quantity) " + _J5)

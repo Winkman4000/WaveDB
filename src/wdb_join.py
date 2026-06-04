@@ -40,8 +40,13 @@ def _all_columns(node):
 def join_query(db, sql):
     tree = sqlglot.parse_one(sql, read='duckdb')
     joins = tree.args.get('joins')
+    # FK-pointer fast path: handles 1..N joins as a chain/star of pre-resolved pointers.
+    try:
+        return _fast_pointer_agg(db, tree, _build_chain(db, tree))
+    except _FastUnsupported:
+        pass   # not an FK-pointer aggregate query -> fall back to the pandas hash-join path
     if not joins or len(joins) != 1:
-        raise NotImplementedError("join: exactly one JOIN supported (step 1)")
+        raise NotImplementedError("join: multi-join requires FK pointers; fallback supports one INNER join")
     jn = joins[0]
     if (jn.args.get('side') or jn.args.get('kind')):
         raise NotImplementedError("join: only INNER JOIN supported (step 1)")
@@ -64,12 +69,7 @@ def join_query(db, sql):
     lcols = {c[0] for c in db.cat.get_table(lt)['schema'].__iter__()} if False else set(db.cat.column_names(lt))
     rcols = set(db.cat.column_names(rt))
 
-    fast = _fast_detect(db, lt, la, rt, ra, lk, rk)
-    if fast is not None:
-        try:
-            return _fast_pointer_agg(db, tree, **fast)
-        except _FastUnsupported:
-            pass   # fall back to the always-correct pandas hash-join path below
+    # (FK-pointer fast path already attempted above via _build_chain)
 
     def resolve(tbl_alias, name):
         """(alias, col) -> merged-frame key 'alias.col'. Unqualified resolves by membership."""
@@ -234,7 +234,7 @@ def _code_val(seg, pcol, code):
     return seg.fetch(pcol, int(code))
 
 
-def _fast_pointer_agg(db, tree, child, parent, child_alias, parent_alias, fk_col):
+def _fast_pointer_agg(db, tree, ctx):
     import operator
     proj = tree.expressions
     if not any(wdb_sql._agg_kind(p) for p in proj): raise _FastUnsupported   # plain projection -> fallback
@@ -242,10 +242,9 @@ def _fast_pointer_agg(db, tree, child, parent, child_alias, parent_alias, fk_col
     gnodes = group.expressions if group is not None else []
     if len(gnodes) > 1: raise _FastUnsupported
 
-    cseg, csp = _solo_segment(db, child)
-    pseg, _   = _solo_segment(db, parent)
-    ptr = db.fk_pointer(csp, fk_col)
-    if ptr is None: raise _FastUnsupported
+    fact = ctx['fact']; alias2t = ctx['alias2t']; seg_of = ctx['seg_of']; composed = ctx['composed']
+    cols_of = {a: set(db.cat.column_names(t)) for a, t in alias2t.items()}
+    phys_of = {a: db.cat.phys_map(t) for a, t in alias2t.items()}
 
     _colmemo = {}
     def _col_cached(seg, pcol):                 # decode each column once per query (multi-agg reuse)
@@ -253,27 +252,21 @@ def _fast_pointer_agg(db, tree, child, parent, child_alias, parent_alias, fk_col
         if k not in _colmemo: _colmemo[k] = wdb_sql._col(seg, pcol)
         return _colmemo[k]
 
-    ccols = set(db.cat.column_names(child)); pcols = set(db.cat.column_names(parent))
-    cphys = db.cat.phys_map(child);          pphys = db.cat.phys_map(parent)
-
     def resolve(node):
         a, nm = node.table, node.name
-        if a == child_alias or (not a and nm in ccols and nm not in pcols): return cseg, cphys.get(nm, nm), False
-        if a == parent_alias or (not a and nm in pcols and nm not in ccols): return pseg, pphys.get(nm, nm), True
-        raise _FastUnsupported
-    def col_native(node):
-        seg, pcol, gathered = resolve(node)
-        arr, nm = _col_cached(seg, pcol)
-        if gathered:
-            arr = arr[ptr]; nm = nm[ptr] if nm is not None else None
-        return arr, nm, seg, pcol
+        if not a:                               # unqualified: find the unique table owning the column
+            owners = [al for al, cs in cols_of.items() if nm in cs]
+            if len(owners) != 1: raise _FastUnsupported
+            a = owners[0]
+        if a not in alias2t or nm not in cols_of[a]: raise _FastUnsupported
+        return seg_of[a], phys_of[a].get(nm, nm), composed[a]   # composed[a] is None for the fact table
     def col_operand(node):
-        # like col_native but un-gathered: parent columns become ('g', arr, ptr) so the gather happens
-        # per-chunk inside the threaded kernel instead of materialising the full gathered array here.
-        seg, pcol, gathered = resolve(node)
+        # parent columns become ('g', arr, composed_ptr) so the gather happens per-chunk inside the
+        # threaded kernel instead of materialising the full gathered array here.
+        seg, pcol, cptr = resolve(node)
         arr, nm = _col_cached(seg, pcol)
-        if gathered:
-            return ('g', arr, ptr), (('g', nm, ptr) if nm is not None else None), seg, pcol
+        if cptr is not None:
+            return ('g', arr, cptr), (('g', nm, cptr) if nm is not None else None), seg, pcol
         return ('d', arr), (('d', nm) if nm is not None else None), seg, pcol
 
     # ---- WHERE -> boolean mask over child rows ----
@@ -296,9 +289,9 @@ def _fast_pointer_agg(db, tree, child, parent, child_alias, parent_alias, fk_col
         b = wdb_sql._lit_for_col(seg, pcol, e, 'O')
         return b if isinstance(b, (bytes, bytearray)) else str(b).encode()
     def leaf(colnode, make_bool):
-        seg, pcol, gathered = resolve(colnode)   # evaluate un-gathered, then gather the bool if parent
+        seg, pcol, cptr = resolve(colnode)       # evaluate un-gathered, then gather the bool via composed ptr
         b = make_bool(seg, pcol)
-        return b[ptr] if gathered else b
+        return b if cptr is None else b[cptr]
     def mask_eval(node):
         if isinstance(node, E.Paren): return mask_eval(node.this)
         if isinstance(node, E.And): return mask_eval(node.this) & mask_eval(node.expression)
@@ -345,16 +338,16 @@ def _fast_pointer_agg(db, tree, child, parent, child_alias, parent_alias, fk_col
     sel = (lambda a: a if mask is None else a[mask])
 
     # ---- group codes (as an operand; gathered per-chunk in the threaded kernel) ----
-    n = len(ptr)
+    n = ctx['n']
     if n == 0: return [], [wdb_sql._alias(p) for p in proj]
     mask_op = ('d', mask) if mask is not None else None
     if gnodes:
-        gseg, gpcol, ggath = resolve(gnodes[0])
+        gseg, gpcol, gcptr = resolve(gnodes[0])
         if gseg.cols[gpcol]['mode'] == 4: raise _FastUnsupported   # codes not value-identity
         full = gseg.codes(gpcol)
         if full.size == 0: return [], [wdb_sql._alias(p) for p in proj]
         K = int(full.max()) + 1                          # safe upper bound; empty groups dropped later
-        group_op = ('g', full, ptr) if ggath else ('d', full)
+        group_op = ('g', full, gcptr) if gcptr is not None else ('d', full)
     else:
         K = 1; group_op = None; gseg = gpcol = None
 
@@ -425,3 +418,63 @@ def _fast_pointer_agg(db, tree, child, parent, child_alias, parent_alias, fk_col
     lim = wdb_sql._limit(tree)
     if lim is not None: rows = rows[:lim]
     return rows, [wdb_sql._alias(p) for p in proj]
+
+
+# ── Multi-table FK-pointer chain (rung: breadth) ─────────────────────────────
+# Generalises the single FK pointer to a walk: lineitem -> orders -> customer -> nation -> region.
+# Each join's ON must match a stored FK pointer (child -> parent). The "fact" table is the one that is
+# a child but never a parent; from it every other table is reached by composing the per-edge pointers
+# (compose by gathering the next pointer through the current one). composed[alias] maps each fact row to
+# that table's row (None for the fact itself). Raises _FastUnsupported if the join graph is not an
+# FK-pointer-rooted tree, so the caller can fall back.
+def _build_chain(db, tree):
+    frm = tree.find(E.From).this
+    tables = [(frm.name, frm.alias or frm.name)]
+    for jn in (tree.args.get('joins') or []):
+        if jn.args.get('side') or jn.args.get('kind'): raise _FastUnsupported   # INNER only
+        if not isinstance(jn.this, E.Table): raise _FastUnsupported              # no subqueries
+        tables.append((jn.this.name, jn.this.alias or jn.this.name))
+    alias2t = {a: t for t, a in tables}
+    if len(alias2t) != len(tables): raise _FastUnsupported                       # duplicate/self alias
+
+    edges = {}            # child_alias -> (parent_alias, fk_col)
+    parents = set()
+    for jn in (tree.args.get('joins') or []):
+        on = jn.args.get('on')
+        if not isinstance(on, E.EQ): raise _FastUnsupported
+        le, re = on.this, on.expression
+        if not (isinstance(le, E.Column) and isinstance(re, E.Column)): raise _FastUnsupported
+        aA, kA, aB, kB = le.table, le.name, re.table, re.name
+        tA, tB = alias2t.get(aA), alias2t.get(aB)
+        if tA is None or tB is None: raise _FastUnsupported
+        fkA, fkB = db.cat.fk_pointers(tA), db.cat.fk_pointers(tB)
+        if kA in fkA and fkA[kA]['parent'] == tB and fkA[kA]['parent_key'] == kB:
+            child_a, parent_a, fk_col = aA, aB, kA
+        elif kB in fkB and fkB[kB]['parent'] == tA and fkB[kB]['parent_key'] == kA:
+            child_a, parent_a, fk_col = aB, aA, kB
+        else:
+            raise _FastUnsupported                                               # edge is not a stored FK pointer
+        if child_a in edges: raise _FastUnsupported                              # one parent per child (tree)
+        edges[child_a] = (parent_a, fk_col); parents.add(parent_a)
+
+    fact_candidates = [a for a in edges if a not in parents]
+    if len(fact_candidates) != 1: raise _FastUnsupported                         # need a single rooted fact
+    fact = fact_candidates[0]
+
+    seg_of, sp_of = {}, {}
+    for _, a in tables:
+        seg_of[a], sp_of[a] = _solo_segment(db, alias2t[a])
+
+    composed = {fact: None}                                                      # None = identity (fact rows)
+    progress = True
+    while progress:
+        progress = False
+        for child_a, (parent_a, fk_col) in edges.items():
+            if child_a in composed and parent_a not in composed:
+                p = db.fk_pointer(sp_of[child_a], fk_col)
+                if p is None: raise _FastUnsupported
+                cc = composed[child_a]
+                composed[parent_a] = p if cc is None else p[cc]                  # compose by gather
+                progress = True
+    if any(a not in composed for _, a in tables): raise _FastUnsupported         # disconnected
+    return dict(fact=fact, alias2t=alias2t, seg_of=seg_of, composed=composed, n=seg_of[fact].N)
