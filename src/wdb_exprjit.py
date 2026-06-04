@@ -16,7 +16,7 @@ distinct (body, #slots, gathered?, masked?, minmax?) shape and cached in-process
 
 This mirrors the hand-written decode-fused kernels in wdb_agg, generalised to arbitrary +,-,*,/ trees.
 """
-import os
+import os, re
 import numpy as np
 
 try:
@@ -127,11 +127,13 @@ def grouped_expr(group_keys, body, inputs, mask, n, need_minmax):
     return cnt[:, :K].sum(0), s[:, :K].sum(0), None, None
 
 
-def _build_multi(bodies, mm_flags, slot_gathered, gk_gathered, nkeys, has_mask):
+def _build_multi(bodies, mm_flags, slot_gathered, gk_gathered, nkeys, has_mask, pred):
     """Compile a kernel that, in ONE pass, composes the group code inline, decodes the shared value slots
     once, and accumulates EVERY value expression (count + per-expr sum, and min/max where flagged).
-    bodies: tuple of numba-source expressions over global slots v0..v{G-1}; mm_flags: per-expr need_minmax."""
-    key = (bodies, mm_flags, slot_gathered, gk_gathered, nkeys, has_mask)
+    bodies: tuple of numba-source expressions over global slots v0..v{G-1}; mm_flags: per-expr need_minmax.
+    pred: a boolean expression over the same slots (WHERE fused inline); '' for none. When present, the
+    predicate's slots are decoded first and a failing row is skipped before any other slot is decoded."""
+    key = (bodies, mm_flags, slot_gathered, gk_gathered, nkeys, has_mask, pred)
     fn = _CACHE.get(key)
     if fn is not None:
         return fn
@@ -162,11 +164,19 @@ def _build_multi(bodies, mm_flags, slot_gathered, gk_gathered, nkeys, has_mask):
           "    for t in _prange(NT):",
           "        lo = t * chunk; hi = min(lo + chunk, n)",
           "        for i in range(lo, hi):"]
-    if has_mask:
+    def _decode(k):
+        idx = f'c{k}[p{k}[i]]' if slot_gathered[k] else f'c{k}[i]'
+        return f"            v{k} = b{k}[{idx}]"
+    pred_slots = sorted(set(int(x) for x in re.findall(r'v(\d+)', pred))) if pred else []
+    done = set()
+    if pred:                                    # decode only what the predicate needs, then skip early
+        for k in pred_slots:
+            L += [_decode(k)]; done.add(k)
+        L += [f"            if not ({pred}): continue"]
+    elif has_mask:
         L += ["            if not mask[i]: continue"]
     for k in range(G):
-        idx = f'c{k}[p{k}[i]]' if slot_gathered[k] else f'c{k}[i]'
-        L += [f"            v{k} = b{k}[{idx}]"]
+        if k not in done: L += [_decode(k)]
     if nkeys == 0:
         L += ["            g = 0"]
     else:
@@ -193,7 +203,7 @@ def _build_multi(bodies, mm_flags, slot_gathered, gk_gathered, nkeys, has_mask):
     return fn
 
 
-def grouped_multi(group_keys, inputs, exprs, mask, n):
+def grouped_multi(group_keys, inputs, exprs, mask, n, pred=None):
     """Single-pass fused aggregation of MANY value expressions sharing one composite group + decoded slots.
       group_keys : list of (codes, K_i, ptr_or_None)  -- composed inline into the group code.
       inputs     : global list of (base, codes, ptr_or_None) distinct value slots.
@@ -207,7 +217,8 @@ def grouped_multi(group_keys, inputs, exprs, mask, n):
     slot_gathered = tuple(inp[2] is not None for inp in inputs)
     bodies   = tuple(e[0] for e in exprs)
     mm_flags = tuple(bool(e[1]) for e in exprs)
-    fn = _build_multi(bodies, mm_flags, slot_gathered, gk_gathered, nkeys, mask is not None)
+    has_mask = mask is not None and not pred          # fused predicate supersedes a materialised mask
+    fn = _build_multi(bodies, mm_flags, slot_gathered, gk_gathered, nkeys, has_mask, pred or '')
 
     args = [n]
     for (codes, _ki, ptr) in group_keys:
@@ -219,7 +230,7 @@ def grouped_multi(group_keys, inputs, exprs, mask, n):
         args += [base, codes]
         if ptr is not None: args.append(np.ascontiguousarray(ptr))
     args += [K, _NT, Kp]
-    if mask is not None: args.append(mask)
+    if has_mask: args.append(mask)
 
     res = fn(*args)
     counts = res[0][:, :K].sum(0)

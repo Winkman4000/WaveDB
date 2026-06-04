@@ -270,3 +270,25 @@ def test_chain_mixed_plain_arith_onepass():
 def test_chain_singlekey_multivalue_distinct():
     _match("SELECT l.l_returnflag, SUM(l.l_extendedprice), SUM(l.l_quantity), AVG(l.l_discount) "
            + _J3 + "GROUP BY l.l_returnflag")
+
+
+# ── WHERE-predicate fusion: numeric / datetime comparisons evaluated inline in the kernel ──
+def test_chain_where_fused_numeric():
+    _match("SELECT l.l_returnflag, SUM(l.l_extendedprice*(1-l.l_discount)) "
+           + _J3 + "WHERE l.l_quantity > 25 GROUP BY l.l_returnflag")
+def test_chain_where_fused_between_and():
+    _match("SELECT l.l_returnflag, SUM(l.l_extendedprice) " + _J3 +
+           "WHERE l.l_quantity BETWEEN 10 AND 40 AND l.l_discount > 0.02 GROUP BY l.l_returnflag")
+def test_chain_where_fused_date_range_parent():
+    _match("SELECT l.l_returnflag, SUM(l.l_extendedprice) " + _J3 +
+           "WHERE o.o_orderdate >= DATE '1994-01-01' AND o.o_orderdate < DATE '1995-01-01' "
+           "GROUP BY l.l_returnflag")
+def test_chain_where_fused_or():
+    _match("SELECT l.l_returnflag, COUNT(*) " + _J3 +
+           "WHERE l.l_quantity < 5 OR l.l_quantity > 45 GROUP BY l.l_returnflag")
+def test_chain_where_string_fallback():            # string predicate -> materialised mask, still correct
+    _match("SELECT l.l_returnflag, SUM(l.l_extendedprice) " + _J3 +
+           "WHERE c.c_mktsegment = 'BUILDING' GROUP BY l.l_returnflag")
+def test_chain_where_mixed_string_numeric():
+    _match("SELECT l.l_returnflag, SUM(l.l_extendedprice*(1-l.l_discount)) " + _J3 +
+           "WHERE c.c_mktsegment = 'BUILDING' AND l.l_quantity > 20 GROUP BY l.l_returnflag")

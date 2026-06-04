@@ -402,13 +402,17 @@ def _fast_pointer_agg(db, tree, ctx):
             return leaf(node.this, mk)
         raise _FastUnsupported
     where = tree.args.get('where')
-    mask = mask_eval(where.this) if where is not None else None
-    sel = (lambda a: a if mask is None else a[mask])
+    _maskc = {}
+    def get_mask():                # materialise the WHERE bool mask lazily -- only non-fused paths need it
+        if 'm' not in _maskc:
+            _maskc['m'] = mask_eval(where.this) if where is not None else None
+        return _maskc['m']
+    def _mask_op():
+        m = get_mask(); return ('d', m) if m is not None else None
 
     # ---- group codes (as an operand; gathered per-chunk in the threaded kernel) ----
     n = ctx['n']
     if n == 0: return [], [wdb_sql._alias(p) for p in proj]
-    mask_op = ('d', mask) if mask is not None else None
     gkeys = []                                           # one per GROUP BY column
     for g in gnodes:
         gseg, gpcol, gcptr = resolve(g)
@@ -475,6 +479,46 @@ def _fast_pointer_agg(db, tree, ctx):
             return f"({build_fused(node.this)} {_ARITH_STR[type(node)]} {build_fused(node.expression)})"
         raise _FastUnsupported
 
+    _CMP_STR = {E.GT: '>', E.LT: '<', E.GTE: '>=', E.LTE: '<=', E.EQ: '==', E.NEQ: '!='}
+    def build_pred(node):
+        # Compile a WHERE predicate to a numba boolean over the shared slots (numeric/datetime comparisons,
+        # BETWEEN, AND/OR/NOT). Raises _FastUnsupported for string / IN / anything else -> materialised mask.
+        if isinstance(node, E.Paren): return build_pred(node.this)
+        if isinstance(node, E.And): return f"({build_pred(node.this)} and {build_pred(node.expression)})"
+        if isinstance(node, E.Or):  return f"({build_pred(node.this)} or {build_pred(node.expression)})"
+        if isinstance(node, E.Not): return f"(not {build_pred(node.this)})"
+        if type(node) in _CMP_STR:
+            op = _CMP_STR[type(node)]; a, b = node.this, node.expression
+            if   isinstance(a, E.Column) and not isinstance(b, E.Column): col, lit, left = a, b, True
+            elif isinstance(b, E.Column) and not isinstance(a, E.Column): col, lit, left = b, a, False
+            else: raise _FastUnsupported
+            cseg, cpcol, _c = resolve(col)
+            if cseg.cols[cpcol]['dt'] == 1: raise _FastUnsupported       # string compare -> mask fallback
+            v = build_fused(col)
+            kind = 'f' if cseg.cols[cpcol]['dt'] == 2 else 'i'
+            lv = wdb_sql._lit_for_col(cseg, cpcol, lit, kind)
+            if not isinstance(lv, (int, float, np.integer, np.floating)): raise _FastUnsupported
+            lv = float(lv) if kind == 'f' else int(lv)
+            return f"({v} {op} {lv})" if left else f"({lv} {op} {v})"
+        if isinstance(node, E.Between):
+            col = node.this
+            if not isinstance(col, E.Column): raise _FastUnsupported
+            cseg, cpcol, _c = resolve(col)
+            if cseg.cols[cpcol]['dt'] == 1: raise _FastUnsupported
+            v = build_fused(col); kind = 'f' if cseg.cols[cpcol]['dt'] == 2 else 'i'
+            lo = wdb_sql._lit_for_col(cseg, cpcol, node.args['low'], kind)
+            hi = wdb_sql._lit_for_col(cseg, cpcol, node.args['high'], kind)
+            lo = float(lo) if kind == 'f' else int(lo); hi = float(hi) if kind == 'f' else int(hi)
+            return f"(({lo} <= {v}) and ({v} <= {hi}))"
+        raise _FastUnsupported
+
+    pred_body = None
+    if where is not None:
+        try:
+            pred_body = build_pred(where.this)
+        except _FastUnsupported:
+            pred_body = None; slots.clear(); slot_list.clear()   # discard any partial predicate slots
+
     plan = []; fully = wdb_exprjit.HAS_NUMBA
     for i, p in enumerate(proj):
         inner = p.this if isinstance(p, E.Alias) else p
@@ -509,7 +553,8 @@ def _fast_pointer_agg(db, tree, ctx):
             if fn in ('SUM', 'AVG', 'MIN', 'MAX'):
                 if body not in ex_index: ex_index[body] = len(exprs); exprs.append([body, False])
                 if fn in ('MIN', 'MAX'): exprs[ex_index[body]][1] = True
-        counts, results = wdb_exprjit.grouped_multi(group_keys, slot_list, exprs, mask, n)
+        counts, results = wdb_exprjit.grouped_multi(group_keys, slot_list, exprs,
+                                                    None if pred_body else get_mask(), n, pred_body)
         nz = counts > 0
         for (i, fn, body, is_dt, unit) in plan:
             if fn == 'count':
@@ -573,7 +618,7 @@ def _fast_pointer_agg(db, tree, ctx):
                 g['aggs'].append((i, fn))
                 if fn in ('MIN', 'MAX'): g['mm'] = True
             for g in groups.values():
-                cE, sE, mnE, mxE = wdb_exprjit.grouped_expr(group_keys, g['body'], g['inputs'], mask, n, g['mm'])
+                cE, sE, mnE, mxE = wdb_exprjit.grouped_expr(group_keys, g['body'], g['inputs'], get_mask(), n, g['mm'])
                 expr_counts = cE; nz = cE > 0
                 for (i, fn) in g['aggs']:
                     o = np.full(K, None, dtype=object)
@@ -586,18 +631,20 @@ def _fast_pointer_agg(db, tree, ctx):
         # plain (column / star) aggregates via the existing fused/numpy machinery
         if specs or minmax:
             if numba_ok:
-                counts, agg_arrays = wdb_agg.fused_numba(_group_op(), K, specs + minmax, mask_op, n)
+                counts, agg_arrays = wdb_agg.fused_numba(_group_op(), K, specs + minmax, _mask_op(), n)
             elif n >= wdb_agg.PARALLEL_THRESHOLD and not minmax:
-                counts, agg_arrays = wdb_agg.fused_counts_and_aggs(_group_op(), K, specs, mask_op, n)
+                counts, agg_arrays = wdb_agg.fused_counts_and_aggs(_group_op(), K, specs, _mask_op(), n)
             else:
                 gc = wdb_agg._slice(_group_op(), 0, n)
                 gcodes = np.zeros(n, dtype=np.int64) if gc is None else gc.astype(np.int64, copy=False)
-                if mask is not None: gcodes = gcodes[mask]
+                _m = get_mask()
+                if _m is not None: gcodes = gcodes[_m]
                 counts = wdb_agg.group_counts(gcodes, K)
                 def _materialize(vop, nop):
-                    v = wdb_agg._slice(vop, 0, n); v = v[mask] if mask is not None else v
+                    _m = get_mask()
+                    v = wdb_agg._slice(vop, 0, n); v = v[_m] if _m is not None else v
                     nm = wdb_agg._slice(nop, 0, n)
-                    if nm is not None and mask is not None: nm = nm[mask]
+                    if nm is not None and _m is not None: nm = nm[_m]
                     return v, nm
                 agg_arrays = {}
                 for (i, fn, vop, nop) in specs + minmax:
@@ -609,7 +656,8 @@ def _fast_pointer_agg(db, tree, ctx):
         else:                                                     # only COUNT(*) / key columns -> counts-only pass
             gc = wdb_agg._slice(_group_op(), 0, n)
             gcodes = np.zeros(n, dtype=np.int64) if gc is None else gc.astype(np.int64, copy=False)
-            if mask is not None: gcodes = gcodes[mask]
+            _m = get_mask()
+            if _m is not None: gcodes = gcodes[_m]
             counts = wdb_agg.group_counts(gcodes, K)
     present = np.nonzero(counts > 0)[0]
 

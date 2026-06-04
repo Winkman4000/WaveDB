@@ -239,6 +239,8 @@ def _lit_for_col(seg, colname, lit, arr_kind):
     value comparable with column `colname`."""
     if isinstance(lit, E.Neg):
         return -_lit_for_col(seg, colname, lit.this, arr_kind)
+    if isinstance(lit, E.Cast):            # DATE '...' / CAST('...' AS DATE) -> unwrap to inner literal
+        return _lit_for_col(seg, colname, lit.this, arr_kind)
     c = seg.cols[colname]
     if c['dt'] == 3:                       # datetime: parse string/number to int64 epoch
         return _parse_temporal(lit.this, seg.unit(colname))
