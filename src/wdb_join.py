@@ -523,20 +523,33 @@ def _fast_pointer_agg(db, tree, ctx):
         full = gseg.codes(gpcol)
         if full.size == 0: return [], [wdb_sql._alias(p) for p in proj]
         gkeys.append({'seg': gseg, 'pcol': gpcol, 'cptr': gcptr, 'full': full, 'K': int(full.max()) + 1})
+    gid_to_comp = None                                    # set when a high-card composite is hash-factorised
     if len(gkeys) == 0:
-        K = 1; group_op = None
+        K = 1; group_op = None; group_keys = []
     elif len(gkeys) == 1:                                 # single key: keep the gather-fused operand
         k0 = gkeys[0]; K = k0['K']
         group_op = ('g', k0['full'], k0['cptr']) if k0['cptr'] is not None else ('d', k0['full'])
+        group_keys = [(k0['full'], K, k0['cptr'])]
     else:                                                 # multi-key: mixed-radix composite
         K = 1
         for k in gkeys: K *= k['K']
-        if K > MULTI_GROUP_CEIL: raise _FastUnsupported   # dense composite would blow up -> needs hashing
-        group_op = None                                   # comp array built lazily; codegen composes inline
+        if K <= MULTI_GROUP_CEIL:                          # dense: codegen composes the code INLINE (no array)
+            group_op = None
+            group_keys = [(k['full'], k['K'], k['cptr']) for k in gkeys]
+        else:                                              # high-card: hash-factorise the composite to dense ids
+            prod = 1
+            for k in gkeys: prod *= k['K']
+            if prod > (1 << 62): raise _FastUnsupported    # mixed-radix code would overflow int64
+            comp = np.zeros(n, dtype=np.int64)
+            for k in gkeys:
+                codes = k['full'][k['cptr']] if k['cptr'] is not None else k['full']
+                comp = comp * k['K'] + codes.astype(np.int64, copy=False)
+            gids, gid_to_comp = pd.factorize(comp, sort=False)   # hash-factorise -> only groups present
+            gids = np.ascontiguousarray(gids.astype(np.int64))
+            K = len(gid_to_comp); group_op = ('d', gids); group_keys = [(gids, K, None)]
 
     # The codegen value path composes the composite group code INLINE (no comp array). The non-fused
     # plain / numpy / counts-only paths get a materialised group operand on demand via _group_op().
-    group_keys = [(k['full'], k['K'], k['cptr']) for k in gkeys]
     _go = {}
     def _group_op():
         if group_op is not None or not gkeys: return group_op
@@ -870,7 +883,8 @@ def _fast_pointer_agg(db, tree, ctx):
     rows = []
     for code in present:
         if gkeys:
-            kc = [0] * len(gkeys); tmp = int(code)
+            kc = [0] * len(gkeys)
+            tmp = int(code) if gid_to_comp is None else int(gid_to_comp[code])   # factorised id -> composite
             for j in range(len(gkeys) - 1, -1, -1):
                 kc[j] = tmp % radices[j]; tmp //= radices[j]
         row = []

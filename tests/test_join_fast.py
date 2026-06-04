@@ -392,3 +392,18 @@ def test_chain_plain_projection_distinct_cols():
     _match("SELECT l.l_orderkey, c.c_mktsegment " + _J3 +
            "WHERE l.l_quantity > 49 ORDER BY l.l_orderkey, c.c_mktsegment LIMIT 12",
            ordered=True, expect_fast=False)
+
+
+# ── high-card multi-group: when the dense composite code space exceeds MULTI_GROUP_CEIL, the group key is
+# hash-factorised to dense ids and the SAME fused kernel runs over them (previously this bailed to the pandas
+# tail). Force the branch on the small fixture by lowering the ceiling. ──
+def test_chain_highcard_multigroup_factorize():
+    save = wdb_join.MULTI_GROUP_CEIL
+    try:
+        wdb_join.MULTI_GROUP_CEIL = 4                 # force factorise for any 2+ col composite
+        _match("SELECT l.l_returnflag, l.l_shipmode, SUM(l.l_extendedprice) " + _J3 +
+               "GROUP BY l.l_returnflag, l.l_shipmode")
+        _match("SELECT l.l_returnflag, l.l_shipmode, o.o_orderpriority, COUNT(*) " + _J3 +
+               "GROUP BY l.l_returnflag, l.l_shipmode, o.o_orderpriority")
+    finally:
+        wdb_join.MULTI_GROUP_CEIL = save
