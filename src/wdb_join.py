@@ -209,6 +209,11 @@ class _FastUnsupported(Exception):
     pass
 
 _FAST_HITS = 0   # diagnostic: how many queries took the gather fast path
+FUSE_STR_PRED = True   # string '='/'!=' -> inline code comparison (codes[i]==target). Measured to
+                       # beat both the identity-base trick and the materialised-mask path at every
+                       # cardinality, fact AND gathered-parent, at sf=1 -- so no runtime switch is
+                       # warranted yet. This flag is where a parent-cache-thrash threshold would go
+                       # if a large-parent (sf>=10) workload ever shows the gather losing to a mask.
 
 
 def _fast_detect(db, lt, la, rt, ra, lk, rk):
@@ -492,8 +497,23 @@ def _fast_pointer_agg(db, tree, ctx):
             if   isinstance(a, E.Column) and not isinstance(b, E.Column): col, lit, left = a, b, True
             elif isinstance(b, E.Column) and not isinstance(a, E.Column): col, lit, left = b, a, False
             else: raise _FastUnsupported
-            cseg, cpcol, _c = resolve(col)
-            if cseg.cols[cpcol]['dt'] == 1: raise _FastUnsupported       # string compare -> mask fallback
+            cseg, cpcol, cptr = resolve(col)
+            if cseg.cols[cpcol]['dt'] == 1:                              # string -> fuse a CODE comparison
+                if not FUSE_STR_PRED: raise _FastUnsupported
+                if type(node) not in (E.EQ, E.NEQ): raise _FastUnsupported   # ordering on strings -> mask
+                sc = _str_codes(cseg, cpcol)
+                if sc is None or not lit.is_string: raise _FastUnsupported
+                codes, code_of, nullcode = sc
+                target = code_of.get(_lit_bytes(cseg, cpcol, lit), -1)
+                ckey = (id(cseg), cpcol, id(cptr) if cptr is not None else None)
+                if ckey not in slots:                                   # raw code slot: base=None, codes only
+                    slots[ckey] = len(slot_list)
+                    slot_list.append((None, np.ascontiguousarray(codes),
+                                      None if cptr is None else np.ascontiguousarray(cptr)))
+                vk = f"v{slots[ckey]}"
+                if type(node) is E.EQ: return f"({vk} == {target})"
+                if nullcode is None:   return f"({vk} != {target})"
+                return f"(({vk} != {target}) and ({vk} != {nullcode}))"   # SQL: NULL != x is not TRUE
             v = build_fused(col)
             kind = 'f' if cseg.cols[cpcol]['dt'] == 2 else 'i'
             lv = wdb_sql._lit_for_col(cseg, cpcol, lit, kind)

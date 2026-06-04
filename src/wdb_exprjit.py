@@ -127,13 +127,13 @@ def grouped_expr(group_keys, body, inputs, mask, n, need_minmax):
     return cnt[:, :K].sum(0), s[:, :K].sum(0), None, None
 
 
-def _build_multi(bodies, mm_flags, slot_gathered, gk_gathered, nkeys, has_mask, pred):
+def _build_multi(bodies, mm_flags, slot_gathered, slot_code, gk_gathered, nkeys, has_mask, pred):
     """Compile a kernel that, in ONE pass, composes the group code inline, decodes the shared value slots
     once, and accumulates EVERY value expression (count + per-expr sum, and min/max where flagged).
     bodies: tuple of numba-source expressions over global slots v0..v{G-1}; mm_flags: per-expr need_minmax.
     pred: a boolean expression over the same slots (WHERE fused inline); '' for none. When present, the
     predicate's slots are decoded first and a failing row is skipped before any other slot is decoded."""
-    key = (bodies, mm_flags, slot_gathered, gk_gathered, nkeys, has_mask, pred)
+    key = (bodies, mm_flags, slot_gathered, slot_code, gk_gathered, nkeys, has_mask, pred)
     fn = _CACHE.get(key)
     if fn is not None:
         return fn
@@ -146,7 +146,8 @@ def _build_multi(bodies, mm_flags, slot_gathered, gk_gathered, nkeys, has_mask, 
     for j in range(1, nkeys):
         params.append(f'r{j}')
     for k in range(G):
-        params += [f'b{k}', f'c{k}']
+        if not slot_code[k]: params.append(f'b{k}')      # code slots carry no base array (raw codes)
+        params.append(f'c{k}')
         if slot_gathered[k]: params.append(f'p{k}')
     params += ['K', 'NT', 'Kp']
     if has_mask:
@@ -166,7 +167,7 @@ def _build_multi(bodies, mm_flags, slot_gathered, gk_gathered, nkeys, has_mask, 
           "        for i in range(lo, hi):"]
     def _decode(k):
         idx = f'c{k}[p{k}[i]]' if slot_gathered[k] else f'c{k}[i]'
-        return f"            v{k} = b{k}[{idx}]"
+        return f"            v{k} = {idx}" if slot_code[k] else f"            v{k} = b{k}[{idx}]"
     pred_slots = sorted(set(int(x) for x in re.findall(r'v(\d+)', pred))) if pred else []
     done = set()
     if pred:                                    # decode only what the predicate needs, then skip early
@@ -215,10 +216,11 @@ def grouped_multi(group_keys, inputs, exprs, mask, n, pred=None):
     nkeys = len(group_keys)
     gk_gathered   = tuple(gk[2] is not None for gk in group_keys)
     slot_gathered = tuple(inp[2] is not None for inp in inputs)
+    slot_code     = tuple(inp[0] is None for inp in inputs)   # base None -> raw code slot (string equality)
     bodies   = tuple(e[0] for e in exprs)
     mm_flags = tuple(bool(e[1]) for e in exprs)
     has_mask = mask is not None and not pred          # fused predicate supersedes a materialised mask
-    fn = _build_multi(bodies, mm_flags, slot_gathered, gk_gathered, nkeys, has_mask, pred or '')
+    fn = _build_multi(bodies, mm_flags, slot_gathered, slot_code, gk_gathered, nkeys, has_mask, pred or '')
 
     args = [n]
     for (codes, _ki, ptr) in group_keys:
@@ -227,7 +229,8 @@ def grouped_multi(group_keys, inputs, exprs, mask, n, pred=None):
     for j in range(1, nkeys):
         args.append(group_keys[j][1])
     for (base, codes, ptr) in inputs:
-        args += [base, codes]
+        if base is not None: args.append(base)            # code slots pass codes only
+        args.append(codes)
         if ptr is not None: args.append(np.ascontiguousarray(ptr))
     args += [K, _NT, Kp]
     if has_mask: args.append(mask)

@@ -292,3 +292,24 @@ def test_chain_where_string_fallback():            # string predicate -> materia
 def test_chain_where_mixed_string_numeric():
     _match("SELECT l.l_returnflag, SUM(l.l_extendedprice*(1-l.l_discount)) " + _J3 +
            "WHERE c.c_mktsegment = 'BUILDING' AND l.l_quantity > 20 GROUP BY l.l_returnflag")
+
+
+# ── string-equality WHERE fusion (inline dictionary-code comparison, no materialised mask) ──
+def test_chain_where_fused_string_fact():
+    _match("SELECT l.l_returnflag, SUM(l.l_extendedprice) " + _J3 +
+           "WHERE l.l_shipmode = 'AIR' GROUP BY l.l_returnflag")
+def test_chain_where_fused_string_neq():
+    _match("SELECT l.l_returnflag, COUNT(*) " + _J3 +
+           "WHERE l.l_shipmode != 'AIR' GROUP BY l.l_returnflag")
+def test_chain_where_fused_string_parent():
+    _match("SELECT l.l_returnflag, SUM(l.l_extendedprice) " + _J3 +
+           "WHERE c.c_mktsegment = 'BUILDING' GROUP BY l.l_returnflag")
+def test_chain_where_fused_string_or():
+    _match("SELECT l.l_returnflag, COUNT(*) " + _J3 +
+           "WHERE l.l_shipmode = 'AIR' OR l.l_shipmode = 'RAIL' GROUP BY l.l_returnflag")
+def test_chain_where_fused_string_and_numeric():
+    _match("SELECT l.l_returnflag, SUM(l.l_extendedprice*(1-l.l_discount)) " + _J3 +
+           "WHERE c.c_mktsegment = 'BUILDING' AND l.l_quantity > 20 GROUP BY l.l_returnflag")
+def test_chain_where_fused_string_missing_value():     # literal not in dict -> matches nothing
+    _match("SELECT l.l_returnflag, COUNT(*) " + _J3 +
+           "WHERE l.l_shipmode = 'NOSUCHMODE' GROUP BY l.l_returnflag")
