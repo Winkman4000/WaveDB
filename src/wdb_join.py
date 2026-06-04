@@ -943,6 +943,30 @@ def _fast_pointer_agg(db, tree, ctx):
 # (compose by gathering the next pointer through the current one). composed[alias] maps each fact row to
 # that table's row (None for the fact itself). Raises _FastUnsupported if the join graph is not an
 # FK-pointer-rooted tree, so the caller can fall back.
+def _key_is_unique(db, table, col):
+    """True if `col` in `table` is a single clean segment with all-distinct values (a candidate join parent)."""
+    try: seg, _ = _solo_segment(db, table)
+    except _FastUnsupported: return False
+    pc = db.cat.phys_map(table).get(col, col)
+    if pc not in seg.cols: return False
+    v = wdb_sql._col(seg, pc)[0]
+    return v is not None and len(v) == len(np.unique(np.asarray(v)))
+
+
+def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
+    """Build a child->parent gather pointer at query time via a hash probe (the parent key must be unique).
+    For each child row, the parent row whose key matches. INNER + row-preserving only: a partial match would
+    drop child rows, so that raises _FastUnsupported and the query falls back. A hash join becomes a pointer,
+    and every downstream gather/predicate/aggregate stays on the same fused chain."""
+    cp = db.cat.phys_map(ctbl).get(ckey, ckey); pp = db.cat.phys_map(ptbl).get(pkey, pkey)
+    ck = np.asarray(wdb_sql._col(cseg, cp)[0]); pk = np.asarray(wdb_sql._col(pseg, pp)[0])
+    pidx = pd.Index(pk)
+    if not pidx.is_unique: raise _FastUnsupported                 # many-to-many -> not a pointer
+    ptr = pidx.get_indexer(ck)
+    if (ptr < 0).any(): raise _FastUnsupported                    # unmatched child rows -> would drop -> fall back
+    return ptr.astype(np.int64)
+
+
 def _build_chain(db, tree):
     frm = tree.find(E.From).this
     tables = [(frm.name, frm.alias or frm.name)]
@@ -968,8 +992,12 @@ def _build_chain(db, tree):
             child_a, parent_a, fk_col = aA, aB, kA
         elif kB in fkB and fkB[kB]['parent'] == tA and fkB[kB]['parent_key'] == kA:
             child_a, parent_a, fk_col = aB, aA, kB
+        elif _key_is_unique(db, tB, kB):                                         # non-FK: parent = unique-key side
+            child_a, parent_a, fk_col = aA, aB, ('hash', kA, kB)                 # built as a runtime hash pointer
+        elif _key_is_unique(db, tA, kA):
+            child_a, parent_a, fk_col = aB, aA, ('hash', kB, kA)
         else:
-            raise _FastUnsupported                                               # edge is not a stored FK pointer
+            raise _FastUnsupported                                               # neither key unique -> not a pointer
         if child_a in edges: raise _FastUnsupported                              # one parent per child (tree)
         edges[child_a] = (parent_a, fk_col); parents.add(parent_a)
 
@@ -1014,7 +1042,11 @@ def _build_chain(db, tree):
         for child_a, (parent_a, fk_col) in edges.items():
             if parent_a not in keep: continue                                    # pruned hop: skip the gather
             if child_a in composed and parent_a not in composed:
-                p = db.fk_pointer(sp_of[child_a], fk_col)
+                if isinstance(fk_col, tuple) and fk_col and fk_col[0] == 'hash':
+                    p = _hash_pointer(db, alias2t[child_a], fk_col[1], seg_of[child_a],
+                                      alias2t[parent_a], fk_col[2], seg_of[parent_a])
+                else:
+                    p = db.fk_pointer(sp_of[child_a], fk_col)
                 if p is None: raise _FastUnsupported
                 cc = composed[child_a]
                 composed[parent_a] = p if cc is None else p[cc]                  # compose by gather
