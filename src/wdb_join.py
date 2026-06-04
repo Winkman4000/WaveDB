@@ -308,14 +308,14 @@ def _fast_pointer_agg(db, tree, ctx):
             if isinstance(node, (E.Paren, E.Cast)): return emit(node.this)
             if isinstance(node, E.Neg): return f"(-{emit(node.this)})"
             if isinstance(node, E.Column):
-                seg, pcol, cptr = resolve(node)
-                if cptr is not None: raise _FastUnsupported          # parent column: gathered decode not fused yet
+                seg, pcol, cptr = resolve(node)               # cptr: fact->parent pointer (None for the fact)
                 raw = wdb_sql.raw_dict_col(seg, pcol)
                 if raw is None: raise _FastUnsupported               # nullable / string / computed -> fallback
-                key = (id(seg), pcol)
+                key = (id(seg), pcol, id(cptr) if cptr is not None else None)
                 if key not in slot:
                     slot[key] = len(inputs)
-                    inputs.append((np.ascontiguousarray(raw[0]), np.ascontiguousarray(raw[1])))
+                    inputs.append((np.ascontiguousarray(raw[0]), np.ascontiguousarray(raw[1]),
+                                   None if cptr is None else np.ascontiguousarray(cptr)))
                 return f"v{slot[key]}"
             if isinstance(node, E.Literal):
                 if node.is_string: raise _FastUnsupported
@@ -479,7 +479,7 @@ def _fast_pointer_agg(db, tree, ctx):
     if expr_aggs:
         groups = {}
         for (i, fn, body, inputs) in expr_aggs:
-            ek = (body, tuple(id(b) for b, _ in inputs))
+            ek = (body, tuple(id(b) for b, _, _ in inputs))
             g = groups.setdefault(ek, {'body': body, 'inputs': inputs, 'aggs': [], 'mm': False})
             g['aggs'].append((i, fn))
             if fn in ('MIN', 'MAX'): g['mm'] = True

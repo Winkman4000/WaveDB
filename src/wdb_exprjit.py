@@ -27,24 +27,29 @@ except Exception:
 
 _NT = min(8, os.cpu_count() or 1)
 _PARALLEL_THRESHOLD = 2_000_000
-_CACHE = {}                       # (body, m, gathered, has_mask, need_minmax) -> compiled kernel
+_CACHE = {}                       # (body, slot_gathered, group_gathered, has_mask, need_minmax) -> kernel
 
 
-def _build(body, m, gathered, has_mask, need_minmax):
-    """Generate + compile (or fetch from cache) the fused kernel for this expression shape."""
-    key = (body, m, gathered, has_mask, need_minmax)
+def _build(body, slot_gathered, group_gathered, has_mask, need_minmax):
+    """Generate + compile (or fetch from cache) the fused kernel for this expression shape.
+    slot_gathered : tuple of bools, one per value slot. True = parent column read through a per-fact-row
+                    pointer (v = base[codes[ptr[i]]], a fused double hop); False = direct fact decode."""
+    key = (body, slot_gathered, group_gathered, has_mask, need_minmax)
     fn = _CACHE.get(key)
     if fn is not None:
         return fn
 
-    params = (['pcodes', 'ptr'] if gathered else ['gc'])
+    m = len(slot_gathered)
+    params = (['pcodes', 'gptr'] if group_gathered else ['gc'])
     for k in range(m):
         params += [f'b{k}', f'c{k}']
+        if slot_gathered[k]:
+            params.append(f'p{k}')
     params += ['K', 'NT', 'Kp']
     if has_mask:
         params.append('mask')
-    grp   = 'pcodes[ptr[i]]' if gathered else 'gc[i]'
-    nrows = 'ptr' if gathered else 'gc'
+    grp   = 'pcodes[gptr[i]]' if group_gathered else 'gc[i]'
+    nrows = 'gptr' if group_gathered else 'gc'
 
     L = [f"def _k({', '.join(params)}):"]
     L += [f"    n = {nrows}.shape[0]",
@@ -58,7 +63,8 @@ def _build(body, m, gathered, has_mask, need_minmax):
     if has_mask:
         L += ["            if not mask[i]: continue"]
     for k in range(m):
-        L += [f"            v{k} = b{k}[c{k}[i]]"]
+        idx = f'c{k}[p{k}[i]]' if slot_gathered[k] else f'c{k}[i]'
+        L += [f"            v{k} = b{k}[{idx}]"]
     L += [f"            x = {body}",
           f"            g = {grp}",
           "            s[t, g] += x; cnt[t, g] += 1"]
@@ -79,16 +85,19 @@ def grouped_expr(group_op, K, body, inputs, mask, n, need_minmax):
     """Run the fused expression aggregation.
       group_op : ('d', gc) direct group codes, or ('g', pcodes, ptr) gather-fused group.
       body     : numba-source scalar expression over v0..v{m-1}.
-      inputs   : list of (base, codes) per slot.
+      inputs   : list of (base, codes, ptr_or_None) per slot; ptr None = direct fact column.
       Returns (count[K], sum[K], min[K] | None, max[K] | None)."""
     Kp = ((K + 7) // 8) * 8 + 8
-    gathered = group_op[0] == 'g'
-    m = len(inputs)
-    fn = _build(body, m, gathered, mask is not None, need_minmax)
+    group_gathered = group_op[0] == 'g'
+    slot_gathered = tuple(inp[2] is not None for inp in inputs)
+    fn = _build(body, slot_gathered, group_gathered, mask is not None, need_minmax)
 
-    args = ([group_op[1], group_op[2]] if gathered else [np.ascontiguousarray(group_op[1])])
-    for (base, codes) in inputs:
+    args = ([np.ascontiguousarray(group_op[1]), np.ascontiguousarray(group_op[2])]
+            if group_gathered else [np.ascontiguousarray(group_op[1])])
+    for (base, codes, ptr) in inputs:
         args += [base, codes]
+        if ptr is not None:
+            args.append(np.ascontiguousarray(ptr))
     args += [K, _NT, Kp]
     if mask is not None:
         args.append(mask)

@@ -220,3 +220,23 @@ def test_chain_arith_parent_group():
 def test_chain_arith_order_limit():
     _match("SELECT l.l_returnflag, SUM(l.l_extendedprice*(1-l.l_discount)) AS rev " + _J3 +
            "GROUP BY l.l_returnflag ORDER BY rev DESC LIMIT 2", ordered=True)
+
+
+# ── gathered (parent) value columns inside fused arithmetic expressions ──
+def test_chain_arith_parent_value():
+    _match("SELECT l.l_returnflag, SUM(o.o_totalprice*(1-l.l_discount)) AS x " + _J3 +
+           "GROUP BY l.l_returnflag")
+def test_chain_arith_parent_value_scaled():
+    _match("SELECT l.l_returnflag, SUM(o.o_totalprice*0.5) AS x " + _J3 + "GROUP BY l.l_returnflag")
+def test_chain_arith_two_parents():
+    _match("SELECT l.l_returnflag, SUM(c.c_acctbal + o.o_totalprice) AS x " + _J3 +
+           "GROUP BY l.l_returnflag")
+def test_chain_arith_parent_value_parent_group():
+    _match("SELECT c.c_mktsegment, SUM(o.o_totalprice*(1-l.l_discount)) AS x " + _J3 +
+           "GROUP BY c.c_mktsegment")
+def test_chain_arith_parent_value_where():
+    _match("SELECT l.l_returnflag, SUM(o.o_totalprice*(1-l.l_discount)) AS x " + _J3 +
+           "WHERE l.l_quantity > 25 GROUP BY l.l_returnflag")
+def test_chain_arith_parent_value_minmax():
+    _match("SELECT l.l_returnflag, MIN(o.o_totalprice*(1-l.l_discount)), "
+           "MAX(o.o_totalprice*(1-l.l_discount)) " + _J3 + "GROUP BY l.l_returnflag")
