@@ -75,3 +75,27 @@ def test_fused_gathered_group():
     m = rng.random(n) < 0.5                              # masked gathered path
     counts2, _, _, _ = A.numba_grouped_g(pcodes, ptr, [price], K, mask=m)
     assert np.array_equal(counts2, A.group_counts(gc[m], K))
+
+def test_decode_fused_vs_materialised():
+    # decode-fused kernels (value = base[vcodes[i]]) must match the materialised base[vcodes] path,
+    # for direct & gathered group, masked & unmasked, serial & parallel.
+    if not A.HAS_NUMBA: return
+    rng = np.random.default_rng(11)
+    def same(got, ref):
+        gc_, gs, gmn, gmx = got; rc, rs, rmn, rmx = ref
+        return (np.array_equal(gc_, rc) and np.allclose(gs, rs)
+                and np.allclose(gmn, rmn) and np.allclose(gmx, rmx))
+    for n in (250_000, A.PARALLEL_THRESHOLD + 120_000):     # serial then parallel
+        K = 1500
+        base = rng.uniform(1, 1000, 30_000).astype(np.float64)
+        vcodes = rng.integers(0, len(base), n).astype(np.int64)
+        val = base[vcodes]
+        gc = rng.integers(0, K, n).astype(np.int64)
+        m = rng.random(n) < 0.5
+        assert same(A.numba_grouped_d(gc, base, vcodes, K), A.numba_grouped(gc, [val], K))
+        assert same(A.numba_grouped_d(gc, base, vcodes, K, mask=m), A.numba_grouped(gc, [val], K, mask=m))
+        npar = 20_000
+        pcodes = rng.integers(0, K, npar).astype(np.int64); ptr = rng.integers(0, npar, n).astype(np.int64)
+        assert same(A.numba_grouped_gd(pcodes, ptr, base, vcodes, K), A.numba_grouped_g(pcodes, ptr, [val], K))
+        assert same(A.numba_grouped_gd(pcodes, ptr, base, vcodes, K, mask=m),
+                    A.numba_grouped_g(pcodes, ptr, [val], K, mask=m))

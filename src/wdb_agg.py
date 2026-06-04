@@ -295,6 +295,119 @@ if HAS_NUMBA:
                     if x > mx[t, c]: mx[t, c] = x
         return cnt, s, mn, mx
 
+    # ---- decode-fused: x = base[vcodes[i]] computed in the loop, never materialising the value array ----
+    @_njit(cache=True)
+    def _nb_g1d_ser(gc, base, vcodes, K):
+        n = gc.shape[0]
+        cnt = np.zeros(K, np.int64); s = np.zeros(K, np.float64)
+        mn = np.full(K, np.inf); mx = np.full(K, -np.inf)
+        for i in range(n):
+            c = gc[i]; x = base[vcodes[i]]
+            cnt[c] += 1; s[c] += x
+            if x < mn[c]: mn[c] = x
+            if x > mx[c]: mx[c] = x
+        return cnt, s, mn, mx
+
+    @_njit(parallel=True, cache=True)
+    def _nb_g1d_par(gc, base, vcodes, K, NT, Kp):
+        n = gc.shape[0]
+        cnt = np.zeros((NT, Kp), np.int64); s = np.zeros((NT, Kp), np.float64)
+        mn = np.full((NT, Kp), np.inf); mx = np.full((NT, Kp), -np.inf)
+        chunk = (n + NT - 1) // NT
+        for t in _prange(NT):
+            lo = t * chunk; hi = min(lo + chunk, n)
+            for i in range(lo, hi):
+                c = gc[i]; x = base[vcodes[i]]
+                cnt[t, c] += 1; s[t, c] += x
+                if x < mn[t, c]: mn[t, c] = x
+                if x > mx[t, c]: mx[t, c] = x
+        return cnt, s, mn, mx
+
+    @_njit(cache=True)
+    def _nb_g1md_ser(gc, base, vcodes, m, K):
+        n = gc.shape[0]
+        cnt = np.zeros(K, np.int64); s = np.zeros(K, np.float64)
+        mn = np.full(K, np.inf); mx = np.full(K, -np.inf)
+        for i in range(n):
+            if m[i]:
+                c = gc[i]; x = base[vcodes[i]]
+                cnt[c] += 1; s[c] += x
+                if x < mn[c]: mn[c] = x
+                if x > mx[c]: mx[c] = x
+        return cnt, s, mn, mx
+
+    @_njit(parallel=True, cache=True)
+    def _nb_g1md_par(gc, base, vcodes, m, K, NT, Kp):
+        n = gc.shape[0]
+        cnt = np.zeros((NT, Kp), np.int64); s = np.zeros((NT, Kp), np.float64)
+        mn = np.full((NT, Kp), np.inf); mx = np.full((NT, Kp), -np.inf)
+        chunk = (n + NT - 1) // NT
+        for t in _prange(NT):
+            lo = t * chunk; hi = min(lo + chunk, n)
+            for i in range(lo, hi):
+                if m[i]:
+                    c = gc[i]; x = base[vcodes[i]]
+                    cnt[t, c] += 1; s[t, c] += x
+                    if x < mn[t, c]: mn[t, c] = x
+                    if x > mx[t, c]: mx[t, c] = x
+        return cnt, s, mn, mx
+
+    @_njit(cache=True)
+    def _nb_g1gd_ser(pcodes, ptr, base, vcodes, K):     # gathered group + decoded value, both fused
+        n = ptr.shape[0]
+        cnt = np.zeros(K, np.int64); s = np.zeros(K, np.float64)
+        mn = np.full(K, np.inf); mx = np.full(K, -np.inf)
+        for i in range(n):
+            c = pcodes[ptr[i]]; x = base[vcodes[i]]
+            cnt[c] += 1; s[c] += x
+            if x < mn[c]: mn[c] = x
+            if x > mx[c]: mx[c] = x
+        return cnt, s, mn, mx
+
+    @_njit(parallel=True, cache=True)
+    def _nb_g1gd_par(pcodes, ptr, base, vcodes, K, NT, Kp):
+        n = ptr.shape[0]
+        cnt = np.zeros((NT, Kp), np.int64); s = np.zeros((NT, Kp), np.float64)
+        mn = np.full((NT, Kp), np.inf); mx = np.full((NT, Kp), -np.inf)
+        chunk = (n + NT - 1) // NT
+        for t in _prange(NT):
+            lo = t * chunk; hi = min(lo + chunk, n)
+            for i in range(lo, hi):
+                c = pcodes[ptr[i]]; x = base[vcodes[i]]
+                cnt[t, c] += 1; s[t, c] += x
+                if x < mn[t, c]: mn[t, c] = x
+                if x > mx[t, c]: mx[t, c] = x
+        return cnt, s, mn, mx
+
+    @_njit(cache=True)
+    def _nb_g1gmd_ser(pcodes, ptr, base, vcodes, m, K):
+        n = ptr.shape[0]
+        cnt = np.zeros(K, np.int64); s = np.zeros(K, np.float64)
+        mn = np.full(K, np.inf); mx = np.full(K, -np.inf)
+        for i in range(n):
+            if m[i]:
+                c = pcodes[ptr[i]]; x = base[vcodes[i]]
+                cnt[c] += 1; s[c] += x
+                if x < mn[c]: mn[c] = x
+                if x > mx[c]: mx[c] = x
+        return cnt, s, mn, mx
+
+    @_njit(parallel=True, cache=True)
+    def _nb_g1gmd_par(pcodes, ptr, base, vcodes, m, K, NT, Kp):
+        n = ptr.shape[0]
+        cnt = np.zeros((NT, Kp), np.int64); s = np.zeros((NT, Kp), np.float64)
+        mn = np.full((NT, Kp), np.inf); mx = np.full((NT, Kp), -np.inf)
+        chunk = (n + NT - 1) // NT
+        for t in _prange(NT):
+            lo = t * chunk; hi = min(lo + chunk, n)
+            for i in range(lo, hi):
+                if m[i]:
+                    c = pcodes[ptr[i]]; x = base[vcodes[i]]
+                    cnt[t, c] += 1; s[t, c] += x
+                    if x < mn[t, c]: mn[t, c] = x
+                    if x > mx[t, c]: mx[t, c] = x
+        return cnt, s, mn, mx
+
     @_njit(cache=True)
     def _nb_gN_ser(gc, vmat, K):
         n = gc.shape[0]; V = vmat.shape[1]
@@ -373,8 +486,30 @@ def numba_grouped_g(pcodes, ptr, cols, K, mask=None):
     return cnt, s[None, :], mn[None, :], mx[None, :]
 
 
+def _reduce1(cnt, s, mn, mx, K):
+    return (cnt[:, :K].sum(0), s[:, :K].sum(0)[None, :], mn[:, :K].min(0)[None, :], mx[:, :K].max(0)[None, :])
+
+def numba_grouped_d(gc, base, vcodes, K, mask=None):
+    """Direct group code gc[i], value decoded as base[vcodes[i]] -- decode fused, no value array."""
+    par = gc.shape[0] >= PARALLEL_THRESHOLD; Kp = ((K + 7) // 8) * 8 + 8
+    if mask is not None:
+        if par: return _reduce1(*_nb_g1md_par(gc, base, vcodes, mask, K, _NT, Kp), K)
+        cnt, s, mn, mx = _nb_g1md_ser(gc, base, vcodes, mask, K); return cnt, s[None, :], mn[None, :], mx[None, :]
+    if par: return _reduce1(*_nb_g1d_par(gc, base, vcodes, K, _NT, Kp), K)
+    cnt, s, mn, mx = _nb_g1d_ser(gc, base, vcodes, K); return cnt, s[None, :], mn[None, :], mx[None, :]
+
+def numba_grouped_gd(pcodes, ptr, base, vcodes, K, mask=None):
+    """Gathered group code pcodes[ptr[i]] AND value base[vcodes[i]] -- both gathers fused into one pass."""
+    par = ptr.shape[0] >= PARALLEL_THRESHOLD; Kp = ((K + 7) // 8) * 8 + 8
+    if mask is not None:
+        if par: return _reduce1(*_nb_g1gmd_par(pcodes, ptr, base, vcodes, mask, K, _NT, Kp), K)
+        cnt, s, mn, mx = _nb_g1gmd_ser(pcodes, ptr, base, vcodes, mask, K); return cnt, s[None, :], mn[None, :], mx[None, :]
+    if par: return _reduce1(*_nb_g1gd_par(pcodes, ptr, base, vcodes, K, _NT, Kp), K)
+    cnt, s, mn, mx = _nb_g1gd_ser(pcodes, ptr, base, vcodes, K); return cnt, s[None, :], mn[None, :], mx[None, :]
+
+
 def _opkey(op):
-    return (op[0], id(op[1])) + ((id(op[2]),) if op[0] == 'g' else ())
+    return (op[0], id(op[1])) + ((id(op[2]),) if op[0] in ('g', 'raw') else ())
 
 def fused_numba(group_op, K, specs_all, mask_op, n):
     """Fused-kernel replacement for the numpy agg paths, for numeric non-null operands. Materialises the
@@ -383,31 +518,41 @@ def fused_numba(group_op, K, specs_all, mask_op, n):
     m = _slice(mask_op, 0, n)
     if m is not None: m = np.ascontiguousarray(m)
 
-    col_of = {}; cols = []
+    col_of = {}; vops = []
     for (key, fn, vop, nop) in specs_all:
         if fn in ('SUM', 'AVG', 'MIN', 'MAX'):
             k = _opkey(vop)
             if k not in col_of:
-                col_of[k] = len(cols); cols.append(np.ascontiguousarray(_slice(vop, 0, n)))
-    V = len(cols); sums = mins = maxs = None
+                col_of[k] = len(vops); vops.append(vop)
+    V = len(vops); sums = mins = maxs = None
+    def _mat(v): return np.ascontiguousarray(_slice(v, 0, n))
+    def _gc():
+        g = _slice(group_op, 0, n)
+        g = np.zeros(n, dtype=np.int64) if g is None else g.astype(np.int64, copy=False)
+        return np.ascontiguousarray(g, dtype=np.int64)   # full length -- mask is fused into the kernel
     gathered = group_op is not None and group_op[0] == 'g'
-    if V == 1 and gathered:
-        # group code lives on a parent: fuse the gather (c = pcodes[ptr[i]]) instead of materialising it
+
+    if V == 1 and vops[0][0] == 'raw':
+        # value is a plain dict column: fuse the base[vcodes[i]] decode into the pass (no value array)
+        base = np.ascontiguousarray(vops[0][1]); vcodes = np.ascontiguousarray(vops[0][2])
+        if gathered:
+            pcodes = np.ascontiguousarray(group_op[1]); ptr = np.ascontiguousarray(group_op[2])
+            counts, sums, mins, maxs = numba_grouped_gd(pcodes, ptr, base, vcodes, K, mask=m)
+        else:
+            counts, sums, mins, maxs = numba_grouped_d(_gc(), base, vcodes, K, mask=m)
+    elif V == 1 and gathered:
         pcodes = np.ascontiguousarray(group_op[1]); ptr = np.ascontiguousarray(group_op[2])
-        counts, sums, mins, maxs = numba_grouped_g(pcodes, ptr, cols, K, mask=m)
-    else:
-        gc = _slice(group_op, 0, n)
-        gc = np.zeros(n, dtype=np.int64) if gc is None else gc.astype(np.int64, copy=False)
-        gc = np.ascontiguousarray(gc, dtype=np.int64)    # full length -- mask is fused into the kernel
-        if V == 1:
-            counts, sums, mins, maxs = numba_grouped(gc, cols, K, mask=m)   # mask fused; count comes free
-        elif V == 0:
-            g = gc if m is None else gc[m]
-            counts = np.bincount(g, minlength=K) if g.size else np.zeros(K, np.int64)
-        else:                                            # V>=2 (rare): apply mask by indexing
-            if m is not None: gc = gc[m]; cols = [c[m] for c in cols]
-            if gc.size: counts, sums, mins, maxs = numba_grouped(gc, cols, K)
-            else: counts = np.zeros(K, np.int64)
+        counts, sums, mins, maxs = numba_grouped_g(pcodes, ptr, [_mat(vops[0])], K, mask=m)
+    elif V == 1:
+        counts, sums, mins, maxs = numba_grouped(_gc(), [_mat(vops[0])], K, mask=m)
+    elif V == 0:
+        gc = _gc(); g = gc if m is None else gc[m]
+        counts = np.bincount(g, minlength=K) if g.size else np.zeros(K, np.int64)
+    else:                                                # V>=2 (rare): apply mask by indexing
+        gc = _gc(); cols = [_mat(v) for v in vops]
+        if m is not None: gc = gc[m]; cols = [c[m] for c in cols]
+        if gc.size: counts, sums, mins, maxs = numba_grouped(gc, cols, K)
+        else: counts = np.zeros(K, np.int64)
 
     finals = {}
     for (key, fn, vop, nop) in specs_all:

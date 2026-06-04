@@ -214,6 +214,23 @@ def _col(seg, name):
     for k,v in enumerate(ov): lut[len(dv)+k]=v
     return lut[codes], None
 
+def raw_dict_col(seg, name):
+    """For a plain dict-coded NUMERIC column (no nulls, no overrides), return (base, codes) so the caller
+    can defer/fuse the base[codes] decode instead of materialising it. base is float64 (dt2) or int64
+    (dt0 int / dt3 datetime-epoch); codes index it per row. Returns None for anything that is not this
+    simple case (computed/inline/constant modes, nullable, overridden, or string), where the caller must
+    fall back to the full _col decode."""
+    c = seg.cols[name]
+    if c['mode'] in (4, 5, 6) or c['has_null']: return None
+    if seg._override_vals_typed(name):          return None
+    if c['dt'] == 2:
+        base = np.asarray(seg._typed_dict(name), dtype=np.float64)
+    elif c['dt'] in (0, 3):
+        base = np.asarray(seg._typed_dict(name), dtype=np.int64)
+    else:
+        return None
+    return base, seg.codes(name)
+
 def _parse_temporal(litstr, unit):
     return int(np.datetime64(str(litstr).replace(' ','T')).astype(f'datetime64[{unit}]').view('int64'))
 

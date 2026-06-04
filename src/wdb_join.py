@@ -264,6 +264,10 @@ def _fast_pointer_agg(db, tree, ctx):
         # parent columns become ('g', arr, composed_ptr) so the gather happens per-chunk inside the
         # threaded kernel instead of materialising the full gathered array here.
         seg, pcol, cptr = resolve(node)
+        if cptr is None:
+            raw = wdb_sql.raw_dict_col(seg, pcol)         # plain dict numeric col -> defer/fuse the decode
+            if raw is not None:
+                return ('raw', raw[0], raw[1]), None, seg, pcol
         arr, nm = _col_cached(seg, pcol)
         if cptr is not None:
             return ('g', arr, cptr), (('g', nm, cptr) if nm is not None else None), seg, pcol
