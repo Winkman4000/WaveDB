@@ -421,15 +421,25 @@ def _fast_pointer_agg(db, tree, ctx):
     elif len(gkeys) == 1:                                 # single key: keep the gather-fused operand
         k0 = gkeys[0]; K = k0['K']
         group_op = ('g', k0['full'], k0['cptr']) if k0['cptr'] is not None else ('d', k0['full'])
-    else:                                                 # multi-key: mixed-radix composite code
+    else:                                                 # multi-key: mixed-radix composite
         K = 1
         for k in gkeys: K *= k['K']
         if K > MULTI_GROUP_CEIL: raise _FastUnsupported   # dense composite would blow up -> needs hashing
-        comp = np.zeros(n, dtype=np.int64)
-        for k in gkeys:
-            codes = k['full'][k['cptr']] if k['cptr'] is not None else k['full']
-            comp = comp * k['K'] + codes.astype(np.int64, copy=False)
-        group_op = ('d', np.ascontiguousarray(comp))
+        group_op = None                                   # comp array built lazily; codegen composes inline
+
+    # The codegen value path composes the composite group code INLINE (no comp array). The non-fused
+    # plain / numpy / counts-only paths get a materialised group operand on demand via _group_op().
+    group_keys = [(k['full'], k['K'], k['cptr']) for k in gkeys]
+    _go = {}
+    def _group_op():
+        if group_op is not None or not gkeys: return group_op
+        if 'op' not in _go:
+            comp = np.zeros(n, dtype=np.int64)
+            for k in gkeys:
+                codes = k['full'][k['cptr']] if k['cptr'] is not None else k['full']
+                comp = comp * k['K'] + codes.astype(np.int64, copy=False)
+            _go['op'] = ('d', np.ascontiguousarray(comp))
+        return _go['op']
 
     # ---- per-projection results ----
     # COUNT/SUM/AVG become operand specs computed in one pass (threaded + per-chunk gather above a row
@@ -484,7 +494,7 @@ def _fast_pointer_agg(db, tree, ctx):
             g['aggs'].append((i, fn))
             if fn in ('MIN', 'MAX'): g['mm'] = True
         for g in groups.values():
-            cE, sE, mnE, mxE = wdb_exprjit.grouped_expr(group_op, K, g['body'], g['inputs'], mask, n, g['mm'])
+            cE, sE, mnE, mxE = wdb_exprjit.grouped_expr(group_keys, g['body'], g['inputs'], mask, n, g['mm'])
             expr_counts = cE; nz = cE > 0
             for (i, fn) in g['aggs']:
                 o = np.full(K, None, dtype=object)
@@ -497,11 +507,11 @@ def _fast_pointer_agg(db, tree, ctx):
     # plain (column / star) aggregates via the existing fused/numpy machinery
     if specs or minmax:
         if numba_ok:
-            counts, agg_arrays = wdb_agg.fused_numba(group_op, K, specs + minmax, mask_op, n)
+            counts, agg_arrays = wdb_agg.fused_numba(_group_op(), K, specs + minmax, mask_op, n)
         elif n >= wdb_agg.PARALLEL_THRESHOLD and not minmax:
-            counts, agg_arrays = wdb_agg.fused_counts_and_aggs(group_op, K, specs, mask_op, n)
+            counts, agg_arrays = wdb_agg.fused_counts_and_aggs(_group_op(), K, specs, mask_op, n)
         else:
-            gc = wdb_agg._slice(group_op, 0, n)
+            gc = wdb_agg._slice(_group_op(), 0, n)
             gcodes = np.zeros(n, dtype=np.int64) if gc is None else gc.astype(np.int64, copy=False)
             if mask is not None: gcodes = gcodes[mask]
             counts = wdb_agg.group_counts(gcodes, K)
@@ -518,7 +528,7 @@ def _fast_pointer_agg(db, tree, ctx):
     elif expr_counts is not None:
         counts = expr_counts                                  # only arithmetic aggregates -> counts from codegen
     else:                                                     # only COUNT(*) / key columns -> counts-only pass
-        gc = wdb_agg._slice(group_op, 0, n)
+        gc = wdb_agg._slice(_group_op(), 0, n)
         gcodes = np.zeros(n, dtype=np.int64) if gc is None else gc.astype(np.int64, copy=False)
         if mask is not None: gcodes = gcodes[mask]
         counts = wdb_agg.group_counts(gcodes, K)

@@ -240,3 +240,17 @@ def test_chain_arith_parent_value_where():
 def test_chain_arith_parent_value_minmax():
     _match("SELECT l.l_returnflag, MIN(o.o_totalprice*(1-l.l_discount)), "
            "MAX(o.o_totalprice*(1-l.l_discount)) " + _J3 + "GROUP BY l.l_returnflag")
+
+
+# ── composite GROUP BY fused inline (no comp array) under codegen arithmetic ──
+def test_chain_arith_q1_multikey():
+    _match("SELECT l.l_returnflag, l.l_linestatus, "
+           "SUM(l.l_extendedprice*(1-l.l_discount)*(1+l.l_tax)) AS rev " + _J3 +
+           "GROUP BY l.l_returnflag, l.l_linestatus")
+def test_chain_arith_two_parent_keys():
+    _match("SELECT c.c_mktsegment, o.o_orderpriority, "
+           "SUM(l.l_extendedprice*(1-l.l_discount)) AS rev " + _J3 +
+           "GROUP BY c.c_mktsegment, o.o_orderpriority")
+def test_chain_arith_multikey_avg_order():
+    _match("SELECT c.c_mktsegment, l.l_returnflag, AVG(l.l_extendedprice*(1-l.l_discount)) AS a " + _J3 +
+           "GROUP BY c.c_mktsegment, l.l_returnflag ORDER BY a DESC LIMIT 4", ordered=True)
