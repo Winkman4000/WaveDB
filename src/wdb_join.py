@@ -203,6 +203,8 @@ def _aggregate(merged, proj, group, R):
 # integer codes with the bincount kernel. Narrow by design -- single join, one group key, GROUP BY +
 # aggregates -- and raises _FastUnsupported for anything else so join_query falls back to pandas.
 
+MULTI_GROUP_CEIL = 1 << 18   # max composite groups for dense multi-col GROUP BY (else -> hashing/fallback)
+
 class _FastUnsupported(Exception):
     pass
 
@@ -240,7 +242,6 @@ def _fast_pointer_agg(db, tree, ctx):
     if not any(wdb_sql._agg_kind(p) for p in proj): raise _FastUnsupported   # plain projection -> fallback
     group = tree.args.get('group')
     gnodes = group.expressions if group is not None else []
-    if len(gnodes) > 1: raise _FastUnsupported
 
     fact = ctx['fact']; alias2t = ctx['alias2t']; seg_of = ctx['seg_of']; composed = ctx['composed']
     cols_of = {a: set(db.cat.column_names(t)) for a, t in alias2t.items()}
@@ -377,15 +378,27 @@ def _fast_pointer_agg(db, tree, ctx):
     n = ctx['n']
     if n == 0: return [], [wdb_sql._alias(p) for p in proj]
     mask_op = ('d', mask) if mask is not None else None
-    if gnodes:
-        gseg, gpcol, gcptr = resolve(gnodes[0])
+    gkeys = []                                           # one per GROUP BY column
+    for g in gnodes:
+        gseg, gpcol, gcptr = resolve(g)
         if gseg.cols[gpcol]['mode'] == 4: raise _FastUnsupported   # codes not value-identity
         full = gseg.codes(gpcol)
         if full.size == 0: return [], [wdb_sql._alias(p) for p in proj]
-        K = int(full.max()) + 1                          # safe upper bound; empty groups dropped later
-        group_op = ('g', full, gcptr) if gcptr is not None else ('d', full)
-    else:
-        K = 1; group_op = None; gseg = gpcol = None
+        gkeys.append({'seg': gseg, 'pcol': gpcol, 'cptr': gcptr, 'full': full, 'K': int(full.max()) + 1})
+    if len(gkeys) == 0:
+        K = 1; group_op = None
+    elif len(gkeys) == 1:                                 # single key: keep the gather-fused operand
+        k0 = gkeys[0]; K = k0['K']
+        group_op = ('g', k0['full'], k0['cptr']) if k0['cptr'] is not None else ('d', k0['full'])
+    else:                                                 # multi-key: mixed-radix composite code
+        K = 1
+        for k in gkeys: K *= k['K']
+        if K > MULTI_GROUP_CEIL: raise _FastUnsupported   # dense composite would blow up -> needs hashing
+        comp = np.zeros(n, dtype=np.int64)
+        for k in gkeys:
+            codes = k['full'][k['cptr']] if k['cptr'] is not None else k['full']
+            comp = comp * k['K'] + codes.astype(np.int64, copy=False)
+        group_op = ('d', np.ascontiguousarray(comp))
 
     # ---- per-projection results ----
     # COUNT/SUM/AVG become operand specs computed in one pass (threaded + per-chunk gather above a row
@@ -414,8 +427,11 @@ def _fast_pointer_agg(db, tree, ctx):
             else:
                 specs.append((i, fn, vop, nop)); col_results[i] = ('arr', None, False, None)
         else:
-            if gseg is None: raise _FastUnsupported   # bare key column without GROUP BY
-            col_results[i] = ('key',)
+            if not gkeys or not isinstance(inner, E.Column): raise _FastUnsupported  # bare col w/o GROUP BY
+            pseg, ppcol, _ = resolve(inner)
+            ki = next((j for j, k in enumerate(gkeys) if k['seg'] is pseg and k['pcol'] == ppcol), None)
+            if ki is None: raise _FastUnsupported          # projected column is not a GROUP BY key
+            col_results[i] = ('key', ki)
 
     if numba_ok and (specs or minmax):
         counts, agg_arrays = wdb_agg.fused_numba(group_op, K, specs + minmax, mask_op, n)
@@ -439,13 +455,19 @@ def _fast_pointer_agg(db, tree, ctx):
     present = np.nonzero(counts > 0)[0]
 
     # ---- assemble rows ----
+    radices = [k['K'] for k in gkeys]                    # decode composite group code -> per-key codes
     rows = []
     for code in present:
+        if gkeys:
+            kc = [0] * len(gkeys); tmp = int(code)
+            for j in range(len(gkeys) - 1, -1, -1):
+                kc[j] = tmp % radices[j]; tmp //= radices[j]
         row = []
         for i, p in enumerate(proj):
             r = col_results[i]
             if r[0] == 'key':
-                row.append(wdb_sql._pyval(_code_val(gseg, gpcol, code)))
+                gk = gkeys[r[1]]
+                row.append(wdb_sql._pyval(_code_val(gk['seg'], gk['pcol'], kc[r[1]])))
             elif r[0] == 'count':
                 row.append(int(counts[code]))
             else:

@@ -167,3 +167,27 @@ def test_chain_revenue_where():
 def test_chain_minmax_expr():
     _match("SELECT n.n_name, MIN(l.l_extendedprice*(1-l.l_discount)), "
            "MAX(l.l_extendedprice*(1-l.l_discount)) " + _J3 + "GROUP BY n.n_name")
+
+
+# ── multi-column GROUP BY over the chain (mixed-radix composite group codes) ──
+def test_chain_group_two_fact_keys():
+    _match("SELECT l.l_returnflag, l.l_linestatus, COUNT(*), SUM(l.l_extendedprice) " + _J3 +
+           "GROUP BY l.l_returnflag, l.l_linestatus")
+def test_chain_group_fact_parent_keys():
+    _match("SELECT l.l_returnflag, o.o_orderpriority, SUM(l.l_extendedprice) " + _J3 +
+           "GROUP BY l.l_returnflag, o.o_orderpriority")
+def test_chain_group_three_keys():
+    _match("SELECT c.c_mktsegment, o.o_orderpriority, l.l_returnflag, SUM(l.l_extendedprice) " + _J3 +
+           "GROUP BY c.c_mktsegment, o.o_orderpriority, l.l_returnflag")
+def test_chain_group_multi_proj_swapped():
+    _match("SELECT o.o_orderpriority, l.l_returnflag, COUNT(*) " + _J3 +
+           "GROUP BY l.l_returnflag, o.o_orderpriority")
+def test_chain_group_multi_where():
+    _match("SELECT l.l_returnflag, l.l_linestatus, SUM(l.l_extendedprice) " + _J3 +
+           "WHERE l.l_quantity > 25 GROUP BY l.l_returnflag, l.l_linestatus")
+def test_chain_group_multi_minmax():
+    _match("SELECT c.c_mktsegment, l.l_returnflag, MIN(l.l_extendedprice), MAX(l.l_extendedprice), "
+           "AVG(l.l_extendedprice) " + _J3 + "GROUP BY c.c_mktsegment, l.l_returnflag")
+def test_chain_group_multi_order_limit():
+    _match("SELECT l.l_returnflag, l.l_linestatus, SUM(l.l_extendedprice) AS rev " + _J3 +
+           "GROUP BY l.l_returnflag, l.l_linestatus ORDER BY rev DESC LIMIT 3", ordered=True)
