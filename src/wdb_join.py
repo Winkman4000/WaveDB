@@ -525,6 +525,32 @@ def _build_chain(db, tree):
     if len(fact_candidates) != 1: raise _FastUnsupported                         # need a single rooted fact
     fact = fact_candidates[0]
 
+    # Linear chain (each child has one parent, single rooted fact): order it fact -> p1 -> p2 -> ...
+    order = [fact]; cur = fact
+    while cur in edges:
+        cur = edges[cur][0]; order.append(cur)
+
+    # JOIN PRUNING. An FK pointer is built only after verifying referential integrity (every child maps to
+    # exactly one parent, parent key unique), so each child->parent INNER join is row-preserving -- joining
+    # a table the query never reads cannot change the result. So we only need to compose pointers up to the
+    # furthest table actually referenced by the projection / WHERE / GROUP BY / ORDER BY (NOT the join ON
+    # columns, which are join plumbing). Everything beyond it is dropped, saving a gather per pruned hop.
+    cols_of = {a: set(db.cat.column_names(t)) for a, t in alias2t.items()}
+    ref = {fact}
+    scan = list(tree.expressions)
+    for key in ('where', 'group', 'order'):
+        node = tree.args.get(key)
+        if node is not None: scan.append(node)
+    for rootn in scan:
+        for col in rootn.find_all(E.Column):
+            a = col.table
+            if a and a in alias2t:
+                ref.add(a)
+            elif not a:                                          # unqualified: keep every candidate owner
+                ref.update(al for al, cs in cols_of.items() if col.name in cs)
+    keep_idx = max((i for i, a in enumerate(order) if a in ref), default=0)
+    keep = set(order[:keep_idx + 1])
+
     seg_of, sp_of = {}, {}
     for _, a in tables:
         seg_of[a], sp_of[a] = _solo_segment(db, alias2t[a])
@@ -534,11 +560,12 @@ def _build_chain(db, tree):
     while progress:
         progress = False
         for child_a, (parent_a, fk_col) in edges.items():
+            if parent_a not in keep: continue                                    # pruned hop: skip the gather
             if child_a in composed and parent_a not in composed:
                 p = db.fk_pointer(sp_of[child_a], fk_col)
                 if p is None: raise _FastUnsupported
                 cc = composed[child_a]
                 composed[parent_a] = p if cc is None else p[cc]                  # compose by gather
                 progress = True
-    if any(a not in composed for _, a in tables): raise _FastUnsupported         # disconnected
+    if any(a not in composed for a in keep): raise _FastUnsupported              # kept tables must connect
     return dict(fact=fact, alias2t=alias2t, seg_of=seg_of, composed=composed, n=seg_of[fact].N)
