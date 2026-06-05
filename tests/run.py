@@ -1,11 +1,26 @@
 #!/usr/bin/env python3
-"""Zero-dependency test runner. Usage: python3 tests/run.py [substring-filter]"""
-import sys, os, importlib, traceback, time
+"""Zero-dependency test runner. Usage: python3 tests/run.py [substring-filter] [--report]
+On completion prints the scoreboard summary (examples/report.md); --report regenerates it."""
+import sys, os, importlib, traceback, time, subprocess
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
+def _scoreboard():
+    rep = os.path.join(ROOT, 'examples', 'report.md')
+    if '--report' in sys.argv:
+        print("\nregenerating scoreboard (bench/report.py) ...")
+        subprocess.run([sys.executable, os.path.join(ROOT, 'bench', 'report.py')])
+    if os.path.exists(rep):
+        print("\n" + "=" * 60 + "\nSCOREBOARD  (examples/report.md)")
+        for l in open(rep).read().splitlines():
+            if l.startswith('_TPC-H') or 'WaveDB total' in l or l.startswith('**'):
+                print("  " + l.replace('**', '').replace('|', ' ').strip())
+        print("  regenerate: python bench/report.py   (or tests/run.py --report)")
+
 def main():
-    filt = sys.argv[1] if len(sys.argv) > 1 else ''
+    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    filt = args[0] if args else ''
     mods = sorted(f[:-3] for f in os.listdir(HERE)
                   if f.startswith('test_') and f.endswith('.py'))
     passed = failed = 0; fails = []
@@ -27,6 +42,7 @@ def main():
         print("\nFAILURES:")
         for name, e, tb in fails:
             print(f"\n--- {name} ---\n{tb}")
+    _scoreboard()
     sys.exit(1 if failed else 0)
 
 if __name__ == '__main__':
