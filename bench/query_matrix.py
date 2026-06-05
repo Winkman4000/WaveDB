@@ -55,43 +55,11 @@ def best(fn, n=5):
     for _ in range(n): t = time.perf_counter(); fn(); ts.append(time.perf_counter()-t)
     return min(ts)*1000
 
-L = "lineitem"
-QUERIES = [
- ("agg","whole COUNT(*)",                 f"SELECT COUNT(*) FROM {L}"),
- ("agg","whole SUM",                      f"SELECT SUM(l_extendedprice) FROM {L}"),
- ("agg","whole multi-agg (5)",            f"SELECT COUNT(*),SUM(l_extendedprice),AVG(l_discount),MIN(l_quantity),MAX(l_quantity) FROM {L}"),
- ("group","GROUP BY K3 count",            f"SELECT l_returnflag,COUNT(*) FROM {L} GROUP BY l_returnflag"),
- ("group","GROUP BY K3 sum",              f"SELECT l_returnflag,SUM(l_extendedprice) FROM {L} GROUP BY l_returnflag"),
- ("group","GROUP BY K7 avg",              f"SELECT l_shipmode,AVG(l_quantity) FROM {L} GROUP BY l_shipmode"),
- ("group","GROUP BY 2-col Q1-shape",      f"SELECT l_returnflag,l_linestatus,COUNT(*),SUM(l_quantity),AVG(l_extendedprice) FROM {L} GROUP BY l_returnflag,l_linestatus"),
- ("group","GROUP BY datetime K2.5k",      f"SELECT l_shipdate,COUNT(*) FROM {L} GROUP BY l_shipdate"),
- ("group","GROUP BY high-card K200k",     f"SELECT l_partkey,SUM(l_quantity) FROM {L} GROUP BY l_partkey"),
- ("group","GROUP BY vhigh-card K1.5M",    f"SELECT l_orderkey,COUNT(*) FROM {L} GROUP BY l_orderkey"),
- ("filter","WHERE numeric > ",            f"SELECT COUNT(*) FROM {L} WHERE l_quantity > 30"),
- ("filter","WHERE BETWEEN + agg",         f"SELECT SUM(l_extendedprice) FROM {L} WHERE l_discount BETWEEN 0.05 AND 0.07"),
- ("filter","WHERE date-range Q6-shape",   f"SELECT SUM(l_extendedprice*l_discount) FROM {L} WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01' AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 24"),
- ("filter","WHERE string =",              f"SELECT COUNT(*) FROM {L} WHERE l_returnflag = 'R'"),
- ("filter","WHERE IN (3)",                f"SELECT COUNT(*) FROM {L} WHERE l_shipmode IN ('AIR','RAIL','SHIP')"),
- ("filter","WHERE AND/OR",                f"SELECT SUM(l_quantity) FROM {L} WHERE l_quantity > 30 AND (l_returnflag='R' OR l_linestatus='F')"),
- ("filter","WHERE + GROUP BY",            f"SELECT l_returnflag,SUM(l_extendedprice) FROM {L} WHERE l_quantity > 25 GROUP BY l_returnflag"),
- ("distinct","DISTINCT 1-col",            f"SELECT DISTINCT l_returnflag FROM {L}"),
- ("distinct","DISTINCT 2-col",            f"SELECT DISTINCT l_returnflag,l_linestatus FROM {L}"),
- ("distinct","DISTINCT high-card",        f"SELECT DISTINCT l_partkey FROM {L}"),
- ("distinct","COUNT(DISTINCT) low",       f"SELECT COUNT(DISTINCT l_shipmode) FROM {L}"),
- ("distinct","COUNT(DISTINCT) high",      f"SELECT COUNT(DISTINCT l_partkey) FROM {L}"),
- ("distinct","grouped COUNT(DISTINCT)",   f"SELECT l_returnflag,COUNT(DISTINCT l_shipmode) FROM {L} GROUP BY l_returnflag"),
- ("order","ORDER BY + LIMIT",             f"SELECT l_partkey,SUM(l_quantity) s FROM {L} GROUP BY l_partkey ORDER BY s DESC,l_partkey LIMIT 10"),
- ("order","HAVING",                       f"SELECT l_shipmode,COUNT(*) c FROM {L} GROUP BY l_shipmode HAVING COUNT(*) > 800000"),
- ("join","JOIN group parent-key",         "SELECT c.c_mktsegment,COUNT(*),SUM(o.o_totalprice) FROM orders o JOIN customer c ON o.o_custkey=c.c_custkey GROUP BY c.c_mktsegment"),
- ("join","JOIN group child-key",          "SELECT l.l_returnflag,SUM(l.l_extendedprice) FROM lineitem l JOIN orders o ON l.l_orderkey=o.o_orderkey GROUP BY l.l_returnflag"),
- ("join","JOIN group parent-date hiK",    "SELECT o.o_orderdate,SUM(l.l_extendedprice) FROM lineitem l JOIN orders o ON l.l_orderkey=o.o_orderkey GROUP BY o.o_orderdate"),
- ("join","JOIN + WHERE",                  "SELECT o.o_orderpriority,SUM(l.l_extendedprice) FROM lineitem l JOIN orders o ON l.l_orderkey=o.o_orderkey WHERE l.l_quantity > 30 GROUP BY o.o_orderpriority"),
- ("join","3-table JOIN",                  "SELECT c.c_mktsegment,SUM(l.l_extendedprice) FROM lineitem l JOIN orders o ON l.l_orderkey=o.o_orderkey JOIN customer c ON o.o_custkey=c.c_custkey GROUP BY c.c_mktsegment"),
-]
+from catalog import QUERIES   # single source of truth (also feeds docs/queries.md + planner workload)
 
 print(f"lineitem N={SEGS['lineitem'].N:,}  orders N={SEGS['orders'].N:,}  customer N={SEGS['customer'].N:,}\n")
 out = []
-for i,(cat,name,q) in enumerate(QUERIES, 1):
+for i,(cat,name,q,_ex) in enumerate(QUERIES, 1):
     h = wdb_join._FAST_HITS
     try:
         gw = db.run(q); fast = wdb_join._FAST_HITS > h
