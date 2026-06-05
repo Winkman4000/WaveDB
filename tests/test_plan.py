@@ -62,3 +62,44 @@ def test_cluster_none_when_no_candidate():
     only_unsorted = {'x': _s(10, 0.0, None, 0, 0, 4)}
     c = P.plan_segment(only_unsorted, CALIB)['cluster']
     assert c['key'] is None
+
+
+# --- measured cluster-key scoring (pure objective; no data / no bench DB needed) ---------
+
+def test_score_filter_pruning_picks_most_filtered():
+    cand = ['q', 'd']
+    wl = {'q': {'filter': 5, 'group': 0}, 'd': {'filter': 2, 'group': 0}}
+    sel = {'q': 0.4, 'd': 0.27}; cov = {'q': {'q'}, 'd': {'d'}}
+    r = P.score_cluster_keys(cand, wl, sel, cov)
+    assert r[0][0] == 'q' and abs(r[0][1] - 3.0) < 1e-9      # 5*(1-0.4)
+
+def test_score_compounding_lifts_via_coverage():
+    cand = ['s', 'q']
+    wl = {'s': {'filter': 1, 'group': 0}, 'q': {'filter': 1, 'group': 0},
+          'o': {'filter': 3, 'group': 0}}
+    sel = {'s': 0.15, 'q': 0.4, 'o': 0.5}; cov = {'s': {'s', 'o'}, 'q': {'q'}}
+    r = P.score_cluster_keys(cand, wl, sel, cov)
+    assert r[0][0] == 's' and 'o' in r[0][2]['covers']       # free slice on correlated 'o'
+
+def test_score_group_locality_factor_flips_pick():
+    cand = ['rf', 'q']
+    wl = {'rf': {'filter': 0, 'group': 6}, 'q': {'filter': 2, 'group': 0}}
+    sel = {'q': 0.4}; cov = {'rf': {'rf'}, 'q': {'q'}}
+    assert P.score_cluster_keys(cand, wl, sel, cov, group_locality=0.25)[0][0] == 'rf'
+    assert P.score_cluster_keys(cand, wl, sel, cov, group_locality=0.05)[0][0] == 'q'
+
+def test_score_unmeasured_selectivity_is_conservative():
+    r = P.score_cluster_keys(['x'], {'x': {'filter': 9, 'group': 0}}, {}, {'x': {'x'}})
+    assert r[0][1] == 0.0                                    # sel defaults to 1.0 -> no saving
+
+def test_derive_workload_counts_filter_and_group():
+    qs = ["SELECT l_returnflag, SUM(l_quantity) FROM lineitem "
+          "WHERE l_quantity > 30 GROUP BY l_returnflag",
+          "SELECT COUNT(*) FROM lineitem WHERE l_discount BETWEEN 0.05 AND 0.07",
+          "SELECT l_shipmode, COUNT(*) FROM lineitem "
+          "WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01' "
+          "GROUP BY l_shipmode"]
+    wl = P.derive_workload(qs)
+    assert wl['l_quantity']['filter'] == 1 and wl['l_discount']['filter'] == 1
+    assert wl['l_shipdate']['filter'] == 1                   # a range = one filter event
+    assert wl['l_returnflag']['group'] == 1 and wl['l_shipmode']['group'] == 1
