@@ -59,14 +59,18 @@ def execute(seg: Segment, sql: str, col_map=None):
             # row projection (SELECT cols ... [WHERE] [ORDER BY] [LIMIT]) -> return rows
             cols = [seg_col(_colname(p if not isinstance(p,E.Alias) else p.this)) for p in proj]
             idx = np.nonzero(mask)[0] if mask is not None else np.arange(N)
-            order = tree.args.get('order'); lim = _limit(tree)
-            if order is None and lim is not None: idx = idx[:lim]   # no ordering: limit early (fast path)
+            order = tree.args.get('order'); lim = _limit(tree); distinct = tree.args.get('distinct') is not None
+            if order is None and lim is not None and not distinct: idx = idx[:lim]   # no order/distinct: limit early
             out = []
             colvals = {c: seg.values(c) for c in cols}
             for i in idx: out.append(tuple(_pyval(colvals[c][i]) for c in cols))
-            if order is not None:                                   # ORDER BY: sort full set, then LIMIT
-                out = _apply_order(out, proj, order)
-                if lim is not None: out = out[:lim]
+            if distinct:                                           # SELECT DISTINCT -> dedup (order-preserving)
+                seen = set(); ded = []
+                for r in out:
+                    if r not in seen: seen.add(r); ded.append(r)
+                out = ded
+            if order is not None: out = _apply_order(out, proj, order)   # ORDER BY: sort, then LIMIT
+            if lim is not None: out = out[:lim]
             return out, [_alias(p) for p in proj]
 
     # ---- GROUP BY path ----
@@ -120,11 +124,27 @@ def execute(seg: Segment, sql: str, col_map=None):
             return v
         segf = seg_v.astype(np.float64)
         return {'SUM': segf.sum(), 'AVG': segf.mean()}[fn]
+    def groupdistinct(colname, gi):                # COUNT(DISTINCT col) within group gi (ignores NULL)
+        pcol = seg_col(colname)
+        if colname not in aggcache:
+            arr, nm = _col(seg, pcol)
+            if mask is not None:
+                arr = arr[mask]; nm = nm[mask] if nm is not None else None
+            aggcache[colname] = (arr[order], (nm[order] if nm is not None else None))
+        vs, vn = aggcache[colname]; sl = slice(gstarts[gi], gends[gi]); seg_v = vs[sl]
+        if vn is not None: seg_v = seg_v[~vn[sl]]
+        return len(set(seg_v.tolist()))
     rows=[]
     for gi,cv in enumerate(uc):
         keyidx = decombo(cv); rowout=[]; ki=0
         for p,kind in agg_specs:
-            if kind is None:
+            _inn = p.this if isinstance(p, E.Alias) else p
+            if isinstance(_inn, E.Count) and isinstance(_inn.this, E.Distinct):   # COUNT(DISTINCT col) per group
+                _dx = _inn.this.expressions
+                if len(_dx) != 1 or not isinstance(_dx[0], E.Column):
+                    raise NotImplementedError("COUNT(DISTINCT) over expression/multiple columns")
+                rowout.append(int(groupdistinct(_dx[0].name, gi)))
+            elif kind is None:
                 rowout.append(_pyval(keyval(ki, keyidx[ki]))); ki+=1
             elif kind[0]=='COUNT_STAR':
                 rowout.append(int(counts[gi]))
@@ -250,6 +270,16 @@ def _lit_for_col(seg, colname, lit, arr_kind):
     return v
 
 def _agg_scalar(seg, p, mask, seg_col):
+    _inner = p.this if isinstance(p, E.Alias) else p
+    if isinstance(_inner, E.Count) and isinstance(_inner.this, E.Distinct):   # COUNT(DISTINCT col)
+        _dx = _inner.this.expressions
+        if len(_dx) != 1 or not isinstance(_dx[0], E.Column):
+            raise NotImplementedError("COUNT(DISTINCT) over expression/multiple columns")
+        arr, nm = _col(seg, seg_col(_dx[0].name))
+        if mask is not None:
+            arr = arr[mask]; nm = nm[mask] if nm is not None else None
+        if nm is not None: arr = arr[~nm]                                     # COUNT(DISTINCT) ignores NULL
+        return int(len(set(arr.tolist())))
     kind=_agg_kind(p)
     if kind[0]=='COUNT_STAR': return int(mask.sum()) if mask is not None else seg.N
     fn,cn=kind

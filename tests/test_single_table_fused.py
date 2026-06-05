@@ -53,3 +53,17 @@ def test_st_empty_sum_null():
 def test_st_empty_group_is_empty():
     db, con = _fixture()
     assert db.run("SELECT g, COUNT(*) FROM t WHERE k > 999 GROUP BY g")[0] == []
+
+# DISTINCT (fused == GROUP BY over value-identity cols; mode-4 col k falls back to wdb_sql dedup)
+def test_st_distinct_two_cols():    _match("SELECT DISTINCT g, s FROM t")
+def test_st_distinct_one_col():     _match("SELECT DISTINCT g FROM t")
+def test_st_distinct_where():       _match("SELECT DISTINCT g FROM t WHERE k > 4")
+def test_st_distinct_order_limit(): _match("SELECT DISTINCT s FROM t ORDER BY s LIMIT 2", expect_fast=True)
+def test_st_distinct_mode4_fallback(): _match("SELECT DISTINCT k FROM t", expect_fast=False)  # k is mode-4 -> wdb_sql dedup
+
+# COUNT(DISTINCT) (single fused; grouped via wdb_sql)
+def test_st_count_distinct():       _match("SELECT COUNT(DISTINCT g) FROM t")
+def test_st_count_distinct_where(): _match("SELECT COUNT(DISTINCT g) FROM t WHERE k > 3")
+def test_st_count_distinct_mode4_fallback(): _match("SELECT COUNT(DISTINCT id) FROM t", expect_fast=False)  # id sequential -> mode-4 -> wdb_sql
+def test_st_grouped_count_distinct(): _match("SELECT g, COUNT(DISTINCT s) FROM t GROUP BY g", expect_fast=False)
+def test_st_grouped_count_distinct_mixed(): _match("SELECT g, COUNT(*), COUNT(DISTINCT s) FROM t GROUP BY g", expect_fast=False)

@@ -284,6 +284,9 @@ class _FastUnsupported(Exception):
     pass
 
 _FAST_HITS = 0   # diagnostic: how many queries took the gather fast path
+def _bump_fast():
+    global _FAST_HITS
+    _FAST_HITS += 1
 LUT_MAX_CARD = 65536   # code-LUT predicate fusion (LIKE / string-ordering / IS NULL) precomputes
                        # keep[code]=pred(dict_value) over the dictionary; viable only while the dict
                        # is small. Measured precompute (LIKE regex over D dict values): 0.02ms@200,
@@ -348,9 +351,25 @@ def _bulk_keyvals(seg, pcol, codes):
 def _fast_pointer_agg(db, tree, ctx):
     import operator
     proj = tree.expressions
-    if not any(wdb_sql._agg_kind(p) for p in proj): raise _FastUnsupported   # plain projection -> fallback
     group = tree.args.get('group')
-    gnodes = group.expressions if group is not None else []
+    has_agg = any(wdb_sql._agg_kind(p) for p in proj)
+    cd_col = None                                                            # COUNT(DISTINCT col), sole, no GROUP BY
+    if group is None and len(proj) == 1:
+        _i0 = proj[0].this if isinstance(proj[0], E.Alias) else proj[0]
+        if isinstance(_i0, E.Count) and isinstance(_i0.this, E.Distinct):
+            _dx = _i0.this.expressions
+            if len(_dx) == 1 and isinstance(_dx[0], E.Column): cd_col = _dx[0]
+            else: raise _FastUnsupported                                     # COUNT(DISTINCT expr / multi) -> fallback
+    if cd_col is not None:
+        gnodes = []                                                          # computed directly after mask setup
+    elif tree.args.get('distinct') is not None and not has_agg and group is None:
+        cols = [(p.this if isinstance(p, E.Alias) else p) for p in proj]      # SELECT DISTINCT cols == GROUP BY cols
+        if not all(isinstance(c, E.Column) for c in cols): raise _FastUnsupported  # DISTINCT * / over expr
+        gnodes = cols
+    elif not has_agg:
+        raise _FastUnsupported                                                # plain projection -> fallback
+    else:
+        gnodes = group.expressions if group is not None else []
 
     fact = ctx['fact']; alias2t = ctx['alias2t']; seg_of = ctx['seg_of']; composed = ctx['composed']
     cols_of = {a: set(db.cat.column_names(t)) for a, t in alias2t.items()}
@@ -550,6 +569,17 @@ def _fast_pointer_agg(db, tree, ctx):
     n = ctx['n']
     if n == 0 and gnodes: return [], [wdb_sql._alias(p) for p in proj]   # GROUP BY over 0 rows -> no groups
     # (no GROUP BY over 0 rows falls through: SQL still emits one grand-total row -- COUNT=0, SUM/MIN/MAX=NULL)
+    if cd_col is not None:                       # COUNT(DISTINCT col) == # distinct non-null codes among matches
+        cseg, cpcol, ccptr = resolve(cd_col)
+        if cseg.cols[cpcol]['mode'] == 4: raise _FastUnsupported           # codes not value-identity -> fallback
+        codes = cseg.codes(cpcol); codes = codes if ccptr is None else codes[ccptr]
+        m = get_mask()
+        if m is not None: codes = codes[m]
+        uniq = np.unique(codes) if codes.size else np.empty(0, dtype=np.int64)
+        cc = cseg.cols[cpcol]
+        if cc['has_null']: uniq = uniq[uniq != cc['V'] - 1]                # COUNT(DISTINCT) ignores NULL
+        _bump_fast()
+        return [(int(uniq.size),)], [wdb_sql._alias(proj[0])]
     gkeys = []                                           # one per GROUP BY column
     for g in gnodes:
         gseg, gpcol, gcptr = resolve(g)
