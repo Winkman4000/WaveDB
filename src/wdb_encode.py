@@ -276,6 +276,12 @@ def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_s
     out = bytearray(b'WVDB4'); out += struct.pack('<H', len(cols)); out += struct.pack('<I', N)
     for nm in cols: out += blobs[nm]
     open(out_path,'wb').write(out)
+    try:                                          # advisory: write per-column stats sidecar (planner reads it)
+        from wdb_engine import Segment
+        import wdb_profile
+        wdb_profile.profile_and_save(Segment(out_path), out_path)
+    except Exception:
+        pass
     return dict(n_rows=N, n_cols=len(cols), bytes=len(out), seconds=time.time()-t0, sizes=sizes)
 
 if __name__ == '__main__':
