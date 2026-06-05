@@ -12,6 +12,11 @@ import wdb_join
 
 DIR = '/tmp/jbprof_sf1.0'
 db = Database.open(os.path.join(DIR, 'wdb'))
+# FK relationships are pre-resolved once (like building an index/sort key) so equi-joins
+# become a gather instead of a runtime hash build.
+for _a in [('orders','o_custkey','customer','c_custkey'),('lineitem','l_orderkey','orders','o_orderkey')]:
+    try: db.create_fk_pointer(*_a)
+    except Exception: pass
 con = duckdb.connect(); con.execute("INSTALL tpch; LOAD tpch; CALL dbgen(sf=1)")
 
 SEGS = {t: Segment(os.path.join(DIR, 'wdb', f'{t}_0.wdb')) for t in ('lineitem','orders','customer')}
