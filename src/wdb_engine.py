@@ -395,13 +395,15 @@ class Segment:
         if c['mode'] in (3, 5) or c.get('code_enc', 0) == 1:
             return self._raw_codes(nm)[lo:hi]
         bits = c['bits']; base = c['cstart']
-        w = (1 << np.arange(bits - 1, -1, -1)).astype(np.uint64)
         bit_lo = lo * bits; bit_hi = hi * bits
         byte_lo = bit_lo // 8; byte_hi = (bit_hi + 7) // 8
         allb = np.unpackbits(self.buf[base + byte_lo:base + byte_hi])
         s = bit_lo - byte_lo * 8
         b = allb[s:s + (hi - lo) * bits].reshape(hi - lo, bits)
-        return (b.astype(np.uint64) * w).sum(1).astype(np.int64)
+        # weighted bit-sum via BLAS matmul: ~3x faster than (b.astype*w).sum(1). Exact in
+        # float64 -- every code is < 2^bits with bits <= 32, well under the 2^53 integer limit.
+        w = (1 << np.arange(bits - 1, -1, -1)).astype(np.float64)
+        return (b.astype(np.float64) @ w).astype(np.int64)
 
     def values_range(self, nm, lo, hi):
         """Decoded values for rows [lo, hi) only (the cluster-slice read). Mirrors _base_values'
