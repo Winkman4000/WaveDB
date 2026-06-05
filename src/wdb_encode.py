@@ -222,7 +222,34 @@ def _serialize_fd(p, det_idx, det_codes):
     out += _pack_codes(ymap, p['bits'])
     return bytes(out), (len(out), p['V'], p['bits'], p['dtype'], 3, p['has_null'], p['aux'])
 
-def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_specs=None):
+def _cluster_order(kc, N):
+    """Stable row permutation sorting by the cluster key (nulls last) + the slice-boundary
+    index (sorted unique key values -> first-row offsets) used by the executor's searchsorted."""
+    if isinstance(kc, ma.MaskedArray):
+        mask = ma.getmaskarray(kc); base = np.asarray(kc.data)
+    else:
+        mask = None; base = np.asarray(kc)
+    k = base.dtype.kind
+    if k == 'M':
+        sortkey = base.view('int64'); aux = _unit_code(np.datetime_data(base.dtype)[0]); dt = 3
+    elif k in 'iu':
+        sortkey = base.astype(np.int64, copy=False); aux = 0; dt = 0
+    elif k == 'f':
+        sortkey = base.astype(np.float64, copy=False); aux = 0; dt = 2
+    else:
+        raise TypeError(f"cluster key must be int/float/datetime, got {base.dtype}")
+    if mask is not None and mask.any():
+        order = np.lexsort((sortkey, mask)); nn = int((~mask).sum())
+    else:
+        order = np.argsort(sortkey, kind='stable'); nn = N
+    ks = sortkey[np.asarray(order)][:nn]
+    vals, idx = np.unique(ks, return_index=True)
+    offsets = np.append(idx.astype(np.int64), np.int64(nn))
+    return np.asarray(order), dict(dtype=dt, aux=aux, n=int(N), nn=int(nn),
+                                   values=vals, offsets=offsets)
+
+
+def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_specs=None, cluster_by=None):
     """fd_specs: optional {dependent_col: determinant_col} — store the dependent column as
     a mode-3 FD-reference into the determinant (lossless iff the FD is exact; callers pass
     only verified FDs). Determinant must be a normal (non-FD) column in the same segment."""
@@ -230,6 +257,14 @@ def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_s
     fd_specs = fd_specs or {}
     t0 = time.time()
     coldata, N, cols = wdb_read.read_columns(input_path, columns, reader=reader)
+    cluster_meta = None
+    if cluster_by is not None:
+        if cluster_by not in coldata:
+            raise KeyError(f"cluster_by {cluster_by!r} not among columns {list(coldata)}")
+        _order, cluster_meta = _cluster_order(coldata[cluster_by], N)
+        for _nm in cols:
+            coldata[_nm] = coldata[_nm][_order]
+        cluster_meta['key'] = cluster_by
     if workers is None:
         workers = min(len(cols), (os.cpu_count() or 4))
     blobs = {}; sizes = {}
@@ -282,7 +317,12 @@ def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_s
         wdb_profile.profile_and_save(Segment(out_path), out_path)
     except Exception:
         pass
-    return dict(n_rows=N, n_cols=len(cols), bytes=len(out), seconds=time.time()-t0, sizes=sizes)
+    if cluster_meta is not None:
+        import pickle
+        with open(out_path + '.cluster', 'wb') as _cf:
+            pickle.dump(cluster_meta, _cf, protocol=4)
+    return dict(n_rows=N, n_cols=len(cols), bytes=len(out), seconds=time.time()-t0,
+                sizes=sizes, cluster=cluster_by)
 
 if __name__ == '__main__':
     if len(sys.argv) < 3:
