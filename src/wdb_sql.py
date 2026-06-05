@@ -141,15 +141,22 @@ def execute(seg: Segment, sql: str, col_map=None):
         segf = seg_v.astype(np.float64)
         return {'SUM': segf.sum(), 'AVG': segf.mean()}[fn]
     def groupdistinct(colname, gi):                # COUNT(DISTINCT col) within group gi (ignores NULL)
-        pcol = seg_col(colname)
-        if colname not in aggcache:
-            arr, nm = _col(seg, pcol)
-            if mask is not None:
-                arr = arr[mask]; nm = nm[mask] if nm is not None else None
-            aggcache[colname] = (arr[order], (nm[order] if nm is not None else None))
-        vs, vn = aggcache[colname]; sl = slice(gstarts[gi], gends[gi]); seg_v = vs[sl]
-        if vn is not None: seg_v = seg_v[~vn[sl]]
-        return len(set(seg_v.tolist()))
+        pcol = seg_col(colname); c = seg.cols[pcol]; ck = '#cd#' + colname
+        if ck not in aggcache:
+            if c['mode'] == 4:                     # positional codes aren't value-identity -> use values
+                arr, nm = _col(seg, pcol)
+                if mask is not None:
+                    arr = arr[mask]; nm = nm[mask] if nm is not None else None
+                aggcache[ck] = ('v', arr[order], (nm[order] if nm is not None else None))
+            else:                                  # value-identity codes: np.unique on int64, no value decode
+                codes = seg.codes(pcol); codes = codes[mask] if mask is not None else codes
+                aggcache[ck] = ('c', codes[order], (c['V'] - 1) if c['has_null'] else None)
+        knd, vs, extra = aggcache[ck]; sl = slice(gstarts[gi], gends[gi]); seg_v = vs[sl]
+        if knd == 'v':
+            if extra is not None: seg_v = seg_v[~extra[sl]]
+        elif extra is not None:
+            seg_v = seg_v[seg_v != extra]          # drop NULL code
+        return int(np.unique(seg_v).size)
     rows=[]
     for gi,cv in enumerate(uc):
         keyidx = decombo(cv); rowout=[]; ki=0
@@ -291,11 +298,17 @@ def _agg_scalar(seg, p, mask, seg_col):
         _dx = _inner.this.expressions
         if len(_dx) != 1 or not isinstance(_dx[0], E.Column):
             raise NotImplementedError("COUNT(DISTINCT) over expression/multiple columns")
-        arr, nm = _col(seg, seg_col(_dx[0].name))
-        if mask is not None:
-            arr = arr[mask]; nm = nm[mask] if nm is not None else None
-        if nm is not None: arr = arr[~nm]                                     # COUNT(DISTINCT) ignores NULL
-        return int(len(set(arr.tolist())))
+        cn = seg_col(_dx[0].name); c = seg.cols[cn]
+        if c['mode'] == 4:                              # positional codes aren't value-identity -> values
+            arr, nm = _col(seg, cn)
+            if mask is not None:
+                arr = arr[mask]; nm = nm[mask] if nm is not None else None
+            if nm is not None: arr = arr[~nm]
+            return int(np.unique(arr).size)
+        codes = seg.codes(cn)                           # value-identity: count distinct CODES (no value decode)
+        if mask is not None: codes = codes[mask]
+        if c['has_null']: codes = codes[codes != (c['V'] - 1)]   # COUNT(DISTINCT) ignores NULL
+        return int(np.unique(codes).size)
     kind=_agg_kind(p)
     if kind[0]=='COUNT_STAR': return int(mask.sum()) if mask is not None else seg.N
     fn,cn=kind
@@ -398,9 +411,11 @@ def _agg_scalar_range(seg, p, lo, hi, rmask, seg_col):
     if isinstance(_inner, E.Count) and isinstance(_inner.this, E.Distinct):
         _dx = _inner.this.expressions
         if len(_dx) != 1 or not isinstance(_dx[0], E.Column): raise NotImplementedError
-        cn = seg_col(_dx[0].name)
-        if seg.cols[cn]['has_null'] or seg._overrides(cn) is not None: raise NotImplementedError
-        return int(len(set(seg.values_range(cn, lo, hi)[rmask].tolist())))
+        cn = seg_col(_dx[0].name); c = seg.cols[cn]
+        if c['has_null'] or seg._overrides(cn) is not None: raise NotImplementedError
+        if c['mode'] == 4:                                  # positional codes -> count distinct values
+            return int(np.unique(seg.values_range(cn, lo, hi)[rmask]).size)
+        return int(np.unique(seg._raw_codes_range(cn, lo, hi)[rmask]).size)   # value-identity codes
     kind = _agg_kind(p)
     if kind is None: raise NotImplementedError("bare column in aggregate query")
     if kind[0] == 'COUNT_STAR': return int(rmask.sum())
