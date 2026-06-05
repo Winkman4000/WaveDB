@@ -342,6 +342,7 @@ def _eval_pred(seg, node, seg_col):
         if a.dtype.kind not in 'iuf' and isinstance(v,int) and seg.cols[cn]['dt']!=3: v=str(v).encode()
         import operator
         op={E.EQ:operator.eq,E.NEQ:operator.ne,E.GT:operator.gt,E.LT:operator.lt,E.GTE:operator.ge,E.LTE:operator.le}[type(node)]
+        if a.dtype.kind == 'M': a = a.view('int64')   # datetime: compare epoch ints
         res = op(a,v)
         if nmask is not None: res = res & ~nmask   # SQL: NULL fails any comparison
         return res
@@ -349,6 +350,7 @@ def _eval_pred(seg, node, seg_col):
         col=_colname(node.this); a, nmask = _col(seg, seg_col(col))
         lo=_lit_for_col(seg, seg_col(col), node.args['low'], a.dtype.kind)
         hi=_lit_for_col(seg, seg_col(col), node.args['high'], a.dtype.kind)
+        if a.dtype.kind == 'M': a = a.view('int64')   # datetime: compare epoch ints
         res=(a>=lo)&(a<=hi)
         if nmask is not None: res = res & ~nmask
         return res

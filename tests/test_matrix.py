@@ -19,9 +19,9 @@ from wdb_db import Database
 # query battery applies to all. Knobs vary the STRUCTURE.
 # ----------------------------------------------------------------------------
 def spec(name, N=2000, cg=6, ch=4, cd=40, ck=9, ntype='float', gtype='str',
-         nulls=(), order='id'):
+         nulls=(), order='id', nseg=1):
     return dict(name=name, N=N, cg=cg, ch=ch, cd=cd, ck=ck, ntype=ntype,
-                gtype=gtype, nulls=tuple(nulls), order=order)
+                gtype=gtype, nulls=tuple(nulls), order=order, nseg=nseg)
 
 VARIANTS = [
     spec('base'),
@@ -44,16 +44,41 @@ VARIANTS = [
     spec('h_wide', ch=37),
     spec('dup_heavy', cg=2, ch=2, ck=2),       # many identical rows
     spec('mid_scattered', N=20000, order='random'),
+    # --- numeric edge structures ---
+    spec('neg_measure', ntype='neg'),
+    spec('zero_measure', ntype='zero'),
+    spec('const_measure', ntype='const'),            # mode-6 synthetic const
+    spec('neg_scattered', ntype='neg', order='random'),
+    spec('nulls_n_int', ntype='int', nulls=('n',)),
+    # --- null edge structures ---
+    spec('allnull_g', gtype='null'),                 # exercises empty-dict guard
+    spec('nulls_d', nulls=('d',)),                   # nullable datetime in group/filter
+    spec('nulls_d_scattered', nulls=('d',), order='random'),
+    # --- cardinality / mode structures ---
+    spec('g_bool', cg=2),                            # boolean-like dim
+    spec('k_seq', ck=5000),                          # k becomes 0..N-1 sequential -> mode-4
+    spec('highcard_scattered', cg=1000, order='random'),
+    # --- multi-segment (distinct merge code path) ---
+    spec('two_seg', N=4000, nseg=2),
+    spec('two_seg_scattered', N=4000, nseg=2, order='random'),
+    spec('two_seg_clustered', N=4000, nseg=2, order='d'),
+    spec('two_seg_nulls', N=4000, nseg=2, nulls=('g', 'n')),
+    spec('three_seg', N=6000, nseg=3),
 ]
 
 
 def _gen_sql(s):
     def nul(col, expr):
         return f"CASE WHEN (i%10)=0 THEN NULL ELSE {expr} END" if col in s['nulls'] else expr
-    g = nul('g', (f"'G'||(i%{s['cg']})" if s['gtype'] == 'str' else f"(i%{s['cg']})"))
-    n = nul('n', (f"((i%97)+1)*1.5" if s['ntype'] == 'float' else f"((i%97)+1)"))
+    if s['gtype'] == 'null':
+        g = "CAST(NULL AS VARCHAR)"
+    else:
+        g = nul('g', (f"'G'||(i%{s['cg']})" if s['gtype'] == 'str' else f"(i%{s['cg']})"))
+    nmap = {'float': "((i%97)+1)*1.5", 'int': "((i%97)+1)",
+            'neg': "((i%97)-48)*1.5", 'zero': "(i%5)", 'const': "7.0"}
+    n = nul('n', nmap.get(s['ntype'], nmap['float']))
     h = f"(i%{s['ch']})"
-    d = f"(DATE '2020-01-01' + CAST(i%{s['cd']} AS INTEGER))"
+    d = nul('d', f"(DATE '2020-01-01' + CAST(i%{s['cd']} AS INTEGER))")
     k = f"(i%{s['ck']})"
     return (f"SELECT CAST(i AS BIGINT) id, {g} AS g, {h} AS h, {n} AS n, "
             f"{d} AS d, {k} AS k FROM range({s['N']}) t(i)")
@@ -81,13 +106,17 @@ def _build(s):
     desc = con.execute("DESCRIBE t").fetchall()
     sel = ", ".join((f"CAST({c[0]} AS DOUBLE) AS {c[0]}" if c[1].startswith('DECIMAL') else c[0])
                     for c in desc)
-    order = {'id': 'id', 'd': 'd, id', 'random': 'random()'}[s['order']]
-    pq = os.path.join(d, 't.parquet')
-    con.execute(f"COPY (SELECT {sel} FROM t ORDER BY {order}) TO '{pq}' (FORMAT parquet)")
+    order = {'id': 'id', 'd': 'd, id', 'random': 'hash(id)'}[s['order']]   # hash = deterministic shuffle
     db = Database.create(d)
     db.cat.add_table('t', [[c[0], ('float' if c[1].startswith('DECIMAL') else _WT[c[1]])] for c in desc])
-    wdb_encode.encode(pq, os.path.join(d, 't_0.wdb'))
-    db.cat.add_segment('t', 't_0.wdb')
+    nseg = s.get('nseg', 1); N = s['N']
+    per = (-(-N // nseg)) if nseg > 1 else N                        # ceil division
+    for i in range(nseg):
+        pq = os.path.join(d, f't_{i}.parquet')
+        clause = f"LIMIT {per} OFFSET {i*per}" if nseg > 1 else ""
+        con.execute(f"COPY (SELECT {sel} FROM t ORDER BY {order} {clause}) TO '{pq}' (FORMAT parquet)")
+        wdb_encode.encode(pq, os.path.join(d, f't_{i}.wdb'))
+        db.cat.add_segment('t', f't_{i}.wdb')
     _CACHE[s['name']] = (db, con, _lits(s))
     return _CACHE[s['name']]
 

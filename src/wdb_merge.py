@@ -19,6 +19,10 @@ _AGG = (E.Count, E.Sum, E.Min, E.Max, E.Avg)
 def _inner(p):
     return p.this if isinstance(p, E.Alias) else p
 
+def _is_cdistinct(node):
+    return (isinstance(node, E.Count) and isinstance(node.this, E.Distinct)
+            and len(node.this.expressions) == 1 and isinstance(node.this.expressions[0], E.Column))
+
 def _classify(proj):
     """Return (keys, plan, partial_select_sql_exprs).
     plan[i] describes how to build final column i from merged partials."""
@@ -29,6 +33,8 @@ def _classify(proj):
         partials.append(sql_expr); return len(keys) + len(partials) - 1
     for p in proj:
         node = _inner(p)
+        if _is_cdistinct(node):                       # COUNT(DISTINCT col): merged via value-set union, not partials
+            plan.append(('cdistinct', node.this.expressions[0].name)); continue
         if isinstance(node, E.Column):
             nm = node.name
             if nm not in keys: keys.append(nm)
@@ -84,8 +90,11 @@ def _merge_partials(row_lists, n_keys, plan):
             for slot, val in enumerate(parts):
                 # determine op for this partial slot from plan
                 op = _slot_op(slot + n_keys, plan)
-                if op in ('sum', 'count_star'):
+                if op == 'count_star':
                     cur[slot] = _num(cur[slot]) + _num(val)
+                elif op == 'sum':                       # None-preserving: an all-NULL group sums to NULL, not 0
+                    if val is not None:
+                        cur[slot] = val if cur[slot] is None else cur[slot] + val
                 elif op == 'min':
                     a = _mm(cur[slot]); b = _mm(val)
                     cur[slot] = b if a is None else (a if b is None else min(a, b))
@@ -129,6 +138,11 @@ def merge_query(segs, hot_parquet, sql, col_map=None):
             con = duckdb.connect()
             base_p = wdb_sql._to_physical(base, col_map)   # hot parquet carries physical names
             rows += [tuple(x) for x in con.execute(_duck_from(base_p, hot_parquet)).fetchall()]
+        if tree.args.get('distinct') is not None:        # SELECT DISTINCT: per-tier dedup is not enough
+            seen = set(); ded = []                       # -> dedup the cross-tier union (order-preserving)
+            for r in rows:
+                if r not in seen: seen.add(r); ded.append(r)
+            rows = ded
         rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))
         lim = wdb_sql._limit(tree)
         if lim is not None: rows = rows[:lim]
@@ -136,18 +150,55 @@ def merge_query(segs, hot_parquet, sql, col_map=None):
 
     # ---- aggregates / GROUP BY: partial merge ----
     keys, plan, partials = _classify(proj)
+    has_cd = any(e[0] == 'cdistinct' for e in plan)
     row_lists = []
-    if segs:
+    if keys or partials:
         psql = _partial_sql(tree, "tbl", keys, partials)
         for seg in segs:
             r, _ = wdb_sql.execute(seg, psql, col_map=col_map); row_lists.append(list(r))
-    if hot_parquet is not None:
-        tree_p = wdb_sql._to_physical(tree, col_map)       # hot parquet carries physical names;
-        keys_p, _, partials_p = _classify(tree_p.expressions)  # same structure as cold, by position
-        psql_h = _partial_sql(tree_p, f"'{hot_parquet}'", keys_p, partials_p)
-        con = duckdb.connect()
-        row_lists.append([tuple(x) for x in con.execute(psql_h).fetchall()])
-    acc = _merge_partials(row_lists, len(keys), plan)
+        if hot_parquet is not None:
+            tree_p = wdb_sql._to_physical(tree, col_map)       # hot parquet carries physical names;
+            keys_p, _, partials_p = _classify(tree_p.expressions)  # same structure as cold, by position
+            psql_h = _partial_sql(tree_p, f"'{hot_parquet}'", keys_p, partials_p)
+            con = duckdb.connect()
+            row_lists.append([tuple(x) for x in con.execute(psql_h).fetchall()])
+        acc = _merge_partials(row_lists, len(keys), plan)
+    else:
+        acc = {(): []}                                # pure COUNT(DISTINCT), no GROUP BY -> one global group
+
+    # COUNT(DISTINCT col): the mergeable partial is the SET of distinct values per group, not a count
+    # (summing per-segment counts double-counts values that span segments). Gather distinct
+    # (keys..., value) pairs from every tier, union per group key, then count the non-null values.
+    cd = {}
+    if has_cd:
+        where = tree.args.get('where')
+        wsql = f" WHERE {where.this.sql(dialect='duckdb')}" if where is not None else ""
+        for entry in plan:
+            if entry[0] != 'cdistinct': continue
+            col = entry[1]; sets = cd.setdefault(col, {})
+            sel = ", ".join([f'"{k}" AS _k{i}' for i, k in enumerate(keys)] + [f'"{col}" AS _v'])
+            gsql = " GROUP BY " + ", ".join(chr(34) + g + chr(34) for g in (keys + [col]))
+            qsql = f"SELECT {sel} FROM tbl{wsql}{gsql}"
+            pair_lists = []
+            for seg in segs:
+                r, _ = wdb_sql.execute(seg, qsql, col_map=col_map); pair_lists.append(r)
+            if hot_parquet is not None:
+                pk = [(col_map.get(k, k) if col_map else k) for k in keys]
+                pc = (col_map.get(col, col) if col_map else col)
+                pw = wdb_sql._to_physical(copy.deepcopy(tree), col_map).args.get('where')
+                pwsql = f" WHERE {pw.this.sql(dialect='duckdb')}" if pw is not None else ""
+                psel = ", ".join([f'"{k}"' for k in pk] + [f'"{pc}"'])
+                pg = " GROUP BY " + ", ".join(chr(34) + g + chr(34) for g in (pk + [pc]))
+                con = duckdb.connect()
+                pair_lists.append([tuple(x) for x in
+                                   con.execute(f"SELECT {psel} FROM '{hot_parquet}'{pwsql}{pg}").fetchall()])
+            for rows in pair_lists:
+                for r in rows:
+                    kt = tuple(r[:len(keys)]); val = r[len(keys)]
+                    if val is None: continue                  # COUNT(DISTINCT) ignores NULL
+                    sets.setdefault(kt, set()).add(_mm(val))
+            for kt in sets:
+                acc.setdefault(kt, [None] * len(partials))     # emit groups seen only via the distinct gather
 
     out = []
     for key, parts in acc.items():
@@ -156,6 +207,8 @@ def merge_query(segs, hot_parquet, sql, col_map=None):
         for entry in plan:
             if entry[0] == 'key':
                 row.append(key[entry[1]])
+            elif entry[0] == 'cdistinct':
+                row.append(len(cd.get(entry[1], {}).get(key, ())))
             elif entry[0] in ('sum', 'count_star', 'min', 'max'):
                 row.append(full[entry[1]])
             elif entry[0] == 'avg':
