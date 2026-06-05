@@ -85,6 +85,9 @@ def _chain_pandas(db, tree, ctx):
     else:
         keys = [R(p.this if isinstance(p, E.Alias) else p) for p in proj]
         rows = [tuple(_render(v) for v in t) for t in df[keys].itertuples(index=False, name=None)]
+    having = tree.args.get('having')
+    if having is not None:
+        rows = wdb_sql._apply_having(rows, proj, having.this, None)   # fused path must filter too
     rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))
     lim = wdb_sql._limit(tree)
     if lim is not None: rows = rows[:lim]
@@ -178,6 +181,9 @@ def join_query(db, sql):
         keys = [R(p.this if isinstance(p, E.Alias) else p) for p in proj]
         rows = [tuple(_render(v) for v in t) for t in merged[keys].itertuples(index=False, name=None)]
 
+    having = tree.args.get('having')
+    if having is not None:
+        rows = wdb_sql._apply_having(rows, proj, having.this, None)   # fused path must filter too
     rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))
     lim = wdb_sql._limit(tree)
     if lim is not None: rows = rows[:lim]
@@ -334,7 +340,12 @@ def _bulk_keyvals(seg, pcol, codes):
     td = seg._typed_dict(pcol)
     if not isinstance(td, np.ndarray):
         td = np.array(td, dtype=object)
-    picked = td[codes]
+    codes = np.asarray(codes)
+    nc = (c['V'] - 1) if c['has_null'] else None
+    if len(td) == 0:                                  # all-null column -> every key is NULL
+        return [None] * len(codes)
+    safe = np.where(codes == nc, 0, codes) if nc is not None else codes   # null code -> dummy idx (fixed below)
+    picked = td[safe]
     if dt == 3:                                       # int64 epochs -> datetime64 -> _pyval string
         unit = seg.unit(pcol)
         out = [wdb_sql._pyval(x) for x in picked.astype(np.int64).view(f'datetime64[{unit}]')]
@@ -342,8 +353,8 @@ def _bulk_keyvals(seg, pcol, codes):
         out = [wdb_sql._pyval(x) for x in picked]
     else:                                             # int / float -> python scalars (C-level tolist)
         out = picked.tolist()
-    if c['has_null']:
-        nc = c['V'] - 1; cl = codes.tolist()
+    if nc is not None:
+        cl = codes.tolist()
         out = [None if cl[i] == nc else out[i] for i in range(len(out))]
     return out
 
@@ -509,6 +520,7 @@ def _fast_pointer_agg(db, tree, ctx):
                         return res
                 arr, _ = _col_cached(seg, pcol)
                 v = wdb_sql._lit_for_col(seg, pcol, node.expression, arr.dtype.kind)
+                if arr.dtype.kind == 'M': arr = arr.view('int64')   # datetime: compare as epoch ints
                 return _OPS[op](arr, v)
             return leaf(node.this, mk)
         if isinstance(node, E.Between):
@@ -516,6 +528,7 @@ def _fast_pointer_agg(db, tree, ctx):
                 arr, _ = _col_cached(seg, pcol)
                 lo = wdb_sql._lit_for_col(seg, pcol, node.args['low'], arr.dtype.kind)
                 hi = wdb_sql._lit_for_col(seg, pcol, node.args['high'], arr.dtype.kind)
+                if arr.dtype.kind == 'M': arr = arr.view('int64')   # datetime: compare as epoch ints
                 return (arr >= lo) & (arr <= hi)
             return leaf(node.this, mk)
         if isinstance(node, E.In):
@@ -975,6 +988,9 @@ def _fast_pointer_agg(db, tree, ctx):
     rows = list(zip(*col_lists)) if col_lists else [() for _ in present]
 
     global _FAST_HITS; _FAST_HITS += 1
+    having = tree.args.get('having')
+    if having is not None:
+        rows = wdb_sql._apply_having(rows, proj, having.this, None)   # fused path must filter too
     rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))
     lim = wdb_sql._limit(tree)
     if lim is not None: rows = rows[:lim]
