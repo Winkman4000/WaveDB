@@ -61,8 +61,8 @@ def execute(seg: Segment, sql: str, col_map=None):
                 try:
                     sl = _cluster_slice(seg, where.this, seg_col)
                     if sl is not None:
-                        lo, hi = sl
-                        rmask = _eval_pred_range(seg, where.this, seg_col, lo, hi)
+                        lo, hi, consumed = sl
+                        rmask = _eval_pred_range(seg, where.this, seg_col, lo, hi, consumed)
                         row = [_agg_scalar_range(seg, p, lo, hi, rmask, seg_col) for p in proj]
                         global _SLICE_HITS; _SLICE_HITS += 1
                         return [tuple(row)], [_alias(p) for p in proj]
@@ -321,7 +321,7 @@ def _cluster_slice(seg, where_node, seg_col):
     left for the residual evaluator (we never slice on a non-hard constraint)."""
     cm = seg.cluster_meta()
     if cm is None: return None
-    key = cm['key']; los = []; his = []
+    key = cm['key']; los = []; his = []; consumed = set()
     def _kind(dt): return 'i' if dt in (0, 3) else 'f'
     def visit(n):
         if isinstance(n, E.Paren): return visit(n.this)
@@ -335,28 +335,31 @@ def _cluster_slice(seg, where_node, seg_col):
             op = {E.EQ: '=', E.GT: '>', E.LT: '<', E.GTE: '>=', E.LTE: '<='}[type(n)]
             v = _lit_for_col(seg, key, lit, _kind(seg.cols[key]['dt']))
             b = seg.slice_for_predicate(key, op, v)
-            if b is not None: los.append(b[0]); his.append(b[1])
+            if b is not None: los.append(b[0]); his.append(b[1]); consumed.add(id(n))
         elif isinstance(n, E.Between):
             col = _colname(n.this)
             if col is None or seg_col(col) != key: return
             k = _kind(seg.cols[key]['dt'])
             lov = _lit_for_col(seg, key, n.args['low'], k); hiv = _lit_for_col(seg, key, n.args['high'], k)
             b1 = seg.slice_for_predicate(key, '>=', lov); b2 = seg.slice_for_predicate(key, '<=', hiv)
-            if b1 is not None and b2 is not None: los.append(b1[0]); his.append(b2[1])
+            if b1 is not None and b2 is not None: los.append(b1[0]); his.append(b2[1]); consumed.add(id(n))
     visit(where_node)
     if not los: return None
     lo = max(los); hi = min(his)
-    return (lo, hi) if lo < hi else (0, 0)
+    return (lo, hi, consumed) if lo < hi else (0, 0, consumed)
 
-def _eval_pred_range(seg, node, seg_col, lo, hi):
-    """Evaluate a WHERE predicate over rows [lo,hi) only, returning bool[hi-lo]. Same operator
-    set as _eval_pred for the sliceable shapes; raises NotImplementedError on nulls, overrides,
-    or unsupported nodes so the caller falls back to the full-column path (never a wrong answer)."""
+def _eval_pred_range(seg, node, seg_col, lo, hi, consumed):
+    """Evaluate a WHERE predicate over rows [lo,hi) only, returning bool[hi-lo]. Nodes in
+    `consumed` (the exact key conjuncts the slice was built from) are all-true on the slice by
+    construction, so they short-circuit to ones WITHOUT decoding the key. Same operator set as
+    _eval_pred otherwise; raises NotImplementedError on nulls/overrides/unsupported -> caller
+    falls back to the full-column path (never a wrong answer)."""
     import operator
-    if isinstance(node, E.And): return _eval_pred_range(seg, node.this, seg_col, lo, hi) & _eval_pred_range(seg, node.expression, seg_col, lo, hi)
-    if isinstance(node, E.Or):  return _eval_pred_range(seg, node.this, seg_col, lo, hi) | _eval_pred_range(seg, node.expression, seg_col, lo, hi)
-    if isinstance(node, E.Not): return ~_eval_pred_range(seg, node.this, seg_col, lo, hi)
-    if isinstance(node, E.Paren): return _eval_pred_range(seg, node.this, seg_col, lo, hi)
+    if isinstance(node, E.And): return _eval_pred_range(seg, node.this, seg_col, lo, hi, consumed) & _eval_pred_range(seg, node.expression, seg_col, lo, hi, consumed)
+    if isinstance(node, E.Or):  return _eval_pred_range(seg, node.this, seg_col, lo, hi, consumed) | _eval_pred_range(seg, node.expression, seg_col, lo, hi, consumed)
+    if isinstance(node, E.Not): return ~_eval_pred_range(seg, node.this, seg_col, lo, hi, consumed)
+    if isinstance(node, E.Paren): return _eval_pred_range(seg, node.this, seg_col, lo, hi, consumed)
+    if id(node) in consumed: return np.ones(hi - lo, dtype=bool)   # key conjunct: all-true on slice
     def _slice(cn):
         if seg.cols[cn]['has_null'] or seg._overrides(cn) is not None:
             raise NotImplementedError("null/override column in slice predicate")
