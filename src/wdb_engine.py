@@ -83,6 +83,7 @@ class Segment:
         self.buf = np.frombuffer(buf, dtype=np.uint8); self._codes = {}
         self.path = path; self._presence = 0   # 0 = not yet loaded
         self._ov = 0                            # override sidecar: 0 = not yet loaded
+        self._cluster = 0                       # .cluster slice-boundary sidecar: 0 = not loaded
         self._synth = {}                        # mode-6 synthetic constant columns (ADD COLUMN)
         self._tdict = {}                        # memo: decoded base dict per column (immutable .wdb)
     def add_const_column(self, name, value, dt, aux=0):
@@ -351,3 +352,79 @@ class Segment:
     def cardinality(self, nm): return self.cols[nm]['V']
     def group_by_count(self, nm):
         return np.bincount(self.codes(nm), minlength=self.cols[nm]['V'])
+
+    # ---- narrow-before-expand: cluster-key slicing -----------------------------------------
+    def cluster_meta(self):
+        """Slice-boundary index from the .cluster sidecar, or None. Keys: key, dtype, aux,
+        values (sorted unique key, int64/float), offsets (first-row of each, len+1), nn, n."""
+        if isinstance(self._cluster, int):            # 0 = not yet loaded
+            import os, pickle
+            p = self.path + '.cluster'
+            self._cluster = pickle.load(open(p, 'rb')) if os.path.exists(p) else None
+        return self._cluster
+
+    def slice_for_predicate(self, nm, op, lit):
+        """If nm is the cluster key and (op, lit) is a range/eq, return the contiguous (lo, hi)
+        row bounds of the matching slice; else None. lit must be in the key's native numeric
+        domain (int, float, or int64 epoch for datetime). Nulls live at [nn, n) and never match,
+        so range/eq bounds stay inside [0, nn)."""
+        cm = self.cluster_meta()
+        if cm is None or cm['key'] != nm or op not in ('=', '>', '>=', '<', '<='):
+            return None
+        vals = cm['values']; off = cm['offsets']; nn = int(cm['nn'])
+        if op == '=':
+            i = int(np.searchsorted(vals, lit, 'left'))
+            if i < len(vals) and vals[i] == lit:
+                return (int(off[i]), int(off[i + 1]))
+            return (0, 0)
+        if op in ('>', '>='):
+            i = int(np.searchsorted(vals, lit, 'right' if op == '>' else 'left'))
+            return (int(off[i]), nn)
+        i = int(np.searchsorted(vals, lit, 'left' if op == '<' else 'right'))
+        return (0, int(off[i]))
+
+    def _raw_codes_range(self, nm, lo, hi):
+        """Per-row codes for rows [lo, hi) ONLY. Raw bit-packed columns (code_enc 0) touch just
+        the covering bytes -- the narrow-before-expand read. mode 4/6 are positional (free slice).
+        Other encodings full-decode then slice (correct; bigger win awaits block decode)."""
+        if lo >= hi:
+            return np.empty(0, dtype=np.int64)
+        c = self.cols[nm]
+        if c['mode'] == 4: return np.arange(lo, hi, dtype=np.int64)
+        if c['mode'] == 6: return np.zeros(hi - lo, dtype=np.int64)
+        if c['mode'] in (3, 5) or c.get('code_enc', 0) == 1:
+            return self._raw_codes(nm)[lo:hi]
+        bits = c['bits']; base = c['cstart']
+        w = (1 << np.arange(bits - 1, -1, -1)).astype(np.uint64)
+        bit_lo = lo * bits; bit_hi = hi * bits
+        byte_lo = bit_lo // 8; byte_hi = (bit_hi + 7) // 8
+        allb = np.unpackbits(self.buf[base + byte_lo:base + byte_hi])
+        s = bit_lo - byte_lo * 8
+        b = allb[s:s + (hi - lo) * bits].reshape(hi - lo, bits)
+        return (b.astype(np.uint64) * w).sum(1).astype(np.int64)
+
+    def values_range(self, nm, lo, hi):
+        """Decoded values for rows [lo, hi) only (the cluster-slice read). Mirrors _base_values'
+        code->value mapping over the slice. No override support (clustered segments are fresh)."""
+        c = self.cols[nm]
+        if c['mode'] == 4:
+            arr = self._seq_decode(c)[lo:hi]
+            return arr.view(f"datetime64[{_DT_UNITS[c['aux']]}]") if c['dt'] == 3 else arr
+        if c['mode'] == 5: return self._inline_values(c)[lo:hi]
+        if c['mode'] == 6: return self._const_array(nm)[lo:hi]
+        codes = self._raw_codes_range(nm, lo, hi); dvals = self._typed_dict(nm)
+        if c['has_null']:
+            nullcode = c['V'] - 1; lut = np.empty(c['V'], dtype=object)
+            if c['dt'] == 3:
+                unit = _DT_UNITS[c['aux']]
+                for i, v in enumerate(dvals): lut[i] = np.int64(v).view(f'datetime64[{unit}]')
+            else:
+                for i, v in enumerate(dvals): lut[i] = v
+            lut[nullcode] = None
+            return lut[codes]
+        if c['dt'] == 0: return np.array(dvals, dtype=np.int64)[codes]
+        if c['dt'] == 2: return np.array(dvals, dtype=np.float64)[codes]
+        if c['dt'] == 3:
+            unit = _DT_UNITS[c['aux']]
+            return np.array(dvals, dtype=np.int64)[codes].view(f'datetime64[{unit}]')
+        return np.array(dvals, dtype=object)[codes]
