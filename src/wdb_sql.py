@@ -6,6 +6,8 @@ Unsupported shapes raise NotImplementedError (honest failure, never silent wrong
 import sqlglot, sqlglot.expressions as E, numpy as np
 from wdb_engine import Segment
 
+_SLICE_HITS = 0   # count of queries answered via the cluster-slice fast path (tests/telemetry)
+
 def _colname(node):
     if isinstance(node, E.Column): return node.name
     return None
@@ -52,6 +54,20 @@ def execute(seg: Segment, sql: str, col_map=None):
     if not gcols:
         # no GROUP BY: either pure aggregates over (masked) rows, or row projection
         if any(_is_agg(p) for p in proj):
+            # narrow-before-expand: if WHERE pins a range/eq on the cluster key, slice to those
+            # rows and decode only the slice (no whole-column scan). Falls back on anything the
+            # slice path does not support; only when no deleted rows (presence) complicate it.
+            if where is not None and seg.cluster_meta() is not None and seg.presence_mask() is None:
+                try:
+                    sl = _cluster_slice(seg, where.this, seg_col)
+                    if sl is not None:
+                        lo, hi = sl
+                        rmask = _eval_pred_range(seg, where.this, seg_col, lo, hi)
+                        row = [_agg_scalar_range(seg, p, lo, hi, rmask, seg_col) for p in proj]
+                        global _SLICE_HITS; _SLICE_HITS += 1
+                        return [tuple(row)], [_alias(p) for p in proj]
+                except NotImplementedError:
+                    pass
             row = []
             for p in proj: row.append(_agg_scalar(seg, p, mask, seg_col))
             return [tuple(row)], [_alias(p) for p in proj]
@@ -297,6 +313,106 @@ def _agg_scalar(seg, p, mask, seg_col):
         return _pyval(v)
     arr = arr.astype(np.float64)                  # SUM/AVG are numeric
     return _pyval({'SUM': arr.sum(), 'AVG': arr.mean()}[fn])
+
+# ---------- narrow-before-expand: cluster-key slice fast path (scalar aggregates) ----------
+def _cluster_slice(seg, where_node, seg_col):
+    """Intersect every top-level-AND range/eq conjunct on the cluster key into one (lo,hi) row
+    slice, or None if the WHERE pins nothing on the key. Only descends And/Paren -- Or/Not are
+    left for the residual evaluator (we never slice on a non-hard constraint)."""
+    cm = seg.cluster_meta()
+    if cm is None: return None
+    key = cm['key']; los = []; his = []
+    def _kind(dt): return 'i' if dt in (0, 3) else 'f'
+    def visit(n):
+        if isinstance(n, E.Paren): return visit(n.this)
+        if isinstance(n, E.And): visit(n.this); visit(n.expression); return
+        if isinstance(n, (E.EQ, E.GT, E.LT, E.GTE, E.LTE)):
+            col = _colname(n.this)
+            if col is None or seg_col(col) != key: return
+            lit = n.expression
+            if not (isinstance(lit, E.Literal) or (isinstance(lit, E.Neg) and isinstance(lit.this, E.Literal))):
+                return
+            op = {E.EQ: '=', E.GT: '>', E.LT: '<', E.GTE: '>=', E.LTE: '<='}[type(n)]
+            v = _lit_for_col(seg, key, lit, _kind(seg.cols[key]['dt']))
+            b = seg.slice_for_predicate(key, op, v)
+            if b is not None: los.append(b[0]); his.append(b[1])
+        elif isinstance(n, E.Between):
+            col = _colname(n.this)
+            if col is None or seg_col(col) != key: return
+            k = _kind(seg.cols[key]['dt'])
+            lov = _lit_for_col(seg, key, n.args['low'], k); hiv = _lit_for_col(seg, key, n.args['high'], k)
+            b1 = seg.slice_for_predicate(key, '>=', lov); b2 = seg.slice_for_predicate(key, '<=', hiv)
+            if b1 is not None and b2 is not None: los.append(b1[0]); his.append(b2[1])
+    visit(where_node)
+    if not los: return None
+    lo = max(los); hi = min(his)
+    return (lo, hi) if lo < hi else (0, 0)
+
+def _eval_pred_range(seg, node, seg_col, lo, hi):
+    """Evaluate a WHERE predicate over rows [lo,hi) only, returning bool[hi-lo]. Same operator
+    set as _eval_pred for the sliceable shapes; raises NotImplementedError on nulls, overrides,
+    or unsupported nodes so the caller falls back to the full-column path (never a wrong answer)."""
+    import operator
+    if isinstance(node, E.And): return _eval_pred_range(seg, node.this, seg_col, lo, hi) & _eval_pred_range(seg, node.expression, seg_col, lo, hi)
+    if isinstance(node, E.Or):  return _eval_pred_range(seg, node.this, seg_col, lo, hi) | _eval_pred_range(seg, node.expression, seg_col, lo, hi)
+    if isinstance(node, E.Not): return ~_eval_pred_range(seg, node.this, seg_col, lo, hi)
+    if isinstance(node, E.Paren): return _eval_pred_range(seg, node.this, seg_col, lo, hi)
+    def _slice(cn):
+        if seg.cols[cn]['has_null'] or seg._overrides(cn) is not None:
+            raise NotImplementedError("null/override column in slice predicate")
+        return seg.values_range(cn, lo, hi)
+    if isinstance(node, (E.EQ, E.NEQ, E.GT, E.LT, E.GTE, E.LTE)):
+        cn = seg_col(_colname(node.this)); lit = node.expression
+        if not (isinstance(lit, E.Literal) or (isinstance(lit, E.Neg) and isinstance(lit.this, E.Literal))):
+            raise NotImplementedError("non-literal RHS")
+        a = _slice(cn); v = _lit_for_col(seg, cn, lit, a.dtype.kind)
+        if a.dtype.kind not in 'iuf' and isinstance(v, int) and seg.cols[cn]['dt'] != 3: v = str(v).encode()
+        if a.dtype.kind == 'M': a = a.view('int64')
+        op = {E.EQ: operator.eq, E.NEQ: operator.ne, E.GT: operator.gt, E.LT: operator.lt, E.GTE: operator.ge, E.LTE: operator.le}[type(node)]
+        return op(a, v)
+    if isinstance(node, E.Between):
+        cn = seg_col(_colname(node.this)); a = _slice(cn)
+        lov = _lit_for_col(seg, cn, node.args['low'], a.dtype.kind); hiv = _lit_for_col(seg, cn, node.args['high'], a.dtype.kind)
+        if a.dtype.kind == 'M': a = a.view('int64')
+        return (a >= lov) & (a <= hiv)
+    if isinstance(node, E.In):
+        cn = seg_col(_colname(node.this)); a = _slice(cn); lits = node.args.get('expressions') or []
+        vals = []
+        for L in lits:
+            if not isinstance(L, E.Literal): raise NotImplementedError("IN non-literal")
+            if seg.cols[cn]['dt'] == 3: vals.append(_parse_temporal(L.this, seg.unit(cn)))
+            elif L.is_string: vals.append(L.this.encode() if a.dtype.kind not in 'iuf' else L.this)
+            else: vals.append(int(L.this) if a.dtype.kind in 'iu' else (float(L.this) if a.dtype.kind == 'f' else str(L.this).encode()))
+        if a.dtype.kind == 'M': a = a.view('int64'); return np.isin(a, np.array(vals, dtype=a.dtype))
+        if a.dtype.kind in 'iuf': return np.isin(a, np.array(vals, dtype=a.dtype))
+        sv = set(vals); return np.fromiter((x in sv for x in a), dtype=bool, count=len(a))
+    raise NotImplementedError(f"slice predicate {type(node).__name__}")
+
+def _agg_scalar_range(seg, p, lo, hi, rmask, seg_col):
+    """Scalar aggregate over the residual-masked cluster slice (no whole-column decode).
+    Non-null columns only; raises NotImplementedError otherwise (caller falls back)."""
+    _inner = p.this if isinstance(p, E.Alias) else p
+    if isinstance(_inner, E.Count) and isinstance(_inner.this, E.Distinct):
+        _dx = _inner.this.expressions
+        if len(_dx) != 1 or not isinstance(_dx[0], E.Column): raise NotImplementedError
+        cn = seg_col(_dx[0].name)
+        if seg.cols[cn]['has_null'] or seg._overrides(cn) is not None: raise NotImplementedError
+        return int(len(set(seg.values_range(cn, lo, hi)[rmask].tolist())))
+    kind = _agg_kind(p)
+    if kind is None: raise NotImplementedError("bare column in aggregate query")
+    if kind[0] == 'COUNT_STAR': return int(rmask.sum())
+    fn, cn_name = kind; cn = seg_col(cn_name)
+    if seg.cols[cn]['has_null'] or seg._overrides(cn) is not None: raise NotImplementedError
+    a = seg.values_range(cn, lo, hi)[rmask]
+    if fn == 'COUNT': return int(len(a))
+    if len(a) == 0: return None
+    if fn in ('MIN', 'MAX'):
+        v = a.min() if fn == 'MIN' else a.max()
+        if seg.cols[cn]['dt'] == 3 and isinstance(v, (int, np.integer)):
+            v = np.int64(v).view(f"datetime64[{seg.unit(cn)}]")
+        return _pyval(v)
+    af = a.astype(np.float64)
+    return _pyval({'SUM': af.sum(), 'AVG': af.mean()}[fn])
 
 def _seq_eq_mask(seg, name, neg, lit):
     """O(1)-compute equality mask for a clean-affine integer mode-4 column (n_exc==0, no

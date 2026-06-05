@@ -103,3 +103,61 @@ def test_slice_datetime_key():
     lo, hi = s.slice_for_predicate('d', '>=', thr)
     d = s.values('d')
     assert set(range(lo, hi)) == set(np.where(d >= np.datetime64('2024-01-04'))[0].tolist())
+
+
+# --- step 2b: wired slice fast-path in the executor (clustered == unclustered) -----------
+import wdb_sql
+
+def _pair(df, key):
+    return Segment(_enc(df)), Segment(_enc(df, cluster_by=key))
+
+def test_executor_slice_matches_full_path():
+    n = 400
+    df = pd.DataFrame({'k': np.arange(n) % 25, 'v': (np.arange(n) * 7) % 1000, 'm': np.arange(n) % 5})
+    full, clus = _pair(df, 'k')
+    queries = [
+        "SELECT COUNT(*) FROM t WHERE k > 10",
+        "SELECT SUM(v) FROM t WHERE k > 10",
+        "SELECT SUM(v) FROM t WHERE k >= 5 AND k < 15",
+        "SELECT SUM(v) FROM t WHERE k > 5 AND m < 3",
+        "SELECT COUNT(*), SUM(v), MIN(v), MAX(v) FROM t WHERE k BETWEEN 4 AND 8",
+        "SELECT SUM(v) FROM t WHERE k = 7",
+        "SELECT COUNT(DISTINCT m) FROM t WHERE k > 3",
+        "SELECT SUM(v) FROM t WHERE k > 100",          # empty slice
+    ]
+    before = wdb_sql._SLICE_HITS
+    for q in queries:
+        r_full, _ = wdb_sql.execute(full, q)
+        r_clus, _ = wdb_sql.execute(clus, q)
+        assert r_full == r_clus, (q, r_full, r_clus)
+    assert wdb_sql._SLICE_HITS == before + len(queries)   # every one took the slice path
+
+
+def test_executor_no_key_predicate_falls_back():
+    df = pd.DataFrame({'k': np.arange(200) % 10, 'v': np.arange(200), 'm': np.arange(200) % 4})
+    full, clus = _pair(df, 'k')
+    before = wdb_sql._SLICE_HITS
+    q = "SELECT SUM(v) FROM t WHERE m < 2"             # no cluster-key predicate
+    assert wdb_sql.execute(full, q) == wdb_sql.execute(clus, q)
+    assert wdb_sql._SLICE_HITS == before               # slice path NOT taken
+
+
+def test_executor_slice_datetime_range():
+    days = pd.to_datetime('2024-01-01') + pd.to_timedelta(np.arange(300) % 12, unit='D')
+    df = pd.DataFrame({'d': days.values, 'v': (np.arange(300) * 3) % 500})
+    full, clus = _pair(df, 'd')
+    q = ("SELECT SUM(v), COUNT(*) FROM t "
+         "WHERE d >= '2024-01-04' AND d < '2024-01-09'")
+    before = wdb_sql._SLICE_HITS
+    assert wdb_sql.execute(full, q) == wdb_sql.execute(clus, q)
+    assert wdb_sql._SLICE_HITS == before + 1
+
+
+def test_executor_slice_float_sum_isclose():
+    import math
+    n = 300
+    df = pd.DataFrame({'k': np.arange(n) % 20, 'p': np.round(np.arange(n) * 1.07, 2)})
+    full, clus = _pair(df, 'k')
+    q = "SELECT SUM(p) FROM t WHERE k > 8"
+    a = wdb_sql.execute(full, q)[0][0][0]; b = wdb_sql.execute(clus, q)[0][0][0]
+    assert math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-6)
