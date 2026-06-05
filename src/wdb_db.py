@@ -84,6 +84,11 @@ class Database:
             hp = wdb_dml.hot_path(self.cat, name)
             hot = hp if os.path.exists(hp) else None
             if hot is None and len(segs) == 1:
+                if tree.args.get('group') is not None or any(wdb_sql._agg_kind(e) for e in tree.expressions):
+                    try:
+                        return wdb_join.table_agg(self, tree)        # single-table aggregate -> fused fast path
+                    except wdb_join._FastUnsupported:
+                        pass                                          # fall back to the single-table executor
                 return wdb_sql.execute(segs[0], sql, col_map=cmap)
             if hot is None and not segs:
                 raise ValueError(f"table {name!r} has no data yet")

@@ -91,6 +91,13 @@ def _chain_pandas(db, tree, ctx):
     return rows, [wdb_sql._alias(p) for p in proj]
 
 
+def table_agg(db, tree):
+    """Single-table aggregate routed through the SAME fused engine as joins: a 0-join chain (fact only, every
+    cptr is None). Reuses predicate fusion, high-card factorise, and vectorised assembly. Raises
+    _FastUnsupported on anything not fusable so the caller falls back to the mature single-table executor."""
+    return _fast_pointer_agg(db, tree, _build_chain(db, tree))
+
+
 def join_query(db, sql):
     tree = sqlglot.parse_one(sql, read='duckdb')
     joins = tree.args.get('joins')
@@ -305,6 +312,9 @@ def _solo_segment(db, name):
     if os.path.exists(wdb_dml.hot_path(db.cat, name)): raise _FastUnsupported
     seg = db.open_segment(paths[0], name)
     if seg.presence_mask() is not None: raise _FastUnsupported
+    import wdb_override
+    if wdb_override.load(seg.path): raise _FastUnsupported                  # column overrides (post-UPDATE)
+    if any(c.get('mode') == 6 for c in seg.cols.values()): raise _FastUnsupported   # synthetic ADD COLUMN
     return seg, paths[0]
 
 
@@ -369,6 +379,8 @@ def _fast_pointer_agg(db, tree, ctx):
             if raw is not None:
                 return ('raw', raw[0], raw[1]), None, seg, pcol
         arr, nm = _col_cached(seg, pcol)
+        if seg.cols[pcol]['dt'] == 3 and getattr(arr, 'dtype', None) is not None and arr.dtype.kind == 'M':
+            arr = arr.view('int64')                       # datetime64 -> epoch ints for the numba kernel
         if cptr is not None:
             return ('g', arr, cptr), (('g', nm, cptr) if nm is not None else None), seg, pcol
         return ('d', arr), (('d', nm) if nm is not None else None), seg, pcol
@@ -536,7 +548,8 @@ def _fast_pointer_agg(db, tree, ctx):
 
     # ---- group codes (as an operand; gathered per-chunk in the threaded kernel) ----
     n = ctx['n']
-    if n == 0: return [], [wdb_sql._alias(p) for p in proj]
+    if n == 0 and gnodes: return [], [wdb_sql._alias(p) for p in proj]   # GROUP BY over 0 rows -> no groups
+    # (no GROUP BY over 0 rows falls through: SQL still emits one grand-total row -- COUNT=0, SUM/MIN/MAX=NULL)
     gkeys = []                                           # one per GROUP BY column
     for g in gnodes:
         gseg, gpcol, gcptr = resolve(g)
@@ -897,7 +910,9 @@ def _fast_pointer_agg(db, tree, ctx):
             _m = get_mask()
             if _m is not None: gcodes = gcodes[_m]
             counts = wdb_agg.group_counts(gcodes, K)
-    present = np.nonzero(counts > 0)[0]
+    # No GROUP BY -> exactly one output row (the grand total), even over zero rows (COUNT=0, SUM/MIN/MAX=NULL,
+    # matching SQL). With a GROUP BY, empty groups are dropped.
+    present = np.array([0]) if not gkeys else np.nonzero(counts > 0)[0]
 
     # ---- assemble rows (vectorised) ----
     # Decode every present group's composite code into per-key code arrays in one shot, bulk-decode each key
@@ -1001,9 +1016,13 @@ def _build_chain(db, tree):
         if child_a in edges: raise _FastUnsupported                              # one parent per child (tree)
         edges[child_a] = (parent_a, fk_col); parents.add(parent_a)
 
-    fact_candidates = [a for a in edges if a not in parents]
-    if len(fact_candidates) != 1: raise _FastUnsupported                         # need a single rooted fact
-    fact = fact_candidates[0]
+    if not edges:                                                                # 0 joins: single-table query
+        if len(tables) != 1: raise _FastUnsupported                              # multiple tables, no FK edge
+        fact = tables[0][1]
+    else:
+        fact_candidates = [a for a in edges if a not in parents]
+        if len(fact_candidates) != 1: raise _FastUnsupported                     # need a single rooted fact
+        fact = fact_candidates[0]
 
     # Linear chain (each child has one parent, single rooted fact): order it fact -> p1 -> p2 -> ...
     order = [fact]; cur = fact

@@ -337,7 +337,7 @@ class Segment:
     def presence_mask(self):
         """Bool array (len N, True=live) from the presence sidecar, or None if all rows live.
         Lazily loaded and cached. None lets callers take the unmasked fast path."""
-        if self._presence == 0:
+        if isinstance(self._presence, int):          # int sentinel = not yet loaded (loaded = ndarray|None)
             import wdb_presence
             self._presence = wdb_presence.load(self.path, self.N)
         return self._presence
