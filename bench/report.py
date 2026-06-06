@@ -55,52 +55,69 @@ def duck_baseline():
 _MEMRUN = '/tmp/_wdb_memrun.py'
 def _write_memrun():
     open(_MEMRUN, 'w').write(
-        "import sys\n"
+        "import sys, time\n"
         f"sys.path.insert(0,{HERE!r}); sys.path.insert(0,{SRC!r})\n"
         "from wdb_db import Database\n"
         "from catalog import QUERIES\n"
         f"db=Database.open({WDB!r})\n"
+        "ms=0.0\n"
         "if sys.argv[1]!='floor':\n"
         "    for a in [('orders','o_custkey','customer','c_custkey'),('lineitem','l_orderkey','orders','o_orderkey')]:\n"
         "        try: db.create_fk_pointer(*a)\n"
         "        except Exception: pass\n"
         "    sql=QUERIES[int(sys.argv[1])][2]\n"
-        "    db.run(sql); db.run(sql)\n"
+        "    for _ in range(5): db.run(sql)\n"   # warm to steady state (numba thread pool)
+        "    ts=[]\n"
+        "    for _ in range(8):\n"
+        "        t=time.perf_counter(); db.run(sql); ts.append(time.perf_counter()-t)\n"
+        "    ms=min(ts)*1000\n"
         "else:\n"
         "    db.run('SELECT COUNT(*) FROM lineitem')\n"
         "hwm=0\n"
         "for line in open('/proc/self/status'):\n"
         "    if line.startswith('VmHWM'): hwm=int(line.split()[1])\n"
-        "print(hwm)\n")
+        "print(ms, hwm)\n")
 
 def _peak_kb(arg):
+    """Run one query alone in a fresh process (no other engine resident -> production-representative).
+    Returns (best_of_5_ms, peak_VmHWM_kb)."""
     r = subprocess.run([sys.executable, _MEMRUN, str(arg)], capture_output=True, text=True)
-    try: return int(r.stdout.strip().splitlines()[-1])
-    except Exception: return -1
+    try:
+        p = r.stdout.strip().splitlines()[-1].split()
+        return float(p[0]), int(p[1])
+    except Exception: return float('nan'), -1
 
 
 _DUCKMEM = '/tmp/_duck_memrun.py'
 def _write_duckmem():
     open(_DUCKMEM, 'w').write(
-        "import sys\n"
+        "import sys, time\n"
         f"sys.path.insert(0,{HERE!r})\n"
         "import duckdb\n"
         "from catalog import QUERIES\n"
         f"con=duckdb.connect({os.path.join(DIR,'baseline.duckdb')!r}, read_only=True)\n"
+        "ms=0.0\n"
         "if sys.argv[1]!='floor':\n"
         "    sql=QUERIES[int(sys.argv[1])][2]\n"
-        "    con.execute(sql).fetchall(); con.execute(sql).fetchall()\n"
+        "    for _ in range(5): con.execute(sql).fetchall()\n"   # symmetric warmup
+        "    ts=[]\n"
+        "    for _ in range(8):\n"
+        "        t=time.perf_counter(); con.execute(sql).fetchall(); ts.append(time.perf_counter()-t)\n"
+        "    ms=min(ts)*1000\n"
         "else:\n"
         "    con.execute('SELECT COUNT(*) FROM lineitem').fetchall()\n"
         "hwm=0\n"
         "for line in open('/proc/self/status'):\n"
         "    if line.startswith('VmHWM'): hwm=int(line.split()[1])\n"
-        "print(hwm)\n")
+        "print(ms, hwm)\n")
 
 def _duck_peak_kb(arg):
+    """DuckDB alone in a fresh process. Returns (best_of_5_ms, peak_VmHWM_kb)."""
     r = subprocess.run([sys.executable, _DUCKMEM, str(arg)], capture_output=True, text=True)
-    try: return int(r.stdout.strip().splitlines()[-1])
-    except Exception: return -1
+    try:
+        p = r.stdout.strip().splitlines()[-1].split()
+        return float(p[0]), int(p[1])
+    except Exception: return float('nan'), -1
 
 
 def write_caps(out, mem, dmem, dsz, wtot, git):
@@ -110,7 +127,9 @@ def write_caps(out, mem, dmem, dsz, wtot, git):
     E = "<!-- END MEASURED -->"
     L = [B, "", "## Measured performance vs DuckDB", ""]
     L.append(f"_TPC-H sf=1, commit `{git}`, {datetime.date.today().isoformat()}. "
-             f"Speed in ms (lower is better). RAM = peak VmHWM in a fresh process per query._\n")
+             f"Speed in ms (lower is better), best of 8 after 5 warmups. Each engine measured ALONE "
+             f"in a fresh process per query (production-representative -- neither contends with the "
+             f"other); RAM = peak VmHWM._\n")
     L.append(f"**Storage:** WaveDB {wtot/MB:.1f} MB vs DuckDB {dsz/MB:.1f} MB "
              f"= **{dsz/wtot:.2f}x smaller** (same data).\n")
     L.append("| capability | WaveDB | DuckDB | speed | WaveDB RAM | DuckDB RAM |")
@@ -168,8 +187,10 @@ def write_md(tabs, fk, side, dsz, out, mem, dmem, floor, Nl, secs):
              f"({wtot/MB:.1f} MB vs {dsz/MB:.1f} MB), FK-pointer join index included. "
              f"Column data alone is {wtab/MB:.1f} MB ({dsz/wtab:.2f}x).\n")
     L.append("## Per-query  (speed - memory - bits)\n")
-    L.append(f"Peak RAM = VmHWM in a fresh process per query. Load floor (open + COUNT) "
-             f"= {floor/1024:.0f} MB; anything above that is the query's own footprint.\n")
+    L.append(f"Each engine is measured ALONE in a fresh process per query (best-of-5 latency + peak "
+             f"RAM) -- the production scenario, since WaveDB and DuckDB never run together in "
+             f"deployment. Load floor (open + COUNT) = {floor/1024:.0f} MB; anything above that is "
+             f"the query's own footprint.\n")
     L.append("| # | category | query | rows | bits read | DuckDB | WaveDB | speedup | WaveDB RAM | DuckDB RAM | fused | ok |")
     L.append("|---|---|---|--:|--:|--:|--:|--:|--:|--:|:-:|:-:|")
     okc = fc = 0; sps = []
@@ -203,16 +224,23 @@ def main():
     print("building DuckDB baseline (once) ..."); dsz = duck_baseline()
     db = M.open_db(); con = M.open_duck(); segs = M.open_segs(); COL = M.build_cols(segs)
     Nl = segs['lineitem'].N
-    print("running query matrix ..."); out = M.run_matrix(db, con, COL, log=print)
-    print("measuring WaveDB peak RAM per query (fresh process each) ...")
-    _write_memrun(); floor = _peak_kb('floor')
-    mem = []
+    print("running query matrix (correctness) ..."); out = M.run_matrix(db, con, COL, log=print)
+    db = con = segs = None        # drop both engines before the isolated timing/RAM runs
+    print("measuring WaveDB alone per query (fresh process each: latency + peak RAM) ...")
+    _write_memrun(); floor = _peak_kb('floor')[1]
+    mem = []; wms = []
     for i in range(len(QUERIES)):
-        k = _peak_kb(i); mem.append(k); print(f"  wdb  mem[{i:2d}] {k/1024:6.0f} MB  {QUERIES[i][1]}")
-    print("measuring DuckDB peak RAM per query (fresh process each) ...")
-    _write_duckmem(); dmem = []
+        ms, k = _peak_kb(i); mem.append(k); wms.append(ms)
+        print(f"  wdb  [{i:2d}] {ms:7.2f} ms  {k/1024:6.0f} MB  {QUERIES[i][1]}")
+    print("measuring DuckDB alone per query (fresh process each: latency + peak RAM) ...")
+    _write_duckmem(); dmem = []; dms = []
     for i in range(len(QUERIES)):
-        k = _duck_peak_kb(i); dmem.append(k); print(f"  duck mem[{i:2d}] {k/1024:6.0f} MB")
+        ms, k = _duck_peak_kb(i); dmem.append(k); dms.append(ms)
+        print(f"  duck [{i:2d}] {ms:7.2f} ms  {k/1024:6.0f} MB")
+    # Replace the co-resident matrix timings with the isolated, production-representative ones
+    # (each engine alone in its own process -- neither contends with the other's thread pool).
+    out = [(c, n, b, nr, ok, fast, dms[i], wms[i])
+           for i, (c, n, b, nr, ok, fast, _d, _w) in enumerate(out)]
     wtot = sum(tabs.values()) + fk + side
     git = subprocess.run(['git', 'rev-parse', '--short', 'HEAD'], cwd=ROOT,
                          capture_output=True, text=True).stdout.strip()
