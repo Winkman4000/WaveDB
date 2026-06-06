@@ -285,6 +285,9 @@ def _aggregate(merged, proj, group, R):
 # aggregates -- and raises _FastUnsupported for anything else so join_query falls back to pandas.
 
 MULTI_GROUP_CEIL = 1 << 18   # max composite groups for dense multi-col GROUP BY (else -> hashing/fallback)
+GROUP_CD_CELL_CEIL = 1 << 22  # max (groups x value-cardinality) cells for the one-pass grouped
+                              # COUNT(DISTINCT) keep-table; above this the dense 2-D table is too big
+                              # and we fall back to the sort-based path.
 
 class _FastUnsupported(Exception):
     pass
@@ -913,7 +916,56 @@ def _fast_pointer_agg(db, tree, ctx):
         else:
             fully = False; break
 
-    if fully:
+    def _grouped_cd():
+        # Grouped COUNT(DISTINCT vcol): when the group key(s) and vcol are value-identity dict columns
+        # whose dense (groups x value-cardinality) table is small, count distinct value codes per group
+        # in ONE vectorised pass (a 2-D keep-table) instead of the sort-based fallback -- O(N). Returns
+        # (counts, col_results) in the same group-id space the row assembler expects, else None.
+        cd_idx = vnode = None
+        for idx, p in enumerate(proj):
+            inner = p.this if isinstance(p, E.Alias) else p
+            if isinstance(inner, E.Count) and isinstance(inner.this, E.Distinct):
+                dcols = list(inner.this.find_all(E.Column))
+                if cd_idx is not None or len(dcols) != 1: return None      # one COUNT(DISTINCT col) only
+                cd_idx = idx; vnode = dcols[0]
+            elif isinstance(inner, E.Column):
+                continue                                                   # bare group key (matched below)
+            else:
+                return None
+        if cd_idx is None: return None
+        if any(k['cptr'] is not None for k in gkeys): return None          # v1: fact-only group keys
+        vseg, vpcol, vcptr = resolve(vnode)
+        vc = vseg.cols[vpcol]
+        if vc['mode'] == 4 or vcptr is not None: return None               # need value-identity fact codes
+        nv = vc['V']
+        if K * nv > GROUP_CD_CELL_CEIL: return None                        # dense table too big -> fallback
+        op = _group_op()
+        if op is None or op[0] != 'd': return None
+        gid = np.asarray(op[1], dtype=np.int64)
+        vcodes = vseg.codes(vpcol)
+        m = get_mask()
+        if m is not None: gid = gid[m]; vcodes = vcodes[m]
+        # ONE pass: a (groups x value) cell count. Row totals give presence; nonzero non-null
+        # columns per row give the distinct count. The null code is the last dict slot (V-1).
+        table = np.bincount(gid * nv + vcodes, minlength=K * nv).reshape(K, nv)
+        counts_l = table.sum(axis=1)                                       # rows per group (presence)
+        nn = nv - 1 if vc['has_null'] else nv                              # COUNT(DISTINCT) drops NULL
+        dist = (table[:, :nn] > 0).sum(axis=1).astype(object)
+        cr = {}
+        for idx, p in enumerate(proj):
+            if idx == cd_idx:
+                cr[idx] = ('arr', dist, False, None)
+            else:
+                pseg, ppcol, _r = resolve(p.this if isinstance(p, E.Alias) else p)
+                ki = next((j for j, k in enumerate(gkeys) if k['seg'] is pseg and k['pcol'] == ppcol), None)
+                if ki is None: return None
+                cr[idx] = ('key', ki)
+        return counts_l, cr
+
+    cdist = _grouped_cd() if gkeys else None
+    if cdist is not None:
+        counts, col_results = cdist
+    elif fully:
         ex_index = {}; exprs = []                        # dedup identical expressions; share one pass
         for (i, fn, body, is_dt, unit) in plan:
             if fn in ('SUM', 'AVG', 'MIN', 'MAX'):
