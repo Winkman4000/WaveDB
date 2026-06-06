@@ -157,49 +157,49 @@ _Last updated: commit 270623d. Datasets used for measurement: TPC-H sf=1
 
 ## Measured performance vs DuckDB
 
-_TPC-H sf=1, commit `25f09d5`, 2026-06-05. Speed in ms (lower is better). RAM = peak VmHWM in a fresh process per query._
+_TPC-H sf=1, commit `80468fe`, 2026-06-05. Speed in ms (lower is better). RAM = peak VmHWM in a fresh process per query._
 
 **Storage:** WaveDB 173.1 MB vs DuckDB 214.0 MB = **1.24x smaller** (same data).
 
 | capability | WaveDB | DuckDB | speed | WaveDB RAM | DuckDB RAM |
 |---|--:|--:|:--|--:|--:|
 | **agg** | | | | | |
-| whole COUNT(*) | 0.2 ms | 0.3 ms | 1.66x faster | 899 MB | 56 MB |
-| whole SUM | 1.1 ms | 0.6 ms | 0.56x slower | 899 MB | 86 MB |
-| whole multi-agg | 4.2 ms | 3.1 ms | 0.74x slower | 899 MB | 109 MB |
+| whole COUNT(*) | 0.2 ms | 0.3 ms | 1.42x faster | 657 MB | 57 MB |
+| whole SUM | 1.9 ms | 0.6 ms | 0.34x slower | 726 MB | 86 MB |
+| whole multi-agg | 3.7 ms | 2.6 ms | 0.70x slower | 736 MB | 109 MB |
 | **group** | | | | | |
-| GROUP BY K3 count | 1.6 ms | 4.9 ms | 3.14x faster | 899 MB | 73 MB |
-| GROUP BY K3 sum | 4.4 ms | 5.1 ms | 1.16x faster | 899 MB | 99 MB |
-| GROUP BY K7 avg | 1.9 ms | 15.4 ms | 8.13x faster | 899 MB | 95 MB |
-| GROUP BY 2-col (Q1) | 7.9 ms | 9.8 ms | 1.25x faster | 899 MB | 107 MB |
-| GROUP BY datetime K2.5k | 2.1 ms | 1.9 ms | 0.95x slower | 899 MB | 73 MB |
-| GROUP BY high-card K200k | 70.6 ms | 213.0 ms | 3.02x faster | 899 MB | 430 MB |
-| GROUP BY vhigh-card K1.5M | 181.2 ms | 289.0 ms | 1.60x faster | 899 MB | 367 MB |
+| GROUP BY K3 count | 1.6 ms | 4.9 ms | 3.15x faster | 657 MB | 73 MB |
+| GROUP BY K3 sum | 3.1 ms | 5.2 ms | 1.67x faster | 773 MB | 100 MB |
+| GROUP BY K7 avg | 2.1 ms | 15.3 ms | 7.40x faster | 669 MB | 96 MB |
+| GROUP BY 2-col (Q1) | 6.1 ms | 10.3 ms | 1.69x faster | 866 MB | 107 MB |
+| GROUP BY datetime K2.5k | 2.1 ms | 2.1 ms | 1.00x faster | 657 MB | 74 MB |
+| GROUP BY high-card K200k | 68.2 ms | 210.9 ms | 3.09x faster | 732 MB | 438 MB |
+| GROUP BY vhigh-card K1.5M | 176.9 ms | 285.9 ms | 1.62x faster | 796 MB | 364 MB |
 | **filter** | | | | | |
-| WHERE numeric > | 3.7 ms | 0.8 ms | 0.22x slower | 899 MB | 72 MB |
-| WHERE BETWEEN + agg | 5.8 ms | 1.5 ms | 0.27x slower | 898 MB | 96 MB |
-| WHERE date-range (Q6) | 3.3 ms | 2.4 ms | 0.73x slower | 899 MB | 123 MB |
-| WHERE string = | 1.9 ms | 4.0 ms | 2.13x faster | 899 MB | 72 MB |
-| WHERE IN (3) | 3.1 ms | 9.3 ms | 2.97x faster | 899 MB | 73 MB |
-| WHERE AND/OR | 5.0 ms | 8.5 ms | 1.68x faster | 899 MB | 88 MB |
-| WHERE + GROUP BY | 5.3 ms | 5.2 ms | 0.98x slower | 899 MB | 101 MB |
+| WHERE numeric > | 3.7 ms | 0.9 ms | 0.24x slower | 657 MB | 73 MB |
+| WHERE BETWEEN + agg | 5.8 ms | 1.7 ms | 0.29x slower | 773 MB | 96 MB |
+| WHERE date-range (Q6) | 4.3 ms | 2.4 ms | 0.57x slower | 871 MB | 124 MB |
+| WHERE string = | 1.9 ms | 4.0 ms | 2.13x faster | 657 MB | 72 MB |
+| WHERE IN (3) | 3.2 ms | 9.4 ms | 3.00x faster | 657 MB | 73 MB |
+| WHERE AND/OR | 5.3 ms | 8.7 ms | 1.66x faster | 715 MB | 89 MB |
+| WHERE + GROUP BY | 5.7 ms | 5.1 ms | 0.89x slower | 820 MB | 101 MB |
 | **distinct** | | | | | |
-| DISTINCT 1-col | 1.5 ms | 13.9 ms | 9.33x faster | 899 MB | 83 MB |
-| DISTINCT 2-col | 2.6 ms | 18.3 ms | 6.91x faster | 899 MB | 95 MB |
-| DISTINCT high-card | 16.2 ms | 49.7 ms | 3.07x faster | 899 MB | 265 MB |
-| COUNT(DISTINCT) low | 0.2 ms | 16.7 ms | 110.18x faster | 899 MB | 84 MB |
-| COUNT(DISTINCT) high | 0.2 ms | 27.0 ms | 175.38x faster | 899 MB | 267 MB |
-| grouped COUNT(DISTINCT) | 265.1 ms | 21.7 ms | 0.08x slower | 899 MB | 106 MB |
+| DISTINCT 1-col | 1.5 ms | 13.2 ms | 8.90x faster | 657 MB | 84 MB |
+| DISTINCT 2-col | 2.5 ms | 17.0 ms | 6.78x faster | 665 MB | 95 MB |
+| DISTINCT high-card | 18.1 ms | 50.3 ms | 2.79x faster | 729 MB | 269 MB |
+| COUNT(DISTINCT) low | 0.1 ms | 16.5 ms | 111.92x faster | 657 MB | 84 MB |
+| COUNT(DISTINCT) high | 0.2 ms | 26.7 ms | 176.91x faster | 657 MB | 263 MB |
+| grouped COUNT(DISTINCT) | 271.6 ms | 21.6 ms | 0.08x slower | 842 MB | 106 MB |
 | **order** | | | | | |
-| ORDER BY + LIMIT | 158.9 ms | 34.6 ms | 0.22x slower | 899 MB | 393 MB |
-| HAVING | 1.9 ms | 15.0 ms | 7.78x faster | 899 MB | 83 MB |
+| ORDER BY + LIMIT | 161.2 ms | 34.4 ms | 0.21x slower | 744 MB | 400 MB |
+| HAVING | 1.9 ms | 14.9 ms | 7.71x faster | 657 MB | 83 MB |
 | **join** | | | | | |
-| JOIN group parent-key | 1.8 ms | 9.0 ms | 4.97x faster | 899 MB | 103 MB |
-| JOIN group child-key | 4.7 ms | 17.4 ms | 3.74x faster | 899 MB | 206 MB |
-| JOIN group parent-date | 4.6 ms | 18.2 ms | 3.91x faster | 898 MB | 172 MB |
-| JOIN + WHERE | 5.1 ms | 30.1 ms | 5.85x faster | 899 MB | 248 MB |
-| 3-table JOIN | 10.2 ms | 37.7 ms | 3.71x faster | 911 MB | 218 MB |
+| JOIN group parent-key | 1.8 ms | 9.5 ms | 5.39x faster | 657 MB | 108 MB |
+| JOIN group child-key | 4.8 ms | 20.7 ms | 4.30x faster | 773 MB | 175 MB |
+| JOIN group parent-date | 6.6 ms | 20.0 ms | 3.04x faster | 782 MB | 206 MB |
+| JOIN + WHERE | 5.3 ms | 29.7 ms | 5.63x faster | 831 MB | 311 MB |
+| 3-table JOIN | 9.8 ms | 38.4 ms | 3.93x faster | 852 MB | 220 MB |
 
-**30/30 correct - 21/30 faster than DuckDB - median 2.97x.**
+**30/30 correct - 22/30 faster than DuckDB - median 2.79x.**
 
 <!-- END MEASURED -->
