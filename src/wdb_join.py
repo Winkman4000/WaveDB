@@ -578,6 +578,59 @@ def _fast_pointer_agg(db, tree, ctx):
     def _mask_op():
         m = get_mask(); return ('d', m) if m is not None else None
 
+    def _dict_keep(node, seg, pcol, td):
+        # Evaluate a WHERE predicate over the (tiny) dictionary value array td -> bool[len(td)].
+        # Single column only; returns None on any shape not reducible to td (caller falls back).
+        if isinstance(node, E.Paren): return _dict_keep(node.this, seg, pcol, td)
+        if isinstance(node, E.And):
+            a = _dict_keep(node.this, seg, pcol, td); b = _dict_keep(node.expression, seg, pcol, td)
+            return None if a is None or b is None else (a & b)
+        if isinstance(node, E.Or):
+            a = _dict_keep(node.this, seg, pcol, td); b = _dict_keep(node.expression, seg, pcol, td)
+            return None if a is None or b is None else (a | b)
+        if isinstance(node, E.Not):
+            a = _dict_keep(node.this, seg, pcol, td); return None if a is None else ~a
+        if type(node) in _OPS:
+            if not (isinstance(node.this, E.Column) and isinstance(node.expression, (E.Literal, E.Neg))):
+                return None                                    # col OP literal only (not expr/flip)
+            v = wdb_sql._lit_for_col(seg, pcol, node.expression, td.dtype.kind)
+            return _OPS[type(node)](td, v)
+        if isinstance(node, E.Between):
+            if not isinstance(node.this, E.Column): return None
+            lo = wdb_sql._lit_for_col(seg, pcol, node.args['low'], td.dtype.kind)
+            hi = wdb_sql._lit_for_col(seg, pcol, node.args['high'], td.dtype.kind)
+            return (td >= lo) & (td <= hi)
+        if isinstance(node, E.In):
+            if not isinstance(node.this, E.Column): return None
+            exprs = node.args.get('expressions') or []
+            if not exprs: return None
+            vals = [wdb_sql._lit_for_col(seg, pcol, e, td.dtype.kind) for e in exprs]
+            return np.isin(td, vals)
+        return None
+
+    def _dict_count(wnode):
+        # COUNT(*) WHERE wnode, when wnode is a predicate on a single value-identity numeric dict
+        # FACT column -> sum cached per-code counts over qualifying dict entries. None -> normal path.
+        try:
+            colnodes = list(wnode.find_all(E.Column))
+            if not colnodes: return None
+            seg0 = pcol0 = None
+            for cn in colnodes:
+                s, p, cp = resolve(cn)
+                if cp is not None: return None                 # parent/join column -> not a solo fact col
+                if seg0 is None: seg0, pcol0 = s, p
+                elif id(s) != id(seg0) or p != pcol0: return None   # more than one column
+            c = seg0.cols[pcol0]
+            if c['mode'] == 4 or c['dt'] not in (0, 2): return None  # value-identity int/float only (v1)
+            td = np.asarray(seg0._typed_dict(pcol0))
+            if td.dtype.kind not in 'iuf' or len(td) == 0: return None
+            keep = _dict_keep(wnode, seg0, pcol0, td)
+            if keep is None: return None
+            counts = seg0.code_counts(pcol0)                   # cached bincount, length V
+            return int(counts[:len(td)][keep].sum())           # [:len(td)] excludes the null bin
+        except Exception:
+            return None
+
     # ---- group codes (as an operand; gathered per-chunk in the threaded kernel) ----
     n = ctx['n']
     if n == 0 and gnodes: return [], [wdb_sql._alias(p) for p in proj]   # GROUP BY over 0 rows -> no groups
@@ -596,6 +649,22 @@ def _fast_pointer_agg(db, tree, ctx):
         if cc['has_null']: uniq = uniq[uniq != cc['V'] - 1]                # COUNT(DISTINCT) ignores NULL
         _bump_fast()
         return [(int(uniq.size),)], [wdb_sql._alias(proj[0])]
+
+    # ---- pure COUNT(*) with a single value-identity dict-column predicate -------------------------
+    # COUNT(*) WHERE P(col) == sum of per-code row counts over the codes whose dict value satisfies P.
+    # O(distinct) over the (tiny) dictionary instead of materialising + scanning N values. One bincount
+    # per column, cached on the segment. Numeric int/float dict columns; any other shape returns None
+    # and falls through to the normal scan. Fail-safe: any unexpected node -> None -> normal path.
+    if (group is None and where is not None and cd_col is None and len(proj) == 1
+            and not gnodes):
+        _p0 = proj[0].this if isinstance(proj[0], E.Alias) else proj[0]
+        if (isinstance(_p0, E.Count) and not isinstance(_p0.this, E.Distinct)
+                and (_p0.this is None or isinstance(_p0.this, E.Star))):
+            _cnt = _dict_count(where.this)
+            if _cnt is not None:
+                _bump_fast()
+                return [(int(_cnt),)], [wdb_sql._alias(proj[0])]
+
     gkeys = []                                           # one per GROUP BY column
     for g in gnodes:
         gseg, gpcol, gcptr = resolve(g)

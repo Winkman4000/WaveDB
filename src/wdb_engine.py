@@ -256,6 +256,16 @@ class Segment:
     def codes(self, nm):
         eff = self._effective(nm)
         return eff[0] if eff is not None else self._raw_codes(nm)
+    def code_counts(self, nm):
+        """Per-code row counts (np.bincount of the code array), cached. Length V (includes the
+        null bin at V-1 when has_null). Lets COUNT(*) WHERE P(col) be summed over the dictionary
+        in O(distinct) instead of materialising + scanning N values."""
+        cc = getattr(self, '_ccounts', None)
+        if cc is None: cc = self._ccounts = {}
+        if nm not in cc:
+            codes = self.codes(nm)
+            cc[nm] = np.bincount(codes, minlength=self.cols[nm]['V'])
+        return cc[nm]
     def _override_vals_typed(self, nm):
         eff = self._effective(nm)
         return eff[1] if eff is not None else []
