@@ -7,28 +7,34 @@ _DT_UNITS = ['us','ns','ms','s','D','h','m','M','Y','W']
 
 class Segment:
     def __init__(self, path):
-        buf = open(path,'rb').read(); assert buf[:5]==b'WVDB4', "not a WVDB3 segment"
+        # memmap instead of read(): the file is demand-paged by the OS, so a Segment
+        # only makes resident the column code/dict pages a query actually touches, and
+        # those pages are file-backed (reclaimable under pressure) rather than anonymous
+        # heap. Parse below reads only small metadata; the big code regions stay un-faulted
+        # until decoded. zstd payload blobs are kept as memmap views (decompress accepts
+        # them) so even compressed dictionaries load lazily.
+        buf = np.memmap(path, dtype=np.uint8, mode='r'); assert bytes(buf[:5])==b'WVDB4', "not a WVDB4 segment"
         off = 5
         self.n_cols = struct.unpack_from('<H',buf,off)[0]; off += 2
         self.N = struct.unpack_from('<I',buf,off)[0]; off += 4
         self.cols = {}; self.order = []; self._dz = zstd.ZstdDecompressor()
         for _ in range(self.n_cols):
             nl = struct.unpack_from('<H',buf,off)[0]; off += 2
-            nm = buf[off:off+nl].decode(); off += nl
+            nm = bytes(buf[off:off+nl]).decode(); off += nl
             V = struct.unpack_from('<I',buf,off)[0]; off += 4
-            bits = buf[off]; off += 1; dt = buf[off]; off += 1; mode = buf[off]; off += 1
-            has_null = buf[off]; off += 1; aux = buf[off]; off += 1
+            bits = int(buf[off]); off += 1; dt = int(buf[off]); off += 1; mode = int(buf[off]); off += 1
+            has_null = int(buf[off]); off += 1; aux = int(buf[off]); off += 1
             n_dict = V - has_null
             meta = dict(V=V, bits=bits, dt=dt, mode=mode, has_null=has_null, n_dict=n_dict, aux=aux)
             if mode == 0:
                 vals = []
                 for _ in range(n_dict):
                     vl = struct.unpack_from('<I',buf,off)[0]; off += 4
-                    vals.append(buf[off:off+vl]); off += vl
+                    vals.append(bytes(buf[off:off+vl])); off += vl
                 meta['vals'] = vals
             elif mode == 2:
                 zlen = struct.unpack_from('<I',buf,off)[0]; off += 4
-                meta['z2'] = bytes(buf[off:off+zlen]); off += zlen
+                meta['z2'] = buf[off:off+zlen]; off += zlen
                 meta['vals'] = None; meta['intvals'] = None
             elif mode == 3:
                 # FD-reference: dependent column stored as y_by_xcode (Vx Y-codes) into a
@@ -39,7 +45,7 @@ class Segment:
                 vals = []
                 for _ in range(n_dict):
                     vl = struct.unpack_from('<I',buf,off)[0]; off += 4
-                    vals.append(buf[off:off+vl]); off += vl
+                    vals.append(bytes(buf[off:off+vl])); off += vl
                 meta['vals'] = vals
                 meta['map_start'] = off
                 off += (Vx*bits+7)//8      # packed y_by_xcode, NOT N per-row codes
@@ -58,29 +64,29 @@ class Segment:
             elif mode == 5:
                 # inline string column: no dict, no per-row codes. zstd(lengths u32)+zstd(bytes).
                 zll = struct.unpack_from('<I', buf, off)[0]; off += 4
-                meta['ilen'] = bytes(buf[off:off+zll]); off += zll
+                meta['ilen'] = buf[off:off+zll]; off += zll
                 zvl = struct.unpack_from('<I', buf, off)[0]; off += 4
-                meta['ival'] = bytes(buf[off:off+zvl]); off += zvl
+                meta['ival'] = buf[off:off+zvl]; off += zvl
                 meta['ivals'] = None
                 self.cols[nm] = meta; self.order.append(nm)
                 continue
             else:
                 Rr = struct.unpack_from('<H',buf,off)[0]; off += 2
                 nr = struct.unpack_from('<I',buf,off)[0]; off += 4
-                meta['restarts'] = np.frombuffer(buf, dtype=np.uint32, count=nr, offset=off); off += nr*4
+                meta['restarts'] = buf[off:off+nr*4].view(np.uint32); off += nr*4
                 fclen = struct.unpack_from('<I',buf,off)[0]; off += 4
                 zlen = struct.unpack_from('<I',buf,off)[0]; off += 4
                 meta['R'] = Rr; meta['z'] = buf[off:off+zlen]; off += zlen
                 meta['vals'] = None; meta['raw'] = None  # decoded lazily
-            code_enc = buf[off]; off += 1; meta['code_enc'] = code_enc   # 0=raw bitpack, 1=zstd codes
+            code_enc = int(buf[off]); off += 1; meta['code_enc'] = code_enc   # 0=raw bitpack, 1=zstd codes
             if code_enc == 0:
                 nb = (self.N*bits+7)//8; meta['cstart'] = off; off += nb
             else:
-                meta['cwidth'] = buf[off]; off += 1
+                meta['cwidth'] = int(buf[off]); off += 1
                 czlen = struct.unpack_from('<I', buf, off)[0]; off += 4
                 meta['czlen'] = czlen; meta['cstart'] = off; off += czlen
             self.cols[nm] = meta; self.order.append(nm)
-        self.buf = np.frombuffer(buf, dtype=np.uint8); self._codes = {}
+        self.buf = buf; self._codes = {}   # buf is a read-only np.memmap (uint8); code/dict reads fault lazily
         self.path = path; self._presence = 0   # 0 = not yet loaded
         self._ov = 0                            # override sidecar: 0 = not yet loaded
         self._cluster = 0                       # .cluster slice-boundary sidecar: 0 = not loaded
