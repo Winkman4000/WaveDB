@@ -27,38 +27,38 @@ A worker is **RAM-bound only when RAM-per-core < its private working set.**
 
 | # | query | latency | priv MB/worker | QPS @ 32 GB | bound |
 |---|---|--:|--:|--:|---|
-| 1 | COUNT(*) | 0.17 ms | 340 | 95,012 | CPU |
-| 21 | COUNT(DISTINCT) low | 0.24 | 322 | 65,708 | CPU |
-| 22 | COUNT(DISTINCT) high | 0.24 | 322 | 67,086 | CPU |
-| 2 | whole SUM | 1.04 | 389 | 15,352 | CPU |
-| 18 | DISTINCT 1-col | 1.21 | 386 | 13,244 | CPU |
-| 4 | GROUP BY K3 count | 1.30 | 386 | 12,306 | CPU |
-| 26 | JOIN parent-key | 1.40 | 373 | 11,451 | CPU |
-| 25 | HAVING | 1.56 | 386 | 10,287 | CPU |
-| 14 | WHERE string = | 1.68 | 386 | 9,501 | CPU |
-| 6 | GROUP BY K7 avg | 1.82 | 433 | 8,795 | CPU |
-| 8 | GROUP BY datetime | 2.08 | 386 | 7,680 | CPU |
-| 19 | DISTINCT 2-col | 2.16 | 432 | 7,411 | CPU |
-| 3 | whole multi-agg | 2.79 | 488 | 5,734 | CPU |
-| 5 | GROUP BY K3 sum | 2.80 | 435 | 5,709 | CPU |
-| 15 | WHERE IN | 2.90 | 386 | 5,519 | CPU |
-| 27 | JOIN child-key | 3.04 | 436 | 5,266 | CPU |
-| 13 | WHERE date-range (Q6) | 3.28 | 530 | 4,877 | CPU |
-| 11 | WHERE numeric > | 3.67 | 387 | 4,365 | CPU |
-| 16 | WHERE AND/OR | 4.89 | 480 | 3,272 | CPU |
-| 7 | GROUP BY 2-col (Q1) | 5.12 | 531 | 3,124 | CPU |
-| 29 | JOIN + WHERE | 5.15 | 495 | 3,105 | CPU |
-| 28 | JOIN parent-date | 5.37 | 448 | 2,978 | CPU |
-| 17 | WHERE + GROUP BY | 5.53 | 482 | 2,893 | CPU |
-| 12 | WHERE BETWEEN | 6.00 | 436 | 2,666 | CPU |
-| 30 | 3-table JOIN | 11.40 | 727 | 1,404 | CPU |
-| 20 | DISTINCT high-card | 15.30 | 413 | 1,046 | CPU |
-| 9 | GROUP BY high-card 200k | 71.55 | 485 | 224 | CPU |
-| 24 | ORDER BY + LIMIT | 161.83 | 490 | 99 | CPU |
-| 23 | grouped COUNT(DISTINCT) | 257.17 | 415 | 62 | CPU |
-| 10 | GROUP BY vhigh-card 1.5M | 199.47 | 344 | 80 | CPU |
+| 1 | COUNT(*) | 0.15 ms | 340 | 104,371 | CPU |
+| 21 | COUNT(DISTINCT) low | 0.24 | 322 | 66,806 | CPU |
+| 22 | COUNT(DISTINCT) high | 0.24 | 322 | 66,308 | CPU |
+| 11 | WHERE numeric > | 0.26 | 368 | 62,064 | CPU |
+| 14 | WHERE string = | 0.28 | 385 | 56,180 | CPU |
+| 15 | WHERE IN (3) | 0.33 | 385 | 47,876 | CPU |
+| 2 | whole SUM | 0.84 | 383 | 19,057 | CPU |
+| 4 | GROUP BY K3 count | 1.27 | 386 | 12,565 | CPU |
+| 26 | JOIN parent-key | 1.30 | 373 | 12,270 | CPU |
+| 18 | DISTINCT 1-col | 1.31 | 386 | 12,169 | CPU |
+| 12 | WHERE BETWEEN + agg | 1.49 | 430 | 10,733 | CPU |
+| 25 | HAVING | 1.57 | 386 | 10,178 | CPU |
+| 16 | WHERE AND/OR | 1.63 | 478 | 9,831 | CPU |
+| 6 | GROUP BY K7 avg | 1.87 | 434 | 8,565 | CPU |
+| 8 | GROUP BY datetime | 2.08 | 386 | 7,676 | CPU |
+| 19 | DISTINCT 2-col | 2.44 | 432 | 6,560 | CPU |
+| 13 | WHERE date-range (Q6) | 2.98 | 524 | 5,372 | CPU |
+| 27 | JOIN child-key | 3.01 | 436 | 5,317 | CPU |
+| 3 | whole multi-agg | 3.06 | 488 | 5,237 | CPU |
+| 5 | GROUP BY K3 sum | 3.21 | 436 | 4,984 | CPU |
+| 28 | JOIN parent-date | 4.57 | 448 | 3,500 | CPU |
+| 29 | JOIN + WHERE | 4.91 | 495 | 3,261 | CPU |
+| 7 | GROUP BY 2-col (Q1) | 5.42 | 531 | 2,954 | CPU |
+| 17 | WHERE + GROUP BY | 5.67 | 482 | 2,823 | CPU |
+| 30 | 3-table JOIN | 10.13 | 819 | 1,579 | CPU |
+| 20 | DISTINCT high-card | 15.63 | 412 | 1,024 | CPU |
+| 9 | GROUP BY high-card 200k | 69.78 | 486 | 229 | CPU |
+| 24 | ORDER BY + LIMIT | 164.32 | 495 | 97 | CPU |
+| 10 | GROUP BY vhigh-card 1.5M | 201.94 | 344 | 79 | CPU |
+| 23 | grouped COUNT(DISTINCT) | 258.53 | 415 | 62 | CPU |
 
-Private working set per worker: **322–727 MB** for dedicated single-query
+Private working set per worker: **322–819 MB** for dedicated single-query
 workers; **~974 MB** worst case for a mixed worker that has touched every column.
 Shared once (file + libs): **~253 MB**.
 
