@@ -919,8 +919,12 @@ def _fast_pointer_agg(db, tree, ctx):
             if fn in ('SUM', 'AVG', 'MIN', 'MAX'):
                 if body not in ex_index: ex_index[body] = len(exprs); exprs.append([body, False])
                 if fn in ('MIN', 'MAX'): exprs[ex_index[body]][1] = True
-        counts, results = wdb_exprjit.grouped_multi(group_keys, slot_list, exprs,
-                                                    None if pred_body else get_mask(), n, pred_body)
+        _mask = None if pred_body else get_mask()
+        if not group_keys and not any(e[1] for e in exprs):     # no GROUP BY, no MIN/MAX -> lean scalar kernel
+            counts, results = wdb_exprjit.scalar_multi(slot_list, exprs, _mask, n, pred_body)
+        else:
+            counts, results = wdb_exprjit.grouped_multi(group_keys, slot_list, exprs,
+                                                        _mask, n, pred_body)
         nz = counts > 0
         for (i, fn, body, is_dt, unit) in plan:
             if fn == 'count':

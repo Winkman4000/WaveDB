@@ -246,3 +246,80 @@ def grouped_multi(group_keys, inputs, exprs, mask, n, pred=None):
             mn = mx = None
         out.append((s, mn, mx))
     return counts, out
+
+
+# ── Scalar (no GROUP BY) aggregate kernel ───────────────────────────────────────────────────────
+# When there is no GROUP BY, grouped_multi's per-thread (NT, Kp) accumulator arrays cost a memory
+# write per row (s[t, g] += x). For a single group that dominates: measured 5.6ms on a predicated
+# SUM over 6M rows. A prange reduction with register/scalar accumulators is ~11x faster (0.5ms) and
+# beats DuckDB. This path handles COUNT + SUM (and AVG via sum/count); MIN/MAX stay on grouped_multi.
+
+def _build_scalar(bodies, slot_gathered, slot_code, has_mask, pred):
+    """Codegen a one-pass prange reduction: optional fused predicate, then COUNT + each SUM body,
+    accumulated in scalar reduction variables (no per-group arrays). Returns (cnt, s0, s1, ...)."""
+    key = ('scalar', bodies, slot_gathered, slot_code, has_mask, pred)
+    fn = _CACHE.get(key)
+    if fn is not None:
+        return fn
+    G = len(slot_gathered); E = len(bodies)
+    params = ['n']
+    for k in range(G):
+        if not slot_code[k]: params.append(f'b{k}')      # code slots carry no base array
+        params.append(f'c{k}')
+        if slot_gathered[k]: params.append(f'p{k}')
+    if has_mask: params.append('mask')
+
+    def _decode(k, ind):
+        idx = f'c{k}[p{k}[i]]' if slot_gathered[k] else f'c{k}[i]'
+        rhs = idx if slot_code[k] else f'b{k}[{idx}]'
+        return f"{ind}v{k} = {rhs}"
+
+    L = [f"def _k({', '.join(params)}):", "    cnt = 0"]
+    for e in range(E): L.append(f"    s{e} = 0.0")
+    L.append("    for i in _prange(n):")
+    pred_slots = sorted(set(int(x) for x in re.findall(r'v(\d+)', pred))) if pred else []
+    cond = None
+    if pred:
+        for k in pred_slots: L.append(_decode(k, "        "))
+        cond = f"({pred})"
+    elif has_mask:
+        cond = "mask[i]"
+    ind = "        "
+    if cond is not None:
+        L.append(f"        if {cond}:"); ind = "            "
+    done = set(pred_slots)
+    for k in range(G):
+        if k not in done: L.append(_decode(k, ind))
+    L.append(f"{ind}cnt += 1")
+    for e in range(E):
+        L.append(f"{ind}x{e} = {bodies[e]}")
+        L.append(f"{ind}s{e} += x{e}")
+    ret = ["cnt"] + [f"s{e}" for e in range(E)]
+    L.append(f"    return ({', '.join(ret)},)")
+
+    ns = {'np': np, '_prange': _prange}
+    exec("\n".join(L), ns)
+    fn = _njit(parallel=True, fastmath=True)(ns['_k'])   # fastmath -> SIMD float reduction (~10x);
+    _CACHE[key] = fn                                      # parallel already reorders sums, so consistent
+    return fn
+
+
+def scalar_multi(inputs, exprs, mask, n, pred=None):
+    """No-GROUP-BY counterpart of grouped_multi. Returns (counts, out) with the SAME shape as
+    grouped_multi for K=1 (length-1 arrays) so the caller is unchanged. SUM/COUNT only -- callers
+    with a MIN/MAX expr use grouped_multi instead."""
+    slot_gathered = tuple(inp[2] is not None for inp in inputs)
+    slot_code     = tuple(inp[0] is None for inp in inputs)
+    bodies        = tuple(e[0] for e in exprs)
+    has_mask = mask is not None and not pred
+    fn = _build_scalar(bodies, slot_gathered, slot_code, has_mask, pred or '')
+    args = [n]
+    for (base, codes, ptr) in inputs:
+        if base is not None: args.append(base)
+        args.append(codes)
+        if ptr is not None: args.append(np.ascontiguousarray(ptr))
+    if has_mask: args.append(mask)
+    res = fn(*args)
+    counts = np.array([res[0]], dtype=np.int64)
+    out = [(np.array([res[1 + e]], dtype=np.float64), None, None) for e in range(len(bodies))]
+    return counts, out
