@@ -584,12 +584,15 @@ def _fast_pointer_agg(db, tree, ctx):
     # (no GROUP BY over 0 rows falls through: SQL still emits one grand-total row -- COUNT=0, SUM/MIN/MAX=NULL)
     if cd_col is not None:                       # COUNT(DISTINCT col) == # distinct non-null codes among matches
         cseg, cpcol, ccptr = resolve(cd_col)
-        if cseg.cols[cpcol]['mode'] == 4: raise _FastUnsupported           # codes not value-identity -> fallback
-        codes = cseg.codes(cpcol); codes = codes if ccptr is None else codes[ccptr]
+        cc = cseg.cols[cpcol]
+        if cc['mode'] == 4: raise _FastUnsupported                         # codes not value-identity -> fallback
         m = get_mask()
+        if m is None and ccptr is None:           # no filter: distinct count == dictionary cardinality (O(1))
+            _bump_fast()
+            return [(int(cc['V'] - cc['has_null']),)], [wdb_sql._alias(proj[0])]
+        codes = cseg.codes(cpcol); codes = codes if ccptr is None else codes[ccptr]
         if m is not None: codes = codes[m]
         uniq = np.unique(codes) if codes.size else np.empty(0, dtype=np.int64)
-        cc = cseg.cols[cpcol]
         if cc['has_null']: uniq = uniq[uniq != cc['V'] - 1]                # COUNT(DISTINCT) ignores NULL
         _bump_fast()
         return [(int(uniq.size),)], [wdb_sql._alias(proj[0])]

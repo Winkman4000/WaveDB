@@ -140,23 +140,27 @@ def execute(seg: Segment, sql: str, col_map=None):
             return v
         segf = seg_v.astype(np.float64)
         return {'SUM': segf.sum(), 'AVG': segf.mean()}[fn]
-    def groupdistinct(colname, gi):                # COUNT(DISTINCT col) within group gi (ignores NULL)
-        pcol = seg_col(colname); c = seg.cols[pcol]; ck = '#cd#' + colname
+    def groupdistinct(colname, gi):                # COUNT(DISTINCT col) per group (ignores NULL)
+        ck = '#cdarr#' + colname
         if ck not in aggcache:
-            if c['mode'] == 4:                     # positional codes aren't value-identity -> use values
-                arr, nm = _col(seg, pcol)
-                if mask is not None:
-                    arr = arr[mask]; nm = nm[mask] if nm is not None else None
-                aggcache[ck] = ('v', arr[order], (nm[order] if nm is not None else None))
-            else:                                  # value-identity codes: np.unique on int64, no value decode
+            pcol = seg_col(colname); c = seg.cols[pcol]; G = len(uc)
+            if c['mode'] == 4:                                 # positional codes -> remap values to dense ids
+                arr, nm = _col(seg, pcol); arr = arr[mask] if mask is not None else arr
+                _u, codes = np.unique(arr, return_inverse=True); Vc = len(_u); nullmask = None
+            else:                                              # value-identity codes (no value decode)
                 codes = seg.codes(pcol); codes = codes[mask] if mask is not None else codes
-                aggcache[ck] = ('c', codes[order], (c['V'] - 1) if c['has_null'] else None)
-        knd, vs, extra = aggcache[ck]; sl = slice(gstarts[gi], gends[gi]); seg_v = vs[sl]
-        if knd == 'v':
-            if extra is not None: seg_v = seg_v[~extra[sl]]
-        elif extra is not None:
-            seg_v = seg_v[seg_v != extra]          # drop NULL code
-        return int(np.unique(seg_v).size)
+                Vc = c['V']; nullmask = (codes == (c['V'] - 1)) if c['has_null'] else None
+            gid = np.searchsorted(uc, combo)                   # per-row group index 0..G-1
+            if nullmask is not None:
+                keep = ~nullmask; gid = gid[keep]; codes = codes[keep]
+            if G * Vc <= 64_000_000:                           # dense presence matrix: O(N) scatter, no sort
+                Mx = np.zeros((G, Vc), dtype=bool); Mx[gid, codes] = True
+                counts = Mx.sum(axis=1)
+            else:                                              # huge key space: unique (group,code) pairs
+                key = gid.astype(np.int64) * Vc + codes.astype(np.int64)
+                counts = np.bincount(np.unique(key) // Vc, minlength=G)
+            aggcache[ck] = counts
+        return int(aggcache[ck][gi])
     rows=[]
     for gi,cv in enumerate(uc):
         keyidx = decombo(cv); rowout=[]; ki=0
@@ -299,6 +303,8 @@ def _agg_scalar(seg, p, mask, seg_col):
         if len(_dx) != 1 or not isinstance(_dx[0], E.Column):
             raise NotImplementedError("COUNT(DISTINCT) over expression/multiple columns")
         cn = seg_col(_dx[0].name); c = seg.cols[cn]
+        if mask is None and c['mode'] != 4 and seg._overrides(cn) is None:
+            return int(c['V'] - c['has_null'])         # no filter: distinct count == dict cardinality (O(1))
         if c['mode'] == 4:                              # positional codes aren't value-identity -> values
             arr, nm = _col(seg, cn)
             if mask is not None:
