@@ -108,18 +108,35 @@ class Database:
         pk = pseg.values(pphys.get(parent_key, parent_key))
         if pk.dtype.kind not in 'iufM':
             raise NotImplementedError("create_fk_pointer: numeric/temporal parent key only (step 1)")
-        if not np.all(pk[1:] >= pk[:-1]):
+        # Sorted + unique in one cheap pass over the (small) parent key. Avoids
+        # np.unique's full-array sort+copy (~73 MB on a 1.5M key); views only.
+        if (pk[1:] < pk[:-1]).any():
             raise ValueError(f"parent {parent!r} is not stored sorted by {parent_key!r}")
-        if len(np.unique(pk)) != len(pk):
+        if (pk[1:] == pk[:-1]).any():
             raise ValueError(f"parent key {parent_key!r} is not unique")
-        fk = cseg.values(cphys.get(fk_col, fk_col))
-        ptr = np.searchsorted(pk, fk)
-        in_range = ptr < len(pk)
-        if not (in_range.all() and np.array_equal(pk[np.where(in_range, ptr, 0)], fk)):
-            raise ValueError("referential integrity violation: some child keys are absent in the parent")
-        wdb_fkptr.save(cpaths[0], fk_col, ptr.astype(np.int64))
+        npk = len(pk); fcol = cphys.get(fk_col, fk_col)
+        # Resolve the child->parent pointer block by block so we never hold the whole
+        # child key plus searchsorted/where/gather/astype temporaries at once. ptr is
+        # the int64 result, written in place (searchsorted already returns int64, so no
+        # astype copy). Integrity is verified per block. Peak extra = one block, not 6M.
+        ptr = np.empty(cseg.N, dtype=np.int64)
+        def _verify_resolve(fkv, out):
+            p = np.searchsorted(pk, fkv)
+            if (p >= npk).any() or not np.array_equal(pk[p], fkv):
+                raise ValueError("referential integrity violation: some child keys are absent in the parent")
+            out[:] = p
+        if cseg._overrides(fcol) is not None:
+            # Pending DML edits on the child key: values_range skips overrides, so fall
+            # back to the override-aware whole-column decode (correctness over peak RAM).
+            _verify_resolve(cseg.values(fcol), ptr)
+        else:
+            CH = 1_000_000
+            for lo in range(0, cseg.N, CH):
+                hi = min(lo + CH, cseg.N)
+                _verify_resolve(cseg.values_range(fcol, lo, hi), ptr[lo:hi])
+        wdb_fkptr.save(cpaths[0], fk_col, ptr)
         self.cat.add_fk_pointer(child, fk_col, parent, parent_key)
-        return len(ptr)
+        return int(cseg.N)
 
     def set_table_mode(self, name, mode):
         """Operator control: 'buffered' = high-traffic, INSERT appends to hot buffer
