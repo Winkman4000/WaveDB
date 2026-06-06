@@ -103,7 +103,10 @@ class Database:
         cpaths = self.cat.segment_paths(child); ppaths = self.cat.segment_paths(parent)
         if len(cpaths) != 1 or len(ppaths) != 1:
             raise NotImplementedError("create_fk_pointer: single-segment tables only (step 1)")
-        cseg = Segment(cpaths[0]); pseg = Segment(ppaths[0])
+        # Reuse already-open (cached) segments instead of opening duplicate file
+        # buffers. If a query already touched these tables the segments are resident;
+        # if not, this warms the cache the later joins will use anyway.
+        cseg = self.open_segment(cpaths[0], child); pseg = self.open_segment(ppaths[0], parent)
         pphys = self.cat.phys_map(parent); cphys = self.cat.phys_map(child)
         pk = pseg.values(pphys.get(parent_key, parent_key))
         if pk.dtype.kind not in 'iufM':
