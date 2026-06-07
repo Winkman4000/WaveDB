@@ -288,6 +288,10 @@ MULTI_GROUP_CEIL = 1 << 18   # max composite groups for dense multi-col GROUP BY
 GROUP_CD_CELL_CEIL = 1 << 22  # max (groups x value-cardinality) cells for the one-pass grouped
                               # COUNT(DISTINCT) keep-table; above this the dense 2-D table is too big
                               # and we fall back to the sort-based path.
+TALLY_MAX_RATIO = 0.9         # engage the value-frequency tally for whole-table SUM/AVG/MIN/MAX only
+                              # when n_dict < N * this (the column actually has repeats to exploit);
+                              # a near-all-distinct column has none, so we scan instead. Self-gated on
+                              # the column's own measured cardinality -- never on the workload.
 
 class _FastUnsupported(Exception):
     pass
@@ -667,6 +671,50 @@ def _fast_pointer_agg(db, tree, ctx):
             if _cnt is not None:
                 _bump_fast()
                 return [(int(_cnt),)], [wdb_sql._alias(proj[0])]
+
+    # ---- whole-table SUM/AVG/MIN/MAX (+COUNT*) from the per-value tally (no GROUP BY, no WHERE) ------
+    # Every reduction over a value-identity numeric dict column is a reduction over (value, frequency):
+    # SUM = dict . code_counts (one BLAS dot), AVG = SUM / total, MIN/MAX = extreme value with a nonzero
+    # count. O(distinct), no row scan and no gather. Self-gated: engaged only when the column actually
+    # compresses (n_dict < N * TALLY_MAX_RATIO); a near-all-distinct column has no repeats to exploit and
+    # falls through to the scan kernel below with identical results. Floats only in v1 (dt==2).
+    def _whole_tally():
+        plan = []                                          # ('sum'|'avg'|'min'|'max', seg, pcol) | ('cnt',_,_)
+        has_red = False
+        for p in proj:
+            node = p.this if isinstance(p, E.Alias) else p
+            if (isinstance(node, E.Count) and not isinstance(node.this, E.Distinct)
+                    and (node.this is None or isinstance(node.this, E.Star))):
+                plan.append(('cnt', None, None)); continue
+            if not isinstance(node, (E.Sum, E.Avg, E.Min, E.Max)): return None
+            col = node.this
+            if not isinstance(col, E.Column): return None              # SUM(a*b) etc -> needs the scan
+            s, pc, cp = resolve(col)
+            if cp is not None: return None                             # gathered/joined column -> not whole-table
+            cc = s.cols[pc]
+            if cc['mode'] != 0 or cc['dt'] != 2: return None           # value-identity float dict only (v1)
+            if cc['n_dict'] >= n * TALLY_MAX_RATIO: return None        # ~no repeats -> scan instead
+            plan.append((node.key, s, pc)); has_red = True
+        return plan if has_red else None                              # leave pure COUNT(*) to the scalar path
+
+    if group is None and where is None and cd_col is None and not gnodes and proj and n > 0:
+        _tp = _whole_tally()
+        if _tp is not None:
+            row = []
+            for op, s, pc in _tp:
+                if op == 'cnt': row.append(int(n)); continue
+                nd = s.cols[pc]['n_dict']
+                counts = s.code_counts(pc)[:nd]
+                dv = np.asarray(s._typed_dict(pc), dtype=np.float64)[:nd]
+                if op == 'sum':   row.append(float(np.dot(dv, counts)))
+                elif op == 'avg':
+                    tot = float(counts.sum()); row.append(float(np.dot(dv, counts) / tot) if tot else None)
+                else:
+                    pres = counts > 0
+                    row.append(None if not pres.any() else
+                               (float(dv[pres].min()) if op == 'min' else float(dv[pres].max())))
+            _bump_fast()
+            return [tuple(row)], [wdb_sql._alias(p) for p in proj]
 
     gkeys = []                                           # one per GROUP BY column
     for g in gnodes:
