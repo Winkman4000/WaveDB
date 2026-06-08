@@ -55,3 +55,23 @@ def test_budget_guard_falls_back_but_correct():
     finally:
         BX.BSI_RAM_BUDGET = old
     assert abs(float(ans_bsi[0][0]) - float(ans_fb[0][0])) < 1e-6   # path-independent answer
+
+
+def test_escalate_knob_routes_and_agrees():
+    # default is throughput (non-escalated): BSI engages
+    db = _db()
+    assert db.escalate is False
+    a_thru = db.run("SELECT SUM(n) FROM t WHERE disc < 0.03", escalate=False)[0]
+    assert 'disc' in BX.footprint(_seg(db))[1]          # throughput mode built the index
+    # escalated (latency): skips BSI entirely -> fused parallel scan, index never built
+    db2 = _db()
+    a_lat = db2.run("SELECT SUM(n) FROM t WHERE disc < 0.03", escalate=True)[0]
+    assert BX.footprint(_seg(db2)) == (0, [])           # escalated never touched the BSI path
+    # identical answer either way (path-independent)
+    assert abs(float(a_thru[0][0]) - float(a_lat[0][0])) < 1e-6
+
+
+def test_db_level_escalate_default():
+    db = _db(); db.escalate = True                      # operator sets the deployment default
+    db.run("SELECT SUM(n) FROM t WHERE disc < 0.03")    # no per-call override -> uses db default
+    assert BX.footprint(_seg(db)) == (0, [])            # escalated default -> no BSI

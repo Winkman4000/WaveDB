@@ -20,6 +20,12 @@ class Database:
         self.cat = catalog
         self._seg_cache = {}   # path -> ((mtime_ns,size), Segment): immutable .wdb base, reused across queries
         self._ptr_cache = {}   # (child_seg_path, fk_col) -> ((mtime_ns,size), int64 ptr array)
+        # Operator-selected execution intent. escalate=False (default) optimizes for THROUGHPUT
+        # (shared DB, many concurrent 1-thread workers): engages the BSI filter-index, which reads
+        # fewer bytes per query. escalate=True optimizes a single query for LATENCY: it skips BSI
+        # and uses the fully parallel fused scan, which wins when one query owns all cores. Both
+        # paths return identical results; the choice is the caller's, per-run or as this default.
+        self.escalate = False
 
     @classmethod
     def create(cls, dbdir): return cls(Catalog.create(dbdir))
@@ -59,7 +65,8 @@ class Database:
         if f is None: raise NotImplementedError("SELECT without FROM")
         return f.this.name
 
-    def run(self, sql):
+    def run(self, sql, escalate=None):
+        esc = self.escalate if escalate is None else escalate
         tree = sqlglot.parse_one(sql, read='duckdb')
         if isinstance(tree, E.Create):
             return wdb_ddl.create_table(self.cat, sql)
@@ -90,10 +97,11 @@ class Database:
                         return wdb_sql.execute(segs[0], sql, col_map=cmap, tree=tree)  # clustered slice path
                     if wdb_sql._cluster_will_group_slice(segs[0], tree, cmap):
                         return wdb_sql.execute(segs[0], sql, col_map=cmap, tree=tree)  # clustered group-slice path
-                    try:
-                        return wdb_bsi_exec.execute(segs[0], tree, cmap)  # BSI filter-aggregate path
-                    except wdb_bsi_exec._BSIUnsupported:
-                        pass                                          # shape/selectivity unfit -> fused/fallback
+                    if not esc:
+                        try:
+                            return wdb_bsi_exec.execute(segs[0], tree, cmap)  # BSI filter path (throughput)
+                        except wdb_bsi_exec._BSIUnsupported:
+                            pass                                          # shape/selectivity unfit -> fused/fallback
                     try:
                         return wdb_join.table_agg(self, tree)        # single-table aggregate -> fused fast path
                     except wdb_join._FastUnsupported:

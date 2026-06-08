@@ -68,10 +68,10 @@ def _write_memrun():
         "        try: db.create_fk_pointer(*a)\n"
         "        except Exception: pass\n"
         "    sql=QUERIES[int(sys.argv[1])][2]\n"
-        "    for _ in range(5): db.run(sql)\n"   # warm to steady state (numba thread pool)
+        "    for _ in range(5): db.run(sql, escalate=True)\n"   # warm to steady state (numba thread pool)
         "    ts=[]\n"
         "    for _ in range(8):\n"
-        "        t=time.perf_counter(); db.run(sql); ts.append(time.perf_counter()-t)\n"
+        "        t=time.perf_counter(); db.run(sql, escalate=True); ts.append(time.perf_counter()-t)\n"
         "    ms=min(ts)*1000\n"
         "else:\n"
         "    db.run('SELECT COUNT(*) FROM lineitem')\n"
@@ -190,10 +190,11 @@ def write_md(tabs, fk, side, dsz, out, mem, dmem, floor, Nl, secs, bsi=(0, [])):
              f"Column data alone is {wtab/MB:.1f} MB ({dsz/wtab:.2f}x).\n")
     bb, bcols = bsi
     if bcols:
-        L.append(f"_BSI filter-index (in-RAM, additive -- not on disk): {bb/MB:.1f} MB across "
-                 f"{len(bcols)} column(s) ({', '.join(bcols)}), built lazily only for columns the "
-                 f"workload filters, capped at {BSIBUDGET/MB:.0f} MB/segment. Included in the peak-RAM "
-                 f"column below for queries that use it._\n")
+        L.append(f"_Throughput mode (`escalate=False`, the default) additionally builds a BSI "
+                 f"filter-index: {bb/MB:.1f} MB in RAM across {len(bcols)} column(s) "
+                 f"({', '.join(bcols)}), built lazily only for filtered columns, capped at "
+                 f"{BSIBUDGET/MB:.0f} MB/segment. The per-query table below is the **escalated** "
+                 f"(latency) path -- fully parallel fused scan, no BSI -- so it does not include this._\n")
     L.append("## Per-query  (speed - memory - bits)\n")
     L.append(f"Each engine is measured ALONE in a fresh process per query (best-of-5 latency + peak "
              f"RAM) -- the production scenario, since WaveDB and DuckDB never run together in "
