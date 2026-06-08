@@ -12,7 +12,7 @@ import sqlglot, sqlglot.expressions as E
 from wdb_catalog import Catalog
 from wdb_engine import Segment
 import os
-import wdb_ddl, wdb_dml, wdb_sql, wdb_merge, wdb_compact, wdb_join, wdb_fkptr
+import wdb_ddl, wdb_dml, wdb_sql, wdb_merge, wdb_compact, wdb_join, wdb_fkptr, wdb_bsi_exec
 import numpy as np
 
 class Database:
@@ -90,6 +90,10 @@ class Database:
                         return wdb_sql.execute(segs[0], sql, col_map=cmap, tree=tree)  # clustered slice path
                     if wdb_sql._cluster_will_group_slice(segs[0], tree, cmap):
                         return wdb_sql.execute(segs[0], sql, col_map=cmap, tree=tree)  # clustered group-slice path
+                    try:
+                        return wdb_bsi_exec.execute(segs[0], tree, cmap)  # BSI filter-aggregate path
+                    except wdb_bsi_exec._BSIUnsupported:
+                        pass                                          # shape/selectivity unfit -> fused/fallback
                     try:
                         return wdb_join.table_agg(self, tree)        # single-table aggregate -> fused fast path
                     except wdb_join._FastUnsupported:
