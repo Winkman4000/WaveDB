@@ -7,6 +7,29 @@ import sqlglot, sqlglot.expressions as E, numpy as np
 from wdb_engine import Segment
 
 _SLICE_HITS = 0   # count of queries answered via the cluster-slice fast path (tests/telemetry)
+SLICE_RESIDENT_BUDGET = 1 << 31   # per-column N*8-byte budget to keep a decoded column resident
+
+def _slice_vals(seg, cn, lo, hi, rmask):
+    """Measure values for the cluster slice [lo,hi) under residual rmask. Decode-once-resident when
+    the column fits the RAM budget (serving throughput: no per-query dict gather); else lazy partial
+    decode. Skips the boolean-index copy when rmask selects the whole slice (the consumed-key case)."""
+    base = seg.resident_values(cn) if seg.N * 8 <= SLICE_RESIDENT_BUDGET else None
+    a = base[lo:hi] if base is not None else seg.values_range(cn, lo, hi)
+    return a if rmask is None else a[rmask]
+
+def _cluster_will_slice(seg, tree, col_map):
+    """True iff this query would take the cluster-slice fast path: clustered segment, no GROUP BY,
+    no deleted rows, and the WHERE pins a range/eq on the cluster key. Cheap (only inspects the small
+    WHERE); the router uses it to divert clustered scalar-aggregate queries off the fused scan."""
+    if seg.cluster_meta() is None or seg.presence_mask() is not None: return False
+    if tree.args.get('group') is not None: return False
+    where = tree.args.get('where')
+    if where is None: return False
+    def seg_col(nm): return nm if col_map is None else col_map.get(nm, nm)
+    try:
+        return _cluster_slice(seg, where.this, seg_col) is not None
+    except NotImplementedError:
+        return False
 
 def _colname(node):
     if isinstance(node, E.Column): return node.name
@@ -39,35 +62,37 @@ def execute(seg: Segment, sql: str, col_map=None):
         return col_map[nm]                                 # schema view: complete logical->physical
     N = seg.N
 
+    # ---- projections / shape ----
+    proj = tree.expressions  # list of selected exprs
+    group = tree.args.get('group')
+    gcols = [ _colname(g) for g in group.expressions ] if group else []
+    where = tree.args.get('where')
+
+    # ---- cluster-slice fast path: tried BEFORE the full-column WHERE eval, which it avoids.
+    # narrow-before-expand -- WHERE pins a range/eq on the cluster key, so decode only that slice
+    # off the sorted segment. Falls through on anything unsupported; only when no deleted rows. ----
+    if (not gcols and where is not None and any(_is_agg(p) for p in proj)
+            and seg.cluster_meta() is not None and seg.presence_mask() is None):
+        try:
+            sl = _cluster_slice(seg, where.this, seg_col)
+            if sl is not None:
+                lo, hi, consumed = sl
+                rmask = _eval_pred_range(seg, where.this, seg_col, lo, hi, consumed)
+                row = [_agg_scalar_range(seg, p, lo, hi, rmask, seg_col) for p in proj]
+                global _SLICE_HITS; _SLICE_HITS += 1
+                return [tuple(row)], [_alias(p) for p in proj]
+        except NotImplementedError:
+            pass
+
     # ---- presence (deleted rows) seeds the mask; WHERE is AND-ed onto it ----
     mask = seg.presence_mask()          # bool[N] True=live, or None if all live
-    where = tree.args.get('where')
     if where is not None:
         wm = _eval_pred(seg, where.this, seg_col)
         mask = wm if mask is None else (wm & mask)
 
-    # ---- projections ----
-    proj = tree.expressions  # list of selected exprs
-    group = tree.args.get('group')
-    gcols = [ _colname(g) for g in group.expressions ] if group else []
-
     if not gcols:
         # no GROUP BY: either pure aggregates over (masked) rows, or row projection
         if any(_is_agg(p) for p in proj):
-            # narrow-before-expand: if WHERE pins a range/eq on the cluster key, slice to those
-            # rows and decode only the slice (no whole-column scan). Falls back on anything the
-            # slice path does not support; only when no deleted rows (presence) complicate it.
-            if where is not None and seg.cluster_meta() is not None and seg.presence_mask() is None:
-                try:
-                    sl = _cluster_slice(seg, where.this, seg_col)
-                    if sl is not None:
-                        lo, hi, consumed = sl
-                        rmask = _eval_pred_range(seg, where.this, seg_col, lo, hi, consumed)
-                        row = [_agg_scalar_range(seg, p, lo, hi, rmask, seg_col) for p in proj]
-                        global _SLICE_HITS; _SLICE_HITS += 1
-                        return [tuple(row)], [_alias(p) for p in proj]
-                except NotImplementedError:
-                    pass
             row = []
             for p in proj: row.append(_agg_scalar(seg, p, mask, seg_col))
             return [tuple(row)], [_alias(p) for p in proj]
@@ -374,11 +399,21 @@ def _eval_pred_range(seg, node, seg_col, lo, hi, consumed):
     _eval_pred otherwise; raises NotImplementedError on nulls/overrides/unsupported -> caller
     falls back to the full-column path (never a wrong answer)."""
     import operator
-    if isinstance(node, E.And): return _eval_pred_range(seg, node.this, seg_col, lo, hi, consumed) & _eval_pred_range(seg, node.expression, seg_col, lo, hi, consumed)
-    if isinstance(node, E.Or):  return _eval_pred_range(seg, node.this, seg_col, lo, hi, consumed) | _eval_pred_range(seg, node.expression, seg_col, lo, hi, consumed)
-    if isinstance(node, E.Not): return ~_eval_pred_range(seg, node.this, seg_col, lo, hi, consumed)
+    # None == "all-true on [lo,hi), no residual" (node fully consumed by the slice). Propagating None
+    # instead of an ones() array lets the pure-key case skip the per-query mask alloc + scan entirely.
+    if isinstance(node, E.And):
+        a = _eval_pred_range(seg, node.this, seg_col, lo, hi, consumed)
+        b = _eval_pred_range(seg, node.expression, seg_col, lo, hi, consumed)
+        return b if a is None else (a if b is None else a & b)
+    if isinstance(node, E.Or):
+        a = _eval_pred_range(seg, node.this, seg_col, lo, hi, consumed)
+        b = _eval_pred_range(seg, node.expression, seg_col, lo, hi, consumed)
+        return None if (a is None or b is None) else (a | b)            # True OR x = True
+    if isinstance(node, E.Not):
+        a = _eval_pred_range(seg, node.this, seg_col, lo, hi, consumed)
+        return np.zeros(hi - lo, dtype=bool) if a is None else ~a       # NOT(all-true) = all-false
     if isinstance(node, E.Paren): return _eval_pred_range(seg, node.this, seg_col, lo, hi, consumed)
-    if id(node) in consumed: return np.ones(hi - lo, dtype=bool)   # key conjunct: all-true on slice
+    if id(node) in consumed: return None   # key conjunct already satisfied by the slice: no residual
     def _slice(cn):
         if seg.cols[cn]['has_null'] or seg._overrides(cn) is not None:
             raise NotImplementedError("null/override column in slice predicate")
@@ -420,14 +455,16 @@ def _agg_scalar_range(seg, p, lo, hi, rmask, seg_col):
         cn = seg_col(_dx[0].name); c = seg.cols[cn]
         if c['has_null'] or seg._overrides(cn) is not None: raise NotImplementedError
         if c['mode'] == 4:                                  # positional codes -> count distinct values
-            return int(np.unique(seg.values_range(cn, lo, hi)[rmask]).size)
-        return int(np.unique(seg._raw_codes_range(cn, lo, hi)[rmask]).size)   # value-identity codes
+            v = seg.values_range(cn, lo, hi)
+            return int(np.unique(v if rmask is None else v[rmask]).size)
+        rc = seg._raw_codes_range(cn, lo, hi)
+        return int(np.unique(rc if rmask is None else rc[rmask]).size)   # value-identity codes
     kind = _agg_kind(p)
     if kind is None: raise NotImplementedError("bare column in aggregate query")
-    if kind[0] == 'COUNT_STAR': return int(rmask.sum())
+    if kind[0] == 'COUNT_STAR': return int(hi - lo) if rmask is None else int(rmask.sum())
     fn, cn_name = kind; cn = seg_col(cn_name)
     if seg.cols[cn]['has_null'] or seg._overrides(cn) is not None: raise NotImplementedError
-    a = seg.values_range(cn, lo, hi)[rmask]
+    a = _slice_vals(seg, cn, lo, hi, rmask)
     if fn == 'COUNT': return int(len(a))
     if len(a) == 0: return None
     if fn in ('MIN', 'MAX'):
