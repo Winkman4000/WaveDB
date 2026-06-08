@@ -87,7 +87,7 @@ class Database:
                 if (tree.args.get('group') is not None or tree.args.get('distinct') is not None
                         or any(wdb_sql._agg_kind(e) for e in tree.expressions)):
                     if wdb_sql._cluster_will_slice(segs[0], tree, cmap):
-                        return wdb_sql.execute(segs[0], sql, col_map=cmap)  # clustered scalar slice > fused scan
+                        return wdb_sql.execute(segs[0], sql, col_map=cmap, tree=tree)  # clustered slice path
                     try:
                         return wdb_join.table_agg(self, tree)        # single-table aggregate -> fused fast path
                     except wdb_join._FastUnsupported:

@@ -50,9 +50,11 @@ def _to_physical(node, col_map):
             col.this.set('this', col_map[nm])
     return t
 
-def execute(seg: Segment, sql: str, col_map=None):
-    """col_map: optional {sql_name -> segment_name}; default identity."""
-    tree = sqlglot.parse_one(sql, read='duckdb')
+def execute(seg: Segment, sql: str, col_map=None, tree=None):
+    """col_map: optional {sql_name -> segment_name}; default identity.
+    tree: optional pre-parsed sqlglot AST -- lets the router reuse its parse (no second parse)."""
+    if tree is None:
+        tree = sqlglot.parse_one(sql, read='duckdb')
     if not isinstance(tree, E.Select): raise NotImplementedError(f"top-level {type(tree).__name__}")
     if tree.args.get('joins'): raise NotImplementedError("JOIN (step 2)")
     if tree.args.get('with'): raise NotImplementedError("CTE/WITH (later)")
@@ -472,8 +474,7 @@ def _agg_scalar_range(seg, p, lo, hi, rmask, seg_col):
         if seg.cols[cn]['dt'] == 3 and isinstance(v, (int, np.integer)):
             v = np.int64(v).view(f"datetime64[{seg.unit(cn)}]")
         return _pyval(v)
-    af = a.astype(np.float64)
-    return _pyval({'SUM': af.sum(), 'AVG': af.mean()}[fn])
+    return _pyval({'SUM': a.sum(dtype=np.float64), 'AVG': a.mean(dtype=np.float64)}[fn])
 
 def _seq_eq_mask(seg, name, neg, lit):
     """O(1)-compute equality mask for a clean-affine integer mode-4 column (n_exc==0, no
