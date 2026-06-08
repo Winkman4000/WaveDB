@@ -180,3 +180,49 @@ def test_resident_slice_sum_matches_full():
     lo, hi = s.slice_for_predicate('k', '>=', 5)
     got = float(s.resident_values('big')[lo:hi].sum())
     assert got == float(s.values('big')[k >= 5].sum())
+
+
+# --- step 4: grouped slice-sums (GROUP BY the cluster key = range walk) -------------------
+
+def _grp_pair():
+    np.random.seed(7); n = 1200
+    df = pd.DataFrame({
+        'rf': np.random.choice(['A', 'N', 'R'], n),
+        'ls': np.random.choice(['O', 'F'], n),
+        'p':  np.round(np.random.rand(n) * 100, 2),
+        'q':  np.random.randint(1, 40, n).astype(float),
+        'sm': np.random.choice(['AIR', 'RAIL', 'SHIP'], n),
+    })
+    return Segment(_enc(df)), Segment(_enc(df, cluster_by='rf'))
+
+def _gnorm(rows):
+    return sorted(tuple(round(x, 6) if isinstance(x, float) else (x.decode() if isinstance(x, bytes) else x)
+                        for x in r) for r in rows)
+
+def test_grouped_slice_matches_full_and_fires():
+    full, clus = _grp_pair()
+    queries = [
+        "SELECT rf, COUNT(*) FROM t GROUP BY rf",
+        "SELECT rf, SUM(p) FROM t GROUP BY rf",
+        "SELECT rf, COUNT(*), SUM(p), MIN(q), MAX(q), AVG(p) FROM t GROUP BY rf",
+        "SELECT rf, COUNT(DISTINCT sm) FROM t GROUP BY rf",
+    ]
+    before = wdb_sql._GROUP_SLICE_HITS
+    for q in queries:
+        assert _gnorm(wdb_sql.execute(full, q)[0]) == _gnorm(wdb_sql.execute(clus, q)[0]), q
+    assert wdb_sql._GROUP_SLICE_HITS == before + len(queries)   # every one took the group-slice path
+
+def test_grouped_slice_skips_non_key_group():
+    full, clus = _grp_pair()
+    before = wdb_sql._GROUP_SLICE_HITS
+    q = "SELECT sm, AVG(q) FROM t GROUP BY sm"               # group col != cluster key
+    assert _gnorm(wdb_sql.execute(full, q)[0]) == _gnorm(wdb_sql.execute(clus, q)[0])
+    assert wdb_sql._GROUP_SLICE_HITS == before               # NOT taken
+
+def test_grouped_slice_skips_having_and_order():
+    full, clus = _grp_pair()
+    before = wdb_sql._GROUP_SLICE_HITS
+    for q in ["SELECT rf, COUNT(*) c FROM t GROUP BY rf HAVING COUNT(*) > 1",
+              "SELECT rf, SUM(p) s FROM t GROUP BY rf ORDER BY s DESC"]:
+        assert _gnorm(wdb_sql.execute(full, q)[0]) == _gnorm(wdb_sql.execute(clus, q)[0]), q
+    assert wdb_sql._GROUP_SLICE_HITS == before               # HAVING/ORDER -> general path

@@ -412,7 +412,7 @@ class Segment:
         domain (int, float, or int64 epoch for datetime). Nulls live at [nn, n) and never match,
         so range/eq bounds stay inside [0, nn)."""
         cm = self.cluster_meta()
-        if cm is None or cm['key'] != nm or op not in ('=', '>', '>=', '<', '<='):
+        if cm is None or cm['key'] != nm or cm['dtype'] == 1 or op not in ('=', '>', '>=', '<', '<='):
             return None
         vals = cm['values']; off = cm['offsets']; nn = int(cm['nn'])
         if op == '=':

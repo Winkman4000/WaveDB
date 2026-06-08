@@ -230,14 +230,21 @@ def _cluster_order(kc, N):
     else:
         mask = None; base = np.asarray(kc)
     k = base.dtype.kind
+    str_uniq = None
     if k == 'M':
         sortkey = base.view('int64'); aux = _unit_code(np.datetime_data(base.dtype)[0]); dt = 3
     elif k in 'iu':
         sortkey = base.astype(np.int64, copy=False); aux = 0; dt = 0
     elif k == 'f':
         sortkey = base.astype(np.float64, copy=False); aux = 0; dt = 2
+    elif k in 'SUO':
+        # string/bytes key: factorize to value-sorted integer codes (fast int sort), and keep the
+        # sorted unique strings so the grouped/range reader can emit the group value directly. dt=1.
+        import pandas as pd
+        codes, uniq = pd.factorize(base, sort=True)
+        sortkey = codes.astype(np.int64); aux = 0; dt = 1; str_uniq = np.asarray(uniq)
     else:
-        raise TypeError(f"cluster key must be int/float/datetime, got {base.dtype}")
+        raise TypeError(f"cluster key must be int/float/datetime/string, got {base.dtype}")
     if mask is not None and mask.any():
         order = np.lexsort((sortkey, mask)); nn = int((~mask).sum())
     else:
@@ -245,6 +252,8 @@ def _cluster_order(kc, N):
     ks = sortkey[np.asarray(order)][:nn]
     vals, idx = np.unique(ks, return_index=True)
     offsets = np.append(idx.astype(np.int64), np.int64(nn))
+    if str_uniq is not None:
+        vals = str_uniq[vals]                       # map present value-sorted codes -> their strings
     return np.asarray(order), dict(dtype=dt, aux=aux, n=int(N), nn=int(nn),
                                    values=vals, offsets=offsets)
 

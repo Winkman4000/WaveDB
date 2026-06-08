@@ -31,6 +31,60 @@ def _cluster_will_slice(seg, tree, col_map):
     except NotImplementedError:
         return False
 
+_GROUP_SLICE_HITS = 0   # count of GROUP BYs answered via the clustered range-walk (tests/telemetry)
+
+def _cluster_will_group_slice(seg, tree, col_map):
+    """True iff a single-column GROUP BY on the cluster key with no WHERE/HAVING/ORDER/LIMIT and no
+    deleted rows -- the rows are already grouped into the cluster ranges, so no sort/scatter."""
+    if seg.cluster_meta() is None or seg.presence_mask() is not None: return False
+    if (tree.args.get('where') is not None or tree.args.get('having') is not None
+            or tree.args.get('order') is not None or _limit(tree) is not None): return False
+    g = tree.args.get('group')
+    if g is None or len(g.expressions) != 1: return False
+    gn = _colname(g.expressions[0])
+    if gn is None: return False
+    key = gn if col_map is None else col_map.get(gn, gn)
+    return seg.cluster_meta()['key'] == key
+
+def _grouped_slice(seg, proj, gn, seg_col):
+    """GROUP BY the cluster key as a range walk: each cluster range IS a group, so per-group
+    aggregates are sequential reductions over resident slices -- no group-code scan, no scatter,
+    no sort. Returns (rows, cols) or raises NotImplementedError on an unsupported agg (caller
+    falls back to the general group path). Gated by the caller to no WHERE/HAVING/ORDER/LIMIT."""
+    cm = seg.cluster_meta(); off = cm['offsets']; K = len(off) - 1
+    agg_specs = [(p, _agg_kind(p)) for p in proj]
+    rows = []
+    for gi in range(K):
+        lo, hi = int(off[gi]), int(off[gi + 1]); rowout = []
+        for p, kind in agg_specs:
+            _inn = p.this if isinstance(p, E.Alias) else p
+            if isinstance(_inn, E.Count) and isinstance(_inn.this, E.Distinct):
+                _dx = _inn.this.expressions
+                if len(_dx) != 1 or not isinstance(_dx[0], E.Column): raise NotImplementedError
+                cn = seg_col(_dx[0].name); c = seg.cols[cn]
+                if c['has_null'] or seg._overrides(cn) is not None: raise NotImplementedError
+                rc = seg.values_range(cn, lo, hi) if c['mode'] == 4 else seg._raw_codes_range(cn, lo, hi)
+                rowout.append(int(np.unique(rc).size))
+            elif kind is None:                                  # the group-key column: constant on the slice
+                rowout.append(_pyval(seg.values_range(seg_col(gn), lo, lo + 1)[0]))
+            elif kind[0] == 'COUNT_STAR':
+                rowout.append(int(hi - lo))
+            else:
+                fn, cn_name = kind; cn = seg_col(cn_name); c = seg.cols[cn]
+                if c['has_null'] or seg._overrides(cn) is not None: raise NotImplementedError
+                a = seg.resident_values(cn)[lo:hi]
+                if len(a) == 0: rowout.append(None)
+                elif fn == 'COUNT': rowout.append(int(len(a)))
+                elif fn in ('MIN', 'MAX'):
+                    v = a.min() if fn == 'MIN' else a.max()
+                    if c['dt'] == 3 and isinstance(v, (int, np.integer)):
+                        v = np.int64(v).view(f"datetime64[{seg.unit(cn)}]")
+                    rowout.append(_pyval(v))
+                else:
+                    rowout.append(_pyval({'SUM': a.sum(dtype=np.float64), 'AVG': a.mean(dtype=np.float64)}[fn]))
+        rows.append(tuple(rowout))
+    return rows, [_alias(p) for p in proj]
+
 def _colname(node):
     if isinstance(node, E.Column): return node.name
     return None
@@ -122,6 +176,19 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
     # arange(N) -- identity-per-row -- so grouping on them would put every row in its own group;
     # there we factorize the decoded VALUES instead (vectorized np.unique on int64/datetime64).
     # Each meta carries how to turn a key index back into the emitted value.
+    # Clustered single-key GROUP BY: the rows already sit in the cluster ranges, so each group is
+    # a contiguous slice -- skip the factorise + sort + scatter and reduce each range directly.
+    if (len(gcols) == 1 and where is None and seg.cluster_meta() is not None
+            and seg.presence_mask() is None and tree.args.get('having') is None
+            and tree.args.get('order') is None and _limit(tree) is None
+            and seg.cluster_meta()['key'] == seg_col(gcols[0])):
+        try:
+            global _GROUP_SLICE_HITS
+            r = _grouped_slice(seg, proj, gcols[0], seg_col)
+            _GROUP_SLICE_HITS += 1
+            return r
+        except NotImplementedError:
+            pass
     gnames = [seg_col(g) for g in gcols]
     combo = None; metas=[]   # metas[i] = (gn, kind, table): 'val'->unique values, 'code'->unique codes
     for gn in gnames:
