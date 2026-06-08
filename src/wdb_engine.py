@@ -92,6 +92,18 @@ class Segment:
         self._cluster = 0                       # .cluster slice-boundary sidecar: 0 = not loaded
         self._synth = {}                        # mode-6 synthetic constant columns (ADD COLUMN)
         self._tdict = {}                        # memo: decoded base dict per column (immutable .wdb)
+        self._resident = {}                     # memo: full per-row decoded array, kept resident for chunk reads
+    def resident_values(self, nm):
+        """Decode the column ONCE and keep the full per-row array resident, so cluster-slice
+        reads over a sorted segment are a plain memory slice with no per-query decode. This
+        trades RAM (N * itemsize) for eliminating the dict gather on every query; callers gate
+        it on a RAM budget and only materialize columns a chunk path actually aggregates. The
+        array is the same object values() would produce (overrides applied), cached by name."""
+        r = self._resident.get(nm)
+        if r is None:
+            r = np.ascontiguousarray(self.values(nm))
+            self._resident[nm] = r
+        return r
     def add_const_column(self, name, value, dt, aux=0):
         """Register a synthetic constant column: `value` for ALL N live rows. Used for a logical
         column this immutable segment PREDATES (ADD COLUMN) -- the default is materialized lazily

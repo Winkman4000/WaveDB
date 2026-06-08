@@ -24,9 +24,11 @@ Needs the bench DB at /tmp/jbprof_sf1.0 (build: python bench/join_prof.py 1.0).
 """
 import os, sys, subprocess
 
-# Pin math libs to a single thread: one worker == one core, so W workers fill W
-# cores without internal oversubscription skewing the per-worker latency.
-for _v in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS'):
+# Pin math libs AND numba to a single thread: the throughput model is W single-threaded
+# workers, one per core. numba.prange must be pinned too, else the per-worker latency is the
+# 8-thread parallel time while W still = cores -> QPS overstated by the (poor) parallel speedup.
+for _v in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS',
+           'NUMBA_NUM_THREADS'):
     os.environ.setdefault(_v, '1')
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -51,23 +53,21 @@ def _smaps_private_dirty():
     return -1
 
 
-def _worker(qi):
+def _worker(qi, dur):
     import time
     sys.path.insert(0, SRC); sys.path.insert(0, HERE)
     from wdb_db import Database
     from catalog import QUERIES
+    import numba; numba.set_num_threads(1)          # one worker == one core
     db = Database.open(WDB)
     for a in FKS:
         try: db.create_fk_pointer(*a)
         except Exception: pass
     sql = QUERIES[qi][2]
-    for _ in range(3): db.run(sql)                  # warm
-    t = time.perf_counter(); db.run(sql); est = (time.perf_counter() - t) * 1000
-    K = max(5, min(300, int(1500 / max(est, 0.5))))
-    t = time.perf_counter()
-    for _ in range(K): db.run(sql)
-    ms = (time.perf_counter() - t) * 1000 / K
-    print(f"{ms:.4f} {_smaps_private_dirty()}", flush=True)
+    for _ in range(3): db.run(sql)                  # warm (JIT + caches)
+    end = time.perf_counter() + dur; c = 0
+    while time.perf_counter() < end: db.run(sql); c += 1
+    print(f"{c} {_smaps_private_dirty()}", flush=True)
 
 
 def run(budget_gb=32, cores=None):
@@ -78,33 +78,35 @@ def run(budget_gb=32, cores=None):
     sys.path.insert(0, HERE)
     from catalog import QUERIES
     budget = budget_gb * 1024
-    print(f"Throughput @ {budget_gb} GB / {cores} cores  (single-thread workers, "
-          f"private working set per worker)\n")
-    print(f"  {'#':>2} {'query':<26}{'lat ms':>8}{'QPS/core':>9}{'priv MB':>8}{'W':>4}{'bound':>6}{'QPS@'+str(budget_gb)+'GB':>11}")
-    tot = 0.0
+    print(f"Sustained throughput @ {budget_gb} GB / {cores} cores -- ACTUAL concurrent aggregate.\n"
+          f"  W single-thread workers run AT THE SAME TIME; the @W column is real measured\n"
+          f"  queries/sec, so memory-bandwidth contention is included (not extrapolated).\n")
+    print(f"  {'#':>2} {'query':<26}{'1wkr q/s':>9}{'priv MB':>8}{'W':>4}{'@W q/s':>9}{'scale':>7}{'bound':>6}")
+    me = os.path.abspath(__file__); SOLO, CONC = 1.5, 2.0
     for i, (cat, name, sql, _) in enumerate(QUERIES):
-        r = subprocess.run([sys.executable, os.path.abspath(__file__), '_worker', str(i)],
-                           capture_output=True, text=True)
+        r = subprocess.run([sys.executable, me, '_worker', str(i), str(SOLO)], capture_output=True, text=True)
         try:
-            ms, priv = r.stdout.strip().split(); ms = float(ms); priv = int(priv)
+            c, priv = r.stdout.strip().split(); solo = int(c) / SOLO; priv = int(priv)
         except ValueError:
-            print(f"  {i+1:>2} {name:<26} ERR {r.stderr.strip().splitlines()[-1][:48] if r.stderr.strip() else '?'}")
+            print(f"  {i+1:>2} {name:<26} ERR {r.stderr.strip().splitlines()[-1][:46] if r.stderr.strip() else '?'}")
             continue
-        qps_core = 1000 / ms if ms > 0 else 0
         w_ram = max(1, budget // max(priv, 1))
         W = min(cores, w_ram)
-        bound = 'RAM' if w_ram < cores else 'CPU'
-        qps = qps_core * W
-        tot += qps
-        print(f"  {i+1:>2} {name:<26}{ms:>8.2f}{qps_core:>9.0f}{priv:>8}{W:>4}{bound:>6}{qps:>11.0f}")
-    print(f"\n  All queries CPU-bound means RAM never throttles throughput at this budget.")
-    print(f"  Break-even: a worker is RAM-bound only when RAM/core < its private MB above.")
+        ps = [subprocess.Popen([sys.executable, me, '_worker', str(i), str(CONC)],
+                               stdout=subprocess.PIPE, text=True) for _ in range(W)]
+        agg = sum(int(p.communicate()[0].strip().split()[0]) for p in ps) / CONC
+        scale = agg / (solo * W) if solo > 0 else 0
+        bound = 'RAM' if w_ram < cores else ('BW' if scale < 0.6 else 'CPU')
+        print(f"  {i+1:>2} {name:<26}{solo:>9.0f}{priv:>8}{W:>4}{agg:>9.0f}{scale*100:>6.0f}%{bound:>6}")
+    print(f"\n  @W q/s = real aggregate with W workers running together (lower than W x 1wkr when")
+    print(f"  scaling < 100%: the box is memory-bandwidth-bound, not CPU- or RAM-bound).")
+    print(f"  bound: RAM = won't fit W=cores in budget; BW = scales < 60% (bandwidth); CPU otherwise.")
 
 
 if __name__ == '__main__':
     a = sys.argv[1] if len(sys.argv) > 1 else None
     if a == '_worker':
-        _worker(int(sys.argv[2]))
+        _worker(int(sys.argv[2]), float(sys.argv[3]))
     else:
         gb = int(a) if (a and a.isdigit()) else 32
         cores = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else None

@@ -161,3 +161,22 @@ def test_executor_slice_float_sum_isclose():
     q = "SELECT SUM(p) FROM t WHERE k > 8"
     a = wdb_sql.execute(full, q)[0][0][0]; b = wdb_sql.execute(clus, q)[0][0][0]
     assert math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-6)
+
+
+# --- step 3: resident decoded cache (decode-once at load, slice cheaply) ------------------
+
+def test_resident_values_matches_values():
+    s = _seg_clustered()
+    for nm in ('big', 'small', 'k'):
+        assert np.array_equal(s.resident_values(nm), s.values(nm))
+
+def test_resident_values_cached_identity():
+    s = _seg_clustered()
+    a = s.resident_values('big'); b = s.resident_values('big')
+    assert a is b                                     # decoded once, same object kept resident
+
+def test_resident_slice_sum_matches_full():
+    s = _seg_clustered(); k = s.values('k')
+    lo, hi = s.slice_for_predicate('k', '>=', 5)
+    got = float(s.resident_values('big')[lo:hi].sum())
+    assert got == float(s.values('big')[k >= 5].sum())
