@@ -18,6 +18,7 @@ import wdb_bsi_kernels as K
 
 _BSI_HITS = 0
 SEL_CEIL = 0.35   # predicate selectivity above this -> fall back to fused scan
+BSI_RAM_BUDGET = 1 << 26   # 64 MB of built index per segment; past it, new columns fall back to fused
 
 
 class _BSIUnsupported(Exception):
@@ -40,12 +41,15 @@ def _bump():
 
 
 def _col_index(seg, col):
-    """Lazy per-segment BSI for a predicate column, cached on seg._bsi.
-    Raises _BSIUnsupported for anything not safe to index (computed/inline/
-    constant mode, nullable, string, or overridden)."""
+    """Lazy per-segment BSI for a predicate column, cached on seg._bsi (with the
+    running byte total on seg._bsi_bytes). Workload-driven by construction: only
+    columns an actual query filters get built. Raises _BSIUnsupported for anything
+    not safe to index (computed/inline/constant mode, nullable, string, overridden)
+    or once the per-segment index RAM budget is exhausted -- both degrade to the
+    fused scan with identical results."""
     cache = getattr(seg, '_bsi', None)
     if cache is None:
-        cache = {}; seg._bsi = cache
+        cache = {}; seg._bsi = cache; seg._bsi_bytes = 0
     hit = cache.get(col)
     if hit is not None:
         return hit
@@ -54,9 +58,16 @@ def _col_index(seg, col):
         raise _BSIUnsupported("col not BSI-indexable")
     if seg._override_vals_typed(col):
         raise _BSIUnsupported("overrides")
+    # prospective size = B planes * ceil(N/8) bytes; refuse if it would blow the budget
+    plane_bytes = -(-seg.N // 8)
+    nplanes = max(1, max(0, c['V'] - 1).bit_length())
+    if seg._bsi_bytes + nplanes * plane_bytes > BSI_RAM_BUDGET:
+        raise _BSIUnsupported("index RAM budget exhausted")
     codes = seg.codes(col)
     dv = np.asarray(seg._typed_dict(col))   # value-sorted (np.unique) => code order == value order
-    hit = (B.build_bsi(codes, seg.N), dv)
+    bsi = B.build_bsi(codes, seg.N)
+    seg._bsi_bytes += bsi.nbytes()
+    hit = (bsi, dv)
     cache[col] = hit
     return hit
 
@@ -249,3 +260,12 @@ def execute(seg, tree, col_map):
         rows.append(tuple(rv))
     _bump()
     return rows, header
+
+
+def footprint(seg):
+    """(bytes, [indexed columns]) of the BSI index currently built on this segment.
+    The index is additive in-memory state; this is what it contributes to RSS."""
+    cache = getattr(seg, '_bsi', None)
+    if not cache:
+        return 0, []
+    return getattr(seg, '_bsi_bytes', 0), sorted(cache.keys())

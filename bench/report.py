@@ -18,9 +18,11 @@ SRC  = os.path.join(ROOT, 'src')
 sys.path.insert(0, HERE); sys.path.insert(0, SRC)
 import duckdb
 import query_matrix as M
+import wdb_bsi_exec as BX
 from catalog import QUERIES
 
 DIR = '/tmp/jbprof_sf1.0'; WDB = os.path.join(DIR, 'wdb'); MB = 1024 * 1024
+BSIBUDGET = BX.BSI_RAM_BUDGET
 
 
 def _need_db():
@@ -165,7 +167,7 @@ def write_caps(out, mem, dmem, dsz, wtot, git):
     return cap
 
 
-def write_md(tabs, fk, side, dsz, out, mem, dmem, floor, Nl, secs):
+def write_md(tabs, fk, side, dsz, out, mem, dmem, floor, Nl, secs, bsi=(0, [])):
     wtab = sum(tabs.values()); wtot = wtab + fk + side
     git = subprocess.run(['git', 'rev-parse', '--short', 'HEAD'], cwd=ROOT,
                          capture_output=True, text=True).stdout.strip()
@@ -186,6 +188,12 @@ def write_md(tabs, fk, side, dsz, out, mem, dmem, floor, Nl, secs):
     L.append(f"WaveDB stores the same data in **{dsz/wtot:.2f}x less space** than DuckDB "
              f"({wtot/MB:.1f} MB vs {dsz/MB:.1f} MB), FK-pointer join index included. "
              f"Column data alone is {wtab/MB:.1f} MB ({dsz/wtab:.2f}x).\n")
+    bb, bcols = bsi
+    if bcols:
+        L.append(f"_BSI filter-index (in-RAM, additive -- not on disk): {bb/MB:.1f} MB across "
+                 f"{len(bcols)} column(s) ({', '.join(bcols)}), built lazily only for columns the "
+                 f"workload filters, capped at {BSIBUDGET/MB:.0f} MB/segment. Included in the peak-RAM "
+                 f"column below for queries that use it._\n")
     L.append("## Per-query  (speed - memory - bits)\n")
     L.append(f"Each engine is measured ALONE in a fresh process per query (best-of-5 latency + peak "
              f"RAM) -- the production scenario, since WaveDB and DuckDB never run together in "
@@ -244,9 +252,27 @@ def main():
     wtot = sum(tabs.values()) + fk + side
     git = subprocess.run(['git', 'rev-parse', '--short', 'HEAD'], cwd=ROOT,
                          capture_output=True, text=True).stdout.strip()
-    rep, s = write_md(tabs, fk, side, dsz, out, mem, dmem, floor, Nl, time.time() - t0)
+    # BSI filter-index footprint: run the filter-category queries in-process so the lazy
+    # index builds, then read what it cost (additive in-RAM state -- option (b), no sidecar).
+    abx = M.open_db()
+    for a in [('orders', 'o_custkey', 'customer', 'c_custkey'),
+              ('lineitem', 'l_orderkey', 'orders', 'o_orderkey')]:
+        try: abx.create_fk_pointer(*a)
+        except Exception: pass
+    for c, n, sql, _ in QUERIES:
+        if c == 'filter':
+            try: abx.run(sql)
+            except Exception: pass
+    try:
+        bseg = abx.open_segment(abx.cat.segment_paths('lineitem')[0], 'lineitem')
+        bsi_acct = BX.footprint(bseg)
+    except Exception:
+        bsi_acct = (0, [])
+    abx = None
+    rep, s = write_md(tabs, fk, side, dsz, out, mem, dmem, floor, Nl, time.time() - t0, bsi=bsi_acct)
     cap = write_caps(out, mem, dmem, dsz, wtot, git)
     print(f"\nwrote {rep}\nwrote {cap}")
+    print(f"  BSI filter-index: {bsi_acct[0]/MB:.1f} MB across {len(bsi_acct[1])} cols {bsi_acct[1]}")
     print(f"  storage: WaveDB {(sum(tabs.values())+fk+side)/MB:.1f} MB vs DuckDB {dsz/MB:.1f} MB "
           f"= {s[7]:.2f}x smaller")
     print(f"  queries: {s[0]}/{s[1]} correct, {s[2]} fused, {s[3]} faster, median {s[4]:.2f}x")
