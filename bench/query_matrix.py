@@ -80,17 +80,18 @@ def open_duck():
     return con
 
 
-def run_matrix(db, con, COL, log=lambda *a: None):
-    """Per query: (cat,name,bits,rows_out,ok,fast,duck_ms,wave_ms). Reusable runner."""
+def run_matrix(db, con, COL, log=lambda *a: None, escalate=False):
+    """Per query: (cat,name,bits,rows_out,ok,fast,duck_ms,wave_ms). Reusable runner.
+    escalate selects the WaveDB execution mode (False=throughput/BSI, True=latency/fused)."""
     import wdb_join
     out = []
     for i, (cat, name, q, _ex) in enumerate(QUERIES, 1):
         h = wdb_join._FAST_HITS
         try:
-            gw = db.run(q); fast = wdb_join._FAST_HITS > h
+            gw = db.run(q, escalate=escalate); fast = wdb_join._FAST_HITS > h
             exp = [tuple(r) for r in con.execute(q).fetchall()]
             ok = _eq(_norm(gw[0]), _norm(exp))
-            w = best(lambda: db.run(q)); d = best(lambda: con.execute(q).fetchall())
+            w = best(lambda: db.run(q, escalate=escalate)); d = best(lambda: con.execute(q).fetchall())
             bits, _ = bits_read(q, COL)
             out.append((cat, name, bits, len(gw[0]), ok, fast, d, w))
             log(f"{i:2d} {name:30s} {bits/1e6:8.1f}Mb ok={ok} fast={fast} "

@@ -233,7 +233,7 @@ def main():
     print("building DuckDB baseline (once) ..."); dsz = duck_baseline()
     db = M.open_db(); con = M.open_duck(); segs = M.open_segs(); COL = M.build_cols(segs)
     Nl = segs['lineitem'].N
-    print("running query matrix (correctness) ..."); out = M.run_matrix(db, con, COL, log=print)
+    print("running query matrix (correctness) ..."); out = M.run_matrix(db, con, COL, log=print, escalate=True)
     db = con = segs = None        # drop both engines before the isolated timing/RAM runs
     print("measuring WaveDB alone per query (fresh process each: latency + peak RAM) ...")
     _write_memrun(); floor = _peak_kb('floor')[1]
