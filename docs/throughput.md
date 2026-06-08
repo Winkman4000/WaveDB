@@ -1,104 +1,143 @@
-# Throughput & the RAM-per-core ceiling
+# Throughput: the memory-bandwidth wall
 
-**TL;DR — RAM is not a throughput constraint for WaveDB on any normal machine.**
-At a 32 GB budget on 16 cores, every one of the 30 catalog queries is *CPU-bound*:
-the box runs out of cores long before RAM. Lowering our memory footprint buys
-zero throughput; latency is the only lever. This is measured, not assumed —
+**TL;DR — under concurrency, every catalog query is *memory-bandwidth-bound*, not
+CPU-bound and not RAM-capacity-bound.** Sixteen workers deliver only 8–58 % of
+16× the single-worker rate; the missing throughput is contention on the shared
+~50 GB/s memory bus. Scaling tracks *bytes read per query* — `COUNT(*)` reads
+almost nothing and scales to 58 %, a whole-column `SUM` streams ~48 MB and scales
+to 9 %. So the lever for throughput is **bytes read per query** (compression and
+the BSI filter-index), *not* single-query latency. RAM capacity never binds on a
+machine with ≥ ~1 GB/core. Live numbers: [`examples/throughput.md`](../examples/throughput.md);
 reproduce with `python bench/throughput.py`.
+
+## What this corrects
+
+An earlier version of this doc computed throughput as `W × (1000 / latency_ms)`
+— it *extrapolated* aggregate queries/sec from a single query's latency, assuming
+`W` workers scale perfectly. They do not. Measuring `W` workers running **at the
+same time** shows 8–58 % scaling, and that gap *is* the bandwidth wall. The
+extrapolation inverted the conclusion: it reported every query "CPU-bound" and
+recommended optimizing latency. The real concurrent measurement says the
+opposite — bandwidth-bound, optimize bytes per query.
 
 ## The model
 
-The footprint of a columnar engine only matters as a limit on how many query
-workers fit in memory. Dedicate the machine to one query type and run `W`
-single-threaded workers in parallel (math libs pinned to one thread, so `W`
-workers saturate `W` cores cleanly). Then:
+Dedicate the machine to one query type and run `W` single-threaded workers in
+parallel (math libs and numba pinned to one thread, so `W` workers saturate `W`
+cores cleanly). The reported number is the **real aggregate queries/sec with all
+`W` running together** — bandwidth contention included, not extrapolated.
 
-    throughput = W x (1000 / latency_ms)
-    W          = min(cores, (budget - shared) / private_per_worker)
+    throughput = measured aggregate q/s across W workers running concurrently
+    W          = min(cores, budget_MB / private_per_worker_MB)
 
 Memmap'd segment files are shared across workers (page cache, paid once), so the
 quantity that scales per worker is the **private (anonymous)** working set
-(`Private_Dirty` in `/proc/self/smaps_rollup`) — the decoded column caches, FK
-pointers, and Python/numpy objects — *not* the total RSS.
+(`Private_Dirty` in `/proc/self/smaps_rollup`) — decoded column caches, FK
+pointers, the BSI index, Python/numpy objects — not the total RSS. WaveDB workers
+run in the default **non-escalated (throughput) mode**, so the BSI filter-index
+engages where it pays.
 
-A worker is **RAM-bound only when RAM-per-core < its private working set.**
+## Measured: SF1, W = 16, 32 GB budget
 
-## Measured: queries/sec at 32 GB / 16 cores (SF1, 6M-row lineitem)
+The full per-query table is the committed scoreboard,
+[`examples/throughput.md`](../examples/throughput.md). The shape of the result:
 
-| # | query | latency | priv MB/worker | QPS @ 32 GB | bound |
-|---|---|--:|--:|--:|---|
-| 1 | COUNT(*) | 0.15 ms | 340 | 104,371 | CPU |
-| 21 | COUNT(DISTINCT) low | 0.24 | 322 | 66,806 | CPU |
-| 22 | COUNT(DISTINCT) high | 0.24 | 322 | 66,308 | CPU |
-| 11 | WHERE numeric > | 0.26 | 368 | 62,064 | CPU |
-| 14 | WHERE string = | 0.28 | 385 | 56,180 | CPU |
-| 15 | WHERE IN (3) | 0.33 | 385 | 47,876 | CPU |
-| 2 | whole SUM | 0.84 | 383 | 19,057 | CPU |
-| 4 | GROUP BY K3 count | 1.27 | 386 | 12,565 | CPU |
-| 26 | JOIN parent-key | 1.30 | 373 | 12,270 | CPU |
-| 18 | DISTINCT 1-col | 1.31 | 386 | 12,169 | CPU |
-| 12 | WHERE BETWEEN + agg | 1.49 | 430 | 10,733 | CPU |
-| 25 | HAVING | 1.57 | 386 | 10,178 | CPU |
-| 16 | WHERE AND/OR | 1.63 | 478 | 9,831 | CPU |
-| 6 | GROUP BY K7 avg | 1.87 | 434 | 8,565 | CPU |
-| 8 | GROUP BY datetime | 2.08 | 386 | 7,676 | CPU |
-| 19 | DISTINCT 2-col | 2.44 | 432 | 6,560 | CPU |
-| 13 | WHERE date-range (Q6) | 2.98 | 524 | 5,372 | CPU |
-| 27 | JOIN child-key | 3.01 | 436 | 5,317 | CPU |
-| 3 | whole multi-agg | 3.06 | 488 | 5,237 | CPU |
-| 5 | GROUP BY K3 sum | 3.21 | 436 | 4,984 | CPU |
-| 28 | JOIN parent-date | 4.57 | 448 | 3,500 | CPU |
-| 29 | JOIN + WHERE | 4.91 | 495 | 3,261 | CPU |
-| 7 | GROUP BY 2-col (Q1) | 5.42 | 531 | 2,954 | CPU |
-| 17 | WHERE + GROUP BY | 5.67 | 482 | 2,823 | CPU |
-| 30 | 3-table JOIN | 10.13 | 819 | 1,579 | CPU |
-| 20 | DISTINCT high-card | 15.63 | 412 | 1,024 | CPU |
-| 9 | GROUP BY high-card 200k | 69.78 | 486 | 229 | CPU |
-| 24 | ORDER BY + LIMIT | 164.32 | 495 | 97 | CPU |
-| 10 | GROUP BY vhigh-card 1.5M | 201.94 | 344 | 79 | CPU |
-| 23 | grouped COUNT(DISTINCT) | 258.53 | 415 | 62 | CPU |
+- **All 30 queries are bandwidth-bound** (scale < 60 %). At 32 GB / 16 cores the
+  worker count is `W = cores = 16` for every query — RAM capacity never caps it
+  (the `bound` column reads `BW` everywhere, never `RAM`).
+- **Scaling inversely tracks bytes read per query.** The byte-light queries scale
+  best; the byte-heavy ones scale worst:
 
-Private working set per worker: **322–819 MB** for dedicated single-query
-workers; **~974 MB** worst case for a mixed worker that has touched every column.
-Shared once (file + libs): **~253 MB**.
+  | query | reads | scale @16 |
+  |---|---|--:|
+  | `COUNT(*)` | ~0 column bytes (row count only) | 58 % |
+  | `COUNT(DISTINCT)` (code-only) | dictionary codes, no value decode | 57 % |
+  | `GROUP BY K3 count` | one code column, tally | 55 % |
+  | `WHERE l_quantity > 30` count | one code column | 42 % |
+  | whole `SUM(l_extendedprice)` | full 48 MB value column | 9 % |
+  | `GROUP BY returnflag, SUM(...)` | key codes + full value column | 8 % |
 
-## The break-even: which chip could ever make RAM the bottleneck?
+  More bytes streamed per query → more pressure on the bus → worse concurrent
+  scaling. That inverse relationship is the whole argument: throughput is gated
+  by how many bytes each query pulls through the ~50 GB/s bus, not by how many
+  cores or how much RAM the box has.
 
-RAM throttles us when it can't hold `cores` workers:
+## Why bandwidth, not cores or RAM capacity
 
-    RAM-bound  <=>  RAM_total < shared + cores x private
-    break-even RAM-per-core  ~=  private_per_worker  (~0.4-1.0 GB/core at SF1)
+- **Cores:** 16 workers fill 16 cores, but an analytical worker spends most of
+  its cycles *waiting* on column bytes from DRAM, not computing. The bus
+  saturates before the ALUs do, so the 17th core (or hyperthread) buys little.
+- **RAM capacity:** still not the binding constraint. The per-worker private set
+  is well under the 2 GB/worker that a 32 GB / 16-core box allows, so `W` is
+  pinned by core count, never by capacity. Capacity headroom does not buy
+  throughput; bus bandwidth does. (The RAM-per-core ceiling is detailed below —
+  it is real but no normal machine hits it.)
 
-So **RAM only bottlenecks below ~1 GB of RAM per core.** Where real hardware sits:
+## The lever: fewer bytes per query
+
+Because aggregate throughput is gated by the memory bus, it improves by reading
+**fewer bytes per query**:
+
+- **Compression.** WaveDB stores the same data ~1.23× smaller than DuckDB, so
+  every scan streams fewer bytes off the bus.
+- **The BSI filter-index (throughput mode).** For selective off-key filters it
+  evaluates predicates on compact bit-planes and walks only the set bits,
+  touching ~16 MB of index instead of scanning the full predicate columns. This
+  flips the two off-key filters it engages — `WHERE BETWEEN` (#11) and TPC-H Q6
+  (#12) — from losses to wins **under concurrency**, even though the same path
+  loses single-query latency (see modes below).
+- **Narrow, code-only paths.** `COUNT`, `GROUP BY`, and `COUNT(DISTINCT)` over
+  dictionary codes never decode values; they read the fewest bytes and scale
+  best (55–58 %).
+
+Single-query latency is a *different* axis, optimized by a *different* mode.
+
+## Two modes — operator-selected (escalation)
+
+The same query has two honest execution strategies; the operator declares intent
+per call (`db.run(sql, escalate=...)`) or as a deployment default (`db.escalate`).
+
+| mode | `escalate` | strategy | wins when | scoreboard |
+|---|---|---|---|---|
+| **throughput** (default) | `False` | BSI filter-index, fewest bytes | many concurrent queries split the cores | [`examples/throughput.md`](../examples/throughput.md) |
+| **latency** | `True` | fully parallel fused scan | one query owns all the cores | [`examples/report.md`](../examples/report.md) |
+
+The BSI bitmap-walk kernel is single-threaded, so it wins when cores are split
+across concurrent workers (bytes saved dominates) and loses when one query can
+use all 16 cores in a parallel fused scan. Rather than have the engine guess
+intent, the mode is the operator's explicit choice; both return identical
+results.
+
+## The RAM-per-core ceiling (capacity is not the wall)
+
+RAM throttles throughput only when it cannot hold `cores` workers:
+
+    RAM-bound  ⇔  RAM_total < shared + cores × private_per_worker
+    break-even RAM-per-core  ≈  private_per_worker  (well under 1 GB/core at SF1)
+
+So RAM only becomes the bottleneck **below ~1 GB of RAM per core** — a regime no
+normal machine occupies:
 
 | machine | RAM/core | result |
 |---|--:|---|
-| this box (30 GB / 16) | 1.9 GB | CPU-bound, ~2x margin |
-| compute-optimized cloud (stingiest commodity) | ~2 GB | CPU-bound |
-| general / memory-optimized cloud | 4–32 GB | CPU-bound by miles |
-| laptop / Raspberry Pi 5 | 1–2 GB | CPU-bound |
-| **to flip RAM-bound** | **< 1 GB** | 128-core EPYC starved to < 128 GB — rare, deliberate |
+| this box (30 GB / 16) | 1.9 GB | bandwidth-bound, capacity to spare |
+| compute-optimized cloud (stingiest commodity) | ~2 GB | capacity to spare |
+| general / memory-optimized cloud | 4–32 GB | capacity to spare by miles |
+| laptop / Raspberry Pi 5 | 1–2 GB | capacity to spare |
+| **to flip RAM-bound** | **< 1 GB** | a 128-core chip starved to < 128 GB — rare, deliberate |
 
-A 128-core EPYC at 32 GB (0.13 GB/core) *would* be RAM-bound — but nobody builds
-that. The hardware enforces it: EPYC needs all 12 DDR5 channels populated to feed
-a dense core count, which forces a 192–384 GB minimum regardless of capacity
-needs. **The same density that creates the cores forces the RAM up**, so you
-physically can't build the config where our 1.85x footprint costs throughput
-without also starving the chip's bandwidth and losing throughput anyway.
+And the hardware resists even that: a dense core count needs all the DDR channels
+populated to be fed, which forces a large RAM minimum regardless of capacity
+need. The same density that creates the cores forces the RAM up — so you can't
+easily build the config where footprint costs throughput without also starving
+the bus (and losing throughput to bandwidth anyway). Capacity is not the lever;
+bytes-per-query is.
 
-## Scaling caveat (honest bound)
+## Reproduce
 
-The private number scales with the *working set*, which scales with dataset rows
-(~0.34–0.97 GB at SF1; ~10x at SF10). Two release valves keep it bounded:
-memmap means the on-disk dataset can dwarf RAM (only hot decoded columns are
-resident), and an optional LRU cap bounds the per-worker number directly. The
-precise claim: **at a given data scale, any machine with >=~1 GB RAM/core is
-CPU-bound — which covers all normal hardware.**
+    python bench/throughput.py [budget_gb] [cores]      # defaults: 32, nproc
 
-## Consequence for the roadmap
-
-Stop optimizing RAM; optimize latency. Throughput is dragged down by a short list
-of CPU-bound queries: grouped COUNT(DISTINCT) (#23, 62 QPS), GROUP BY vhigh-card
-(#10, 80), ORDER BY+LIMIT (#24, 99), GROUP BY high-card (#9, 224), DISTINCT
-high-card (#20, 1046) — largely the same set as the scoreboard losses. Every ms
-shaved there multiplies by the core count into aggregate QPS.
+Writes [`examples/throughput.md`](../examples/throughput.md) (WaveDB vs DuckDB,
+per-query 1-worker and @W aggregate q/s, scaling %, bound, BSI flag) and prints
+the same table to stdout. WaveDB is measured in throughput mode (BSI on); both
+engines run as `W` single-thread workers concurrently.

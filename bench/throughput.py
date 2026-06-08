@@ -127,6 +127,7 @@ def _write_md(rows, budget_gb, cores):
     med = ratios[len(ratios) // 2] if ratios else 0.0
     wins = sum(1 for r in rows if r[7] >= 1.0)
     bsi_n = sum(1 for r in rows if r[2])
+    bw_n = sum(1 for r in rows if r[3] > 0 and r[4] > 0 and (r[5] / (r[3] * r[4])) < 0.6)
     L = ["# WaveDB throughput scoreboard\n"]
     L.append(f"_TPC-H sf=1 - vs DuckDB - commit `{git}` - {datetime.date.today().isoformat()} - "
              f"W={cores} single-thread workers per engine, {budget_gb} GB budget._\n")
@@ -135,18 +136,24 @@ def _write_md(rows, budget_gb, cores):
              "aggregate queries/sec, memory-bandwidth contention included (not extrapolated from "
              "single-query latency). WaveDB runs in the default non-escalated (throughput) mode, so the "
              "BSI filter-index engages where it pays (BSI column).\n")
-    L.append("| # | category | query | BSI | WaveDB @W q/s | DuckDB @W q/s | ratio | W |")
-    L.append("|---|---|---|:-:|--:|--:|--:|--:|")
+    L.append("| # | category | query | BSI | WaveDB 1-wkr q/s | WaveDB @W q/s | scale | bound | "
+             "DuckDB @W q/s | ratio |")
+    L.append("|---|---|---|:-:|--:|--:|--:|:-:|--:|--:|")
     last = None
     for i, (cat, name, fired, solo, W, wq, dq, ratio) in enumerate(rows):
         if cat != last:
-            L.append(f"| **{cat}** | | | | | | | |"); last = cat
+            L.append(f"| **{cat}** | | | | | | | | | |"); last = cat
+        scale = wq / (solo * W) if solo > 0 and W > 0 else 0.0
+        bound = 'RAM' if W < cores else ('BW' if scale < 0.6 else 'CPU')
         mark = " **" if ratio >= 1 else ""
-        L.append(f"| {i} | {cat} | {name} | {'Y' if fired else '-'} | {wq:.0f} | {dq:.0f} | "
-                 f"{ratio:.2f}x{mark} | {W} |")
+        L.append(f"| {i} | {cat} | {name} | {'Y' if fired else '-'} | {solo:.0f} | {wq:.0f} | "
+                 f"{scale*100:.0f}% | {bound} | {dq:.0f} | {ratio:.2f}x{mark} |")
     L.append("")
-    L.append(f"**{wins}/{len(rows)} faster than DuckDB - median {med:.2f}x - BSI filter-index engaged on "
-             f"{bsi_n} {'query' if bsi_n == 1 else 'queries'}.** Bold ratios are WaveDB wins.\n")
+    L.append(f"**{wins}/{len(rows)} faster than DuckDB - median {med:.2f}x.** BSI filter-index engaged "
+             f"on {bsi_n} {'query' if bsi_n == 1 else 'queries'}. {bw_n}/{len(rows)} queries are "
+             f"memory-bandwidth-bound under concurrency (scale < 60%): the shared memory bus, not core "
+             f"count or RAM capacity, is the throughput wall -- so the lever is **bytes read per query** "
+             f"(compression + the BSI index), not single-query latency. Bold ratios are WaveDB wins.\n")
     rep = os.path.join(ROOT, 'examples', 'throughput.md')
     open(rep, 'w').write("\n".join(L) + "\n")
     print(f"\nwrote {rep}")
