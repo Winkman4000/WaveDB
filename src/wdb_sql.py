@@ -33,12 +33,22 @@ def _cluster_will_slice(seg, tree, col_map):
 
 _GROUP_SLICE_HITS = 0   # count of GROUP BYs answered via the clustered range-walk (tests/telemetry)
 
+def _has_count_distinct(proj):
+    """True if any projection is COUNT(DISTINCT col). Such grouped queries keep the fused
+    _grouped_cd path (a bincount cell-table) -- it beats the group-slice's per-group np.unique."""
+    for p in proj:
+        _inn = p.this if isinstance(p, E.Alias) else p
+        if isinstance(_inn, E.Count) and isinstance(_inn.this, E.Distinct):
+            return True
+    return False
+
 def _cluster_will_group_slice(seg, tree, col_map):
     """True iff a single-column GROUP BY on the cluster key with no WHERE/HAVING/ORDER/LIMIT and no
     deleted rows -- the rows are already grouped into the cluster ranges, so no sort/scatter."""
     if seg.cluster_meta() is None or seg.presence_mask() is not None: return False
     if (tree.args.get('where') is not None or tree.args.get('having') is not None
             or tree.args.get('order') is not None or _limit(tree) is not None): return False
+    if _has_count_distinct(tree.expressions): return False          # fused _grouped_cd is faster
     g = tree.args.get('group')
     if g is None or len(g.expressions) != 1: return False
     gn = _colname(g.expressions[0])
@@ -181,6 +191,7 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
     if (len(gcols) == 1 and where is None and seg.cluster_meta() is not None
             and seg.presence_mask() is None and tree.args.get('having') is None
             and tree.args.get('order') is None and _limit(tree) is None
+            and not _has_count_distinct(proj)
             and seg.cluster_meta()['key'] == seg_col(gcols[0])):
         try:
             global _GROUP_SLICE_HITS

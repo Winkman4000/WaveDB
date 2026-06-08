@@ -205,12 +205,20 @@ def test_grouped_slice_matches_full_and_fires():
         "SELECT rf, COUNT(*) FROM t GROUP BY rf",
         "SELECT rf, SUM(p) FROM t GROUP BY rf",
         "SELECT rf, COUNT(*), SUM(p), MIN(q), MAX(q), AVG(p) FROM t GROUP BY rf",
-        "SELECT rf, COUNT(DISTINCT sm) FROM t GROUP BY rf",
     ]
     before = wdb_sql._GROUP_SLICE_HITS
     for q in queries:
         assert _gnorm(wdb_sql.execute(full, q)[0]) == _gnorm(wdb_sql.execute(clus, q)[0]), q
     assert wdb_sql._GROUP_SLICE_HITS == before + len(queries)   # every one took the group-slice path
+
+def test_grouped_count_distinct_keeps_fused_path():
+    # COUNT(DISTINCT) grouped on the cluster key stays correct but is NOT diverted to the
+    # group-slice (the fused _grouped_cd bincount path is faster than per-group np.unique).
+    full, clus = _grp_pair()
+    q = "SELECT rf, COUNT(DISTINCT sm) FROM t GROUP BY rf"
+    before = wdb_sql._GROUP_SLICE_HITS
+    assert _gnorm(wdb_sql.execute(full, q)[0]) == _gnorm(wdb_sql.execute(clus, q)[0])
+    assert wdb_sql._GROUP_SLICE_HITS == before               # group-slice NOT taken
 
 def test_grouped_slice_skips_non_key_group():
     full, clus = _grp_pair()
