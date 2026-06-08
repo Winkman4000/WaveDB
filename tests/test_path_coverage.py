@@ -11,7 +11,7 @@ import sys, os, tempfile, uuid, math, datetime, re
 from decimal import Decimal
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import duckdb, sqlglot, sqlglot.expressions as E
-import wdb_encode, wdb_join, wdb_sql
+import wdb_encode, wdb_join, wdb_sql, wdb_bsi_exec
 from wdb_db import Database
 
 _DB = None; _CON = None
@@ -66,6 +66,12 @@ CASES = [
                                    "WHERE l_quantity > 25 GROUP BY l_shipmode"),
     ('st_order_limit',     'fast', "SELECT l_partkey, SUM(l_quantity) AS s FROM lineitem "
                                    "GROUP BY l_partkey ORDER BY s DESC LIMIT 10"),                 # #24
+    # ---- BSI filter-aggregate path: selective off-key numeric/range predicates ----
+    ('bsi_discount_btw',   'bsi',  "SELECT SUM(l_extendedprice) FROM lineitem "
+                                   "WHERE l_discount BETWEEN 0.05 AND 0.07"),
+    ('bsi_q6_multi',       'bsi',  "SELECT SUM(l_extendedprice * l_discount) FROM lineitem "
+                                   "WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01' "
+                                   "AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 24"),
     # ---- FK-pointer joins: must gather (not hash / pandas) ----
     ('jn_group_sum',       'fast', "SELECT c.c_mktsegment, SUM(o.o_totalprice) FROM orders o "
                                    "JOIN customer c ON o.o_custkey=c.c_custkey GROUP BY c.c_mktsegment"),
@@ -112,12 +118,13 @@ def _is_fusion_candidate(tree):
             or any(wdb_sql._agg_kind(x) for x in tree.expressions))
 
 def _classify(db, q):
-    """Run q and report ('fast' | 'fallback' | 'rows', result_rows)."""
+    """Run q and report ('bsi' | 'fast' | 'fallback' | 'rows', result_rows)."""
     tree = sqlglot.parse_one(q, read='duckdb')
     cand = _is_fusion_candidate(tree)
-    before = wdb_join._FAST_HITS
+    fb = wdb_join._FAST_HITS; bb = wdb_bsi_exec._BSI_HITS
     rows = db.run(q)[0]
-    if wdb_join._FAST_HITS > before: return 'fast', rows
+    if wdb_bsi_exec._BSI_HITS > bb: return 'bsi', rows
+    if wdb_join._FAST_HITS > fb: return 'fast', rows
     return ('fallback' if cand else 'rows'), rows
 
 def _evaluate():
@@ -135,12 +142,15 @@ def _evaluate():
         if ans != 'OK':
             fails.append(f"{label}: answer {ans} vs DuckDB  ({q})")
         elif got != expected:
-            if expected == 'fast':
-                fails.append(f"{label}: REGRESSION -- expected fast path, got {got!r}. Fix the fast path or "
-                             f"investigate why it stopped fusing.  ({q})")
+            perf = ('fast', 'bsi')
+            if expected in perf and got not in perf:
+                fails.append(f"{label}: REGRESSION -- expected {expected!r} path, got {got!r}. Investigate "
+                             f"why it stopped using the accelerated path.  ({q})")
+            elif expected not in perf and got in perf:
+                fails.append(f"{label}: now takes the {got!r} path (expected {expected!r}). Good news -- "
+                             f"promote it in CASES so the ratchet stays honest.  ({q})")
             else:
-                fails.append(f"{label}: now takes the FAST path (expected {expected!r}). Good news -- "
-                             f"promote it to 'fast' in CASES.  ({q})")
+                fails.append(f"{label}: path changed {expected!r} -> {got!r}; update CASES if intended.  ({q})")
     return report, fails
 
 def _print_report(report):
