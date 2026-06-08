@@ -67,3 +67,25 @@ def test_st_count_distinct_where(): _match("SELECT COUNT(DISTINCT g) FROM t WHER
 def test_st_count_distinct_mode4_fallback(): _match("SELECT COUNT(DISTINCT id) FROM t", expect_fast=False)  # id sequential -> mode-4 -> wdb_sql
 def test_st_grouped_count_distinct(): _match("SELECT g, COUNT(DISTINCT s) FROM t GROUP BY g", expect_fast=False)
 def test_st_grouped_count_distinct_mixed(): _match("SELECT g, COUNT(*), COUNT(DISTINCT s) FROM t GROUP BY g", expect_fast=False)
+
+
+# ── bounded top-K: ORDER BY <projected aggregate/COUNT> [DESC] LIMIT k over a GROUP BY ────────────
+# _topk_prefilter shrinks `present` to a provable superset of the winners before row assembly; the
+# unchanged _apply_order over that subset is the source of truth for exact ordering, so results match
+# DuckDB. These assert BOTH correctness and that the prefilter actually engages (_TOPK_HITS bumps),
+# except the skip case where lim >= #groups so pruning cannot help.
+def _match_topk(q, expect_topk=True):
+    db, con = _fixture()
+    f0 = wdb_join._FAST_HITS; t0 = wdb_join._TOPK_HITS
+    g = _norm(db.run(q)[0]); e = _norm([tuple(r) for r in con.execute(q).fetchall()])
+    assert wdb_join._FAST_HITS == f0 + 1, f"single-table fast path NOT taken: {q}"
+    assert (wdb_join._TOPK_HITS == t0 + 1) == expect_topk, \
+        f"top-K prefilter {'did not engage' if expect_topk else 'engaged unexpectedly'}: {q}"
+    assert g == e, f"mismatch {q}\n got {g[:4]}\n exp {e[:4]}"
+
+def test_st_topk_sum_desc():   _match_topk("SELECT g, SUM(amt) AS s FROM t GROUP BY g ORDER BY s DESC, g LIMIT 3")
+def test_st_topk_sum_asc():    _match_topk("SELECT g, SUM(amt) AS s FROM t GROUP BY g ORDER BY s ASC, g LIMIT 3")
+def test_st_topk_count_ties(): _match_topk("SELECT g, COUNT(*) AS c FROM t GROUP BY g ORDER BY c DESC, g LIMIT 3")  # all groups tie on count -> tie-break by g; superset keeps all ties
+def test_st_topk_k1():         _match_topk("SELECT g, SUM(amt) AS m FROM t GROUP BY g ORDER BY m DESC, g LIMIT 1")
+def test_st_topk_unaliased():  _match_topk("SELECT g, SUM(amt) FROM t GROUP BY g ORDER BY SUM(amt) DESC, g LIMIT 3")
+def test_st_topk_skip_lim_ge_n(): _match_topk("SELECT g, SUM(amt) AS s FROM t GROUP BY g ORDER BY s DESC LIMIT 10", expect_topk=False)  # lim(10) >= 6 groups -> no prune

@@ -297,6 +297,7 @@ class _FastUnsupported(Exception):
     pass
 
 _FAST_HITS = 0   # diagnostic: how many queries took the gather fast path
+_TOPK_HITS = 0   # diagnostic: how many queries had `present` pruned by the bounded top-K prefilter
 def _bump_fast():
     global _FAST_HITS
     _FAST_HITS += 1
@@ -364,6 +365,64 @@ def _bulk_keyvals(seg, pcol, codes):
         cl = codes.tolist()
         out = [None if cl[i] == nc else out[i] for i in range(len(out))]
     return out
+
+
+def _topk_prefilter(tree, proj, col_results, counts, present, gkeys):
+    """ORDER BY <projected aggregate>[DESC] LIMIT k over a GROUP BY: shrink `present` to a provable
+    superset of the top-k groups with ONE numpy partition on the primary order array, so the row
+    assembly materialises ~k rows instead of every group. The downstream _apply_order over the shrunk
+    set stays the source of truth for exact ordering (tie-breaks, null handling), so the result is
+    identical to the full path -- this only drops groups that provably cannot enter the top-k.
+    Engages only when the PRIMARY order key maps to a finite numeric aggregate/COUNT column and
+    k < #groups; otherwise returns `present` unchanged (full path). Pruning by primary key alone is
+    a valid superset: every true top-k row has a primary value at least as good as the k-th best, so
+    `a >= thresh` (desc) / `a <= thresh` (asc), with all boundary ties kept, can never exclude one."""
+    if not gkeys:
+        return present
+    order = tree.args.get('order')
+    lim = wdb_sql._limit(tree)
+    if order is None or lim is None or lim <= 0:
+        return present
+    n = len(present)
+    if lim >= n:
+        return present
+    o0 = order.expressions[0]
+    desc = bool(o0.args.get('desc'))
+    target = o0.this
+    idx = None
+    for i, p in enumerate(proj):                       # same match rule as _apply_order
+        inner = p.this if isinstance(p, E.Alias) else p
+        tname = target.name if isinstance(target, E.Column) else None
+        if inner.sql() == target.sql() or wdb_sql._alias(p) == tname:
+            idx = i; break
+    if idx is None:
+        return present
+    r = col_results[idx]
+    if r[0] == 'count':
+        a = counts[present]
+    elif r[0] == 'arr' and not r[2]:                   # numeric aggregate array (not datetime)
+        a = r[1][present]
+    else:
+        return present                                 # key column / datetime primary -> full path
+    a = np.asarray(a)
+    if a.dtype.kind == 'O':                            # Decimal/object agg array -> float proxy for the
+        try:                                           # partition only; equal values map to identical floats
+            a = a.astype(np.float64)                   # and distinct sums differ far more than float error,
+        except (TypeError, ValueError):                # so the >=thresh superset stays exact. None -> bail.
+            return present
+    if a.dtype.kind not in 'iuf':
+        return present
+    if a.dtype.kind == 'f' and not np.isfinite(a).all():   # NaN/inf -> null-ordering risk, full path
+        return present
+    k = int(lim)
+    if desc:
+        thresh = np.partition(a, n - k)[n - k]         # k-th largest value
+        sel = np.nonzero(a >= thresh)[0]
+    else:
+        thresh = np.partition(a, k - 1)[k - 1]         # k-th smallest value
+        sel = np.nonzero(a <= thresh)[0]
+    global _TOPK_HITS; _TOPK_HITS += 1
+    return present[sel]
 
 
 def _fast_pointer_agg(db, tree, ctx):
@@ -1132,6 +1191,7 @@ def _fast_pointer_agg(db, tree, ctx):
     # No GROUP BY -> exactly one output row (the grand total), even over zero rows (COUNT=0, SUM/MIN/MAX=NULL,
     # matching SQL). With a GROUP BY, empty groups are dropped.
     present = np.array([0]) if not gkeys else np.nonzero(counts > 0)[0]
+    present = _topk_prefilter(tree, proj, col_results, counts, present, gkeys)   # bounded top-K: drop non-winners pre-assembly
 
     # ---- assemble rows (vectorised) ----
     # Decode every present group's composite code into per-key code arrays in one shot, bulk-decode each key
