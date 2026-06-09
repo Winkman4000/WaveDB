@@ -94,9 +94,11 @@ def _spawn(engine, qi, dur, W):
 def run(budget_gb=32, cores=None):
     if cores is None:
         cores = os.cpu_count() or 8
-    if not os.path.isdir(WDB) or not os.path.exists(DUCK):
+    if not os.path.isdir(WDB):
         print(f"bench DB absent at {DIR}\n  build: python bench/join_prof.py 1.0"); sys.exit(2)
     sys.path.insert(0, HERE)
+    import report                                       # ONE baseline builder/validator, shared with the
+    report.duck_baseline()                              # latency scoreboard: (re)builds an empty/partial DB
     from catalog import QUERIES
     budget = budget_gb * 1024
     SOLO, CONC = 1.5, 2.0

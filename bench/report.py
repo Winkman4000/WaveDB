@@ -41,10 +41,30 @@ def wdb_sizes():
     return tables, fk, side
 
 
-def duck_baseline():
-    """A DuckDB native file holding ONLY the three bench tables (fair size comparison)."""
-    ddb = os.path.join(DIR, 'baseline.duckdb')
+def _baseline_has_tables(ddb):
+    """True iff the file exists AND actually holds the three bench tables. A bare
+    duckdb.connect(path) (e.g. a stray inspection, or an interrupted build) creates an EMPTY
+    file; trusting existence alone would then make every DuckDB measurement nan."""
     if not os.path.exists(ddb):
+        return False
+    try:
+        c = duckdb.connect(ddb, read_only=True)
+        have = {r[0] for r in c.execute(
+            "SELECT table_name FROM information_schema.tables").fetchall()}
+        c.close()
+        return {'customer', 'orders', 'lineitem'}.issubset(have)
+    except Exception:
+        return False
+
+
+def duck_baseline():
+    """A DuckDB native file holding ONLY the three bench tables (fair size comparison). Rebuilds
+    when missing OR present-but-empty/partial (validated by table presence, not just file
+    existence), so a stray/interrupted connect can never silently zero out the comparison."""
+    ddb = os.path.join(DIR, 'baseline.duckdb')
+    if not _baseline_has_tables(ddb):
+        if os.path.exists(ddb):
+            os.remove(ddb)                                  # empty/partial/corrupt -> rebuild clean
         con = duckdb.connect()
         con.execute("INSTALL tpch; LOAD tpch; CALL dbgen(sf=1)")
         con.execute(f"ATTACH '{ddb}' AS f")
