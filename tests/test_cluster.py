@@ -234,3 +234,70 @@ def test_grouped_slice_skips_having_and_order():
               "SELECT rf, SUM(p) s FROM t GROUP BY rf ORDER BY s DESC"]:
         assert _gnorm(wdb_sql.execute(full, q)[0]) == _gnorm(wdb_sql.execute(clus, q)[0]), q
     assert wdb_sql._GROUP_SLICE_HITS == before               # HAVING/ORDER -> general path
+
+
+# --- step 5: per-slice scalar agg (cluster-key GROUP BY + predicate -> wdb_join fast path) -------
+# A filtered GROUP BY on the cluster key falls off the no-WHERE grouped-slice path; _fast_pointer_agg
+# then runs the register-accumulator scalar kernel once per cluster slice (instead of grouped_multi's
+# per-group indexed-write accumulators). Bit-identical results; ~5x faster on the bench. These lock
+# that it fires when it should, is correct, and is gated off for MIN/MAX and non-cluster-key groups.
+
+def _clustered_db(df, key):
+    import wdb_encode
+    from wdb_db import Database
+    d = tempfile.mkdtemp(); db = Database.create(d)
+    cols = [[c, ('string' if df[c].dtype.kind == 'O' else 'float' if df[c].dtype.kind == 'f' else 'int')]
+            for c in df.columns]
+    db.cat.add_table('t', cols)
+    pq = os.path.join(d, 't.parquet'); df.to_parquet(pq)
+    seg = 't_0.wdb'; wdb_encode.encode(pq, os.path.join(d, seg), cluster_by=key)
+    db.cat.add_segment('t', seg)
+    return db
+
+def _key(v): return v.decode() if isinstance(v, (bytes, bytearray)) else v
+
+def test_slice_scalar_filtered_group_fires_and_correct():
+    import wdb_join
+    np.random.seed(11); n = 3000
+    df = pd.DataFrame({'rf': np.random.choice(['A', 'N', 'R'], n),
+                       'q':  np.random.randint(1, 51, n).astype(float),
+                       'ext': np.round(np.random.rand(n) * 1000, 2)})
+    db = _clustered_db(df, 'rf')
+    h0 = wdb_join._SLICE_SCALAR_HITS
+    rows, _ = db.run("SELECT rf, SUM(ext) FROM t WHERE q > 25 GROUP BY rf")
+    assert wdb_join._SLICE_SCALAR_HITS == h0 + 1                 # per-slice scalar fired
+    exp = df[df.q > 25].groupby('rf')['ext'].sum().to_dict()
+    got = {_key(r[0]): r[1] for r in rows}
+    assert set(got) == set(exp)
+    for k in exp: assert abs(got[k] - exp[k]) < 1e-6 * max(1, abs(exp[k])), (k, got[k], exp[k])
+    h0 = wdb_join._SLICE_SCALAR_HITS
+    rows, _ = db.run("SELECT rf, COUNT(*) FROM t WHERE q > 25 GROUP BY rf")
+    assert wdb_join._SLICE_SCALAR_HITS == h0 + 1
+    assert {_key(r[0]): r[1] for r in rows} == df[df.q > 25].groupby('rf').size().to_dict()
+
+def test_slice_scalar_avg_and_drops_empty_group():
+    import wdb_join
+    np.random.seed(13); n = 2500
+    # force group 'R' to have NO rows passing the filter -> must be dropped from output
+    rf = np.random.choice(['A', 'N', 'R'], n); q = np.random.randint(1, 51, n).astype(float)
+    q[rf == 'R'] = 5.0                                            # all 'R' rows fail q>25
+    df = pd.DataFrame({'rf': rf, 'q': q, 'ext': np.round(np.random.rand(n) * 1000, 2)})
+    db = _clustered_db(df, 'rf')
+    rows, _ = db.run("SELECT rf, AVG(ext) FROM t WHERE q > 25 GROUP BY rf")
+    got = {_key(r[0]): r[1] for r in rows}
+    exp = df[df.q > 25].groupby('rf')['ext'].mean().to_dict()
+    assert set(got) == set(exp) and 'R' not in got               # empty group dropped
+    for k in exp: assert abs(got[k] - exp[k]) < 1e-6 * max(1, abs(exp[k]))
+
+def test_slice_scalar_gated_off():
+    import wdb_join
+    np.random.seed(12); n = 2000
+    df = pd.DataFrame({'rf': np.random.choice(['A', 'N', 'R'], n),
+                       'q':  np.random.randint(1, 51, n).astype(float),
+                       'ext': np.round(np.random.rand(n) * 1000, 2)})
+    db = _clustered_db(df, 'rf')
+    h0 = wdb_join._SLICE_SCALAR_HITS                             # MIN/MAX -> scalar_multi can't; stays grouped_multi
+    db.run("SELECT rf, SUM(ext), MIN(q), MAX(q) FROM t WHERE q > 25 GROUP BY rf")
+    assert wdb_join._SLICE_SCALAR_HITS == h0
+    db.run("SELECT q, COUNT(*) FROM t WHERE ext > 500 GROUP BY q")   # non-cluster-key group
+    assert wdb_join._SLICE_SCALAR_HITS == h0
