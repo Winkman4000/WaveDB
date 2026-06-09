@@ -1,47 +1,49 @@
 # WaveDB throughput scoreboard
 
-_TPC-H sf=1 - vs DuckDB - commit `f1fd4d9` - 2026-06-09 - W=16 single-thread workers per engine, 32 GB budget._
+_TPC-H sf=1 - vs DuckDB - commit `2d2be69` - 2026-06-09 - W=16 single-thread workers per engine, 32 GB budget._
 
 Throughput is the optimization target for a shared analytical DB. Each engine runs W single-threaded workers concurrently (one per core); the number is the **real measured** aggregate queries/sec, memory-bandwidth contention included (not extrapolated from single-query latency). WaveDB runs in the default non-escalated (throughput) mode, so the BSI filter-index engages where it pays (BSI column).
+
+Rows marked **cube** in the bound column are answered from a materialised low-card GROUP BY aggregate (a precomputed [count, sums] per cell, built at load time for filter-free group-bys whose cell count is under the cap) -- the query reads a few hundred bytes instead of scanning the value columns, so it is parse-bound, not bandwidth-bound. This is a materialised view: a DIFFERENT class than a faster scan (DuckDB could build the same), and it applies ONLY to filter-free low-card group-bys with COUNT/SUM/AVG; everything else falls back to the scan.
 
 | # | category | query | BSI | WaveDB 1-wkr q/s | WaveDB @W q/s | scale | bound | DuckDB @W q/s | ratio |
 |---|---|---|:-:|--:|--:|--:|:-:|--:|--:|
 | **agg** | | | | | | | | | |
-| 0 | agg | whole COUNT(*) | - | 6639 | 62041 | 58% | BW | 81604 | 0.76x |
-| 1 | agg | whole SUM | - | 1842 | 2918 | 10% | BW | 1574 | 1.85x ** |
-| 2 | agg | whole multi-agg | - | 1277 | 2398 | 12% | BW | 408 | 5.89x ** |
+| 0 | agg | whole COUNT(*) | - | 6783 | 61949 | 57% | BW | 81434 | 0.76x |
+| 1 | agg | whole SUM | - | 1857 | 2600 | 9% | BW | 1578 | 1.65x ** |
+| 2 | agg | whole multi-agg | - | 1284 | 2406 | 12% | BW | 406 | 5.93x ** |
 | **group** | | | | | | | | | |
-| 3 | group | GROUP BY K3 count | - | 7151 | 62316 | 54% | BW | 537 | 116.04x ** |
-| 4 | group | GROUP BY K3 sum | - | 533 | 688 | 8% | BW | 446 | 1.55x ** |
-| 5 | group | GROUP BY K7 avg | - | 121 | 546 | 28% | BW | 504 | 1.08x ** |
-| 6 | group | GROUP BY 2-col (Q1) | - | 43 | 110 | 16% | BW | 232 | 0.48x |
-| 7 | group | GROUP BY datetime K2.5k | - | 200 | 708 | 22% | BW | 703 | 1.01x ** |
-| 8 | group | GROUP BY high-card K200k | - | 12 | 76 | 39% | BW | 34 | 2.22x ** |
-| 9 | group | GROUP BY vhigh-card K1.5M | - | 5 | 22 | 29% | BW | 16 | 1.38x ** |
+| 3 | group | GROUP BY K3 count | - | 7866 | 72786 | 58% | cube | 542 | 134.42x ** |
+| 4 | group | GROUP BY K3 sum | - | 7797 | 69953 | 56% | cube | 446 | 156.85x ** |
+| 5 | group | GROUP BY K7 avg | - | 7715 | 70576 | 57% | cube | 504 | 140.03x ** |
+| 6 | group | GROUP BY 2-col (Q1) | - | 4251 | 37996 | 56% | cube | 235 | 161.68x ** |
+| 7 | group | GROUP BY datetime K2.5k | - | 199 | 670 | 21% | BW | 687 | 0.98x |
+| 8 | group | GROUP BY high-card K200k | - | 12 | 73 | 38% | BW | 33 | 2.21x ** |
+| 9 | group | GROUP BY vhigh-card K1.5M | - | 5 | 21 | 28% | BW | 16 | 1.27x ** |
 | **filter** | | | | | | | | | |
-| 10 | filter | WHERE numeric > | - | 1034 | 6999 | 42% | BW | 1218 | 5.74x ** |
-| 11 | filter | WHERE BETWEEN + agg | Y | 106 | 884 | 52% | BW | 706 | 1.25x ** |
-| 12 | filter | WHERE date-range (Q6) | Y | 238 | 898 | 24% | BW | 400 | 2.24x ** |
-| 13 | filter | WHERE string = | - | 1523 | 2084 | 9% | BW | 536 | 3.89x ** |
-| 14 | filter | WHERE IN (3) | - | 1045 | 2392 | 14% | BW | 142 | 16.90x ** |
-| 15 | filter | WHERE AND/OR | - | 218 | 528 | 15% | BW | 286 | 1.85x ** |
-| 16 | filter | WHERE + GROUP BY | - | 118 | 296 | 16% | BW | 399 | 0.74x |
+| 10 | filter | WHERE numeric > | - | 1012 | 6874 | 42% | BW | 1222 | 5.63x ** |
+| 11 | filter | WHERE BETWEEN + agg | Y | 105 | 885 | 53% | BW | 706 | 1.25x ** |
+| 12 | filter | WHERE date-range (Q6) | Y | 237 | 804 | 21% | BW | 426 | 1.89x ** |
+| 13 | filter | WHERE string = | - | 1525 | 2318 | 9% | BW | 535 | 4.33x ** |
+| 14 | filter | WHERE IN (3) | - | 1042 | 1767 | 11% | BW | 142 | 12.40x ** |
+| 15 | filter | WHERE AND/OR | - | 216 | 470 | 14% | BW | 284 | 1.65x ** |
+| 16 | filter | WHERE + GROUP BY | - | 116 | 292 | 16% | BW | 394 | 0.74x |
 | **distinct** | | | | | | | | | |
-| 17 | distinct | DISTINCT 1-col | - | 1817 | 3263 | 11% | BW | 1236 | 2.64x ** |
-| 18 | distinct | DISTINCT 2-col | - | 141 | 444 | 20% | BW | 188 | 2.36x ** |
-| 19 | distinct | DISTINCT high-card | - | 47 | 162 | 22% | BW | 94 | 1.73x ** |
-| 20 | distinct | COUNT(DISTINCT) low | - | 6613 | 60923 | 58% | BW | 1303 | 46.76x ** |
-| 21 | distinct | COUNT(DISTINCT) high | - | 6580 | 60256 | 57% | BW | 106 | 568.46x ** |
-| 22 | distinct | grouped COUNT(DISTINCT) | - | 93 | 146 | 10% | BW | 222 | 0.66x |
+| 17 | distinct | DISTINCT 1-col | - | 1796 | 2384 | 8% | BW | 1244 | 1.92x ** |
+| 18 | distinct | DISTINCT 2-col | - | 363 | 544 | 9% | BW | 184 | 2.95x ** |
+| 19 | distinct | DISTINCT high-card | - | 47 | 161 | 21% | BW | 92 | 1.75x ** |
+| 20 | distinct | COUNT(DISTINCT) low | - | 6601 | 60586 | 57% | BW | 1300 | 46.59x ** |
+| 21 | distinct | COUNT(DISTINCT) high | - | 6532 | 59188 | 57% | BW | 103 | 574.64x ** |
+| 22 | distinct | grouped COUNT(DISTINCT) | - | 91 | 170 | 12% | BW | 225 | 0.76x |
 | **order** | | | | | | | | | |
-| 23 | order | ORDER BY + LIMIT | - | 34 | 130 | 24% | BW | 52 | 2.49x ** |
-| 24 | order | HAVING | - | 204 | 718 | 22% | BW | 734 | 0.98x |
+| 23 | order | ORDER BY + LIMIT | - | 36 | 129 | 22% | BW | 50 | 2.55x ** |
+| 24 | order | HAVING | - | 1892 | 17022 | 56% | cube | 743 | 22.91x ** |
 | **join** | | | | | | | | | |
-| 25 | join | JOIN group parent-key | - | 171 | 364 | 13% | BW | 386 | 0.94x |
-| 26 | join | JOIN group child-key | - | 183 | 314 | 11% | BW | 54 | 5.81x ** |
-| 27 | join | JOIN group parent-date | - | 57 | 148 | 16% | BW | 55 | 2.69x ** |
-| 28 | join | JOIN + WHERE | - | 31 | 227 | 45% | BW | 52 | 4.37x ** |
-| 29 | join | 3-table JOIN | - | 39 | 86 | 14% | BW | 40 | 2.19x ** |
+| 25 | join | JOIN group parent-key | - | 173 | 369 | 13% | BW | 345 | 1.07x ** |
+| 26 | join | JOIN group child-key | - | 184 | 341 | 12% | BW | 54 | 6.31x ** |
+| 27 | join | JOIN group parent-date | - | 56 | 150 | 17% | BW | 54 | 2.77x ** |
+| 28 | join | JOIN + WHERE | - | 31 | 220 | 45% | BW | 57 | 3.85x ** |
+| 29 | join | 3-table JOIN | - | 38 | 94 | 15% | BW | 40 | 2.37x ** |
 
-**24/30 faster than DuckDB - median 2.22x.** BSI filter-index engaged on 2 queries. 30/30 queries are memory-bandwidth-bound under concurrency (scale < 60%): the shared memory bus, not core count or RAM capacity, is the throughput wall -- so the lever is **bytes read per query** (compression + the BSI index), not single-query latency. Bold ratios are WaveDB wins.
+**26/30 faster than DuckDB - median 2.77x.** 5 filter-free low-card group-bys are answered from a materialised cube (bound=cube; precomputed aggregate, not a scan). BSI filter-index engaged on 2 queries. Of the scan queries, 25/30 are memory-bandwidth-bound under concurrency (scale < 60%): the shared memory bus, not core count or RAM capacity, is the throughput wall -- so the lever is **bytes read per query** (compression, the BSI index, and -- where the shape allows -- not reading at all via the cube), not single-query latency. Bold ratios are WaveDB wins.
 

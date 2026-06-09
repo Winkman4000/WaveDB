@@ -222,9 +222,13 @@ def _serialize_fd(p, det_idx, det_codes):
     out += _pack_codes(ymap, p['bits'])
     return bytes(out), (len(out), p['V'], p['bits'], p['dtype'], 3, p['has_null'], p['aux'])
 
-def _cluster_order(kc, N):
+def _cluster_order(kc, N, tiebreak=None):
     """Stable row permutation sorting by the cluster key (nulls last) + the slice-boundary
-    index (sorted unique key values -> first-row offsets) used by the executor's searchsorted."""
+    index (sorted unique key values -> first-row offsets) used by the executor's searchsorted.
+    tiebreak (optional column array): a secondary sort key used ONLY to order rows WITHIN each
+    cluster-key slice. It does not change the slice offsets/values (those stay keyed on the
+    primary cluster key), so single-key consumers are unaffected; it makes a second low-card
+    group column contiguous within each slice for the per-range scalar path."""
     if isinstance(kc, ma.MaskedArray):
         mask = ma.getmaskarray(kc); base = np.asarray(kc.data)
     else:
@@ -245,10 +249,23 @@ def _cluster_order(kc, N):
         sortkey = codes.astype(np.int64); aux = 0; dt = 1; str_uniq = np.asarray(uniq)
     else:
         raise TypeError(f"cluster key must be int/float/datetime/string, got {base.dtype}")
+    tb = None
+    if tiebreak is not None:
+        tbase = np.asarray(tiebreak.data if isinstance(tiebreak, ma.MaskedArray) else tiebreak)
+        tk = tbase.dtype.kind
+        if tk in 'SUO':
+            import pandas as pd
+            tcodes, _tu = pd.factorize(tbase, sort=True); tb = tcodes.astype(np.int64)
+        elif tk == 'M':
+            tb = tbase.view('int64').astype(np.int64, copy=False)
+        else:
+            tb = tbase.astype(np.int64, copy=False)
     if mask is not None and mask.any():
-        order = np.lexsort((sortkey, mask)); nn = int((~mask).sum())
+        keys = (sortkey, mask) if tb is None else (tb, sortkey, mask)
+        order = np.lexsort(keys); nn = int((~mask).sum())
     else:
-        order = np.argsort(sortkey, kind='stable'); nn = N
+        order = np.argsort(sortkey, kind='stable') if tb is None else np.lexsort((tb, sortkey))
+        nn = N
     ks = sortkey[np.asarray(order)][:nn]
     vals, idx = np.unique(ks, return_index=True)
     offsets = np.append(idx.astype(np.int64), np.int64(nn))
@@ -258,7 +275,7 @@ def _cluster_order(kc, N):
                                    values=vals, offsets=offsets)
 
 
-def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_specs=None, cluster_by=None):
+def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_specs=None, cluster_by=None, cluster_tiebreak=None, cubes=None):
     """fd_specs: optional {dependent_col: determinant_col} — store the dependent column as
     a mode-3 FD-reference into the determinant (lossless iff the FD is exact; callers pass
     only verified FDs). Determinant must be a normal (non-FD) column in the same segment."""
@@ -270,10 +287,17 @@ def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_s
     if cluster_by is not None:
         if cluster_by not in coldata:
             raise KeyError(f"cluster_by {cluster_by!r} not among columns {list(coldata)}")
-        _order, cluster_meta = _cluster_order(coldata[cluster_by], N)
+        _tb = None
+        if cluster_tiebreak is not None:
+            if cluster_tiebreak not in coldata:
+                raise KeyError(f"cluster_tiebreak {cluster_tiebreak!r} not among columns {list(coldata)}")
+            _tb = coldata[cluster_tiebreak]
+        _order, cluster_meta = _cluster_order(coldata[cluster_by], N, tiebreak=_tb)
         for _nm in cols:
             coldata[_nm] = coldata[_nm][_order]
         cluster_meta['key'] = cluster_by
+        if cluster_tiebreak is not None:
+            cluster_meta['tiebreak'] = cluster_tiebreak
     if workers is None:
         workers = min(len(cols), (os.cpu_count() or 4))
     blobs = {}; sizes = {}
@@ -330,6 +354,13 @@ def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_s
         import pickle
         with open(out_path + '.cluster', 'wb') as _cf:
             pickle.dump(cluster_meta, _cf, protocol=4)
+    if cubes:                                     # materialise low-card GROUP BY cubes (the cap in
+        try:                                      # wdb_cube declines any grouping above CUBE_MAX_CELLS)
+            from wdb_engine import Segment
+            import wdb_cube
+            wdb_cube.build_and_write(Segment(out_path), cubes)
+        except Exception:
+            pass
     return dict(n_rows=N, n_cols=len(cols), bytes=len(out), seconds=time.time()-t0,
                 sizes=sizes, cluster=cluster_by)
 

@@ -55,6 +55,7 @@ def _worker(qi, dur):
     sys.path.insert(0, SRC); sys.path.insert(0, HERE)
     from wdb_db import Database
     import wdb_bsi_exec as BX
+    import wdb_cube as CB
     from catalog import QUERIES
     import numba; numba.set_num_threads(1)              # one worker == one core
     db = Database.open(WDB)
@@ -63,10 +64,11 @@ def _worker(qi, dur):
         except Exception: pass
     sql = QUERIES[qi][2]
     for _ in range(3): db.run(sql)                      # warm (JIT + caches + lazy BSI build)
-    h = BX._BSI_HITS; db.run(sql); fired = int(BX._BSI_HITS > h)
+    h = BX._BSI_HITS; hc = CB._CUBE_HITS; db.run(sql)
+    fired = int(BX._BSI_HITS > h); cube = int(CB._CUBE_HITS > hc)
     end = time.perf_counter() + dur; c = 0
     while time.perf_counter() < end: db.run(sql); c += 1
-    print(f"{c} {_smaps_private_dirty()} {fired}", flush=True)
+    print(f"{c} {_smaps_private_dirty()} {fired} {cube}", flush=True)
 
 
 def _dworker(qi, dur):
@@ -108,15 +110,15 @@ def run(budget_gb=32, cores=None):
     for i, (cat, name, sql, _) in enumerate(QUERIES):
         s = _spawn('w', i, SOLO, 1)[0]
         try:
-            solo = int(s[0]) / SOLO; priv = int(s[1]); fired = bool(int(s[2]))
+            solo = int(s[0]) / SOLO; priv = int(s[1]); fired = bool(int(s[2])); cube = bool(int(s[3]))
         except (ValueError, IndexError):
-            rows.append((cat, name, False, 0, 0, 0.0, 0.0, 0.0))
+            rows.append((cat, name, False, 0, 0, 0.0, 0.0, 0.0, False))
             print(f"  {i:>2} {name:<26} ERR"); continue
         W = min(cores, max(1, budget // max(priv, 1)))
         wq = sum(int(o[0]) for o in _spawn('w', i, CONC, W) if o) / CONC
         dq = sum(int(o[0]) for o in _spawn('d', i, CONC, W) if o) / CONC
         ratio = wq / dq if dq > 0 else 0.0
-        rows.append((cat, name, fired, solo, W, wq, dq, ratio))
+        rows.append((cat, name, fired, solo, W, wq, dq, ratio, cube))
         print(f"  {i:>2} {name:<26}{'BSI' if fired else '-':>4}{solo:>9.0f}{W:>4}"
               f"{wq:>9.0f}{dq:>9.0f}{ratio:>7.2f}x")
     _write_md(rows, budget_gb, cores)
@@ -129,7 +131,9 @@ def _write_md(rows, budget_gb, cores):
     med = ratios[len(ratios) // 2] if ratios else 0.0
     wins = sum(1 for r in rows if r[7] >= 1.0)
     bsi_n = sum(1 for r in rows if r[2])
-    bw_n = sum(1 for r in rows if r[3] > 0 and r[4] > 0 and (r[5] / (r[3] * r[4])) < 0.6)
+    cube_n = sum(1 for r in rows if len(r) > 8 and r[8])
+    bw_n = sum(1 for r in rows if not (len(r) > 8 and r[8])      # cubes are parse-bound, not bandwidth-bound
+               and r[3] > 0 and r[4] > 0 and (r[5] / (r[3] * r[4])) < 0.6)
     L = ["# WaveDB throughput scoreboard\n"]
     L.append(f"_TPC-H sf=1 - vs DuckDB - commit `{git}` - {datetime.date.today().isoformat()} - "
              f"W={cores} single-thread workers per engine, {budget_gb} GB budget._\n")
@@ -138,28 +142,39 @@ def _write_md(rows, budget_gb, cores):
              "aggregate queries/sec, memory-bandwidth contention included (not extrapolated from "
              "single-query latency). WaveDB runs in the default non-escalated (throughput) mode, so the "
              "BSI filter-index engages where it pays (BSI column).\n")
+    L.append("Rows marked **cube** in the bound column are answered from a materialised low-card GROUP BY "
+             "aggregate (a precomputed [count, sums] per cell, built at load time for filter-free group-bys "
+             "whose cell count is under the cap) -- the query reads a few hundred bytes instead of scanning "
+             "the value columns, so it is parse-bound, not bandwidth-bound. This is a materialised view: a "
+             "DIFFERENT class than a faster scan (DuckDB could build the same), and it applies ONLY to "
+             "filter-free low-card group-bys with COUNT/SUM/AVG; everything else falls back to the scan.\n")
     L.append("| # | category | query | BSI | WaveDB 1-wkr q/s | WaveDB @W q/s | scale | bound | "
              "DuckDB @W q/s | ratio |")
     L.append("|---|---|---|:-:|--:|--:|--:|:-:|--:|--:|")
     last = None
-    for i, (cat, name, fired, solo, W, wq, dq, ratio) in enumerate(rows):
+    for i, r in enumerate(rows):
+        cat, name, fired, solo, W, wq, dq, ratio = r[:8]
+        is_cube = len(r) > 8 and r[8]
         if cat != last:
             L.append(f"| **{cat}** | | | | | | | | | |"); last = cat
         scale = wq / (solo * W) if solo > 0 and W > 0 else 0.0
-        bound = 'RAM' if W < cores else ('BW' if scale < 0.6 else 'CPU')
+        bound = 'cube' if is_cube else ('RAM' if W < cores else ('BW' if scale < 0.6 else 'CPU'))
         mark = " **" if ratio >= 1 else ""
         L.append(f"| {i} | {cat} | {name} | {'Y' if fired else '-'} | {solo:.0f} | {wq:.0f} | "
                  f"{scale*100:.0f}% | {bound} | {dq:.0f} | {ratio:.2f}x{mark} |")
     L.append("")
-    L.append(f"**{wins}/{len(rows)} faster than DuckDB - median {med:.2f}x.** BSI filter-index engaged "
-             f"on {bsi_n} {'query' if bsi_n == 1 else 'queries'}. {bw_n}/{len(rows)} queries are "
+    L.append(f"**{wins}/{len(rows)} faster than DuckDB - median {med:.2f}x.** "
+             f"{cube_n} filter-free low-card group-bys are answered from a materialised cube (bound=cube; "
+             f"precomputed aggregate, not a scan). BSI filter-index engaged on {bsi_n} "
+             f"{'query' if bsi_n == 1 else 'queries'}. Of the scan queries, {bw_n}/{len(rows)} are "
              f"memory-bandwidth-bound under concurrency (scale < 60%): the shared memory bus, not core "
              f"count or RAM capacity, is the throughput wall -- so the lever is **bytes read per query** "
-             f"(compression + the BSI index), not single-query latency. Bold ratios are WaveDB wins.\n")
+             f"(compression, the BSI index, and -- where the shape allows -- not reading at all via the "
+             f"cube), not single-query latency. Bold ratios are WaveDB wins.\n")
     rep = os.path.join(ROOT, 'examples', 'throughput.md')
     open(rep, 'w').write("\n".join(L) + "\n")
     print(f"\nwrote {rep}")
-    print(f"  {wins}/{len(rows)} faster, median {med:.2f}x, BSI on {bsi_n}")
+    print(f"  {wins}/{len(rows)} faster, median {med:.2f}x, BSI on {bsi_n}, cube on {cube_n}")
     return rep
 
 

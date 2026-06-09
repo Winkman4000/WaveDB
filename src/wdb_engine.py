@@ -90,6 +90,7 @@ class Segment:
         self.path = path; self._presence = 0   # 0 = not yet loaded
         self._ov = 0                            # override sidecar: 0 = not yet loaded
         self._cluster = 0                       # .cluster slice-boundary sidecar: 0 = not loaded
+        self._cubes = 0                         # .cube materialised-aggregate sidecar: 0 = not loaded
         self._synth = {}                        # mode-6 synthetic constant columns (ADD COLUMN)
         self._tdict = {}                        # memo: decoded base dict per column (immutable .wdb)
         self._resident = {}                     # memo: full per-row decoded array, kept resident for chunk reads
@@ -405,6 +406,15 @@ class Segment:
             p = self.path + '.cluster'
             self._cluster = pickle.load(open(p, 'rb')) if os.path.exists(p) else None
         return self._cluster
+
+    def cubes(self):
+        """Materialised low-card GROUP BY cubes from the .cube sidecar, or [] if none. Each is a dict
+        {dims, B, keys, count, sums} -- a precomputed aggregate the executor can answer from directly."""
+        if isinstance(self._cubes, int):              # 0 = not yet loaded
+            import os, pickle
+            p = self.path + '.cube'
+            self._cubes = pickle.load(open(p, 'rb')) if os.path.exists(p) else []
+        return self._cubes
 
     def slice_for_predicate(self, nm, op, lit):
         """If nm is the cluster key and (op, lit) is a range/eq, return the contiguous (lo, hi)

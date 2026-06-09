@@ -242,6 +242,10 @@ def write_md(tabs, fk, side, dsz, out, mem, dmem, floor, Nl, secs, bsi=(0, [])):
     L.append("")
     L.append(f"**{okc}/{len(out)} correct - {fc}/{len(out)} fused - {win}/{len(sps)} faster than DuckDB "
              f"- median {med:.2f}x - peak RAM median {pmed:.0f} MB / max {pmax:.0f} MB**\n")
+    L.append("_Some filter-free low-card GROUP BY queries are answered from a materialised aggregate cube "
+             "(a precomputed [count, sums] per cell built at load time) rather than a scan, so they show as "
+             "non-fused here; the cube is a materialised view (a different class than a faster scan), gated "
+             "to filter-free low-card group-bys with COUNT/SUM/AVG and falling back to the scan otherwise._\n")
     rep = os.path.join(ROOT, 'examples', 'report.md')
     open(rep, 'w').write("\n".join(L) + "\n")
     return rep, (okc, len(out), fc, win, med, pmed, pmax, dsz/wtot)
