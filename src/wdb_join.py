@@ -299,7 +299,6 @@ class _FastUnsupported(Exception):
 _FAST_HITS = 0   # diagnostic: how many queries took the gather fast path
 _TOPK_HITS = 0   # diagnostic: how many queries had `present` pruned by the bounded top-K prefilter
 _SLICE_SCALAR_HITS = 0   # diagnostic: how many queries took the per-slice scalar agg (cluster-key GROUP BY + predicate)
-_SLICE2_SCALAR_HITS = 0  # diagnostic: how many queries took the cluster-key + tiebreak two-key per-range scalar agg
 def _bump_fast():
     global _FAST_HITS
     _FAST_HITS += 1
@@ -447,40 +446,6 @@ def _slice_scalar_agg(group_keys, inputs, exprs, mask, n, pred, offsets):
         counts[g] += int(cnt[0])                         # += (not =) so a key split across runs still sums
         for e in range(len(exprs)):
             sums[e][g] += out[e][0][0]
-    return counts, [(sums[e], None, None) for e in range(len(exprs))]
-
-
-def _slice2_scalar_agg(group_keys, inputs, exprs, mask, n, pred, offsets):
-    """Two-key GROUP BY where the leading key is the cluster key (each slice is one leading-key value,
-    contiguous via `offsets`) and the second key is the cluster TIEBREAK -- so rows sharing a (leading,
-    second) pair are adjacent WITHIN each slice by construction of the build sort. Each (slice x second-
-    key run) is therefore exactly one composite group: run the register-accumulator scalar kernel once
-    per run instead of grouped_multi's per-group indexed-write scatter. Value columns are read once, in
-    one pass (the runs partition each slice, the slices partition the table). Composite code matches
-    grouped_multi's mixed-radix g0*K1 + g1, so output indexing is identical. SUM/AVG/COUNT only (caller
-    gates out MIN/MAX). Run boundaries come from change-points in the second key -- this needs only
-    equal-pair adjacency (guaranteed by the tiebreak sort), never an assumption about code ordering."""
-    (k0, K0, _), (k1, K1, _) = group_keys[0], group_keys[1]
-    K = K0 * K1
-    global _SLICE2_SCALAR_HITS; _SLICE2_SCALAR_HITS += 1
-    counts = np.zeros(K, dtype=np.int64)
-    sums = [np.zeros(K, dtype=np.float64) for _ in exprs]
-    for gi in range(len(offsets) - 1):
-        lo, hi = int(offsets[gi]), int(offsets[gi + 1])
-        if hi <= lo: continue
-        g0 = int(k0[lo])                                  # leading key constant across the slice
-        s = k1[lo:hi]                                     # second key: contiguous runs (tiebreak-sorted)
-        chg = np.flatnonzero(s[1:] != s[:-1]) + 1
-        starts = np.concatenate(([0], chg)); ends = np.concatenate((chg, [hi - lo]))
-        for a, b in zip(starts.tolist(), ends.tolist()):
-            comp = g0 * K1 + int(s[a])
-            si = [(bb, c[lo + a:lo + b], (None if p is None else np.ascontiguousarray(p[lo + a:lo + b])))
-                  for (bb, c, p) in inputs]
-            cnt, out = wdb_exprjit.scalar_multi(
-                si, exprs, (None if mask is None else mask[lo + a:lo + b]), b - a, pred)
-            counts[comp] += int(cnt[0])
-            for e in range(len(exprs)):
-                sums[e][comp] += out[e][0][0]
     return counts, [(sums[e], None, None) for e in range(len(exprs))]
 
 
@@ -1138,7 +1103,7 @@ def _fast_pointer_agg(db, tree, ctx):
                 if body not in ex_index: ex_index[body] = len(exprs); exprs.append([body, False])
                 if fn in ('MIN', 'MAX'): exprs[ex_index[body]][1] = True
         _mask = None if pred_body else get_mask()
-        _cm = gkeys[0]['seg'].cluster_meta() if (1 <= len(gkeys) <= 2) else None
+        _cm = gkeys[0]['seg'].cluster_meta() if len(gkeys) == 1 else None
         _no_mm = not any(e[1] for e in exprs)
         if not group_keys and _no_mm:     # no GROUP BY, no MIN/MAX -> lean scalar kernel
             counts, results = wdb_exprjit.scalar_multi(slot_list, exprs, _mask, n, pred_body)
@@ -1146,13 +1111,6 @@ def _fast_pointer_agg(db, tree, ctx):
               and _cm.get('key') == gkeys[0]['pcol'] and gkeys[0]['seg'].presence_mask() is None):
             counts, results = _slice_scalar_agg(group_keys, slot_list, exprs,   # cluster-key GROUP BY +
                                                 _mask, n, pred_body, _cm['offsets'])  # predicate -> per-slice scalar
-        elif (len(gkeys) == 2 and _cm is not None and gid_to_comp is None and _no_mm
-              and gkeys[0]['cptr'] is None and gkeys[1]['cptr'] is None
-              and gkeys[1]['seg'] is gkeys[0]['seg']
-              and _cm.get('key') == gkeys[0]['pcol'] and _cm.get('tiebreak') == gkeys[1]['pcol']
-              and gkeys[0]['seg'].presence_mask() is None):
-            counts, results = _slice2_scalar_agg(group_keys, slot_list, exprs,  # cluster-key + tiebreak
-                                                 _mask, n, pred_body, _cm['offsets'])  # 2-key -> per-range scalar
         else:
             counts, results = wdb_exprjit.grouped_multi(group_keys, slot_list, exprs,
                                                         _mask, n, pred_body)

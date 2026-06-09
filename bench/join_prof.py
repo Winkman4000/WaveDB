@@ -16,21 +16,21 @@ wt = lambda t: 'float' if t.startswith('DECIMAL') else WT[t]
 if not os.path.exists(DIR):
     os.makedirs(DIR); con = duckdb.connect(); con.execute(f"INSTALL tpch; LOAD tpch; CALL dbgen(sf={SF})")
     db = Database.create(os.path.join(DIR,'wdb'))
-    def load(tbl, order_by=None, extra=None, cluster_by=None, cluster_tiebreak=None, cubes=None):
+    def load(tbl, order_by=None, extra=None, cluster_by=None, cubes=None):
         desc = con.execute(f"DESCRIBE {tbl}").fetchall()
         cols=[(f"CAST({c[0]} AS DOUBLE) AS {c[0]}" if c[1].startswith('DECIMAL') else c[0]) for c in desc]
         sch=[[c[0],wt(c[1])] for c in desc]
         if extra: cols.append(extra[0]); sch.append(extra[1])
         ob=f" ORDER BY {order_by}" if order_by else ""
         pq=os.path.join(DIR,f'{tbl}.parquet'); con.execute(f"COPY (SELECT {', '.join(cols)} FROM {tbl}{ob}) TO '{pq}' (FORMAT parquet)")
-        db.cat.add_table(tbl,sch); seg=f'{tbl}_0.wdb'; wdb_encode.encode(pq,os.path.join(DIR,'wdb',seg),cluster_by=cluster_by,cluster_tiebreak=cluster_tiebreak,cubes=cubes); db.cat.add_segment(tbl,seg)
+        db.cat.add_table(tbl,sch); seg=f'{tbl}_0.wdb'; wdb_encode.encode(pq,os.path.join(DIR,'wdb',seg),cluster_by=cluster_by,cubes=cubes); db.cat.add_segment(tbl,seg)
     load('customer', order_by='c_custkey')
     con.execute("CREATE TEMP TABLE ord_pk AS SELECT o_orderkey, row_number() OVER (ORDER BY o_orderkey)-1 AS pos FROM orders")
     load('orders', order_by='o_orderkey')
-    # lineitem clustered by l_returnflag, tiebroken by l_linestatus: returnflag stays the contiguous
-    # leading slice key (unchanged offsets — #4/#5/#16 range-walk identical), and linestatus is now
-    # contiguous WITHIN each returnflag slice so the 2-col Q1 group (#6) takes the per-range scalar path.
-    load('lineitem', cluster_by='l_returnflag', cluster_tiebreak='l_linestatus',
+    # lineitem clustered by l_returnflag (the planner's measured pick): GROUP BY returnflag (#4/#5)
+    # and the filtered returnflag group (#16) take the cluster slice paths. Low-card filter-free
+    # group-bys are answered from the materialised cube; the 2-col Q1 group (#6) falls to the cube too.
+    load('lineitem', cluster_by='l_returnflag',
          cubes=[['l_returnflag'], ['l_shipmode'], ['l_returnflag','l_linestatus']],
          extra=("(SELECT pos FROM ord_pk WHERE o_orderkey=l_orderkey) AS l_ord_ptr",['l_ord_ptr','int']))
     print("built", DIR)
