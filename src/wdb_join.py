@@ -802,7 +802,22 @@ def _fast_pointer_agg(db, tree, ctx):
     gkeys = []                                           # one per GROUP BY column
     for g in gnodes:
         gseg, gpcol, gcptr = resolve(g)
-        if gseg.cols[gpcol]['mode'] == 4: raise _FastUnsupported   # codes not value-identity
+        if gseg.cols[gpcol]['mode'] == 4:
+            # Affine-coded (mode 4): stored codes are not dict indices, so the dict-decode label path
+            # can't map them. Factorise the column's VALUES to dense group ids + carry explicit labels.
+            # Value-correct and mode-agnostic; gather/scatter and mixed-radix decode are unchanged.
+            vals = np.asarray(gseg.values(gpcol))
+            gids, uniq = pd.factorize(vals, sort=False)
+            full = np.ascontiguousarray(gids.astype(np.int64))
+            if full.size == 0: return [], [wdb_sql._alias(p) for p in proj]
+            if gseg.cols[gpcol]['dt'] == 3:
+                _u = np.asarray(uniq).astype(np.int64).view(f"datetime64[{gseg.unit(gpcol)}]")
+                _labels = [wdb_sql._pyval(x) for x in _u]
+            else:
+                _labels = [wdb_sql._pyval(x) for x in np.asarray(uniq).tolist()]
+            gkeys.append({'seg': gseg, 'pcol': gpcol, 'cptr': gcptr, 'full': full,
+                          'K': len(uniq), 'labels': _labels})
+            continue
         full = gseg.codes(gpcol)
         if full.size == 0: return [], [wdb_sql._alias(p) for p in proj]
         gkeys.append({'seg': gseg, 'pcol': gpcol, 'cptr': gcptr, 'full': full, 'K': int(full.max()) + 1})
@@ -1240,7 +1255,10 @@ def _fast_pointer_agg(db, tree, ctx):
         r = col_results[i]
         if r[0] == 'key':
             gk = gkeys[r[1]]
-            col_lists.append(_bulk_keyvals(gk['seg'], gk['pcol'], kc_arr[r[1]]))
+            if 'labels' in gk:                            # affine/factorised key: gid -> value via label table
+                _lab = gk['labels']; col_lists.append([_lab[c] for c in kc_arr[r[1]].tolist()])
+            else:
+                col_lists.append(_bulk_keyvals(gk['seg'], gk['pcol'], kc_arr[r[1]]))
         elif r[0] == 'count':
             col_lists.append(counts[present].tolist())
         else:
