@@ -335,9 +335,9 @@ def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_s
             from wdb_engine import Segment
             import wdb_cube
             _seg = Segment(out_path)
-            if cubes == 'auto':                   # exhaustive: every column-subset whose card product fits
-                cards = wdb_cube.segment_cardinalities(_seg)
-                specs = wdb_cube.enumerate_cube_specs(cards)
+            if cubes == 'auto':                   # exhaustive but non-redundant: only the maximal cubes
+                cards = wdb_cube.segment_cardinalities(_seg)   # are persisted; sub-cubes derive at query time
+                specs = wdb_cube.maximal_cube_specs(cards)
             else:
                 specs = cubes
             wdb_cube.build_and_write(_seg, specs, workers=workers)

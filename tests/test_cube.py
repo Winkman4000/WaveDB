@@ -110,10 +110,29 @@ def test_cube_auto_true_cardinality():
     cards = wdb_cube.segment_cardinalities(seg)
     assert cards['q'] == 8 and cards['g'] == 5, f"true card wrong (mode-4 V leak?): {cards}"   # not 20000
     built = set(frozenset(c['dims']) for c in seg.cubes())
-    assert built == set(frozenset(s) for s in wdb_cube.enumerate_cube_specs(cards)), "auto set != enumerator"
-    assert frozenset(['g','q']) in built, f"expected (g,q) cube, got {built}"
+    assert built == set(frozenset(s) for s in wdb_cube.maximal_cube_specs(cards)), "persisted != maximal set"
+    # (g,q) is non-maximal -> derivable, not stored; the range-filter query must still fire a cube (derived) and be correct
+    assert frozenset(['g','q']) not in built, f"(g,q) should be derived, not persisted: {built}"
     before = wdb_cube._CUBE_HITS
     qy = "SELECT g, SUM(amt) FROM t WHERE q > 4 GROUP BY g"
     got = _norm(db.run(qy)[0]); exp = _norm([tuple(r) for r in con.execute(qy).fetchall()])
-    assert wdb_cube._CUBE_HITS == before + 1, "auto (g,q) cube did not fire on range filter"
+    assert wdb_cube._CUBE_HITS == before + 1, "auto (g,q) cube did not fire on range filter (derive failed?)"
     assert got == exp, f"auto cube range-filter mismatch\n got {got[:4]}\n exp {exp[:4]}"
+
+
+def test_cube_derive_equals_direct():
+    # a cube rolled down from a superset must equal a directly-built cube (within float tolerance):
+    # same keyset, identical counts, sums equal to fp ULP. This is what makes maximal-only lossless.
+    db, _ = _fixture()
+    seg = Segment(db.cat.segment_paths('t')[0])
+    cubes = seg.cubes()
+    gs = next(c for c in cubes if set(c['dims']) == {'g', 's'})        # parent
+    g_direct = next(c for c in cubes if c['dims'] == ['g'])            # directly built
+    g_der = wdb_cube._derive_cube(gs, ['g'])                          # rolled down from (g,s)
+    dd = {k: i for i, k in enumerate(g_direct['keys'])}
+    assert set(g_der['keys']) == set(g_direct['keys']), "derived keyset differs"
+    assert all(int(g_der['count'][i]) == int(g_direct['count'][dd[k]]) for i, k in enumerate(g_der['keys'])), "counts differ"
+    for m in g_der['sums']:
+        for i, k in enumerate(g_der['keys']):
+            a = float(g_der['sums'][m][i]); b = float(g_direct['sums'][m][dd[k]])
+            assert abs(a - b) <= 1e-6 * max(1.0, abs(b)), f"derived sum {m} off: {a} vs {b}"

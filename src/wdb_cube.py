@@ -81,6 +81,43 @@ def build_cube(seg, dims, max_cells=CUBE_MAX_CELLS):
     return {'dims': list(dims), 'B': B, 'keys': keys, 'count': count, 'sums': sums}
 
 
+def _derive_cube(parent, sub_dims):
+    """Roll a stored cube up to a subset of its dims by summing out the rest. Exact: count and every
+    measure-sum are additive, so the result is value-identical to build_cube(seg, sub_dims) (cell order
+    aside, which no caller depends on). O(parent cells) -- microseconds for a <=4096-cell parent."""
+    pidx = [parent['dims'].index(d) for d in sub_dims]
+    pkeys = parent['keys']; pcount = parent['count']; psums = parent['sums']
+    pos = {}; order = []; cnt = []; sacc = {m: [] for m in psums}
+    for b in range(len(pkeys)):
+        k = pkeys[b]; sk = tuple(k[i] for i in pidx)
+        j = pos.get(sk)
+        if j is None:
+            j = len(order); pos[sk] = j; order.append(sk); cnt.append(0)
+            for m in sacc: sacc[m].append(0.0)
+        cnt[j] += int(pcount[b])
+        for m in psums: sacc[m][j] += float(psums[m][b])
+    return {'dims': list(sub_dims), 'B': len(order), 'keys': order,
+            'count': np.asarray(cnt, dtype=np.int64),
+            'sums': {m: np.asarray(sacc[m], dtype=np.float64) for m in psums}}
+
+
+def _get_cube(cubes, needed):
+    """Return the smallest cube that answers GROUP BY `needed`: an exact stored cube if present, else
+    the dims rolled down from the smallest stored superset (derived once and cached into `cubes`, so
+    later queries of the same shape hit it directly). None if no stored cube covers `needed`.
+    This is what lets disk persist only the maximal (non-redundant) cubes while every sub-cube the
+    operator asks for still arrives ready-made."""
+    needed = set(needed)
+    for c in cubes:
+        if set(c['dims']) == needed: return c
+    cands = [c for c in cubes if needed <= set(c['dims'])]
+    if not cands: return None
+    parent = min(cands, key=lambda c: c['B'])
+    derived = _derive_cube(parent, [d for d in parent['dims'] if d in needed])
+    cubes.append(derived)                              # cache for this segment instance (RAM only)
+    return derived
+
+
 def write_cubes(seg_path, cubes):
     pickle.dump(list(cubes), open(seg_path + '.cube', 'wb'), protocol=4)
 
@@ -154,6 +191,21 @@ def enumerate_cube_specs(cards, cap=CUBE_MAX_CELLS, max_arity=None):
     return [dims for _p, dims in out]
 
 
+def maximal_cube_specs(cards, cap=CUBE_MAX_CELLS):
+    """The non-redundant cubes to actually persist: every spec to which no further column can be added
+    without exceeding the cap. Each spec dropped from the full enumeration is a strict subset of one of
+    these, so it is recovered exactly by rolling a maximal cube down (see _get_cube/_derive_cube) --
+    full generality, a fraction of the storage and build cost."""
+    cset = {c: v for c, v in cards.items() if v >= 2}
+    out = []
+    for s in enumerate_cube_specs(cards, cap):
+        p = 1
+        for c in s: p *= cset[c]
+        if all((c in s) or (p * v > cap) for c, v in cset.items()):   # cannot extend by any column
+            out.append(s)
+    return out
+
+
 def _grouped_cdist_from_cube(tree, col_map, cubes):
     """SELECT col1, COUNT(DISTINCT col2) ... GROUP BY col1  answered from a [col1,col2] cube.
     Every stored cell is one (col1,col2) pair that actually occurred, so COUNT(DISTINCT col2) for a
@@ -183,7 +235,7 @@ def _grouped_cdist_from_cube(tree, col_map, cubes):
             if nm is None: return None
             if (col_map.get(nm, nm) if col_map else nm) != col1: return None
     if cd_col is None or cd_col == col1: return None
-    cube = next((c for c in cubes if len(c['dims']) == 2 and set(c['dims']) == {col1, cd_col}), None)
+    cube = _get_cube(cubes, {col1, cd_col})                 # exact or derived [col1,col2] cube
     if cube is None: return None
     i1 = cube['dims'].index(col1); i2 = cube['dims'].index(cd_col)
     cnt = collections.Counter(); allv1 = []
@@ -277,7 +329,7 @@ def _range_filter_from_cube(tree, col_map, cubes):
         if nm is None: return None
         gcols.append(mp(nm))
     if fcol in gcols: return None                          # filter col must be the non-grouped dim
-    cube = next((c for c in cubes if set(c['dims']) == (set(gcols) | {fcol})), None)
+    cube = _get_cube(cubes, set(gcols) | {fcol})
     if cube is None: return None
     proj = tree.expressions
     getters = []; need = set()
@@ -359,7 +411,7 @@ def try_cube(seg, tree, col_map):
         if nm is None: return None
         gcols.append(col_map.get(nm, nm) if col_map else nm)
     gset = set(gcols)
-    cube = next((c for c in cubes if set(c['dims']) == gset), None)
+    cube = _get_cube(cubes, gset)
     if cube is None: return None
     proj = tree.expressions
     getters = []
