@@ -30,9 +30,11 @@ if not os.path.exists(DIR):
     # orders so cubes='auto' cubes it; the planner then answers a customer-dim group-by (e.g. #25) from
     # the orders cube instead of a gather. High-card customer columns are left to the gather.
     _cust = db.open_segment(os.path.join(DIR, 'wdb', 'customer_0.wdb'), 'customer')
-    _stamp = wdb_cube.low_card_stamp_cols(_cust)                       # e.g. c_mktsegment(5), c_nationkey(25)
     _ctypes = {d[0]: d[1] for d in con.execute("DESCRIBE customer").fetchall()}
     _odesc = con.execute("DESCRIBE orders").fetchall()
+    _ocolset = {c[0] for c in _odesc}                                 # skip stamps that would collide with an
+    _stamp = [c for c in wdb_cube.low_card_stamp_cols(_cust)          # existing child col (e.g. the FK key
+              if f'o_{c[2:]}' not in _ocolset]                        # c_custkey -> o_custkey already present)
     _ocols = ", ".join((f"CAST(o.{c[0]} AS DOUBLE) AS {c[0]}" if c[1].startswith('DECIMAL') else f"o.{c[0]}") for c in _odesc)
     _ssel = ", ".join(f"c.{c} AS o_{c[2:]}" for c in _stamp)
     _osch = [[c[0], wt(c[1])] for c in _odesc] + [[f"o_{c[2:]}", wt(_ctypes[c])] for c in _stamp]
