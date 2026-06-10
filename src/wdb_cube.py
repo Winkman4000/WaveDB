@@ -22,40 +22,57 @@ import numpy as np
 import wdb_sql
 import sqlglot.expressions as E
 
-CUBE_MAX_CELLS = 1024          # prod(dim cardinalities) cap; above this storage cost outweighs the win
+CUBE_MAX_CELLS = 4096          # prod(dim cardinalities) cap; above this storage cost outweighs the win.
+                               # Measured: a 2,526-cell l_shipdate cube is ~114 KB and answers GROUP BY date
+                               # in 0.37ms vs DuckDB 12.4ms (33x/worker). 4096 keeps that in, stays tiny.
 _CUBE_HITS = 0                 # diagnostic: how many queries were answered from a materialised cube
 
 
-def _radix(seg, dims):
-    """(per-row composite code, [K per dim]) or None if prod(K) exceeds the cell cap."""
-    codes = []; Ks = []
+def _radix(seg, dims, max_cells=CUBE_MAX_CELLS):
+    """(per-row composite code, [K per dim], [value array per dim]) or None if prod(K) > cap.
+
+    Dense per-dim codes come from factorising each dim's MEASURED values -- not seg.codes() -- so the
+    cube is built off the distinct values actually present and is independent of the column's storage
+    mode (dict mode 0 OR positional mode 4). seg.codes() returns row-position codes for mode-4 columns
+    (e.g. small-N datetime), which would spuriously look high-card; factorising the values is the honest
+    self-measured cardinality. NA (null) factorises to its own code so a null group is preserved."""
+    import pandas as pd
+    codes = []; Ks = []; vals_list = []
     for d in dims:
-        c = seg.codes(d)
-        K = int(c.max()) + 1 if c.size else 0
-        codes.append(np.asarray(c).astype(np.int64, copy=False)); Ks.append(K)
+        vals = np.asarray(wdb_sql._col(seg, d)[0])
+        c, uniq = pd.factorize(vals, sort=True)                 # dense 0..K-1, NA -> -1
+        c = c.astype(np.int64, copy=False)
+        if (c < 0).any(): c = c + 1; K = len(uniq) + 1          # lift NA into code 0 (its own group)
+        else: K = len(uniq)
+        codes.append(c); Ks.append(K); vals_list.append(vals)
     prod = 1
     for K in Ks: prod *= K
-    if prod == 0 or prod > CUBE_MAX_CELLS: return None
+    if prod == 0 or prod > max_cells: return None
     comp = np.zeros(seg.N, dtype=np.int64)
     for c, K in zip(codes, Ks):
         comp = comp * K + c
-    return comp, Ks
+    return comp, Ks, vals_list
 
 
 def build_cube(seg, dims, max_cells=CUBE_MAX_CELLS):
     """Freeze [count, Sum each non-null float measure] per occurring cell of GROUP BY `dims`.
     Returns a cube dict, or None if the grouping is too high-card to be worth materialising."""
-    r = _radix(seg, dims)
+    r = _radix(seg, dims, max_cells)
     if r is None: return None
-    comp, Ks = r
+    comp, Ks, dim_arrs = r
     uniq, first_idx, inv = np.unique(comp, return_index=True, return_inverse=True)
     B = int(len(uniq))
     count = np.bincount(inv, minlength=B).astype(np.int64)
     # decode each cell's group-key value from the executor's own per-row decode at a representative
-    # row of the cell -- guaranteed identical to what a scan would emit (no dict-ordering assumption)
-    dim_arrs = [np.asarray(wdb_sql._col(seg, d)[0]) for d in dims]
-    keys = [tuple(wdb_sql._pyval(dim_arrs[i][first_idx[b]]) for i in range(len(dims)))
-            for b in range(B)]
+    # row of the cell (dim_arrs come from _radix) -- identical to what a scan would emit.
+    # datetime dims are stored as int64 epochs; emit them exactly as the scan path does
+    # (epoch -> datetime64[unit] -> _pyval) so cube rows are byte-identical to a full scan.
+    dim_units = [seg.unit(d) if seg.cols[d].get('dt') == 3 else None for d in dims]
+    def _keyval(i, idx):
+        v = dim_arrs[i][idx]
+        if dim_units[i] is not None: v = np.int64(v).view(f'datetime64[{dim_units[i]}]')
+        return wdb_sql._pyval(v)
+    keys = [tuple(_keyval(i, first_idx[b]) for i in range(len(dims))) for b in range(B)]
     sums = {}
     for nm, meta in seg.cols.items():
         if meta.get('dt') == 2 and not meta.get('has_null'):       # non-null float measure only

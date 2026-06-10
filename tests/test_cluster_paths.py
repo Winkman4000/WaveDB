@@ -18,14 +18,14 @@ from wdb_engine import Segment
 
 _DB = None; _CON = None
 def _fixture():
-    """60k rows clustered by `a`. a x b = 32 cells (cube fires); a x c = 1600 cells (> 1024 cap -> the
+    """60k rows clustered by `a`. a x b = 32 cells (cube fires); a x c = 8000 cells (> 4096 cap -> the
     ['a','c'] cube is declined at build, so that group must fall to grouped_multi). String keys are
     dict-encoded (mode 0) and measures are real doubles (dt 2) so the fused path actually engages."""
     global _DB, _CON
     if _DB is not None: return _DB, _CON
     _CON = duckdb.connect()
     _CON.execute("CREATE TABLE t AS SELECT i AS id, 'A'||(i%8) AS a, 'B'||(i%4) AS b, "
-                 "'C'||(i%200) AS c, CAST(((i%50)+1)*1.5 AS DOUBLE) AS m1, "
+                 "'C'||(i%1000) AS c, CAST(((i%50)+1)*1.5 AS DOUBLE) AS m1, "
                  "CAST(((i%97)+1)*2.0 AS DOUBLE) AS m2 FROM range(60000) t(i)")
     d = os.path.join(tempfile.gettempdir(), f'clpath_{uuid.uuid4().hex[:8]}'); os.makedirs(d, exist_ok=True)
     _DB = Database.create(d)

@@ -18,15 +18,16 @@ def _fixture():
     d = os.path.join(tempfile.gettempdir(), f'cube_{uuid.uuid4().hex[:8]}'); os.makedirs(d, exist_ok=True)
     # g: 6-value low card, s: 4-value; k: high-card (near unique); amt: float measure
     _CON.execute("CREATE TABLE t AS SELECT i AS id, 'G'||(i%6) AS g, 'S'||(i%4) AS s, i AS k, "
+                 "(DATE '1992-01-01' + CAST(i%40 AS INTEGER)) AS d, "
                  "((i%50)+1)*1.5 AS amt FROM range(30000) t(i)")
     _DB = Database.create(d)
-    wt = {'BIGINT':'int','INTEGER':'int','VARCHAR':'string','DOUBLE':'float'}
+    wt = {'BIGINT':'int','INTEGER':'int','VARCHAR':'string','DOUBLE':'float','DATE':'datetime'}
     desc = _CON.execute("DESCRIBE t").fetchall()
     sel = ", ".join((f"CAST({c[0]} AS DOUBLE) AS {c[0]}" if c[1].startswith('DECIMAL') else c[0]) for c in desc)
     pq = os.path.join(d, 't.parquet'); _CON.execute(f"COPY (SELECT {sel} FROM t ORDER BY id) TO '{pq}' (FORMAT parquet)")
     _DB.cat.add_table('t', [[c[0], ('float' if c[1].startswith('DECIMAL') else wt[c[1]])] for c in desc])
     wdb_encode.encode(pq, os.path.join(d, 't_0.wdb'),
-                      cubes=[['g'], ['g','s'], ['k']])      # ['k'] is high-card -> cap declines it
+                      cubes=[['g'], ['g','s'], ['k'], ['d']])  # ['k'] high-card -> declined; ['d'] datetime (40)
     _DB.cat.add_segment('t', 't_0.wdb')
     return _DB, _CON
 
@@ -43,6 +44,8 @@ def _run(q, expect_cube):
     assert g == e, f"mismatch {q}\n got {g[:4]}\n exp {e[:4]}"
 
 def test_cube_single_dim_sum():   _run("SELECT g, COUNT(*), SUM(amt) FROM t GROUP BY g", True)
+def test_cube_datetime_dim():     _run("SELECT d, COUNT(*) FROM t GROUP BY d", True)        # dt=3 key path
+def test_cube_datetime_sum():     _run("SELECT d, SUM(amt) FROM t GROUP BY d", True)        # date key + measure
 def test_cube_single_dim_avg():   _run("SELECT g, AVG(amt) FROM t GROUP BY g", True)
 def test_cube_two_dim_q1():       _run("SELECT g, s, COUNT(*), SUM(amt), AVG(amt) FROM t GROUP BY g, s", True)
 def test_cube_order_limit():      _run("SELECT g, SUM(amt) z FROM t GROUP BY g ORDER BY z DESC, g LIMIT 2", True)

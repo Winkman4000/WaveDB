@@ -30,8 +30,9 @@ if not os.path.exists(DIR):
     # lineitem clustered by l_returnflag (the planner's measured pick): GROUP BY returnflag (#4/#5)
     # and the filtered returnflag group (#16) take the cluster slice paths. Low-card filter-free
     # group-bys are answered from the materialised cube; the 2-col Q1 group (#6) falls to the cube too.
+    # l_shipdate (2,526 distinct) is cubed too -- just over the old 1024 cap, ~114 KB, flips #7.
     load('lineitem', cluster_by='l_returnflag',
-         cubes=[['l_returnflag'], ['l_shipmode'], ['l_returnflag','l_linestatus']],
+         cubes=[['l_returnflag'], ['l_shipmode'], ['l_returnflag','l_linestatus'], ['l_shipdate']],
          extra=("(SELECT pos FROM ord_pk WHERE o_orderkey=l_orderkey) AS l_ord_ptr",['l_ord_ptr','int']))
     print("built", DIR)
 
