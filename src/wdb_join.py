@@ -101,7 +101,7 @@ def table_agg(db, tree):
     return _fast_pointer_agg(db, tree, _build_chain(db, tree))
 
 
-def join_query(db, sql):
+def join_query(db, sql, columnar=False):
     tree = sqlglot.parse_one(sql, read='duckdb')
     joins = tree.args.get('joins')
     # FK-pointer fast path: handles 1..N joins as a chain/star of pre-resolved pointers.
@@ -111,7 +111,7 @@ def join_query(db, sql):
         chain = None
     if chain is not None:
         try:
-            return _fast_pointer_agg(db, tree, chain)            # fully fused
+            return _fast_pointer_agg(db, tree, chain, columnar)  # fully fused
         except _FastUnsupported:
             return _chain_pandas(db, tree, chain)                # same chain, pandas agg/predicate tail
     # Not an FK chain (e.g. a join that has no stored pointer) -> single-join pandas hash merge.
@@ -473,7 +473,7 @@ def _slice_scalar_agg(group_keys, inputs, exprs, mask, n, pred, offsets):
     return counts, [(sums[e], None, None) for e in range(len(exprs))]
 
 
-def _fast_pointer_agg(db, tree, ctx):
+def _fast_pointer_agg(db, tree, ctx, columnar=False):
     import operator
     proj = tree.expressions
     group = tree.args.get('group')
@@ -1265,6 +1265,31 @@ def _fast_pointer_agg(db, tree, ctx):
         kc_arr = [None] * len(gkeys)
         for j in range(len(gkeys) - 1, -1, -1):
             kc_arr[j] = comp % radices[j]; comp //= radices[j]
+
+    # Native columnar result: hand back {name: ndarray} built from the already-native group arrays,
+    # skipping the per-cell _pyval decode and the row-tuple zip. Only when no HAVING/ORDER/LIMIT needs
+    # row materialisation (those stay on the row path). This is the big lever at high cardinality, where
+    # the per-row assembly -- not the gather -- dominated db.run.
+    if (columnar and tree.args.get('having') is None and tree.args.get('order') is None
+            and wdb_sql._limit(tree) is None):
+        names = [wdb_sql._alias(p) for p in proj]
+        out = {}
+        for i, p in enumerate(proj):
+            r = col_results[i]; nm = names[i]
+            if r[0] == 'key':
+                gk = gkeys[r[1]]
+                if 'labels' in gk:
+                    out[nm] = np.asarray(gk['labels'], dtype=object)[kc_arr[r[1]]]
+                else:
+                    out[nm] = np.asarray(_bulk_keyvals(gk['seg'], gk['pcol'], kc_arr[r[1]]), dtype=object)
+            elif r[0] == 'count':
+                out[nm] = counts[present]
+            else:
+                picked = r[1][present]
+                out[nm] = picked.astype(np.int64).view(f"datetime64[{r[3]}]") if r[2] else picked
+        _bump_fast()
+        return out, names
+
     col_lists = []
     for i, p in enumerate(proj):
         r = col_results[i]

@@ -76,6 +76,24 @@ class Database:
         if f is None: raise NotImplementedError("SELECT without FROM")
         return f.this.name
 
+    def run_columnar(self, sql):
+        """Native columnar result for a join GROUP BY: ({colname: ndarray}, colnames) with no Python
+        row-tuple assembly (the per-row cost that dominated db.run at high cardinality). Falls back to
+        transposing the row result for shapes the fast path can't emit columnar (non-join, HAVING/
+        ORDER/LIMIT)."""
+        tree = _parse_sql_cached(sql)
+        names = None
+        if isinstance(tree, E.Select) and tree.args.get('joins'):
+            res, names = wdb_join.join_query(self, sql, columnar=True)
+            if isinstance(res, dict):
+                return res, names
+            rows = res
+        else:
+            out = self.run(sql)
+            rows, names = out if isinstance(out, tuple) else (out, None)
+        cols = {n: [r[i] for r in rows] for i, n in enumerate(names)} if names else {}
+        return cols, names
+
     def run(self, sql, escalate=None):
         esc = self.escalate if escalate is None else escalate
         tree = _parse_sql_cached(sql)
