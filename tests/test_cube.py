@@ -18,6 +18,7 @@ def _fixture():
     d = os.path.join(tempfile.gettempdir(), f'cube_{uuid.uuid4().hex[:8]}'); os.makedirs(d, exist_ok=True)
     # g: 6-value low card, s: 4-value; k: high-card (near unique); amt: float measure
     _CON.execute("CREATE TABLE t AS SELECT i AS id, 'G'||(i%6) AS g, 'S'||(i%4) AS s, i AS k, "
+                 "CAST(i%8 AS INTEGER) AS q, "
                  "(DATE '1992-01-01' + CAST(i%40 AS INTEGER)) AS d, "
                  "((i%50)+1)*1.5 AS amt FROM range(30000) t(i)")
     _DB = Database.create(d)
@@ -27,7 +28,7 @@ def _fixture():
     pq = os.path.join(d, 't.parquet'); _CON.execute(f"COPY (SELECT {sel} FROM t ORDER BY id) TO '{pq}' (FORMAT parquet)")
     _DB.cat.add_table('t', [[c[0], ('float' if c[1].startswith('DECIMAL') else wt[c[1]])] for c in desc])
     wdb_encode.encode(pq, os.path.join(d, 't_0.wdb'),
-                      cubes=[['g'], ['g','s'], ['k'], ['d']])  # ['k'] high-card -> declined; ['d'] datetime (40)
+                      cubes=[['g'], ['g','s'], ['k'], ['d'], ['g','q']])  # ['k'] declined; ['d'] datetime(40); ['g','q'] locks range-filter
     _DB.cat.add_segment('t', 't_0.wdb')
     return _DB, _CON
 
@@ -72,3 +73,18 @@ def test_cube_build_returns_none_over_cap():
     seg = Segment(db.cat.segment_paths('t')[0])
     assert wdb_cube.build_cube(seg, ['k']) is None              # 30000 cells >> 1024 cap
     assert wdb_cube.build_cube(seg, ['g','s']) is not None      # 24 cells, fine
+
+
+# --- range filter on a cube dimension: WHERE fcol <op> const GROUP BY g -> exact roll-up from [g,fcol] cube ---
+# fcol is per-value in the cube, so the predicate selects whole cells (no straddling residual): EXACT, not approximate.
+def test_cube_range_gt():          _run("SELECT g, SUM(amt) FROM t WHERE q > 5 GROUP BY g", True)
+def test_cube_range_gte_count():   _run("SELECT g, COUNT(*) FROM t WHERE q >= 5 GROUP BY g", True)
+def test_cube_range_lt_sum():      _run("SELECT g, SUM(amt) FROM t WHERE q < 3 GROUP BY g", True)
+def test_cube_range_between():     _run("SELECT g, SUM(amt), COUNT(*) FROM t WHERE q BETWEEN 2 AND 5 GROUP BY g", True)
+def test_cube_range_in():          _run("SELECT g, SUM(amt) FROM t WHERE q IN (1,3,5) GROUP BY g", True)
+def test_cube_range_neq_avg():     _run("SELECT g, AVG(amt) FROM t WHERE q != 0 GROUP BY g", True)
+def test_cube_range_string_dim():  _run("SELECT g, SUM(amt) FROM t WHERE s >= 'S2' GROUP BY g", True)   # predicate on string dim
+def test_cube_range_order_limit(): _run("SELECT g, SUM(amt) z FROM t WHERE q > 3 GROUP BY g ORDER BY z DESC, g LIMIT 2", True)
+def test_cube_range_having():      _run("SELECT g, COUNT(*) c FROM t WHERE q > 1 GROUP BY g HAVING COUNT(*) > 2000", True)
+# multi-predicate AND -> _make_pred returns None -> cube must NOT fire, scan answers (still correct)
+def test_cube_range_and_fallback(): _run("SELECT g, SUM(amt) FROM t WHERE q > 2 AND g = 'G1' GROUP BY g", False)

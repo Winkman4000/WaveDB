@@ -154,18 +154,147 @@ def _grouped_cdist_from_cube(tree, col_map, cubes):
     return rows, [wdb_sql._alias(p) for p in proj]
 
 
+def _const(x):
+    """A literal/constant expr -> python scalar, or None if it is not a constant."""
+    if isinstance(x, E.Neg):
+        v = _const(x.this)
+        return None if v is None else -v
+    if isinstance(x, E.Literal):
+        if x.is_string: return x.this
+        s = x.this
+        try: return int(s)
+        except ValueError: return float(s)
+    if isinstance(x, E.Boolean):
+        return bool(x.this)
+    return None
+
+
+def _make_pred(expr):
+    """A single WHERE predicate on one column -> (colname, fn(value)->bool), or None.
+    fn treats NULL (None) as failing, matching SQL three-valued logic (NULL <op> const is never TRUE)."""
+    import operator
+    cmp = {E.GT: operator.gt, E.GTE: operator.ge, E.LT: operator.lt,
+           E.LTE: operator.le, E.EQ: operator.eq, E.NEQ: operator.ne}
+    t = type(expr)
+    if t in cmp:
+        col, val = expr.this, expr.expression
+        if not isinstance(col, E.Column): return None
+        c = _const(val)
+        if c is None: return None
+        f = cmp[t]
+        return wdb_sql._colname(col), (lambda v, f=f, c=c: v is not None and f(v, c))
+    if isinstance(expr, E.Between):
+        col = expr.this
+        lo = _const(expr.args.get('low')); hi = _const(expr.args.get('high'))
+        if not isinstance(col, E.Column) or lo is None or hi is None: return None
+        return wdb_sql._colname(col), (lambda v, lo=lo, hi=hi: v is not None and lo <= v <= hi)
+    if isinstance(expr, E.In):
+        col = expr.this
+        if not isinstance(col, E.Column): return None
+        vals = [_const(x) for x in expr.expressions]
+        if not vals or any(x is None for x in vals): return None
+        s = set(vals)
+        return wdb_sql._colname(col), (lambda v, s=s: v is not None and v in s)
+    return None
+
+
+def _range_filter_from_cube(tree, col_map, cubes):
+    """SELECT g..., COUNT(*)/SUM/AVG  FROM t  WHERE fcol <op> const  GROUP BY g...
+    answered from a cube whose dims are exactly {group cols} + {fcol}.
+
+    The filter column is a stored cube DIMENSION, so every row inside a cell shares fcol's value: the
+    predicate selects whole cells exactly, with no straddling residual. Roll the surviving cells up by
+    the group sub-key. EXACT (not approximate) precisely because fcol is per-value in the cube.
+
+    Gate = the cube's existence (a self-measurement): a {group, fcol} cube exists only if its cell count
+    cleared the cap at build time, so a high-card fcol (no such cube) returns None -> scan fallback.
+    Ops: > >= < <= = != BETWEEN IN. Single predicate only (AND/OR -> None). Returns (rows, cols) or None."""
+    mp = (lambda nm: col_map.get(nm, nm)) if col_map else (lambda nm: nm)
+    group = tree.args.get('group')
+    if group is None: return None
+    pred = _make_pred(tree.args.get('where').this)
+    if pred is None: return None
+    fcol_raw, fn = pred
+    if fcol_raw is None: return None
+    fcol = mp(fcol_raw)
+    gcols = []
+    for g in group.expressions:
+        nm = wdb_sql._colname(g)
+        if nm is None: return None
+        gcols.append(mp(nm))
+    if fcol in gcols: return None                          # filter col must be the non-grouped dim
+    cube = next((c for c in cubes if set(c['dims']) == (set(gcols) | {fcol})), None)
+    if cube is None: return None
+    proj = tree.expressions
+    getters = []; need = set()
+    for p in proj:
+        ak = wdb_sql._agg_kind(p)
+        if ak is None:                                     # bare group-key column
+            nm = wdb_sql._colname(p)
+            if nm is None: return None
+            pc = mp(nm)
+            if pc not in gcols: return None
+            getters.append(('key', gcols.index(pc)))
+        elif ak[0] == 'COUNT_STAR':
+            getters.append(('count',))
+        elif ak[0] == 'SUM':
+            pc = mp(ak[1])
+            if pc not in cube['sums']: return None
+            getters.append(('sum', pc)); need.add(pc)
+        elif ak[0] == 'AVG':
+            pc = mp(ak[1])
+            if pc not in cube['sums']: return None
+            getters.append(('avg', pc)); need.add(pc)
+        else:                                              # COUNT(col) / MIN / MAX -> fall back
+            return None
+    keys = cube['keys']; count = cube['count']; sums = cube['sums']
+    gi = [cube['dims'].index(gc) for gc in gcols]
+    fi = cube['dims'].index(fcol)
+    acc_c = collections.defaultdict(int)
+    acc_s = {m: collections.defaultdict(float) for m in need}
+    order = []; seen = set()
+    for b, k in enumerate(keys):
+        if not fn(k[fi]): continue
+        gk = tuple(k[i] for i in gi)
+        if gk not in seen: seen.add(gk); order.append(gk)
+        acc_c[gk] += int(count[b])
+        for m in need: acc_s[m][gk] += float(sums[m][b])
+    rows = []
+    for gk in order:
+        row = []
+        for gt in getters:
+            if gt[0] == 'key': row.append(gk[gt[1]])
+            elif gt[0] == 'count': row.append(int(acc_c[gk]))
+            elif gt[0] == 'sum': row.append(float(acc_s[gt[1]][gk]))
+            else:
+                c = acc_c[gk]; row.append(float(acc_s[gt[1]][gk]) / c if c else 0.0)
+        rows.append(tuple(row))
+    having = tree.args.get('having')
+    if having is not None: rows = wdb_sql._apply_having(rows, proj, having.this, None)
+    rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))
+    lim = wdb_sql._limit(tree)
+    if lim is not None: rows = rows[:lim]
+    return rows, [wdb_sql._alias(p) for p in proj]
+
+
 def try_cube(seg, tree, col_map):
     """If `tree` is a filter-free GROUP BY whose dims match a stored cube and whose projections are
     all COUNT(*) / SUM / AVG over stored measures (or group-key columns), answer from the cube and
     return (rows, colnames). Also answers grouped COUNT(DISTINCT) from a 2-dim cube. Otherwise return
     None so the caller falls through to the scan paths."""
     global _CUBE_HITS
-    if tree.args.get('where') is not None or tree.args.get('joins'): return None
+    if tree.args.get('joins'): return None
     if tree.args.get('distinct') is not None: return None
     group = tree.args.get('group')
     if group is None: return None
     cubes = seg.cubes()
     if not cubes: return None
+    if tree.args.get('where') is not None:                  # WHERE fcol <op> const on a cube dim -> exact roll-up
+        rf = _range_filter_from_cube(tree, col_map, cubes)
+        if rf is not None:
+            _CUBE_HITS += 1
+            return rf
+        return None                                         # a WHERE we cannot answer from a cube: scan handles it
     cd = _grouped_cdist_from_cube(tree, col_map, cubes)     # grouped COUNT(DISTINCT) via a [col1,col2] cube
     if cd is not None:
         _CUBE_HITS += 1
