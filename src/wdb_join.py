@@ -368,6 +368,30 @@ def _bulk_keyvals(seg, pcol, codes):
     return out
 
 
+def _mode4_group(seg, pcol):
+    """Affine (mode-4) GROUP BY key -> (dense gids per row, K, gid->value labels), memoised on the
+    immutable segment. Factorising the column's values is invariant for a static segment, so do it
+    once per (segment, column) instead of on every query (the cost the affine-key fix introduced)."""
+    cache = getattr(seg, '_mode4_group_cache', None)
+    if cache is None:
+        cache = {}
+        try: seg._mode4_group_cache = cache
+        except Exception: pass
+    hit = cache.get(pcol)
+    if hit is not None: return hit
+    vals = np.asarray(seg.values(pcol))
+    gids, uniq = pd.factorize(vals, sort=False)
+    full = np.ascontiguousarray(gids.astype(np.int64))
+    if seg.cols[pcol]['dt'] == 3:
+        u = np.asarray(uniq).astype(np.int64).view(f"datetime64[{seg.unit(pcol)}]")
+        labels = [wdb_sql._pyval(x) for x in u]
+    else:
+        labels = [wdb_sql._pyval(x) for x in np.asarray(uniq).tolist()]
+    res = (full, len(uniq), labels)
+    if isinstance(cache, dict): cache[pcol] = res
+    return res
+
+
 def _topk_prefilter(tree, proj, col_results, counts, present, gkeys):
     """ORDER BY <projected aggregate>[DESC] LIMIT k over a GROUP BY: shrink `present` to a provable
     superset of the top-k groups with ONE numpy partition on the primary order array, so the row
@@ -803,20 +827,11 @@ def _fast_pointer_agg(db, tree, ctx):
     for g in gnodes:
         gseg, gpcol, gcptr = resolve(g)
         if gseg.cols[gpcol]['mode'] == 4:
-            # Affine-coded (mode 4): stored codes are not dict indices, so the dict-decode label path
-            # can't map them. Factorise the column's VALUES to dense group ids + carry explicit labels.
-            # Value-correct and mode-agnostic; gather/scatter and mixed-radix decode are unchanged.
-            vals = np.asarray(gseg.values(gpcol))
-            gids, uniq = pd.factorize(vals, sort=False)
-            full = np.ascontiguousarray(gids.astype(np.int64))
+            # Affine-coded (mode 4): dense gids + labels, memoised on the immutable segment.
+            full, _K, _labels = _mode4_group(gseg, gpcol)
             if full.size == 0: return [], [wdb_sql._alias(p) for p in proj]
-            if gseg.cols[gpcol]['dt'] == 3:
-                _u = np.asarray(uniq).astype(np.int64).view(f"datetime64[{gseg.unit(gpcol)}]")
-                _labels = [wdb_sql._pyval(x) for x in _u]
-            else:
-                _labels = [wdb_sql._pyval(x) for x in np.asarray(uniq).tolist()]
             gkeys.append({'seg': gseg, 'pcol': gpcol, 'cptr': gcptr, 'full': full,
-                          'K': len(uniq), 'labels': _labels})
+                          'K': _K, 'labels': _labels})
             continue
         full = gseg.codes(gpcol)
         if full.size == 0: return [], [wdb_sql._alias(p) for p in proj]
