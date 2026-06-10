@@ -88,3 +88,32 @@ def test_cube_range_order_limit(): _run("SELECT g, SUM(amt) z FROM t WHERE q > 3
 def test_cube_range_having():      _run("SELECT g, COUNT(*) c FROM t WHERE q > 1 GROUP BY g HAVING COUNT(*) > 2000", True)
 # multi-predicate AND -> _make_pred returns None -> cube must NOT fire, scan answers (still correct)
 def test_cube_range_and_fallback(): _run("SELECT g, SUM(amt) FROM t WHERE q > 2 AND g = 'G1' GROUP BY g", False)
+
+
+# --- cubes='auto': exhaustive enumeration from TRUE per-column cardinality ---
+def test_cube_auto_true_cardinality():
+    # auto must use TRUE distinct counts, not header V: mode-4 affine columns (small synthetic int/date)
+    # store N, not cardinality. If auto trusted V it would miss the (g,q) cube. Lock the fix.
+    import tempfile, uuid
+    con = duckdb.connect()
+    d = os.path.join(tempfile.gettempdir(), f'cubeauto_{uuid.uuid4().hex[:8]}'); os.makedirs(d, exist_ok=True)
+    con.execute("CREATE TABLE t AS SELECT i AS id, 'G'||(i%5) AS g, CAST(i%8 AS INTEGER) AS q, "
+                "CAST(((i%30)+1)*1.0 AS DOUBLE) AS amt FROM range(20000) t(i)")
+    db = Database.create(d)
+    wt = {'BIGINT':'int','INTEGER':'int','VARCHAR':'string','DOUBLE':'float'}
+    desc = con.execute("DESCRIBE t").fetchall()
+    pq = os.path.join(d,'t.parquet'); con.execute(f"COPY (SELECT * FROM t ORDER BY id) TO '{pq}' (FORMAT parquet)")
+    db.cat.add_table('t', [[c[0], wt[c[1]]] for c in desc])
+    wdb_encode.encode(pq, os.path.join(d,'t_0.wdb'), cubes='auto')
+    db.cat.add_segment('t','t_0.wdb')
+    seg = Segment(db.cat.segment_paths('t')[0])
+    cards = wdb_cube.segment_cardinalities(seg)
+    assert cards['q'] == 8 and cards['g'] == 5, f"true card wrong (mode-4 V leak?): {cards}"   # not 20000
+    built = set(frozenset(c['dims']) for c in seg.cubes())
+    assert built == set(frozenset(s) for s in wdb_cube.enumerate_cube_specs(cards)), "auto set != enumerator"
+    assert frozenset(['g','q']) in built, f"expected (g,q) cube, got {built}"
+    before = wdb_cube._CUBE_HITS
+    qy = "SELECT g, SUM(amt) FROM t WHERE q > 4 GROUP BY g"
+    got = _norm(db.run(qy)[0]); exp = _norm([tuple(r) for r in con.execute(qy).fetchall()])
+    assert wdb_cube._CUBE_HITS == before + 1, "auto (g,q) cube did not fire on range filter"
+    assert got == exp, f"auto cube range-filter mismatch\n got {got[:4]}\n exp {exp[:4]}"

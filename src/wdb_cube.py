@@ -90,14 +90,68 @@ def load_cubes(seg_path):
     return pickle.load(open(p, 'rb')) if os.path.exists(p) else None
 
 
-def build_and_write(seg, specs, max_cells=CUBE_MAX_CELLS):
-    """Build every spec that passes the cap and persist the surviving cubes next to the segment."""
-    cubes = []
-    for dims in specs:
-        c = build_cube(seg, dims, max_cells)
-        if c is not None: cubes.append(c)
+def _build_specs_worker(args):
+    """Process-pool worker: reopen the segment (cheap memmap) and build a chunk of specs."""
+    path, specs, max_cells = args
+    from wdb_engine import Segment
+    seg = Segment(path)
+    return [c for c in (build_cube(seg, d, max_cells) for d in specs) if c is not None]
+
+
+def build_and_write(seg, specs, max_cells=CUBE_MAX_CELLS, workers=1):
+    """Build every spec that passes the cap and persist the surviving cubes next to the segment.
+    workers>1 fans the builds across processes (each reopens the segment) -- the per-cube cost is
+    factorize + bincount over N rows, so the exhaustive 'auto' set parallelises well across cores."""
+    specs = list(specs)
+    if workers and workers > 1 and len(specs) > 1:
+        import concurrent.futures as cf
+        nw = min(workers, len(specs))
+        chunks = [specs[i::nw] for i in range(nw)]          # round-robin: mix cube sizes per worker
+        cubes = []
+        with cf.ProcessPoolExecutor(max_workers=nw) as ex:
+            for part in ex.map(_build_specs_worker, [(seg.path, ch, max_cells) for ch in chunks]):
+                cubes.extend(part)
+    else:
+        cubes = [c for c in (build_cube(seg, d, max_cells) for d in specs) if c is not None]
     if cubes: write_cubes(seg.path, cubes)
     return cubes
+
+
+def segment_cardinalities(seg):
+    """True distinct count per column, for auto-enumeration. Dict/inline modes (0,1,2,3,5) store the
+    distinct count directly as V (verified on real-scale segments); mode 4 (affine/positional) stores
+    N rather than the cardinality, so it is measured from the values; mode 6 is a synthetic constant."""
+    import numpy as np, pandas as pd
+    out = {}
+    for nm in seg.order:
+        m = seg.cols[nm]['mode']
+        if m in (0, 1, 2, 3, 5): out[nm] = int(seg.cols[nm]['V'])
+        elif m == 6:             out[nm] = 1
+        else:                    out[nm] = int(len(pd.unique(np.asarray(seg.resident_values(nm)))))
+    return out
+
+
+def enumerate_cube_specs(cards, cap=CUBE_MAX_CELLS, max_arity=None):
+    """Every non-empty column-subset whose cardinality product <= cap -- the exhaustive set of cubes
+    the data allows. `cards` is {col: distinct_count}, taken from each column's stored V (a pure
+    self-measurement: no workload input). Branch-and-bound on cards ascending -- once prod*card
+    exceeds the cap, every higher-card column in the branch also overflows, so we prune the tail.
+    Constant columns (card < 2) are skipped (a 1-value dim never narrows anything). Returns a list
+    of dim-lists, smallest-product first."""
+    cols = sorted((c for c in cards if cards[c] >= 2), key=lambda c: cards[c])
+    n = len(cols); out = []
+    lim = n if max_arity is None else max_arity
+    def dfs(start, cur, prod):
+        if len(cur) >= lim: return
+        for i in range(start, n):
+            p = prod * cards[cols[i]]
+            if p > cap: break                       # ascending: no later (>=) col fits either
+            cur.append(cols[i]); out.append((p, list(cur)))
+            dfs(i + 1, cur, p)
+            cur.pop()
+    dfs(0, [], 1)
+    out.sort(key=lambda t: t[0])                    # cheapest / most broadly useful cubes first
+    return [dims for _p, dims in out]
 
 
 def _grouped_cdist_from_cube(tree, col_map, cubes):

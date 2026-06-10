@@ -330,11 +330,17 @@ def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_s
         import pickle
         with open(out_path + '.cluster', 'wb') as _cf:
             pickle.dump(cluster_meta, _cf, protocol=4)
-    if cubes:                                     # materialise low-card GROUP BY cubes (the cap in
-        try:                                      # wdb_cube declines any grouping above CUBE_MAX_CELLS)
+    if cubes:                                     # materialise GROUP BY cubes (cap in wdb_cube declines
+        try:                                      # any grouping above CUBE_MAX_CELLS)
             from wdb_engine import Segment
             import wdb_cube
-            wdb_cube.build_and_write(Segment(out_path), cubes)
+            _seg = Segment(out_path)
+            if cubes == 'auto':                   # exhaustive: every column-subset whose card product fits
+                cards = wdb_cube.segment_cardinalities(_seg)
+                specs = wdb_cube.enumerate_cube_specs(cards)
+            else:
+                specs = cubes
+            wdb_cube.build_and_write(_seg, specs, workers=workers)
         except Exception:
             pass
     return dict(n_rows=N, n_cols=len(cols), bytes=len(out), seconds=time.time()-t0,
