@@ -17,7 +17,7 @@ is parse-bound (huge throughput win); far above it the cube costs MB for a query
 rows anyway (output-bound), so it is not worth the permanent storage. 1024 sits safely in the win
 zone and captures the genuinely low-card categoricals (and their pairs); above it we decline.
 """
-import os, pickle
+import os, pickle, collections
 import numpy as np
 import wdb_sql
 import sqlglot.expressions as E
@@ -100,16 +100,76 @@ def build_and_write(seg, specs, max_cells=CUBE_MAX_CELLS):
     return cubes
 
 
+def _grouped_cdist_from_cube(tree, col_map, cubes):
+    """SELECT col1, COUNT(DISTINCT col2) ... GROUP BY col1  answered from a [col1,col2] cube.
+    Every stored cell is one (col1,col2) pair that actually occurred, so COUNT(DISTINCT col2) for a
+    given col1 is just the number of stored cells with that col1 (skipping null col2, which SQL's
+    COUNT(DISTINCT) ignores; a col1 whose col2 is always null still emits a row with count 0).
+
+    The gate is the cube's existence, which is itself a measurement: a [col1,col2] cube exists only if
+    its cell count was under the cap at build time. A high-card col2 (e.g. partkey) blows the cap, no
+    cube is built, this returns None, and the query falls back to the scan -- so 'too big' never takes
+    the cube path. Returns (rows, colnames) or None."""
+    group = tree.args.get('group')
+    if group is None or len(group.expressions) != 1: return None
+    g0 = wdb_sql._colname(group.expressions[0])
+    if g0 is None: return None
+    col1 = col_map.get(g0, g0) if col_map else g0
+    proj = tree.expressions
+    cd_col = None
+    for p in proj:
+        inner = p.this if isinstance(p, E.Alias) else p
+        if isinstance(inner, E.Count) and isinstance(inner.this, E.Distinct):
+            dx = inner.this.expressions
+            if len(dx) != 1 or not isinstance(dx[0], E.Column): return None
+            nm = wdb_sql._colname(dx[0])
+            cd_col = col_map.get(nm, nm) if col_map else nm
+        else:                                               # only the bare group key may sit alongside
+            nm = wdb_sql._colname(p)
+            if nm is None: return None
+            if (col_map.get(nm, nm) if col_map else nm) != col1: return None
+    if cd_col is None or cd_col == col1: return None
+    cube = next((c for c in cubes if len(c['dims']) == 2 and set(c['dims']) == {col1, cd_col}), None)
+    if cube is None: return None
+    i1 = cube['dims'].index(col1); i2 = cube['dims'].index(cd_col)
+    cnt = collections.Counter(); allv1 = []
+    seen = set()
+    for k in cube['keys']:
+        v1 = k[i1]
+        if v1 not in seen: seen.add(v1); allv1.append(v1)
+        if k[i2] is not None: cnt[v1] += 1
+    rows = []
+    for v1 in allv1:
+        dc = cnt.get(v1, 0)
+        row = []
+        for p in proj:
+            inner = p.this if isinstance(p, E.Alias) else p
+            row.append(int(dc) if (isinstance(inner, E.Count) and isinstance(inner.this, E.Distinct)) else v1)
+        rows.append(tuple(row))
+    having = tree.args.get('having')
+    if having is not None: rows = wdb_sql._apply_having(rows, proj, having.this, None)
+    rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))
+    lim = wdb_sql._limit(tree)
+    if lim is not None: rows = rows[:lim]
+    return rows, [wdb_sql._alias(p) for p in proj]
+
+
 def try_cube(seg, tree, col_map):
     """If `tree` is a filter-free GROUP BY whose dims match a stored cube and whose projections are
     all COUNT(*) / SUM / AVG over stored measures (or group-key columns), answer from the cube and
-    return (rows, colnames). Otherwise return None so the caller falls through to the scan paths."""
+    return (rows, colnames). Also answers grouped COUNT(DISTINCT) from a 2-dim cube. Otherwise return
+    None so the caller falls through to the scan paths."""
+    global _CUBE_HITS
     if tree.args.get('where') is not None or tree.args.get('joins'): return None
     if tree.args.get('distinct') is not None: return None
     group = tree.args.get('group')
     if group is None: return None
     cubes = seg.cubes()
     if not cubes: return None
+    cd = _grouped_cdist_from_cube(tree, col_map, cubes)     # grouped COUNT(DISTINCT) via a [col1,col2] cube
+    if cd is not None:
+        _CUBE_HITS += 1
+        return cd
     gcols = []
     for g in group.expressions:
         nm = wdb_sql._colname(g)
@@ -158,5 +218,5 @@ def try_cube(seg, tree, col_map):
     rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))
     lim = wdb_sql._limit(tree)
     if lim is not None: rows = rows[:lim]
-    global _CUBE_HITS; _CUBE_HITS += 1
+    _CUBE_HITS += 1
     return rows, [wdb_sql._alias(p) for p in proj]

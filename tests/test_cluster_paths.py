@@ -64,6 +64,7 @@ def _run(q, expect):
 # ---- CUBE: low-card, filter-free ----
 def test_cube_single_key():   _run("SELECT a, COUNT(*), SUM(m1) FROM t GROUP BY a", 'cube')
 def test_cube_two_key():      _run("SELECT a, b, COUNT(*), SUM(m1), AVG(m2) FROM t GROUP BY a, b", 'cube')
+def test_cube_grouped_distinct(): _run("SELECT a, COUNT(DISTINCT b) FROM t GROUP BY a", 'cube')  # [a,b] cube
 
 # ---- grouped_multi: high-card 2-key (cube over cap -> single-pass scatter, NOT a per-range loop) ----
 def test_highcard_two_key_grouped_multi():

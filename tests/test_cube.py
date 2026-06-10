@@ -53,7 +53,11 @@ def test_cube_having():           _run("SELECT g, COUNT(*) c FROM t GROUP BY g H
 # gated off -> must fall back (cube must NOT fire), still correct
 def test_cube_where_falls_back(): _run("SELECT g, SUM(amt) FROM t WHERE k > 100 GROUP BY g", False)
 def test_cube_minmax_falls_back():_run("SELECT g, MIN(amt), MAX(amt) FROM t GROUP BY g", False)
-def test_cube_distinct_falls_back():_run("SELECT g, COUNT(DISTINCT s) FROM t GROUP BY g", False)
+# grouped COUNT(DISTINCT col2) GROUP BY col1 -> answered from the [col1,col2] cube (set-matched)
+def test_cube_grouped_distinct():     _run("SELECT g, COUNT(DISTINCT s) FROM t GROUP BY g", True)
+def test_cube_grouped_distinct_rev(): _run("SELECT s, COUNT(DISTINCT g) FROM t GROUP BY s", True)
+# COUNT(DISTINCT col2) with NO [col1,col2] cube (high-card col2, never built) -> must fall back
+def test_cube_grouped_distinct_no_cube(): _run("SELECT g, COUNT(DISTINCT k) FROM t GROUP BY g", False)
 def test_cube_highcard_no_match(): _run("SELECT k, COUNT(*) FROM t GROUP BY k", False)  # ['k'] cube declined by cap
 
 def test_cube_cap_declines_highcard():
