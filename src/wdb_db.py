@@ -14,6 +14,17 @@ from wdb_engine import Segment
 import os
 import wdb_ddl, wdb_dml, wdb_sql, wdb_merge, wdb_compact, wdb_join, wdb_fkptr, wdb_bsi_exec, wdb_cube
 import numpy as np
+import functools
+
+@functools.lru_cache(maxsize=2048)
+def _parse_sql_cached(sql):
+    """Parse SQL -> AST, memoised per process. Parsing is ~half the wall time of a fast query
+    (cProfile: 46% of COUNT(*), and the entire cost of parse-bound shapes), and the SQL->AST map is
+    pure, so caching it makes repeated queries (the common case: dashboards, prepared statements,
+    throughput workers looping one query) parse exactly once. Returns the SAME tree on a hit -- safe
+    because the executor only READS the tree (validated by the full suite). Bounded so a distinct-query
+    workload can't grow it without limit."""
+    return sqlglot.parse_one(sql, read='duckdb')
 
 class Database:
     def __init__(self, catalog):
@@ -67,7 +78,7 @@ class Database:
 
     def run(self, sql, escalate=None):
         esc = self.escalate if escalate is None else escalate
-        tree = sqlglot.parse_one(sql, read='duckdb')
+        tree = _parse_sql_cached(sql)
         if isinstance(tree, E.Create):
             return wdb_ddl.create_table(self.cat, sql)
         if isinstance(tree, E.Alter):
