@@ -135,6 +135,18 @@ class Catalog:
     def fk_pointers(self, name):
         return self.get_table(name).get('fk_pointers', {})
 
+    def add_stamp(self, child, child_col, parent, parent_col, fk_col, total):
+        """Record that child.child_col is a build-time denormalisation (stamp) of parent.parent_col,
+        reached via child.fk_col. `total` is True iff every child row matched a parent (so an inner join
+        on this edge drops nothing) -- the planner only rewrites a join to a single-table cube read when
+        the stamp is total, keeping results identical."""
+        self.get_table(child).setdefault('stamps', {})[child_col] = {
+            'parent': parent, 'parent_col': parent_col, 'fk_col': fk_col, 'total': bool(total)}
+        self.save()
+
+    def stamps(self, name):
+        return self.get_table(name).get('stamps', {})
+
     def segment_paths(self, name):
         t = self.get_table(name)
         return [os.path.join(self.dbdir, s) for s in t['segments']]

@@ -4,7 +4,7 @@ object-key group-by against a numpy group-by on WaveDB's integer codes."""
 import sys, os, time, tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import duckdb, numpy as np, pandas as pd
-import wdb_encode
+import wdb_encode, wdb_cube
 from wdb_db import Database
 from wdb_engine import Segment
 
@@ -26,7 +26,23 @@ if not os.path.exists(DIR):
         db.cat.add_table(tbl,sch); seg=f'{tbl}_0.wdb'; wdb_encode.encode(pq,os.path.join(DIR,'wdb',seg),cluster_by=cluster_by,cubes=cubes); db.cat.add_segment(tbl,seg)
     load('customer', order_by='c_custkey')
     con.execute("CREATE TEMP TABLE ord_pk AS SELECT o_orderkey, row_number() OVER (ORDER BY o_orderkey)-1 AS pos FROM orders")
-    load('orders', order_by='o_orderkey')
+    # General denormalisation (build-time, self-measured): stamp every LOW-CARD customer column onto
+    # orders so cubes='auto' cubes it; the planner then answers a customer-dim group-by (e.g. #25) from
+    # the orders cube instead of a gather. High-card customer columns are left to the gather.
+    _cust = db.open_segment(os.path.join(DIR, 'wdb', 'customer_0.wdb'), 'customer')
+    _stamp = wdb_cube.low_card_stamp_cols(_cust)                       # e.g. c_mktsegment(5), c_nationkey(25)
+    _ctypes = {d[0]: d[1] for d in con.execute("DESCRIBE customer").fetchall()}
+    _odesc = con.execute("DESCRIBE orders").fetchall()
+    _ocols = ", ".join((f"CAST(o.{c[0]} AS DOUBLE) AS {c[0]}" if c[1].startswith('DECIMAL') else f"o.{c[0]}") for c in _odesc)
+    _ssel = ", ".join(f"c.{c} AS o_{c[2:]}" for c in _stamp)
+    _osch = [[c[0], wt(c[1])] for c in _odesc] + [[f"o_{c[2:]}", wt(_ctypes[c])] for c in _stamp]
+    _opq = os.path.join(DIR, 'orders.parquet')
+    con.execute(f"COPY (SELECT {_ocols}, {_ssel} FROM orders o JOIN customer c ON o.o_custkey=c.c_custkey ORDER BY o.o_orderkey) TO '{_opq}' (FORMAT parquet)")
+    db.cat.add_table('orders', _osch); wdb_encode.encode(_opq, os.path.join(DIR, 'wdb', 'orders_0.wdb'), cubes='auto'); db.cat.add_segment('orders', 'orders_0.wdb')
+    _unmatched = con.execute("SELECT COUNT(*) FROM orders o LEFT JOIN customer c ON o.o_custkey=c.c_custkey WHERE c.c_custkey IS NULL").fetchone()[0]
+    for c in _stamp:
+        db.cat.add_stamp('orders', f'o_{c[2:]}', 'customer', c, 'o_custkey', total=(_unmatched == 0))
+    print(f"stamped {len(_stamp)} low-card customer cols onto orders: {_stamp} (total={_unmatched == 0})")
     # lineitem clustered by l_returnflag (the planner's measured pick): GROUP BY returnflag (#4/#5)
     # and the filtered returnflag group (#16) take the cluster slice paths. Low-card filter-free
     # group-bys are answered from the materialised cube; the 2-col Q1 group (#6) falls to the cube too.

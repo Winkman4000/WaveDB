@@ -111,7 +111,10 @@ class Database:
             return wdb_dml.update(self.cat, sql)
         if isinstance(tree, E.Select):
             if tree.args.get('joins'):
-                return wdb_join.join_query(self, sql)
+                _rw = wdb_join.denorm_rewrite(self, tree)        # join that groups by a denormalised parent
+                if _rw is None:                                  # column -> single-table cube read; else gather
+                    return wdb_join.join_query(self, sql)
+                sql = _rw; tree = _parse_sql_cached(_rw)         # fall through to the single-table path
             name = self._table_in(tree)
             phys = self.cat.phys_map(name)
             cmap = {c: phys.get(c, c) for c in self.cat.column_names(name)}  # complete logical->physical

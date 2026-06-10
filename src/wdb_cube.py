@@ -168,6 +168,15 @@ def segment_cardinalities(seg):
     return out
 
 
+def low_card_stamp_cols(parent_seg, cap=CUBE_MAX_CELLS):
+    """The general denormalisation rule, self-measured: a parent column is worth stamping onto a child
+    iff it is low enough cardinality to live in a cube (2 <= distinct <= cap). High-card parent columns
+    (keys, free-text, near-unique numerics) are left alone -- the join gather already wins on those.
+    Pure self-measurement, workload-agnostic: no query input. Returns a list of parent column names."""
+    cards = segment_cardinalities(parent_seg)
+    return [c for c in parent_seg.order if 2 <= cards.get(c, 0) <= cap]
+
+
 def enumerate_cube_specs(cards, cap=CUBE_MAX_CELLS, max_arity=None):
     """Every non-empty column-subset whose cardinality product <= cap -- the exhaustive set of cubes
     the data allows. `cards` is {col: distinct_count}, taken from each column's stored V (a pure
@@ -417,8 +426,8 @@ def try_cube(seg, tree, col_map):
     getters = []
     for p in proj:
         ak = wdb_sql._agg_kind(p)
-        if ak is None:                                      # bare group-key column
-            nm = wdb_sql._colname(p)
+        if ak is None:                                      # bare group-key column (unwrap any alias)
+            nm = wdb_sql._colname(p.this if isinstance(p, wdb_sql.E.Alias) else p)
             if nm is None: return None
             pc = col_map.get(nm, nm) if col_map else nm
             if pc not in cube['dims']: return None

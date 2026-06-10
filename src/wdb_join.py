@@ -101,6 +101,83 @@ def table_agg(db, tree):
     return _fast_pointer_agg(db, tree, _build_chain(db, tree))
 
 
+def denorm_rewrite(db, tree):
+    """Rewrite a single INNER join that GROUPs BY denormalised (stamped) parent columns into a
+    single-table GROUP BY on the child's stamped columns -- which the cube path then answers, reading a
+    few precomputed cells instead of gathering the whole child. Returns a rewritten joinless SQL string
+    or None (keep the gather). Equivalence conditions, all required:
+      - exactly one INNER join, a GROUP BY, no WHERE / HAVING / DISTINCT (conservative);
+      - every GROUP BY column resolves to a child column: a TOTAL stamp of a parent column (so the inner
+        join drops no child rows), or a child-native column;
+      - every aggregate is COUNT(*) or over a CHILD-NATIVE column (never a stamped parent column -- that
+        would be the grain trap of summing a parent attribute once per child row).
+    Anything else returns None and stays on the gather, which already wins on high-card joins."""
+    joins = tree.args.get('joins')
+    if not joins or len(joins) != 1: return None
+    if tree.args.get('group') is None: return None
+    if (tree.args.get('where') is not None or tree.args.get('having') is not None
+            or tree.args.get('distinct') is not None): return None
+    jn = joins[0]
+    if jn.args.get('side') or jn.args.get('kind'): return None          # INNER only
+    frm = tree.find(E.From)
+    if frm is None: return None
+    frm = frm.this
+    child_t, child_a = frm.name, (frm.alias or frm.name)
+    parent_t, parent_a = jn.this.name, (jn.this.alias or jn.this.name)
+    try:
+        stamps = db.cat.stamps(child_t)
+    except Exception:
+        return None
+    if not stamps: return None
+    pmap = {m['parent_col']: cc for cc, m in stamps.items()
+            if m.get('parent') == parent_t and m.get('total')}          # parent col -> child stamped col
+    if not pmap: return None
+    try:
+        child_cols = set(db.cat.column_names(child_t)); parent_cols = set(db.cat.column_names(parent_t))
+    except Exception:
+        return None
+    stamped = set(pmap.values())
+    def to_child(node):
+        if not isinstance(node, E.Column): return None
+        a, nm = node.table, node.name
+        if a == parent_a: return pmap.get(nm)
+        if a == child_a:  return nm if nm in child_cols else None
+        if nm in child_cols and nm not in parent_cols: return nm        # unqualified child-native
+        if nm in parent_cols and nm not in child_cols: return pmap.get(nm)
+        return None                                                      # ambiguous / unknown
+    gcols = []
+    for g in tree.args['group'].expressions:
+        cc = to_child(g)
+        if cc is None: return None
+        gcols.append(cc)
+    proj_sql = []
+    _FN = {E.Sum: 'SUM', E.Avg: 'AVG', E.Min: 'MIN', E.Max: 'MAX'}
+    for p in tree.expressions:
+        inner = p.this if isinstance(p, E.Alias) else p
+        explicit = p.alias if isinstance(p, E.Alias) else None
+        if isinstance(inner, E.Count) and (inner.this is None or isinstance(inner.this, E.Star)):
+            s = "COUNT(*)"
+        elif isinstance(inner, E.Column):
+            cc = to_child(inner)
+            if cc is None: return None
+            s = cc if cc == inner.name else f"{cc} AS {inner.name}"      # preserve output header
+        elif isinstance(inner, E.Count):
+            arg = inner.this
+            cc = to_child(arg) if isinstance(arg, E.Column) else None
+            if cc is None: return None
+            s = f"COUNT({cc})"
+        elif type(inner) in _FN:
+            arg = inner.this
+            cc = to_child(arg) if isinstance(arg, E.Column) else None
+            if cc is None or cc in stamped: return None                  # measure must be child-native
+            s = f"{_FN[type(inner)]}({cc})"
+        else:
+            return None
+        if explicit: s += f" AS {explicit}"
+        proj_sql.append(s)
+    return f"SELECT {', '.join(proj_sql)} FROM {child_t} GROUP BY {', '.join(gcols)}"
+
+
 def join_query(db, sql, columnar=False):
     tree = sqlglot.parse_one(sql, read='duckdb')
     joins = tree.args.get('joins')
