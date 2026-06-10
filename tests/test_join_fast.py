@@ -407,3 +407,41 @@ def test_chain_highcard_multigroup_factorize():
                "GROUP BY l.l_returnflag, l.l_shipmode, o.o_orderpriority")
     finally:
         wdb_join.MULTI_GROUP_CEIL = save
+
+
+# --- high-cardinality GROUP BY a mode-4 (affine-coded) column -----------------------------------
+# Regression guard for the fix where GROUP BY an affine-coded column (a dense surrogate key) bailed
+# the fast pointer-agg path into the pandas hash-agg. The affine codes aren't dict indices, so the
+# label decode was blocked; the fix factorises the column's VALUES to dense gids + explicit labels.
+# expect_fast=True is the guard: pre-fix these dropped to the slow path and would fail that assert.
+
+def _assert_mode4(table, col):
+    db, _ = _fixture()
+    seg = db.open_segment(db.cat.segment_paths(table)[0], table)
+    m = seg.cols[col]['mode']
+    assert m == 4, f"{table}.{col} expected affine mode-4 (else this test no longer exercises the fix), got {m}"
+
+def test_fast_group_mode4_parent_key_highcard():
+    # gathered parent mode-4 key (c_custkey via the o_custkey pointer); one group per customer
+    _assert_mode4('customer', 'c_custkey')
+    _match("SELECT c.c_custkey, COUNT(*), SUM(o.o_totalprice) FROM orders o "
+           "JOIN customer c ON o.o_custkey=c.c_custkey GROUP BY c.c_custkey")
+
+def test_fast_group_mode4_child_key_highcard():
+    # direct (cptr=None) child mode-4 key (o_orderkey); one group per order
+    _assert_mode4('orders', 'o_orderkey')
+    _match("SELECT o.o_orderkey, SUM(o.o_totalprice) FROM orders o "
+           "JOIN customer c ON o.o_custkey=c.c_custkey GROUP BY o.o_orderkey")
+
+def test_fast_group_mode4_key_with_filter_and_measure():
+    # mode-4 grouping must compose with predicate fusion + a measure, still on the fast path
+    _assert_mode4('customer', 'c_custkey')
+    _match("SELECT c.c_custkey, COUNT(*), SUM(o.o_totalprice) FROM orders o "
+           "JOIN customer c ON o.o_custkey=c.c_custkey WHERE o.o_totalprice > 100000 "
+           "GROUP BY c.c_custkey")
+
+def test_fast_group_mode4_multikey_composite():
+    # composite group where one member is a high-card mode-4 key and the other is low-card
+    _assert_mode4('customer', 'c_custkey')
+    _match("SELECT c.c_custkey, o.o_orderpriority, COUNT(*) FROM orders o "
+           "JOIN customer c ON o.o_custkey=c.c_custkey GROUP BY c.c_custkey, o.o_orderpriority")
