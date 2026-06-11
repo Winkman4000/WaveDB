@@ -176,7 +176,8 @@ class Segment:
         column is zero-padded so the 8-byte window never reads past the buffer."""
         from numpy.lib.stride_tricks import sliding_window_view
         n = hi - lo
-        out = np.empty(n, dtype=np.int64)
+        _od = np.uint8 if bits <= 8 else (np.uint16 if bits <= 16 else (np.uint32 if bits <= 32 else np.int64))
+        out = np.empty(n, dtype=_od)
         if n <= 0: return out
         mask = np.uint64((1 << bits) - 1); CH = 4_000_000
         for c0 in range(lo, hi, CH):
@@ -191,34 +192,42 @@ class Segment:
             sel = np.ascontiguousarray(win[byte0 - first])
             w64 = sel.view('>u8').reshape(-1)
             shift = np.uint64(64 - bits) - (bo & 7).astype(np.uint64)
-            out[c0 - lo:c1 - lo] = ((w64 >> shift) & mask).astype(np.int64)
+            out[c0 - lo:c1 - lo] = ((w64 >> shift) & mask).astype(_od)
         return out
+
+    @staticmethod
+    def _cdt(ndist):
+        # smallest unsigned width that holds codes 0..ndist-1 (keeps the scanned array compact)
+        return (np.uint8 if ndist <= 256 else np.uint16 if ndist <= 65536
+                else np.uint32 if ndist <= 4294967296 else np.int64)
 
     def _raw_codes(self, nm):
         if nm in self._codes: return self._codes[nm]
         c = self.cols[nm]
         if c['mode'] == 6:
-            cc = np.zeros(self.N, dtype=np.int64)    # constant column: a single group
+            cc = np.zeros(self.N, dtype=np.uint8)    # constant column: a single group
             self._codes[nm] = cc; return cc
         if c['mode'] == 4:
-            cc = np.arange(self.N, dtype=np.int64)   # identity codes: value = f(position)
+            dt = np.uint32 if self.N <= 4294967296 else np.int64
+            cc = np.arange(self.N, dtype=dt)         # identity codes: value = f(position)
             self._codes[nm] = cc; return cc
         if c['mode'] == 5:
             uniq, inv = np.unique(self._inline_values(c), return_inverse=True)
             c['_idict'] = uniq                       # sorted distinct values, for fetch()
-            cc = inv.astype(np.int64); self._codes[nm] = cc; return cc
+            cc = inv.astype(self._cdt(len(uniq))); self._codes[nm] = cc; return cc
         if c['mode'] == 3:
             # dependent column: gather Y-codes through the determinant's per-row codes
             x_codes = self._raw_codes(self.order[c['det_idx']])
-            cc = self._fd_map(c)[x_codes].astype(np.int64)
+            fm = self._fd_map(c)
+            cc = fm[x_codes].astype(self._cdt(int(fm.max()) + 1 if fm.size else 1))
             self._codes[nm] = cc; return cc
         if c.get('code_enc', 0) == 1:                # zstd of byte-aligned codes (clustered/skewed)
             raw = self._dz.decompress(self.buf[c['cstart']:c['cstart']+c['czlen']].tobytes())
             wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
-            cc = np.frombuffer(raw, dtype=wdt).astype(np.int64)
+            cc = np.frombuffer(raw, dtype=wdt)       # native width (was upcast to int64)
             self._codes[nm] = cc; return cc
         bits = c['bits']; base = c['cstart']
-        cc = self._bitunpack(base, 0, self.N, bits)
+        cc = self._bitunpack(base, 0, self.N, bits)  # now returns native width
         self._codes[nm] = cc; return cc
     def _effective(self, nm):
         """Effective code space for a column with overrides. An override value that ALREADY
