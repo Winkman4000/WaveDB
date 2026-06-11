@@ -11,7 +11,7 @@ import re
 import sqlglot, sqlglot.expressions as E
 import numpy as np, pandas as pd, os
 from wdb_engine import Segment
-import wdb_sql, wdb_dml, wdb_agg, wdb_fkptr, wdb_exprjit
+import wdb_sql, wdb_dml, wdb_agg, wdb_fkptr, wdb_exprjit, wdb_radix
 
 _CMP = {E.EQ: '==', E.NEQ: '!=', E.GT: '>', E.LT: '<', E.GTE: '>=', E.LTE: '<='}
 
@@ -525,6 +525,26 @@ def _topk_prefilter(tree, proj, col_results, counts, present, gkeys):
         sel = np.nonzero(a <= thresh)[0]
     global _TOPK_HITS; _TOPK_HITS += 1
     return present[sel]
+
+
+def _radix_plan(group_keys, slot_list, exprs, no_mm, pred_body, mask):
+    """Return (key_codes, K, measure) if this GROUP BY matches the radix fast-path, else None.
+    Eligible: single non-gathered key, no MIN/MAX, no filter, >=1M-ish groups (replicated accumulator
+    would overflow LLC), and aggregates limited to COUNT and at most one SUM/AVG over a bare non-
+    gathered numeric slot. measure is None (COUNT-only) or (dict_values, codes) for the SUM payload.
+    The cluster-key slice path is checked before this, so a key reaching here is non-cluster-ordered."""
+    if len(group_keys) != 1: return None
+    kcodes, K, kptr = group_keys[0]
+    if kptr is not None or not no_mm or pred_body or mask is not None: return None
+    if len(exprs) > 1: return None
+    if not wdb_radix.should_use(K, wdb_exprjit._NT): return None
+    if not exprs:
+        return (kcodes, K, None)
+    mb = re.fullmatch(r'v(\d+)', exprs[0][0])           # the SUM/AVG body must be a bare slot
+    if not mb: return None
+    sb, sc, sp = slot_list[int(mb.group(1))]
+    if sp is not None or sb is None: return None        # need a non-gathered numeric dict slot
+    return (kcodes, K, (sb, sc))
 
 
 def _slice_scalar_agg(group_keys, inputs, exprs, mask, n, pred, offsets):
@@ -1212,12 +1232,17 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         _mask = None if pred_body else get_mask()
         _cm = gkeys[0]['seg'].cluster_meta() if len(gkeys) == 1 else None
         _no_mm = not any(e[1] for e in exprs)
+        _rdx = _radix_plan(group_keys, slot_list, exprs, _no_mm, pred_body, _mask)
         if not group_keys and _no_mm:     # no GROUP BY, no MIN/MAX -> lean scalar kernel
             counts, results = wdb_exprjit.scalar_multi(slot_list, exprs, _mask, n, pred_body)
         elif (len(gkeys) == 1 and _cm is not None and gkeys[0]['cptr'] is None and _no_mm
               and _cm.get('key') == gkeys[0]['pcol'] and gkeys[0]['seg'].presence_mask() is None):
             counts, results = _slice_scalar_agg(group_keys, slot_list, exprs,   # cluster-key GROUP BY +
                                                 _mask, n, pred_body, _cm['offsets'])  # predicate -> per-slice scalar
+        elif _rdx is not None:            # high-card non-cluster key -> radix-partitioned aggregation
+            _rk, _rK, _rmeas = _rdx
+            counts, _rsum = wdb_radix.radix_grouped(_rk, _rK, _rmeas, NT=wdb_exprjit._NT)
+            results = [] if _rmeas is None else [(_rsum[0], None, None)]
         else:
             counts, results = wdb_exprjit.grouped_multi(group_keys, slot_list, exprs,
                                                         _mask, n, pred_body)
