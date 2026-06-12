@@ -12,7 +12,7 @@ import sqlglot, sqlglot.expressions as E
 from wdb_catalog import Catalog
 from wdb_engine import Segment
 import os
-import wdb_ddl, wdb_dml, wdb_sql, wdb_merge, wdb_compact, wdb_join, wdb_fkptr, wdb_bsi_exec, wdb_cube
+import wdb_ddl, wdb_dml, wdb_sql, wdb_merge, wdb_compact, wdb_join, wdb_fkptr, wdb_bsi_exec, wdb_cube, wdb_gbcount
 import numpy as np
 import functools
 
@@ -128,6 +128,9 @@ class Database:
                     cube_rows = wdb_cube.try_cube(segs[0], tree, cmap)   # materialised low-card cube:
                     if cube_rows is not None:                            # filter-free GROUP BY answered
                         return cube_rows                                 # from a few precomputed numbers
+                    gbc = wdb_gbcount.try_gbcount(segs[0], tree, cmap)   # high-card single COUNT(*) -> count
+                    if gbc is not None:                                  # projection: top-N read, no scan
+                        return gbc
                     if wdb_sql._cluster_will_slice(segs[0], tree, cmap):
                         return wdb_sql.execute(segs[0], sql, col_map=cmap, tree=tree)  # clustered slice path
                     if wdb_sql._cluster_will_group_slice(segs[0], tree, cmap):
