@@ -22,6 +22,7 @@ import wdb_sql
 E = wdb_sql.E
 
 _HITS = 0   # telemetry: queries answered from a count projection
+_CACHE = {}  # (seg.path, col, N) -> (codes, counts), so a repeated query never re-reads the sidecar
 
 
 def _path(seg, col):
@@ -29,19 +30,20 @@ def _path(seg, col):
 
 
 def _code_values(seg, col):
-    """List V with V[code] = the python group value, or None if the column isn't a value-identity
-    dictionary we can decode by code (mode-4 affine codes are arange(N), not group ids)."""
+    """The column's by-code value dictionary (engine-cached, indexable by code), or None if the
+    column isn't a value-identity dictionary we can decode (mode-4 affine, etc.). Returns the RAW
+    dict (no per-value conversion) so the caller decodes only the few codes it actually emits."""
     c = seg.cols[col]
     if c['mode'] == 4:
         return None
-    if c['dt'] == 1:                                    # string dict (modes 0/1)
+    if c['dt'] == 1:                                    # string dict (modes 0/1): list of bytes
         try:
-            return [wdb_sql._pyval(v) for v in seg.dict_vals(col)]
+            return seg.dict_vals(col)
         except Exception:
             return None
-    if c['dt'] == 0 and c['mode'] == 2:                 # high-card int: sorted int dictionary
+    if c['dt'] == 0 and c['mode'] == 2:                 # high-card int: sorted int64 dictionary
         try:
-            return [wdb_sql._pyval(int(x)) for x in seg._dict_ints(c)]
+            return seg._dict_ints(c)
         except Exception:
             return None
     return None                                         # other encodings: let the scan path handle it (v1)
@@ -64,13 +66,18 @@ def _build(seg, col):
 
 
 def _load(seg, col):
-    """Load the persisted sidecar (rebuilding if absent or stale vs seg.N). Returns (codes, counts)
-    or None if the column can't be projected."""
+    """Load the persisted sidecar (rebuilding if absent or stale vs seg.N, caching in memory).
+    Returns (codes, counts) or None if the column can't be projected."""
+    ck = (seg.path, col, int(seg.N))
+    hit = _CACHE.get(ck)
+    if hit is not None:
+        return hit
     p = _path(seg, col)
     if os.path.exists(p):
         try:
             hc, hn, K, n = pickle.load(open(p, 'rb'))
             if n == int(seg.N):
+                _CACHE[ck] = (hc, hn)
                 return hc, hn
         except Exception:
             pass
@@ -82,6 +89,7 @@ def _load(seg, col):
         pickle.dump((hc, hn, K, n), open(p, 'wb'), protocol=4)
     except Exception:
         pass
+    _CACHE[ck] = (hc, hn)
     return hc, hn
 
 
@@ -165,7 +173,7 @@ def try_gbcount(seg, tree, col_map):
     rows = []
     for code, n in zip(hc[:lim].tolist(), hn[:lim].tolist()):
         row = [None, None]
-        row[ki] = V[code]
+        row[ki] = wdb_sql._pyval(V[code])               # decode only the N emitted keys
         row[ci] = int(n)
         rows.append(tuple(row))
     rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))[:lim]
