@@ -1,0 +1,116 @@
+"""
+wdb_survgroup — survivor-set group-by for SELECTIVE filtered high-card single-key COUNT(*).
+
+`SELECT key, COUNT(*) FROM t WHERE <pred> GROUP BY key ORDER BY COUNT(*) DESC LIMIT N` on a high-card
+key is slow not because of the surviving rows but because the engine scatters them into a K-wide
+(millions of entries) accumulator. When the filter is selective, far fewer rows survive than the
+accumulator is wide, so it is much cheaper to materialize the survivors and group that small set.
+
+The gate is COMPUTED at runtime, not guessed. The predicate has to be evaluated anyway (mode-4 filter
+columns have no value-identity codes, so there is no cheaper way to know which rows pass), so we
+popcount the resulting mask for the exact selectivity and take this path only when sel < gate(N, K).
+Otherwise we return None and the dense path (which is cheaper once the survivor set approaches N)
+handles it. Measured crossover (URL, K=18.3M): survivor-set wins up to ~30% selectivity, and the
+crossover rises with K because a wider accumulator costs more to scatter and scan.
+
+Sibling of wdb_gbcount (the filter-free count projection); reuses its by-code decoder and
+clean-boundary top-N. Fail-closed on any shape it does not own.
+"""
+import numpy as np
+import wdb_sql
+import wdb_gbcount
+E = wdb_sql.E
+
+_HITS = 0   # telemetry: queries answered from the survivor-set path
+
+# Crossover calibration (from the selectivity sweep on this class of machine). survivor-set cost
+# ~ c*survivors; K-wide cost ~ a*N + b*K, roughly flat in survivors -> crossover survivors* grows
+# with K. Empirically survivors*/N ~ 0.30 at K/N ~ 0.18, so gate ~ 1.6 * K/N, clamped to a safe band.
+# The gate only affects SPEED -- a wrong gate just defers to the (correct) dense path -- so the band
+# is deliberately conservative.
+_GATE_SLOPE = 1.6
+_GATE_LO, _GATE_HI = 0.05, 0.35
+
+
+def _gate(N, K):
+    if N <= 0:
+        return _GATE_LO
+    return min(_GATE_HI, max(_GATE_LO, _GATE_SLOPE * K / N))
+
+
+def try_survgroup(seg, tree, col_map):
+    """Answer a selective filtered high-card `key, COUNT(*) WHERE pred GROUP BY key ORDER BY COUNT(*)
+    DESC LIMIT N` by grouping only the survivors, or return None to fall through to the dense path."""
+    global _HITS
+    if tree.args.get('joins') or tree.args.get('distinct') is not None:
+        return None
+    if tree.args.get('having') is not None:
+        return None
+    where = tree.args.get('where')
+    if where is None:
+        return None                                     # filter-free -> wdb_gbcount / cube
+    group = tree.args.get('group')
+    if group is None or len(group.expressions) != 1:
+        return None
+    lim = wdb_sql._limit(tree)
+    if lim is None:
+        return None
+    proj = tree.expressions
+    if len(proj) != 2:
+        return None
+    ci = wdb_gbcount._count_index(proj)
+    if ci is None:
+        return None
+    ki = 1 - ci
+    kp = proj[ki]
+    if wdb_sql._agg_kind(kp) is not None:               # the other projection must be the bare key
+        return None
+    knm = wdb_sql._colname(kp.this if isinstance(kp, E.Alias) else kp)
+    gnm = wdb_sql._colname(group.expressions[0])
+    if knm is None or gnm is None or knm != gnm:
+        return None
+    if not wdb_gbcount._order_is_count_desc(tree, proj, ci):
+        return None
+    sc = (lambda c: col_map.get(c, c)) if col_map else (lambda c: c)
+    col = sc(knm)
+    if col not in seg.cols or seg.cols[col]['mode'] == 4:
+        return None
+    V = wdb_gbcount._code_values(seg, col)              # by-code decoder for the group key
+    if V is None:
+        return None
+
+    # Evaluate the predicate -> survivor mask. This is the sunk cost the dense path would pay too;
+    # here it also yields the exact selectivity for the gate.
+    try:
+        mask = wdb_sql._eval_pred(seg, where.this, sc)
+    except (NotImplementedError, Exception):
+        return None
+    pm = seg.presence_mask()
+    if pm is not None:
+        mask = mask & pm
+    N = seg.N
+    cnt = int(mask.sum())
+    if cnt == 0:
+        return None                                     # empty result -> let the dense path format it
+    K = seg.cols[col].get('V') or (1 << 24)
+    if cnt > _gate(N, K) * N:
+        return None                                     # dense filter -> dense path is cheaper
+
+    # Survivor-set group-by: gather the key codes of survivors and group that small set.
+    codes = seg._raw_codes(col)
+    u, c = np.unique(codes[mask], return_counts=True)
+    order = np.argsort(c, kind='stable')[::-1]          # count descending over distinct survivors
+    cs = c[order]; us = u[order]
+    if lim < cs.size and int(cs[lim - 1]) == int(cs[lim]):
+        return None                                     # tie straddles the LIMIT boundary -> defer to
+                                                        # the dense path for consistent tie-breaking
+    take = min(lim, cs.size)
+    rows = []
+    for i in range(take):
+        row = [None, None]
+        row[ki] = wdb_sql._pyval(V[int(us[i])])         # decode only the N emitted keys
+        row[ci] = int(cs[i])
+        rows.append(tuple(row))
+    rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))[:lim]
+    _HITS += 1
+    return rows, [wdb_sql._alias(p) for p in proj]
