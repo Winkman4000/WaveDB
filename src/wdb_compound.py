@@ -224,6 +224,34 @@ def try_compound(seg, tree, col_map):
     (los, his), keep = res
 
     names = [wdb_sql._alias(p) for p in proj]
+    lim = wdb_sql._limit(tree); off = _offset(tree)
+
+    if len(pc) == 1:                                      # single-key fast path: one np.unique, no
+        k = pc[0]                                         # factorize/pack/unpack (those only help multi-key)
+        if SP.n_exceptions(seg, k) is not None:
+            arr = _m4_in_ranges(seg, k, los, his)[keep]; kind = 'val'
+        else:
+            arr = _codes_in_ranges(seg, k, los, his)[keep]; kind = 'code'
+        if len(arr) == 0:
+            _HITS += 1; return [], names
+        u, counts = np.unique(arr.astype(np.int64), return_counts=True)
+        sel = np.argsort(-counts, kind='stable')
+        sel = sel[off: off + lim] if lim is not None else sel[off:]
+        identvals = u[sel]
+        if kind == 'val':
+            keyvals = [wdb_sql._pyval(np.int64(x)) for x in identvals]
+        else:
+            keyvals = [wdb_sql._pyval(seg.fetch(k, int(x))) for x in identvals]
+        cnts = counts[sel]
+        rows = []
+        for r in range(len(sel)):
+            row = [None] * len(proj); row[ci] = int(cnts[r])
+            for j in range(len(proj)):
+                if j != ci: row[j] = keyvals[r]
+            rows.append(tuple(row))
+        _HITS += 1
+        return rows, names
+
     idents = []; reps = []; cards = []; kinds = []
     for k in pc:
         if SP.n_exceptions(seg, k) is not None:
