@@ -89,6 +89,25 @@ def header(blob):
     base, stride, n, n_exc = _HDR.unpack_from(blob, 4)
     return int(base), int(stride), int(n), int(n_exc)
 
+def exceptions(blob):
+    """Parse a WSQ1 blob into its raw pieces WITHOUT reconstructing the column:
+    (base, stride, n, exc, corr). exc are the delta-indices in [0, n-2] where the true delta
+    departs from stride (sorted ascending, as params() produced them); corr[k] = true_delta - stride
+    at exc[k]. The column is base + cumsum(d) where d == stride except d[exc] == stride + corr.
+    This lets a predicate be resolved against the O(n_exc) change-points instead of the O(n) column."""
+    assert blob[:4] == MAGIC, "bad WSQ1 magic"
+    base, stride, n, n_exc = _HDR.unpack_from(blob, 4)
+    if n_exc == 0:
+        z = np.empty(0, dtype=np.int64)
+        return int(base), int(stride), int(n), z, z
+    off = 4 + _HDR.size
+    (zlen,) = _ZLEN.unpack_from(blob, off); off += _ZLEN.size
+    payload = zstd.ZstdDecompressor().decompress(blob[off:off + zlen])
+    half = n_exc * 8
+    exc = np.frombuffer(payload[:half], dtype='<i8')
+    corr = np.frombuffer(payload[half:2 * half], dtype='<i8')
+    return int(base), int(stride), int(n), exc, corr
+
 def encode(col, max_exc_frac=0.5):
     """Gated encode for the column. Returns a blob if mode 4 is BENEFICIAL for this column,
     else None (decline -> caller uses another mode). Gate: enough rows, the stride actually

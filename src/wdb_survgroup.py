@@ -19,6 +19,7 @@ clean-boundary top-N. Fail-closed on any shape it does not own.
 import numpy as np
 import wdb_sql
 import wdb_gbcount
+import wdb_seqpred
 E = wdb_sql.E
 
 _HITS = 0   # telemetry: queries answered from the survivor-set path
@@ -36,6 +37,50 @@ def _gate(N, K):
     if N <= 0:
         return _GATE_LO
     return min(_GATE_HI, max(_GATE_LO, _GATE_SLOPE * K / N))
+
+
+# Structural pushdown applies when the filter column's exception count is small relative to N
+# (processing the exceptions must be cheaper than reading the column). Above this, fall back to the
+# mask path. Calibrated from the exception-count survey (AdvEngineID 0.8% wins; SearchEngineID 17%
+# does not).
+_SEQ_EXC_FRAC = 0.05
+
+_CMP_OPS = {E.NEQ: wdb_seqpred.NEQ, E.EQ: wdb_seqpred.EQ, E.LT: wdb_seqpred.LT,
+            E.LTE: wdb_seqpred.LTE, E.GT: wdb_seqpred.GT, E.GTE: wdb_seqpred.GTE}
+_FLIP = {wdb_seqpred.LT: wdb_seqpred.GT, wdb_seqpred.GT: wdb_seqpred.LT,
+         wdb_seqpred.LTE: wdb_seqpred.GTE, wdb_seqpred.GTE: wdb_seqpred.LTE,
+         wdb_seqpred.EQ: wdb_seqpred.EQ, wdb_seqpred.NEQ: wdb_seqpred.NEQ}
+
+
+def _int_lit(node):
+    """Extract an int from a Literal / Neg(Literal), or None (strings/floats decline)."""
+    if isinstance(node, E.Neg):
+        v = _int_lit(node.this)
+        return None if v is None else -v
+    if isinstance(node, E.Literal) and not node.args.get('is_string'):
+        try:
+            s = str(node.this)
+            return int(s) if s.lstrip('-').isdigit() else None
+        except Exception:
+            return None
+    return None
+
+
+def _simple_cmp(node, sc):
+    """A bare `col <cmp> intconst` (either operand order) -> (phys_col, op, const), else None."""
+    op = _CMP_OPS.get(type(node))
+    if op is None:
+        return None
+    a, b = node.this, node.args.get('expression')
+    if b is None:
+        return None
+    if isinstance(a, E.Column):
+        lit = _int_lit(b)
+        return None if lit is None else (sc(a.name), op, lit)
+    if isinstance(b, E.Column):
+        lit = _int_lit(a)
+        return None if lit is None else (sc(b.name), _FLIP[op], lit)
+    return None
 
 
 def try_survgroup(seg, tree, col_map):
@@ -79,26 +124,49 @@ def try_survgroup(seg, tree, col_map):
     if V is None:
         return None
 
-    # Evaluate the predicate -> survivor mask. This is the sunk cost the dense path would pay too;
-    # here it also yields the exact selectivity for the gate.
-    try:
-        mask = wdb_sql._eval_pred(seg, where.this, sc)
-    except (NotImplementedError, Exception):
-        return None
-    pm = seg.presence_mask()
-    if pm is not None:
-        mask = mask & pm
     N = seg.N
-    cnt = int(mask.sum())
-    if cnt == 0:
-        return None                                     # empty result -> let the dense path format it
     K = seg.cols[col].get('V') or (1 << 24)
-    if cnt > _gate(N, K) * N:
-        return None                                     # dense filter -> dense path is cheaper
-
-    # Survivor-set group-by: gather the key codes of survivors and group that small set.
     codes = seg._raw_codes(col)
-    u, c = np.unique(codes[mask], return_counts=True)
+
+    # Structural fast path: push `fcol <op> const` into the filter column's mode-4 exception
+    # structure to get survivor row-ranges WITHOUT decoding the filter column, then gather only the
+    # key codes there. Skipped when there are deleted rows (ranges don't model presence) or when the
+    # column has too many exceptions to be worth it.
+    sub = None
+    cmp = _simple_cmp(where.this, sc)
+    if cmp is not None and seg.presence_mask() is None:
+        fcol, op, const = cmp
+        nexc = wdb_seqpred.n_exceptions(seg, fcol)
+        if nexc is not None and nexc <= _SEQ_EXC_FRAC * N:
+            r = wdb_seqpred.survivor_ranges(seg, fcol, op, const)
+            if r is not None:
+                los, his = r
+                cnt = wdb_seqpred.survivor_count(los, his)
+                if cnt == 0:
+                    return None
+                if cnt > _gate(N, K) * N:
+                    return None                         # dense -> dense path is cheaper
+                sub = codes[wdb_seqpred.ranges_to_ids(los, his)]
+
+    if sub is None:
+        # General path: evaluate the predicate to a mask (reads the filter column), then gather.
+        # The eval is the sunk cost the dense path would pay too, and yields the exact selectivity.
+        try:
+            mask = wdb_sql._eval_pred(seg, where.this, sc)
+        except (NotImplementedError, Exception):
+            return None
+        pm = seg.presence_mask()
+        if pm is not None:
+            mask = mask & pm
+        cnt = int(mask.sum())
+        if cnt == 0:
+            return None                                 # empty result -> let the dense path format it
+        if cnt > _gate(N, K) * N:
+            return None                                 # dense filter -> dense path is cheaper
+        sub = codes[mask]
+
+    # Survivor-set group-by: group the small survivor set.
+    u, c = np.unique(sub, return_counts=True)
     order = np.argsort(c, kind='stable')[::-1]          # count descending over distinct survivors
     cs = c[order]; us = u[order]
     if lim < cs.size and int(cs[lim - 1]) == int(cs[lim]):
