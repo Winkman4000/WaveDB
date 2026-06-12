@@ -58,3 +58,39 @@ def read_columns(path, columns=None, reader='auto'):
                 raise
             return _read_duckdb(path, columns)   # auto: fall back on any arrow failure
     return _read_duckdb(path, columns)
+
+
+def column_schema(path, columns=None, reader='auto'):
+    """Return (cols, n_rows) WITHOUT materialising column data — for streaming encode."""
+    use_arrow = reader == 'arrow' or (reader == 'auto' and str(path).lower().endswith('.parquet'))
+    if use_arrow:
+        try:
+            import pyarrow.parquet as pq
+            pf = pq.ParquetFile(path)
+            allcols = list(pf.schema_arrow.names); N = pf.metadata.num_rows
+            return (list(columns) if columns else allcols), N
+        except Exception:
+            if reader == 'arrow':
+                raise
+    import duckdb
+    con = duckdb.connect()
+    schema = con.execute(f"DESCRIBE SELECT * FROM '{path}'").fetchall()
+    allcols = [r[0] for r in schema]
+    N = con.execute(f"SELECT count(*) FROM '{path}'").fetchone()[0]
+    return (list(columns) if columns else allcols), N
+
+
+def read_one_column(path, col, reader='auto'):
+    """Read a SINGLE column as the encoder-expected numpy array (one column in memory at a time)."""
+    use_arrow = reader == 'arrow' or (reader == 'auto' and str(path).lower().endswith('.parquet'))
+    if use_arrow:
+        try:
+            import pyarrow.parquet as pq
+            t = pq.read_table(path, columns=[col])
+            return _arrow_col_to_numpy(t.column(col))
+        except Exception:
+            if reader == 'arrow':
+                raise
+    import duckdb
+    con = duckdb.connect(); con.execute("PRAGMA threads=8")
+    return con.execute(f'SELECT "{col}" FROM \'{path}\'').fetchnumpy()[col]

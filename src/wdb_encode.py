@@ -258,13 +258,55 @@ def _cluster_order(kc, N):
                                    values=vals, offsets=offsets)
 
 
-def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_specs=None, cluster_by=None, cubes=None):
+def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0):
+    """Memory-bounded encode: read + serialize ONE column at a time so peak memory is a single
+    column rather than the whole table. For the no-cluster, no-FD case (each column independent).
+    Output is byte-identical to encode(): same _prep_column/_serialize_column per column, same
+    column order, same header."""
+    cols, N = wdb_read.column_schema(input_path, columns, reader=reader)
+    blobs = {}; sizes = {}
+    for nm in cols:
+        arr = wdb_read.read_one_column(input_path, nm, reader=reader)
+        blobs[nm], sizes[nm] = _serialize_column(_prep_column(nm, arr),
+                                                 zstd.ZstdCompressor(level=ZSTD_LEVEL))
+        del arr
+    out = bytearray(b'WVDB4'); out += struct.pack('<H', len(cols)); out += struct.pack('<I', N)
+    for nm in cols: out += blobs[nm]
+    open(out_path, 'wb').write(out)
+    try:
+        from wdb_engine import Segment
+        import wdb_profile
+        wdb_profile.profile_and_save(Segment(out_path), out_path)
+    except Exception:
+        pass
+    if cubes:
+        try:
+            from wdb_engine import Segment
+            import wdb_cube
+            _seg = Segment(out_path)
+            if cubes == 'auto':
+                cards = wdb_cube.segment_cardinalities(_seg)
+                specs = wdb_cube.maximal_cube_specs(cards)
+            else:
+                specs = cubes
+            wdb_cube.build_and_write(_seg, specs, workers=workers or 4)
+        except Exception:
+            pass
+    return dict(n_rows=N, n_cols=len(cols), bytes=len(out), seconds=time.time() - t0,
+                sizes=sizes, cluster=None)
+
+
+def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_specs=None, cluster_by=None, cubes=None, stream=False):
     """fd_specs: optional {dependent_col: determinant_col} — store the dependent column as
     a mode-3 FD-reference into the determinant (lossless iff the FD is exact; callers pass
-    only verified FDs). Determinant must be a normal (non-FD) column in the same segment."""
+    only verified FDs). Determinant must be a normal (non-FD) column in the same segment.
+    stream=True: read+encode one column at a time (peak memory ~= one column) for the
+    no-cluster, no-FD case; output is byte-identical to the default path."""
     import os, concurrent.futures as cf
     fd_specs = fd_specs or {}
     t0 = time.time()
+    if stream and cluster_by is None and not fd_specs:
+        return _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0)
     coldata, N, cols = wdb_read.read_columns(input_path, columns, reader=reader)
     cluster_meta = None
     if cluster_by is not None:
