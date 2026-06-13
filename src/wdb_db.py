@@ -12,7 +12,7 @@ import sqlglot, sqlglot.expressions as E
 from wdb_catalog import Catalog
 from wdb_engine import Segment
 import os
-import wdb_ddl, wdb_dml, wdb_sql, wdb_merge, wdb_compact, wdb_join, wdb_fkptr, wdb_bsi_exec, wdb_cube, wdb_gbcount, wdb_survgroup, wdb_compound, wdb_groupdistinct, wdb_gdsidecar
+import wdb_ddl, wdb_dml, wdb_sql, wdb_merge, wdb_compact, wdb_join, wdb_fkptr, wdb_bsi_exec, wdb_cube, wdb_gbcount, wdb_survgroup, wdb_compound, wdb_groupdistinct, wdb_gdsidecar, wdb_groupmix
 import numpy as np
 import functools
 
@@ -144,6 +144,9 @@ class Database:
                     gd = wdb_groupdistinct.try_groupdistinct(segs[0], tree, cmap)  # group-wise COUNT(DISTINCT)
                     if gd is not None:                                   # via single-pass code hashing
                         return gd
+                    gmx = wdb_groupmix.try_groupmix(segs[0], tree, cmap)  # GROUP BY + foldable aggs + 1 distinct
+                    if gmx is not None:                                  # (Q09 shape) one pass: bincounts + walk
+                        return gmx
                     if wdb_sql._cluster_will_slice(segs[0], tree, cmap):
                         return wdb_sql.execute(segs[0], sql, col_map=cmap, tree=tree)  # clustered slice path
                     if wdb_sql._cluster_will_group_slice(segs[0], tree, cmap):
