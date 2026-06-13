@@ -31,6 +31,7 @@ class Database:
         self.cat = catalog
         self._seg_cache = {}   # path -> ((mtime_ns,size), Segment): immutable .wdb base, reused across queries
         self._ptr_cache = {}   # (child_seg_path, fk_col) -> ((mtime_ns,size), int64 ptr array)
+        self._gd_cache = {}    # (seg_path, group, target) -> ((mtime_ns,size), sidecar dict): load .npz once
         # Operator-selected execution intent. escalate=False (default) optimizes for THROUGHPUT
         # (shared DB, many concurrent 1-thread workers): engages the BSI filter-index, which reads
         # fewer bytes per query. escalate=True optimizes a single query for LATENCY: it skips BSI
@@ -206,6 +207,20 @@ class Database:
         wdb_fkptr.save(cpaths[0], fk_col, ptr)
         self.cat.add_fk_pointer(child, fk_col, parent, parent_key)
         return int(cseg.N)
+
+    def gd_sidecar(self, segment_path, group_col, target_col):
+        """Cached group-distinct sidecar (the materialized COUNT(DISTINCT) answer). The .npz is immutable
+        once built, so np.load runs once per process, not per query -- this is what makes the served read
+        a memory hit rather than a file read. Reloads only if the file changed. None if no sidecar."""
+        sp = wdb_gdsidecar.sidecar_path(segment_path, group_col, target_col)
+        if not os.path.exists(sp):
+            return None
+        st = os.stat(sp); key = (st.st_mtime_ns, st.st_size)
+        ck = (segment_path, group_col, target_col); hit = self._gd_cache.get(ck)
+        if hit is None or hit[0] != key:
+            s = wdb_gdsidecar.load(segment_path, group_col, target_col)
+            self._gd_cache[ck] = (key, s); return s
+        return hit[1]
 
     def materialize_gd(self, table, group_col, target_col):
         """Build + persist the group-distinct sidecar for table.(group_col, target_col) and register it.

@@ -18,6 +18,7 @@ import os, json
 import numpy as np
 import wdb_groupdistinct as gd
 import wdb_sql
+import wdb_gbcount
 
 E = wdb_sql.E
 
@@ -98,7 +99,7 @@ def rows_from_sidecar(sc, seg, proj, tree, ci, ki, excluded_codes=None):
     if excluded_codes is not None and len(excluded_codes):
         ex = np.asarray(sorted(excluded_codes), dtype=np.int64)
         present = present[~np.isin(present, ex)]
-    kdecode = gd._ids(seg, sc['meta']['group_col'])[2]   # labels free from the live dict (None => code==value)
+    kdecode = wdb_gbcount._code_values(seg, sc['meta']['group_col'])   # labels: cheap dict read O(V), not O(N)
     sel = present[np.argsort(-counts[present], kind='stable')]
     lim = wdb_sql._limit(tree)
     if lim is not None:
@@ -134,7 +135,7 @@ def try_serve(db, table, seg, segment_path, tree, col_map):
     entry = db.cat.gd_entry(table, kcol, tcol)
     if entry is None:                                    # pair not materialized -> walk
         return None
-    s = load(segment_path, kcol, tcol)
+    s = db.gd_sidecar(segment_path, kcol, tcol)          # cached load (np.load once, not per query)
     if s is None:                                        # registered but no data on disk -> walk
         return None
     if entry.get('excluded'):                            # v1: trimmed groups still needed here -> walk
@@ -148,7 +149,7 @@ def codes_for_values(seg, group_col, values):
     """Map group VALUES (what a human sees in the view) to internal group codes, for trimming. Raw-int
     mode-0 columns: code == value. Dict columns: look the value up in the dict. Unknown values are
     skipped (can't trim a group that isn't there)."""
-    decode = gd._ids(seg, group_col)[2]
+    decode = wdb_gbcount._code_values(seg, group_col)
     if decode is None:                                   # raw int: code is the value
         return sorted(int(v) for v in values)
     inv = {}
@@ -170,7 +171,7 @@ def inspect(seg, segment_path, group_col, target_col, excluded=None):
     if s is None:
         return None
     counts = s['counts']; present = s['present']
-    decode = gd._ids(seg, group_col)[2]
+    decode = wdb_gbcount._code_values(seg, group_col)
     ex = set(excluded or [])
     order = present[np.argsort(-counts[present], kind='stable')]
     rows = []
