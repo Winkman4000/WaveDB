@@ -103,8 +103,11 @@ def _order_is_distinct_desc(tree, proj, ci):
     return isinstance(inner, E.Count) and isinstance(inner.this, E.Distinct)
 
 
-def try_groupdistinct(seg, tree, col_map):
-    global _HITS
+def detect(seg, tree, col_map):
+    """Shape gate shared by the live walk and the materialized sidecar. Returns
+    (kcol, tcol, ci, ki, proj) for a `GROUP BY key, COUNT(DISTINCT target)` query inside v1 scope,
+    else None. kcol/tcol are col_map-resolved physical names; ci/ki index the distinct-count and the
+    bare-key projections. Both serve paths must agree on eligibility, so neither duplicates this."""
     if tree.args.get('joins') or tree.args.get('distinct') is not None:
         return None
     if tree.args.get('where') is not None or tree.args.get('having') is not None:
@@ -137,6 +140,15 @@ def try_groupdistinct(seg, tree, col_map):
         return None
     if seg.cols[kcol].get('has_null'):                   # v1: SQL keeps NULL as a group; defer that case
         return None
+    return kcol, tcol, ci, ki, proj
+
+
+def try_groupdistinct(seg, tree, col_map):
+    global _HITS
+    det = detect(seg, tree, col_map)
+    if det is None:
+        return None
+    kcol, tcol, ci, ki, proj = det
 
     kinfo = _ids(seg, kcol)
     tinfo = _ids(seg, tcol)

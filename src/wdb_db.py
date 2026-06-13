@@ -12,7 +12,7 @@ import sqlglot, sqlglot.expressions as E
 from wdb_catalog import Catalog
 from wdb_engine import Segment
 import os
-import wdb_ddl, wdb_dml, wdb_sql, wdb_merge, wdb_compact, wdb_join, wdb_fkptr, wdb_bsi_exec, wdb_cube, wdb_gbcount, wdb_survgroup, wdb_compound, wdb_groupdistinct
+import wdb_ddl, wdb_dml, wdb_sql, wdb_merge, wdb_compact, wdb_join, wdb_fkptr, wdb_bsi_exec, wdb_cube, wdb_gbcount, wdb_survgroup, wdb_compound, wdb_groupdistinct, wdb_gdsidecar
 import numpy as np
 import functools
 
@@ -137,6 +137,9 @@ class Database:
                     cmpd = wdb_compound.try_compound(segs[0], tree, cmap) # compound-AND filter, multi-key
                     if cmpd is not None:                                 # GROUP BY COUNT(*) on survivors
                         return cmpd
+                    gds = wdb_gdsidecar.try_serve(self, name, segs[0], paths[0], tree, cmap)
+                    if gds is not None:                                  # materialized COUNT(DISTINCT):
+                        return gds                                       # read stored counts, no walk
                     gd = wdb_groupdistinct.try_groupdistinct(segs[0], tree, cmap)  # group-wise COUNT(DISTINCT)
                     if gd is not None:                                   # via single-pass code hashing
                         return gd
@@ -203,6 +206,45 @@ class Database:
         wdb_fkptr.save(cpaths[0], fk_col, ptr)
         self.cat.add_fk_pointer(child, fk_col, parent, parent_key)
         return int(cseg.N)
+
+    def materialize_gd(self, table, group_col, target_col):
+        """Build + persist the group-distinct sidecar for table.(group_col, target_col) and register it.
+        The default covers ALL groups -- the count comes free from the dictionary. v1: single segment."""
+        paths = self.cat.segment_paths(table)
+        if len(paths) != 1:
+            raise NotImplementedError("materialize_gd: single-segment tables only (v1)")
+        phys = self.cat.phys_map(table)
+        gcol = phys.get(group_col, group_col); tcol = phys.get(target_col, target_col)
+        seg = self.open_segment(paths[0], table)
+        s = wdb_gdsidecar.build(seg, gcol, tcol)
+        if s is None:
+            raise ValueError(f"{table}.{group_col}/{target_col} is not the value-identity "
+                             f"COUNT(DISTINCT) shape the sidecar supports")
+        wdb_gdsidecar.save(paths[0], s)
+        self.cat.set_gd_materialized(table, gcol, tcol, excluded=[])
+        return s['meta']
+
+    def gd_trim(self, table, group_col, target_col, exclude_values):
+        """Trim the materialized view: leave the given GROUP values to the live walk (pass [] to un-trim
+        for a full sidecar serve). Values are mapped to group codes via the segment dictionary."""
+        paths = self.cat.segment_paths(table)
+        phys = self.cat.phys_map(table)
+        gcol = phys.get(group_col, group_col); tcol = phys.get(target_col, target_col)
+        seg = self.open_segment(paths[0], table)
+        codes = wdb_gdsidecar.codes_for_values(seg, gcol, exclude_values)
+        self.cat.gd_set_trim(table, gcol, tcol, codes)
+        return codes
+
+    def gd_inspect(self, table, group_col, target_col):
+        """The materialized view a human eyeballs to decide what to trim: (group_value, distinct_count,
+        is_trimmed) rows, descending by count. Reads the sidecar; no walk."""
+        paths = self.cat.segment_paths(table)
+        phys = self.cat.phys_map(table)
+        gcol = phys.get(group_col, group_col); tcol = phys.get(target_col, target_col)
+        seg = self.open_segment(paths[0], table)
+        entry = self.cat.gd_entry(table, gcol, tcol)
+        excluded = (entry or {}).get('excluded') or []
+        return wdb_gdsidecar.inspect(seg, paths[0], gcol, tcol, excluded=excluded)
 
     def set_table_mode(self, name, mode):
         """Operator control: 'buffered' = high-traffic, INSERT appends to hot buffer

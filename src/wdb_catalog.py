@@ -147,6 +147,37 @@ class Catalog:
     def stamps(self, name):
         return self.get_table(name).get('stamps', {})
 
+    # ---- group-distinct sidecars (materialized COUNT(DISTINCT) answers) -------------------------
+    # The default sidecar covers ALL groups (the count comes free from the dictionary's V). The user
+    # trims it in the materialized view: `excluded` lists group codes left to the live walk. Presence
+    # of an entry == the pair is materialized; the count data lives in a .npz next to each segment.
+    def set_gd_materialized(self, name, group_col, target_col, excluded=None):
+        gd = self.get_table(name).setdefault('gd', {}).setdefault(group_col, {})
+        gd[target_col] = {'excluded': sorted(int(c) for c in (excluded or []))}
+        self.save()
+
+    def gd_materialized(self, name):
+        return self.get_table(name).get('gd', {})
+
+    def gd_entry(self, name, group_col, target_col):
+        return self.get_table(name).get('gd', {}).get(group_col, {}).get(target_col)
+
+    def gd_set_trim(self, name, group_col, target_col, excluded):
+        """Update just the trim (which group codes are left to the walk) for a materialized pair."""
+        e = self.gd_entry(name, group_col, target_col)
+        if e is None:
+            raise KeyError(f"{name}.{group_col}/{target_col} is not materialized")
+        e['excluded'] = sorted(int(c) for c in (excluded or []))
+        self.save()
+
+    def drop_gd_materialized(self, name, group_col, target_col):
+        gd = self.get_table(name).get('gd', {})
+        if group_col in gd and target_col in gd[group_col]:
+            del gd[group_col][target_col]
+            if not gd[group_col]:
+                del gd[group_col]
+            self.save()
+
     def segment_paths(self, name):
         t = self.get_table(name)
         return [os.path.join(self.dbdir, s) for s in t['segments']]
