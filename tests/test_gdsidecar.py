@@ -146,3 +146,47 @@ def test_build_declines_non_value_identity():
         db.materialize_gd('t','g','k'); assert False, "should have raised"
     except ValueError:
         pass
+
+
+# ── v2: WHERE confined to the group key (filter just removes whole groups) ──────────────────────
+QF_NEQ = "SELECT g, COUNT(DISTINCT s) AS u FROM t WHERE g <> 'G2' GROUP BY g"
+QF_EQ  = "SELECT g, COUNT(DISTINCT s) AS u FROM t WHERE g = 'G3' GROUP BY g"
+QF_IN  = "SELECT g, COUNT(DISTINCT s) AS u FROM t WHERE g IN ('G1','G4') GROUP BY g"
+QF_NIN = "SELECT g, COUNT(DISTINCT s) AS u FROM t WHERE g NOT IN ('G0','G5') GROUP BY g"
+QF_AND = "SELECT g, COUNT(DISTINCT s) AS u FROM t WHERE g <> 'G2' AND g <> 'G4' GROUP BY g"
+QF_OTHER = "SELECT g, COUNT(DISTINCT s) AS u FROM t WHERE s <> 'S0' GROUP BY g"  # filter on TARGET -> must decline
+
+
+def test_serve_filter_on_group_key_neq():
+    db, _ = _fixture(); _ensure_materialized()
+    s0, w0 = scm._SERVE_HITS, gd._HITS
+    r = db.run(QF_NEQ)[0]
+    assert scm._SERVE_HITS == s0 + 1 and gd._HITS == w0          # served from sidecar, no walk
+    assert _norm(r) == _duck(QF_NEQ)
+    assert all(str(row[0]) != 'G2' for row in r)                 # the excluded group is gone
+
+
+def test_serve_filter_eq_in_notin_and():
+    db, _ = _fixture(); _ensure_materialized()
+    for q in (QF_EQ, QF_IN, QF_NIN, QF_AND):
+        s0 = scm._SERVE_HITS
+        r = db.run(q)[0]
+        assert scm._SERVE_HITS == s0 + 1, q                      # each served from the sidecar
+        assert _norm(r) == _duck(q), q
+
+
+def test_filter_on_nongroup_column_declines_serve():
+    db, _ = _fixture(); _ensure_materialized()
+    s0 = scm._SERVE_HITS
+    r = db.run(QF_OTHER)[0]
+    assert scm._SERVE_HITS == s0                                 # sidecar must NOT serve (counts would be wrong)
+    assert _norm(r) == _duck(QF_OTHER)                           # answer still exact via the fallback path
+
+
+def test_walk_path_still_rejects_where():
+    db, _ = _fixture()
+    seg = db.open_segment(db.cat.segment_paths('t')[0], 't')
+    tree = __import__('wdb_db')._parse_sql_cached(QF_NEQ)
+    assert gd.try_groupdistinct(seg, tree, None) is None         # walk contract unchanged: declines WHERE
+    assert gd.detect(seg, tree, None) is None                    # default gate still rejects WHERE
+    assert gd.detect(seg, tree, None, _allow_group_filter=True) is not None  # sidecar opt-in lets it through

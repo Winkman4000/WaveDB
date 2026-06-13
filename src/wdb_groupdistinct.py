@@ -103,15 +103,17 @@ def _order_is_distinct_desc(tree, proj, ci):
     return isinstance(inner, E.Count) and isinstance(inner.this, E.Distinct)
 
 
-def detect(seg, tree, col_map):
+def detect(seg, tree, col_map, _allow_group_filter=False):
     """Shape gate shared by the live walk and the materialized sidecar. Returns
     (kcol, tcol, ci, ki, proj) for a `GROUP BY key, COUNT(DISTINCT target)` query inside v1 scope,
     else None. kcol/tcol are col_map-resolved physical names; ci/ki index the distinct-count and the
     bare-key projections. Both serve paths must agree on eligibility, so neither duplicates this."""
     if tree.args.get('joins') or tree.args.get('distinct') is not None:
         return None
-    if tree.args.get('where') is not None or tree.args.get('having') is not None:
-        return None                                      # v1: no filter (that's v2)
+    if tree.args.get('having') is not None:
+        return None
+    if tree.args.get('where') is not None and not _allow_group_filter:
+        return None                                      # walk path: no filter. sidecar passes a group-key-only filter.
     group = tree.args.get('group')
     if group is None or len(group.expressions) != 1:
         return None

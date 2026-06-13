@@ -117,6 +117,91 @@ def rows_from_sidecar(sc, seg, proj, tree, ci, ki, excluded_codes=None):
     return rows, names
 
 
+_NOLIT = object()
+
+
+def _literal_value(node):
+    """Python scalar from a SQL literal node, or _NOLIT if it isn't a plain string/number literal.
+    NULL is _NOLIT on purpose: NULL comparisons are three-valued and we won't translate them."""
+    if isinstance(node, E.Literal):
+        if node.is_string:
+            return node.this
+        try:
+            return int(node.this)
+        except ValueError:
+            try:
+                return float(node.this)
+            except ValueError:
+                return _NOLIT
+    return _NOLIT
+
+
+def _binary_literal(node):
+    """For a comparison whose one side is the group column, return the literal on the other side."""
+    l, r = node.this, node.args.get('expression')
+    if isinstance(l, E.Column):
+        return _literal_value(r)
+    if isinstance(r, E.Column):
+        return _literal_value(l)
+    return _NOLIT
+
+
+def _excluded_from_group_filter(seg, tree, group_col, col_map, present):
+    """Translate a WHERE *confined to the group key* into the set of group codes to DROP from the
+    sidecar output. The per-group distinct counts are invariant under a filter that only touches the
+    group column -- such a filter only removes whole groups -- so serving the survivors is exact.
+
+    Returns sorted excluded codes, [] when there's no filter, or None to DECLINE (any predicate that
+    references another column, or any form we can't translate exactly, falls through to the walk).
+    Supported leaves (AND-combined): `col <> v`, `col = v`, `col IN (..)`, `col NOT IN (..)`."""
+    where = tree.args.get('where')
+    if where is None:
+        return []
+    pred = where.this
+    sc = (lambda c: col_map.get(c, c)) if col_map else (lambda c: c)
+    for colexpr in pred.find_all(E.Column):
+        if sc(colexpr.name) != group_col:
+            return None                                  # predicate touches a non-group column -> walk
+    leaves = []
+    def _flatten_and(node):
+        if isinstance(node, E.And):
+            _flatten_and(node.this); _flatten_and(node.args.get('expression'))
+        else:
+            leaves.append(node)
+    _flatten_and(pred)
+
+    present_set = set(int(x) for x in present.tolist())
+    exclude = set()
+    keep_only = None                                     # set once any '='/IN narrows to a kept set
+    for leaf in leaves:
+        if isinstance(leaf, E.NEQ):
+            v = _binary_literal(leaf)
+            if v is _NOLIT: return None
+            exclude |= set(codes_for_values(seg, group_col, [v]))
+        elif isinstance(leaf, E.EQ):
+            v = _binary_literal(leaf)
+            if v is _NOLIT: return None
+            ks = set(codes_for_values(seg, group_col, [v]))
+            keep_only = ks if keep_only is None else (keep_only & ks)
+        elif isinstance(leaf, E.In) and leaf.args.get('query') is None:
+            vals = [_literal_value(e) for e in (leaf.expressions or [])]
+            if any(v is _NOLIT for v in vals): return None
+            ks = set(codes_for_values(seg, group_col, vals))
+            keep_only = ks if keep_only is None else (keep_only & ks)
+        elif isinstance(leaf, E.Not) and isinstance(leaf.this, E.In) and leaf.this.args.get('query') is None:
+            vals = [_literal_value(e) for e in (leaf.this.expressions or [])]
+            if any(v is _NOLIT for v in vals): return None
+            exclude |= set(codes_for_values(seg, group_col, vals))
+        else:
+            return None                                  # unhandled predicate form -> walk
+    if keep_only is not None:
+        kept = (keep_only & present_set) - exclude
+        excluded = present_set - kept
+    else:
+        excluded = exclude & present_set
+    return sorted(int(x) for x in excluded)
+
+
 _SERVE_HITS = 0   # telemetry: queries answered from the materialized sidecar (not the walk)
 
 
@@ -128,7 +213,7 @@ def try_serve(db, table, seg, segment_path, tree, col_map):
     WHERE, so a query needs EVERY group -- any trim therefore falls through to the walk for exact parity
     with the live operator. (Subset/filtered serving over the kept groups is v2.)"""
     global _SERVE_HITS
-    det = gd.detect(seg, tree, col_map)
+    det = gd.detect(seg, tree, col_map, _allow_group_filter=True)
     if det is None:
         return None
     kcol, tcol, ci, ki, proj = det
@@ -138,30 +223,61 @@ def try_serve(db, table, seg, segment_path, tree, col_map):
     s = db.gd_sidecar(segment_path, kcol, tcol)          # cached load (np.load once, not per query)
     if s is None:                                        # registered but no data on disk -> walk
         return None
-    if entry.get('excluded'):                            # v1: trimmed groups still needed here -> walk
+    if entry.get('excluded'):                            # catalog trim + query filter don't combine here -> walk
         return None
-    rows, names = rows_from_sidecar(s, seg, proj, tree, ci, ki, excluded_codes=None)
+    excluded = _excluded_from_group_filter(seg, tree, kcol, col_map, s['present'])
+    if excluded is None:                                 # a WHERE we can't translate exactly -> walk
+        return None
+    rows, names = rows_from_sidecar(s, seg, proj, tree, ci, ki, excluded_codes=excluded)
     _SERVE_HITS += 1
     return rows, names
 
 
 def codes_for_values(seg, group_col, values):
-    """Map group VALUES (what a human sees in the view) to internal group codes, for trimming. Raw-int
-    mode-0 columns: code == value. Dict columns: look the value up in the dict. Unknown values are
-    skipped (can't trim a group that isn't there)."""
+    """Map group VALUES (what a human sees) to internal group codes, for trimming/filtering. Raw-int
+    columns: code == value. Dict columns: resolve only the requested literals in ONE pass over the
+    dict (native byte/int compare, no full decode), with early-exit once all are found, and memoize
+    results per (segment, column) so repeated filters are O(K). Building the *full* inverse here was
+    the bug that made a filtered serve on a 6M-value column take ~5s. Unknown values are skipped."""
     decode = wdb_gbcount._code_values(seg, group_col)
     if decode is None:                                   # raw int: code is the value
         return sorted(int(v) for v in values)
-    inv = {}
-    for code, val in enumerate(decode):
-        key = val.decode() if isinstance(val, (bytes, bytearray)) else val
-        inv[key] = code
-    out = []
-    for v in values:
-        key = v.decode() if isinstance(v, (bytes, bytearray)) else v
-        if key in inv:
-            out.append(int(inv[key]))
-    return sorted(out)
+    cache = getattr(seg, '_gd_val2code', None)
+    if cache is None:
+        cache = {}
+        try: seg._gd_val2code = cache
+        except Exception: pass
+    cc = cache.setdefault(group_col, {})
+    string_dict = len(decode) > 0 and isinstance(decode[0], (bytes, bytearray))
+    def nk(v):                                           # normalize a filter literal to the dict's key form
+        if string_dict:
+            return v.encode() if isinstance(v, str) else bytes(v)
+        return int(v)
+    keys = [nk(v) for v in values]
+    out = []; need = set()
+    for k in keys:
+        if k in cc:
+            if cc[k] is not None: out.append(cc[k])
+        else:
+            need.add(k)
+    if need:
+        found = {}
+        if string_dict:
+            for code, val in enumerate(decode):          # single byte-compare pass, early-exit
+                vb = bytes(val)
+                if vb in need:
+                    found[vb] = code
+                    if len(found) == len(need): break
+        else:
+            for code, val in enumerate(decode):
+                iv = int(val)
+                if iv in need:
+                    found[iv] = code
+                    if len(found) == len(need): break
+        for k in need:
+            cc[k] = found.get(k)                          # memoize hits AND misses (None) -> never rescan
+            if cc[k] is not None: out.append(cc[k])
+    return sorted(int(x) for x in out)
 
 
 def inspect(seg, segment_path, group_col, target_col, excluded=None):
