@@ -12,7 +12,7 @@ import sqlglot, sqlglot.expressions as E
 from wdb_catalog import Catalog
 from wdb_engine import Segment
 import os
-import wdb_ddl, wdb_dml, wdb_sql, wdb_merge, wdb_compact, wdb_join, wdb_fkptr, wdb_bsi_exec, wdb_cube, wdb_gbcount, wdb_survgroup, wdb_compound
+import wdb_ddl, wdb_dml, wdb_sql, wdb_merge, wdb_compact, wdb_join, wdb_fkptr, wdb_bsi_exec, wdb_cube, wdb_gbcount, wdb_survgroup, wdb_compound, wdb_groupdistinct
 import numpy as np
 import functools
 
@@ -137,6 +137,9 @@ class Database:
                     cmpd = wdb_compound.try_compound(segs[0], tree, cmap) # compound-AND filter, multi-key
                     if cmpd is not None:                                 # GROUP BY COUNT(*) on survivors
                         return cmpd
+                    gd = wdb_groupdistinct.try_groupdistinct(segs[0], tree, cmap)  # group-wise COUNT(DISTINCT)
+                    if gd is not None:                                   # via single-pass code hashing
+                        return gd
                     if wdb_sql._cluster_will_slice(segs[0], tree, cmap):
                         return wdb_sql.execute(segs[0], sql, col_map=cmap, tree=tree)  # clustered slice path
                     if wdb_sql._cluster_will_group_slice(segs[0], tree, cmap):
