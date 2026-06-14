@@ -1,11 +1,12 @@
 """
 wdb_measure_runtime -- runtime / query-derived measurements and the cost thresholds that read them.
 
-The THIRD measurement file. The other two already exist:
-    wdb_profile    -- DATA measurements (per-column: cardinality, entropy, sortedness) [at rest]
-    wdb_calibrate  -- MACHINE measurements (host read rates, locality penalty, cache cliff)
-This one holds quantities that are only knowable per query, against the live data + predicate, plus
-the calibrated thresholds that turn a measured quantity into a path choice. Centralized so that
+Runtime measurements + the path-choice thresholds that read them. The DATA-measurement sibling lives
+in wdb_profile (true per-column cardinality, read by cube). A MACHINE-measurement pillar (host read
+rates, locality penalty, cache cliff) was prototyped in wdb_calibrate but PARKED 2026-06-14
+(docs/auto_physical_design.md) and never wired -- so the thresholds below are hand-set, not
+host-calibrated. This one holds quantities only knowable per query, against the live data + predicate,
+plus those thresholds that turn a measured quantity into a path choice. Centralized so that
 "why did the router take path A over path B?" is answerable from ONE auditable function instead of a
 magic number buried in an operator body.
 
@@ -98,7 +99,7 @@ def cube_worth_materializing(cell_count, cap=CUBE_MAX_CELLS):
 # --- parallel-vs-serial dispatch threshold (used by wdb_agg) ---
 # Row count above which the parallel reduction beats the serial path; below it, thread dispatch +
 # reduce overhead dominate. Machine-flavored in ORIGIN (dispatch cost vs core count) -- a candidate to
-# become a measured value in wdb_calibrate later; hand-set for now, but centralized here with the other
+# become a host-calibrated value later (see parked wdb_calibrate, docs/auto_physical_design.md); hand-set for now, centralized here with the other
 # path-choice thresholds so it is not duplicated or forgotten.
 PARALLEL_THRESHOLD = 2_000_000
 
