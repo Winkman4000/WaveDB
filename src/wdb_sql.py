@@ -10,6 +10,19 @@ import wdb_measure_runtime as RT
 _SLICE_HITS = 0   # count of queries answered via the cluster-slice fast path (tests/telemetry)
 # decoded-column residency budget lives in wdb_measure_runtime: RT.column_fits_resident(n_rows).
 
+def _kind(dt):
+    """dtype code -> numpy kind char: 'i' for int/datetime (0,3), else 'f'. Shared (also wdb_bsi_exec)."""
+    return 'i' if dt in (0, 3) else 'f'
+
+
+def _flatten_and(node):
+    """Flatten a top-level AND (descending through Paren) into a list of leaf nodes.
+    Shared stateless helper (also wdb_compound, wdb_gdsidecar)."""
+    if isinstance(node, E.Paren): return _flatten_and(node.this)
+    if isinstance(node, E.And): return _flatten_and(node.this) + _flatten_and(node.expression)
+    return [node]
+
+
 def _slice_vals(seg, cn, lo, hi, rmask):
     """Measure values for the cluster slice [lo,hi) under residual rmask. Decode-once-resident when
     the column fits the RAM budget (serving throughput: no per-query dict gather); else lazy partial
@@ -447,7 +460,6 @@ def _cluster_slice(seg, where_node, seg_col):
     cm = seg.cluster_meta()
     if cm is None: return None
     key = cm['key']; los = []; his = []; consumed = set()
-    def _kind(dt): return 'i' if dt in (0, 3) else 'f'
     def visit(n):
         if isinstance(n, E.Paren): return visit(n.this)
         if isinstance(n, E.And): visit(n.this); visit(n.expression); return

@@ -83,17 +83,13 @@ def _code_of(seg, col, value):
     return None
 
 
-def _flatten_and(node):
-    if isinstance(node, E.Paren): return _flatten_and(node.this)
-    if isinstance(node, E.And): return _flatten_and(node.this) + _flatten_and(node.expression)
-    return [node]
 
 
 def _conjuncts(seg, where_node, sc):
     """Flatten a top-level AND into simple conjunct descriptors, or None if any leaf is unsupported.
     Each: {'col','op','const'} | {'col','op':'in','const':[...]} | {'col','op','strempty':True}."""
     out = []
-    for n in _flatten_and(where_node):
+    for n in wdb_sql._flatten_and(where_node):
         if isinstance(n, (E.EQ, E.NEQ, E.LT, E.LTE, E.GT, E.GTE)):
             op = _OPSTR[type(n)]; a = n.this; b = n.args.get('expression')
             if b is None: return None

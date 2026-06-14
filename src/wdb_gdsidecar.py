@@ -162,13 +162,7 @@ def _excluded_from_group_filter(seg, tree, group_col, col_map, present):
     for colexpr in pred.find_all(E.Column):
         if sc(colexpr.name) != group_col:
             return None                                  # predicate touches a non-group column -> walk
-    leaves = []
-    def _flatten_and(node):
-        if isinstance(node, E.And):
-            _flatten_and(node.this); _flatten_and(node.args.get('expression'))
-        else:
-            leaves.append(node)
-    _flatten_and(pred)
+    leaves = wdb_sql._flatten_and(pred)
 
     present_set = set(int(x) for x in present.tolist())
     exclude = set()

@@ -32,8 +32,6 @@ except Exception:
     pass
 
 
-def _kind(dt):
-    return 'i' if dt in (0, 3) else 'f'
 
 
 def _bump():
@@ -113,13 +111,13 @@ def _pred(seg, n, sc):
         col = sc(col); bsi, dv = _col_index(seg, col)
         if not _is_lit(n.expression):
             raise _BSIUnsupported("non-literal rhs")
-        v = S._lit_for_col(seg, col, n.expression, _kind(seg.cols[col]['dt']))
+        v = S._lit_for_col(seg, col, n.expression, S._kind(seg.cols[col]['dt']))
         return _cmp(bsi, dv, type(n), v)
     if isinstance(n, E.Between):
         col = S._colname(n.this)
         if col is None:
             raise _BSIUnsupported("between lhs")
-        col = sc(col); bsi, dv = _col_index(seg, col); k = _kind(seg.cols[col]['dt'])
+        col = sc(col); bsi, dv = _col_index(seg, col); k = S._kind(seg.cols[col]['dt'])
         lo = S._lit_for_col(seg, col, n.args['low'], k)
         hi = S._lit_for_col(seg, col, n.args['high'], k)
         a = int(np.searchsorted(dv, lo, 'left')); b = int(np.searchsorted(dv, hi, 'right'))
@@ -130,7 +128,7 @@ def _pred(seg, n, sc):
         col = S._colname(n.this)
         if col is None:
             raise _BSIUnsupported("in lhs")
-        col = sc(col); bsi, dv = _col_index(seg, col); k = _kind(seg.cols[col]['dt'])
+        col = sc(col); bsi, dv = _col_index(seg, col); k = S._kind(seg.cols[col]['dt'])
         idxs = []
         for lit in n.expressions:
             if not _is_lit(lit):

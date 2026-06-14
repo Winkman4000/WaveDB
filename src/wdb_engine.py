@@ -402,7 +402,6 @@ class Segment:
             import wdb_override
             self._ov = wdb_override.load(self.path) or {}
         return self._ov.get(nm)
-    def cardinality(self, nm): return self.cols[nm]['V']
     def group_by_count(self, nm):
         return np.bincount(self.codes(nm), minlength=self.cols[nm]['V'])
 
