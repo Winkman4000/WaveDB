@@ -20,6 +20,7 @@ ORDER BY the distinct-count DESC (or absent), optional LIMIT. Filters and co-agg
 import numpy as np
 import wdb_sql
 import wdb_gbcount
+import wdb_policies as P
 E = wdb_sql.E
 
 _HITS = 0   # telemetry: queries answered by the group-distinct kernel
@@ -108,15 +109,14 @@ def detect(seg, tree, col_map, _allow_group_filter=False):
     (kcol, tcol, ci, ki, proj) for a `GROUP BY key, COUNT(DISTINCT target)` query inside v1 scope,
     else None. kcol/tcol are col_map-resolved physical names; ci/ki index the distinct-count and the
     bare-key projections. Both serve paths must agree on eligibility, so neither duplicates this."""
-    if tree.args.get('joins') or tree.args.get('distinct') is not None:
-        return None
-    if tree.args.get('having') is not None:
-        return None
-    if tree.args.get('where') is not None and not _allow_group_filter:
-        return None                                      # walk path: no filter. sidecar passes a group-key-only filter.
+    # --- shared shape guards (lifted to wdb_policies; the sidecar relaxes no_where to group-key-only) ---
+    if not P.no_joins(tree):           return None
+    if not P.no_select_distinct(tree): return None
+    if not P.no_having(tree):          return None
+    if not (P.no_where(tree) or _allow_group_filter): return None
+    if not P.single_group_key(tree):   return None
     group = tree.args.get('group')
-    if group is None or len(group.expressions) != 1:
-        return None
+    # --- distinct-family shape match (also EXTRACTS the column/projection indices, so it stays here) ---
     proj = tree.expressions
     if len(proj) != 2:
         return None
@@ -134,14 +134,12 @@ def detect(seg, tree, col_map, _allow_group_filter=False):
         return None
     if not _order_is_distinct_desc(tree, proj, ci):
         return None
+    # --- resolve physical names, then shared segment/column guards ---
     sc = (lambda c: col_map.get(c, c)) if col_map else (lambda c: c)
     kcol = sc(knm); tcol = sc(tname)
-    if kcol not in seg.cols or tcol not in seg.cols:
-        return None
-    if seg.presence_mask() is not None:                  # deleted rows: per-row scan would be unsound here
-        return None
-    if seg.cols[kcol].get('has_null'):                   # v1: SQL keeps NULL as a group; defer that case
-        return None
+    if not P.columns_exist(seg, kcol, tcol): return None
+    if not P.no_deleted_rows(seg):           return None
+    if not P.key_not_nullable(seg, kcol):    return None
     return kcol, tcol, ci, ki, proj
 
 
