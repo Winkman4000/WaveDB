@@ -92,3 +92,18 @@ def cube_worth_materializing(cell_count, cap=CUBE_MAX_CELLS):
     to be worth materializing -- below the cap it is a few KB and parse-bound; far above it the cube
     costs MB for a query that must emit ~cell_count rows anyway (output-bound)."""
     return 0 < cell_count <= cap
+
+
+
+# --- parallel-vs-serial dispatch threshold (used by wdb_agg) ---
+# Row count above which the parallel reduction beats the serial path; below it, thread dispatch +
+# reduce overhead dominate. Machine-flavored in ORIGIN (dispatch cost vs core count) -- a candidate to
+# become a measured value in wdb_calibrate later; hand-set for now, but centralized here with the other
+# path-choice thresholds so it is not duplicated or forgotten.
+PARALLEL_THRESHOLD = 2_000_000
+
+
+def parallel_worth_it(n_rows):
+    """True iff `n_rows` is large enough (>= PARALLEL_THRESHOLD) that the parallel reduction beats the
+    serial path despite thread-dispatch + reduce overhead."""
+    return n_rows >= PARALLEL_THRESHOLD

@@ -26,7 +26,6 @@ except Exception:
     HAS_NUMBA = False
 
 _NT = min(8, os.cpu_count() or 1)
-_PARALLEL_THRESHOLD = 2_000_000
 _CACHE = {}                       # (body, slot_gathered, group_gathered, has_mask, need_minmax) -> kernel
 
 

@@ -113,15 +113,15 @@ def test_fast_order_limit():
 
 def test_threaded_path_matches_duckdb():
     # force the threaded fused kernel on the small fixture (threshold normally 2M rows)
-    import wdb_agg
-    saved = wdb_agg.PARALLEL_THRESHOLD; wdb_agg.PARALLEL_THRESHOLD = 0
+    import wdb_measure_runtime as RT
+    saved = RT.PARALLEL_THRESHOLD; RT.PARALLEL_THRESHOLD = 0
     try:
         _match("SELECT c.c_mktsegment, COUNT(*), SUM(o.o_totalprice), AVG(o.o_totalprice), COUNT(o.o_orderkey) "
                "FROM orders o JOIN customer c ON o.o_custkey=c.c_custkey GROUP BY c.c_mktsegment")
         _match("SELECT c.c_mktsegment, SUM(o.o_totalprice) FROM orders o JOIN customer c "
                "ON o.o_custkey=c.c_custkey WHERE o.o_totalprice > 100000 GROUP BY c.c_mktsegment")
     finally:
-        wdb_agg.PARALLEL_THRESHOLD = saved
+        RT.PARALLEL_THRESHOLD = saved
 
 def test_plain_projection_falls_back():
     # no aggregate -> not eligible -> must fall back to the hash path, still correct

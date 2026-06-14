@@ -76,8 +76,10 @@ def _group_minmax(codes, v, K, cnt, fn):
 # 4), so the win is real but bounded -- it is not an 8x. MIN/MAX stay on the serial path.
 import os
 from concurrent.futures import ThreadPoolExecutor
+import wdb_measure_runtime as RT
 
-PARALLEL_THRESHOLD = 2_000_000     # rows; below this the serial path wins (dispatch + reduce overhead)
+# PARALLEL_THRESHOLD (rows above which the parallel reduction wins) lives in wdb_measure_runtime:
+# RT.parallel_worth_it(n_rows).
 _NT = min(8, os.cpu_count() or 4)  # physical-core-ish; bandwidth-bound, so more threads don't help
 _POOL = None
 
@@ -441,7 +443,7 @@ def numba_grouped(gc, cols, K, mask=None):
     """One fused pass over group codes + value columns (mask, if any, fused into the V=1 kernel so no
     boolean-index copy is made). cols: list of 1-D numeric arrays. Returns (count[K], sums[V,K],
     mins[V,K], maxs[V,K]). Serial below the parallel threshold."""
-    V = len(cols); par = gc.shape[0] >= PARALLEL_THRESHOLD
+    V = len(cols); par = RT.parallel_worth_it(gc.shape[0])
     Kp = ((K + 7) // 8) * 8 + 8                 # cache-line padding for the per-thread accumulator rows
     if V == 1:
         v = cols[0]
@@ -469,7 +471,7 @@ def numba_grouped(gc, cols, K, mask=None):
 def numba_grouped_g(pcodes, ptr, cols, K, mask=None):
     """Gather-fused V=1: the group code is pcodes[ptr[i]] computed per row, instead of materialising the
     full pcodes[ptr] gather + int64 cast first (measured 11.7ms -> 2.0ms at 6M)."""
-    v = cols[0]; par = ptr.shape[0] >= PARALLEL_THRESHOLD
+    v = cols[0]; par = RT.parallel_worth_it(ptr.shape[0])
     Kp = ((K + 7) // 8) * 8 + 8
     if mask is not None:
         if par:
@@ -491,7 +493,7 @@ def _reduce1(cnt, s, mn, mx, K):
 
 def numba_grouped_d(gc, base, vcodes, K, mask=None):
     """Direct group code gc[i], value decoded as base[vcodes[i]] -- decode fused, no value array."""
-    par = gc.shape[0] >= PARALLEL_THRESHOLD; Kp = ((K + 7) // 8) * 8 + 8
+    par = RT.parallel_worth_it(gc.shape[0]); Kp = ((K + 7) // 8) * 8 + 8
     if mask is not None:
         if par: return _reduce1(*_nb_g1md_par(gc, base, vcodes, mask, K, _NT, Kp), K)
         cnt, s, mn, mx = _nb_g1md_ser(gc, base, vcodes, mask, K); return cnt, s[None, :], mn[None, :], mx[None, :]
@@ -500,7 +502,7 @@ def numba_grouped_d(gc, base, vcodes, K, mask=None):
 
 def numba_grouped_gd(pcodes, ptr, base, vcodes, K, mask=None):
     """Gathered group code pcodes[ptr[i]] AND value base[vcodes[i]] -- both gathers fused into one pass."""
-    par = ptr.shape[0] >= PARALLEL_THRESHOLD; Kp = ((K + 7) // 8) * 8 + 8
+    par = RT.parallel_worth_it(ptr.shape[0]); Kp = ((K + 7) // 8) * 8 + 8
     if mask is not None:
         if par: return _reduce1(*_nb_g1gmd_par(pcodes, ptr, base, vcodes, mask, K, _NT, Kp), K)
         cnt, s, mn, mx = _nb_g1gmd_ser(pcodes, ptr, base, vcodes, mask, K); return cnt, s[None, :], mn[None, :], mx[None, :]

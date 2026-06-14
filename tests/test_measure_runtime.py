@@ -54,3 +54,9 @@ def test_cube_cap():
     assert RT.cube_worth_materializing(4096) is True      # boundary inclusive
     assert RT.cube_worth_materializing(4097) is False
     assert RT.cube_worth_materializing(0) is False        # empty product -> not worth
+
+
+def test_parallel_threshold():
+    assert RT.PARALLEL_THRESHOLD == 2_000_000
+    assert RT.parallel_worth_it(2_000_000) is True       # boundary inclusive
+    assert RT.parallel_worth_it(1_999_999) is False

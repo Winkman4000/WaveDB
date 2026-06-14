@@ -5,6 +5,7 @@ If numba is unavailable the engine uses the numpy paths, so these checks are sim
 import os, sys, numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import wdb_agg as A
+import wdb_measure_runtime as RT
 
 def _cmp(counts, finals, codes, K, specs, m=None):
     c = codes if m is None else codes[m]
@@ -51,7 +52,7 @@ def test_fused_whole_table():
 def test_fused_parallel_small_K_padding():
     # >PARALLEL_THRESHOLD rows with K=3: the false-sharing case the cache-line padding fixes.
     if not A.HAS_NUMBA: return
-    rng = np.random.default_rng(4); n = A.PARALLEL_THRESHOLD + 100_000; K = 3
+    rng = np.random.default_rng(4); n = RT.PARALLEL_THRESHOLD + 100_000; K = 3
     codes = rng.integers(0, K, n); price = rng.uniform(1, 1000, n)
     _run(codes, K, [(0, 'SUM', price), (1, 'MIN', price), (2, 'MAX', price)])      # unmasked parallel
     m = rng.random(n) < 0.5
@@ -61,7 +62,7 @@ def test_fused_gathered_group():
     # gathered group (group code = pcodes[ptr[i]]), parallel path + mask, vs materialise-then-group_agg
     if not A.HAS_NUMBA: return
     rng = np.random.default_rng(5)
-    n_parent = 50_000; n = A.PARALLEL_THRESHOLD + 200_000; K = 2000
+    n_parent = 50_000; n = RT.PARALLEL_THRESHOLD + 200_000; K = 2000
     pcodes = rng.integers(0, K, n_parent).astype(np.int64)
     ptr = rng.integers(0, n_parent, n).astype(np.int64)
     price = rng.uniform(1, 1000, n)
@@ -85,7 +86,7 @@ def test_decode_fused_vs_materialised():
         gc_, gs, gmn, gmx = got; rc, rs, rmn, rmx = ref
         return (np.array_equal(gc_, rc) and np.allclose(gs, rs)
                 and np.allclose(gmn, rmn) and np.allclose(gmx, rmx))
-    for n in (250_000, A.PARALLEL_THRESHOLD + 120_000):     # serial then parallel
+    for n in (250_000, RT.PARALLEL_THRESHOLD + 120_000):     # serial then parallel
         K = 1500
         base = rng.uniform(1, 1000, 30_000).astype(np.float64)
         vcodes = rng.integers(0, len(base), n).astype(np.int64)

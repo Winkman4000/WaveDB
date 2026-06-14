@@ -12,6 +12,7 @@ import sqlglot, sqlglot.expressions as E
 import numpy as np, pandas as pd, os
 from wdb_engine import Segment
 import wdb_sql, wdb_dml, wdb_agg, wdb_fkptr, wdb_exprjit, wdb_radix
+import wdb_measure_runtime as RT
 
 _CMP = {E.EQ: '==', E.NEQ: '!=', E.GT: '>', E.LT: '<', E.GTE: '>=', E.LTE: '<='}
 
@@ -1323,7 +1324,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         if specs or minmax:
             if numba_ok:
                 counts, agg_arrays = wdb_agg.fused_numba(_group_op(), K, specs + minmax, _mask_op(), n)
-            elif n >= wdb_agg.PARALLEL_THRESHOLD and not minmax:
+            elif RT.parallel_worth_it(n) and not minmax:
                 counts, agg_arrays = wdb_agg.fused_counts_and_aggs(_group_op(), K, specs, _mask_op(), n)
             else:
                 gc = wdb_agg._slice(_group_op(), 0, n)
