@@ -78,3 +78,12 @@ def test_not_positional():
     assert P.not_positional(_FakeSeg({'a': {'mode': 0}}), 'a') is True
     assert P.not_positional(_FakeSeg({'a': {'mode': 2}}), 'a') is True
     assert P.not_positional(_FakeSeg({'a': {'mode': 4}}), 'a') is False
+
+
+def test_has_group_key():
+    # the looser form: passes for one OR several group keys, fails when GROUP BY is absent
+    assert P.has_group_key(_t("SELECT a, COUNT(*) FROM t GROUP BY a")) is True
+    assert P.has_group_key(_t("SELECT a, b, COUNT(*) FROM t GROUP BY a, b")) is True
+    assert P.has_group_key(_t("SELECT COUNT(*) FROM t")) is False
+    # contrast with single_group_key, which rejects the multi-key case
+    assert P.single_group_key(_t("SELECT a, b, COUNT(*) FROM t GROUP BY a, b")) is False

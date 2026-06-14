@@ -50,6 +50,12 @@ def has_limit(tree):
     """There IS a LIMIT -- bounded top-N shapes only."""
     return wdb_sql._limit(tree) is not None
 
+def has_group_key(tree):
+    """At least one GROUP BY column. The looser form of single_group_key (==1), for multi-key
+    operators that group by several columns at once."""
+    g = tree.args.get('group')
+    return g is not None and len(g.expressions) >= 1
+
 
 # --- shared segment / column guards (read column metadata only) ---
 

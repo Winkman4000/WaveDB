@@ -17,6 +17,7 @@ import numpy as np
 import wdb_sql
 import wdb_gbcount
 import wdb_seqpred as SP
+import wdb_policies as P
 E = wdb_sql.E
 
 _HITS = 0
@@ -186,12 +187,14 @@ def try_compound(seg, tree, col_map):
     """Answer a compound-AND filtered GROUP BY COUNT(*) (single or multi key) on the survivor set,
     or return None to fall through. Fail-closed on every shape it does not own."""
     global _HITS
-    if tree.args.get('joins') or tree.args.get('distinct') is not None: return None
-    if tree.args.get('having') is not None: return None
+    # --- shared shape guards (wdb_policies); FILTERED + MULTI-KEY, so has_where + has_group_key (>=1) ---
+    if not P.no_joins(tree):           return None
+    if not P.no_select_distinct(tree): return None
+    if not P.no_having(tree):          return None
+    if not P.has_where(tree):          return None
+    if not P.has_group_key(tree):      return None
     where = tree.args.get('where')
-    if where is None: return None
     group = tree.args.get('group')
-    if group is None or len(group.expressions) == 0: return None
     proj = tree.expressions
     ci = wdb_gbcount._count_index(proj)
     if ci is None: return None
@@ -214,8 +217,9 @@ def try_compound(seg, tree, col_map):
     if order is not None and not wdb_gbcount._order_is_count_desc(tree, proj, ci): return None
 
     pc = [sc(k) for k in keycols]
-    if any(c not in seg.cols for c in pc): return None
-    if seg.presence_mask() is not None: return None       # deleted rows: ranges don't model presence
+    # --- shared segment/column guards (wdb_policies) ---
+    if not P.columns_exist(seg, *pc): return None
+    if not P.no_deleted_rows(seg):    return None         # deleted rows: ranges don't model presence
 
     conj = _conjuncts(seg, where.this, sc)
     if conj is None: return None
