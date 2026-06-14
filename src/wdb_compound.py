@@ -18,10 +18,11 @@ import wdb_sql
 import wdb_gbcount
 import wdb_seqpred as SP
 import wdb_policies as P
+import wdb_measure_runtime as RT
 E = wdb_sql.E
 
 _HITS = 0
-ABS_RANGE = 50000          # a conjunct takes the range path only if it yields <= this many segments
+# range-path eligibility (filter-column exception cap) lives in wdb_measure_runtime: RT.compound_range_worth_it(nexc).
 _OPSTR = {E.EQ: '=', E.NEQ: '<>', E.LT: '<', E.LTE: '<=', E.GT: '>', E.GTE: '>='}
 _OP2SP = {'=': SP.EQ, '<>': SP.NEQ, '!=': SP.NEQ, '<': SP.LT, '<=': SP.LTE, '>': SP.GT, '>=': SP.GTE}
 _FLIP = {'<': '>', '>': '<', '<=': '>=', '>=': '<=', '=': '=', '<>': '<>', '!=': '!='}
@@ -140,7 +141,7 @@ def _resolve(seg, conjuncts):
         col = cj['col']; op = cj['op']
         if op == 'in' or cj.get('strempty'): residual.append(cj); continue
         ne = SP.n_exceptions(seg, col)
-        if ne is None or ne > ABS_RANGE: residual.append(cj); continue
+        if not RT.compound_range_worth_it(ne): residual.append(cj); continue
         r = SP.survivor_ranges(seg, col, _OP2SP[op], int(cj['const']))
         if r is None: residual.append(cj); continue
         if SP.survivor_count(*r) == seg.N: continue          # covers all rows -> no-op

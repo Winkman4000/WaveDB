@@ -40,3 +40,10 @@ def test_bsi_gates():
     # RAM budget: current + add must stay within budget
     assert RT.bsi_index_fits(0, 1 << 26) is True           # exactly the budget fits
     assert RT.bsi_index_fits(1, 1 << 26) is False          # one byte over
+
+
+def test_compound_range_gate():
+    assert RT.COMPOUND_RANGE_MAX_EXC == 50000
+    assert RT.compound_range_worth_it(None) is False
+    assert RT.compound_range_worth_it(50000) is True     # boundary inclusive
+    assert RT.compound_range_worth_it(50001) is False

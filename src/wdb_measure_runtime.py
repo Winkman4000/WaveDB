@@ -64,3 +64,17 @@ def bsi_too_unselective(cnt, N):
 def bsi_index_fits(current_bytes, add_bytes):
     """True iff adding `add_bytes` of BSI planes keeps the segment's index within BSI_RAM_BUDGET."""
     return current_bytes + add_bytes <= BSI_RAM_BUDGET
+
+
+
+# --- compound-AND range-path eligibility (used by wdb_compound) ---
+# A conjunct `col <op> const` takes the structural range path only when its filter column has few
+# enough mode-4 exceptions to process directly; above this ABSOLUTE cap it is left as a residual mask.
+# (Absolute cap here, unlike the survivor gate's fraction of N -- the calibration was done that way.)
+COMPOUND_RANGE_MAX_EXC = 50000
+
+
+def compound_range_worth_it(nexc):
+    """True iff a conjunct's filter column has few enough exceptions (<= COMPOUND_RANGE_MAX_EXC) to
+    take the structural range path; None nexc (not a mode-4 sequence column) -> not eligible."""
+    return nexc is not None and nexc <= COMPOUND_RANGE_MAX_EXC
