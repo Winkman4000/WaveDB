@@ -40,3 +40,26 @@ The fan-out / approximate-FD / derived-column detector is the GENERAL mechanism 
 - Q3 (AVG(UserID)) ok=False: float precision on huge ids.
 - Q17 ok=False: top-K tie ordering.
 - Q20/Q22 ok=False: under investigation (point-lookup / LIKE result ordering).
+
+---
+
+## Session log — 2026-06-14 (correctness audit)
+
+Commits (pushed):
+- `984151f` — gd-sidecar serves COUNT(DISTINCT) with a group-key-only WHERE. Q13 108,889ms -> ~800ms (beats DuckDB), Q10 0.99ms (213x), bit-exact. (cell F, single group key.)
+- `421bab8` — SQL LIKE missing `re.DOTALL` in the fused wdb_join paths. Q20 `URL LIKE '%google%'` 15908 -> 15911 (bit-exact vs DuckDB). +2 regression tests. Suite 1645 green.
+
+Audited the 6 board `ok=False` flags. Verdict: only ONE was a real bug.
+- **Q20** — REAL: LIKE->regex compiled `^.*pat.*$` without DOTALL, so `.` couldn't cross embedded `\r\n`; 3 long URLs had "google" after a newline. Root-caused on 100M (dict-code frequency proved data = 15911 exact; storage flawless). FIXED + verified.
+- **Q17** — false alarm: unordered `LIMIT` (nondeterministic; matches DuckDB when ordered).
+- **Q38 / Q40 / Q41** — false alarms: full grouped aggregations are BIT-EXACT vs DuckDB (13299 / 41194 / 10948 groups all match). The `ok=False` was `OFFSET`-into-tie-bands + EventDate int-vs-date display in the harness. **The earlier board OVERSTATED the date-needle class as "broken/wrong" — it computes correctly, just slowly.**
+- **Q03** — `AVG(UserID)` sums uint64 in float64, exact only to ~13 sig figs (float-inherent; DuckDB uses int128). Not "wrong", but the lone non-bit-exact result. Optional fix: hi/lo 32-bit split integer accumulator in wdb_exprjit.
+
+Net: everything WaveDB computes is now **bit-exact except Q03**.
+
+Persisted on volume (survive pod stop/start): cb25db + both gd sidecars (SearchPhrase 96MB, MobilePhoneModel 3.5KB), queries.sql, this map.
+
+Open threads for next session:
+1. Q03 exact-integer-sum (optional, to claim literal 100% bit-exact).
+2. Q29 hard crash — the 90-column `SUM(ResolutionWidth + k)` query kills the process (stability bug).
+3. Build the RegionID gd-sidecar to flip Q08/Q09 from walk (~0.16x) to the ~200x read class (proven by Q10).
