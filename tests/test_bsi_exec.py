@@ -7,6 +7,7 @@ import sys, os, tempfile, uuid
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import duckdb
 import wdb_encode, wdb_bsi_exec as BX
+import wdb_measure_runtime as RT
 from wdb_db import Database
 
 _WT = {'BIGINT': 'int', 'INTEGER': 'int', 'DOUBLE': 'float'}
@@ -46,14 +47,14 @@ def test_footprint_after_filter():
 def test_budget_guard_falls_back_but_correct():
     db = _db()
     ans_bsi = db.run("SELECT SUM(n) FROM t WHERE disc < 0.03")[0]
-    old = BX.BSI_RAM_BUDGET
-    BX.BSI_RAM_BUDGET = 1                              # 1 byte -> no column can be indexed
+    old = RT.BSI_RAM_BUDGET
+    RT.BSI_RAM_BUDGET = 1                              # 1 byte -> no column can be indexed
     try:
         db2 = _db()
         ans_fb = db2.run("SELECT SUM(n) FROM t WHERE disc < 0.03")[0]
         assert BX.footprint(_seg(db2)) == (0, [])     # nothing built under the budget
     finally:
-        BX.BSI_RAM_BUDGET = old
+        RT.BSI_RAM_BUDGET = old
     assert abs(float(ans_bsi[0][0]) - float(ans_fb[0][0])) < 1e-6   # path-independent answer
 
 

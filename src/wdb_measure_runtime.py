@@ -45,3 +45,22 @@ def structural_pushdown_worth_it(nexc, N):
     """True iff the filter column's mode-4 exception count `nexc` is small enough (<= SEQ_EXC_FRAC * N)
     that processing the exceptions beats reading the whole column. None nexc -> not eligible."""
     return nexc is not None and nexc <= SEQ_EXC_FRAC * N
+
+
+
+# --- BSI (bit-sliced index) path gates (used by wdb_bsi_exec) ---
+# The bitmap walk pays off only when the predicate is selective enough; above this fraction of rows
+# surviving, the fused scan is cheaper. And a prospective index must fit a per-segment RAM budget.
+BSI_SEL_CEIL = 0.35
+BSI_RAM_BUDGET = 1 << 26   # 64 MB of built index per segment
+
+
+def bsi_too_unselective(cnt, N):
+    """True iff `cnt` surviving rows is too large a fraction of N (> BSI_SEL_CEIL) for the bitmap walk
+    to beat a fused scan -- the operator then falls back to fused."""
+    return cnt > BSI_SEL_CEIL * N
+
+
+def bsi_index_fits(current_bytes, add_bytes):
+    """True iff adding `add_bytes` of BSI planes keeps the segment's index within BSI_RAM_BUDGET."""
+    return current_bytes + add_bytes <= BSI_RAM_BUDGET

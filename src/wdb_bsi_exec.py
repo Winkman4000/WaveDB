@@ -15,10 +15,11 @@ import sqlglot.expressions as E
 import wdb_sql as S
 import wdb_bsi as B
 import wdb_bsi_kernels as K
+import wdb_measure_runtime as RT
 
 _BSI_HITS = 0
-SEL_CEIL = 0.35   # predicate selectivity above this -> fall back to fused scan
-BSI_RAM_BUDGET = 1 << 26   # 64 MB of built index per segment; past it, new columns fall back to fused
+# Path gates (selectivity ceiling, index RAM budget) live in wdb_measure_runtime:
+# RT.bsi_too_unselective(cnt, N) and RT.bsi_index_fits(current_bytes, add_bytes).
 
 
 class _BSIUnsupported(Exception):
@@ -61,7 +62,7 @@ def _col_index(seg, col):
     # prospective size = B planes * ceil(N/8) bytes; refuse if it would blow the budget
     plane_bytes = -(-seg.N // 8)
     nplanes = max(1, max(0, c['V'] - 1).bit_length())
-    if seg._bsi_bytes + nplanes * plane_bytes > BSI_RAM_BUDGET:
+    if not RT.bsi_index_fits(seg._bsi_bytes, nplanes * plane_bytes):
         raise _BSIUnsupported("index RAM budget exhausted")
     codes = seg.codes(col)
     dv = np.asarray(seg._typed_dict(col))   # value-sorted (np.unique) => code order == value order
@@ -233,7 +234,7 @@ def execute(seg, tree, col_map):
     mask = _pred(seg, where.this, sc)
     N = seg.N
     cnt = K.bw_count(mask, N)
-    if cnt > SEL_CEIL * N:
+    if RT.bsi_too_unselective(cnt, N):
         raise _BSIUnsupported("unselective -> fused")
 
     if not keys:

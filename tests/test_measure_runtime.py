@@ -29,3 +29,14 @@ def test_structural_pushdown_worth_it():
     assert RT.structural_pushdown_worth_it(None, 1000) is False
     assert RT.structural_pushdown_worth_it(50, 1000) is True    # boundary: 50 <= 0.05*1000 inclusive
     assert RT.structural_pushdown_worth_it(51, 1000) is False
+
+
+def test_bsi_gates():
+    assert RT.BSI_SEL_CEIL == 0.35
+    assert RT.BSI_RAM_BUDGET == (1 << 26)
+    # selectivity ceiling: > 35% of rows -> too unselective
+    assert RT.bsi_too_unselective(36, 100) is True
+    assert RT.bsi_too_unselective(35, 100) is False        # boundary: 35 <= 0.35*100 inclusive
+    # RAM budget: current + add must stay within budget
+    assert RT.bsi_index_fits(0, 1 << 26) is True           # exactly the budget fits
+    assert RT.bsi_index_fits(1, 1 << 26) is False          # one byte over
