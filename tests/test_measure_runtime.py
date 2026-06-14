@@ -80,3 +80,9 @@ def test_join_ceilings():
     assert RT.code_lut_fits(65536) is True
     assert RT.code_lut_fits(65537) is False
     assert RT.code_lut_fits(0) is False
+
+
+def test_resident_budget():
+    assert RT.SLICE_RESIDENT_BUDGET == (1 << 31)
+    assert RT.column_fits_resident((1 << 31) // 8) is True       # exactly the budget
+    assert RT.column_fits_resident((1 << 31) // 8 + 1) is False

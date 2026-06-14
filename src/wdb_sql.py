@@ -5,15 +5,16 @@ executes against a WVDB3 Segment. Correctness first; optimization second.
 Unsupported shapes raise NotImplementedError (honest failure, never silent wrong answer)."""
 import sqlglot, sqlglot.expressions as E, numpy as np
 from wdb_engine import Segment
+import wdb_measure_runtime as RT
 
 _SLICE_HITS = 0   # count of queries answered via the cluster-slice fast path (tests/telemetry)
-SLICE_RESIDENT_BUDGET = 1 << 31   # per-column N*8-byte budget to keep a decoded column resident
+# decoded-column residency budget lives in wdb_measure_runtime: RT.column_fits_resident(n_rows).
 
 def _slice_vals(seg, cn, lo, hi, rmask):
     """Measure values for the cluster slice [lo,hi) under residual rmask. Decode-once-resident when
     the column fits the RAM budget (serving throughput: no per-query dict gather); else lazy partial
     decode. Skips the boolean-index copy when rmask selects the whole slice (the consumed-key case)."""
-    base = seg.resident_values(cn) if seg.N * 8 <= SLICE_RESIDENT_BUDGET else None
+    base = seg.resident_values(cn) if RT.column_fits_resident(seg.N) else None
     a = base[lo:hi] if base is not None else seg.values_range(cn, lo, hi)
     return a if rmask is None else a[rmask]
 

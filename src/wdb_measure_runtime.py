@@ -155,3 +155,14 @@ def code_lut_fits(ncodes):
     """True iff a column's dictionary is small enough (0 < ncodes <= LUT_MAX_CARD) to precompute a
     per-code predicate LUT; empty or high-card dicts fall back to the mask/row path."""
     return 0 < ncodes <= LUT_MAX_CARD
+
+
+
+# --- decoded-column residency budget (used by wdb_sql's cluster-slice path) ---
+SLICE_RESIDENT_BUDGET = 1 << 31   # per-column N*8-byte budget to keep a decoded column resident
+
+
+def column_fits_resident(n_rows):
+    """True iff a decoded column of n_rows int64s (n_rows*8 bytes) fits the residency budget -- worth
+    decoding once and keeping resident (serving throughput) instead of a lazy per-query partial decode."""
+    return n_rows * 8 <= SLICE_RESIDENT_BUDGET
