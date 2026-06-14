@@ -21,6 +21,7 @@ import os, pickle, collections
 import numpy as np
 import wdb_sql
 import sqlglot.expressions as E
+from wdb_profile import cardinality, segment_cardinalities  # data-measures: cardinality lives in one place
 
 CUBE_MAX_CELLS = 4096          # prod(dim cardinalities) cap; above this storage cost outweighs the win.
                                # Measured: a 2,526-cell l_shipdate cube is ~114 KB and answers GROUP BY date
@@ -154,19 +155,7 @@ def build_and_write(seg, specs, max_cells=CUBE_MAX_CELLS, workers=1):
     return cubes
 
 
-def segment_cardinalities(seg):
-    """True distinct count per column, for auto-enumeration. Dict/inline modes (0,1,2,3,5) store the
-    distinct count directly as V (verified on real-scale segments); mode 4 (affine/positional) stores
-    N rather than the cardinality, so it is measured from the values; mode 6 is a synthetic constant."""
-    import numpy as np, pandas as pd
-    out = {}
-    for nm in seg.order:
-        m = seg.cols[nm]['mode']
-        if m in (0, 1, 2, 3, 5): out[nm] = int(seg.cols[nm]['V'])
-        elif m == 6:             out[nm] = 1
-        else:                    out[nm] = int(len(pd.unique(np.asarray(seg.resident_values(nm)))))
-    return out
-
+# segment_cardinalities / cardinality moved to wdb_profile (the data-measures file); imported above.
 
 def low_card_stamp_cols(parent_seg, cap=CUBE_MAX_CELLS):
     """The general denormalisation rule, self-measured: a parent column is worth stamping onto a child

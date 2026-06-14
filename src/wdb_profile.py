@@ -49,6 +49,24 @@ def _dict_sorted(seg, nm):
     return None
 
 
+def cardinality(seg, col):
+    """True distinct-value count for one column -- the canonical data-measurement of cardinality.
+    Dict/inline modes (0,1,2,3,5) store it directly as V (verified on real-scale segments); mode 6 is a
+    synthetic constant (1); mode 4 (affine/positional) stores N rather than the cardinality, so it is
+    measured from the values. Centralized here so every consumer (cube auto-enumeration, the physical-
+    design planner, profiling) reads ONE definition and they cannot drift."""
+    m = seg.cols[col]['mode']
+    if m in (0, 1, 2, 3, 5): return int(seg.cols[col]['V'])
+    if m == 6:               return 1
+    import pandas as pd
+    return int(len(pd.unique(np.asarray(seg.resident_values(col)))))
+
+
+def segment_cardinalities(seg):
+    """True distinct count for every column, in column order -- the input to cube auto-enumeration."""
+    return {nm: cardinality(seg, nm) for nm in seg.order}
+
+
 def profile_col(seg, nm):
     c = seg.cols[nm]; N = int(seg.N)
     if c['mode'] == 4:                          # affine/seq: stored V is positional -> decode values for true stats
