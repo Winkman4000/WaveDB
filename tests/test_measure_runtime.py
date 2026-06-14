@@ -60,3 +60,23 @@ def test_parallel_threshold():
     assert RT.PARALLEL_THRESHOLD == 2_000_000
     assert RT.parallel_worth_it(2_000_000) is True       # boundary inclusive
     assert RT.parallel_worth_it(1_999_999) is False
+
+
+def test_join_ceilings():
+    assert RT.MULTI_GROUP_CEIL == (1 << 18)
+    assert RT.GROUP_CD_CELL_CEIL == (1 << 22)
+    assert RT.TALLY_MAX_RATIO == 0.9
+    assert RT.LUT_MAX_CARD == 65536
+    # dense multi-group: fits at/under the ceiling
+    assert RT.dense_multigroup_fits(1 << 18) is True
+    assert RT.dense_multigroup_fits((1 << 18) + 1) is False
+    # grouped COUNT(DISTINCT) cell table
+    assert RT.grouped_cdist_fits(1 << 11, 1 << 11) is True       # 2^22 == ceiling, inclusive
+    assert RT.grouped_cdist_fits(1 << 11, (1 << 11) + 1) is False
+    # value-frequency tally: worth it only with repeats (n_dict < 0.9*N)
+    assert RT.tally_worth_it(89, 100) is True
+    assert RT.tally_worth_it(90, 100) is False                   # n_dict >= 0.9*N -> scan
+    # code-LUT cap
+    assert RT.code_lut_fits(65536) is True
+    assert RT.code_lut_fits(65537) is False
+    assert RT.code_lut_fits(0) is False

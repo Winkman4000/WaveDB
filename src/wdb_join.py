@@ -362,14 +362,8 @@ def _aggregate(merged, proj, group, R):
 # integer codes with the bincount kernel. Narrow by design -- single join, one group key, GROUP BY +
 # aggregates -- and raises _FastUnsupported for anything else so join_query falls back to pandas.
 
-MULTI_GROUP_CEIL = 1 << 18   # max composite groups for dense multi-col GROUP BY (else -> hashing/fallback)
-GROUP_CD_CELL_CEIL = 1 << 22  # max (groups x value-cardinality) cells for the one-pass grouped
-                              # COUNT(DISTINCT) keep-table; above this the dense 2-D table is too big
-                              # and we fall back to the sort-based path.
-TALLY_MAX_RATIO = 0.9         # engage the value-frequency tally for whole-table SUM/AVG/MIN/MAX only
-                              # when n_dict < N * this (the column actually has repeats to exploit);
-                              # a near-all-distinct column has none, so we scan instead. Self-gated on
-                              # the column's own measured cardinality -- never on the workload.
+# Dense/tally ceilings (multi-group, grouped COUNT(DISTINCT), value-frequency tally) live in
+# wdb_measure_runtime: RT.dense_multigroup_fits / RT.grouped_cdist_fits / RT.tally_worth_it.
 
 class _FastUnsupported(Exception):
     pass
@@ -380,11 +374,7 @@ _SLICE_SCALAR_HITS = 0   # diagnostic: how many queries took the per-slice scala
 def _bump_fast():
     global _FAST_HITS
     _FAST_HITS += 1
-LUT_MAX_CARD = 65536   # code-LUT predicate fusion (LIKE / string-ordering / IS NULL) precomputes
-                       # keep[code]=pred(dict_value) over the dictionary; viable only while the dict
-                       # is small. Measured precompute (LIKE regex over D dict values): 0.02ms@200,
-                       # 0.88ms@10k, 90ms@1M -- so cap at low-card categoricals; high-card (name/
-                       # comment) columns fall back to the mask/row path.
+# code-LUT cardinality cap lives in wdb_measure_runtime: RT.code_lut_fits(ncodes).
 FUSE_STR_PRED = True   # string '='/'!=' -> inline code comparison (codes[i]==target). Measured to
                        # beat both the identity-base trick and the materialised-mask path at every
                        # cardinality, fact AND gathered-parent, at sf=1 -- so no runtime switch is
@@ -898,7 +888,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             if cp is not None: return None                             # gathered/joined column -> not whole-table
             cc = s.cols[pc]
             if cc['mode'] != 0 or cc['dt'] != 2: return None           # value-identity float dict only (v1)
-            if cc['n_dict'] >= n * TALLY_MAX_RATIO: return None        # ~no repeats -> scan instead
+            if not RT.tally_worth_it(cc['n_dict'], n): return None    # ~no repeats -> scan instead
             plan.append((node.key, s, pc)); has_red = True
         return plan if has_red else None                              # leave pure COUNT(*) to the scalar path
 
@@ -944,7 +934,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     else:                                                 # multi-key: mixed-radix composite
         K = 1
         for k in gkeys: K *= k['K']
-        if K <= MULTI_GROUP_CEIL:                          # dense: codegen composes the code INLINE (no array)
+        if RT.dense_multigroup_fits(K):                    # dense: codegen composes the code INLINE (no array)
             group_op = None
             group_keys = [(k['full'], k['K'], k['cptr']) for k in gkeys]
         else:                                              # high-card: hash-factorise the composite to dense ids
@@ -1030,7 +1020,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         codes, code_of, nullcode = sc
         ncodes = max(max(code_of.values(), default=-1),
                      nullcode if nullcode is not None else -1) + 1
-        if ncodes == 0 or ncodes > LUT_MAX_CARD: raise _FastUnsupported
+        if not RT.code_lut_fits(ncodes): raise _FastUnsupported
         keep = np.zeros(ncodes, dtype=np.int8)
         if mark_null:
             if nullcode is not None: keep[nullcode] = 1            # IS NULL
@@ -1197,7 +1187,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         vc = vseg.cols[vpcol]
         if vc['mode'] == 4 or vcptr is not None: return None               # need value-identity fact codes
         nv = vc['V']
-        if K * nv > GROUP_CD_CELL_CEIL: return None                        # dense table too big -> fallback
+        if not RT.grouped_cdist_fits(K, nv): return None                   # dense table too big -> fallback
         op = _group_op()
         if op is None or op[0] != 'd': return None
         gid = np.asarray(op[1], dtype=np.int64)

@@ -5,6 +5,7 @@ import sys, os, tempfile, uuid, math, datetime, re
 from decimal import Decimal
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import duckdb, wdb_encode, wdb_join
+import wdb_measure_runtime as RT
 from wdb_db import Database
 
 _DB = None; _CON = None
@@ -398,15 +399,15 @@ def test_chain_plain_projection_distinct_cols():
 # hash-factorised to dense ids and the SAME fused kernel runs over them (previously this bailed to the pandas
 # tail). Force the branch on the small fixture by lowering the ceiling. ──
 def test_chain_highcard_multigroup_factorize():
-    save = wdb_join.MULTI_GROUP_CEIL
+    save = RT.MULTI_GROUP_CEIL
     try:
-        wdb_join.MULTI_GROUP_CEIL = 4                 # force factorise for any 2+ col composite
+        RT.MULTI_GROUP_CEIL = 4                 # force factorise for any 2+ col composite
         _match("SELECT l.l_returnflag, l.l_shipmode, SUM(l.l_extendedprice) " + _J3 +
                "GROUP BY l.l_returnflag, l.l_shipmode")
         _match("SELECT l.l_returnflag, l.l_shipmode, o.o_orderpriority, COUNT(*) " + _J3 +
                "GROUP BY l.l_returnflag, l.l_shipmode, o.o_orderpriority")
     finally:
-        wdb_join.MULTI_GROUP_CEIL = save
+        RT.MULTI_GROUP_CEIL = save
 
 
 # --- high-cardinality GROUP BY a mode-4 (affine-coded) column -----------------------------------

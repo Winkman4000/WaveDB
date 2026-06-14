@@ -107,3 +107,51 @@ def parallel_worth_it(n_rows):
     """True iff `n_rows` is large enough (>= PARALLEL_THRESHOLD) that the parallel reduction beats the
     serial path despite thread-dispatch + reduce overhead."""
     return n_rows >= PARALLEL_THRESHOLD
+
+
+
+# --- wdb_join dense / fusion ceilings ---
+
+MULTI_GROUP_CEIL = 1 << 18   # max composite groups for dense multi-col GROUP BY (else -> hashing/fallback)
+
+
+def dense_multigroup_fits(K):
+    """True iff a multi-column GROUP BY's composite code space K is small enough (<= MULTI_GROUP_CEIL)
+    for the dense inline-codegen path; above it, fall back to factorise/hashing."""
+    return K <= MULTI_GROUP_CEIL
+
+
+GROUP_CD_CELL_CEIL = 1 << 22  # max (groups x value-cardinality) cells for the one-pass grouped
+                              # COUNT(DISTINCT) keep-table; above this the dense 2-D table is too big
+                              # and we fall back to the sort-based path.
+
+
+def grouped_cdist_fits(K, nv):
+    """True iff the dense (groups x value-cardinality) keep-table for a one-pass grouped COUNT(DISTINCT)
+    fits (K * nv <= GROUP_CD_CELL_CEIL); above it, use the sort-based path."""
+    return K * nv <= GROUP_CD_CELL_CEIL
+
+
+TALLY_MAX_RATIO = 0.9         # engage the value-frequency tally for whole-table SUM/AVG/MIN/MAX only
+                              # when n_dict < N * this (the column actually has repeats to exploit);
+                              # a near-all-distinct column has none, so we scan instead. Self-gated on
+                              # the column's own measured cardinality -- never on the workload.
+
+
+def tally_worth_it(n_dict, n):
+    """True iff the column compresses enough (n_dict < n * TALLY_MAX_RATIO) for the value-frequency
+    tally to beat a scan; a near-all-distinct column has no repeats to exploit, so scan instead."""
+    return n_dict < n * TALLY_MAX_RATIO
+
+
+LUT_MAX_CARD = 65536   # code-LUT predicate fusion (LIKE / string-ordering / IS NULL) precomputes
+                       # keep[code]=pred(dict_value) over the dictionary; viable only while the dict
+                       # is small. Measured precompute (LIKE regex over D dict values): 0.02ms@200,
+                       # 0.88ms@10k, 90ms@1M -- so cap at low-card categoricals; high-card (name/
+                       # comment) columns fall back to the mask/row path.
+
+
+def code_lut_fits(ncodes):
+    """True iff a column's dictionary is small enough (0 < ncodes <= LUT_MAX_CARD) to precompute a
+    per-code predicate LUT; empty or high-card dicts fall back to the mask/row path."""
+    return 0 < ncodes <= LUT_MAX_CARD
