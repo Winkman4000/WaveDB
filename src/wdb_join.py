@@ -308,7 +308,7 @@ def _mask(df, node, R):
     if isinstance(node, (E.Like, E.ILike)):            # LIKE that didn't fuse (e.g. high-card column)
         s = df[R(node.this)].astype('string')
         rx = '^' + re.escape(str(node.expression.this)).replace('%', '.*').replace('_', '.') + '$'
-        m = s.str.match(rx, case=not isinstance(node, E.ILike), na=False)
+        m = s.str.match(rx, case=not isinstance(node, E.ILike), flags=re.DOTALL, na=False)
         return (~m) if node.args.get('negate') else m
     raise NotImplementedError(f"join WHERE: {type(node).__name__}")
 
@@ -769,7 +769,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 pb = _lit_bytes(seg, pcol, pnode)
                 patt = pb.decode('utf-8', 'replace') if isinstance(pb, (bytes, bytearray)) else str(pb)
                 rx = re.compile('^' + re.escape(patt).replace('%', '.*').replace('_', '.') + '$',
-                                re.IGNORECASE if ci else 0)
+                                re.DOTALL | (re.IGNORECASE if ci else 0))
                 ncodes = max(max(code_of.values(), default=-1),
                              nullcode if nullcode is not None else -1) + 1
                 keep = np.zeros(ncodes, dtype=bool)
@@ -1043,7 +1043,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         pb = _lit_bytes(cseg, cpcol, pat_node)
         patt = pb.decode('utf-8', 'replace') if isinstance(pb, (bytes, bytearray)) else str(pb)
         rxsrc = '^' + re.escape(patt).replace('%', '.*').replace('_', '.') + '$'   # SQL LIKE -> regex
-        rx = re.compile(rxsrc, re.IGNORECASE if ci else 0)
+        rx = re.compile(rxsrc, re.DOTALL | (re.IGNORECASE if ci else 0))
         def _f(vb):
             v = vb.decode('utf-8', 'replace') if isinstance(vb, (bytes, bytearray)) else str(vb)
             return rx.match(v) is not None
