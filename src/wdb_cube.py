@@ -21,6 +21,7 @@ import os, pickle, collections
 import numpy as np
 import wdb_sql
 import sqlglot.expressions as E
+import wdb_policies as P
 from wdb_profile import cardinality, segment_cardinalities  # data-measures: cardinality lives in one place
 
 CUBE_MAX_CELLS = 4096          # prod(dim cardinalities) cap; above this storage cost outweighs the win.
@@ -387,10 +388,11 @@ def try_cube(seg, tree, col_map):
     return (rows, colnames). Also answers grouped COUNT(DISTINCT) from a 2-dim cube. Otherwise return
     None so the caller falls through to the scan paths."""
     global _CUBE_HITS
-    if tree.args.get('joins'): return None
-    if tree.args.get('distinct') is not None: return None
+    # --- shared shape guards (wdb_policies) ---
+    if not P.no_joins(tree):           return None
+    if not P.no_select_distinct(tree): return None
+    if not P.has_group_key(tree):      return None
     group = tree.args.get('group')
-    if group is None: return None
     cubes = seg.cubes()
     if not cubes: return None
     if tree.args.get('where') is not None:                  # WHERE fcol <op> const on a cube dim -> exact roll-up
