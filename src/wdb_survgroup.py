@@ -21,30 +21,14 @@ import wdb_sql
 import wdb_gbcount
 import wdb_seqpred
 import wdb_policies as P
+import wdb_measure_runtime as RT
 E = wdb_sql.E
 
 _HITS = 0   # telemetry: queries answered from the survivor-set path
 
-# Crossover calibration (from the selectivity sweep on this class of machine). survivor-set cost
-# ~ c*survivors; K-wide cost ~ a*N + b*K, roughly flat in survivors -> crossover survivors* grows
-# with K. Empirically survivors*/N ~ 0.30 at K/N ~ 0.18, so gate ~ 1.6 * K/N, clamped to a safe band.
-# The gate only affects SPEED -- a wrong gate just defers to the (correct) dense path -- so the band
-# is deliberately conservative.
-_GATE_SLOPE = 1.6
-_GATE_LO, _GATE_HI = 0.05, 0.35
-
-
-def _gate(N, K):
-    if N <= 0:
-        return _GATE_LO
-    return min(_GATE_HI, max(_GATE_LO, _GATE_SLOPE * K / N))
-
-
-# Structural pushdown applies when the filter column's exception count is small relative to N
-# (processing the exceptions must be cheaper than reading the column). Above this, fall back to the
-# mask path. Calibrated from the exception-count survey (AdvEngineID 0.8% wins; SearchEngineID 17%
-# does not).
-_SEQ_EXC_FRAC = 0.05
+# The survivor-vs-dense crossover gate and the structural-pushdown threshold live in
+# wdb_measure_runtime (the runtime-measures file): RT.survivor_gate(N, K) and
+# RT.structural_pushdown_worth_it(nexc, N).
 
 _CMP_OPS = {E.NEQ: wdb_seqpred.NEQ, E.EQ: wdb_seqpred.EQ, E.LT: wdb_seqpred.LT,
             E.LTE: wdb_seqpred.LTE, E.GT: wdb_seqpred.GT, E.GTE: wdb_seqpred.GTE}
@@ -136,14 +120,14 @@ def try_survgroup(seg, tree, col_map):
     if cmp is not None and seg.presence_mask() is None:
         fcol, op, const = cmp
         nexc = wdb_seqpred.n_exceptions(seg, fcol)
-        if nexc is not None and nexc <= _SEQ_EXC_FRAC * N:
+        if RT.structural_pushdown_worth_it(nexc, N):
             r = wdb_seqpred.survivor_ranges(seg, fcol, op, const)
             if r is not None:
                 los, his = r
                 cnt = wdb_seqpred.survivor_count(los, his)
                 if cnt == 0:
                     return None
-                if cnt > _gate(N, K) * N:
+                if cnt > RT.survivor_gate(N, K) * N:
                     return None                         # dense -> dense path is cheaper
                 sub = codes[wdb_seqpred.ranges_to_ids(los, his)]
 
@@ -160,7 +144,7 @@ def try_survgroup(seg, tree, col_map):
         cnt = int(mask.sum())
         if cnt == 0:
             return None                                 # empty result -> let the dense path format it
-        if cnt > _gate(N, K) * N:
+        if cnt > RT.survivor_gate(N, K) * N:
             return None                                 # dense filter -> dense path is cheaper
         sub = codes[mask]
 
