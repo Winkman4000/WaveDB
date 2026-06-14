@@ -62,3 +62,19 @@ def test_key_not_nullable():
     assert P.key_not_nullable(_FakeSeg({'a': {}}), 'a') is True
     assert P.key_not_nullable(_FakeSeg({'a': {'has_null': False}}), 'a') is True
     assert P.key_not_nullable(_FakeSeg({'a': {'has_null': True}}), 'a') is False
+
+
+# --- COUNT(*) family additions ---
+
+def test_has_where():
+    assert P.has_where(_t("SELECT a, COUNT(*) FROM t WHERE a > 1 GROUP BY a")) is True
+    assert P.has_where(_t("SELECT a, COUNT(*) FROM t GROUP BY a")) is False
+
+def test_has_limit():
+    assert P.has_limit(_t("SELECT a FROM t ORDER BY a LIMIT 10")) is True
+    assert P.has_limit(_t("SELECT a FROM t ORDER BY a")) is False
+
+def test_not_positional():
+    assert P.not_positional(_FakeSeg({'a': {'mode': 0}}), 'a') is True
+    assert P.not_positional(_FakeSeg({'a': {'mode': 2}}), 'a') is True
+    assert P.not_positional(_FakeSeg({'a': {'mode': 4}}), 'a') is False

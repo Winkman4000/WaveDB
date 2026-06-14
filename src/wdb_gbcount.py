@@ -19,6 +19,7 @@ keyed by column — general across any table/column. Staleness-guarded by seg.N.
 """
 import os, pickle, numpy as np
 import wdb_sql
+import wdb_policies as P
 E = wdb_sql.E
 
 _HITS = 0   # telemetry: queries answered from a count projection
@@ -126,16 +127,15 @@ def try_gbcount(seg, tree, col_map):
     """Answer a filter-free high-card `key, COUNT(*) GROUP BY key ORDER BY COUNT(*) DESC LIMIT N`
     from the persisted count projection, or return None to fall through to the scan paths."""
     global _HITS
-    if tree.args.get('joins') or tree.args.get('distinct') is not None:
-        return None
-    if tree.args.get('where') is not None or tree.args.get('having') is not None:
-        return None
+    # --- shared shape guards (wdb_policies); filter-free COUNT(*) top-N ---
+    if not P.no_joins(tree):           return None
+    if not P.no_select_distinct(tree): return None
+    if not P.no_where(tree):           return None
+    if not P.no_having(tree):          return None
+    if not P.single_group_key(tree):   return None
+    if not P.has_limit(tree):          return None      # only the bounded top-N shape
     group = tree.args.get('group')
-    if group is None or len(group.expressions) != 1:
-        return None
     lim = wdb_sql._limit(tree)
-    if lim is None:
-        return None                                     # only the bounded top-N shape
     proj = tree.expressions
     if len(proj) != 2:
         return None
@@ -151,10 +151,10 @@ def try_gbcount(seg, tree, col_map):
     if knm is None or gnm is None or knm != gnm:
         return None
     col = col_map.get(knm, knm) if col_map else knm
-    if col not in seg.cols or seg.cols[col]['mode'] == 4:
-        return None
-    if seg.presence_mask() is not None:                 # deleted rows make stored counts stale
-        return None
+    # --- shared segment/column guards (wdb_policies) ---
+    if not P.columns_exist(seg, col):  return None
+    if not P.not_positional(seg, col): return None
+    if not P.no_deleted_rows(seg):     return None      # deleted rows make stored counts stale
     if not _order_is_count_desc(tree, proj, ci):
         return None
     V = _code_values(seg, col)

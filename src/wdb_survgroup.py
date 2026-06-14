@@ -20,6 +20,7 @@ import numpy as np
 import wdb_sql
 import wdb_gbcount
 import wdb_seqpred
+import wdb_policies as P
 E = wdb_sql.E
 
 _HITS = 0   # telemetry: queries answered from the survivor-set path
@@ -87,19 +88,16 @@ def try_survgroup(seg, tree, col_map):
     """Answer a selective filtered high-card `key, COUNT(*) WHERE pred GROUP BY key ORDER BY COUNT(*)
     DESC LIMIT N` by grouping only the survivors, or return None to fall through to the dense path."""
     global _HITS
-    if tree.args.get('joins') or tree.args.get('distinct') is not None:
-        return None
-    if tree.args.get('having') is not None:
-        return None
+    # --- shared shape guards (wdb_policies); FILTERED family, so it REQUIRES a WHERE ---
+    if not P.no_joins(tree):           return None
+    if not P.no_select_distinct(tree): return None
+    if not P.no_having(tree):          return None
+    if not P.has_where(tree):          return None      # filter-free -> wdb_gbcount / cube
+    if not P.single_group_key(tree):   return None
+    if not P.has_limit(tree):          return None
     where = tree.args.get('where')
-    if where is None:
-        return None                                     # filter-free -> wdb_gbcount / cube
     group = tree.args.get('group')
-    if group is None or len(group.expressions) != 1:
-        return None
     lim = wdb_sql._limit(tree)
-    if lim is None:
-        return None
     proj = tree.expressions
     if len(proj) != 2:
         return None
@@ -118,8 +116,9 @@ def try_survgroup(seg, tree, col_map):
         return None
     sc = (lambda c: col_map.get(c, c)) if col_map else (lambda c: c)
     col = sc(knm)
-    if col not in seg.cols or seg.cols[col]['mode'] == 4:
-        return None
+    # --- shared segment/column guards (wdb_policies) ---
+    if not P.columns_exist(seg, col):  return None
+    if not P.not_positional(seg, col): return None
     V = wdb_gbcount._code_values(seg, col)              # by-code decoder for the group key
     if V is None:
         return None

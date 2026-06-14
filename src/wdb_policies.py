@@ -37,10 +37,18 @@ def no_where(tree):
     """No WHERE clause (filter-free operators only)."""
     return tree.args.get('where') is None
 
+def has_where(tree):
+    """There IS a WHERE clause -- the filtered operators require one (the inverse of no_where)."""
+    return tree.args.get('where') is not None
+
 def single_group_key(tree):
     """Exactly one GROUP BY column."""
     g = tree.args.get('group')
     return g is not None and len(g.expressions) == 1
+
+def has_limit(tree):
+    """There IS a LIMIT -- bounded top-N shapes only."""
+    return wdb_sql._limit(tree) is not None
 
 
 # --- shared segment / column guards (read column metadata only) ---
@@ -56,3 +64,10 @@ def no_deleted_rows(seg):
 def key_not_nullable(seg, col):
     """The column is declared non-nullable (NULL-as-its-own-group is a deferred case)."""
     return not seg.cols[col].get('has_null')
+
+
+def not_positional(seg, col):
+    """The column is not positional (mode-4) encoded, so it has value-identity codes. NOTE: necessary
+    but not sufficient for full decodability -- the operator still confirms its by-code decoder exists,
+    which is a measured/edge check that stays internal."""
+    return seg.cols[col]['mode'] != 4
