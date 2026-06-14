@@ -17,6 +17,7 @@ aggregate/key, optional LIMIT. MIN/MAX/COUNT(col) decline (fall through) in v1.
 import numpy as np
 import wdb_sql
 import wdb_groupdistinct as gd
+import wdb_policies as P
 
 E = wdb_sql.E
 _HITS = 0   # telemetry: queries answered by the multi-aggregate group-distinct kernel
@@ -50,13 +51,13 @@ def _sidecar_counts(db, table, segment_path, kcol, tcol, gmax):
 def _detect(seg, tree, col_map):
     """Returns (kcol, tcol, ci, ki, folds, proj) or None. folds = list of (proj_index, kind, phys_col, dt);
     ci/ki index the COUNT(DISTINCT) and the bare key; kcol/tcol are col_map-resolved physical names."""
-    if tree.args.get('joins') or tree.args.get('distinct') is not None:
-        return None
-    if tree.args.get('where') is not None or tree.args.get('having') is not None:
-        return None
+    # --- shared shape guards (wdb_policies) ---
+    if not P.no_joins(tree):           return None
+    if not P.no_select_distinct(tree): return None
+    if not P.no_where(tree):           return None
+    if not P.no_having(tree):          return None
+    if not P.single_group_key(tree):   return None
     group = tree.args.get('group')
-    if group is None or len(group.expressions) != 1:
-        return None
     proj = tree.expressions
     if len(proj) < 3:                                    # need key + >=1 foldable + 1 distinct
         return None
@@ -94,12 +95,10 @@ def _detect(seg, tree, col_map):
     if key_index is None or not folds:
         return None
     kcol = sc(gnm); tcol = sc(tname)
-    if kcol not in seg.cols or tcol not in seg.cols:
-        return None
-    if seg.presence_mask() is not None:
-        return None
-    if seg.cols[kcol].get('has_null'):
-        return None
+    # --- shared segment/column guards (wdb_policies) ---
+    if not P.columns_exist(seg, kcol, tcol): return None
+    if not P.no_deleted_rows(seg):           return None
+    if not P.key_not_nullable(seg, kcol):    return None
     return kcol, tcol, ci, key_index, folds, proj
 
 
