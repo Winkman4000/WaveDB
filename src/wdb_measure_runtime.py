@@ -78,3 +78,17 @@ def compound_range_worth_it(nexc):
     """True iff a conjunct's filter column has few enough exceptions (<= COMPOUND_RANGE_MAX_EXC) to
     take the structural range path; None nexc (not a mode-4 sequence column) -> not eligible."""
     return nexc is not None and nexc <= COMPOUND_RANGE_MAX_EXC
+
+
+
+# --- cube materialization cap (used by wdb_cube) ---
+CUBE_MAX_CELLS = 4096          # prod(dim cardinalities) cap; above this storage cost outweighs the win.
+                               # Measured: a 2,526-cell l_shipdate cube is ~114 KB and answers GROUP BY date
+                               # in 0.37ms vs DuckDB 12.4ms (33x/worker). 4096 keeps that in, stays tiny.
+
+
+def cube_worth_materializing(cell_count, cap=CUBE_MAX_CELLS):
+    """True iff a cube of `cell_count` cells (the product of its dims' cardinalities) is small enough
+    to be worth materializing -- below the cap it is a few KB and parse-bound; far above it the cube
+    costs MB for a query that must emit ~cell_count rows anyway (output-bound)."""
+    return 0 < cell_count <= cap

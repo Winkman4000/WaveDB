@@ -23,10 +23,9 @@ import wdb_sql
 import sqlglot.expressions as E
 import wdb_policies as P
 from wdb_profile import cardinality, segment_cardinalities  # data-measures: cardinality lives in one place
+from wdb_measure_runtime import CUBE_MAX_CELLS  # runtime-measures: the cube cell-count cap
 
-CUBE_MAX_CELLS = 4096          # prod(dim cardinalities) cap; above this storage cost outweighs the win.
-                               # Measured: a 2,526-cell l_shipdate cube is ~114 KB and answers GROUP BY date
-                               # in 0.37ms vs DuckDB 12.4ms (33x/worker). 4096 keeps that in, stays tiny.
+# CUBE_MAX_CELLS (the cube cell-count cap) lives in wdb_measure_runtime, imported above.
 _CUBE_HITS = 0                 # diagnostic: how many queries were answered from a materialised cube
 
 

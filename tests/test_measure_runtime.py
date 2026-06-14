@@ -47,3 +47,10 @@ def test_compound_range_gate():
     assert RT.compound_range_worth_it(None) is False
     assert RT.compound_range_worth_it(50000) is True     # boundary inclusive
     assert RT.compound_range_worth_it(50001) is False
+
+
+def test_cube_cap():
+    assert RT.CUBE_MAX_CELLS == 4096
+    assert RT.cube_worth_materializing(4096) is True      # boundary inclusive
+    assert RT.cube_worth_materializing(4097) is False
+    assert RT.cube_worth_materializing(0) is False        # empty product -> not worth
