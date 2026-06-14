@@ -92,3 +92,32 @@ def test_decline_where():                # WHERE is v2 -> fall through
 
 def test_decline_no_distinct():          # no COUNT(DISTINCT) -> cube/fused path, not groupmix
     _declined("SELECT g, COUNT(*), SUM(amt) FROM t GROUP BY g")
+
+
+def test_groupmix_consumes_materialized_sidecar():
+    """When the (group, distinct-target) pair is materialized, groupmix reads the sidecar's per-group
+    counts instead of walking -- same answer, no walk. Uses its own db so the shared fixture is untouched."""
+    import shutil
+    con = duckdb.connect()
+    d = os.path.join(tempfile.gettempdir(), f'gmixsc_{uuid.uuid4().hex[:8]}'); os.makedirs(d, exist_ok=True)
+    con.execute("CREATE TABLE t AS SELECT i AS id, 'G'||(i%6) AS g, 'S'||(i%13) AS s, "
+                "(i%4) AS adv, CAST((i%50)+1 AS DOUBLE) AS amt FROM range(30000) t(i)")
+    db = Database.create(d)
+    wt = {'BIGINT':'int','INTEGER':'int','VARCHAR':'string','DOUBLE':'float'}
+    desc = con.execute("DESCRIBE t").fetchall()
+    pq = os.path.join(d,'t.parquet'); con.execute(f"COPY (SELECT * FROM t ORDER BY id) TO '{pq}' (FORMAT parquet)")
+    db.cat.add_table('t', [[c[0], wt[c[1]]] for c in desc])
+    wdb_encode.encode(pq, os.path.join(d,'t_0.wdb')); db.cat.add_segment('t','t_0.wdb')
+    q = ("SELECT g, COUNT(*) AS c, SUM(adv), AVG(amt), COUNT(DISTINCT s) FROM t "
+         "GROUP BY g ORDER BY c DESC, g LIMIT 3")
+    exp = _norm([tuple(r) for r in con.execute(q).fetchall()])
+    try:
+        s0 = gm._SIDECAR_HITS
+        assert _norm(db.run(q)[0]) == exp                       # correct via walk
+        assert gm._SIDECAR_HITS == s0, "should walk before materialize"
+        db.materialize_gd('t', 'g', 's')
+        s1 = gm._SIDECAR_HITS
+        assert _norm(db.run(q)[0]) == exp                       # correct via sidecar
+        assert gm._SIDECAR_HITS == s1 + 1, "groupmix must consume the materialized sidecar"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)

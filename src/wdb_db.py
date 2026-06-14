@@ -144,7 +144,7 @@ class Database:
                     gd = wdb_groupdistinct.try_groupdistinct(segs[0], tree, cmap)  # group-wise COUNT(DISTINCT)
                     if gd is not None:                                   # via single-pass code hashing
                         return gd
-                    gmx = wdb_groupmix.try_groupmix(segs[0], tree, cmap)  # GROUP BY + foldable aggs + 1 distinct
+                    gmx = wdb_groupmix.try_groupmix(segs[0], tree, cmap, db=self, table=name, segment_path=paths[0])  # GROUP BY + foldable aggs + 1 distinct
                     if gmx is not None:                                  # (Q09 shape) one pass: bincounts + walk
                         return gmx
                     if wdb_sql._cluster_will_slice(segs[0], tree, cmap):

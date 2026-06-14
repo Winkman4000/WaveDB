@@ -20,6 +20,31 @@ import wdb_groupdistinct as gd
 
 E = wdb_sql.E
 _HITS = 0   # telemetry: queries answered by the multi-aggregate group-distinct kernel
+_SIDECAR_HITS = 0   # telemetry: distinct component served from a materialized gd sidecar (no walk)
+
+
+def _sidecar_counts(db, table, segment_path, kcol, tcol, gmax):
+    """Per-group distinct counts from a fully-materialized gd sidecar (indexed by group code), or None.
+    Lets the multi-aggregate path (Q09) skip the distinct walk when the (kcol,tcol) pair is materialized.
+    Declines on a trimmed sidecar -- groupmix has no WHERE, so it needs every group's count."""
+    global _SIDECAR_HITS
+    if db is None or table is None or segment_path is None:
+        return None
+    try:
+        import wdb_gdsidecar  # noqa: F401  (ensures module loaded; sidecar lives on db)
+        entry = db.cat.gd_entry(table, kcol, tcol)
+        if entry is None or entry.get('excluded'):
+            return None
+        s = db.gd_sidecar(segment_path, kcol, tcol)
+        if s is None:
+            return None
+        cnts = s['counts']
+        if cnts is None or len(cnts) < gmax:
+            return None
+        _SIDECAR_HITS += 1
+        return cnts
+    except Exception:
+        return None
 
 
 def _detect(seg, tree, col_map):
@@ -78,7 +103,7 @@ def _detect(seg, tree, col_map):
     return kcol, tcol, ci, key_index, folds, proj
 
 
-def try_groupmix(seg, tree, col_map):
+def try_groupmix(seg, tree, col_map, db=None, table=None, segment_path=None):
     global _HITS
     det = _detect(seg, tree, col_map)
     if det is None:
@@ -86,22 +111,15 @@ def try_groupmix(seg, tree, col_map):
     kcol, tcol, ci, ki, folds, proj = det
 
     kinfo = gd._ids(seg, kcol)
-    tinfo = gd._ids(seg, tcol)
-    if kinfo is None or tinfo is None:
+    if kinfo is None:
         return None
     grp, _knull, kdecode = kinfo
-    tgt, tnull, _td = tinfo
-    if grp.shape[0] != tgt.shape[0]:
-        return None
     N = grp.shape[0]
     names = [wdb_sql._alias(p) for p in proj]
     if N == 0:
         _HITS += 1
         return [], names
     gmax = int(grp.max()) + 1
-    k = int(tgt.max()) + 1
-    if gmax * k >= (1 << 62):                            # pair-id would overflow int64 -> decline
-        return None
 
     # ---- foldables: per-group reductions (vectorized) ----
     count = np.bincount(grp, minlength=gmax)
@@ -111,15 +129,26 @@ def try_groupmix(seg, tree, col_map):
             vals = np.asarray(seg.values(pc)).astype(np.float64, copy=False)
             sums[i] = np.bincount(grp, weights=vals, minlength=gmax)
 
-    # ---- non-foldable distinct: the single-pass code-hashing walk (reused) ----
-    if gd._HAVE_NUMBA:
-        capbits = max(20, min(28, int(np.ceil(np.log2(max(N, 2)))) + 1))
-        distinct = gd._walk(grp, tgt, np.int64(k), gmax, np.int64(tnull), capbits)
-    else:
-        keep = (tgt != tnull) if tnull >= 0 else slice(None)
-        key = grp[keep].astype(np.int64) * k + tgt[keep].astype(np.int64)
-        uq = np.unique(key)
-        distinct = np.bincount((uq // k).astype(np.int64), minlength=gmax)
+    # ---- non-foldable distinct: prefer a materialized sidecar, else the code-hashing walk ----
+    distinct = _sidecar_counts(db, table, segment_path, kcol, tcol, gmax)
+    if distinct is None:                                 # not materialized -> decode target and walk
+        tinfo = gd._ids(seg, tcol)
+        if tinfo is None:
+            return None
+        tgt, tnull, _td = tinfo
+        if grp.shape[0] != tgt.shape[0]:
+            return None
+        k = int(tgt.max()) + 1
+        if gmax * k >= (1 << 62):                        # pair-id would overflow int64 -> decline
+            return None
+        if gd._HAVE_NUMBA:
+            capbits = max(20, min(28, int(np.ceil(np.log2(max(N, 2)))) + 1))
+            distinct = gd._walk(grp, tgt, np.int64(k), gmax, np.int64(tnull), capbits)
+        else:
+            keep = (tgt != tnull) if tnull >= 0 else slice(None)
+            key = grp[keep].astype(np.int64) * k + tgt[keep].astype(np.int64)
+            uq = np.unique(key)
+            distinct = np.bincount((uq // k).astype(np.int64), minlength=gmax)
 
     present = np.nonzero(count)[0]                        # a group occurs iff it has >=1 row
 
