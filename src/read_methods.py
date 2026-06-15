@@ -22,6 +22,7 @@ import wdb_compound
 import wdb_gdsidecar
 import wdb_groupdistinct
 import wdb_groupmix
+import wdb_valsort
 import wdb_bsi_exec
 import wdb_join
 import wdb_sql
@@ -93,6 +94,13 @@ group_mix = Read('group_mix',
                  lambda c, spec: wdb_groupmix.execute(c.seg, spec, c.tree,
                                                       db=c.db, table=c.name, segment_path=c.path),
                  'group + foldables + one distinct, one walk')
+
+
+# --- value-sorted projection (non-agg): SELECT col WHERE col<>'' ORDER BY col LIMIT k ---
+sorted_proj = Read('sorted_proj',
+                   lambda c: wdb_valsort.detect(c.seg, c.tree, c.cmap),
+                   lambda c, spec: wdb_valsort.execute(c.seg, spec),
+                   'value-sorted dict projection top-K')
 
 # --- clustered-structure slices (detect = the cheap slice/group-slice guard) --------
 

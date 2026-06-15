@@ -24,3 +24,22 @@ def finalize(rows, proj, order, lim, having=None, seg_col=None):
     if lim is not None:
         rows = rows[:lim]
     return rows
+
+
+def take_sorted(decode, counts, ncodes, lim, skip):
+    """Pop a value-sorted dictionary in ascending code order (== value order, since the
+    dict is stored sorted), skipping `skip` codes (empty/null), emitting each value as
+    many times as its per-code count, until `lim` rows are filled. `decode(code)` returns
+    the value for a code (called only for the few codes actually emitted). The read->worker
+    half of the value-sorted projection: the read supplies the structure, this pops it."""
+    rows = []
+    code = 0
+    while code < ncodes and len(rows) < lim:
+        if code in skip:
+            code += 1; continue
+        n = int(counts[code]) if code < counts.size else 0
+        if n > 0:
+            v = decode(code)
+            rows.extend([(v,)] * min(n, lim - len(rows)))
+        code += 1
+    return rows
