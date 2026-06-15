@@ -19,6 +19,7 @@ ORDER BY the distinct-count DESC (or absent), optional LIMIT. Filters and co-agg
 """
 import numpy as np
 import wdb_sql
+import workers
 import wdb_gbcount
 import wdb_policies as P
 E = wdb_sql.E
@@ -192,9 +193,7 @@ def execute(seg, det, tree):
         row[ki] = wdb_sql._pyval(kdecode[gid] if kdecode is not None else np.int64(gid))
         row[ci] = int(counts[gid])
         rows.append(tuple(row))
-    rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))
-    if lim is not None:
-        rows = rows[:lim]
+    rows = workers.finalize(rows, proj, tree.args.get('order'), lim)
     _HITS += 1
     return rows, names
 

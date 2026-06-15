@@ -20,6 +20,7 @@ zone and captures the genuinely low-card categoricals (and their pairs); above i
 import os, pickle, collections
 import numpy as np
 import wdb_sql
+import workers
 import sqlglot.expressions as E
 import wdb_policies as P
 from wdb_profile import cardinality, segment_cardinalities  # data-measures: cardinality lives in one place
@@ -251,10 +252,8 @@ def _grouped_cdist_from_cube(tree, col_map, cubes):
             row.append(int(dc) if (isinstance(inner, E.Count) and isinstance(inner.this, E.Distinct)) else v1)
         rows.append(tuple(row))
     having = tree.args.get('having')
-    if having is not None: rows = wdb_sql._apply_having(rows, proj, having.this, None)
-    rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))
-    lim = wdb_sql._limit(tree)
-    if lim is not None: rows = rows[:lim]
+    rows = workers.finalize(rows, proj, tree.args.get('order'), wdb_sql._limit(tree),
+                            having=having.this if having is not None else None)
     return rows, [wdb_sql._alias(p) for p in proj]
 
 
@@ -374,10 +373,8 @@ def _range_filter_from_cube(tree, col_map, cubes):
                 c = acc_c[gk]; row.append(float(acc_s[gt[1]][gk]) / c if c else 0.0)
         rows.append(tuple(row))
     having = tree.args.get('having')
-    if having is not None: rows = wdb_sql._apply_having(rows, proj, having.this, None)
-    rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))
-    lim = wdb_sql._limit(tree)
-    if lim is not None: rows = rows[:lim]
+    rows = workers.finalize(rows, proj, tree.args.get('order'), wdb_sql._limit(tree),
+                            having=having.this if having is not None else None)
     return rows, [wdb_sql._alias(p) for p in proj]
 
 
@@ -454,11 +451,8 @@ def execute(seg, spec):
             s = sums[gt[1]]; col_lists.append([float(s[i]) / int(count[i]) for i in range(B)])
     rows = list(zip(*col_lists)) if col_lists else [() for _ in range(B)]
     having = tree.args.get('having')
-    if having is not None:
-        rows = wdb_sql._apply_having(rows, proj, having.this, None)
-    rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))
-    lim = wdb_sql._limit(tree)
-    if lim is not None: rows = rows[:lim]
+    rows = workers.finalize(rows, proj, tree.args.get('order'), wdb_sql._limit(tree),
+                            having=having.this if having is not None else None)
     _CUBE_HITS += 1
     return rows, [wdb_sql._alias(p) for p in proj]
 

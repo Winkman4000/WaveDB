@@ -18,6 +18,7 @@ clean-boundary top-N. Fail-closed on any shape it does not own.
 """
 import numpy as np
 import wdb_sql
+import workers
 import wdb_gbcount
 import wdb_seqpred
 import wdb_policies as P
@@ -163,7 +164,7 @@ def execute(seg, spec):
         row[ki] = wdb_sql._pyval(V[int(us[i])])         # decode only the N emitted keys
         row[ci] = int(cs[i])
         rows.append(tuple(row))
-    rows = wdb_sql._apply_order(rows, proj, spec['order'])[:lim]
+    rows = workers.finalize(rows, proj, spec['order'], lim)
     _HITS += 1
     return rows, [wdb_sql._alias(p) for p in proj]
 

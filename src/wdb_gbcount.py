@@ -19,6 +19,7 @@ keyed by column — general across any table/column. Staleness-guarded by seg.N.
 """
 import os, pickle, numpy as np
 import wdb_sql
+import workers
 import wdb_policies as P
 E = wdb_sql.E
 
@@ -188,7 +189,7 @@ def execute(seg, spec):
         row[ki] = wdb_sql._pyval(V[code])               # decode only the N emitted keys
         row[ci] = int(n)
         rows.append(tuple(row))
-    rows = wdb_sql._apply_order(rows, proj, spec['order'])[:lim]
+    rows = workers.finalize(rows, proj, spec['order'], lim)
     _HITS += 1
     return rows, [wdb_sql._alias(p) for p in proj]
 

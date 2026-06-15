@@ -16,6 +16,7 @@ aggregate/key, optional LIMIT. MIN/MAX/COUNT(col) decline (fall through) in v1.
 """
 import numpy as np
 import wdb_sql
+import workers
 import wdb_groupdistinct as gd
 import wdb_policies as P
 
@@ -168,10 +169,7 @@ def execute(seg, det, tree, db=None, table=None, segment_path=None):
                 row[i] = float(sums[i][g] / cg) if cg else None   # AVG always float (non-null col)
         rows.append(tuple(row))
 
-    rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))
-    lim = wdb_sql._limit(tree)
-    if lim is not None:
-        rows = rows[:lim]
+    rows = workers.finalize(rows, proj, tree.args.get('order'), wdb_sql._limit(tree))
     _HITS += 1
     return rows, names
 
