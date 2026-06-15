@@ -123,10 +123,11 @@ def _order_is_count_desc(tree, proj, ci):
     return ak is not None and ak[0] == 'COUNT_STAR'
 
 
-def try_gbcount(seg, tree, col_map):
-    """Answer a filter-free high-card `key, COUNT(*) GROUP BY key ORDER BY COUNT(*) DESC LIMIT N`
-    from the persisted count projection, or return None to fall through to the scan paths."""
-    global _HITS
+def detect(seg, tree, col_map):
+    """ACTIVATION for the count-projection read. A pure decision over query shape +
+    segment metadata -- touches no row data. Returns a spec dict the read needs, or
+    None to decline. Self-validating, so it's robust called on its own (the controller
+    calls this to route; try_gbcount calls it too)."""
     # --- shared shape guards (wdb_policies); filter-free COUNT(*) top-N ---
     if not P.no_joins(tree):           return None
     if not P.no_select_distinct(tree): return None
@@ -157,9 +158,20 @@ def try_gbcount(seg, tree, col_map):
     if not P.no_deleted_rows(seg):     return None      # deleted rows make stored counts stale
     if not _order_is_count_desc(tree, proj, ci):
         return None
-    V = _code_values(seg, col)
+    V = _code_values(seg, col)                          # by-code value dict (O(V) metadata, engine-cached)
     if V is None:
         return None
+    return {'col': col, 'ci': ci, 'ki': ki, 'lim': lim, 'proj': proj,
+            'V': V, 'order': tree.args.get('order')}
+
+
+def execute(seg, spec):
+    """THE READ: pull the persisted count projection and emit the top-N rows. May still
+    decline (return None) on measured boundary conditions that need the loaded sidecar --
+    a LIMIT past the stored heavy hitters, or a tie straddling the LIMIT boundary."""
+    global _HITS
+    col = spec['col']; ci = spec['ci']; ki = spec['ki']; lim = spec['lim']
+    proj = spec['proj']; V = spec['V']
     loaded = _load(seg, col)
     if loaded is None:
         return None
@@ -176,6 +188,15 @@ def try_gbcount(seg, tree, col_map):
         row[ki] = wdb_sql._pyval(V[code])               # decode only the N emitted keys
         row[ci] = int(n)
         rows.append(tuple(row))
-    rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))[:lim]
+    rows = wdb_sql._apply_order(rows, proj, spec['order'])[:lim]
     _HITS += 1
     return rows, [wdb_sql._alias(p) for p in proj]
+
+
+def try_gbcount(seg, tree, col_map):
+    """Detect + execute, kept as the backward-compatible single-call entry (read_methods
+    and the tests call this). The controller will eventually call detect()/execute() directly."""
+    spec = detect(seg, tree, col_map)
+    if spec is None:
+        return None
+    return execute(seg, spec)
