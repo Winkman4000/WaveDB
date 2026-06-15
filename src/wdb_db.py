@@ -13,6 +13,7 @@ from wdb_catalog import Catalog
 from wdb_engine import Segment
 import os
 import wdb_ddl, wdb_dml, wdb_sql, wdb_merge, wdb_compact, wdb_join, wdb_fkptr, wdb_bsi_exec, wdb_cube, wdb_gbcount, wdb_survgroup, wdb_compound, wdb_groupdistinct, wdb_gdsidecar, wdb_groupmix
+import read_methods, controller
 import numpy as np
 import functools
 
@@ -124,43 +125,8 @@ class Database:
             hp = wdb_dml.hot_path(self.cat, name)
             hot = hp if os.path.exists(hp) else None
             if hot is None and len(segs) == 1:
-                if (tree.args.get('group') is not None or tree.args.get('distinct') is not None
-                        or any(wdb_sql._agg_kind(e) for e in tree.expressions)):
-                    cube_rows = wdb_cube.try_cube(segs[0], tree, cmap)   # materialised low-card cube:
-                    if cube_rows is not None:                            # filter-free GROUP BY answered
-                        return cube_rows                                 # from a few precomputed numbers
-                    gbc = wdb_gbcount.try_gbcount(segs[0], tree, cmap)   # high-card single COUNT(*) -> count
-                    if gbc is not None:                                  # projection: top-N read, no scan
-                        return gbc
-                    sg = wdb_survgroup.try_survgroup(segs[0], tree, cmap) # selective filtered high-card
-                    if sg is not None:                                   # COUNT(*): group survivors only
-                        return sg
-                    cmpd = wdb_compound.try_compound(segs[0], tree, cmap) # compound-AND filter, multi-key
-                    if cmpd is not None:                                 # GROUP BY COUNT(*) on survivors
-                        return cmpd
-                    gds = wdb_gdsidecar.try_serve(self, name, segs[0], paths[0], tree, cmap)
-                    if gds is not None:                                  # materialized COUNT(DISTINCT):
-                        return gds                                       # read stored counts, no walk
-                    gd = wdb_groupdistinct.try_groupdistinct(segs[0], tree, cmap)  # group-wise COUNT(DISTINCT)
-                    if gd is not None:                                   # via single-pass code hashing
-                        return gd
-                    gmx = wdb_groupmix.try_groupmix(segs[0], tree, cmap, db=self, table=name, segment_path=paths[0])  # GROUP BY + foldable aggs + 1 distinct
-                    if gmx is not None:                                  # (Q09 shape) one pass: bincounts + walk
-                        return gmx
-                    if wdb_sql._cluster_will_slice(segs[0], tree, cmap):
-                        return wdb_sql.execute(segs[0], sql, col_map=cmap, tree=tree)  # clustered slice path
-                    if wdb_sql._cluster_will_group_slice(segs[0], tree, cmap):
-                        return wdb_sql.execute(segs[0], sql, col_map=cmap, tree=tree)  # clustered group-slice path
-                    if not esc:
-                        try:
-                            return wdb_bsi_exec.execute(segs[0], tree, cmap)  # BSI filter path (throughput)
-                        except wdb_bsi_exec._BSIUnsupported:
-                            pass                                          # shape/selectivity unfit -> fused/fallback
-                    try:
-                        return wdb_join.table_agg(self, tree)        # single-table aggregate -> fused fast path
-                    except wdb_join._FastUnsupported:
-                        pass                                          # fall back to the single-table executor
-                return wdb_sql.execute(segs[0], sql, col_map=cmap)
+                ctx = read_methods.ReadContext(self, name, segs[0], paths[0], tree, cmap, sql, esc)
+                return controller.route_single_segment(ctx)
             if hot is None and not segs:
                 raise ValueError(f"table {name!r} has no data yet")
             return wdb_merge.merge_query(segs, hot, sql, col_map=cmap)
