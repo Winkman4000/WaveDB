@@ -2,39 +2,39 @@
 controller.py -- THE CONTROLLER (routing layer).
 
 A query, in the user sense, is a *route*: the controller takes a request and sends
-it down a route that resolves to a read (and, later, a worker). The controller
-holds no retrieval logic of its own -- it owns the ORDER of reads and the
-activation gating, and wires requests to reads supplied by its imports.
+it down the read that fires for it (and, later, a worker). The controller holds no
+retrieval logic of its own -- it owns the ORDER of reads and walks it:
 
-Today this reproduces, byte-identically, the hand-ordered try-chain that used to
-live inline in wdb_db.run(): structure reads first (cube -> dict-count -> ... ->
-cluster slices), then the throughput/fused reads, then the general scan as the
-catch-all. The reads still self-select (return None / raise when a request isn't
-their shape); the controller just walks the order and returns the first hit.
+    for read in _READ_ORDER:
+        spec = read.detect(ctx)        # ACTIVATION -- the auditable, preloadable part
+        if spec is None: continue      #   not this read's shape -> next
+        rows = read.execute(ctx, spec) # THE READ -- may still decline (measured) -> next
+        if rows is not None: return rows
+    return general_scan(ctx)           # catch-all: read the columns directly
 
-WHERE THIS IS HEADED (the point of the layer):
-  - bind routes to reads from system state ONCE, when materialization settles
-    (the "preloaded try state"), so query time becomes pure dispatch with no
-    per-query shape-checking;
-  - hang a WORKER off each route, so a route is (read -> worker).
-Both are future increments; the seam is here now.
+Every read -- structure reads, clustered slices, the throughput bit-sliced filter,
+the fused fast path -- is a uniform Read(detect, execute) in read_methods. The
+exception-based reads catch their own "not my shape" signal inside execute; bsi's
+throughput-only gate lives in its detect. Byte-identical to the old hand-ordered
+try-chain that lived inline in wdb_db.run().
+
+WHERE THIS IS HEADED: bind detect results from system state ONCE when materialization
+settles (the preloaded "try state"), and hang a WORKER off each route.
 """
 import read_methods as R
 import wdb_sql
-import wdb_bsi_exec
-import wdb_join
 
 
 def _agg_or_group(tree):
-    """The precondition for the structure-read chain: the request must aggregate,
-    group, or ask for distinct. Plain projections skip straight to the scan."""
+    """Precondition for the structure-read chain: the request must aggregate, group,
+    or ask for distinct. Plain projections skip straight to the scan."""
     return (tree.args.get('group') is not None
             or tree.args.get('distinct') is not None
             or any(wdb_sql._agg_kind(e) for e in tree.expressions))
 
 
-# The single-segment read order -- the "try state". Each entry is a read in
-# read_methods; the first to return non-None wins.
+# The single-segment read order -- the "try state". Each is a read_methods.Read; the
+# first whose detect fires AND whose execute returns rows wins.
 _READ_ORDER = (
     R.cube,                 # pre-materialized cube
     R.dict_count,           # dictionary per-code counts
@@ -45,28 +45,20 @@ _READ_ORDER = (
     R.group_mix,            # group + foldables + one distinct, one walk
     R.cluster_slice,        # contiguous slice of a clustered structure
     R.cluster_group_slice,  # clustered group-runs as slices
+    R.bsi_filter,           # bit-sliced index filter (throughput-only; detect gates on esc)
+    R.fused_agg,            # single-table fused fast path
 )
 
 
 def route_single_segment(ctx):
-    """Route a request over a single clean segment to its read.
-
-    Byte-identical to the previous wdb_db try-chain: if the request aggregates/
-    groups/distincts, walk the structure reads in order; then (throughput only)
-    the bit-sliced filter; then the fused aggregate; each falling through on its
-    own 'not my shape' signal. Anything unrouted falls to the general scan."""
+    """Route a request over a single clean segment to its read, else the general scan.
+    Byte-identical to the previous wdb_db try-chain."""
     if _agg_or_group(ctx.tree):
         for read in _READ_ORDER:
-            rows = read(ctx)
+            spec = read.detect(ctx)
+            if spec is None:
+                continue
+            rows = read.execute(ctx, spec)
             if rows is not None:
                 return rows
-        if not ctx.esc:
-            try:
-                return R.bsi_filter(ctx)              # throughput path
-            except wdb_bsi_exec._BSIUnsupported:
-                pass                                  # shape/selectivity unfit
-        try:
-            return R.fused_agg(ctx)                   # fused fast path
-        except wdb_join._FastUnsupported:
-            pass                                      # fall back to the scan
     return R.general_scan(ctx)

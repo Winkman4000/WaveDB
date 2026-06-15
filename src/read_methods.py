@@ -2,23 +2,18 @@
 read_methods.py -- THE READS LAYER.
 
 A *read* explores one stored structure and returns the retrieved pattern (rows),
-or None to decline because the structure/query shape isn't its kind.
+or None to decline. Each read is now a pair:
+    detect(ctx)        -> spec | None   ACTIVATION (cheap: query shape + materialization)
+    execute(ctx, spec) -> rows | None   THE READ (may still decline on measured conditions)
+bundled in a Read object. The spec is OPAQUE to the controller -- detect hands it
+straight back to execute, so heterogeneous operator signatures stay hidden in the
+adapters here (e.g. group_mix/distinct_sidecar need the db handle + segment path).
 
-Uniform contract:
-    read(ctx) -> rows | None
+This is the seam the controller routes through, and the seam where tier-2
+(materialization) decisions will later be PRELOADED: detect is the preloadable part.
 
-`ctx` (ReadContext) carries everything any read might need: the segment, the
-parsed query, the column map, the db handle, the segment path, the raw sql, and
-the throughput/latency flag. This is the data-access layer -- the menu of ways to
-explore the structure. The CONTROLLER (controller.py) decides which read fires.
-
-Increment 1: the read *bodies* still live in the operator modules; the functions
-below are the gathered entry points (thin calls) so behavior is byte-identical.
-Bodies get relocated here over later increments. Two reads (bsi_filter, fused_agg)
-signal "not my shape" by raising their own exception instead of returning None --
-left as-is here; the controller catches them.
-
-Read order / activation lives in controller.py, not here.
+ctx (ReadContext) carries everything any read needs: segment, parsed query, column
+map, db handle, segment path, raw sql, and the throughput/latency flag.
 """
 import wdb_cube
 import wdb_gbcount
@@ -38,82 +33,110 @@ class ReadContext:
     __slots__ = ('db', 'name', 'seg', 'path', 'tree', 'cmap', 'sql', 'esc')
 
     def __init__(self, db, name, seg, path, tree, cmap, sql, esc):
-        self.db = db          # the WaveDB handle (for reads that need sidecars/fk pointers)
+        self.db = db          # the WaveDB handle (sidecars / fk pointers)
         self.name = name      # logical table name
         self.seg = seg        # the single materialized segment being read
-        self.path = path      # that segment's on-disk path (for sidecar lookups)
+        self.path = path      # that segment's on-disk path (sidecar lookups)
         self.tree = tree      # parsed sqlglot query
         self.cmap = cmap      # logical -> physical column map
         self.sql = sql        # raw sql (post join-rewrite), for the executor paths
         self.esc = esc        # True = latency/fused preference, False = throughput
 
 
-# --- structure reads: each explores one materialized form, returns rows or None ---
+class Read:
+    """A read = its activation (detect) + its retrieval (execute). The controller calls
+    detect(ctx) to route (cheap, preloadable) and execute(ctx, spec) to retrieve. The
+    spec is opaque to the controller; only the matching execute interprets it."""
+    __slots__ = ('name', 'detect', 'execute', 'note')
 
-def cube(c):
-    """Read a pre-materialized cube: grouped aggregates precomputed at build time."""
-    return wdb_cube.try_cube(c.seg, c.tree, c.cmap)
-
-
-def dict_count(c):
-    """Read per-code counts straight from a dictionary: COUNT(*) GROUP BY, no scan."""
-    return wdb_gbcount.try_gbcount(c.seg, c.tree, c.cmap)
-
-
-def survivor_group(c):
-    """Read a selectively-filtered high-cardinality group via survivor ranges."""
-    return wdb_survgroup.try_survgroup(c.seg, c.tree, c.cmap)
+    def __init__(self, name, detect, execute, note=''):
+        self.name = name
+        self.detect = detect
+        self.execute = execute
+        self.note = note
 
 
-def compound_filter(c):
-    """Read grouped counts under a multi-condition AND filter."""
-    return wdb_compound.try_compound(c.seg, c.tree, c.cmap)
+# --- structure reads (operators with a clean detect/execute split) -----------------
+
+cube = Read('cube',
+            lambda c: wdb_cube.detect(c.seg, c.tree, c.cmap),
+            lambda c, spec: wdb_cube.execute(c.seg, spec),
+            'pre-materialized cube')
+
+dict_count = Read('dict_count',
+                  lambda c: wdb_gbcount.detect(c.seg, c.tree, c.cmap),
+                  lambda c, spec: wdb_gbcount.execute(c.seg, spec),
+                  'dictionary per-code counts')
+
+survivor_group = Read('survivor_group',
+                      lambda c: wdb_survgroup.detect(c.seg, c.tree, c.cmap),
+                      lambda c, spec: wdb_survgroup.execute(c.seg, spec),
+                      'filtered high-card group via survivor ranges')
+
+compound_filter = Read('compound_filter',
+                       lambda c: wdb_compound.detect(c.seg, c.tree, c.cmap),
+                       lambda c, spec: wdb_compound.execute(c.seg, spec),
+                       'multi-condition AND filter')
+
+distinct_sidecar = Read('distinct_sidecar',
+                        lambda c: wdb_gdsidecar.detect(c.db, c.name, c.seg, c.path, c.tree, c.cmap),
+                        lambda c, spec: wdb_gdsidecar.execute(c.seg, spec),
+                        'prebuilt group->distinct sidecar')
+
+group_distinct = Read('group_distinct',
+                      lambda c: wdb_groupdistinct.detect(c.seg, c.tree, c.cmap),
+                      lambda c, spec: wdb_groupdistinct.execute(c.seg, spec, c.tree),
+                      'one-pass code-hash distinct walk')
+
+group_mix = Read('group_mix',
+                 lambda c: wdb_groupmix._detect(c.seg, c.tree, c.cmap),
+                 lambda c, spec: wdb_groupmix.execute(c.seg, spec, c.tree,
+                                                      db=c.db, table=c.name, segment_path=c.path),
+                 'group + foldables + one distinct, one walk')
+
+# --- clustered-structure slices (detect = the cheap slice/group-slice guard) --------
+
+cluster_slice = Read('cluster_slice',
+                     lambda c: True if wdb_sql._cluster_will_slice(c.seg, c.tree, c.cmap) else None,
+                     lambda c, spec: wdb_sql.execute(c.seg, c.sql, col_map=c.cmap, tree=c.tree),
+                     'contiguous slice of a clustered structure')
+
+cluster_group_slice = Read('cluster_group_slice',
+                           lambda c: True if wdb_sql._cluster_will_group_slice(c.seg, c.tree, c.cmap) else None,
+                           lambda c, spec: wdb_sql.execute(c.seg, c.sql, col_map=c.cmap, tree=c.tree),
+                           'clustered group-runs as slices')
 
 
-def distinct_sidecar(c):
-    """Read a prebuilt group->distinct sidecar: per-group COUNT(DISTINCT), no walk."""
-    return wdb_gdsidecar.try_serve(c.db, c.name, c.seg, c.path, c.tree, c.cmap)
+# --- throughput / fused reads: these signal "not my shape" by RAISING, so their
+#     execute catches it and returns None (declines) -- folding them into the same
+#     uniform detect/execute loop. bsi's detect carries the throughput-only gate.
+
+def _bsi_detect(c):
+    return None if c.esc else True          # bsi filter is throughput-mode only
+
+def _bsi_execute(c, spec):
+    try:
+        return wdb_bsi_exec.execute(c.seg, c.tree, c.cmap)
+    except wdb_bsi_exec._BSIUnsupported:
+        return None                          # shape/selectivity unfit -> fall through
+
+bsi_filter = Read('bsi_filter', _bsi_detect, _bsi_execute, 'bit-sliced index filter (throughput)')
 
 
-def group_distinct(c):
-    """Read per-group COUNT(DISTINCT) via a one-pass code-hash walk."""
-    return wdb_groupdistinct.try_groupdistinct(c.seg, c.tree, c.cmap)
+def _fused_detect(c):
+    return True                              # always eligible to try; execute decides
+
+def _fused_execute(c, spec):
+    try:
+        return wdb_join.table_agg(c.db, c.tree)
+    except wdb_join._FastUnsupported:
+        return None                          # not the fused shape -> fall through
+
+fused_agg = Read('fused_agg', _fused_detect, _fused_execute, 'single-table fused fast path')
 
 
-def group_mix(c):
-    """Read group + foldable aggregates + one distinct together in one walk."""
-    return wdb_groupmix.try_groupmix(c.seg, c.tree, c.cmap,
-                                     db=c.db, table=c.name, segment_path=c.path)
+# --- the catch-all: read the columns directly. Not a Read -- it never declines. -----
 
-
-def cluster_slice(c):
-    """Read a contiguous slice of a clustered (sorted) structure, when applicable."""
-    if wdb_sql._cluster_will_slice(c.seg, c.tree, c.cmap):
-        return wdb_sql.execute(c.seg, c.sql, col_map=c.cmap, tree=c.tree)
-    return None
-
-
-def cluster_group_slice(c):
-    """Read clustered group-runs as slices, when applicable."""
-    if wdb_sql._cluster_will_group_slice(c.seg, c.tree, c.cmap):
-        return wdb_sql.execute(c.seg, c.sql, col_map=c.cmap, tree=c.tree)
-    return None
-
-
-# --- these two raise their own "not my shape" exception instead of returning None ---
-
-def bsi_filter(c):
-    """Read a bit-sliced index for throughput filtering. Raises _BSIUnsupported."""
-    return wdb_bsi_exec.execute(c.seg, c.tree, c.cmap)
-
-
-def fused_agg(c):
-    """Read a single-table aggregate via the fused fast path. Raises _FastUnsupported."""
-    return wdb_join.table_agg(c.db, c.tree)
-
-
-# --- the catch-all: read the columns directly ---
-
-def general_scan(c):
+def general_scan(ctx):
     """The general scan -- read the columns directly. Always returns a result."""
-    return wdb_sql.execute(c.seg, c.sql, col_map=c.cmap)
+    return wdb_sql.execute(ctx.seg, ctx.sql, col_map=ctx.cmap)
