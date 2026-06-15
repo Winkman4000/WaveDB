@@ -417,7 +417,7 @@ def try_cube(seg, tree, col_map):
     for p in proj:
         ak = wdb_sql._agg_kind(p)
         if ak is None:                                      # bare group-key column (unwrap any alias)
-            nm = wdb_sql._colname(p.this if isinstance(p, wdb_sql.E.Alias) else p)
+            nm = wdb_sql._proj_colname(p)
             if nm is None: return None
             pc = col_map.get(nm, nm) if col_map else nm
             if pc not in cube['dims']: return None

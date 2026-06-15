@@ -113,6 +113,12 @@ def _colname(node):
     if isinstance(node, E.Column): return node.name
     return None
 
+
+def _proj_colname(p):
+    """Column name of a projection/group expr, unwrapping a top-level AS alias first.
+    The 'unwrap alias then name it' idiom, centralized (was inlined across 6 operators)."""
+    return _colname(p.this if isinstance(p, E.Alias) else p)
+
 def _to_physical(node, col_map):
     """Deep-copy a sqlglot expression with column names remapped logical->physical. Used ONLY for
     the DuckDB-side queries (hot buffer / canonical buffer parquet), whose columns carry the

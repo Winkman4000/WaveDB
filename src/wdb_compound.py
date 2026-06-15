@@ -206,7 +206,7 @@ def try_compound(seg, tree, col_map):
     for idx, p in enumerate(proj):
         if idx == ci: continue
         if wdb_sql._agg_kind(p) is not None: return None
-        nm = wdb_sql._colname(p.this if isinstance(p, E.Alias) else p)
+        nm = wdb_sql._proj_colname(p)
         if nm is None: return None
         proj_keys.append(nm)
     if set(proj_keys) != set(keycols): return None
@@ -291,7 +291,7 @@ def try_compound(seg, tree, col_map):
         row[ci] = int(cnts[r])
         for j, p in enumerate(proj):
             if j == ci: continue
-            nm = wdb_sql._colname(p.this if isinstance(p, E.Alias) else p)
+            nm = wdb_sql._proj_colname(p)
             row[j] = name2vals[nm][r]
         rows.append(tuple(row))
     _HITS += 1

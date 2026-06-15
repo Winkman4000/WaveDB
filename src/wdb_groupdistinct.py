@@ -128,7 +128,7 @@ def detect(seg, tree, col_map, _allow_group_filter=False):
     kp = proj[ki]
     if wdb_sql._agg_kind(kp) is not None:                # the other projection must be the bare key
         return None
-    knm = wdb_sql._colname(kp.this if isinstance(kp, E.Alias) else kp)
+    knm = wdb_sql._proj_colname(kp)
     gnm = wdb_sql._colname(group.expressions[0])
     if knm is None or gnm is None or knm != gnm:
         return None

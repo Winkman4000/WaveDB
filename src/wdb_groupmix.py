@@ -76,7 +76,7 @@ def _detect(seg, tree, col_map):
             continue
         kind = wdb_sql._agg_kind(p)
         if kind is None:                                 # must be exactly the bare group key
-            knm = wdb_sql._colname(p.this if isinstance(p, E.Alias) else p)
+            knm = wdb_sql._proj_colname(p)
             if knm is None or knm != gnm or key_index is not None:
                 return None
             key_index = i
