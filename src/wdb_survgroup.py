@@ -68,10 +68,9 @@ def _simple_cmp(node, sc):
     return None
 
 
-def try_survgroup(seg, tree, col_map):
-    """Answer a selective filtered high-card `key, COUNT(*) WHERE pred GROUP BY key ORDER BY COUNT(*)
-    DESC LIMIT N` by grouping only the survivors, or return None to fall through to the dense path."""
-    global _HITS
+def detect(seg, tree, col_map):
+    """ACTIVATION: static shape + segment-metadata guards for the survivor-group read.
+    Touches no row data. Returns a spec the read needs, or None to decline. Self-validating."""
     # --- shared shape guards (wdb_policies); FILTERED family, so it REQUIRES a WHERE ---
     if not P.no_joins(tree):           return None
     if not P.no_select_distinct(tree): return None
@@ -106,17 +105,23 @@ def try_survgroup(seg, tree, col_map):
     V = wdb_gbcount._code_values(seg, col)              # by-code decoder for the group key
     if V is None:
         return None
+    return {'col': col, 'ci': ci, 'ki': ki, 'lim': lim, 'proj': proj, 'V': V,
+            'sc': sc, 'where_node': where.this, 'order': tree.args.get('order')}
+
+
+def execute(seg, spec):
+    """THE READ: group only the filter's survivors. May decline (None) on MEASURED conditions
+    -- empty result, a filter too dense to beat the dense path, or a tie at the LIMIT boundary."""
+    global _HITS
+    col = spec['col']; ci = spec['ci']; ki = spec['ki']; lim = spec['lim']
+    proj = spec['proj']; V = spec['V']; sc = spec['sc']; where_node = spec['where_node']
 
     N = seg.N
     K = seg.cols[col].get('V') or (1 << 24)
     codes = seg._raw_codes(col)
 
-    # Structural fast path: push `fcol <op> const` into the filter column's mode-4 exception
-    # structure to get survivor row-ranges WITHOUT decoding the filter column, then gather only the
-    # key codes there. Skipped when there are deleted rows (ranges don't model presence) or when the
-    # column has too many exceptions to be worth it.
     sub = None
-    cmp = _simple_cmp(where.this, sc)
+    cmp = _simple_cmp(where_node, sc)
     if cmp is not None and seg.presence_mask() is None:
         fcol, op, const = cmp
         nexc = wdb_seqpred.n_exceptions(seg, fcol)
@@ -132,10 +137,8 @@ def try_survgroup(seg, tree, col_map):
                 sub = codes[wdb_seqpred.ranges_to_ids(los, his)]
 
     if sub is None:
-        # General path: evaluate the predicate to a mask (reads the filter column), then gather.
-        # The eval is the sunk cost the dense path would pay too, and yields the exact selectivity.
         try:
-            mask = wdb_sql._eval_pred(seg, where.this, sc)
+            mask = wdb_sql._eval_pred(seg, where_node, sc)
         except (NotImplementedError, Exception):
             return None
         pm = seg.presence_mask()
@@ -148,13 +151,11 @@ def try_survgroup(seg, tree, col_map):
             return None                                 # dense filter -> dense path is cheaper
         sub = codes[mask]
 
-    # Survivor-set group-by: group the small survivor set.
     u, c = np.unique(sub, return_counts=True)
     order = np.argsort(c, kind='stable')[::-1]          # count descending over distinct survivors
     cs = c[order]; us = u[order]
     if lim < cs.size and int(cs[lim - 1]) == int(cs[lim]):
-        return None                                     # tie straddles the LIMIT boundary -> defer to
-                                                        # the dense path for consistent tie-breaking
+        return None                                     # tie straddles the LIMIT boundary
     take = min(lim, cs.size)
     rows = []
     for i in range(take):
@@ -162,6 +163,14 @@ def try_survgroup(seg, tree, col_map):
         row[ki] = wdb_sql._pyval(V[int(us[i])])         # decode only the N emitted keys
         row[ci] = int(cs[i])
         rows.append(tuple(row))
-    rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))[:lim]
+    rows = wdb_sql._apply_order(rows, proj, spec['order'])[:lim]
     _HITS += 1
     return rows, [wdb_sql._alias(p) for p in proj]
+
+
+def try_survgroup(seg, tree, col_map):
+    """Detect + execute, kept as the backward-compatible single-call entry."""
+    spec = detect(seg, tree, col_map)
+    if spec is None:
+        return None
+    return execute(seg, spec)

@@ -381,19 +381,26 @@ def _range_filter_from_cube(tree, col_map, cubes):
     return rows, [wdb_sql._alias(p) for p in proj]
 
 
-def try_cube(seg, tree, col_map):
-    """If `tree` is a filter-free GROUP BY whose dims match a stored cube and whose projections are
-    all COUNT(*) / SUM / AVG over stored measures (or group-key columns), answer from the cube and
-    return (rows, colnames). Also answers grouped COUNT(DISTINCT) from a 2-dim cube. Otherwise return
-    None so the caller falls through to the scan paths."""
-    global _CUBE_HITS
+def detect(seg, tree, col_map):
+    """ACTIVATION (lean): cheap static shape guards + does a cube exist at all. The
+    fine-grained 'do the dims/measures match a stored cube' check must inspect the cube,
+    so it stays in execute (which declines if nothing matches). Returns a spec or None."""
     # --- shared shape guards (wdb_policies) ---
     if not P.no_joins(tree):           return None
     if not P.no_select_distinct(tree): return None
     if not P.has_group_key(tree):      return None
-    group = tree.args.get('group')
     cubes = seg.cubes()
     if not cubes: return None
+    return {'tree': tree, 'col_map': col_map, 'cubes': cubes}
+
+
+def execute(seg, spec):
+    """THE READ: answer a filter-free GROUP BY from a stored cube -- a range-filter roll-up,
+    a grouped COUNT(DISTINCT) from a 2-dim cube, or the main GROUP BY of COUNT(*)/SUM/AVG.
+    Declines (None) when the query's dims/measures don't match any stored cube."""
+    global _CUBE_HITS
+    tree = spec['tree']; col_map = spec['col_map']; cubes = spec['cubes']
+    group = tree.args.get('group')
     if tree.args.get('where') is not None:                  # WHERE fcol <op> const on a cube dim -> exact roll-up
         rf = _range_filter_from_cube(tree, col_map, cubes)
         if rf is not None:
@@ -454,3 +461,11 @@ def try_cube(seg, tree, col_map):
     if lim is not None: rows = rows[:lim]
     _CUBE_HITS += 1
     return rows, [wdb_sql._alias(p) for p in proj]
+
+
+def try_cube(seg, tree, col_map):
+    """Detect + execute, kept as the backward-compatible single-call entry."""
+    spec = detect(seg, tree, col_map)
+    if spec is None:
+        return None
+    return execute(seg, spec)

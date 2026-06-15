@@ -180,10 +180,10 @@ def _offset(tree):
     except Exception: return 0
 
 
-def try_compound(seg, tree, col_map):
-    """Answer a compound-AND filtered GROUP BY COUNT(*) (single or multi key) on the survivor set,
-    or return None to fall through. Fail-closed on every shape it does not own."""
-    global _HITS
+def detect(seg, tree, col_map):
+    """ACTIVATION: static shape + segment-metadata guards for the compound-AND read.
+    Touches no row data. Returns a spec or None. Self-validating; fail-closed on every
+    shape it does not own."""
     # --- shared shape guards (wdb_policies); FILTERED + MULTI-KEY, so has_where + has_group_key (>=1) ---
     if not P.no_joins(tree):           return None
     if not P.no_select_distinct(tree): return None
@@ -217,8 +217,18 @@ def try_compound(seg, tree, col_map):
     # --- shared segment/column guards (wdb_policies) ---
     if not P.columns_exist(seg, *pc): return None
     if not P.no_deleted_rows(seg):    return None         # deleted rows: ranges don't model presence
+    return {'ci': ci, 'sc': sc, 'keycols': keycols, 'pc': pc, 'proj': proj,
+            'where_node': where.this, 'tree': tree}
 
-    conj = _conjuncts(seg, where.this, sc)
+
+def execute(seg, spec):
+    """THE READ: count the survivors of the compound-AND filter, grouped. Single- or multi-key.
+    May decline (None) on the measured packing-overflow guard."""
+    global _HITS
+    ci = spec['ci']; sc = spec['sc']; keycols = spec['keycols']; pc = spec['pc']
+    proj = spec['proj']; where_node = spec['where_node']; tree = spec['tree']
+
+    conj = _conjuncts(seg, where_node, sc)
     if conj is None: return None
     res = _resolve(seg, conj)
     if res is None: return None
@@ -296,3 +306,11 @@ def try_compound(seg, tree, col_map):
         rows.append(tuple(row))
     _HITS += 1
     return rows, names
+
+
+def try_compound(seg, tree, col_map):
+    """Detect + execute, kept as the backward-compatible single-call entry."""
+    spec = detect(seg, tree, col_map)
+    if spec is None:
+        return None
+    return execute(seg, spec)
