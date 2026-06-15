@@ -26,20 +26,21 @@ def finalize(rows, proj, order, lim, having=None, seg_col=None):
     return rows
 
 
-def take_sorted(decode, counts, ncodes, lim, skip):
-    """Pop a value-sorted dictionary in ascending code order (== value order, since the
-    dict is stored sorted), skipping `skip` codes (empty/null), emitting each value as
-    many times as its per-code count, until `lim` rows are filled. `decode(code)` returns
-    the value for a code (called only for the few codes actually emitted). The read->worker
-    half of the value-sorted projection: the read supplies the structure, this pops it."""
+def take_sorted(decode, ncodes, lim, skip):
+    """Pop a value-sorted dictionary from the front -- ascending code == ascending value,
+    since the dict is stored sorted -- skipping `skip` codes (e.g. the null code) and any
+    value that decodes to '' (the filtered-out empty string), emitting the first `lim`
+    values. decode(code) -> value, called only for the handful of codes inspected. The
+    read supplies the sorted structure; this pops it. No row scan, no counts: the dict
+    order IS the sort."""
     rows = []
     code = 0
     while code < ncodes and len(rows) < lim:
         if code in skip:
             code += 1; continue
-        n = int(counts[code]) if code < counts.size else 0
-        if n > 0:
-            v = decode(code)
-            rows.extend([(v,)] * min(n, lim - len(rows)))
+        v = decode(code)
+        if v == '' or v is None:
+            code += 1; continue
+        rows.append((v,))
         code += 1
     return rows

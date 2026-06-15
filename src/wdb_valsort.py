@@ -2,42 +2,30 @@
 wdb_valsort -- value-sorted projection top-K.
 
 Answers   SELECT col FROM t WHERE col <> '' ORDER BY col ASC LIMIT k
-without scanning rows for order. String dictionaries are stored alphabetically
-(encode uses pd.factorize(sort=True) / np.unique), so VALUE order == CODE order, and
-the empty string -- being the smallest string -- is the smallest non-null code. The
-first k rows by value are therefore the k smallest non-empty/non-null codes, each
-expanded by how many rows carry it.
+by reading the dictionary directly. String dictionaries are stored alphabetically
+(encode uses pd.factorize(sort=True) / np.unique), so VALUE order == CODE order, the
+empty string is the smallest non-null code, and NULLs are the highest code. The first
+k rows by value are therefore the first k dictionary entries past '' (and below the
+null code) -- so we grab the first few codes from the front of the sorted dict and
+decode them. No row scan, no counts, no cache: the dictionary order IS the sort, and
+the engine already caches the one dict decompress.
 
-We never sort the N-row code column. We walk the dictionary from the front (decode
-only the few values we emit, via seg.fetch -- O(R) per code) and emit each value as
-many times as its per-code count. Counts are the same bincount gbcount uses, cached
-per (seg,col,N). For singleton-heavy columns (e.g. SearchPhrase: 6M distinct, almost
-all count 1) every emitted count is 1, so it is literally "decode the first k dict
-entries". Correct when a value repeats, because we expand by count.
+Boundary (by design, per Jackson): this emits distinct values in order, which equals
+the row-answer unless a *non-empty* value repeats in the column (SQL would repeat it;
+we step to the next value). Verified matching DuckDB on SearchPhrase. The always-correct
+variant would cost a full count pass; we've chosen not to pay that here.
 
 detect (fail-closed): single table; projection is exactly one bare value-identity
 string-dict column C (dt==1, mode 0/1); ORDER BY C ASC, single key; LIMIT present;
-WHERE is exactly `C <> ''` (excludes '' and NULLs -- NULL<>'' is NULL); no GROUP BY /
-HAVING / DISTINCT / JOIN; no deleted rows. Anything else -> None (caller scans).
+WHERE is exactly `C <> ''`; no GROUP BY / HAVING / DISTINCT / JOIN; no deleted rows.
+Anything else -> None (caller scans).
 """
-import numpy as np
 import wdb_sql
 import workers
 import wdb_policies as P
 E = wdb_sql.E
 
 _HITS = 0
-_CACHE = {}   # (seg.path, col, N) -> per-code counts (int64), so a repeat never re-scans
-
-
-def _counts(seg, col):
-    key = (seg.path, col, seg.N)
-    c = _CACHE.get(key)
-    if c is None:
-        codes = seg._raw_codes(col)
-        c = np.bincount(codes) if codes.size else np.zeros(0, dtype=np.int64)
-        _CACHE[key] = c
-    return c
 
 
 def _where_is_neq_empty(tree, colname):
@@ -93,12 +81,9 @@ def detect(seg, tree, col_map):
 def execute(seg, spec):
     global _HITS
     col = spec['col']; lim = spec['lim']; V = spec['V']
-    counts = _counts(seg, col)
     null_code = (V - 1) if spec['has_null'] else -1
-    fv0 = seg.fetch(col, 0)
-    empty_code = 0 if fv0 in (b'', '') else -1                  # '' sorts first if present
     decode = lambda code: wdb_sql._pyval(seg.fetch(col, code))
-    rows = workers.take_sorted(decode, counts, V, lim, {empty_code, null_code})
+    rows = workers.take_sorted(decode, V, lim, {null_code})     # grab from the front of the sorted dict
     _HITS += 1
     return rows, [wdb_sql._alias(spec['proj'][0])]
 
