@@ -6,7 +6,8 @@
     rows, header = db.run("SELECT * FROM users WHERE id = 1")
 
 Borrowed SQL syntax + sqlglot parser; catalog, storage, and execution are WaveDB's.
-Step 3a: single segment per table.
+run() is the spine: parse -> commands.route (mutations) -> the read path
+(controller.route_single_segment for one clean segment, wdb_merge for many).
 """
 import sqlglot, sqlglot.expressions as E
 from wdb_catalog import Catalog

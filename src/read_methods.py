@@ -89,7 +89,7 @@ group_distinct = Read('group_distinct',
                       'one-pass code-hash distinct walk')
 
 group_mix = Read('group_mix',
-                 lambda c: wdb_groupmix._detect(c.seg, c.tree, c.cmap),
+                 lambda c: wdb_groupmix.detect(c.seg, c.tree, c.cmap),
                  lambda c, spec: wdb_groupmix.execute(c.seg, spec, c.tree,
                                                       db=c.db, table=c.name, segment_path=c.path),
                  'group + foldables + one distinct, one walk')

@@ -49,7 +49,7 @@ def _sidecar_counts(db, table, segment_path, kcol, tcol, gmax):
         return None
 
 
-def _detect(seg, tree, col_map):
+def detect(seg, tree, col_map):
     """Returns (kcol, tcol, ci, ki, folds, proj) or None. folds = list of (proj_index, kind, phys_col, dt);
     ci/ki index the COUNT(DISTINCT) and the bare key; kcol/tcol are col_map-resolved physical names."""
     # --- shared shape guards (wdb_policies) ---
@@ -176,7 +176,7 @@ def execute(seg, det, tree, db=None, table=None, segment_path=None):
 
 def try_groupmix(seg, tree, col_map, db=None, table=None, segment_path=None):
     """Detect + execute, kept as the backward-compatible single-call entry."""
-    det = _detect(seg, tree, col_map)
+    det = detect(seg, tree, col_map)
     if det is None:
         return None
     return execute(seg, det, tree, db=db, table=table, segment_path=segment_path)
