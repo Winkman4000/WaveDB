@@ -14,6 +14,7 @@ from wdb_engine import Segment
 import os
 import wdb_ddl, wdb_dml, wdb_sql, wdb_merge, wdb_compact, wdb_join, wdb_fkptr, wdb_bsi_exec, wdb_cube, wdb_gbcount, wdb_survgroup, wdb_compound, wdb_groupdistinct, wdb_gdsidecar, wdb_groupmix
 import read_methods, controller
+import commands
 import numpy as np
 import functools
 
@@ -99,18 +100,9 @@ class Database:
     def run(self, sql, escalate=None):
         esc = self.escalate if escalate is None else escalate
         tree = _parse_sql_cached(sql)
-        if isinstance(tree, E.Create):
-            return wdb_ddl.create_table(self.cat, sql)
-        if isinstance(tree, E.Alter):
-            return wdb_ddl.alter_table(self.cat, sql, self)
-        if isinstance(tree, E.Insert):
-            return wdb_dml.insert(self.cat, sql)
-        if isinstance(tree, E.Drop):
-            self.cat.drop_table(tree.this.this.name); return None
-        if isinstance(tree, E.Delete):
-            return wdb_dml.delete(self.cat, sql)
-        if isinstance(tree, E.Update):
-            return wdb_dml.update(self.cat, sql)
+        result = commands.route(self, sql, tree)
+        if result is not commands._NOT_A_COMMAND:
+            return result
         if isinstance(tree, E.Select):
             if tree.args.get('joins'):
                 _rw = wdb_join.denorm_rewrite(self, tree)        # join that groups by a denormalised parent
