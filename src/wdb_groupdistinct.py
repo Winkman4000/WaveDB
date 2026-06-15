@@ -143,11 +143,10 @@ def detect(seg, tree, col_map, _allow_group_filter=False):
     return kcol, tcol, ci, ki, proj
 
 
-def try_groupdistinct(seg, tree, col_map):
+def execute(seg, det, tree):
+    """THE READ: per-group COUNT(DISTINCT) via one code-hash walk. May decline (None) on
+    measured conditions (mismatched lengths, pack overflow)."""
     global _HITS
-    det = detect(seg, tree, col_map)
-    if det is None:
-        return None
     kcol, tcol, ci, ki, proj = det
 
     kinfo = _ids(seg, kcol)
@@ -198,3 +197,11 @@ def try_groupdistinct(seg, tree, col_map):
         rows = rows[:lim]
     _HITS += 1
     return rows, names
+
+
+def try_groupdistinct(seg, tree, col_map):
+    """Detect + execute, kept as the backward-compatible single-call entry."""
+    det = detect(seg, tree, col_map)
+    if det is None:
+        return None
+    return execute(seg, det, tree)

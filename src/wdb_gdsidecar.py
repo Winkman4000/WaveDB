@@ -199,14 +199,12 @@ def _excluded_from_group_filter(seg, tree, group_col, col_map, present):
 _SERVE_HITS = 0   # telemetry: queries answered from the materialized sidecar (not the walk)
 
 
-def try_serve(db, table, seg, segment_path, tree, col_map):
-    """Serve a group-distinct query from the materialized sidecar, or return None to fall through to
-    the live walk. Fires only when: (a) the query is the value-identity GROUP BY..COUNT(DISTINCT) shape
-    (shared `detect` with the walk), (b) the pair is registered materialized in the catalog, (c) the
-    sidecar file exists for this segment, and (d) the needed groups are fully covered. In v1 there is no
-    WHERE, so a query needs EVERY group -- any trim therefore falls through to the walk for exact parity
-    with the live operator. (Subset/filtered serving over the kept groups is v2.)"""
-    global _SERVE_HITS
+def detect(db, table, seg, segment_path, tree, col_map):
+    """ACTIVATION for the materialized group-distinct sidecar read. Shape (shared gd.detect) plus
+    materialization checks: the pair is registered, the sidecar exists on disk, no catalog trim, and
+    any WHERE translates to an exact group exclusion. Returns a spec (loaded sidecar + projection info
+    + excluded codes) or None. Loading the (cached) sidecar IS the materialization check, so it lives
+    here in activation. Fires only when the needed groups are fully covered (v1: every group)."""
     det = gd.detect(seg, tree, col_map, _allow_group_filter=True)
     if det is None:
         return None
@@ -222,9 +220,25 @@ def try_serve(db, table, seg, segment_path, tree, col_map):
     excluded = _excluded_from_group_filter(seg, tree, kcol, col_map, s['present'])
     if excluded is None:                                 # a WHERE we can't translate exactly -> walk
         return None
-    rows, names = rows_from_sidecar(s, seg, proj, tree, ci, ki, excluded_codes=excluded)
+    return {'s': s, 'proj': proj, 'ci': ci, 'ki': ki, 'excluded': excluded, 'tree': tree}
+
+
+def execute(seg, spec):
+    """THE READ: assemble the rows from the materialized sidecar (no decline path -- once detect
+    passes, the sidecar fully answers the query)."""
+    global _SERVE_HITS
+    rows, names = rows_from_sidecar(spec['s'], seg, spec['proj'], spec['tree'],
+                                    spec['ci'], spec['ki'], excluded_codes=spec['excluded'])
     _SERVE_HITS += 1
     return rows, names
+
+
+def try_serve(db, table, seg, segment_path, tree, col_map):
+    """Detect + execute, kept as the backward-compatible single-call entry."""
+    spec = detect(db, table, seg, segment_path, tree, col_map)
+    if spec is None:
+        return None
+    return execute(seg, spec)
 
 
 def codes_for_values(seg, group_col, values):

@@ -102,11 +102,11 @@ def _detect(seg, tree, col_map):
     return kcol, tcol, ci, key_index, folds, proj
 
 
-def try_groupmix(seg, tree, col_map, db=None, table=None, segment_path=None):
+def execute(seg, det, tree, db=None, table=None, segment_path=None):
+    """THE READ: group + foldable aggs + one distinct in a single pass. Prefers a materialized
+    sidecar for the distinct, else the code-hashing walk. May decline (None) on measured
+    conditions (missing ids, pack overflow)."""
     global _HITS
-    det = _detect(seg, tree, col_map)
-    if det is None:
-        return None
     kcol, tcol, ci, ki, folds, proj = det
 
     kinfo = gd._ids(seg, kcol)
@@ -174,3 +174,11 @@ def try_groupmix(seg, tree, col_map, db=None, table=None, segment_path=None):
         rows = rows[:lim]
     _HITS += 1
     return rows, names
+
+
+def try_groupmix(seg, tree, col_map, db=None, table=None, segment_path=None):
+    """Detect + execute, kept as the backward-compatible single-call entry."""
+    det = _detect(seg, tree, col_map)
+    if det is None:
+        return None
+    return execute(seg, det, tree, db=db, table=table, segment_path=segment_path)
