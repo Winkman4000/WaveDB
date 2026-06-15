@@ -26,13 +26,14 @@ def finalize(rows, proj, order, lim, having=None, seg_col=None):
     return rows
 
 
-def take_sorted(decode, ncodes, lim, skip):
+def take_sorted(decode, count_of, ncodes, lim, skip):
     """Pop a value-sorted dictionary from the front -- ascending code == ascending value,
-    since the dict is stored sorted -- skipping `skip` codes (e.g. the null code) and any
-    value that decodes to '' (the filtered-out empty string), emitting the first `lim`
-    values. decode(code) -> value, called only for the handful of codes inspected. The
-    read supplies the sorted structure; this pops it. No row scan, no counts: the dict
-    order IS the sort."""
+    since the dict is stored sorted -- skipping `skip` codes (the null code) and any value
+    that decodes to '' (the filtered-out empty string), emitting each value as many times
+    as count_of(code) until `lim` rows are filled. decode(code)->value and count_of(code)->n
+    are called only for the handful of codes inspected. A dup consumes its full count of the
+    limit budget (correct for any LIMIT); singletons return count 1. The read supplies the
+    sorted structure + counts; this pops it."""
     rows = []
     code = 0
     while code < ncodes and len(rows) < lim:
@@ -41,6 +42,7 @@ def take_sorted(decode, ncodes, lim, skip):
         v = decode(code)
         if v == '' or v is None:
             code += 1; continue
-        rows.append((v,))
+        n = count_of(code)
+        rows.extend([(v,)] * min(n, lim - len(rows)))
         code += 1
     return rows
