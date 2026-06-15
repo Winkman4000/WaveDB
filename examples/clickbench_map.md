@@ -1,4 +1,9 @@
 # WaveDB — ClickBench Coverage Map
+
+> **Canonical corpus:** the `Q#` ids here are **ClickBench Q#** in [`../docs/crosswalk.md`](../docs/crosswalk.md).
+> For the unified corpus across both datasets, see [`../docs/corpus.md`](../docs/corpus.md).
+> Kept here for its shape-class roadmap and correctness/precision notes.
+
 *The finite target. Drawn 2026-06-13 on pod yabbering_sapphire_nightingale, cb25db (100M rows, 25 cols), vs DuckDB 16-thread over hits.parquet.*
 
 ## Core truth

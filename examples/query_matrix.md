@@ -1,5 +1,11 @@
 # WaveDB query-type matrix
 
+> **Canonical corpus:** these are our TPC-H **matrix** queries — the `#` column maps to
+> **M#** in [`../docs/crosswalk.md`](../docs/crosswalk.md). For the unified, deduplicated
+> corpus across both datasets (matrix + ClickBench), see [`../docs/corpus.md`](../docs/corpus.md).
+> Kept here for its measured ms results and the honesty notes below.
+
+
 Every query shape the engine supports today, measured on **identical TPC-H sf=1 data**
 (lineitem 6,001,215 rows · orders 1,500,000 · customer 150,000), WaveDB vs DuckDB,
 same machine (Ryzen 7 7800X3D, 8C/16T). Best-of-5 ms. Every result checked row-for-row
