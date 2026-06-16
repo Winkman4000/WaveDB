@@ -13,8 +13,15 @@ sys.path.insert(0, SRC)
 import duckdb
 qs = [l.strip() for l in open(SQLF) if l.strip() and not l.strip().startswith('--')]
 con = duckdb.connect()
+# Oracle types EventDate/EventTime as DATE/TIMESTAMP (cb25db stores them as int
+# days/epoch-seconds; the canonical ClickBench SQL compares them to date literals).
+# Wrapping the parquet in a CTE named `hits` lets `FROM hits` resolve to the typed view.
+HITS_CTE = ("WITH hits AS (SELECT * REPLACE ("
+            "(DATE '1970-01-01' + EventDate) AS EventDate, "
+            "(TIMESTAMP '1970-01-01' + to_seconds(EventTime)) AS EventTime) "
+            f"FROM read_parquet('{PARQ}'))")
 def duck(q):
-    s = re.sub(r'\bFROM hits\b', f"FROM read_parquet('{PARQ}')", q)
+    s = HITS_CTE + ' ' + q
     t = time.perf_counter(); rows = con.execute(s).fetchall(); ms = (time.perf_counter()-t)*1000
     h = hashlib.md5()
     for r in sorted([tuple(round(v,3) if isinstance(v,float) else v for v in row) for row in rows], key=repr):
