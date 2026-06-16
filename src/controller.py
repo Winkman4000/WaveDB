@@ -62,10 +62,16 @@ def route_single_segment(ctx):
             if rows is not None:
                 return rows
     else:
-        # non-agg projection: the value-sorted dict read, else the scan
+        # non-agg projection: the value-sorted dict read, then the cluster-ordered
+        # top-K read, else the scan
         spec = R.sorted_proj.detect(ctx)
         if spec is not None:
             rows = R.sorted_proj.execute(ctx, spec)
+            if rows is not None:
+                return rows
+        spec = R.cluster_topk.detect(ctx)
+        if spec is not None:
+            rows = R.cluster_topk.execute(ctx, spec)
             if rows is not None:
                 return rows
     return R.general_scan(ctx)

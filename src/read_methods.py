@@ -23,6 +23,7 @@ import wdb_gdsidecar
 import wdb_groupdistinct
 import wdb_groupmix
 import wdb_valsort
+import wdb_clustertopk
 import wdb_bsi_exec
 import wdb_join
 import wdb_sql
@@ -101,6 +102,11 @@ sorted_proj = Read('sorted_proj',
                    lambda c: wdb_valsort.detect(c.seg, c.tree, c.cmap),
                    lambda c, spec: wdb_valsort.execute(c.seg, spec),
                    'value-sorted dict projection top-K')
+
+cluster_topk = Read('cluster_topk',
+                    lambda c: wdb_clustertopk.detect(c.seg, c.tree, c.cmap),
+                    lambda c, spec: wdb_clustertopk.execute(c.seg, spec),
+                    'cluster-ordered projection top-K')
 
 # --- clustered-structure slices (detect = the cheap slice/group-slice guard) --------
 
