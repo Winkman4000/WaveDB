@@ -26,7 +26,7 @@ NUM_THRESHOLD = 50000   # delta-code numeric dictionaries above this cardinality
 R = 128
 ZSTD_LEVEL = 9
 CODE_ZSTD_LEVEL = 19    # code-stream compression: clustered/skewed code arrays compress hugely
-CHUNK_DICT = bool(int(os.environ.get('WDB_CHUNK_DICT', '0')))   # block-segment front-coded dicts
+CHUNK_DICT = bool(int(os.environ.get('WDB_CHUNK_DICT', '1')))   # block-segment front-coded dicts (default on; WDB_CHUNK_DICT=0 to opt out)
 CHUNK_DICT_VALS = 16384                                          # values per independent zstd frame (mult of R)
 _INLINE_ENABLED = True  # mode-5 inline strings (toggleable for ablation/debug)
 

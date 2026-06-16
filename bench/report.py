@@ -19,10 +19,11 @@ sys.path.insert(0, HERE); sys.path.insert(0, SRC)
 import duckdb
 import query_matrix as M
 import wdb_bsi_exec as BX
+import wdb_measure_runtime as RT
 from catalog import QUERIES
 
 DIR = '/tmp/jbprof_sf1.0'; WDB = os.path.join(DIR, 'wdb'); MB = 1024 * 1024
-BSIBUDGET = BX.BSI_RAM_BUDGET
+BSIBUDGET = RT.BSI_RAM_BUDGET
 
 
 def _need_db():
