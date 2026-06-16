@@ -645,10 +645,14 @@ def _eval_pred(seg, node, seg_col):
         lits=node.args.get('expressions') or []
         vals=[]
         for L in lits:
+            neg = isinstance(L, E.Neg) and isinstance(L.this, E.Literal)   # IN (-1, 6): -1 parses as Neg(Literal)
+            if neg: L = L.this
             if not isinstance(L,E.Literal): raise NotImplementedError("IN with non-literal / subquery")
             if seg.cols[seg_col(col)]['dt']==3: vals.append(_parse_temporal(L.this, seg.unit(seg_col(col))))
             elif L.is_string: vals.append(L.this.encode() if a.dtype.kind not in 'iuf' else L.this)
-            else: vals.append(int(L.this) if a.dtype.kind in 'iu' else (float(L.this) if a.dtype.kind=='f' else str(L.this).encode()))
+            else:
+                v = int(L.this) if a.dtype.kind in 'iu' else (float(L.this) if a.dtype.kind=='f' else str(L.this).encode())
+                vals.append(-v if (neg and a.dtype.kind in 'iuf') else v)
         if a.dtype.kind in 'iuf':
             m=np.isin(a, np.array(vals, dtype=a.dtype))
         else:
