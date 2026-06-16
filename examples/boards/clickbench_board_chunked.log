@@ -1,0 +1,48 @@
+idx | cold_ms warm_ms | duck_ms | ratio(warm) | ok
+Q00 | 495 2.7 | 34.3 | 12.88x | True
+Q01 | 735 60.6 | 72.9 | 1.20x | True
+Q02 | 1656 465.8 | 101.6 | 0.22x | False
+Q03 | 1539 55.7 | 119.2 | 2.14x | False
+Q04 | 157 2.1 | 422.6 | 199.75x | True
+Q05 | 165 2.2 | 585.8 | 268.70x | True
+Q06 | 388 45.5 | 103.8 | 2.28x | False
+Q07 | 1467 71.5 | 79.2 | 1.11x | True
+Q08 | 167 1.9 | 422.3 | 217.64x | True
+Q09 | 2682 1008.4 | 543.8 | 0.54x | True
+Q10 | 164 1.5 | 158.6 | 103.35x | True
+Q11 | 5223 3721.7 | 208.9 | 0.06x | True
+Q12 | 10292 6685.4 | 557.4 | 0.08x | True
+Q13 | 3155 792.6 | 702.3 | 0.89x | True
+Q14 | 8884 4271.4 | 504.4 | 0.12x | True
+Q15 | 461 1.8 | 369.5 | 208.42x | True
+Q16 | 8736 5424.7 | 1075.1 | 0.20x | True
+Q17 | 20854 17074.3 | 853.4 | 0.05x | False
+Q18 | ---- ---- | ---- | - | ?  <NotImplementedError: unknown column: 'm'
+Q19 | 2169 1262.7 | 76.8 | 0.06x | True
+Q20 | ---- ---- | 990.9 | - | ?  <TIMEOUT>45s
+Q21 | ---- ---- | 924.9 | - | ?  <TIMEOUT>45s
+Q22 | ---- ---- | 1748.4 | - | ?  <TIMEOUT>45s
+Q23 | ---- ---- | 1112.6 | - | ?  <TIMEOUT>45s
+Q24 | ---- ---- | 301.9 | - | ?  <NotImplementedError: ORDER BY non-projected expr
+Q25 | 198 3.3 | 325.0 | 98.31x | True
+Q26 | ---- ---- | 220.2 | - | ?  <NotImplementedError: ORDER BY non-projected expr
+Q27 | ---- ---- | 1050.9 | - | ?  <TIMEOUT>45s
+Q28 | ---- ---- | 8276.3 | - | ?  <NotImplementedError: unknown column: 'k'
+Q29 | ---- ---- | 93.8 | - | ?  <noout:?
+Q30 | 18090 11612.7 | 907.9 | 0.08x | False
+Q31 | ---- ---- | 821.8 | - | ?  <TIMEOUT>45s
+Q32 | ---- ---- | 1510.2 | - | ?  <TIMEOUT>45s
+Q33 | 8461 2.0 | 2111.8 | 1066.07x | True
+Q34 | ---- ---- | 1727.3 | - | ?  <AttributeError: 'Literal' object has no attribute 'table'
+Q35 | ---- ---- | 502.5 | - | ?  <AttributeError: 'Sub' object has no attribute 'table'
+Q36 | 10145 72.1 | ---- | - | ?
+Q37 | 6107 60.4 | ---- | - | ?
+Q38 | 9378 42.9 | ---- | - | ?
+Q39 | ---- ---- | ---- | - | ?  <UFuncTypeError: ufunc 'greater_equal' did not contain a loop with signature matching types (<class 'numpy.
+Q40 | 3803 21.9 | ---- | - | ?
+Q41 | 3527 33.7 | ---- | - | ?
+Q42 | ---- ---- | ---- | - | ?  <AttributeError: 'TimestampTrunc' object has no attribute 'table'
+
+SUMMARY cb25db: ok=17/43 faster=10 median_ratio_ok=1.20x
+WROTE /workspace/cb_board_chunked.json
+DONE
