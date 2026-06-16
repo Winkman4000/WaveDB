@@ -1,0 +1,432 @@
+[
+{
+"idx": 0,
+"cold_ms": 543.7207892537117,
+"warm_ms": 3.017313778400421,
+"nrows": 1,
+"err": null,
+"duck_ms": 59.678561985492706,
+"ratio": 19.778705951202166,
+"ok": true
+},
+{
+"idx": 1,
+"cold_ms": 739.0353567898273,
+"warm_ms": 63.408371061086655,
+"nrows": 1,
+"err": null,
+"duck_ms": 91.51674807071686,
+"ratio": 1.4432912648481542,
+"ok": true
+},
+{
+"idx": 2,
+"cold_ms": 1437.082327902317,
+"warm_ms": 638.0465179681778,
+"nrows": 1,
+"err": null,
+"duck_ms": 157.03442692756653,
+"ratio": 0.24611752043978483,
+"ok": false
+},
+{
+"idx": 3,
+"cold_ms": 2337.4487347900867,
+"warm_ms": 72.64498248696327,
+"nrows": 1,
+"err": null,
+"duck_ms": 312.7042129635811,
+"ratio": 4.304553490940663,
+"ok": false
+},
+{
+"idx": 4,
+"cold_ms": 151.99323743581772,
+"warm_ms": 1.9196942448616028,
+"nrows": 1,
+"err": null,
+"duck_ms": 400.5458205938339,
+"ratio": 208.65084201089044,
+"ok": true
+},
+{
+"idx": 5,
+"cold_ms": 154.4378325343132,
+"warm_ms": 2.2663846611976624,
+"nrows": 1,
+"err": null,
+"duck_ms": 653.4530967473984,
+"ratio": 288.3240025115964,
+"ok": true
+},
+{
+"idx": 6,
+"cold_ms": 1182.9979233443737,
+"warm_ms": 23.683741688728333,
+"nrows": 1,
+"err": null,
+"duck_ms": 186.35614961385727,
+"ratio": 7.868526521826941,
+"ok": false
+},
+{
+"idx": 7,
+"cold_ms": 1477.369263768196,
+"warm_ms": 78.11925932765007,
+"nrows": 18,
+"err": null,
+"duck_ms": 131.26889616250992,
+"ratio": 1.6803653451441225,
+"ok": true
+},
+{
+"idx": 8,
+"cold_ms": 153.55922654271126,
+"warm_ms": 1.8577240407466888,
+"nrows": 10,
+"err": null,
+"duck_ms": 437.7119466662407,
+"ratio": 235.61731294078956,
+"ok": true
+},
+{
+"idx": 9,
+"cold_ms": 2122.1289932727814,
+"warm_ms": 956.3392773270607,
+"nrows": 10,
+"err": null,
+"duck_ms": 530.7646133005619,
+"ratio": 0.5549961461208964,
+"ok": true
+},
+{
+"idx": 10,
+"cold_ms": 150.77802538871765,
+"warm_ms": 1.6462504863739014,
+"nrows": 10,
+"err": null,
+"duck_ms": 174.95384812355042,
+"ratio": 106.27413602708232,
+"ok": true
+},
+{
+"idx": 11,
+"cold_ms": 6290.729183703661,
+"warm_ms": 4105.037979781628,
+"nrows": 10,
+"err": null,
+"duck_ms": 246.35809659957886,
+"ratio": 0.0600135973925104,
+"ok": true
+},
+{
+"idx": 12,
+"cold_ms": 12096.09118103981,
+"warm_ms": 7416.486397385597,
+"nrows": 10,
+"err": null,
+"duck_ms": 552.5684803724289,
+"ratio": 0.07450542625780532,
+"ok": true
+},
+{
+"idx": 13,
+"cold_ms": 4333.350524306297,
+"warm_ms": 801.2841194868088,
+"nrows": 10,
+"err": null,
+"duck_ms": 710.5009481310844,
+"ratio": 0.8867028945814284,
+"ok": true
+},
+{
+"idx": 14,
+"cold_ms": 9057.457126677036,
+"warm_ms": 4521.5361751616,
+"nrows": 10,
+"err": null,
+"duck_ms": 535.2624766528606,
+"ratio": 0.11838066885171615,
+"ok": true
+},
+{
+"idx": 15,
+"cold_ms": 660.7751436531544,
+"warm_ms": 1.1931098997592926,
+"nrows": 10,
+"err": null,
+"duck_ms": 368.70404332876205,
+"ratio": 309.02772946829737,
+"ok": true
+},
+{
+"idx": 16,
+"cold_ms": 11344.017870724201,
+"warm_ms": 6952.696342021227,
+"nrows": 10,
+"err": null,
+"duck_ms": 1020.9470093250275,
+"ratio": 0.14684188106340146,
+"ok": true
+},
+{
+"idx": 17,
+"cold_ms": null,
+"warm_ms": null,
+"nrows": null,
+"err": "TIMEOUT>45s",
+"duck_ms": 797.8423088788986,
+"ratio": null,
+"ok": "?"
+},
+{
+"idx": 18,
+"cold_ms": null,
+"warm_ms": null,
+"nrows": null,
+"err": "NotImplementedError: unknown column: 'm'",
+"duck_ms": 1865.350142121315,
+"ratio": null,
+"ok": "?"
+},
+{
+"idx": 19,
+"cold_ms": 3012.6783400774,
+"warm_ms": 1741.8137565255165,
+"nrows": 4,
+"err": null,
+"duck_ms": 101.7848290503025,
+"ratio": 0.058436115037544444,
+"ok": true
+},
+{
+"idx": 20,
+"cold_ms": null,
+"warm_ms": null,
+"nrows": null,
+"err": "TIMEOUT>45s",
+"duck_ms": 1643.8869424164295,
+"ratio": null,
+"ok": "?"
+},
+{
+"idx": 21,
+"cold_ms": null,
+"warm_ms": null,
+"nrows": null,
+"err": "TIMEOUT>45s",
+"duck_ms": 991.9090569019318,
+"ratio": null,
+"ok": "?"
+},
+{
+"idx": 22,
+"cold_ms": null,
+"warm_ms": null,
+"nrows": null,
+"err": "TIMEOUT>45s",
+"duck_ms": 2070.493385195732,
+"ratio": null,
+"ok": "?"
+},
+{
+"idx": 23,
+"cold_ms": null,
+"warm_ms": null,
+"nrows": null,
+"err": "TIMEOUT>45s",
+"duck_ms": 1880.6595392525196,
+"ratio": null,
+"ok": "?"
+},
+{
+"idx": 24,
+"cold_ms": 888.7421861290932,
+"warm_ms": 1.9913986325263977,
+"nrows": 10,
+"err": null,
+"duck_ms": 499.38468262553215,
+"ratio": 250.77082733153497,
+"ok": true
+},
+{
+"idx": 25,
+"cold_ms": 555.8544285595417,
+"warm_ms": 3.639858216047287,
+"nrows": 10,
+"err": null,
+"duck_ms": 390.31800627708435,
+"ratio": 107.23439845988044,
+"ok": true
+},
+{
+"idx": 26,
+"cold_ms": 890.7232098281384,
+"warm_ms": 18.950391560792923,
+"nrows": 10,
+"err": null,
+"duck_ms": 425.53094774484634,
+"ratio": 22.454994999957734,
+"ok": true
+},
+{
+"idx": 27,
+"cold_ms": null,
+"warm_ms": null,
+"nrows": null,
+"err": "NotImplementedError: unknown column: None",
+"duck_ms": 1085.1904265582561,
+"ratio": null,
+"ok": "?"
+},
+{
+"idx": 28,
+"cold_ms": null,
+"warm_ms": null,
+"nrows": null,
+"err": "NotImplementedError: unknown column: 'k'",
+"duck_ms": 8231.242001056671,
+"ratio": null,
+"ok": "?"
+},
+{
+"idx": 29,
+"cold_ms": 15240.213725715876,
+"warm_ms": 367.74174124002457,
+"nrows": 1,
+"err": null,
+"duck_ms": 126.51731446385384,
+"ratio": 0.34403849298488026,
+"ok": false
+},
+{
+"idx": 30,
+"cold_ms": null,
+"warm_ms": null,
+"nrows": null,
+"err": "TIMEOUT>45s",
+"duck_ms": 570.449385792017,
+"ratio": null,
+"ok": "?"
+},
+{
+"idx": 31,
+"cold_ms": null,
+"warm_ms": null,
+"nrows": null,
+"err": "TIMEOUT>45s",
+"duck_ms": 28902.402590960264,
+"ratio": null,
+"ok": "?"
+},
+{
+"idx": 32,
+"cold_ms": null,
+"warm_ms": null,
+"nrows": null,
+"err": "TIMEOUT>45s",
+"duck_ms": 1475.5833111703396,
+"ratio": null,
+"ok": "?"
+},
+{
+"idx": 33,
+"cold_ms": 11186.957206577063,
+"warm_ms": 1.3066940009593964,
+"nrows": 10,
+"err": null,
+"duck_ms": 1709.9895291030407,
+"ratio": 1308.6380804132705,
+"ok": true
+},
+{
+"idx": 34,
+"cold_ms": null,
+"warm_ms": null,
+"nrows": null,
+"err": "AttributeError: 'Literal' object has no attribute 'table'",
+"duck_ms": 1747.84729257226,
+"ratio": null,
+"ok": "?"
+},
+{
+"idx": 35,
+"cold_ms": null,
+"warm_ms": null,
+"nrows": null,
+"err": "AttributeError: 'Sub' object has no attribute 'table'",
+"duck_ms": 494.94338780641556,
+"ratio": null,
+"ok": "?"
+},
+{
+"idx": 36,
+"cold_ms": 22027.99640595913,
+"warm_ms": 8902.747862040997,
+"nrows": 10,
+"err": null,
+"duck_ms": 174.28303137421608,
+"ratio": 0.01957631891579381,
+"ok": true
+},
+{
+"idx": 37,
+"cold_ms": 14962.940286844969,
+"warm_ms": 7503.897938877344,
+"nrows": 10,
+"err": null,
+"duck_ms": 264.10774141550064,
+"ratio": 0.03519607323644033,
+"ok": true
+},
+{
+"idx": 38,
+"cold_ms": 5309.968318790197,
+"warm_ms": 1005.3322575986385,
+"nrows": 10,
+"err": null,
+"duck_ms": 165.85004329681396,
+"ratio": 0.1649703787412208,
+"ok": false
+},
+{
+"idx": 39,
+"cold_ms": null,
+"warm_ms": null,
+"nrows": null,
+"err": "NotImplementedError: unknown column: 'Src'",
+"duck_ms": 433.8526017963886,
+"ratio": null,
+"ok": "?"
+},
+{
+"idx": 40,
+"cold_ms": 5640.184435993433,
+"warm_ms": 2373.6273422837257,
+"nrows": 10,
+"err": null,
+"duck_ms": 87.8898836672306,
+"ratio": 0.037027667360230845,
+"ok": false
+},
+{
+"idx": 41,
+"cold_ms": 5305.478781461716,
+"warm_ms": 1764.0160471200943,
+"nrows": 10,
+"err": null,
+"duck_ms": 108.03110525012016,
+"ratio": 0.06124156604271832,
+"ok": false
+},
+{
+"idx": 42,
+"cold_ms": null,
+"warm_ms": null,
+"nrows": null,
+"err": "NotImplementedError: unknown column: None",
+"duck_ms": 141.4417177438736,
+"ratio": null,
+"ok": "?"
+}
+]

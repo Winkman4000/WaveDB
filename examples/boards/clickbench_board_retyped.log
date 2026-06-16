@@ -1,0 +1,46 @@
+idx | cold_ms warm_ms | duck_ms | ratio(warm) | ok
+Q00 | 544 3.0 | 59.7 | 19.78x | True
+Q01 | 739 63.4 | 91.5 | 1.44x | True
+Q02 | 1437 638.0 | 157.0 | 0.25x | False
+Q03 | 2337 72.6 | 312.7 | 4.30x | False
+Q04 | 152 1.9 | 400.5 | 208.65x | True
+Q05 | 154 2.3 | 653.5 | 288.32x | True
+Q06 | 1183 23.7 | 186.4 | 7.87x | False
+Q07 | 1477 78.1 | 131.3 | 1.68x | True
+Q08 | 154 1.9 | 437.7 | 235.62x | True
+Q09 | 2122 956.3 | 530.8 | 0.55x | True
+Q10 | 151 1.6 | 175.0 | 106.27x | True
+Q11 | 6291 4105.0 | 246.4 | 0.06x | True
+Q12 | 12096 7416.5 | 552.6 | 0.07x | True
+Q13 | 4333 801.3 | 710.5 | 0.89x | True
+Q14 | 9057 4521.5 | 535.3 | 0.12x | True
+Q15 | 661 1.2 | 368.7 | 309.03x | True
+Q16 | 11344 6952.7 | 1020.9 | 0.15x | True
+Q17 | ---- ---- | 797.8 | - | ?  <TIMEOUT>45s
+Q18 | ---- ---- | 1865.4 | - | ?  <NotImplementedError: unknown column: 'm'
+Q19 | 3013 1741.8 | 101.8 | 0.06x | True
+Q20 | ---- ---- | 1643.9 | - | ?  <TIMEOUT>45s
+Q21 | ---- ---- | 991.9 | - | ?  <TIMEOUT>45s
+Q22 | ---- ---- | 2070.5 | - | ?  <TIMEOUT>45s
+Q23 | ---- ---- | 1880.7 | - | ?  <TIMEOUT>45s
+Q24 | 889 2.0 | 499.4 | 250.77x | True
+Q25 | 556 3.6 | 390.3 | 107.23x | True
+Q26 | 891 19.0 | 425.5 | 22.45x | True
+Q27 | ---- ---- | 1085.2 | - | ?  <NotImplementedError: unknown column: None
+Q28 | ---- ---- | 8231.2 | - | ?  <NotImplementedError: unknown column: 'k'
+Q29 | 15240 367.7 | 126.5 | 0.34x | False
+Q30 | ---- ---- | 570.4 | - | ?  <TIMEOUT>45s
+Q31 | ---- ---- | 28902.4 | - | ?  <TIMEOUT>45s
+Q32 | ---- ---- | 1475.6 | - | ?  <TIMEOUT>45s
+Q33 | 11187 1.3 | 1710.0 | 1308.64x | True
+Q34 | ---- ---- | 1747.8 | - | ?  <AttributeError: 'Literal' object has no attribute 'table'
+Q35 | ---- ---- | 494.9 | - | ?  <AttributeError: 'Sub' object has no attribute 'table'
+Q36 | 22028 8902.7 | 174.3 | 0.02x | True
+Q37 | 14963 7503.9 | 264.1 | 0.04x | True
+Q38 | 5310 1005.3 | 165.9 | 0.16x | False
+Q39 | ---- ---- | 433.9 | - | ?  <NotImplementedError: unknown column: 'Src'
+Q40 | 5640 2373.6 | 87.9 | 0.04x | False
+Q41 | 5305 1764.0 | 108.0 | 0.06x | False
+Q42 | ---- ---- | 141.4 | - | ?  <NotImplementedError: unknown column: None
+
+SUMMARY ok=21/43 faster=12 median_ratio_ok=1.68x
