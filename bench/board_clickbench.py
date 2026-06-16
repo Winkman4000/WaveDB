@@ -26,7 +26,7 @@ for i, q in enumerate(qs):
     try: dh, dn, dms = duck(q)
     except Exception: dh, dn, dms = None, None, None
     try:
-        p = subprocess.run(['python3', WORKER, SRC, DBDIR, q], capture_output=True, text=True, timeout=T, env=env)
+        p = subprocess.run([sys.executable, WORKER, SRC, DBDIR, q], capture_output=True, text=True, timeout=T, env=env)
         ln = [l for l in p.stdout.strip().splitlines() if l.startswith('{')]
         w = json.loads(ln[-1]) if ln else {'err': 'noout:' + (p.stderr.strip()[-90:] or '?')}
     except subprocess.TimeoutExpired:
