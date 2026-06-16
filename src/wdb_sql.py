@@ -186,8 +186,11 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
             # row projection (SELECT cols ... [WHERE] [ORDER BY] [LIMIT]) -> return rows
             cols = [seg_col(_colname(p if not isinstance(p,E.Alias) else p.this)) for p in proj]
             idx = np.nonzero(mask)[0] if mask is not None else np.arange(N)
-            order = tree.args.get('order'); lim = _limit(tree); distinct = tree.args.get('distinct') is not None
-            if order is None and lim is not None and not distinct: idx = idx[:lim]   # no order/distinct: limit early
+            order = tree.args.get('order'); lim = _limit(tree); off = _offset(tree)
+            distinct = tree.args.get('distinct') is not None
+            early = order is None and not distinct      # window in scan order before materializing
+            if early and (lim is not None or off):
+                idx = idx[off: off + lim] if lim is not None else idx[off:]
             out = []
             colvals = {c: seg.values(c) for c in cols}
             for i in idx: out.append(tuple(_pyval(colvals[c][i]) for c in cols))
@@ -196,8 +199,9 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
                 for r in out:
                     if r not in seen: seen.add(r); ded.append(r)
                 out = ded
-            if order is not None: out = _apply_order(out, proj, order)   # ORDER BY: sort, then LIMIT
-            if lim is not None: out = out[:lim]
+            if order is not None: out = _apply_order(out, proj, order)   # ORDER BY: sort, then LIMIT/OFFSET
+            if not early and (lim is not None or off):
+                out = out[off: off + lim] if lim is not None else out[off:]
             return out, [_alias(p) for p in proj]
 
     # ---- GROUP BY path ----
@@ -312,9 +316,10 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
     # ---- ORDER BY ----
     rows = _apply_order(rows, proj, tree.args.get('order'))
 
-    # ---- LIMIT ----
-    lim = _limit(tree)
-    if lim is not None: rows = rows[:lim]
+    # ---- LIMIT / OFFSET ----
+    lim = _limit(tree); off = _offset(tree)
+    if lim is not None or off:
+        rows = rows[off: off + lim] if lim is not None else rows[off:]
     return rows, [_alias(p) for p in proj]
 
 # ---------- helpers ----------
@@ -348,6 +353,12 @@ def _limit(tree):
     lim = tree.args.get('limit')
     if lim is None: return None
     return int(lim.expression.this) if hasattr(lim.expression,'this') else int(lim.text('expression'))
+def _offset(tree):
+    """OFFSET row count (0 when absent). LIMIT n OFFSET k returns rows [k : k+n]."""
+    o = tree.args.get('offset')
+    if o is None: return 0
+    try: return int(o.expression.this)
+    except Exception: return 0
 def _col(seg, name):
     """Typed array + null mask. arr is int64/float64/object(bytes); nulls filled with a
     sentinel and flagged in nmask (or None if the column has no nulls). Override values are

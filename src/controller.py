@@ -53,6 +53,11 @@ _READ_ORDER = (
 def route_single_segment(ctx):
     """Route a request over a single clean segment to its read, else the general scan.
     Byte-identical to the previous wdb_db try-chain."""
+    # OFFSET: the fast structure reads pre-truncate to LIMIT (so they drop the offset
+    # window). Any query with OFFSET goes straight to the general scan, which
+    # materializes the full ordered result and applies LIMIT/OFFSET together.
+    if wdb_sql._offset(ctx.tree):
+        return R.general_scan(ctx)
     if _agg_or_group(ctx.tree):
         for read in _READ_ORDER:
             spec = read.detect(ctx)

@@ -130,7 +130,7 @@ def merge_query(segs, hot_parquet, sql, col_map=None):
         rows = []
         # strip ORDER/LIMIT for per-tier; apply post-merge
         base = copy.deepcopy(tree)
-        base.set('order', None); base.set('limit', None)
+        base.set('order', None); base.set('limit', None); base.set('offset', None)
         bsql = base.sql(dialect='duckdb')
         for seg in segs:
             r, _ = wdb_sql.execute(seg, bsql, col_map=col_map); rows += list(r)
@@ -144,8 +144,9 @@ def merge_query(segs, hot_parquet, sql, col_map=None):
                 if r not in seen: seen.add(r); ded.append(r)
             rows = ded
         rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))
-        lim = wdb_sql._limit(tree)
-        if lim is not None: rows = rows[:lim]
+        lim = wdb_sql._limit(tree); off = wdb_sql._offset(tree)
+        if lim is not None or off:
+            rows = rows[off: off + lim] if lim is not None else rows[off:]
         return rows, [wdb_sql._alias(p) for p in proj]
 
     # ---- aggregates / GROUP BY: partial merge ----
@@ -220,8 +221,9 @@ def merge_query(segs, hot_parquet, sql, col_map=None):
     if having is not None:
         out = wdb_sql._apply_having(out, proj, having.this, lambda x: x)
     out = wdb_sql._apply_order(out, proj, tree.args.get('order'))
-    lim = wdb_sql._limit(tree)
-    if lim is not None: out = out[:lim]
+    lim = wdb_sql._limit(tree); off = wdb_sql._offset(tree)
+    if lim is not None or off:
+        out = out[off: off + lim] if lim is not None else out[off:]
     return out, [wdb_sql._alias(p) for p in proj]
 
 def _duck_from(base_tree, parquet):
