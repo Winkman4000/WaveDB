@@ -15,6 +15,7 @@ Segment format "WVDB3":
   then: packed codes (n_rows * bits, MSB-first)
 """
 import numpy as np, numpy.ma as ma, pandas as pd, zstandard as zstd, struct, time, sys
+import os
 import wdb_read
 
 _DT_UNITS = ['us','ns','ms','s','D','h','m','M','Y','W']   # code = index; aux byte stores it
@@ -25,6 +26,8 @@ NUM_THRESHOLD = 50000   # delta-code numeric dictionaries above this cardinality
 R = 128
 ZSTD_LEVEL = 9
 CODE_ZSTD_LEVEL = 19    # code-stream compression: clustered/skewed code arrays compress hugely
+CHUNK_DICT = bool(int(os.environ.get('WDB_CHUNK_DICT', '0')))   # block-segment front-coded dicts
+CHUNK_DICT_VALS = 16384                                          # values per independent zstd frame (mult of R)
 _INLINE_ENABLED = True  # mode-5 inline strings (toggleable for ablation/debug)
 
 def _encode_column(col):
@@ -121,6 +124,8 @@ def _prep_column(nm, col, allow_seq=True):
         mode = 2
     else:
         mode = 0
+    if mode == 1 and CHUNK_DICT:
+        aux |= 0x40                                     # bit6 = write the dict as chunked zstd frames
     return dict(nm=nm, dtype=dtype, has_null=has_null, V=V, valb=valb,
                 codes=codes.astype(np.uint64), aux=aux, uniq=uniq, bits=bits, mode=mode)
 
@@ -151,9 +156,24 @@ def _dict_bytes(p, zc):
             cp = 0; m = min(len(prev), len(sv))
             while cp < m and prev[cp] == sv[cp]: cp += 1
             suf = sv[cp:]; fc += struct.pack('<HH', cp, len(suf)) + suf; prev = sv
-        z = zc.compress(bytes(fc))
-        out += struct.pack('<H', R) + struct.pack('<I', len(restarts)) + np.array(restarts, dtype=np.uint32).tobytes()
-        out += struct.pack('<I', len(fc)) + struct.pack('<I', len(z)) + z
+        fc = bytes(fc); rst = np.array(restarts, dtype=np.uint32); nb = len(rst)
+        if p['aux'] & 0x40:                       # chunked: one independent zstd frame per CHUNK_DICT_VALS
+            V = len(p['valb']); CH = CHUNK_DICT_VALS; BPC = CH // R
+            n_chunks = (V + CH - 1) // CH
+            ustart = []; czl = []; frames = []
+            for j in range(n_chunks):
+                b0 = int(rst[j*BPC])
+                b1 = int(rst[(j+1)*BPC]) if (j+1)*BPC < nb else len(fc)
+                fr = zc.compress(fc[b0:b1]); frames.append(fr); ustart.append(b0); czl.append(len(fr))
+            out += struct.pack('<H', R) + struct.pack('<I', CH) + struct.pack('<I', n_chunks)
+            out += struct.pack('<I', nb) + rst.tobytes() + struct.pack('<I', len(fc))
+            out += np.array(ustart, dtype=np.uint32).tobytes()
+            out += np.array(czl, dtype=np.uint32).tobytes()
+            for fr in frames: out += fr
+        else:
+            z = zc.compress(fc)
+            out += struct.pack('<H', R) + struct.pack('<I', nb) + rst.tobytes()
+            out += struct.pack('<I', len(fc)) + struct.pack('<I', len(z)) + z
     return out
 
 def _code_section(codes, bits):

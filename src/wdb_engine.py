@@ -24,8 +24,9 @@ class Segment:
             V = struct.unpack_from('<I',buf,off)[0]; off += 4
             bits = int(buf[off]); off += 1; dt = int(buf[off]); off += 1; mode = int(buf[off]); off += 1
             has_null = int(buf[off]); off += 1; aux = int(buf[off]); off += 1
+            chunked = bool(aux & 0x40); aux &= 0x3F            # bit6 = front-coded chunked dict
             n_dict = V - has_null
-            meta = dict(V=V, bits=bits, dt=dt, mode=mode, has_null=has_null, n_dict=n_dict, aux=aux)
+            meta = dict(V=V, bits=bits, dt=dt, mode=mode, has_null=has_null, n_dict=n_dict, aux=aux, chunked=chunked)
             if mode == 0:
                 vals = []
                 for _ in range(n_dict):
@@ -72,12 +73,29 @@ class Segment:
                 continue
             else:
                 Rr = struct.unpack_from('<H',buf,off)[0]; off += 2
-                nr = struct.unpack_from('<I',buf,off)[0]; off += 4
-                meta['restarts'] = buf[off:off+nr*4].view(np.uint32); off += nr*4
-                fclen = struct.unpack_from('<I',buf,off)[0]; off += 4
-                zlen = struct.unpack_from('<I',buf,off)[0]; off += 4
-                meta['R'] = Rr; meta['z'] = buf[off:off+zlen]; off += zlen
-                meta['vals'] = None; meta['raw'] = None  # decoded lazily
+                meta['R'] = Rr
+                if meta['chunked']:
+                    CH = struct.unpack_from('<I',buf,off)[0]; off += 4
+                    nch = struct.unpack_from('<I',buf,off)[0]; off += 4
+                    nr = struct.unpack_from('<I',buf,off)[0]; off += 4
+                    meta['restarts'] = buf[off:off+nr*4].view(np.uint32); off += nr*4
+                    fclen = struct.unpack_from('<I',buf,off)[0]; off += 4
+                    meta['CHUNK'] = CH
+                    meta['chunk_ustart'] = buf[off:off+nch*4].view(np.uint32); off += nch*4
+                    czlen = buf[off:off+nch*4].view(np.uint32); off += nch*4
+                    meta['chunk_czlen'] = czlen
+                    foff = np.empty(nch+1, dtype=np.int64); foff[0] = 0
+                    np.cumsum(czlen.astype(np.int64), out=foff[1:])
+                    meta['chunk_foff'] = foff; meta['chunk_base'] = off
+                    off += int(foff[-1])
+                    meta['chunks'] = {}; meta['vals'] = None
+                else:
+                    nr = struct.unpack_from('<I',buf,off)[0]; off += 4
+                    meta['restarts'] = buf[off:off+nr*4].view(np.uint32); off += nr*4
+                    fclen = struct.unpack_from('<I',buf,off)[0]; off += 4
+                    zlen = struct.unpack_from('<I',buf,off)[0]; off += 4
+                    meta['z'] = buf[off:off+zlen]; off += zlen
+                    meta['vals'] = None; meta['raw'] = None  # decoded lazily
             code_enc = int(buf[off]); off += 1; meta['code_enc'] = code_enc   # 0=raw bitpack, 1=zstd codes
             if code_enc == 0:
                 nb = (self.N*bits+7)//8; meta['cstart'] = off; off += nb
@@ -126,7 +144,20 @@ class Segment:
         return np.full(N, v, dtype=object)           # string/bytes constant
 
     def _decode_fc(self, c):
-        raw = self._dz.decompress(c['z']); vals = []; prev = b''; o = 0; i = 0; R = c['R']
+        R = c['R']
+        if c.get('chunked'):
+            vals = []
+            for j in range(len(c['chunk_czlen'])):
+                fb = c['chunk_base'] + int(c['chunk_foff'][j])
+                fe = c['chunk_base'] + int(c['chunk_foff'][j+1])
+                raw = self._dz.decompress(bytes(self.buf[fb:fe]))
+                o = 0; i = 0; prev = b''
+                while o < len(raw):
+                    if i % R == 0: prev = b''
+                    cp, sl = struct.unpack_from('<HH', raw, o); o += 4
+                    suf = raw[o:o+sl]; o += sl; prev = prev[:cp]+suf; vals.append(prev); i += 1
+            return vals
+        raw = self._dz.decompress(c['z']); vals = []; prev = b''; o = 0; i = 0
         while o < len(raw):
             if i % R == 0: prev = b''
             cp, sl = struct.unpack_from('<HH', raw, o); o += 4
@@ -382,6 +413,18 @@ class Segment:
                 unit = _DT_UNITS[c['aux']]
                 return np.int64(struct.unpack('<q', v)[0]).view(f'datetime64[{unit}]')
             return v
+        if c.get('chunked'):
+            CH = c['CHUNK']; j = code // CH
+            buf = c['chunks'].get(j)
+            if buf is None:
+                fb = c['chunk_base'] + int(c['chunk_foff'][j])
+                fe = c['chunk_base'] + int(c['chunk_foff'][j+1])
+                buf = self._dz.decompress(bytes(self.buf[fb:fe])); c['chunks'][j] = buf
+            R = c['R']; o = int(c['restarts'][code // R]) - int(c['chunk_ustart'][j]); prev = b''
+            for _ in range(code % R + 1):
+                cp, sl = struct.unpack_from('<HH', buf, o); o += 4
+                suf = buf[o:o+sl]; o += sl; prev = prev[:cp] + suf
+            return prev
         if c.get('raw') is None: c['raw'] = self._dz.decompress(c['z'])
         raw = c['raw']; R = c['R']; o = int(c['restarts'][code // R]); prev = b''
         for _ in range(code % R + 1):
