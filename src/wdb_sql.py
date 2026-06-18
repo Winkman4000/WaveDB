@@ -114,6 +114,51 @@ def _colname(node):
     return None
 
 
+_EXTRACT_UNITS = {'YEAR', 'MONTH', 'QUARTER', 'DAY'}
+
+def _date_unit(td, unit, dt_unit='D'):
+    """Map a date column's typed dictionary to an integer group value per code -- the date
+    coarsening, evaluated over V dict values, never over N rows. `dt_unit` is the column's stored
+    datetime64 unit (from seg.unit): the dict ints are interpreted in THAT unit, then coarsened.
+    Returns an int array aligned to codes 0..V-1."""
+    raw = np.asarray(td)
+    if raw.dtype.kind in ('i', 'u'):                       # raw ints -> view in the column's unit
+        d = raw.astype(np.int64).view(f'datetime64[{dt_unit}]').astype('datetime64[D]')
+    else:
+        d = raw.astype('datetime64[D]')
+    if unit == 'YEAR':
+        return d.astype('datetime64[Y]').astype(int) + 1970
+    if unit == 'MONTH':
+        return d.astype('datetime64[M]').astype(int) % 12 + 1
+    if unit == 'QUARTER':
+        return (d.astype('datetime64[M]').astype(int) % 12) // 3 + 1
+    if unit == 'DAY':
+        return (d - d.astype('datetime64[M]')).astype('timedelta64[D]').astype(int) + 1
+    raise NotImplementedError(f"EXTRACT unit {unit!r}")
+
+def _group_key(node, proj=None):
+    """Classify a GROUP BY expression. Returns:
+      ('col', name)        -- a bare value-identity column (today's path, unchanged)
+      ('fn', col, unit)    -- EXTRACT(unit FROM col): a date coarsening, grouped in code space
+    Raises NotImplementedError for anything else, preserving the prior 'unknown column' behavior.
+    `proj` (the SELECT list) lets a bare GROUP BY name resolve to a projection alias -- e.g.
+    SELECT EXTRACT(year FROM d) AS y ... GROUP BY y, where sqlglot parses `y` as a Column."""
+    g = node.this if isinstance(node, E.Alias) else node
+    nm = _colname(g)
+    if nm is not None and proj is not None:
+        for p in proj:                                  # bare name matching a SELECT alias -> its expr
+            if isinstance(p, E.Alias) and p.alias == nm:
+                g = p.this; nm = _colname(g); break
+    if nm is not None:
+        return ('col', nm)
+    if isinstance(g, E.Extract):
+        unit = g.this.name.upper() if hasattr(g.this, 'name') else str(g.this).upper()
+        col = g.args.get('expression')
+        if unit in _EXTRACT_UNITS and isinstance(col, E.Column):
+            return ('fn', col.name, unit)
+    raise NotImplementedError(f"unsupported GROUP BY key: {g.sql()!r}")
+
+
 def _proj_colname(p):
     """Column name of a projection/group expr, unwrapping a top-level AS alias first.
     The 'unwrap alias then name it' idiom, centralized (was inlined across 6 operators)."""
@@ -151,7 +196,8 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
     # ---- projections / shape ----
     proj = tree.expressions  # list of selected exprs
     group = tree.args.get('group')
-    gcols = [ _colname(g) for g in group.expressions ] if group else []
+    gkeys = [ _group_key(g, proj) for g in group.expressions ] if group else []
+    gcols = [ k[1] for k in gkeys ]   # underlying column name per group key (bare col or fn(col))
     where = tree.args.get('where')
 
     # ---- cluster-slice fast path: tried BEFORE the full-column WHERE eval, which it avoids.
@@ -225,9 +271,19 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
         except NotImplementedError:
             pass
     gnames = [seg_col(g) for g in gcols]
-    combo = None; metas=[]   # metas[i] = (gn, kind, table): 'val'->unique values, 'code'->unique codes
-    for gn in gnames:
-        if seg.cols[gn]['mode'] == 4:
+    combo = None; metas=[]   # metas[i] = (gn, kind, table): 'val'->unique values, 'code'->unique codes, 'computed'->(unit, table of typed group values)
+    for gn, gk in zip(gnames, gkeys):
+        if gk[0] == 'fn':
+            # date coarsening: evaluate the unit over the column's DICTIONARY (V values, not N rows),
+            # giving a per-code group-id; map row codes through it. No per-row function eval.
+            unit = gk[2]
+            td = seg._typed_dict(gn)                            # sorted dict values (datetime64 day-numbers)
+            gid_of_code = _date_unit(td, unit, seg.unit(gn))   # code -> integer group value, in the column's unit
+            gc = seg.codes(gn); gc = gc[mask] if mask is not None else gc
+            row_gv = gid_of_code[gc]                            # per-row group value
+            u, inv = np.unique(row_gv, return_inverse=True)    # distinct group values + per-row slot
+            metas.append((gn, 'computed', u))
+        elif seg.cols[gn]['mode'] == 4:
             vals = seg.values(gn); vals = vals[mask] if mask is not None else vals
             u, inv = np.unique(vals, return_inverse=True)      # value-identity keys
             metas.append((gn, 'val', u))
@@ -243,7 +299,7 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
         return list(reversed(out))   # per-key INDEX into that key's table
     def keyval(ki, idx):
         gn, kk, u = metas[ki]
-        if kk == 'val': return u[idx]                          # typed value directly
+        if kk in ('val', 'computed'): return u[idx]            # typed value directly (computed = date coarsening int)
         code = u[idx]; c = seg.cols[gn]
         if c['has_null'] and int(code) == c['V']-1: return None
         return seg.fetch(gn, int(code))

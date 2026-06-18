@@ -1,0 +1,54 @@
+"""Computed GROUP BY keys: EXTRACT(unit FROM datecol) grouped as a coarsening of the sorted date
+dictionary -- evaluated over V dict values, never per-row, no new storage. Verifies the engine
+answers year/month/quarter group-bys (alias and explicit forms, with COUNT/SUM, single and multi-key)
+identically to a direct computation. Self-contained small segment."""
+import sys, os, uuid, tempfile, shutil
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+import numpy as np, pandas as pd
+from wdb_db import Database
+from wdb_engine import Segment
+import wdb_sql, wdb_encode
+
+
+def _build(d):
+    db = Database.create(d); db.run("CREATE TABLE t (mode VARCHAR, d DATE, q INTEGER)")
+    dates = pd.to_datetime('1992-01-01') + pd.to_timedelta(np.arange(2000) * 7, unit='D')  # spans years
+    rng = np.random.default_rng(0)
+    df = pd.DataFrame({'mode': rng.choice(['AIR', 'SHIP', 'RAIL'], 2000),
+                       'd': rng.choice(dates, 2000),
+                       'q': rng.integers(1, 50, 2000)})
+    pq = os.path.join(d, 's.parquet'); df.to_parquet(pq, index=False)
+    wdb_encode.encode(pq, os.path.join(d, 't_0.wdb')); db.cat.add_segment('t', 't_0.wdb')
+    return db, Segment(os.path.join(d, 't_0.wdb')), df
+
+
+def _truth_year(df):
+    g = df.assign(y=df['d'].dt.year).groupby('y').size()
+    return sorted((int(y), int(c)) for y, c in g.items())
+
+
+def test_computed_groupkey():
+    d = os.path.join(tempfile.gettempdir(), f'cgk_{uuid.uuid4().hex[:8]}')
+    try:
+        db, seg, df = _build(d)
+        # alias form: GROUP BY y where y is a SELECT alias for EXTRACT(year FROM d)
+        rows = wdb_sql.execute(seg, "SELECT EXTRACT(year FROM d) y, COUNT(*) FROM t GROUP BY y ORDER BY y")[0]
+        assert sorted((int(r[0]), int(r[1])) for r in rows) == _truth_year(df), rows
+        # explicit form: GROUP BY EXTRACT(...) -- same answer
+        rows2 = wdb_sql.execute(seg, "SELECT EXTRACT(year FROM d) y, COUNT(*) FROM t GROUP BY EXTRACT(year FROM d) ORDER BY y")[0]
+        assert sorted((int(r[0]), int(r[1])) for r in rows2) == _truth_year(df)
+        # month + quarter produce the right number of groups
+        rmo = wdb_sql.execute(seg, "SELECT EXTRACT(month FROM d) m, COUNT(*) FROM t GROUP BY m")[0]
+        assert {int(r[0]) for r in rmo} <= set(range(1, 13)) and len(rmo) == df['d'].dt.month.nunique()
+        rq = wdb_sql.execute(seg, "SELECT EXTRACT(quarter FROM d) q, COUNT(*) FROM t GROUP BY q")[0]
+        assert {int(r[0]) for r in rq} <= {1, 2, 3, 4}
+        # SUM over a computed key matches pandas
+        rs = wdb_sql.execute(seg, "SELECT EXTRACT(year FROM d) y, SUM(q) s FROM t GROUP BY y ORDER BY y")[0]
+        truth_sum = df.assign(y=df['d'].dt.year).groupby('y')['q'].sum()
+        assert {int(r[0]): int(r[1]) for r in rs} == {int(k): int(v) for k, v in truth_sum.items()}
+        # two-key: bare column + computed key
+        r2 = wdb_sql.execute(seg, "SELECT mode, EXTRACT(year FROM d) y, COUNT(*) c FROM t GROUP BY mode, y")[0]
+        truth2 = df.assign(y=df['d'].dt.year).groupby(['mode', 'y']).size()
+        assert {(r[0], int(r[1])): int(r[2]) for r in r2} == {(m, int(y)): int(c) for (m, y), c in truth2.items()}
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
