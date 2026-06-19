@@ -52,3 +52,32 @@ def test_computed_groupkey():
         assert {(r[0], int(r[1])): int(r[2]) for r in r2} == {(m, int(y)): int(c) for (m, y), c in truth2.items()}
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_datecount_rollup_fastpath():
+    """Single-key date-coarsening COUNT(*) is answered via the V->G per-code rollup (no N pass),
+    fires only for that shape, and matches the general path. SUM / two-key / WHERE decline it."""
+    import wdb_sql
+    d = os.path.join(tempfile.gettempdir(), f'dcr_{uuid.uuid4().hex[:8]}')
+    try:
+        db, seg, df = _build(d)
+        def fired(sql):
+            h0 = wdb_sql._DATECOUNT_HITS
+            rows = wdb_sql.execute(seg, sql)[0]
+            return rows, (wdb_sql._DATECOUNT_HITS - h0 == 1)
+        # fires + correct vs pandas truth
+        rows, f = fired("SELECT EXTRACT(year FROM d) y, COUNT(*) FROM t GROUP BY y ORDER BY y")
+        assert f, "single-key date COUNT(*) should use the rollup fast path"
+        assert sorted((int(r[0]), int(r[1])) for r in rows) == _truth_year(df)
+        # ORDER BY count DESC + LIMIT still uses it
+        _, f2 = fired("SELECT EXTRACT(year FROM d) y, COUNT(*) c FROM t GROUP BY y ORDER BY c DESC LIMIT 2")
+        assert f2
+        # must NOT fire for SUM, two-key, or WHERE (but those still answer via the general path)
+        _, f3 = fired("SELECT EXTRACT(year FROM d) y, SUM(q) s FROM t GROUP BY y")
+        assert not f3
+        _, f4 = fired("SELECT mode, EXTRACT(year FROM d) y, COUNT(*) c FROM t GROUP BY mode, y")
+        assert not f4
+        _, f5 = fired("SELECT EXTRACT(year FROM d) y, COUNT(*) c FROM t WHERE q > 10 GROUP BY y")
+        assert not f5
+    finally:
+        shutil.rmtree(d, ignore_errors=True)

@@ -46,6 +46,21 @@ def _cluster_will_slice(seg, tree, col_map):
         return False
 
 _GROUP_SLICE_HITS = 0   # count of GROUP BYs answered via the clustered range-walk (tests/telemetry)
+_DATECOUNT_HITS = 0     # count of date-coarsening COUNT(*) answered via the V->G per-code rollup
+
+
+def _has_count_star_only(proj):
+    """True if exactly one projection is COUNT(*) and the rest are non-aggregate group keys.
+    Gates the date-coarsening rollup fast path (which only knows how to produce counts)."""
+    naggs = 0
+    for p in proj:
+        ak = _agg_kind(p)
+        if ak is None:
+            continue
+        if ak[0] != 'COUNT_STAR':
+            return False
+        naggs += 1
+    return naggs == 1
 
 def _has_count_distinct(proj):
     """True if any projection is COUNT(DISTINCT col). Such grouped queries keep the fused
@@ -135,6 +150,40 @@ def _date_unit(td, unit, dt_unit='D'):
     if unit == 'DAY':
         return (d - d.astype('datetime64[M]')).astype('timedelta64[D]').astype(int) + 1
     raise NotImplementedError(f"EXTRACT unit {unit!r}")
+
+_CODECOUNT_CACHE = {}   # (seg.path, col, N) -> full per-code count vector (length V), incl singletons
+_DATEMAP_CACHE = {}     # (seg.path, col, unit, N) -> (group keys, per-code inverse) for the V->G rollup
+
+def _code_counts(seg, col):
+    """Full per-code count vector aligned to codes 0..V-1 (singletons included), cached per
+    (segment, column, N). For a date column V is tiny, so this is small and built once. This is the
+    materialized base a date-coarsening COUNT(*) rolls up over -- V->G, no per-row pass."""
+    ck = (seg.path, col, int(seg.N))
+    hit = _CODECOUNT_CACHE.get(ck)
+    if hit is not None:
+        return hit
+    codes = seg._raw_codes(col)
+    K = int(seg.cols[col].get('V') or (int(codes.max()) + 1 if codes.size else 1))
+    cc = np.bincount(codes, minlength=K).astype(np.int64)
+    _CODECOUNT_CACHE[ck] = cc
+    return cc
+
+def _date_count_rollup(seg, col, unit):
+    """COUNT(*) grouped by EXTRACT(unit FROM col), answered as a V->G rollup over per-code counts:
+    map each code to its group value, sum the per-code counts into those groups. O(V), no N pass.
+    The code->group mapping (group keys + inverse) is deterministic per (col,unit) and cached, so a
+    warm call is just the final bincount. Returns {group_value: count}."""
+    mk = (seg.path, col, unit, int(seg.N))
+    m = _DATEMAP_CACHE.get(mk)
+    if m is None:
+        td = seg._typed_dict(col)
+        gid_of_code = _date_unit(td, unit, seg.unit(col))   # length-V group value per code
+        keys, inv = np.unique(gid_of_code, return_inverse=True)
+        m = (keys, inv); _DATEMAP_CACHE[mk] = m
+    keys, inv = m
+    cc = _code_counts(seg, col)                             # length-V counts (cached)
+    g = np.bincount(inv, weights=cc, minlength=len(keys)).astype(np.int64)
+    return dict(zip(keys.tolist(), g.tolist()))
 
 def _group_key(node, proj=None):
     """Classify a GROUP BY expression. Returns:
@@ -271,6 +320,23 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
         except NotImplementedError:
             pass
     gnames = [seg_col(g) for g in gcols]
+    # --- date-coarsening COUNT(*) fast path: single computed key, count-only, filter-free ---
+    # The answer is a V->G rollup over per-code counts (O(V)) instead of an O(N) remap+unique.
+    if (len(gkeys) == 1 and gkeys[0][0] == 'fn' and where is None
+            and mask is None and tree.args.get('having') is None
+            and len(proj) == 2 and _has_count_star_only(proj)):
+        gv = _date_count_rollup(seg, gnames[0], gkeys[0][2])
+        ci = 0 if _agg_kind(proj[0]) is not None else 1   # which projection is COUNT(*)
+        rows = []
+        for k, c in gv.items():
+            row = [None, None]; row[ci] = int(c); row[1 - ci] = int(k)
+            rows.append(tuple(row))
+        rows = _apply_order(rows, proj, tree.args.get('order'))
+        lim = _limit(tree); off = _offset(tree)
+        if lim is not None or off:
+            rows = rows[off: off + lim] if lim is not None else rows[off:]
+        global _DATECOUNT_HITS; _DATECOUNT_HITS += 1
+        return rows, [_alias(p) for p in proj]
     combo = None; metas=[]   # metas[i] = (gn, kind, table): 'val'->unique values, 'code'->unique codes, 'computed'->(unit, table of typed group values)
     for gn, gk in zip(gnames, gkeys):
         if gk[0] == 'fn':
