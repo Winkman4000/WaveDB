@@ -144,6 +144,16 @@ bsi_filter = Read('bsi_filter', _bsi_detect, _bsi_execute, 'bit-sliced index fil
 
 
 def _fused_detect(c):
+    # fused_agg only groups by bare columns; a computed group key (e.g. EXTRACT(unit FROM col)) is
+    # not its shape. Decline at detect (sub-us) instead of attempting it and burning an O(N)-ish
+    # table_agg pass before raising _FastUnsupported -- that wasted ~1ms on 100M before the general
+    # path's date-coarsening rollup could run.
+    g = c.tree.args.get('group')
+    if g is not None:
+        for ge in g.expressions:
+            node = ge.this if isinstance(ge, wdb_sql.E.Alias) else ge
+            if not isinstance(node, wdb_sql.E.Column):
+                return None
     return True                              # always eligible to try; execute decides
 
 def _fused_execute(c, spec):
