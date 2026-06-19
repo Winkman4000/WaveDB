@@ -147,11 +147,18 @@ def _fused_detect(c):
     # fused_agg only groups by bare columns; a computed group key (e.g. EXTRACT(unit FROM col)) is
     # not its shape. Decline at detect (sub-us) instead of attempting it and burning an O(N)-ish
     # table_agg pass before raising _FastUnsupported -- that wasted ~1ms on 100M before the general
-    # path's date-coarsening rollup could run.
+    # path's date-coarsening rollup could run. A bare GROUP BY name may be a SELECT alias for a
+    # computed expr (GROUP BY g where g AS EXTRACT(...)), so resolve aliases before deciding.
     g = c.tree.args.get('group')
     if g is not None:
+        proj = c.tree.expressions
         for ge in g.expressions:
             node = ge.this if isinstance(ge, wdb_sql.E.Alias) else ge
+            if isinstance(node, wdb_sql.E.Column):
+                nm = node.name
+                for p in proj:                       # resolve a bare name to its SELECT-alias expr
+                    if isinstance(p, wdb_sql.E.Alias) and p.alias == nm:
+                        node = p.this; break
             if not isinstance(node, wdb_sql.E.Column):
                 return None
     return True                              # always eligible to try; execute decides
