@@ -439,8 +439,19 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
                 counts = np.bincount(np.unique(key) // Vc, minlength=G)
             aggcache[ck] = counts
         return int(aggcache[ck][gi])
+    # --- COUNT(*)-only top-K fast select: when the query is ORDER BY <count> DESC LIMIT k with no
+    # HAVING, only k of the (possibly millions of) groups survive. Pick them with argpartition
+    # (O(G), no full sort) and build rows for those alone, instead of materialising every group
+    # then sorting. Pure structural gate -- counts come from the same `counts` vector either way. ---
+    gi_list = range(len(uc))
+    _topk = _count_topk_plan(proj, agg_specs, tree)
+    if _topk is not None and len(uc) > _topk:
+        k = _topk
+        part = np.argpartition(counts, -k)[-k:]
+        gi_list = part[np.argsort(counts[part])[::-1]].tolist()   # k groups, count-desc
     rows=[]
-    for gi,cv in enumerate(uc):
+    for gi in gi_list:
+        cv = uc[gi]
         keyidx = decombo(cv); rowout=[]; ki=0
         for p,kind in agg_specs:
             _inn = p.this if isinstance(p, E.Alias) else p
@@ -486,6 +497,31 @@ def _agg_kind(p):
     for cls,nm in [(E.Sum,'SUM'),(E.Avg,'AVG'),(E.Min,'MIN'),(E.Max,'MAX')]:
         if isinstance(inner, cls): return (nm, _colname(inner.this))
     return None  # not an aggregate -> group key
+def _count_topk_plan(proj, agg_specs, tree):
+    """Return k (the LIMIT) when this grouped query is a COUNT(*)-only top-K by that count:
+    every aggregate is COUNT(*), there is an ORDER BY whose sole key is that count (or its alias)
+    DESC, a LIMIT is present, and no OFFSET / HAVING. Otherwise None. Lets the group path build
+    only the k surviving groups (argpartition) instead of every group. Structural -- no data."""
+    if tree.args.get('having') is not None or _offset(tree): return None
+    lim = _limit(tree)
+    if lim is None: return None
+    aggs = [k for _, k in agg_specs if k is not None]
+    if not aggs or any(k[0] != 'COUNT_STAR' for k in aggs): return None
+    order = tree.args.get('order')
+    if order is None: return None
+    oexprs = order.expressions
+    if len(oexprs) != 1: return None
+    o = oexprs[0]
+    if not bool(o.args.get('desc')): return None            # must be DESC (largest counts)
+    key = o.this
+    # the ORDER BY key must reference the COUNT(*) -- either COUNT(*) inline or the count's alias
+    if isinstance(key, E.Count): return int(lim)
+    if isinstance(key, E.Column):
+        nm = key.name
+        for p in proj:
+            if isinstance(p, E.Alias) and p.alias == nm and isinstance(p.this, E.Count):
+                return int(lim)
+    return None
 def _pyval(v):
     if isinstance(v,(bytes,bytearray)):
         try: return v.decode('utf-8','surrogatepass')
@@ -760,6 +796,55 @@ def _seq_eq_mask(seg, name, neg, lit):
             if 0 <= p < N: mask[p] = True
     return ~mask if neg else mask
 
+def _dict_eq_mask(seg, name, neg, lit):
+    """Code-space equality for a dictionary-coded column: resolve the literal to its dictionary
+    code, then compare the CODE array (an integer scan) instead of decoding N values. Pure
+    structural logic -- works for any dict column, no dataset knowledge. Returns bool[N] for
+    '= X' (or '!= X' if neg), or None to fall back to the value-decode path.
+
+    Correctness: codes index directly into the typed dict (seg.fetch maps code->dict[code]), so
+    rows equal to X are exactly the rows whose code == the code(s) of X. A literal absent from the
+    dict matches no rows (EQ -> all False, NEQ -> all live). NULL never satisfies = or <> (SQL),
+    so the null code is excluded from a positive match and, for NEQ, also excluded."""
+    c = seg.cols[name]
+    if c['mode'] == 4:                      # affine/value-identity: _seq_eq_mask owns this
+        return None
+    if seg._overrides(name) is not None:    # override values aren't in the base dict -> value path
+        return None
+    try:
+        codes = seg.codes(name)
+    except Exception:
+        return None
+    if codes is None or codes.dtype.kind not in 'iu':
+        return None
+    td = seg._typed_dict(name)
+    td = td if isinstance(td, np.ndarray) else np.asarray(td, dtype=object)
+    V = c['V']
+    nullcode = (V - 1) if c['has_null'] else None
+    kind = 'i' if c['dt'] == 0 else ('f' if c['dt'] == 2 else ('i' if c['dt'] == 3 else 'S'))
+    v = _lit_for_col(seg, name, lit, kind)
+    if c['dt'] not in (0, 2, 3) and isinstance(v, int):
+        v = str(v).encode()
+    try:
+        match = (td == v)
+    except Exception:
+        return None
+    mcodes = np.nonzero(match)[0]
+    if nullcode is not None:
+        mcodes = mcodes[mcodes != nullcode]
+    if len(mcodes) == 0:                    # literal absent: EQ matches nothing, NEQ matches all live
+        res = np.zeros(len(codes), dtype=bool)
+    elif len(mcodes) == 1:
+        res = (codes == mcodes[0])
+    else:
+        res = np.isin(codes, mcodes)
+    if neg:
+        res = ~res
+        if nullcode is not None:           # SQL: NULL <> X is not TRUE -> exclude nulls
+            res &= (codes != nullcode)
+    return res
+
+
 def _eval_pred(seg, node, seg_col):
     if isinstance(node, E.And): return _eval_pred(seg,node.this,seg_col) & _eval_pred(seg,node.expression,seg_col)
     if isinstance(node, E.Or):  return _eval_pred(seg,node.this,seg_col) | _eval_pred(seg,node.expression,seg_col)
@@ -772,6 +857,8 @@ def _eval_pred(seg, node, seg_col):
         if isinstance(node, (E.EQ, E.NEQ)):
             fm = _seq_eq_mask(seg, cn, isinstance(node, E.NEQ), lit)   # O(1) clean-affine eq
             if fm is not None: return fm
+            dm = _dict_eq_mask(seg, cn, isinstance(node, E.NEQ), lit)  # code-space eq (no value decode)
+            if dm is not None: return dm
         a, nmask = _col(seg, cn)
         v = _lit_for_col(seg, cn, lit, a.dtype.kind)
         if a.dtype.kind not in 'iuf' and isinstance(v,int) and seg.cols[cn]['dt']!=3: v=str(v).encode()
