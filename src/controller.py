@@ -39,6 +39,7 @@ _READ_ORDER = (
     R.cube,                 # pre-materialized cube
     R.dict_count,           # dictionary per-code counts
     R.heavypair,            # two-key COUNT(*) top-N from a count-sorted pair sidecar
+    R.scanpair,             # two-key COUNT(*) top-N, high-card non-key filter via code-space scan
     R.survivor_group,       # filtered high-card group via survivor ranges
     R.compound_filter,      # multi-condition AND filter
     R.distinct_sidecar,     # prebuilt group->distinct sidecar
