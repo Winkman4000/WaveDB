@@ -81,3 +81,26 @@ def test_datecount_rollup_fastpath():
         assert not f5
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_time_coarsening_units():
+    """EXTRACT(minute/hour) and DATE_TRUNC over a timestamp column: classifier recognizes them,
+    the coarsening is evaluated over the dictionary, and DATE_TRUNC renders as a datetime."""
+    import wdb_sql, sqlglot
+    # classifier recognizes the new shapes (incl. SELECT-alias resolution)
+    def keys(q):
+        t = sqlglot.parse_one(q, read='duckdb')
+        return [wdb_sql._group_key(g, t.expressions) for g in t.args['group'].expressions]
+    assert keys("SELECT extract(minute FROM t) m, COUNT(*) FROM x GROUP BY m") == [('fn', 't', 'MINUTE')]
+    assert keys("SELECT extract(hour FROM t) h, COUNT(*) FROM x GROUP BY h") == [('fn', 't', 'HOUR')]
+    assert keys("SELECT DATE_TRUNC('minute', t) m, COUNT(*) FROM x GROUP BY m") == [('fn', 't', 'TRUNC:MINUTE')]
+    assert keys("SELECT a, extract(minute FROM t) m, b, COUNT(*) FROM x GROUP BY a, m, b") == [
+        ('col', 'a'), ('fn', 't', 'MINUTE'), ('col', 'b')]
+    # _date_unit math over a tiny second-resolution dict (epoch seconds)
+    import numpy as np
+    secs = np.array([1372708800, 1372708860, 1372712400], dtype=np.int64)  # 20:00:00, 20:01:00, 21:00:00 UTC
+    assert wdb_sql._date_unit(secs, 'MINUTE', 's').tolist() == [0, 1, 0]
+    assert wdb_sql._date_unit(secs, 'HOUR', 's').tolist() == [20, 20, 21]
+    tr = wdb_sql._date_unit(secs, 'TRUNC:MINUTE', 's')   # truncates to the minute (epoch ticks)
+    assert tr.tolist() == [1372708800, 1372708860, 1372712400]
+    assert wdb_sql._is_trunc('TRUNC:MINUTE') and not wdb_sql._is_trunc('MINUTE')

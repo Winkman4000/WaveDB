@@ -129,26 +129,31 @@ def _colname(node):
     return None
 
 
-_EXTRACT_UNITS = {'YEAR', 'MONTH', 'QUARTER', 'DAY'}
+_EXTRACT_UNITS = {'YEAR', 'MONTH', 'QUARTER', 'DAY', 'HOUR', 'MINUTE'}
+_TRUNC_UNITS = {'YEAR', 'QUARTER', 'MONTH', 'WEEK', 'DAY', 'HOUR', 'MINUTE'}
+_NP_UNIT = {'YEAR': 'Y', 'MONTH': 'M', 'WEEK': 'W', 'DAY': 'D', 'HOUR': 'h', 'MINUTE': 'm'}
 
 def _date_unit(td, unit, dt_unit='D'):
-    """Map a date column's typed dictionary to an integer group value per code -- the date
-    coarsening, evaluated over V dict values, never over N rows. `dt_unit` is the column's stored
-    datetime64 unit (from seg.unit): the dict ints are interpreted in THAT unit, then coarsened.
-    Returns an int array aligned to codes 0..V-1."""
+    """Map a date/timestamp column's typed dictionary to an integer group value per code -- the
+    coarsening, evaluated over the V dict values, never over N rows. `dt_unit` is the column's stored
+    datetime64 unit (from seg.unit); the dict ints are interpreted in THAT unit, preserving sub-day
+    resolution for timestamps. `unit` is either an EXTRACT field ('YEAR'..'MINUTE') or 'TRUNC:<U>'
+    for DATE_TRUNC. EXTRACT returns the field's integer; TRUNC returns the truncated value in the
+    column's own unit (epoch ticks), matching DuckDB's truncated timestamp. Returns int array over
+    codes 0..V-1."""
     raw = np.asarray(td)
-    if raw.dtype.kind in ('i', 'u'):                       # raw ints -> view in the column's unit
-        d = raw.astype(np.int64).view(f'datetime64[{dt_unit}]').astype('datetime64[D]')
-    else:
-        d = raw.astype('datetime64[D]')
-    if unit == 'YEAR':
-        return d.astype('datetime64[Y]').astype(int) + 1970
-    if unit == 'MONTH':
-        return d.astype('datetime64[M]').astype(int) % 12 + 1
-    if unit == 'QUARTER':
-        return (d.astype('datetime64[M]').astype(int) % 12) // 3 + 1
-    if unit == 'DAY':
-        return (d - d.astype('datetime64[M]')).astype('timedelta64[D]').astype(int) + 1
+    base = f'datetime64[{dt_unit}]'
+    d = raw.astype(np.int64).view(base) if raw.dtype.kind in ('i', 'u') else raw.astype(base)
+    if unit.startswith('TRUNC:'):                          # DATE_TRUNC -> truncated value in column unit
+        u = _NP_UNIT[unit.split(':', 1)[1]]
+        trunc = d.astype(f'datetime64[{u}]').astype(base)  # floor to U, back to column unit
+        return trunc.view(np.int64)                        # epoch ticks (column unit) -- DuckDB's timestamp
+    if unit == 'YEAR':    return d.astype('datetime64[Y]').astype(int) + 1970
+    if unit == 'QUARTER': return (d.astype('datetime64[M]').astype(int) % 12) // 3 + 1
+    if unit == 'MONTH':   return d.astype('datetime64[M]').astype(int) % 12 + 1
+    if unit == 'DAY':     return (d.astype('datetime64[D]') - d.astype('datetime64[M]')).astype('timedelta64[D]').astype(int) + 1
+    if unit == 'HOUR':    return d.astype('datetime64[h]').astype(int) % 24
+    if unit == 'MINUTE':  return d.astype('datetime64[m]').astype(int) % 60
     raise NotImplementedError(f"EXTRACT unit {unit!r}")
 
 _CODECOUNT_CACHE = {}   # (seg.path, col, N) -> full per-code count vector (length V), incl singletons
@@ -168,11 +173,21 @@ def _code_counts(seg, col):
     _CODECOUNT_CACHE[ck] = cc
     return cc
 
+def _trunc_to_dt(tick, dt_unit):
+    """A DATE_TRUNC group value is an epoch tick in the column's unit; render it as a Python
+    datetime so the output matches DuckDB's truncated-timestamp type (not a raw int)."""
+    import datetime as _dt
+    return np.datetime64(int(tick), dt_unit).astype('datetime64[us]').astype(_dt.datetime)
+
+def _is_trunc(unit):
+    return isinstance(unit, str) and unit.startswith('TRUNC:')
+
 def _date_count_rollup(seg, col, unit):
     """COUNT(*) grouped by EXTRACT(unit FROM col), answered as a V->G rollup over per-code counts:
     map each code to its group value, sum the per-code counts into those groups. O(V), no N pass.
     The code->group mapping (group keys + inverse) is deterministic per (col,unit) and cached, so a
-    warm call is just the final bincount. Returns {group_value: count}."""
+    warm call is just the final bincount. Returns {group_value: count}. For DATE_TRUNC the key is
+    rendered as a datetime (matching DuckDB); for EXTRACT it's the field integer."""
     mk = (seg.path, col, unit, int(seg.N))
     m = _DATEMAP_CACHE.get(mk)
     if m is None:
@@ -183,6 +198,9 @@ def _date_count_rollup(seg, col, unit):
     keys, inv = m
     cc = _code_counts(seg, col)                             # length-V counts (cached)
     g = np.bincount(inv, weights=cc, minlength=len(keys)).astype(np.int64)
+    if _is_trunc(unit):
+        du = seg.unit(col)
+        return {_trunc_to_dt(k, du): int(v) for k, v in zip(keys.tolist(), g.tolist())}
     return dict(zip(keys.tolist(), g.tolist()))
 
 def _group_key(node, proj=None):
@@ -205,6 +223,12 @@ def _group_key(node, proj=None):
         col = g.args.get('expression')
         if unit in _EXTRACT_UNITS and isinstance(col, E.Column):
             return ('fn', col.name, unit)
+    if isinstance(g, (E.TimestampTrunc, E.DateTrunc)):      # DATE_TRUNC(unit, col) / TIMESTAMP_TRUNC
+        u = g.args.get('unit')
+        unit = (u.name if hasattr(u, 'name') else str(u)).upper().strip("'\"")
+        col = g.this
+        if unit in _TRUNC_UNITS and isinstance(col, E.Column):
+            return ('fn', col.name, 'TRUNC:' + unit)
     raise NotImplementedError(f"unsupported GROUP BY key: {g.sql()!r}")
 
 
@@ -329,7 +353,7 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
         ci = 0 if _agg_kind(proj[0]) is not None else 1   # which projection is COUNT(*)
         rows = []
         for k, c in gv.items():
-            row = [None, None]; row[ci] = int(c); row[1 - ci] = int(k)
+            row = [None, None]; row[ci] = int(c); row[1 - ci] = k   # k already typed (int field or datetime)
             rows.append(tuple(row))
         rows = _apply_order(rows, proj, tree.args.get('order'))
         lim = _limit(tree); off = _offset(tree)
@@ -348,24 +372,27 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
             gc = seg.codes(gn); gc = gc[mask] if mask is not None else gc
             row_gv = gid_of_code[gc]                            # per-row group value
             u, inv = np.unique(row_gv, return_inverse=True)    # distinct group values + per-row slot
-            metas.append((gn, 'computed', u))
+            metas.append((gn, 'computed', u, unit))
         elif seg.cols[gn]['mode'] == 4:
             vals = seg.values(gn); vals = vals[mask] if mask is not None else vals
             u, inv = np.unique(vals, return_inverse=True)      # value-identity keys
-            metas.append((gn, 'val', u))
+            metas.append((gn, 'val', u, None))
         else:
             gc = seg.codes(gn); gc = gc[mask] if mask is not None else gc
             u, inv = np.unique(gc, return_inverse=True)
-            metas.append((gn, 'code', u))
+            metas.append((gn, 'code', u, None))
         combo = inv if combo is None else combo*len(u)+inv
     uc, counts = np.unique(combo, return_counts=True)
     def decombo(cv):
         out=[]; x=cv
-        for _,_,u in reversed(metas): out.append(int(x%len(u))); x//=len(u)
+        for m in reversed(metas): u=m[2]; out.append(int(x%len(u))); x//=len(u)
         return list(reversed(out))   # per-key INDEX into that key's table
     def keyval(ki, idx):
-        gn, kk, u = metas[ki]
-        if kk in ('val', 'computed'): return u[idx]            # typed value directly (computed = date coarsening int)
+        gn, kk, u, unit = metas[ki]
+        if kk == 'computed':
+            v = u[idx]
+            return _trunc_to_dt(v, seg.unit(gn)) if _is_trunc(unit) else v
+        if kk == 'val': return u[idx]                          # typed value directly
         code = u[idx]; c = seg.cols[gn]
         if c['has_null'] and int(code) == c['V']-1: return None
         return seg.fetch(gn, int(code))
