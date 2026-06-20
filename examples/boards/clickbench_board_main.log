@@ -1,44 +1,46 @@
-Pseudo-terminal will not be allocated because stdin is not a terminal.
-Q00 | 959 5.8 | 107.0 | 18.53x | True
-Q01 | 738 57.3 | 105.7 | 1.84x | True
-Q02 | 3514 650.7 | 142.2 | 0.22x | False
-Q03 | 2357 72.2 | 303.7 | 4.21x | False
-Q04 | 153 2.5 | 404.4 | 162.06x | True
-Q05 | 155 1.8 | 650.4 | 353.13x | True
-Q06 | 1179 26.2 | 187.7 | 7.16x | False
-Q07 | 1484 72.7 | 103.4 | 1.42x | True
-Q08 | 154 1.9 | 472.8 | 250.55x | True
-Q09 | 2129 952.6 | 552.5 | 0.58x | True
-Q10 | 127 1.8 | 165.0 | 90.04x | True
-Q11 | 6205 4034.2 | 196.8 | 0.05x | True
-Q12 | 12025 7432.1 | 619.3 | 0.08x | True
-Q13 | 4041 765.1 | 723.8 | 0.95x | True
-Q14 | 9068 4556.0 | 495.0 | 0.11x | True
-Q15 | 713 1.3 | 387.0 | 288.73x | True
-Q16 | 4547 1.4 | 1034.3 | 752.75x | True
-Q17 | ---- ---- | 854.7 | - | ?  <TIMEOUT>45s
-Q18 | ---- ---- | 1791.2 | - | ?  <NotImplementedError: unsupported GROUP BY key: 'EXTRACT(MINUTE FROM EventTime)'
-Q19 | 3014 1756.6 | 102.6 | 0.06x | True
-Q20 | ---- ---- | 1527.3 | - | ?  <TIMEOUT>45s
-Q21 | ---- ---- | 979.7 | - | ?  <TIMEOUT>45s
-Q22 | ---- ---- | 2000.2 | - | ?  <TIMEOUT>45s
-Q23 | ---- ---- | 1732.3 | - | ?  <TIMEOUT>45s
-Q24 | 832 1.9 | 551.2 | 296.12x | False
-Q25 | 550 4.1 | 349.5 | 84.38x | True
-Q26 | 871 23.2 | 474.3 | 20.42x | True
-Q27 | ---- ---- | 1082.7 | - | ?  <NotImplementedError: unknown column: None
-Q28 | ---- ---- | 8042.4 | - | ?  <NotImplementedError: unsupported GROUP BY key: "REGEXP_REPLACE(Referer, '^https?://(?:www\\.)?([^/]+)/.*$', '\\
-Q29 | 15239 344.3 | 109.8 | 0.32x | False
-Q30 | 18896 13012.2 | 529.0 | 0.04x | False
-Q31 | ---- ---- | 814.5 | - | ?  <TIMEOUT>45s
-Q32 | ---- ---- | 1504.3 | - | ?  <TIMEOUT>45s
-Q33 | 11428 1.3 | 1735.1 | 1334.84x | True
-Q34 | ---- ---- | 1776.6 | - | ?  <NotImplementedError: unsupported GROUP BY key: '1'
-Q35 | ---- ---- | 490.0 | - | ?  <NotImplementedError: unsupported GROUP BY key: 'ClientIP - 1'
-Q36 | 22358 8955.2 | 198.9 | 0.02x | True
-Q37 | 15197 7664.2 | 242.2 | 0.03x | True
-Q38 | 5337 1004.5 | 217.0 | 0.22x | False
-Q39 | ---- ---- | 461.4 | - | ?  <NotImplementedError: unsupported GROUP BY key: "CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer
-Q40 | 6898 2402.3 | 184.1 | 0.08x | False
-Q41 | 5580 1783.7 | 118.4 | 0.07x | False
-Q42 | ---- ---- | 168.0 | - | ?  <NotImplementedError: unsupported GROUP BY key: 'TIMESTAMP_TRUNC(EventTime, MINUTE)'
+idx | cold_ms warm_ms | duck_ms | ratio(warm) | ok
+Q00 | 674 3.0 | 163.8 | 54.21x | True
+Q01 | 745 60.9 | 106.4 | 1.75x | True
+Q02 | 3614 639.9 | 170.5 | 0.27x | False
+Q03 | 2403 72.2 | 289.3 | 4.00x | False
+Q04 | 159 5.3 | 410.8 | 76.87x | True
+Q05 | 164 2.6 | 592.7 | 231.12x | True
+Q06 | 1209 24.5 | 172.7 | 7.04x | False
+Q07 | 1480 77.5 | 99.7 | 1.29x | True
+Q08 | 159 2.3 | 450.2 | 195.43x | True
+Q09 | 2101 952.7 | 537.3 | 0.56x | True
+Q10 | 153 1.7 | 177.6 | 104.15x | True
+Q11 | 4570 2357.9 | 208.7 | 0.09x | True
+Q12 | 8085 3485.9 | 581.6 | 0.17x | True
+Q13 | 3953 787.0 | 752.5 | 0.96x | True
+Q14 | 4046 60.0 | 503.7 | 8.40x | True
+Q15 | 671 1.3 | 394.9 | 296.02x | True
+Q16 | 4549 8.7 | 1004.6 | 115.26x | True
+Q17 | ---- ---- | 838.0 | - | ?  <TIMEOUT>45s
+Q18 | ---- ---- | 1839.2 | - | ?  <TIMEOUT>45s
+Q19 | 2192 912.4 | 106.6 | 0.12x | True
+Q20 | ---- ---- | 1568.5 | - | ?  <TIMEOUT>45s
+Q21 | ---- ---- | 925.7 | - | ?  <TIMEOUT>45s
+Q22 | ---- ---- | 2016.1 | - | ?  <TIMEOUT>45s
+Q23 | ---- ---- | 1724.0 | - | ?  <TIMEOUT>45s
+Q24 | 872 2.0 | 505.4 | 249.60x | False
+Q25 | 515 3.8 | 356.4 | 92.67x | True
+Q26 | 880 19.4 | 452.0 | 23.27x | True
+Q27 | ---- ---- | 1059.8 | - | ?  <NotImplementedError: unknown column: None
+Q28 | ---- ---- | 8170.5 | - | ?  <NotImplementedError: unsupported GROUP BY key: "REGEXP_REPLACE(Referer, '^https?://(?:www\\.)?([^/]+)/.*$', '\\
+Q29 | 15208 367.7 | 103.9 | 0.28x | False
+Q30 | 18931 12901.5 | 529.8 | 0.04x | False
+Q31 | ---- ---- | 774.1 | - | ?  <TIMEOUT>45s
+Q32 | ---- ---- | 1457.6 | - | ?  <TIMEOUT>45s
+Q33 | 11174 1.6 | 1732.8 | 1117.66x | True
+Q34 | ---- ---- | 1783.8 | - | ?  <NotImplementedError: unsupported GROUP BY key: '1'
+Q35 | ---- ---- | 504.8 | - | ?  <NotImplementedError: unsupported GROUP BY key: 'ClientIP - 1'
+Q36 | 15135 1852.3 | 329.9 | 0.18x | True
+Q37 | 8894 1413.0 | 228.8 | 0.16x | True
+Q38 | 5101 833.8 | 217.9 | 0.26x | False
+Q39 | ---- ---- | 437.2 | - | ?  <NotImplementedError: unsupported GROUP BY key: "CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer
+Q40 | 5918 1360.4 | 165.7 | 0.12x | False
+Q41 | 4556 702.3 | 96.3 | 0.14x | False
+Q42 | 2335 634.2 | 158.6 | 0.25x | True
+
+SUMMARY ok=21/43 faster=13 median_ratio_ok=8.40x
