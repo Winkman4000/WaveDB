@@ -166,10 +166,44 @@ def _order_is_count_desc(tree, proj, ci):
     return ak is not None and ak[0] == 'COUNT_STAR'
 
 
+def _axis_filter(seg, where_node, cols, col_map):
+    """Parse a WHERE that is a single equality/inequality on ONE of the two pair axes into a walk
+    filter: (col, neg, codeset). The pre-sorted block already separates pairs by both axes, so such
+    a filter is answered by walking the count-descending block and skipping rows whose axis code is
+    (for '=') not in / (for '<>') in the codeset -- no recount, no scan. Self-referential: it only
+    works because the filtered column is one of the sidecar's KEPT axes.
+
+    Returns (col, neg, codes ndarray) or None to decline (filter not on a pair axis, or not a simple
+    eq/neq against a literal). codes is the set of axis codes equal to the literal; empty means the
+    literal is absent (eq -> matches nothing, neq -> matches everything)."""
+    n = where_node.this if isinstance(where_node, E.Where) else where_node
+    if not isinstance(n, (E.EQ, E.NEQ)):
+        return None
+    col = wdb_sql._colname(n.this)
+    lit = n.expression
+    if col is None or not isinstance(lit, E.Literal):
+        return None
+    phys = col_map.get(col, col) if col_map else col
+    if phys not in cols:                     # filter must be on one of the two pair axes
+        return None
+    vals = _vals(seg, phys)
+    if vals is None:
+        return None
+    c = seg.cols[phys]
+    kind = 'i' if c['dt'] == 0 else ('f' if c['dt'] == 2 else ('i' if c['dt'] == 3 else 'S'))
+    v = wdb_sql._lit_for_col(seg, phys, lit, kind)
+    if c['dt'] not in (0, 2, 3) and isinstance(v, int):
+        v = str(v).encode()
+    try:
+        codes = np.nonzero(np.asarray(vals) == v)[0].astype(np.int64)
+    except Exception:
+        return None
+    return (phys, isinstance(n, E.NEQ), codes)
+
+
 def detect(seg, tree, col_map):
     if not P.no_joins(tree):           return None
     if not P.no_select_distinct(tree): return None
-    if not P.no_where(tree):           return None
     if not P.no_having(tree):          return None
     if not P.has_limit(tree):          return None
     group = tree.args.get('group')
@@ -197,11 +231,18 @@ def detect(seg, tree, col_map):
     if not P.no_deleted_rows(seg):         return None
     if not _order_is_count_desc(tree, proj, ci):
         return None
+    # WHERE: allowed only if it is a single eq/neq on one of the two pair axes (a kept-axis filter,
+    # answered by a walk-and-skip over the sorted block). Any other WHERE -> decline to the scan.
+    afilter = None
+    if P.has_where(tree):
+        afilter = _axis_filter(seg, tree.args.get('where'), cols, col_map)
+        if afilter is None:
+            return None
     Vs = {col: _vals(seg, col) for col in cols}
     if any(v is None for v in Vs.values()):              # both keys must be value-identity decodable
         return None
     return {'cols': cols, 'ci': ci, 'lim': wdb_sql._limit(tree), 'proj': proj,
-            'knames': knames, 'V': Vs, 'order': tree.args.get('order')}
+            'knames': knames, 'V': Vs, 'order': tree.args.get('order'), 'afilter': afilter}
 
 
 def execute(seg, spec):
@@ -212,14 +253,32 @@ def execute(seg, spec):
     if loaded is None:
         return None
     cA, cB, cn, lm = loaded
-    if lim > cn.size:                                    # would need singleton pairs (count 1)
-        return None
-    if lim < cn.size and int(cn[lim - 1]) == int(cn[lim]):
-        return None                                      # tie straddles LIMIT -> defer to scan
     a, b = sorted(cols)
     by_col = {a: cA, b: cB}                               # code array per (name-sorted) column
+
+    # --- kept-axis filter: keep only block rows whose filtered-axis code matches the predicate.
+    # The block is already count-descending, so the filtered top-K is the first `lim` kept rows.
+    # Pure selection over stored cells -- no recount, no scan (works because the filter is on a
+    # KEPT axis). positions[] indexes the block in count order. ---
+    afilter = spec.get('afilter')
+    if afilter is not None:
+        fcol, neg, fcodes = afilter
+        axis = by_col[fcol]
+        inset = np.isin(axis, fcodes) if fcodes.size else np.zeros(axis.size, dtype=bool)
+        keep = ~inset if neg else inset
+        positions = np.nonzero(keep)[0]                  # block indices passing the filter, count order
+    else:
+        positions = np.arange(cn.size)
+
+    if lim > positions.size:                             # not enough heavy pairs -> singletons needed -> scan
+        return None
+    if lim < positions.size:                            # tie straddling LIMIT on the FILTERED sequence
+        if int(cn[positions[lim - 1]]) == int(cn[positions[lim]]):
+            return None                                  # ambiguous boundary -> defer to scan
+
     rows = []
-    for r in range(lim):
+    for r in positions[:lim]:
+        r = int(r)
         row = [None] * len(proj)
         row[ci] = int(cn[r])
         for pi, p in enumerate(proj):
