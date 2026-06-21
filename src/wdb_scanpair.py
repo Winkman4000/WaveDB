@@ -1,24 +1,25 @@
 """
-wdb_scanpair -- HIGH-CARD filter regime for a 2-key COUNT(*) top-K with a WHERE on a NON-key column.
+wdb_scanpair -- NON-KEY filter regime for a 2-key COUNT(*) top-K with a WHERE on a separate column.
 
 The companion to wdb_heavypair. When the filter column C is one of the two group keys, the sorted
-pair sidecar answers it by walk-and-skip (heavypair). When C is a SEPARATE column, the sidecar has
-no C axis -- it summed C away -- so the cells can't be sliced by C. The two ways out are decided by
-C's cardinality alone (self-referential, no data values):
+pair sidecar answers it by walk-and-skip (heavypair). When C is a SEPARATE column, the sidecar
+summed C away -- its cells can't be sliced by C -- so we SCAN: jump to the rows where C = v
+(a code-space equality scan: one O(N) boolean pass, flat ~25ms on 100M regardless of how many rows
+match), gather the two group-key codes there, fuse + bincount + argpartition for top-K, decode only
+the K winners. The scan IS the answer; nothing persisted.
 
-  * C LOW-card  -> keep C as an axis in a sidecar (built separately). Not this module.
-  * C HIGH-card -> SCAN. A high-card C value covers few rows, so jump to the rows where C = v
-                   (a code-space equality scan, O(N) but a single flat ~20ms boolean pass on 100M),
-                   gather the two group-key codes there, fuse + bincount + argpartition for top-K.
-                   No persisted structure; the scan IS the answer.
+This handles C at ANY cardinality. We deliberately do NOT build a per-C sidecar: storing each C
+value's per-(A,B) contribution is the same data volume as a 3-key (A,B,C) sidecar -- it explodes --
+so there is no cardinality threshold here. High-card C -> tiny matched set, scan dominates (~25ms);
+low-card C -> larger matched set, the gather+count grows but still beats a full group-by. One scan,
+every C, no extra segments to manage.
 
 Same contract as the other reads: detect(seg, tree, col_map) -> spec | None;
 execute(seg, spec) -> (rows, colnames) | None. Fail-closed outside its exact shape.
 
 Scope (v1): single segment, exactly two value-identity group keys, projections {k1, k2, COUNT(*)},
 ORDER BY COUNT(*) DESC + LIMIT, no HAVING/DISTINCT/JOIN/OFFSET, WHERE = a single `col = literal`
-(equality only; the positive-eq case is the rare/high-card one the scan is good at) on a dict-coded
-column that is NOT a group key and whose cardinality is >= _HIGHCARD_MIN.
+(equality only) on a dict-coded column that is NOT a group key.
 """
 import numpy as np
 import wdb_sql
@@ -27,7 +28,6 @@ import workers
 E = wdb_sql.E
 
 _HITS = 0
-_HIGHCARD_MIN = 10000   # C is "high card" at/above this distinct-value count -> scan regime
 
 
 def _eq_on_nonkey(seg, where_node, gnames, col_map):
@@ -48,9 +48,11 @@ def _eq_on_nonkey(seg, where_node, gnames, col_map):
     c = seg.cols[phys]
     if c['mode'] == 4 or seg._overrides(phys) is not None:
         return None
-    V = c.get('V') or 0
-    if V < _HIGHCARD_MIN:                           # low-card C -> belongs in a sidecar axis, not scan
-        return None
+    # No cardinality gate: the scan handles a non-key equality filter at ANY cardinality of C. For
+    # high-card C the matched set is tiny (flat ~25ms scan dominates); for low-card C the matched set
+    # is larger so the gather+count grows, but it still beats a full group-by -- and crucially it
+    # needs no persisted per-C structure (a C-keyed sidecar storing per-(A,B) adjustments is the same
+    # data volume as a 3-key sidecar -> it explodes, so we don't build one). One scan, every C.
     try:
         codes = seg.codes(phys)
     except Exception:
@@ -145,11 +147,21 @@ def execute(seg, spec):
         return [], [wdb_sql._alias(p) for p in proj]
     # 2) gather the two group-key codes at the matched rows
     a, b = cols
-    ca = seg.codes(a)[pos].astype(np.int64)
-    cb = seg.codes(b)[pos].astype(np.int64)
-    Vb = int(seg.cols[b]['V'])
-    # 3) fuse + count (one pass) + top-K via argpartition (no full sort)
-    key = ca * Vb + cb
+    Va = int(seg.cols[a]['V']); Vb = int(seg.cols[b]['V'])
+    # 3) fuse + count. Read FEWER BYTES: fuse into the narrowest int that holds Va*Vb, so the
+    #    sort in np.unique moves half the bytes when the pair fits uint32 (the common case). The
+    #    aggregation -- not the scan -- is the cost at high match, and it scales with key width.
+    prod = Va * Vb
+    if prod < (1 << 32):
+        fdt = np.uint32
+    elif prod < (1 << 64):
+        fdt = np.int64
+    else:
+        fdt = None
+    if fdt is not None and fdt is np.uint32:
+        key = (seg.codes(a)[pos].astype(np.uint32) * np.uint32(Vb) + seg.codes(b)[pos].astype(np.uint32))
+    else:
+        key = seg.codes(a)[pos].astype(np.int64) * Vb + seg.codes(b)[pos].astype(np.int64)
     uk, cnt = np.unique(key, return_counts=True)
     k = lim
     if k < cnt.size:
@@ -161,7 +173,7 @@ def execute(seg, spec):
     #    _typed_dict decode of a high-card key is ~1s; we need ~K values)
     rows = []
     for idx in order[:k]:
-        acode = int(uk[idx] // Vb); bcode = int(uk[idx] % Vb)
+        acode = int(uk[idx]) // Vb; bcode = int(uk[idx]) % Vb
         codeof = {a: acode, b: bcode}
         row = [None] * len(proj)
         row[ci] = int(cnt[idx])
