@@ -13,3 +13,4 @@ src/wdb_fetch
 src/wdb_kernel
 src/wdb_kernel_count
 *.wdb
+src/kernels/*.so
