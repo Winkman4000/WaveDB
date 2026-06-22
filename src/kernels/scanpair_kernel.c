@@ -128,3 +128,65 @@ int64_t wdb_tally(const int64_t* keys, int64_t m, int capbits,
         if (htab_k[h] != -1) { out_k[d] = htab_k[h]; out_c[d] = htab_c[h]; d++; }
     return d;
 }
+
+/* ---- Stage 3 (parallel): radix-partition the fused keys, then tally partitions across cores ----
+ * For large survivor sets the single-table tally is memory-latency bound. Radix-partition the keys
+ * by a strong-mixed hash so partitions are even and DISJOINT (no key spans two partitions), scatter
+ * them contiguously (one sequential pass), then tally each partition into a small cache-resident
+ * sub-table -- in parallel across cores, with NO merge (disjoint partitions). Each partition writes
+ * its distinct (key,count) into its own output slice [starts[p], starts[p+1]); pcount[p] records how
+ * many it wrote, and the caller compacts. Returns total distinct, or -1 on sub-table overflow
+ * (caller falls back to the single-table path). Needs <omp.h> and <stdlib.h>; built with -fopenmp. */
+#include <omp.h>
+#include <stdlib.h>
+
+static inline uint64_t wdb_mix(uint64_t x){
+    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27; x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31; return x;
+}
+
+int64_t wdb_tally_parallel(const int64_t* keys, int64_t m, int pbits, int subbits, int nthreads,
+                           int64_t* scratch, int64_t* starts, int64_t* pcount,
+                           int64_t* out_k, int64_t* out_c) {
+    int64_t P = 1LL << pbits; int shift = 64 - pbits;
+    for (int64_t p = 0; p <= P; ++p) starts[p] = 0;
+    for (int64_t i = 0; i < m; ++i) { uint64_t h = wdb_mix((uint64_t)keys[i]); starts[(h >> shift) + 1]++; }
+    for (int64_t p = 0; p < P; ++p) starts[p + 1] += starts[p];     /* starts[p] = partition start */
+    for (int64_t p = 0; p < P; ++p) pcount[p] = starts[p];          /* scatter cursor */
+    for (int64_t i = 0; i < m; ++i) {
+        uint64_t h = wdb_mix((uint64_t)keys[i]); int64_t p = h >> shift;
+        scratch[pcount[p]++] = keys[i];
+    }
+    int64_t subcap = 1LL << subbits, submask = subcap - 1, ceiling = subcap - (subcap >> 3);
+    int overflow = 0;
+    #pragma omp parallel num_threads(nthreads)
+    {
+        int64_t* thk = (int64_t*)malloc(sizeof(int64_t) * subcap);
+        int64_t* thc = (int64_t*)malloc(sizeof(int64_t) * subcap);
+        if (thk && thc) {
+            #pragma omp for schedule(dynamic, 4)
+            for (int64_t p = 0; p < P; ++p) {
+                int64_t lo = starts[p], hi = starts[p + 1], filled = 0, w = starts[p];
+                for (int64_t s = 0; s < subcap; ++s) thk[s] = -1;
+                for (int64_t i = lo; i < hi; ++i) {
+                    int64_t k = scratch[i], h = (int64_t)(wdb_mix((uint64_t)k) & submask);
+                    while (1) {
+                        if (thk[h] == -1) {
+                            if (filled >= ceiling) { __atomic_store_n(&overflow, 1, __ATOMIC_RELAXED); break; }
+                            thk[h] = k; thc[h] = 1; filled++; break;
+                        } else if (thk[h] == k) { thc[h]++; break; }
+                        else h = (h + 1) & submask;
+                    }
+                }
+                int64_t d = 0;
+                for (int64_t s = 0; s < subcap; ++s) if (thk[s] != -1) { out_k[w + d] = thk[s]; out_c[w + d] = thc[s]; d++; }
+                pcount[p] = d;
+            }
+        } else { __atomic_store_n(&overflow, 1, __ATOMIC_RELAXED); }
+        free(thk); free(thc);
+    }
+    if (overflow) return -1;
+    int64_t total = 0; for (int64_t p = 0; p < P; ++p) total += pcount[p];
+    return total;
+}

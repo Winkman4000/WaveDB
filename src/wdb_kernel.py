@@ -19,6 +19,7 @@ import numpy as np
 
 _LIB = 0           # 0 = not yet attempted; None = unavailable; else the loaded CDLL
 _SRC = os.path.join(os.path.dirname(__file__), 'kernels', 'scanpair_kernel.c')
+_PARALLEL_MIN = 2_000_000   # survivor count above which radix+parallel tally beats the single table
 
 
 def _has_avx512():
@@ -44,7 +45,7 @@ def _load():
         if not os.path.exists(so):
             r = subprocess.run(
                 ['gcc', '-O3', '-march=native', '-mavx512f', '-mavx512bw', '-mavx512vl',
-                 '-mavx512dq', '-shared', '-fPIC', '-o', so, _SRC],
+                 '-mavx512dq', '-fopenmp', '-shared', '-fPIC', '-o', so, _SRC],
                 capture_output=True, timeout=60)
             if r.returncode != 0 or not os.path.exists(so):
                 return None
@@ -59,6 +60,9 @@ def _load():
                                         ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p]
         lib.wdb_tally.restype = ctypes.c_int64
         lib.wdb_tally.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_int] + [ctypes.c_void_p] * 4
+        lib.wdb_tally_parallel.restype = ctypes.c_int64
+        lib.wdb_tally_parallel.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_int, ctypes.c_int,
+                                           ctypes.c_int] + [ctypes.c_void_p] * 5
         _LIB = lib
     except Exception:
         _LIB = None
@@ -107,15 +111,38 @@ def scanpair_topk(cC, cA, cB, vC, Vb, k):
     keys = np.empty(m, dtype=np.int64)
     lib.wdb_gather_fuse(cA.ctypes.data, cA.dtype.itemsize, cB.ctypes.data, cB.dtype.itemsize,
                         pos.ctypes.data, m, int(Vb), keys.ctypes.data)
-    cb = _capbits(m)                                  # distinct <= m; size table to that
-    cap = 1 << cb
-    htab_k = np.empty(cap, np.int64); htab_c = np.empty(cap, np.int64)
-    out_k = np.empty(cap, np.int64); out_c = np.empty(cap, np.int64)
-    d = lib.wdb_tally(keys.ctypes.data, m, cb, htab_k.ctypes.data, htab_c.ctypes.data,
-                      out_k.ctypes.data, out_c.ctypes.data)
-    if d < 0:
-        return None                                   # table full (distinct > capped size) -> fall back
-    uk = out_k[:d]; cnt = out_c[:d]
+    # Tally. For large survivor sets, radix-partition + parallel per-partition tally (cache-resident,
+    # ~4-8 cores; past that, memory bandwidth caps it). Below the threshold, the single table wins
+    # (threading overhead not worth it). Either path falls back to None on overflow / unavailability.
+    uk = cnt = None
+    if m >= _PARALLEL_MIN:
+        pbits, subbits = 10, 16                        # 1024 partitions; 64K-slot sub-tables (cache)
+        nth = min(8, os.cpu_count() or 1)              # sweet spot; bandwidth-bound past ~8
+        Pn = 1 << pbits
+        scratch = np.empty(m, np.int64); starts = np.empty(Pn + 1, np.int64); pcount = np.empty(Pn, np.int64)
+        ok = np.empty(m, np.int64); oc = np.empty(m, np.int64)
+        d = lib.wdb_tally_parallel(keys.ctypes.data, m, pbits, subbits, nth,
+                                   scratch.ctypes.data, starts.ctypes.data, pcount.ctypes.data,
+                                   ok.ctypes.data, oc.ctypes.data)
+        if d >= 0:
+            # parallel output is gapped: partition p wrote pcount[p] entries at offset starts[p].
+            # compact into contiguous (uk, cnt).
+            uk = np.empty(d, np.int64); cnt = np.empty(d, np.int64); w = 0
+            for pp in range(Pn):
+                c = int(pcount[pp])
+                if c:
+                    o = int(starts[pp])
+                    uk[w:w+c] = ok[o:o+c]; cnt[w:w+c] = oc[o:o+c]; w += c
+    if uk is None:
+        cb = _capbits(m)                              # single-table path (small m, or parallel overflow)
+        cap = 1 << cb
+        htab_k = np.empty(cap, np.int64); htab_c = np.empty(cap, np.int64)
+        out_k = np.empty(cap, np.int64); out_c = np.empty(cap, np.int64)
+        d = lib.wdb_tally(keys.ctypes.data, m, cb, htab_k.ctypes.data, htab_c.ctypes.data,
+                          out_k.ctypes.data, out_c.ctypes.data)
+        if d < 0:
+            return None                               # table full -> fall back to numpy
+        uk = out_k[:d]; cnt = out_c[:d]
     kk = min(k, d)
     if kk < d:
         part = np.argpartition(cnt, -kk)[-kk:]
