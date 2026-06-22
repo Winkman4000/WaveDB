@@ -129,6 +129,61 @@ def _colname(node):
     return None
 
 
+# ---- scalar functions evaluated over a column's DICTIONARY (value-identity per code) ----------
+# f(value) that depends only on the value is a property of the dict entry, not the row: compute it
+# over the V distinct values once -> fval_by_code[V], then per-row value is fval_by_code[codes].
+# Same shape as the date-coarsening group key. Registry maps SQL func name -> (typed_dict -> int64[V]).
+
+def _fn_length(td):
+    """CHARACTER length of each dict value (matches DuckDB length()); None -> 0 (slot unused, the
+    null mask handles real nulls). Bytes decoded as utf-8 for true char count (ascii: == byte len)."""
+    out = np.empty(len(td), dtype=np.int64)
+    for i, v in enumerate(td):
+        if v is None: out[i] = 0
+        elif isinstance(v, (bytes, bytearray)): out[i] = len(v.decode('utf-8', 'replace'))
+        else: out[i] = len(str(v))
+    return out
+
+_SCALAR_FNS = { 'LENGTH': _fn_length }
+
+def _scalar_fn(node):
+    """Classify FUNC(column) where FUNC is registered -> ('sfn', fname, colname), else None."""
+    g = node.this if isinstance(node, E.Alias) else node
+    fname = None
+    if isinstance(g, E.Length): fname = 'LENGTH'
+    elif isinstance(g, (E.Anonymous, E.Func)):
+        nm = (getattr(g, 'name', '') or '').upper()
+        if nm in _SCALAR_FNS: fname = nm
+    if fname is None: return None
+    inner = g.this if not isinstance(g, E.Anonymous) else (g.expressions[0] if g.expressions else None)
+    if isinstance(inner, E.Column): return ('sfn', fname, inner.name)
+    return None
+
+_SFN_CACHE = {}   # (id(seg), col, fname) -> fval_by_code int64[V]
+
+def _fval_by_code(seg, fname, cn):
+    key = (id(seg), cn, fname)
+    m = _SFN_CACHE.get(key)
+    if m is None:
+        m = _SCALAR_FNS[fname](seg._typed_dict(cn))
+        _SFN_CACHE[key] = m
+    return m
+
+def _sfn_array(seg, fname, cn, mask=None):
+    """Derived per-row int64 array fval_by_code[codes] + null mask (null code -> null). Applies mask
+    if given. One implementation shared by the group path and the aggregate path."""
+    fv = _fval_by_code(seg, fname, cn)
+    codes = seg.codes(cn)
+    c = seg.cols[cn]
+    nmask = None
+    if c.get('has_null'):
+        nmask = (codes == (c['V'] - 1))
+    arr = fv[codes]
+    if mask is not None:
+        arr = arr[mask]; nmask = nmask[mask] if nmask is not None else None
+    return arr, nmask
+
+
 _EXTRACT_UNITS = {'YEAR', 'MONTH', 'QUARTER', 'DAY', 'HOUR', 'MINUTE'}
 _TRUNC_UNITS = {'YEAR', 'QUARTER', 'MONTH', 'WEEK', 'DAY', 'HOUR', 'MINUTE'}
 _NP_UNIT = {'YEAR': 'Y', 'MONTH': 'M', 'WEEK': 'W', 'DAY': 'D', 'HOUR': 'h', 'MINUTE': 'm'}
@@ -229,6 +284,9 @@ def _group_key(node, proj=None):
         col = g.this
         if unit in _TRUNC_UNITS and isinstance(col, E.Column):
             return ('fn', col.name, 'TRUNC:' + unit)
+    sf = _scalar_fn(g)                                       # length(col) etc. -> scalar-fn group key
+    if sf is not None:
+        return ('sfn', sf[2], sf[1])                        # ('sfn', colname, fname)
     raise NotImplementedError(f"unsupported GROUP BY key: {g.sql()!r}")
 
 
@@ -373,6 +431,11 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
             row_gv = gid_of_code[gc]                            # per-row group value
             u, inv = np.unique(row_gv, return_inverse=True)    # distinct group values + per-row slot
             metas.append((gn, 'computed', u, unit))
+        elif gk[0] == 'sfn':
+            # scalar fn (e.g. length(col)): evaluate over the DICTIONARY, gather per row, group on it.
+            row_gv, _ = _sfn_array(seg, gk[2], gn, mask)       # gk[2]=fname; per-row int64 value
+            u, inv = np.unique(row_gv, return_inverse=True)
+            metas.append((gn, 'computed', u, None))            # plain int group values
         elif seg.cols[gn]['mode'] == 4:
             vals = seg.values(gn); vals = vals[mask] if mask is not None else vals
             u, inv = np.unique(vals, return_inverse=True)      # value-identity keys
@@ -401,20 +464,26 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
     gstarts = np.searchsorted(combo_s, uc); gends = np.r_[gstarts[1:], len(combo_s)]
     aggcache={}
     def groupagg(colname, fn, gi):
-        pcol = seg_col(colname)
-        if colname not in aggcache:
-            arr, nm = _col(seg, pcol)              # cache NATIVE dtype; float cast only for SUM/AVG
-            if mask is not None:
-                arr = arr[mask]; nm = nm[mask] if nm is not None else None
-            aggcache[colname]=(arr[order], (nm[order] if nm is not None else None))
+        is_sfn = isinstance(colname, tuple) and colname[0] == 'sfn'
+        ckey = colname if not is_sfn else colname            # tuple is hashable -> fine as cache key
+        if ckey not in aggcache:
+            if is_sfn:                                        # AVG/SUM/... over length(col) etc.
+                arr, nm = _sfn_array(seg, colname[1], seg_col(colname[2]), mask)
+            else:
+                pcol = seg_col(colname)
+                arr, nm = _col(seg, pcol)          # cache NATIVE dtype; float cast only for SUM/AVG
+                if mask is not None:
+                    arr = arr[mask]; nm = nm[mask] if nm is not None else None
+            aggcache[ckey]=(arr[order], (nm[order] if nm is not None else None))
+        colname = ckey
         vs, vn = aggcache[colname]; sl=slice(gstarts[gi],gends[gi]); seg_v=vs[sl]
         if vn is not None: seg_v = seg_v[~vn[sl]]      # SQL: aggregates ignore NULLs
         if fn=='COUNT': return len(seg_v)
         if len(seg_v)==0: return None
         if fn in ('MIN', 'MAX'):                       # native min/max (datetime/string included)
             v = seg_v.min() if fn == 'MIN' else seg_v.max()
-            if seg.cols[pcol]['dt'] == 3 and isinstance(v, (int, np.integer)):
-                v = np.int64(v).view(f"datetime64[{seg.unit(pcol)}]")
+            if not is_sfn and seg.cols[seg_col(colname)]['dt'] == 3 and isinstance(v, (int, np.integer)):
+                v = np.int64(v).view(f"datetime64[{seg.unit(seg_col(colname))}]")
             return v
         segf = seg_v.astype(np.float64)
         return {'SUM': segf.sum(), 'AVG': segf.mean()}[fn]
@@ -495,7 +564,12 @@ def _agg_kind(p):
         if isinstance(inner.this, E.Star) or inner.this is None: return ('COUNT_STAR',)
         return ('COUNT', _colname(inner.this))
     for cls,nm in [(E.Sum,'SUM'),(E.Avg,'AVG'),(E.Min,'MIN'),(E.Max,'MAX')]:
-        if isinstance(inner, cls): return (nm, _colname(inner.this))
+        if isinstance(inner, cls):
+            cn = _colname(inner.this)
+            if cn is not None: return (nm, cn)
+            sf = _scalar_fn(inner.this)               # FN(length(col)) -> carry the sfn spec
+            if sf is not None: return (nm, sf)         # (FN, ('sfn', fname, colname))
+            return (nm, None)
     return None  # not an aggregate -> group key
 def _count_topk_plan(proj, agg_specs, tree):
     """Return k (the LIMIT) when this grouped query is a COUNT(*)-only top-K by that count:
@@ -639,6 +713,14 @@ def _agg_scalar(seg, p, mask, seg_col):
     kind=_agg_kind(p)
     if kind[0]=='COUNT_STAR': return int(mask.sum()) if mask is not None else seg.N
     fn,cn=kind
+    if isinstance(cn, tuple) and cn[0] == 'sfn':              # FN(length(col)) etc., no GROUP BY
+        arr, nm = _sfn_array(seg, cn[1], seg_col(cn[2]), mask)
+        if nm is not None: arr = arr[~nm]
+        if fn == 'COUNT': return int(len(arr))
+        if len(arr) == 0: return None
+        if fn in ('MIN', 'MAX'): return _pyval(arr.min() if fn == 'MIN' else arr.max())
+        arrf = arr.astype(np.float64)
+        return _pyval({'SUM': arrf.sum(), 'AVG': arrf.mean()}[fn])
     arr, nm = _col(seg, seg_col(cn))
     if mask is not None:
         arr = arr[mask]; nm = nm[mask] if nm is not None else None
