@@ -23,6 +23,7 @@ ORDER BY COUNT(*) DESC + LIMIT, no HAVING/DISTINCT/JOIN/OFFSET, WHERE = a single
 """
 import numpy as np
 import wdb_sql
+import wdb_kernel
 import wdb_policies as P
 import workers
 E = wdb_sql.E
@@ -141,42 +142,48 @@ def execute(seg, spec):
     cC = seg.codes(fcol)
     if fcodes.size == 0:
         return [], [wdb_sql._alias(p) for p in proj]      # literal absent -> empty result
-    mask = (cC == fcodes[0]) if fcodes.size == 1 else np.isin(cC, fcodes)
-    pos = np.nonzero(mask)[0]
-    if pos.size == 0:
-        return [], [wdb_sql._alias(p) for p in proj]
-    # 2) gather the two group-key codes at the matched rows
     a, b = cols
     Va = int(seg.cols[a]['V']); Vb = int(seg.cols[b]['V'])
-    # 3) fuse + count. Read FEWER BYTES: fuse into the narrowest int that holds Va*Vb, so the
-    #    sort in np.unique moves half the bytes when the pair fits uint32 (the common case). The
-    #    aggregation -- not the scan -- is the cost at high match, and it scales with key width.
     prod = Va * Vb
-    if prod < (1 << 32):
-        fdt = np.uint32
-    elif prod < (1 << 64):
-        fdt = np.int64
-    else:
-        fdt = None
-    if fdt is not None and fdt is np.uint32:
-        key = (seg.codes(a)[pos].astype(np.uint32) * np.uint32(Vb) + seg.codes(b)[pos].astype(np.uint32))
-    else:
-        key = seg.codes(a)[pos].astype(np.int64) * Vb + seg.codes(b)[pos].astype(np.int64)
-    uk, cnt = np.unique(key, return_counts=True)
-    k = lim
-    if k < cnt.size:
-        part = np.argpartition(cnt, -k)[-k:]
-        order = part[np.argsort(cnt[part])[::-1]]
-    else:
-        order = np.argsort(cnt)[::-1]
-    # 4) decode ONLY the K winner codes via random-access fetch (not the whole dictionary -- a full
-    #    _typed_dict decode of a high-card key is ~1s; we need ~K values)
+    # FAST PATH (single C code, fused key fits uint32): the AVX-512 kernel scans C alone for
+    # survivor positions, gathers A/B only there (native width, no upcast), and HASH-tallies the
+    # pairs (counts, never sorts; memory = pairs that occur, not the a*b key space). Returns the
+    # decoded-code top-K, or None (kernel unavailable / out of shape) to fall back to numpy below.
+    winners = None
+    if fcodes.size == 1 and prod < (1 << 32):
+        kr = wdb_kernel.scanpair_topk(seg.codes(fcol), seg.codes(a), seg.codes(b),
+                                      int(fcodes[0]), Vb, lim)
+        if kr is not None:
+            ka, kb, kc = kr
+            if ka.size == 0:
+                return [], [wdb_sql._alias(p) for p in proj]
+            winners = [(int(ka[i]), int(kb[i]), int(kc[i])) for i in range(ka.size)]
+
+    if winners is None:
+        # numpy fallback: scan -> gather both columns -> narrow-fuse -> unique-sort -> top-K
+        mask = (cC == fcodes[0]) if fcodes.size == 1 else np.isin(cC, fcodes)
+        pos = np.nonzero(mask)[0]
+        if pos.size == 0:
+            return [], [wdb_sql._alias(p) for p in proj]
+        if prod < (1 << 32):
+            key = (seg.codes(a)[pos].astype(np.uint32) * np.uint32(Vb) + seg.codes(b)[pos].astype(np.uint32))
+        else:
+            key = seg.codes(a)[pos].astype(np.int64) * Vb + seg.codes(b)[pos].astype(np.int64)
+        uk, cnt = np.unique(key, return_counts=True)
+        k = lim
+        if k < cnt.size:
+            part = np.argpartition(cnt, -k)[-k:]
+            order = part[np.argsort(cnt[part])[::-1]]
+        else:
+            order = np.argsort(cnt)[::-1]
+        winners = [(int(uk[idx]) // Vb, int(uk[idx]) % Vb, int(cnt[idx])) for idx in order[:k]]
+
+    # decode ONLY the K winner codes via random-access fetch (never the whole dictionary)
     rows = []
-    for idx in order[:k]:
-        acode = int(uk[idx]) // Vb; bcode = int(uk[idx]) % Vb
+    for acode, bcode, ccount in winners:
         codeof = {a: acode, b: bcode}
         row = [None] * len(proj)
-        row[ci] = int(cnt[idx])
+        row[ci] = ccount
         for pi, pp in enumerate(proj):
             if pi == ci: continue
             knm = wdb_sql._proj_colname(pp)
