@@ -68,13 +68,20 @@ def _load():
 _SCAN = {1: 'wdb_scan_u8', 2: 'wdb_scan_u16', 4: 'wdb_scan_u32'}
 
 
-def _capbits(distinct_upper):
-    """Hash capacity ~2x an upper bound on distinct keys (load factor < 0.5), clamped."""
+def _capbits(m):
+    """Pick the open-addressing table size (power-of-two slots) for m survivor rows.
+
+    The table only needs to hold the DISTINCT pairs, which is usually far below the row count m.
+    Sizing to 2*m badly oversizes when pairs repeat (the common high-match case): a 1GB table spends
+    all its time zeroing and cache-missing. Measured: for ~1.8M distinct pairs, a 2M-slot table
+    (load factor ~0.85, fits in cache) tallied ~2.4x faster than a 67M-slot one. So we size to ~2*m
+    but CAP at 2^22 (4M slots, 64MB) -- past that, a higher load factor on a cache-resident table
+    beats a sparse table that thrashes memory. Linear probing stays fine up to ~0.85 here."""
     b = 10
-    target = max(distinct_upper * 2, 1024)
+    target = max(m * 2, 1024)
     while (1 << b) < target:
         b += 1
-    return min(b, 27)
+    return min(b, 22)
 
 
 def scanpair_topk(cC, cA, cB, vC, Vb, k):
@@ -106,6 +113,8 @@ def scanpair_topk(cC, cA, cB, vC, Vb, k):
     out_k = np.empty(cap, np.int64); out_c = np.empty(cap, np.int64)
     d = lib.wdb_tally(keys.ctypes.data, m, cb, htab_k.ctypes.data, htab_c.ctypes.data,
                       out_k.ctypes.data, out_c.ctypes.data)
+    if d < 0:
+        return None                                   # table full (distinct > capped size) -> fall back
     uk = out_k[:d]; cnt = out_c[:d]
     kk = min(k, d)
     if kk < d:

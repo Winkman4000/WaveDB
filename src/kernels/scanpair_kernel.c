@@ -105,12 +105,20 @@ void wdb_gather_fuse(const void* cA, int aw, const void* cB, int bw,
 int64_t wdb_tally(const int64_t* keys, int64_t m, int capbits,
                   int64_t* htab_k, int64_t* htab_c, int64_t* out_k, int64_t* out_c) {
     int64_t cap = 1LL << capbits, mask = cap - 1;
+    /* Fill ceiling: never let the table get so full that linear probing degenerates / can't insert.
+     * If distinct keys would exceed this, bail with -1 so the caller falls back to the numpy path
+     * (this also makes a too-small capped table SAFE rather than an infinite probe loop). */
+    int64_t ceiling = cap - (cap >> 3);          /* 87.5% load max */
+    int64_t distinct = 0;
     for (int64_t i = 0; i < cap; ++i) htab_k[i] = -1;
     for (int64_t i = 0; i < m; ++i) {
         int64_t k = keys[i];
         int64_t h = (k * 2654435761LL) & mask;
         while (1) {
-            if (htab_k[h] == -1) { htab_k[h] = k; htab_c[h] = 1; break; }
+            if (htab_k[h] == -1) {
+                if (distinct >= ceiling) return -1;   /* table too full -> signal fallback */
+                htab_k[h] = k; htab_c[h] = 1; distinct++; break;
+            }
             else if (htab_k[h] == k) { htab_c[h]++; break; }
             else h = (h + 1) & mask;
         }
