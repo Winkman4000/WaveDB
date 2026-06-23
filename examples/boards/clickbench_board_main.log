@@ -1,46 +1,46 @@
 idx | cold_ms warm_ms | duck_ms | ratio(warm) | ok
-Q00 | 344 8.4 | 51.4 | 6.13x | True
-Q01 | 798 61.2 | 101.9 | 1.66x | True
-Q02 | 2917 645.8 | 154.3 | 0.24x | False
-Q03 | 2252 66.0 | 277.0 | 4.20x | False
-Q04 | 152 1.9 | 469.3 | 243.76x | True
-Q05 | 151 1.7 | 638.7 | 370.87x | True
-Q06 | 1190 23.2 | 174.3 | 7.52x | False
-Q07 | 1505 60.0 | 123.9 | 2.07x | True
-Q08 | 149 1.7 | 503.1 | 298.88x | True
-Q09 | 1970 981.4 | 617.6 | 0.63x | True
-Q10 | 154 1.5 | 188.5 | 129.14x | True
-Q11 | 4649 2427.7 | 201.3 | 0.08x | True
-Q12 | 8101 3641.2 | 630.0 | 0.17x | True
-Q13 | 4046 796.6 | 794.4 | 1.00x | True
-Q14 | 4056 60.7 | 608.7 | 10.02x | True
-Q15 | 662 1.3 | 413.4 | 312.82x | True
-Q16 | 4486 9.8 | 1047.2 | 106.98x | True
-Q17 | ---- ---- | 906.4 | - | ?  <TIMEOUT>45s
-Q18 | ---- ---- | 1950.2 | - | ?  <TIMEOUT>45s
-Q19 | 2307 971.0 | 103.3 | 0.11x | True
-Q20 | ---- ---- | 1661.6 | - | ?  <TIMEOUT>45s
-Q21 | ---- ---- | 987.1 | - | ?  <TIMEOUT>45s
-Q22 | ---- ---- | 2058.1 | - | ?  <TIMEOUT>45s
-Q23 | ---- ---- | 1591.0 | - | ?  <TIMEOUT>45s
-Q24 | 897 2.0 | 485.5 | 248.73x | False
-Q25 | 554 3.2 | 397.3 | 125.05x | True
-Q26 | 898 18.9 | 445.5 | 23.60x | True
-Q27 | ---- ---- | 1080.7 | - | ?  <NotImplementedError: unknown column: None
-Q28 | ---- ---- | 8775.7 | - | ?  <NotImplementedError: unsupported GROUP BY key: "REGEXP_REPLACE(Referer, '^https?://(?:www\\.)?([^/]+)/.*$', '\\
-Q29 | 15466 367.9 | 112.5 | 0.31x | False
-Q30 | 19644 14242.5 | 554.8 | 0.04x | False
-Q31 | ---- ---- | 881.9 | - | ?  <TIMEOUT>45s
-Q32 | ---- ---- | 1610.2 | - | ?  <TIMEOUT>45s
-Q33 | 11273 1.2 | 1834.7 | 1568.43x | True
-Q34 | ---- ---- | 1896.2 | - | ?  <NotImplementedError: unsupported GROUP BY key: '1'
-Q35 | ---- ---- | 528.5 | - | ?  <NotImplementedError: unsupported GROUP BY key: 'ClientIP - 1'
-Q36 | 15267 1903.6 | 294.9 | 0.15x | True
-Q37 | 9016 1443.6 | 158.1 | 0.11x | True
-Q38 | 5242 839.9 | 206.2 | 0.25x | False
-Q39 | ---- ---- | 479.0 | - | ?  <NotImplementedError: unsupported GROUP BY key: "CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer
-Q40 | 5983 1392.2 | 131.1 | 0.09x | False
-Q41 | 4592 706.4 | 97.0 | 0.14x | False
-Q42 | 2355 628.7 | 127.3 | 0.20x | True
+Q00 | 310 5.7 | 51.4 | 8.96x | True
+Q01 | 717 60.0 | 102.8 | 1.71x | True
+Q02 | 2850 644.3 | 114.0 | 0.18x | False
+Q03 | 2272 72.1 | 288.3 | 4.00x | False
+Q04 | 157 2.5 | 408.4 | 160.42x | True
+Q05 | 156 2.1 | 646.5 | 306.21x | True
+Q06 | 1170 23.5 | 173.9 | 7.39x | False
+Q07 | 1489 78.2 | 96.6 | 1.23x | True
+Q08 | 160 2.6 | 434.3 | 168.90x | True
+Q09 | 1925 951.9 | 531.1 | 0.56x | True
+Q10 | 153 2.2 | 183.2 | 85.11x | True
+Q11 | 4398 2183.6 | 211.9 | 0.10x | True
+Q12 | 6339 1712.8 | 554.7 | 0.32x | True
+Q13 | 3919 775.6 | 720.2 | 0.93x | True
+Q14 | 4034 59.7 | 532.5 | 8.92x | True
+Q15 | 647 1.4 | 391.3 | 270.21x | True
+Q16 | 4575 9.5 | 977.1 | 102.63x | True
+Q17 | 25433 18959.1 | 834.0 | 0.04x | False
+Q18 | ---- ---- | 1807.3 | - | ?  <TIMEOUT>60s
+Q19 | 2365 913.7 | 84.5 | 0.09x | True
+Q20 | 27388 7935.2 | 975.7 | 0.12x | True
+Q21 | 35000 12870.2 | 918.5 | 0.07x | True
+Q22 | ---- ---- | 1956.2 | - | ?  <TIMEOUT>60s
+Q23 | ---- ---- | 1755.1 | - | ?  <TIMEOUT>60s
+Q24 | 880 1.7 | 540.0 | 315.29x | False
+Q25 | 554 3.3 | 354.9 | 106.71x | True
+Q26 | 897 19.1 | 432.3 | 22.63x | True
+Q27 | 20834 2894.9 | 1086.9 | 0.38x | True
+Q28 | ---- ---- | 8092.4 | - | ?  <NotImplementedError: unsupported GROUP BY key: "REGEXP_REPLACE(Referer, '^https?://(?:www\\.)?([^/]+)/.*$', '\\
+Q29 | 15224 369.2 | 110.0 | 0.30x | False
+Q30 | 15467 9463.3 | 553.6 | 0.06x | False
+Q31 | ---- ---- | 803.8 | - | ?  <TIMEOUT>60s
+Q32 | ---- ---- | 1518.4 | - | ?  <TIMEOUT>60s
+Q33 | 11259 1.1 | 1723.9 | 1597.19x | True
+Q34 | ---- ---- | 1770.7 | - | ?  <NotImplementedError: unsupported GROUP BY key: '1'
+Q35 | ---- ---- | 482.6 | - | ?  <NotImplementedError: unsupported GROUP BY key: 'ClientIP - 1'
+Q36 | 15242 1864.9 | 292.7 | 0.16x | True
+Q37 | 9117 1448.5 | 283.6 | 0.20x | True
+Q38 | 5181 878.2 | 217.6 | 0.25x | False
+Q39 | ---- ---- | 313.0 | - | ?  <NotImplementedError: unsupported GROUP BY key: "CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer
+Q40 | 6211 1409.3 | 144.1 | 0.10x | False
+Q41 | 4508 691.6 | 113.6 | 0.16x | False
+Q42 | 2325 603.1 | 114.0 | 0.19x | True
 
-SUMMARY ok=21/43 faster=13 median_ratio_ok=6.13x
+SUMMARY ok=24/43 faster=13 median_ratio_ok=1.47x
