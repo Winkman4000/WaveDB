@@ -169,6 +169,28 @@ def _fval_by_code(seg, fname, cn):
         _SFN_CACHE[key] = m
     return m
 
+def _ck(cn):
+    """Hashable stable key for an aggregate column ref (plain name or ('sfn',fname,col) tuple)."""
+    return cn if not isinstance(cn, tuple) else tuple(cn)
+
+
+def _factorize_nonneg(x, domain=None):
+    """Like np.unique(x, return_inverse=True) but for non-negative ints with a known/derivable
+    small domain. Returns (present_sorted_values, inverse_indices). Avoids the argsort-based
+    return_inverse path (measured ~27x faster on 100M codes): count present via bincount, build a
+    dense remap, gather. `domain` = upper bound (exclusive) on values; derived from max+1 if None."""
+    x = np.ascontiguousarray(x)
+    if x.size == 0:
+        return np.empty(0, x.dtype), np.empty(0, np.int64)
+    hi = int(domain) if domain is not None else int(x.max()) + 1
+    if hi <= 0:
+        return np.unique(x, return_inverse=True)
+    present = np.nonzero(np.bincount(x, minlength=hi))[0]    # sorted distinct present values
+    remap = np.empty(hi, np.int64); remap[present] = np.arange(len(present))
+    inv = remap[x]
+    return present, inv
+
+
 def _sfn_array(seg, fname, cn, mask=None):
     """Derived per-row int64 array fval_by_code[codes] + null mask (null code -> null). Applies mask
     if given. One implementation shared by the group path and the aggregate path."""
@@ -419,7 +441,7 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
             rows = rows[off: off + lim] if lim is not None else rows[off:]
         global _DATECOUNT_HITS; _DATECOUNT_HITS += 1
         return rows, [_alias(p) for p in proj]
-    combo = None; metas=[]   # metas[i] = (gn, kind, table): 'val'->unique values, 'code'->unique codes, 'computed'->(unit, table of typed group values)
+    combo = None; combo_dom = None; metas=[]   # metas[i] = (gn, kind, table): 'val'->unique values, 'code'->unique codes, 'computed'->(unit, table of typed group values)
     for gn, gk in zip(gnames, gkeys):
         if gk[0] == 'fn':
             # date coarsening: evaluate the unit over the column's DICTIONARY (V values, not N rows),
@@ -434,7 +456,7 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
         elif gk[0] == 'sfn':
             # scalar fn (e.g. length(col)): evaluate over the DICTIONARY, gather per row, group on it.
             row_gv, _ = _sfn_array(seg, gk[2], gn, mask)       # gk[2]=fname; per-row int64 value
-            u, inv = np.unique(row_gv, return_inverse=True)
+            u, inv = _factorize_nonneg(row_gv)                 # lengths are non-negative ints
             metas.append((gn, 'computed', u, None))            # plain int group values
         elif seg.cols[gn]['mode'] == 4:
             vals = seg.values(gn); vals = vals[mask] if mask is not None else vals
@@ -442,10 +464,20 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
             metas.append((gn, 'val', u, None))
         else:
             gc = seg.codes(gn); gc = gc[mask] if mask is not None else gc
-            u, inv = np.unique(gc, return_inverse=True)
+            u, inv = _factorize_nonneg(gc)                     # codes dense; domain=max+1 (handles override codes >= V)
             metas.append((gn, 'code', u, None))
         combo = inv if combo is None else combo*len(u)+inv
-    uc, counts = np.unique(combo, return_counts=True)
+        combo_dom = len(u) if combo_dom is None else combo_dom*len(u)
+    # uc/counts: when the combined key domain is modest, bincount over it (no 100M sort). The sort-based
+    # np.unique(return_counts) on 100M combos was ~2.9s; bincount is ~0.1s and also gives dense gids.
+    if combo_dom is not None and combo_dom <= 64_000_000:
+        cc = np.bincount(combo, minlength=combo_dom)
+        uc = np.nonzero(cc)[0]                              # present combined keys (sorted)
+        counts = cc[uc]
+        _combo_dense = True                                # combo values index directly into a dense space
+    else:
+        uc, counts = np.unique(combo, return_counts=True)
+        _combo_dense = False
     def decombo(cv):
         out=[]; x=cv
         for m in reversed(metas): u=m[2]; out.append(int(x%len(u))); x//=len(u)
@@ -460,8 +492,67 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
         if c['has_null'] and int(code) == c['V']-1: return None
         return seg.fetch(gn, int(code))
     agg_specs = [(p, _agg_kind(p)) for p in proj]
-    order = np.argsort(combo, kind='stable'); combo_s=combo[order]
-    gstarts = np.searchsorted(combo_s, uc); gends = np.r_[gstarts[1:], len(combo_s)]
+
+    # ---- bincount scatter-aggregation fast path (SUM/COUNT/AVG only) ----
+    # The argsort-based per-group slicing below sorts all N rows (~8s+ at 100M). When every aggregate
+    # is decomposable (COUNT(*), COUNT(col), SUM, AVG) we don't need rows grouped contiguously: scatter
+    # each row's value into its group bucket with np.bincount over a dense group id. O(N), no sort.
+    # MIN/MAX and COUNT(DISTINCT) still need the argsort/slice path, so we gate them out.
+    def _decomposable(kind):
+        if kind is None: return True                          # group key, not an agg
+        if kind[0] in ('COUNT_STAR', 'COUNT', 'SUM', 'AVG'): return True
+        return False
+    _has_distinct = any(
+        isinstance((p.this if isinstance(p, E.Alias) else p), E.Count)
+        and isinstance((p.this if isinstance(p, E.Alias) else p).this, E.Distinct)
+        for p, _ in agg_specs)
+    _fast = (not _has_distinct) and all(_decomposable(k) for _, k in agg_specs)
+
+    fast_count = None; fast_sum = {}
+    if _fast:
+        G = len(uc)
+        if _combo_dense:
+            # combo already indexes the dense combo_dom space; map combo-value -> 0..G-1 via a remap
+            # table (gather), avoiding the ~2s searchsorted(uc, combo) over 100M.
+            remap = np.empty(combo_dom, np.int64); remap[uc] = np.arange(G)
+            gid = remap[combo]
+            fast_count = counts.astype(np.int64)              # counts already = cc[uc] from bincount
+        else:
+            gid = np.searchsorted(uc, combo)                  # dense group id per row, 0..G-1
+            fast_count = np.bincount(gid, minlength=G).astype(np.int64)
+        for _p, kind in agg_specs:
+            if kind is None or kind[0] in ('COUNT_STAR',): continue
+            fn, cn = kind
+            fkey = (fn, cn if not isinstance(cn, tuple) else cn)
+            if fn == 'COUNT' and cn is None: continue
+            # build the value array (+ null mask) for cn, then bincount-scatter into groups
+            if isinstance(cn, tuple) and cn[0] == 'sfn':
+                arr, nm = _sfn_array(seg, cn[1], seg_col(cn[2]), mask)
+            else:
+                arr, nm = _col(seg, seg_col(cn))
+                if mask is not None:
+                    arr = arr[mask]; nm = nm[mask] if nm is not None else None
+            if fn in ('SUM', 'AVG'):
+                is_int = np.issubdtype(arr.dtype, np.integer)
+                if nm is not None:                            # NULLs excluded from sum and from the AVG denominator
+                    valid = ~nm; gv = gid[valid]; av = arr[valid]
+                    cnts = np.bincount(gv, minlength=G).astype(np.int64)
+                else:
+                    gv = gid; av = arr; cnts = fast_count
+                if is_int:                                    # exact integer sum (no float64 mantissa loss)
+                    sums = np.zeros(G, np.int64); np.add.at(sums, gv, av.astype(np.int64))
+                else:
+                    sums = np.bincount(gv, weights=av.astype(np.float64), minlength=G)
+                fast_sum[(fn, _ck(cn))] = (sums, cnts, is_int)
+            elif fn == 'COUNT':                               # COUNT(col) = non-null count
+                cnts = np.bincount(gid[~nm], minlength=G).astype(np.int64) if nm is not None else fast_count
+                fast_sum[(fn, _ck(cn))] = (None, cnts, False)
+
+    if _fast:
+        order = None; gstarts = gends = None                  # argsort path not needed on fast path
+    else:
+        order = np.argsort(combo, kind='stable'); combo_s=combo[order]
+        gstarts = np.searchsorted(combo_s, uc); gends = np.r_[gstarts[1:], len(combo_s)]
     aggcache={}
     def groupagg(colname, fn, gi):
         is_sfn = isinstance(colname, tuple) and colname[0] == 'sfn'
@@ -533,6 +624,18 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
                 rowout.append(_pyval(keyval(ki, keyidx[ki]))); ki+=1
             elif kind[0]=='COUNT_STAR':
                 rowout.append(int(counts[gi]))
+            elif _fast:
+                fn,cn=kind
+                if fn=='COUNT' and cn is None:
+                    rowout.append(int(fast_count[gi]))
+                elif fn=='COUNT':
+                    rowout.append(int(fast_sum[(fn,_ck(cn))][1][gi]))
+                else:
+                    sums,cnts,is_int=fast_sum[(fn,_ck(cn))]
+                    c=int(cnts[gi])
+                    if c==0: rowout.append(None)
+                    elif fn=='SUM': rowout.append(int(sums[gi]) if is_int else _pyval(sums[gi]))
+                    else: rowout.append(_pyval(float(sums[gi])/c))   # AVG always float
             else:
                 fn,cn=kind; rowout.append(_pyval(groupagg(cn, fn, gi)))
         rows.append(tuple(rowout))
@@ -998,23 +1101,29 @@ def _eval_pred(seg, node, seg_col):
     raise NotImplementedError(f"predicate {type(node).__name__}")
 
 def _apply_having(rows, proj, node, seg_col):
-    # map aggregate expr in HAVING to its column index in proj
-    def val(row, expr):
-        for i,p in enumerate(proj):
-            inner=p.this if isinstance(p,E.Alias) else p
-            if inner.sql()==expr.sql(): return row[i]
-        # COUNT(*) match
-        raise NotImplementedError("HAVING references non-projected expr")
+    # Resolve each HAVING leaf's column index ONCE (was: inner.sql()==expr.sql() per row, which
+    # re-serialised the AST ~ncols times per group -- O(groups*cols) sqlglot .sql() calls).
     import operator
-    def test(row,n):
-        if isinstance(n,E.And): return test(row,n.this) and test(row,n.expression)
-        if isinstance(n,E.Or): return test(row,n.this) or test(row,n.expression)
-        if isinstance(n,(E.GT,E.LT,E.GTE,E.LTE,E.EQ,E.NEQ)):
-            lhs=val(row,n.this); rhs=float(n.expression.this)
-            op={E.GT:operator.gt,E.LT:operator.lt,E.GTE:operator.ge,E.LTE:operator.le,E.EQ:operator.eq,E.NEQ:operator.ne}[type(n)]
-            return op(lhs,rhs)
+    proj_inner = [(p.this if isinstance(p, E.Alias) else p) for p in proj]
+    proj_sql = [pi.sql() for pi in proj_inner]                 # serialise each projection ONCE
+    def col_index(expr):
+        es = expr.sql()
+        for i, ps in enumerate(proj_sql):
+            if ps == es: return i
+        raise NotImplementedError("HAVING references non-projected expr")
+    OPS = {E.GT:operator.gt,E.LT:operator.lt,E.GTE:operator.ge,E.LTE:operator.le,E.EQ:operator.eq,E.NEQ:operator.ne}
+    # compile the predicate tree to a closure over precomputed indices (no per-row .sql())
+    def compile_node(n):
+        if isinstance(n, E.And):
+            a, b = compile_node(n.this), compile_node(n.expression); return lambda r: a(r) and b(r)
+        if isinstance(n, E.Or):
+            a, b = compile_node(n.this), compile_node(n.expression); return lambda r: a(r) or b(r)
+        if isinstance(n, (E.GT,E.LT,E.GTE,E.LTE,E.EQ,E.NEQ)):
+            idx = col_index(n.this); rhs = float(n.expression.this); op = OPS[type(n)]
+            return lambda r: op(r[idx], rhs)
         raise NotImplementedError("HAVING op")
-    return [r for r in rows if test(r,node)]
+    pred = compile_node(node)
+    return [r for r in rows if pred(r)]
 
 def _apply_order(rows, proj, order):
     if order is None: return rows
