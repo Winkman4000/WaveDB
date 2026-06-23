@@ -280,14 +280,31 @@ def _date_count_rollup(seg, col, unit):
         return {_trunc_to_dt(k, du): int(v) for k, v in zip(keys.tolist(), g.tolist())}
     return dict(zip(keys.tolist(), g.tolist()))
 
-def _group_key(node, proj=None):
+def _literal_value(g):
+    """Python value of a sqlglot Literal (string -> str, else int then float)."""
+    if g.is_string: return g.this
+    sv = g.this
+    try: return int(sv)
+    except (ValueError, TypeError): return float(sv)
+
+
+def _group_key(node, proj=None, _resolve_pos=True):
     """Classify a GROUP BY expression. Returns:
       ('col', name)        -- a bare value-identity column (today's path, unchanged)
       ('fn', col, unit)    -- EXTRACT(unit FROM col): a date coarsening, grouped in code space
+      ('sfn', col, fname)  -- scalar function of a column, e.g. length(col)
+      ('const', value)     -- a constant literal key (GROUP BY 1 resolves here when SELECT 1 ...)
     Raises NotImplementedError for anything else, preserving the prior 'unknown column' behavior.
     `proj` (the SELECT list) lets a bare GROUP BY name resolve to a projection alias -- e.g.
     SELECT EXTRACT(year FROM d) AS y ... GROUP BY y, where sqlglot parses `y` as a Column."""
     g = node.this if isinstance(node, E.Alias) else node
+    # Positional GROUP BY: an integer literal refers to the Nth SELECT item (1-based). SQL-standard.
+    # Resolve once (_resolve_pos guard) so a resolved integer literal (SELECT 1) becomes a const key
+    # rather than recursing as another position.
+    if _resolve_pos and proj and isinstance(g, E.Literal) and g.is_int:
+        pos = int(g.this)
+        if 1 <= pos <= len(proj):
+            return _group_key(proj[pos-1], proj, _resolve_pos=False)
     nm = _colname(g)
     if nm is not None and proj is not None:
         for p in proj:                                  # bare name matching a SELECT alias -> its expr
@@ -309,6 +326,8 @@ def _group_key(node, proj=None):
     sf = _scalar_fn(g)                                       # length(col) etc. -> scalar-fn group key
     if sf is not None:
         return ('sfn', sf[2], sf[1])                        # ('sfn', colname, fname)
+    if isinstance(g, E.Literal):                            # constant key (e.g. GROUP BY 1 -> SELECT 1)
+        return ('const', _literal_value(g))
     raise NotImplementedError(f"unsupported GROUP BY key: {g.sql()!r}")
 
 
@@ -350,7 +369,7 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
     proj = tree.expressions  # list of selected exprs
     group = tree.args.get('group')
     gkeys = [ _group_key(g, proj) for g in group.expressions ] if group else []
-    gcols = [ k[1] for k in gkeys ]   # underlying column name per group key (bare col or fn(col))
+    gcols = [ (None if k[0]=='const' else k[1]) for k in gkeys ]   # underlying column (None for const keys)
     where = tree.args.get('where')
 
     # ---- cluster-slice fast path: tried BEFORE the full-column WHERE eval, which it avoids.
@@ -423,7 +442,7 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
             return r
         except NotImplementedError:
             pass
-    gnames = [seg_col(g) for g in gcols]
+    gnames = [(seg_col(g) if g is not None else None) for g in gcols]
     # --- date-coarsening COUNT(*) fast path: single computed key, count-only, filter-free ---
     # The answer is a V->G rollup over per-code counts (O(V)) instead of an O(N) remap+unique.
     if (len(gkeys) == 1 and gkeys[0][0] == 'fn' and where is None
@@ -453,6 +472,12 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
             row_gv = gid_of_code[gc]                            # per-row group value
             u, inv = np.unique(row_gv, return_inverse=True)    # distinct group values + per-row slot
             metas.append((gn, 'computed', u, unit))
+        elif gk[0] == 'const':
+            # constant key (GROUP BY <int> -> SELECT <literal>): one distinct value, contributes
+            # nothing to the grouping (domain 1). inv is all-zeros over the post-mask row count.
+            n_rows = len(combo) if combo is not None else (int(np.count_nonzero(mask)) if mask is not None else seg.N)
+            u = np.array([gk[1]], dtype=object); inv = np.zeros(n_rows, dtype=np.int64)
+            metas.append((None, 'computed', u, None))
         elif gk[0] == 'sfn':
             # scalar fn (e.g. length(col)): evaluate over the DICTIONARY, gather per row, group on it.
             row_gv, _ = _sfn_array(seg, gk[2], gn, mask)       # gk[2]=fname; per-row int64 value
@@ -609,6 +634,13 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
         k = _topk
         part = np.argpartition(counts, -k)[-k:]
         gi_list = part[np.argsort(counts[part])[::-1]].tolist()   # k groups, count-desc
+    # match each non-agg projection to its group key by identity (SELECT order may != GROUP BY order)
+    _gpos = {}
+    for _i, _k in enumerate(gkeys): _gpos.setdefault(_k, _i)
+    def _gki_of(pp):
+        try: kk = _group_key(pp, proj, _resolve_pos=False)
+        except NotImplementedError: return None
+        return _gpos.get(kk)
     rows=[]
     for gi in gi_list:
         cv = uc[gi]
@@ -621,7 +653,9 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
                     raise NotImplementedError("COUNT(DISTINCT) over expression/multiple columns")
                 rowout.append(int(groupdistinct(_dx[0].name, gi)))
             elif kind is None:
-                rowout.append(_pyval(keyval(ki, keyidx[ki]))); ki+=1
+                gk_i = _gki_of(p)
+                if gk_i is None: gk_i = ki                      # defensive positional fallback
+                rowout.append(_pyval(keyval(gk_i, keyidx[gk_i]))); ki+=1
             elif kind[0]=='COUNT_STAR':
                 rowout.append(int(counts[gi]))
             elif _fast:

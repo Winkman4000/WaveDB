@@ -104,3 +104,44 @@ def test_time_coarsening_units():
     tr = wdb_sql._date_unit(secs, 'TRUNC:MINUTE', 's')   # truncates to the minute (epoch ticks)
     assert tr.tolist() == [1372708800, 1372708860, 1372712400]
     assert wdb_sql._is_trunc('TRUNC:MINUTE') and not wdb_sql._is_trunc('MINUTE')
+
+
+def test_positional_and_const_groupkeys():
+    """Positional GROUP BY (GROUP BY n -> Nth SELECT item), constant-literal group keys
+    (GROUP BY 1 where SELECT 1), and projection<->group-key matching by expression identity
+    (SELECT/GROUP BY orderings may differ). Verified vs DuckDB on a small segment."""
+    import duckdb, sqlglot
+    d = os.path.join(tempfile.gettempdir(), f'pos_{uuid.uuid4().hex[:8]}')
+    try:
+        os.makedirs(d, exist_ok=True)
+        rng = np.random.default_rng(1)
+        urls = np.array(['', 'http://a.com', 'http://b.org/p', 'https://c.net/x'], dtype=object)
+        df = pd.DataFrame({'URL': urls[rng.integers(0, len(urls), 4000)],
+                           'RegionID': rng.integers(0, 9, 4000).astype(np.int64)})
+        pq = os.path.join(d, 's.parquet'); df.to_parquet(pq, index=False)
+        wdb_encode.encode(pq, os.path.join(d, 't_0.wdb'))
+        seg = Segment(os.path.join(d, 't_0.wdb')); con = duckdb.connect()
+
+        def norm(rs):
+            return sorted([tuple(round(float(x), 4) if isinstance(x, float) else x for x in r) for r in rs],
+                          key=lambda t: tuple(str(x) for x in t))
+        def chk(q):
+            wave = wdb_sql.execute(seg, q.replace('FROM t', 'FROM hits'))[0]
+            duck = con.execute(q.replace('FROM t', f"FROM '{pq}'")).fetchall()
+            assert norm(wave) == norm(duck), (q, norm(wave)[:4], norm(duck)[:4])
+
+        # classifier: positional + const tuples
+        def keys(q):
+            tt = sqlglot.parse_one(q, read='duckdb')
+            return [wdb_sql._group_key(g, tt.expressions) for g in tt.args['group'].expressions]
+        assert keys("SELECT 1, URL, COUNT(*) FROM t GROUP BY 1, URL") == [('const', 1), ('col', 'URL')]
+        assert keys("SELECT URL, RegionID, COUNT(*) FROM t GROUP BY 2, 1") == [('col', 'RegionID'), ('col', 'URL')]
+
+        chk("SELECT 1, URL, COUNT(*) AS c FROM t GROUP BY 1, URL")            # Q34 shape
+        chk("SELECT URL, COUNT(*) c FROM t GROUP BY 1")                        # positional -> real column
+        chk("SELECT URL, RegionID, COUNT(*) c FROM t GROUP BY 2, 1")           # SELECT order != GROUP BY order
+        chk("SELECT RegionID, 1, URL, COUNT(*) c FROM t GROUP BY 3, 1, 2")     # 3-key mixed order
+        chk("SELECT 1, COUNT(*) c FROM t GROUP BY 1")                          # const-only
+        chk("SELECT 'x', RegionID, COUNT(*) c FROM t GROUP BY 1, RegionID")    # string const + real key
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
