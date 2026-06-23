@@ -288,6 +288,56 @@ def _literal_value(g):
     except (ValueError, TypeError): return float(sv)
 
 
+def _eval_scalar(node, env):
+    """Evaluate a scalar arithmetic expression against a {column_name: value} env. Supports
+    column refs, numeric literals, +, -, * and unary minus / parens. Raises (KeyError/TypeError)
+    for anything else -- the caller treats that as 'not evaluable from base columns' and falls back."""
+    n = node.this if isinstance(node, E.Alias) else node
+    if isinstance(n, E.Column):  return env[n.name]            # KeyError if not a base column -> fallback
+    if isinstance(n, E.Literal): return _literal_value(n)
+    if isinstance(n, E.Paren):   return _eval_scalar(n.this, env)
+    if isinstance(n, E.Neg):     return -_eval_scalar(n.this, env)
+    if isinstance(n, E.Add):     return _eval_scalar(n.this, env) + _eval_scalar(n.expression, env)
+    if isinstance(n, E.Sub):     return _eval_scalar(n.this, env) - _eval_scalar(n.expression, env)
+    if isinstance(n, E.Mul):     return _eval_scalar(n.this, env) * _eval_scalar(n.expression, env)
+    raise TypeError("not a scalar arithmetic expression")
+
+
+def _eval_scalar_safe(node, env):
+    """(_eval_scalar(node,env), True) or (None, False) if it isn't a base-column arithmetic expr."""
+    try: return _eval_scalar(node, env), True
+    except (KeyError, TypeError, ValueError): return None, False
+
+
+def _affine_key(g):
+    """Detect a group key that is an INJECTIVE function of a single column -- col +/- const,
+    const - col, col * nonzero-const, unary minus, and compositions. Injective means grouping by
+    the base column makes the identical piles as grouping by the expression (one-to-one), so the
+    expression need not be its own partition dimension: group by the base column, compute the
+    expression per pile at emit. Returns ('affine', basecol, canonical_sql) or None.
+    NOT injective (e.g. length(col), col % k, integer col / k) -> not matched here."""
+    cols = set(); ok = [True]
+    def walk(n):
+        if isinstance(n, E.Column): cols.add(n.name); return
+        if isinstance(n, E.Literal): return
+        if isinstance(n, E.Paren): walk(n.this); return
+        if isinstance(n, E.Neg):   walk(n.this); return
+        if isinstance(n, (E.Add, E.Sub)): walk(n.this); walk(n.expression); return
+        if isinstance(n, E.Mul):
+            l, r = n.this, n.expression
+            lit = r if isinstance(r, E.Literal) else (l if isinstance(l, E.Literal) else None)
+            if lit is None: ok[0] = False; return            # col*col is not single-col / not injective
+            try:
+                if float(_literal_value(lit)) == 0.0: ok[0] = False   # *0 collapses -> not injective
+            except (ValueError, TypeError): ok[0] = False
+            walk(l if lit is r else r); return               # walk the non-literal (column) side
+        ok[0] = False                                        # any other op: not provably injective
+    walk(g)
+    if ok[0] and len(cols) == 1:
+        return ('affine', next(iter(cols)), g.sql())
+    return None
+
+
 def _group_key(node, proj=None, _resolve_pos=True):
     """Classify a GROUP BY expression. Returns:
       ('col', name)        -- a bare value-identity column (today's path, unchanged)
@@ -326,6 +376,9 @@ def _group_key(node, proj=None, _resolve_pos=True):
     sf = _scalar_fn(g)                                       # length(col) etc. -> scalar-fn group key
     if sf is not None:
         return ('sfn', sf[2], sf[1])                        # ('sfn', colname, fname)
+    af = _affine_key(g)                                      # col +/- const etc. -> injective single-col
+    if af is not None:
+        return af                                           # ('affine', basecol, canonical_sql)
     if isinstance(g, E.Literal):                            # constant key (e.g. GROUP BY 1 -> SELECT 1)
         return ('const', _literal_value(g))
     raise NotImplementedError(f"unsupported GROUP BY key: {g.sql()!r}")
@@ -368,7 +421,18 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
     # ---- projections / shape ----
     proj = tree.expressions  # list of selected exprs
     group = tree.args.get('group')
-    gkeys = [ _group_key(g, proj) for g in group.expressions ] if group else []
+    gkeys_raw = [ _group_key(g, proj) for g in group.expressions ] if group else []
+    # Effective grouping dimensions: an affine single-column key (ClientIP-1) reduces to its base
+    # column (ClientIP) -- injective, so same piles -- and base columns are DEDUPED. This collapses
+    # GROUP BY ClientIP, ClientIP-1, ClientIP-2, ClientIP-3 to grouping by ClientIP ONCE (no radix
+    # explosion); the minus-variants are functions of the pile's ClientIP, computed at emit. Genuine
+    # derived keys (sfn/date/const) stay their own dimension (deduped by identity).
+    gkeys = []; _eff_seen = {}
+    for _k in gkeys_raw:
+        _e = ('col', _k[1]) if _k[0] == 'affine' else _k
+        _sig = _e[1] if _e[0] == 'col' else _e
+        if _sig in _eff_seen: continue
+        _eff_seen[_sig] = len(gkeys); gkeys.append(_e)
     gcols = [ (None if k[0]=='const' else k[1]) for k in gkeys ]   # underlying column (None for const keys)
     where = tree.args.get('where')
 
@@ -645,6 +709,11 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
     for gi in gi_list:
         cv = uc[gi]
         keyidx = decombo(cv); rowout=[]; ki=0
+        # base-column values for this pile -> evaluate any arithmetic/bare-column projection directly
+        env = {}
+        for _mi, (_gn, _kk, _u, _un) in enumerate(metas):
+            if _gn is not None and _kk in ('code', 'val'):
+                env[_gn] = keyval(_mi, keyidx[_mi])
         for p,kind in agg_specs:
             _inn = p.this if isinstance(p, E.Alias) else p
             if isinstance(_inn, E.Count) and isinstance(_inn.this, E.Distinct):   # COUNT(DISTINCT col) per group
@@ -653,9 +722,13 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
                     raise NotImplementedError("COUNT(DISTINCT) over expression/multiple columns")
                 rowout.append(int(groupdistinct(_dx[0].name, gi)))
             elif kind is None:
-                gk_i = _gki_of(p)
-                if gk_i is None: gk_i = ki                      # defensive positional fallback
-                rowout.append(_pyval(keyval(gk_i, keyidx[gk_i]))); ki+=1
+                _inn2 = p.this if isinstance(p, E.Alias) else p
+                val, ok = _eval_scalar_safe(_inn2, env)         # bare col / arithmetic of base columns
+                if not ok:                                      # genuine derived key (sfn/date/const)
+                    gk_i = _gki_of(p)
+                    if gk_i is None: gk_i = ki                  # defensive positional fallback
+                    val = keyval(gk_i, keyidx[gk_i])
+                rowout.append(_pyval(val)); ki+=1
             elif kind[0]=='COUNT_STAR':
                 rowout.append(int(counts[gi]))
             elif _fast:

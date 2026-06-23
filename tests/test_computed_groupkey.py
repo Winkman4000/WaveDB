@@ -145,3 +145,45 @@ def test_positional_and_const_groupkeys():
         chk("SELECT 'x', RegionID, COUNT(*) c FROM t GROUP BY 1, RegionID")    # string const + real key
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_affine_groupkeys():
+    """Injective single-column arithmetic group keys (col +/- const, *const, nested) reduce to their
+    base column; repeated base columns dedup so GROUP BY ClientIP, ClientIP-1, ClientIP-2, ClientIP-3
+    groups by ClientIP ONCE (no radix-combo explosion). Independent derived keys (RegionID, UserID-1)
+    add their base column to the group. Values computed per pile at emit. Verified vs DuckDB."""
+    import duckdb, sqlglot
+    d = os.path.join(tempfile.gettempdir(), f'aff_{uuid.uuid4().hex[:8]}')
+    try:
+        os.makedirs(d, exist_ok=True)
+        rng = np.random.default_rng(3); N = 8000
+        df = pd.DataFrame({'ClientIP': rng.integers(1000, 5000, N).astype(np.int64),
+                           'UserID': rng.integers(0, 300, N).astype(np.int64),
+                           'RegionID': rng.integers(0, 8, N).astype(np.int64)})
+        pq = os.path.join(d, 's.parquet'); df.to_parquet(pq, index=False)
+        wdb_encode.encode(pq, os.path.join(d, 't_0.wdb'))
+        seg = Segment(os.path.join(d, 't_0.wdb')); con = duckdb.connect()
+
+        def norm(rs): return sorted([tuple(int(x) for x in r) for r in rs])
+        def chk(q):
+            wave = wdb_sql.execute(seg, q.replace('FROM t', 'FROM hits'))[0]
+            duck = con.execute(q.replace('FROM t', f"FROM '{pq}'")).fetchall()
+            assert norm(wave) == norm(duck), (q, norm(wave)[:3], norm(duck)[:3])
+
+        # classifier: affine tuple + dedup to a single effective base column
+        def keys(q):
+            tt = sqlglot.parse_one(q, read='duckdb')
+            return [wdb_sql._group_key(g, tt.expressions) for g in tt.args['group'].expressions]
+        assert keys("SELECT ClientIP-1 k FROM t GROUP BY ClientIP-1") == [('affine', 'ClientIP', 'ClientIP - 1')]
+        assert wdb_sql._affine_key(sqlglot.parse_one("length(URL)", read='duckdb')) is None  # not injective
+
+        chk("SELECT ClientIP, ClientIP-1, ClientIP-2, ClientIP-3, COUNT(*) c FROM t "
+            "GROUP BY ClientIP, ClientIP-1, ClientIP-2, ClientIP-3")                 # Q35 (full set)
+        chk("SELECT ClientIP-5 k, COUNT(*) c FROM t GROUP BY ClientIP-5")            # single affine
+        chk("SELECT ClientIP*2 k, COUNT(*) c FROM t GROUP BY ClientIP*2")            # mul by const
+        chk("SELECT (ClientIP-1)*2+3 k, COUNT(*) c FROM t GROUP BY (ClientIP-1)*2+3")# nested affine
+        chk("SELECT RegionID, UserID-1, COUNT(*) c FROM t GROUP BY RegionID, UserID-1")  # independent
+        chk("SELECT RegionID, ClientIP, ClientIP-1, COUNT(*) c FROM t "
+            "GROUP BY RegionID, ClientIP, ClientIP-1")                               # affine + plain mix
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
