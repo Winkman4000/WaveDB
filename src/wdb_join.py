@@ -689,13 +689,48 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     def _str_codes(seg, pcol):
         c = seg.cols[pcol]
         if c['dt'] != 1 or c['mode'] == 4: return None        # only value-identity string dicts
-        if c['mode'] == 5: seg._raw_codes(pcol); dv = seg.cols[pcol].get('_idict')
+        # code_of ({value_bytes: code}) is expensive to build for a high-card dict (e.g. 18M URLs ~8s).
+        # It depends only on the column's dictionary, so cache it on the segment -- built at most once
+        # per column, not once per query.
+        cache = getattr(seg, '_strcode_cache', None)
+        if cache is None: cache = seg._strcode_cache = {}
+        if pcol in cache:
+            code_of = cache[pcol]
         else:
-            try: dv = seg.dict_vals(pcol)
-            except Exception: return None
-        if dv is None: return None
-        code_of = {(v if isinstance(v, (bytes, bytearray)) else str(v).encode()): i for i, v in enumerate(dv)}
+            if c['mode'] == 5: seg._raw_codes(pcol); dv = seg.cols[pcol].get('_idict')
+            else:
+                try: dv = seg.dict_vals(pcol)
+                except Exception: return None
+            if dv is None: return None
+            code_of = {(v if isinstance(v, (bytes, bytearray)) else str(v).encode()): i for i, v in enumerate(dv)}
+            cache[pcol] = code_of
         return seg.codes(pcol), code_of, (c['V'] - 1 if c['has_null'] else None)
+    def _code_of_literal(seg, pcol, lit_bytes):
+        """Resolve ONE literal to its dictionary code without building the full {value:code} dict.
+        DuckDB-style: a filter like URL = 'x' only needs x's code, not a dict of all 18M values.
+        Vectorized search over the dict values (object-array ==), result cached per (col, literal).
+        Returns the code (int) or -1 if the literal is absent from the dictionary."""
+        c = seg.cols[pcol]
+        litcache = getattr(seg, '_litcode_cache', None)
+        if litcache is None: litcache = seg._litcode_cache = {}
+        key = (pcol, bytes(lit_bytes))
+        if key in litcache: return litcache[key]
+        # if the full code_of is already cached, just use it (no rebuild)
+        full = getattr(seg, '_strcode_cache', {}).get(pcol)
+        if full is not None:
+            code = full.get(bytes(lit_bytes), -1)
+            litcache[key] = code; return code
+        try:
+            if c['mode'] == 5: seg._raw_codes(pcol); dv = seg.cols[pcol].get('_idict')
+            else: dv = seg.dict_vals(pcol)
+        except Exception:
+            dv = None
+        if dv is None:
+            litcache[key] = -1; return -1
+        arr = dv if isinstance(dv, np.ndarray) else np.asarray(dv, dtype=object)
+        hits = np.nonzero(arr == lit_bytes)[0]          # vectorized; no per-value Python dict
+        code = int(hits[0]) if len(hits) else -1
+        litcache[key] = code; return code
     def _lit_bytes(seg, pcol, e):
         b = wdb_sql._lit_for_col(seg, pcol, e, 'O')
         return b if isinstance(b, (bytes, bytearray)) else str(b).encode()
@@ -712,10 +747,11 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             op = type(node)
             def mk(seg, pcol):
                 if op in (E.EQ, E.NEQ):
-                    sc = _str_codes(seg, pcol)
-                    if sc is not None:                       # code comparison, no object materialisation
-                        codes, code_of, nullcode = sc
-                        tc = code_of.get(_lit_bytes(seg, pcol, node.expression), -1)
+                    c = seg.cols[pcol]
+                    if c['dt'] == 1 and c['mode'] != 4:      # value-identity string dict: compare codes
+                        codes = seg.codes(pcol)
+                        nullcode = (c['V'] - 1) if c['has_null'] else None
+                        tc = _code_of_literal(seg, pcol, _lit_bytes(seg, pcol, node.expression))
                         if op is E.EQ: return codes == tc
                         res = codes != tc
                         if nullcode is not None: res &= (codes != nullcode)   # SQL: NULL != x is not TRUE
@@ -736,10 +772,10 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         if isinstance(node, E.In):
             def mk(seg, pcol):
                 exprs = node.args.get('expressions') or []
-                sc = _str_codes(seg, pcol)
-                if sc is not None:
-                    codes, code_of, _ = sc
-                    tcs = [code_of[b] for b in (_lit_bytes(seg, pcol, e) for e in exprs) if b in code_of]
+                c = seg.cols[pcol]
+                if c['dt'] == 1 and c['mode'] != 4:
+                    codes = seg.codes(pcol)
+                    tcs = [t for t in (_code_of_literal(seg, pcol, _lit_bytes(seg, pcol, e)) for e in exprs) if t >= 0]
                     return np.isin(codes, tcs)
                 arr, _ = _col_cached(seg, pcol)
                 vals = [wdb_sql._lit_for_col(seg, pcol, e, arr.dtype.kind) for e in exprs]
@@ -1002,15 +1038,17 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         if isinstance(nd, (E.Neg, E.Cast, E.Paren)): return _is_lit(nd.this)
         return False
     def _str_slot(cseg, cpcol, cptr):                  # raw code slot for a string column (base=None)
-        sc = _str_codes(cseg, cpcol)
-        if sc is None: raise _FastUnsupported
-        codes, code_of, nullcode = sc
+        c = cseg.cols[cpcol]
+        if c['dt'] != 1 or c['mode'] == 4: raise _FastUnsupported   # value-identity string dicts only
+        try: codes = cseg.codes(cpcol)
+        except Exception: raise _FastUnsupported
+        nullcode = (c['V'] - 1) if c['has_null'] else None
         ckey = (id(cseg), cpcol, id(cptr) if cptr is not None else None)
         if ckey not in slots:
             slots[ckey] = len(slot_list)
             slot_list.append((None, np.ascontiguousarray(codes),
                               None if cptr is None else np.ascontiguousarray(cptr)))
-        return f"v{slots[ckey]}", code_of, nullcode
+        return f"v{slots[ckey]}", nullcode      # NO code_of -- literals resolved via _code_of_literal
     def _code_lut(cseg, cpcol, cptr, fn, mark_null=False):
         # ARBITRARY single-column string predicate -> code-LUT: precompute keep[code]=fn(dict_value) over
         # the (small) dictionary, add it as a value slot whose base IS that bool table, predicate -> 'vk!=0'.
@@ -1081,8 +1119,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             if cseg.cols[cpcol]['dt'] == 1:                # string
                 if not FUSE_STR_PRED or not lit.is_string: raise _FastUnsupported
                 if type(node) in (E.EQ, E.NEQ):            # equality -> direct code comparison
-                    vk, code_of, nullcode = _str_slot(cseg, cpcol, cptr)
-                    target = code_of.get(_lit_bytes(cseg, cpcol, lit), -1)
+                    vk, nullcode = _str_slot(cseg, cpcol, cptr)
+                    target = _code_of_literal(cseg, cpcol, _lit_bytes(cseg, cpcol, lit))
                     if type(node) is E.EQ: return f"({vk} == {target})"
                     if nullcode is None:   return f"({vk} != {target})"
                     return f"(({vk} != {target}) and ({vk} != {nullcode}))"   # SQL: NULL != x not TRUE
@@ -1105,11 +1143,11 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             cseg, cpcol, cptr = resolve(col)
             if cseg.cols[cpcol]['dt'] == 1:                # string IN -> OR of code equalities
                 if not FUSE_STR_PRED: raise _FastUnsupported
-                vk, code_of, _nc = _str_slot(cseg, cpcol, cptr)
+                vk, _nc = _str_slot(cseg, cpcol, cptr)
                 tgts = []
                 for e in exprs:
                     if not e.is_string: raise _FastUnsupported
-                    tgts.append(code_of.get(_lit_bytes(cseg, cpcol, e), -1))
+                    tgts.append(_code_of_literal(cseg, cpcol, _lit_bytes(cseg, cpcol, e)))
                 return "(" + " or ".join(f"({vk} == {t})" for t in tgts) + ")"
             v = build_fused(col); kind = 'f' if cseg.cols[cpcol]['dt'] == 2 else 'i'  # numeric IN
             vals = []
