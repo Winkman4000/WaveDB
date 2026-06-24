@@ -234,3 +234,38 @@ def test_case_groupkeys():
             "FROM t GROUP BY SearchEngineID, CASE WHEN AdvEngineID=0 THEN Referer ELSE '' END")
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_regexp_replace_groupkey():
+    """REGEXP_REPLACE(col, pattern, repl) as a group key (Q28) -- a string-valued scalar function over
+    a single column (non-injective). Computed per distinct dict value, factorized, grouped. Verified
+    vs DuckDB incl. AVG(length(col)), COUNT(*), MIN(col), WHERE, HAVING, ORDER BY."""
+    import duckdb, sqlglot
+    d = os.path.join(tempfile.gettempdir(), f'rx_{uuid.uuid4().hex[:8]}')
+    try:
+        os.makedirs(d, exist_ok=True)
+        rng = np.random.default_rng(11); N = 9000
+        refs = np.array(['', 'http://www.example.com/page/1', 'https://sub.foo.org/x', 'http://a.b.c/',
+                         'https://www.example.com/q?z=1', 'http://other.net/path', 'notaurl',
+                         'http://example.com/y', 'https://deep.site.co.uk/a/b/c'], dtype=object)
+        df = pd.DataFrame({'Referer': refs[rng.integers(0, len(refs), N)]})
+        pq = os.path.join(d, 's.parquet'); df.to_parquet(pq, index=False)
+        wdb_encode.encode(pq, os.path.join(d, 't_0.wdb'))
+        seg = Segment(os.path.join(d, 't_0.wdb')); con = duckdb.connect()
+        RX = r"REGEXP_REPLACE(Referer, '^https?://(?:www\.)?([^/]+)/.*$', '\1')"
+
+        def norm(rs): return sorted([tuple(round(float(x),4) if isinstance(x,float) else x for x in r)
+                                     for r in rs], key=lambda t: tuple(str(x) for x in t))
+        def chk(q):
+            wave = wdb_sql.execute(seg, q.replace('FROM t', 'FROM hits'))[0]
+            duck = con.execute(q.replace('FROM t', f"FROM '{pq}'")).fetchall()
+            assert norm(wave) == norm(duck), (q, norm(wave)[:4], norm(duck)[:4])
+
+        k = wdb_sql._group_key(sqlglot.parse_one(f"SELECT {RX} AS k FROM t", read='duckdb').expressions[0], None)
+        assert k[0] == 'sfn' and k[2] == 'REGEXP_REPLACE'
+
+        chk(f"SELECT {RX} AS k, COUNT(*) c FROM t WHERE Referer<>'' GROUP BY k")
+        chk(f"SELECT {RX} AS k, AVG(length(Referer)) AS l, COUNT(*) AS c, MIN(Referer) "
+            f"FROM t WHERE Referer<>'' GROUP BY k HAVING COUNT(*)>500 ORDER BY l DESC, k LIMIT 25")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)

@@ -3,6 +3,7 @@
 ORDER BY, LIMIT, returning the FULL correct result set. Parses real SQL via sqlglot;
 executes against a WVDB3 Segment. Correctness first; optimization second.
 Unsupported shapes raise NotImplementedError (honest failure, never silent wrong answer)."""
+import re
 import sqlglot, sqlglot.expressions as E, numpy as np
 from wdb_engine import Segment
 import wdb_measure_runtime as RT
@@ -134,7 +135,7 @@ def _colname(node):
 # over the V distinct values once -> fval_by_code[V], then per-row value is fval_by_code[codes].
 # Same shape as the date-coarsening group key. Registry maps SQL func name -> (typed_dict -> int64[V]).
 
-def _fn_length(td):
+def _fn_length(td, params=None):
     """CHARACTER length of each dict value (matches DuckDB length()); None -> 0 (slot unused, the
     null mask handles real nulls). Bytes decoded as utf-8 for true char count (ascii: == byte len)."""
     out = np.empty(len(td), dtype=np.int64)
@@ -144,11 +145,48 @@ def _fn_length(td):
         else: out[i] = len(str(v))
     return out
 
-_SCALAR_FNS = { 'LENGTH': _fn_length }
+def _fn_regexp_replace(td, params):
+    """REGEXP_REPLACE over each dict value. params=(pattern, replacement, modifiers). Matches DuckDB:
+    replace first match (all if 'g' modifier) with the replacement (\\1 = capture group 1); a string
+    with no match is returned unchanged; None -> None. Returns an object array of str."""
+    pattern, repl, mods = params
+    rx = re.compile(pattern)
+    count = 0 if (mods and 'g' in mods) else 1               # DuckDB: 'g' = global else first match
+    out = np.empty(len(td), dtype=object)
+    for i, v in enumerate(td):
+        if v is None: out[i] = None; continue
+        sv = v.decode('utf-8', 'replace') if isinstance(v, (bytes, bytearray)) else str(v)
+        out[i] = rx.sub(repl, sv, count=count)
+    return out
+
+
+def _factorize_obj(vals):
+    """Factorize an object array (str/None) WITHOUT sorting -> (unique_obj_array, codes int64).
+    First-seen order (final ORDER BY decides output); tolerates None mixed with strings (np.unique
+    would raise comparing None to str)."""
+    seen = {}; out = np.empty(len(vals), np.int64); uniq = []
+    for i, v in enumerate(vals):
+        j = seen.get(v, -1)
+        if j < 0: j = len(uniq); seen[v] = j; uniq.append(v)
+        out[i] = j
+    u = np.empty(len(uniq), dtype=object)
+    for i, v in enumerate(uniq): u[i] = v
+    return u, out
+
+
+_SCALAR_FNS = { 'LENGTH': _fn_length, 'REGEXP_REPLACE': _fn_regexp_replace }
 
 def _scalar_fn(node):
-    """Classify FUNC(column) where FUNC is registered -> ('sfn', fname, colname), else None."""
+    """Classify a scalar fn over a single column -> ('sfn', fname, colname, params) or None.
+    params is None for parameterless fns (LENGTH) or a hashable tuple (REGEXP_REPLACE)."""
     g = node.this if isinstance(node, E.Alias) else node
+    if isinstance(g, E.RegexpReplace):                       # REGEXP_REPLACE(col, pattern, repl[, mods])
+        col = g.this; pat = g.args.get('expression'); repl = g.args.get('replacement')
+        if isinstance(col, E.Column) and isinstance(pat, E.Literal) and isinstance(repl, E.Literal):
+            mods = g.args.get('modifiers')
+            modv = mods.this if isinstance(mods, E.Literal) else None
+            return ('sfn', 'REGEXP_REPLACE', col.name, (pat.this, repl.this, modv))
+        return None
     fname = None
     if isinstance(g, E.Length): fname = 'LENGTH'
     elif isinstance(g, (E.Anonymous, E.Func)):
@@ -156,16 +194,16 @@ def _scalar_fn(node):
         if nm in _SCALAR_FNS: fname = nm
     if fname is None: return None
     inner = g.this if not isinstance(g, E.Anonymous) else (g.expressions[0] if g.expressions else None)
-    if isinstance(inner, E.Column): return ('sfn', fname, inner.name)
+    if isinstance(inner, E.Column): return ('sfn', fname, inner.name, None)
     return None
 
 _SFN_CACHE = {}   # (id(seg), col, fname) -> fval_by_code int64[V]
 
-def _fval_by_code(seg, fname, cn):
-    key = (id(seg), cn, fname)
+def _fval_by_code(seg, fname, cn, params=None):
+    key = (id(seg), cn, fname, params)
     m = _SFN_CACHE.get(key)
     if m is None:
-        m = _SCALAR_FNS[fname](seg._typed_dict(cn))
+        m = _SCALAR_FNS[fname](seg._typed_dict(cn), params)
         _SFN_CACHE[key] = m
     return m
 
@@ -191,10 +229,10 @@ def _factorize_nonneg(x, domain=None):
     return present, inv
 
 
-def _sfn_array(seg, fname, cn, mask=None):
-    """Derived per-row int64 array fval_by_code[codes] + null mask (null code -> null). Applies mask
-    if given. One implementation shared by the group path and the aggregate path."""
-    fv = _fval_by_code(seg, fname, cn)
+def _sfn_array(seg, fname, cn, mask=None, params=None):
+    """Derived per-row array fval_by_code[codes] + null mask (null code -> null). Applies mask if
+    given. One implementation shared by the group path and the aggregate path."""
+    fv = _fval_by_code(seg, fname, cn, params)
     codes = seg.codes(cn)
     c = seg.cols[cn]
     nmask = None
@@ -426,9 +464,9 @@ def _group_key(node, proj=None, _resolve_pos=True, node_sink=None):
         col = g.this
         if unit in _TRUNC_UNITS and isinstance(col, E.Column):
             return ('fn', col.name, 'TRUNC:' + unit)
-    sf = _scalar_fn(g)                                       # length(col) etc. -> scalar-fn group key
+    sf = _scalar_fn(g)                                       # length/regexp_replace(col) -> sfn group key
     if sf is not None:
-        return ('sfn', sf[2], sf[1])                        # ('sfn', colname, fname)
+        return ('sfn', sf[2], sf[1], sf[3])                 # ('sfn', colname, fname, params)
     af = _affine_key(g)                                      # col +/- const etc. -> injective single-col
     if af is not None:
         return af                                           # ('affine', basecol, canonical_sql)
@@ -606,10 +644,19 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
             u, inv = np.unique(row_gv, return_inverse=True)
             metas.append((None, 'computed', u, None))
         elif gk[0] == 'sfn':
-            # scalar fn (e.g. length(col)): evaluate over the DICTIONARY, gather per row, group on it.
-            row_gv, _ = _sfn_array(seg, gk[2], gn, mask)       # gk[2]=fname; per-row int64 value
-            u, inv = _factorize_nonneg(row_gv)                 # lengths are non-negative ints
-            metas.append((gn, 'computed', u, None))            # plain int group values
+            # scalar fn over a column (length(col), regexp_replace(col,...)): evaluate over the
+            # DICTIONARY (V values), then group. int output -> gather + factorize_nonneg; string output
+            # (REGEXP_REPLACE) -> factorize the per-CODE results (V, cheap) and map row codes through it.
+            params = gk[3] if len(gk) > 3 else None
+            fv = _fval_by_code(seg, gk[2], gn, params)
+            if fv.dtype == object:                             # string-valued fn
+                codes = seg.codes(gn); codes = codes[mask] if mask is not None else codes
+                u, code2g = _factorize_obj(fv)                 # per-code result -> group id (V values)
+                inv = code2g[codes]                            # per-row group id (gather)
+            else:                                              # int-valued fn (length)
+                row_gv, _ = _sfn_array(seg, gk[2], gn, mask, params)
+                u, inv = _factorize_nonneg(row_gv)
+            metas.append((gn, 'computed', u, None))
         elif seg.cols[gn]['mode'] == 4:
             vals = seg.values(gn); vals = vals[mask] if mask is not None else vals
             u, inv = np.unique(vals, return_inverse=True)      # value-identity keys
@@ -679,7 +726,7 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
             if fn == 'COUNT' and cn is None: continue
             # build the value array (+ null mask) for cn, then bincount-scatter into groups
             if isinstance(cn, tuple) and cn[0] == 'sfn':
-                arr, nm = _sfn_array(seg, cn[1], seg_col(cn[2]), mask)
+                arr, nm = _sfn_array(seg, cn[1], seg_col(cn[2]), mask, cn[3] if len(cn) > 3 else None)
             else:
                 arr, nm = _col(seg, seg_col(cn))
                 if mask is not None:
@@ -711,7 +758,7 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
         ckey = colname if not is_sfn else colname            # tuple is hashable -> fine as cache key
         if ckey not in aggcache:
             if is_sfn:                                        # AVG/SUM/... over length(col) etc.
-                arr, nm = _sfn_array(seg, colname[1], seg_col(colname[2]), mask)
+                arr, nm = _sfn_array(seg, colname[1], seg_col(colname[2]), mask, colname[3] if len(colname) > 3 else None)
             else:
                 pcol = seg_col(colname)
                 arr, nm = _col(seg, pcol)          # cache NATIVE dtype; float cast only for SUM/AVG
@@ -987,7 +1034,7 @@ def _agg_scalar(seg, p, mask, seg_col):
     if kind[0]=='COUNT_STAR': return int(mask.sum()) if mask is not None else seg.N
     fn,cn=kind
     if isinstance(cn, tuple) and cn[0] == 'sfn':              # FN(length(col)) etc., no GROUP BY
-        arr, nm = _sfn_array(seg, cn[1], seg_col(cn[2]), mask)
+        arr, nm = _sfn_array(seg, cn[1], seg_col(cn[2]), mask, cn[3] if len(cn) > 3 else None)
         if nm is not None: arr = arr[~nm]
         if fn == 'COUNT': return int(len(arr))
         if len(arr) == 0: return None
