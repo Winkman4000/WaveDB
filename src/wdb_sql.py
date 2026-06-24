@@ -309,6 +309,59 @@ def _eval_scalar_safe(node, env):
     except (KeyError, TypeError, ValueError): return None, False
 
 
+def _to_rows(v, nrows):
+    """Broadcast a scalar to an object array of length nrows; pass arrays through unchanged."""
+    if isinstance(v, np.ndarray): return v
+    a = np.empty(nrows, dtype=object); a[:] = v; return a
+
+
+def _eval_rows(seg, node, mask):
+    """Vectorised PER-ROW evaluation of a scalar expression over the (masked) rows -> numpy array of
+    length = #selected rows. Used for genuine derived group keys that aren't a simple function of one
+    column (e.g. CASE WHEN ...), which must be evaluated per row then factorized. String values are
+    produced as bytes (consistent with the engine; _pyval decodes them to str at emit). Raises
+    TypeError for unsupported nodes (caller keeps the prior 'unsupported' behavior)."""
+    import operator
+    n = node.this if isinstance(node, E.Alias) else node
+    if isinstance(n, E.Paren): return _eval_rows(seg, n.this, mask)
+    if isinstance(n, E.Column):
+        c = n.name; col = seg.cols[c]
+        if col['dt'] == 1:                                   # string dict col: decode distinct survivors
+            rc = seg.codes(c); rc = rc[mask] if mask is not None else rc
+            uc, inv = np.unique(rc, return_inverse=True)
+            vals = np.empty(len(uc), dtype=object)
+            for i, code in enumerate(uc):
+                v = seg.fetch(c, int(code))
+                vals[i] = v if isinstance(v, (bytes, bytearray)) else (b'' if v is None else str(v).encode())
+            return vals[inv]
+        v = np.asarray(seg.values(c)); return v[mask] if mask is not None else v
+    if isinstance(n, E.Literal):
+        return n.this.encode() if n.is_string else _literal_value(n)
+    if isinstance(n, E.Null): return None
+    if isinstance(n, E.Not): return ~_eval_rows(seg, n.this, mask)
+    if isinstance(n, E.And): return _eval_rows(seg, n.this, mask) & _eval_rows(seg, n.expression, mask)
+    if isinstance(n, E.Or):  return _eval_rows(seg, n.this, mask) | _eval_rows(seg, n.expression, mask)
+    if isinstance(n, (E.EQ, E.NEQ, E.GT, E.LT, E.GTE, E.LTE)):
+        l = _eval_rows(seg, n.this, mask); r = _eval_rows(seg, n.expression, mask)
+        op = {E.EQ:operator.eq, E.NEQ:operator.ne, E.GT:operator.gt,
+              E.LT:operator.lt, E.GTE:operator.ge, E.LTE:operator.le}[type(n)]
+        return op(l, r)
+    if isinstance(n, E.Neg): return -_eval_rows(seg, n.this, mask)
+    if isinstance(n, E.Add): return _eval_rows(seg, n.this, mask) + _eval_rows(seg, n.expression, mask)
+    if isinstance(n, E.Sub): return _eval_rows(seg, n.this, mask) - _eval_rows(seg, n.expression, mask)
+    if isinstance(n, E.Mul): return _eval_rows(seg, n.this, mask) * _eval_rows(seg, n.expression, mask)
+    if isinstance(n, E.Case):
+        nrows = int(np.count_nonzero(mask)) if mask is not None else seg.N
+        default = n.args.get('default')
+        acc = _to_rows(_eval_rows(seg, default, mask), nrows) if default is not None else np.full(nrows, None, object)
+        for iff in reversed(n.args.get('ifs') or []):        # last WHEN wins if listed first -> reverse-fold
+            cond = _eval_rows(seg, iff.this, mask)
+            then = _to_rows(_eval_rows(seg, iff.args.get('true'), mask), nrows)
+            acc = np.where(cond, then, acc)
+        return acc
+    raise TypeError(f"_eval_rows: unsupported node {type(n).__name__}")
+
+
 def _affine_key(g):
     """Detect a group key that is an INJECTIVE function of a single column -- col +/- const,
     const - col, col * nonzero-const, unary minus, and compositions. Injective means grouping by
@@ -338,7 +391,7 @@ def _affine_key(g):
     return None
 
 
-def _group_key(node, proj=None, _resolve_pos=True):
+def _group_key(node, proj=None, _resolve_pos=True, node_sink=None):
     """Classify a GROUP BY expression. Returns:
       ('col', name)        -- a bare value-identity column (today's path, unchanged)
       ('fn', col, unit)    -- EXTRACT(unit FROM col): a date coarsening, grouped in code space
@@ -381,6 +434,9 @@ def _group_key(node, proj=None, _resolve_pos=True):
         return af                                           # ('affine', basecol, canonical_sql)
     if isinstance(g, E.Literal):                            # constant key (e.g. GROUP BY 1 -> SELECT 1)
         return ('const', _literal_value(g))
+    if isinstance(g, E.Case):                               # CASE WHEN ...: genuine derived key,
+        if node_sink is not None: node_sink[g.sql()] = g    # evaluated per row then factorized
+        return ('rowexpr', g.sql())
     raise NotImplementedError(f"unsupported GROUP BY key: {g.sql()!r}")
 
 
@@ -421,7 +477,8 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
     # ---- projections / shape ----
     proj = tree.expressions  # list of selected exprs
     group = tree.args.get('group')
-    gkeys_raw = [ _group_key(g, proj) for g in group.expressions ] if group else []
+    rowexpr_nodes = {}
+    gkeys_raw = [ _group_key(g, proj, node_sink=rowexpr_nodes) for g in group.expressions ] if group else []
     # Effective grouping dimensions: an affine single-column key (ClientIP-1) reduces to its base
     # column (ClientIP) -- injective, so same piles -- and base columns are DEDUPED. This collapses
     # GROUP BY ClientIP, ClientIP-1, ClientIP-2, ClientIP-3 to grouping by ClientIP ONCE (no radix
@@ -541,6 +598,12 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
             # nothing to the grouping (domain 1). inv is all-zeros over the post-mask row count.
             n_rows = len(combo) if combo is not None else (int(np.count_nonzero(mask)) if mask is not None else seg.N)
             u = np.array([gk[1]], dtype=object); inv = np.zeros(n_rows, dtype=np.int64)
+            metas.append((None, 'computed', u, None))
+        elif gk[0] == 'rowexpr':
+            # general per-row expression (e.g. CASE WHEN ...): evaluate over the masked rows, then
+            # factorize the resulting values. Not injective / multi-column, so it is its own dimension.
+            row_gv = _eval_rows(seg, rowexpr_nodes[gk[1]], mask)
+            u, inv = np.unique(row_gv, return_inverse=True)
             metas.append((None, 'computed', u, None))
         elif gk[0] == 'sfn':
             # scalar fn (e.g. length(col)): evaluate over the DICTIONARY, gather per row, group on it.

@@ -187,3 +187,50 @@ def test_affine_groupkeys():
             "GROUP BY RegionID, ClientIP, ClientIP-1")                               # affine + plain mix
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_case_groupkeys():
+    """CASE WHEN ... THEN ... ELSE ... END as a group key (Q39). Not injective / multi-column, so it
+    is a genuine derived key: evaluated per row (vectorized) then factorized. Verified vs DuckDB,
+    including the alias-referenced CASE (GROUP BY Src where Src is the SELECT alias)."""
+    import duckdb, sqlglot
+    d = os.path.join(tempfile.gettempdir(), f'case_{uuid.uuid4().hex[:8]}')
+    try:
+        os.makedirs(d, exist_ok=True)
+        rng = np.random.default_rng(7); N = 12000
+        refs = np.array(['', 'http://r1.com', 'http://r2.org', 'http://r3.net'], dtype=object)
+        urls = np.array(['', 'http://u1.com', 'http://u2.org'], dtype=object)
+        df = pd.DataFrame({
+            'TraficSourceID': rng.integers(-1, 4, N).astype(np.int64),
+            'SearchEngineID': rng.integers(0, 3, N).astype(np.int64),
+            'AdvEngineID':    rng.integers(0, 3, N).astype(np.int64),
+            'Referer': refs[rng.integers(0, len(refs), N)],
+            'URL':     urls[rng.integers(0, len(urls), N)],
+            'CounterID': rng.integers(60, 64, N).astype(np.int64),
+            'IsRefresh': rng.integers(0, 2, N).astype(np.int64)})
+        pq = os.path.join(d, 's.parquet'); df.to_parquet(pq, index=False)
+        wdb_encode.encode(pq, os.path.join(d, 't_0.wdb'))
+        seg = Segment(os.path.join(d, 't_0.wdb')); con = duckdb.connect()
+
+        def norm(rs): return sorted([tuple(x for x in r) for r in rs], key=lambda t: tuple(str(x) for x in t))
+        def chk(q):
+            wave = wdb_sql.execute(seg, q.replace('FROM t', 'FROM hits'))[0]
+            duck = con.execute(q.replace('FROM t', f"FROM '{pq}'")).fetchall()
+            assert norm(wave) == norm(duck), (q, norm(wave)[:4], norm(duck)[:4])
+
+        k = wdb_sql._group_key(sqlglot.parse_one(
+            "SELECT CASE WHEN AdvEngineID=0 THEN Referer ELSE '' END AS S FROM t", read='duckdb').expressions[0],
+            None)
+        assert k[0] == 'rowexpr'
+
+        chk("SELECT TraficSourceID, SearchEngineID, AdvEngineID, "
+            "CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE '' END AS Src, "
+            "URL AS Dst, COUNT(*) AS PageViews FROM t WHERE CounterID = 62 AND IsRefresh = 0 "
+            "GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst")          # Q39 shape
+        chk("SELECT CASE WHEN SearchEngineID=0 THEN 'a' ELSE 'b' END AS k, COUNT(*) c FROM t GROUP BY k")
+        chk("SELECT CASE WHEN AdvEngineID>0 THEN 1 ELSE 0 END AS k, COUNT(*) c FROM t GROUP BY k")
+        # plain column + CASE together, grouping by the explicit CASE expression (DuckDB-accepted form)
+        chk("SELECT SearchEngineID, CASE WHEN AdvEngineID=0 THEN Referer ELSE '' END AS S, COUNT(*) c "
+            "FROM t GROUP BY SearchEngineID, CASE WHEN AdvEngineID=0 THEN Referer ELSE '' END")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
