@@ -353,17 +353,18 @@ def _to_rows(v, nrows):
     a = np.empty(nrows, dtype=object); a[:] = v; return a
 
 
-def _eval_rows(seg, node, mask):
+def _eval_rows(seg, node, mask, resolve=None):
     """Vectorised PER-ROW evaluation of a scalar expression over the (masked) rows -> numpy array of
     length = #selected rows. Used for genuine derived group keys that aren't a simple function of one
     column (e.g. CASE WHEN ...), which must be evaluated per row then factorized. String values are
-    produced as bytes (consistent with the engine; _pyval decodes them to str at emit). Raises
-    TypeError for unsupported nodes (caller keeps the prior 'unsupported' behavior)."""
+    produced as bytes (consistent with the engine; _pyval decodes them to str at emit). `resolve` maps
+    a logical column name to its physical segment name (col_map); identity if None. Raises TypeError
+    for unsupported nodes (caller keeps the prior 'unsupported' behavior)."""
     import operator
     n = node.this if isinstance(node, E.Alias) else node
-    if isinstance(n, E.Paren): return _eval_rows(seg, n.this, mask)
+    if isinstance(n, E.Paren): return _eval_rows(seg, n.this, mask, resolve)
     if isinstance(n, E.Column):
-        c = n.name; col = seg.cols[c]
+        c = resolve(n.name) if resolve is not None else n.name; col = seg.cols[c]
         if col['dt'] == 1:                                   # string dict col: decode distinct survivors
             rc = seg.codes(c); rc = rc[mask] if mask is not None else rc
             uc, inv = np.unique(rc, return_inverse=True)
@@ -376,25 +377,25 @@ def _eval_rows(seg, node, mask):
     if isinstance(n, E.Literal):
         return n.this.encode() if n.is_string else _literal_value(n)
     if isinstance(n, E.Null): return None
-    if isinstance(n, E.Not): return ~_eval_rows(seg, n.this, mask)
-    if isinstance(n, E.And): return _eval_rows(seg, n.this, mask) & _eval_rows(seg, n.expression, mask)
-    if isinstance(n, E.Or):  return _eval_rows(seg, n.this, mask) | _eval_rows(seg, n.expression, mask)
+    if isinstance(n, E.Not): return ~_eval_rows(seg, n.this, mask, resolve)
+    if isinstance(n, E.And): return _eval_rows(seg, n.this, mask, resolve) & _eval_rows(seg, n.expression, mask, resolve)
+    if isinstance(n, E.Or):  return _eval_rows(seg, n.this, mask, resolve) | _eval_rows(seg, n.expression, mask, resolve)
     if isinstance(n, (E.EQ, E.NEQ, E.GT, E.LT, E.GTE, E.LTE)):
-        l = _eval_rows(seg, n.this, mask); r = _eval_rows(seg, n.expression, mask)
+        l = _eval_rows(seg, n.this, mask, resolve); r = _eval_rows(seg, n.expression, mask, resolve)
         op = {E.EQ:operator.eq, E.NEQ:operator.ne, E.GT:operator.gt,
               E.LT:operator.lt, E.GTE:operator.ge, E.LTE:operator.le}[type(n)]
         return op(l, r)
-    if isinstance(n, E.Neg): return -_eval_rows(seg, n.this, mask)
-    if isinstance(n, E.Add): return _eval_rows(seg, n.this, mask) + _eval_rows(seg, n.expression, mask)
-    if isinstance(n, E.Sub): return _eval_rows(seg, n.this, mask) - _eval_rows(seg, n.expression, mask)
-    if isinstance(n, E.Mul): return _eval_rows(seg, n.this, mask) * _eval_rows(seg, n.expression, mask)
+    if isinstance(n, E.Neg): return -_eval_rows(seg, n.this, mask, resolve)
+    if isinstance(n, E.Add): return _eval_rows(seg, n.this, mask, resolve) + _eval_rows(seg, n.expression, mask, resolve)
+    if isinstance(n, E.Sub): return _eval_rows(seg, n.this, mask, resolve) - _eval_rows(seg, n.expression, mask, resolve)
+    if isinstance(n, E.Mul): return _eval_rows(seg, n.this, mask, resolve) * _eval_rows(seg, n.expression, mask, resolve)
     if isinstance(n, E.Case):
         nrows = int(np.count_nonzero(mask)) if mask is not None else seg.N
         default = n.args.get('default')
-        acc = _to_rows(_eval_rows(seg, default, mask), nrows) if default is not None else np.full(nrows, None, object)
+        acc = _to_rows(_eval_rows(seg, default, mask, resolve), nrows) if default is not None else np.full(nrows, None, object)
         for iff in reversed(n.args.get('ifs') or []):        # last WHEN wins if listed first -> reverse-fold
-            cond = _eval_rows(seg, iff.this, mask)
-            then = _to_rows(_eval_rows(seg, iff.args.get('true'), mask), nrows)
+            cond = _eval_rows(seg, iff.this, mask, resolve)
+            then = _to_rows(_eval_rows(seg, iff.args.get('true'), mask, resolve), nrows)
             acc = np.where(cond, then, acc)
         return acc
     raise TypeError(f"_eval_rows: unsupported node {type(n).__name__}")
@@ -528,7 +529,7 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
         _sig = _e[1] if _e[0] == 'col' else _e
         if _sig in _eff_seen: continue
         _eff_seen[_sig] = len(gkeys); gkeys.append(_e)
-    gcols = [ (None if k[0]=='const' else k[1]) for k in gkeys ]   # underlying column (None for const keys)
+    gcols = [ (None if k[0] in ('const','rowexpr') else k[1]) for k in gkeys ]   # None for const/rowexpr (no single base col)
     where = tree.args.get('where')
 
     # ---- cluster-slice fast path: tried BEFORE the full-column WHERE eval, which it avoids.
@@ -640,7 +641,7 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
         elif gk[0] == 'rowexpr':
             # general per-row expression (e.g. CASE WHEN ...): evaluate over the masked rows, then
             # factorize the resulting values. Not injective / multi-column, so it is its own dimension.
-            row_gv = _eval_rows(seg, rowexpr_nodes[gk[1]], mask)
+            row_gv = _eval_rows(seg, rowexpr_nodes[gk[1]], mask, seg_col)
             u, inv = np.unique(row_gv, return_inverse=True)
             metas.append((None, 'computed', u, None))
         elif gk[0] == 'sfn':

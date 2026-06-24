@@ -126,7 +126,7 @@ def test_positional_and_const_groupkeys():
             return sorted([tuple(round(float(x), 4) if isinstance(x, float) else x for x in r) for r in rs],
                           key=lambda t: tuple(str(x) for x in t))
         def chk(q):
-            wave = wdb_sql.execute(seg, q.replace('FROM t', 'FROM hits'))[0]
+            wave = wdb_sql.execute(seg, q.replace('FROM t', 'FROM hits'), col_map={c: c for c in seg.cols})[0]
             duck = con.execute(q.replace('FROM t', f"FROM '{pq}'")).fetchall()
             assert norm(wave) == norm(duck), (q, norm(wave)[:4], norm(duck)[:4])
 
@@ -166,7 +166,7 @@ def test_affine_groupkeys():
 
         def norm(rs): return sorted([tuple(int(x) for x in r) for r in rs])
         def chk(q):
-            wave = wdb_sql.execute(seg, q.replace('FROM t', 'FROM hits'))[0]
+            wave = wdb_sql.execute(seg, q.replace('FROM t', 'FROM hits'), col_map={c: c for c in seg.cols})[0]
             duck = con.execute(q.replace('FROM t', f"FROM '{pq}'")).fetchall()
             assert norm(wave) == norm(duck), (q, norm(wave)[:3], norm(duck)[:3])
 
@@ -214,7 +214,7 @@ def test_case_groupkeys():
 
         def norm(rs): return sorted([tuple(x for x in r) for r in rs], key=lambda t: tuple(str(x) for x in t))
         def chk(q):
-            wave = wdb_sql.execute(seg, q.replace('FROM t', 'FROM hits'))[0]
+            wave = wdb_sql.execute(seg, q.replace('FROM t', 'FROM hits'), col_map={c: c for c in seg.cols})[0]
             duck = con.execute(q.replace('FROM t', f"FROM '{pq}'")).fetchall()
             assert norm(wave) == norm(duck), (q, norm(wave)[:4], norm(duck)[:4])
 
@@ -257,7 +257,7 @@ def test_regexp_replace_groupkey():
         def norm(rs): return sorted([tuple(round(float(x),4) if isinstance(x,float) else x for x in r)
                                      for r in rs], key=lambda t: tuple(str(x) for x in t))
         def chk(q):
-            wave = wdb_sql.execute(seg, q.replace('FROM t', 'FROM hits'))[0]
+            wave = wdb_sql.execute(seg, q.replace('FROM t', 'FROM hits'), col_map={c: c for c in seg.cols})[0]
             duck = con.execute(q.replace('FROM t', f"FROM '{pq}'")).fetchall()
             assert norm(wave) == norm(duck), (q, norm(wave)[:4], norm(duck)[:4])
 
