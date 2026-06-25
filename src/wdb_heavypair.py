@@ -23,8 +23,11 @@ GROUP BY k1,k2 and k2,k1 share one node). Staleness-guarded by seg.N. Format ver
 older sidecar without landmarks is rebuilt rather than mis-read.
 
 Scope (v1): single segment, exactly two value-identity (non-mode-4) keys, projections exactly
-{bare k1, bare k2, COUNT(*)}, no WHERE/HAVING/DISTINCT/JOIN, ORDER BY COUNT(*) DESC + LIMIT N within
-the stored heavy-hitter set, no deleted rows.
+{bare k1, bare k2, COUNT(*)}, no WHERE/HAVING/DISTINCT/JOIN (a single eq/neq on a pair axis is
+allowed), LIMIT N, no deleted rows. Two ORDER forms: ORDER BY COUNT(*) DESC (classic top-N), or NO
+ORDER BY at all (unordered "any N" -- the count-descending heavy front is a legal, cheapest answer;
+this is the Q17 shape). If the heavy block holds < N pairs, decline to the scan (singleton top-up
+is a future v2). The loaded block is heap-resident in _CACHE across queries for the process lifetime.
 """
 import os, pickle, numpy as np
 import wdb_sql
@@ -54,7 +57,24 @@ def _vals(seg, col):
     return v
 
 _HITS = 0
-_CACHE = {}     # (seg.path, (a,b), N) -> (codesA, codesB, counts, landmarks)
+_CACHE = {}     # (seg.path, (a,b), N) -> (codesA, codesB, counts, landmarks); heap-resident across queries
+
+# Per-pair on/off. A disabled (name-sorted) pair is blocked from getting a sidecar: detect declines,
+# so the query falls through to the scan and no RAM is spent on that pair. The operator's RAM-budget
+# control -- enable only the pairs worth keeping resident. Empty set = all eligible pairs allowed.
+_DISABLED = set()
+
+
+def disable_pair(a, b):
+    _DISABLED.add(tuple(sorted((a, b))))
+
+
+def enable_pair(a, b):
+    _DISABLED.discard(tuple(sorted((a, b))))
+
+
+def is_disabled(cols):
+    return tuple(sorted(cols)) in _DISABLED
 
 
 def _path(seg, cols):
@@ -225,11 +245,24 @@ def detect(seg, tree, col_map):
     if set(knames) != set(gnames):                       # the two bare keys are exactly the group keys
         return None
     cols = [col_map.get(k, k) if col_map else k for k in knames]
+    if is_disabled(cols):                  # operator turned this pair off -> no sidecar, fall to scan
+        return None
     for col in cols:
         if not P.columns_exist(seg, col):  return None
         if not P.not_positional(seg, col): return None
     if not P.no_deleted_rows(seg):         return None
-    if not _order_is_count_desc(tree, proj, ci):
+    # ORDER shape: two legal forms.
+    #   (a) ORDER BY COUNT(*) DESC + LIMIT N  -> classic top-N by count.
+    #   (b) LIMIT N with NO ORDER BY          -> "any N pairs" (result order unspecified). The
+    #       count-descending heavy front is a LEGAL answer to an unordered limit, and it is the
+    #       cheapest N to produce (front of the already-sorted block). This is the Q17 shape.
+    # Anything else (ordered by a key, ASC, etc.) the count-sorted block can't serve -> decline.
+    order = tree.args.get('order')
+    if order is None or not order.expressions:
+        unordered = True
+    elif _order_is_count_desc(tree, proj, ci):
+        unordered = False
+    else:
         return None
     # WHERE: allowed only if it is a single eq/neq on one of the two pair axes (a kept-axis filter,
     # answered by a walk-and-skip over the sorted block). Any other WHERE -> decline to the scan.
@@ -242,7 +275,8 @@ def detect(seg, tree, col_map):
     if any(v is None for v in Vs.values()):              # both keys must be value-identity decodable
         return None
     return {'cols': cols, 'ci': ci, 'lim': wdb_sql._limit(tree), 'proj': proj,
-            'knames': knames, 'V': Vs, 'order': tree.args.get('order'), 'afilter': afilter}
+            'knames': knames, 'V': Vs, 'order': tree.args.get('order'), 'afilter': afilter,
+            'unordered': unordered}
 
 
 def execute(seg, spec):
@@ -272,9 +306,10 @@ def execute(seg, spec):
 
     if lim > positions.size:                             # not enough heavy pairs -> singletons needed -> scan
         return None
-    if lim < positions.size:                            # tie straddling LIMIT on the FILTERED sequence
-        if int(cn[positions[lim - 1]]) == int(cn[positions[lim]]):
+    if not spec.get('unordered') and lim < positions.size:   # tie straddling LIMIT (matters only when ORDERED:
+        if int(cn[positions[lim - 1]]) == int(cn[positions[lim]]):  # which of the tied pairs are "top N"?)
             return None                                  # ambiguous boundary -> defer to scan
+    # unordered LIMIT: any N pairs is a legal answer, so a tie across the boundary is fine -- no decline.
 
     rows = []
     for r in positions[:lim]:

@@ -16,7 +16,7 @@
   "14": "heavypair",
   "15": "dict_count",
   "16": "heavypair",
-  "17": "fused_agg",
+  "17": "heavypair",
   "18": "general_scan",
   "19": "general_scan",
   "20": "fused_agg",
