@@ -15,3 +15,4 @@ src/wdb_kernel_count
 *.wdb
 src/kernels/*.so
 bench/pod_*.py
+.coverage

@@ -1,46 +1,46 @@
-idx | cold_ms warm_ms | duck_ms | ratio(warm) | ok
-Q00 | 449 7.3 | 52.7 | 7.21x | True
-Q01 | 813 53.9 | 104.0 | 1.93x | True
-Q02 | 3063 679.6 | 187.5 | 0.28x | False
-Q03 | 1933 77.2 | 336.6 | 4.36x | False
-Q04 | 136 1.6 | 452.4 | 284.58x | True
-Q05 | 151 1.8 | 633.9 | 357.74x | True
-Q06 | 1204 24.3 | 172.3 | 7.10x | False
-Q07 | 1527 64.8 | 94.1 | 1.45x | True
-Q08 | 152 1.8 | 470.6 | 256.96x | True
-Q09 | 1972 976.3 | 582.0 | 0.60x | True
-Q10 | 156 1.3 | 179.5 | 133.91x | True
-Q11 | 4510 2252.8 | 204.4 | 0.09x | True
-Q12 | 6328 1736.3 | 596.2 | 0.34x | True
-Q13 | 4018 806.3 | 738.0 | 0.92x | True
-Q14 | 4142 63.4 | 597.4 | 9.42x | True
-Q15 | 676 1.1 | 395.7 | 359.75x | True
-Q16 | 4567 10.0 | 1110.9 | 110.71x | True
-Q17 | 26475 19743.7 | 929.3 | 0.05x | False
-Q18 | ---- ---- | 1992.6 | - | ?  <TIMEOUT>60s
-Q19 | 2270 956.3 | 95.6 | 0.10x | True
-Q20 | 28734 7971.4 | 1638.7 | 0.21x | True
-Q21 | 36209 13602.1 | 1001.2 | 0.07x | True
-Q22 | ---- ---- | 2194.4 | - | ?  <TIMEOUT>60s
-Q23 | ---- ---- | 1706.6 | - | ?  <TIMEOUT>60s
-Q24 | 882 1.7 | 615.8 | 357.07x | False
-Q25 | 529 3.3 | 372.9 | 112.83x | True
-Q26 | 892 19.9 | 490.9 | 24.64x | True
-Q27 | 20965 3013.5 | 1056.2 | 0.35x | True
-Q28 | ---- ---- | 8546.7 | - | ?  <TIMEOUT>60s
-Q29 | 15346 361.0 | 133.3 | 0.37x | False
-Q30 | 15489 9924.8 | 614.7 | 0.06x | False
-Q31 | ---- ---- | 866.6 | - | ?  <TIMEOUT>60s
-Q32 | ---- ---- | 1604.3 | - | ?  <TIMEOUT>60s
-Q33 | 11354 1.3 | 1804.2 | 1392.44x | True
-Q34 | 5738 2664.5 | 1843.4 | 0.69x | True
-Q35 | 3695 2449.9 | 590.7 | 0.24x | True
-Q36 | 15485 1940.5 | 191.6 | 0.10x | True
-Q37 | 9009 1495.9 | 179.9 | 0.12x | True
-Q38 | 5359 881.4 | 203.8 | 0.23x | False
-Q39 | ---- ---- | 402.7 | - | ?  <TIMEOUT>60s
-Q40 | 5005 1460.1 | 161.2 | 0.11x | False
-Q41 | 4451 718.8 | 103.3 | 0.14x | False
-Q42 | 2403 614.7 | 114.6 | 0.19x | True
+idx | cold_ms warm_ms | duck_ms | ratio(warm) | read | ok
+Q00 | 340 2.1 | 88.3 | 42.48x | fused_agg      | True
+Q01 | 747 61.0 | 117.3 | 1.92x | fused_agg      | True
+Q02 | 2830 631.3 | 150.5 | 0.24x | fused_agg      | True
+Q03 | 1833 74.8 | 299.9 | 4.01x | fused_agg      | False
+Q04 | 141 2.2 | 396.3 | 181.42x | fused_agg      | True
+Q05 | 149 1.6 | 631.4 | 389.24x | fused_agg      | True
+Q06 | 1180 24.0 | 182.6 | 7.62x | fused_agg      | True
+Q07 | 1525 114.4 | 105.7 | 0.92x | fused_agg      | True
+Q08 | 135 2.3 | 479.5 | 211.65x | distinct_sidecar | True
+Q09 | 1938 923.5 | 542.7 | 0.59x | group_mix      | True
+Q10 | 105 1.7 | 172.9 | 100.76x | distinct_sidecar | True
+Q11 | 4487 2314.1 | 222.1 | 0.10x | general_scan   | True
+Q12 | 6082 1701.3 | 558.1 | 0.33x | fused_agg      | True
+Q13 | 4002 819.8 | 730.4 | 0.89x | distinct_sidecar | True
+Q14 | 4100 61.1 | 507.0 | 8.30x | heavypair      | True
+Q15 | 681 1.3 | 397.0 | 299.71x | dict_count     | True
+Q16 | 4499 9.5 | 986.1 | 103.92x | heavypair      | True
+Q17 | 25202 18623.6 | 834.2 | 0.04x | fused_agg      | False
+Q18 | ---- ---- | 1832.3 | - | general_scan   | ?  <TIMEOUT>60s
+Q19 | 2221 921.1 | 86.6 | 0.09x | general_scan   | True
+Q20 | 26977 7700.1 | 1506.9 | 0.20x | fused_agg      | True
+Q21 | 35098 13256.0 | 937.2 | 0.07x | fused_agg      | True
+Q22 | ---- ---- | 1999.8 | - | general_scan   | ?  <TIMEOUT>60s
+Q23 | ---- ---- | 1653.5 | - | ERR:NotImplementedError | ?  <TIMEOUT>60s
+Q24 | 893 1.8 | 516.1 | 290.46x | cluster_topk   | False
+Q25 | 543 3.5 | 345.1 | 99.51x | sorted_proj    | True
+Q26 | 895 19.1 | 474.5 | 24.87x | cluster_topk   | True
+Q27 | 20550 2945.5 | 1050.0 | 0.36x | general_scan   | True
+Q28 | ---- ---- | 8189.2 | - | general_scan   | ?  <TIMEOUT>60s
+Q29 | 15219 387.6 | 105.5 | 0.27x | fused_agg      | True
+Q30 | 14781 9455.8 | 518.9 | 0.05x | fused_agg      | True
+Q31 | ---- ---- | 821.8 | - | fused_agg      | ?  <TIMEOUT>60s
+Q32 | ---- ---- | 1510.8 | - | fused_agg      | ?  <TIMEOUT>60s
+Q33 | 11244 1.4 | 1812.2 | 1302.90x | dict_count     | True
+Q34 | 5560 2519.5 | 1772.8 | 0.70x | general_scan   | True
+Q35 | 3531 2296.9 | 487.1 | 0.21x | general_scan   | True
+Q36 | 15236 1887.0 | 297.0 | 0.16x | survivor_group | True
+Q37 | 8854 1436.3 | 211.0 | 0.15x | survivor_group | True
+Q38 | 5117 869.6 | 219.8 | 0.25x | general_scan   | False
+Q39 | ---- ---- | 314.8 | - | general_scan   | ?  <TIMEOUT>60s
+Q40 | 4740 1439.5 | 171.6 | 0.12x | general_scan   | False
+Q41 | 4251 703.8 | 124.0 | 0.18x | general_scan   | False
+Q42 | 2337 605.8 | 169.4 | 0.28x | general_scan   | True
 
-SUMMARY ok=26/43 faster=13 median_ratio_ok=1.18x
+SUMMARY ok=30/43 faster=13 median_ratio_ok=0.80x

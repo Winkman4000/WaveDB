@@ -52,6 +52,10 @@ _READ_ORDER = (
 )
 
 
+_PATH_SINK = None   # None on speed-runs (one None-check per query, zero cost). The path-run
+                   # sets this to a callable(ctx, read_name) to record the winning read.
+
+
 def route_single_segment(ctx):
     """Route a request over a single clean segment to its read, else the general scan.
     Byte-identical to the previous wdb_db try-chain."""
@@ -59,6 +63,7 @@ def route_single_segment(ctx):
     # window). Any query with OFFSET goes straight to the general scan, which
     # materializes the full ordered result and applies LIMIT/OFFSET together.
     if wdb_sql._offset(ctx.tree):
+        if _PATH_SINK is not None: _PATH_SINK(ctx, 'general_scan')
         return R.general_scan(ctx)
     if _agg_or_group(ctx.tree):
         for read in _READ_ORDER:
@@ -67,6 +72,7 @@ def route_single_segment(ctx):
                 continue
             rows = read.execute(ctx, spec)
             if rows is not None:
+                if _PATH_SINK is not None: _PATH_SINK(ctx, read.name)
                 return rows
     else:
         # non-agg projection: the value-sorted dict read, then the cluster-ordered
@@ -75,10 +81,13 @@ def route_single_segment(ctx):
         if spec is not None:
             rows = R.sorted_proj.execute(ctx, spec)
             if rows is not None:
+                if _PATH_SINK is not None: _PATH_SINK(ctx, R.sorted_proj.name)
                 return rows
         spec = R.cluster_topk.detect(ctx)
         if spec is not None:
             rows = R.cluster_topk.execute(ctx, spec)
             if rows is not None:
+                if _PATH_SINK is not None: _PATH_SINK(ctx, R.cluster_topk.name)
                 return rows
+    if _PATH_SINK is not None: _PATH_SINK(ctx, 'general_scan')
     return R.general_scan(ctx)

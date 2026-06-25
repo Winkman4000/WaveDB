@@ -121,7 +121,7 @@ def _grouped_slice(seg, proj, gn, seg_col):
                         v = np.int64(v).view(f"datetime64[{seg.unit(cn)}]")
                     rowout.append(_pyval(v))
                 else:
-                    rowout.append(_pyval({'SUM': a.sum(dtype=np.float64), 'AVG': a.mean(dtype=np.float64)}[fn]))
+                    rowout.append(_pyval(_sum_avg(a, fn)))
         rows.append(tuple(rowout))
     return rows, [_alias(p) for p in proj]
 
@@ -776,8 +776,7 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
             if not is_sfn and seg.cols[seg_col(colname)]['dt'] == 3 and isinstance(v, (int, np.integer)):
                 v = np.int64(v).view(f"datetime64[{seg.unit(seg_col(colname))}]")
             return v
-        segf = seg_v.astype(np.float64)
-        return {'SUM': segf.sum(), 'AVG': segf.mean()}[fn]
+        return _sum_avg(seg_v, fn)
     def groupdistinct(colname, gi):                # COUNT(DISTINCT col) per group (ignores NULL)
         ck = '#cdarr#' + colname
         if ck not in aggcache:
@@ -917,6 +916,31 @@ def _count_topk_plan(proj, agg_specs, tree):
             if isinstance(p, E.Alias) and p.alias == nm and isinstance(p.this, E.Count):
                 return int(lim)
     return None
+def _exact_int_sum(arr):
+    """Exact Python-int sum of an integer numpy array -- no int64 overflow and no float64 mantissa
+    loss (DuckDB sums integers exactly; float64 loses precision past 2^53, e.g. AVG(UserID)).
+    Non-negative arrays use a fast hi/lo 32-bit split summed in uint64; signed arrays fall back to
+    object accumulation."""
+    if arr.size == 0: return 0
+    if int(arr.min()) >= 0:
+        u = arr.astype(np.uint64, copy=False)
+        lo = int(np.bitwise_and(u, np.uint64(0xFFFFFFFF)).sum(dtype=np.uint64))   # each <2^32; sum fits uint64
+        hi = int(np.right_shift(u, np.uint64(32)).sum(dtype=np.uint64))
+        return (hi << 32) + lo
+    return int(arr.sum(dtype=object))
+
+
+def _sum_avg(arr, fn):
+    """SUM or AVG over `arr` (already null-filtered, len>0). Integer inputs: exact integer sum ->
+    SUM returns a Python int (matching DuckDB's integer SUM), AVG returns exact_sum / n as a float.
+    Float inputs use float64."""
+    if np.issubdtype(arr.dtype, np.integer):
+        si = _exact_int_sum(arr)
+        return si if fn == 'SUM' else (si / len(arr))
+    af = arr.astype(np.float64)
+    return float(af.sum()) if fn == 'SUM' else float(af.mean())
+
+
 def _pyval(v):
     if isinstance(v,(bytes,bytearray)):
         try: return v.decode('utf-8','surrogatepass')
@@ -1040,8 +1064,7 @@ def _agg_scalar(seg, p, mask, seg_col):
         if fn == 'COUNT': return int(len(arr))
         if len(arr) == 0: return None
         if fn in ('MIN', 'MAX'): return _pyval(arr.min() if fn == 'MIN' else arr.max())
-        arrf = arr.astype(np.float64)
-        return _pyval({'SUM': arrf.sum(), 'AVG': arrf.mean()}[fn])
+        return _pyval(_sum_avg(arr, fn))
     arr, nm = _col(seg, seg_col(cn))
     if mask is not None:
         arr = arr[mask]; nm = nm[mask] if nm is not None else None
@@ -1054,8 +1077,7 @@ def _agg_scalar(seg, p, mask, seg_col):
         if c['dt'] == 3 and isinstance(v, (int, np.integer)):   # dict-mode datetime is int64 epoch
             v = np.int64(v).view(f"datetime64[{seg.unit(seg_col(cn))}]")
         return _pyval(v)
-    arr = arr.astype(np.float64)                  # SUM/AVG are numeric
-    return _pyval({'SUM': arr.sum(), 'AVG': arr.mean()}[fn])
+    return _pyval(_sum_avg(arr, fn))
 
 # ---------- narrow-before-expand: cluster-key slice fast path (scalar aggregates) ----------
 def _cluster_slice(seg, where_node, seg_col):
@@ -1170,7 +1192,7 @@ def _agg_scalar_range(seg, p, lo, hi, rmask, seg_col):
         if seg.cols[cn]['dt'] == 3 and isinstance(v, (int, np.integer)):
             v = np.int64(v).view(f"datetime64[{seg.unit(cn)}]")
         return _pyval(v)
-    return _pyval({'SUM': a.sum(dtype=np.float64), 'AVG': a.mean(dtype=np.float64)}[fn])
+    return _pyval(_sum_avg(a, fn))
 
 def _seq_eq_mask(seg, name, neg, lit):
     """O(1)-compute equality mask for a clean-affine integer mode-4 column (n_exc==0, no

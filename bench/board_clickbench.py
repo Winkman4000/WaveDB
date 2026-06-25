@@ -10,7 +10,8 @@ SRC, DBDIR, PARQ, SQLF, OUT = sys.argv[1:6]
 T = int(sys.argv[6]) if len(sys.argv) > 6 else 45
 WORKER = os.path.join(os.path.dirname(__file__), '_cbq_worker.py')
 sys.path.insert(0, SRC)
-import duckdb
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # for _cbnorm
+import duckdb, _cbnorm as N
 qs = [l.strip() for l in open(SQLF) if l.strip() and not l.strip().startswith('--')]
 con = duckdb.connect()
 # Oracle types EventDate/EventTime as DATE/TIMESTAMP (cb25db stores them as int
@@ -23,12 +24,12 @@ HITS_CTE = ("WITH hits AS (SELECT * REPLACE ("
 def duck(q):
     s = HITS_CTE + ' ' + q
     t = time.perf_counter(); rows = con.execute(s).fetchall(); ms = (time.perf_counter()-t)*1000
-    h = hashlib.md5()
-    for r in sorted([tuple(round(v,3) if isinstance(v,float) else v for v in row) for row in rows], key=repr):
-        h.update(repr(r).encode())
-    return h.hexdigest(), len(rows), ms
+    return N.limit_hash(rows), len(rows), ms
 env = dict(os.environ); env['PYTHONPATH'] = SRC
-out = []; print("idx | cold_ms warm_ms | duck_ms | ratio(warm) | ok", flush=True)
+# optional: per-query winning read from a path run (bench/path_run.py). Joined by idx if present.
+_PATHS_F = os.path.join(os.path.dirname(OUT), "clickbench_paths.json")
+PATHS = json.load(open(_PATHS_F)) if os.path.exists(_PATHS_F) else {}
+out = []; print("idx | cold_ms warm_ms | duck_ms | ratio(warm) | read | ok", flush=True)
 for i, q in enumerate(qs):
     try: dh, dn, dms = duck(q)
     except Exception: dh, dn, dms = None, None, None
@@ -40,12 +41,13 @@ for i, q in enumerate(qs):
         w = {'err': 'TIMEOUT>%ds' % T}
     ok = bool(w.get('hash') == dh) if ('hash' in w and dh is not None) else '?'
     ratio = (dms / w['warm_ms']) if (w.get('warm_ms') and dms) else None
-    print("Q%02d | %s %s | %s | %s | %s%s" % (i,
+    read = PATHS.get(str(i), "?")
+    print("Q%02d | %s %s | %s | %s | %-14s | %s%s" % (i,
         ('%.0f' % w['cold_ms'] if w.get('cold_ms') else '----'),
         ('%.1f' % w['warm_ms'] if w.get('warm_ms') else '----'),
-        ('%.1f' % dms if dms else '----'), ('%.2fx' % ratio if ratio else '-'), ok,
+        ('%.1f' % dms if dms else '----'), ('%.2fx' % ratio if ratio else '-'), read, ok,
         ('  <' + w['err'] if w.get('err') else '')), flush=True)
-    out.append({'idx': i, **{k: w.get(k) for k in ('cold_ms','warm_ms','nrows','err')},
+    out.append({'idx': i, 'read': read, **{k: w.get(k) for k in ('cold_ms','warm_ms','nrows','err')},
                 'duck_ms': dms, 'ratio': ratio, 'ok': ok})
 okc = sum(1 for r in out if r['ok'] is True)
 fast = sum(1 for r in out if r['ratio'] and r['ratio'] >= 1 and r['ok'] is True)
