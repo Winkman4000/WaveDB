@@ -18,6 +18,7 @@ map, db handle, segment path, raw sql, and the throughput/latency flag.
 import wdb_cube
 import wdb_gbcount
 import wdb_heavypair
+import wdb_countpos
 import wdb_scanpair
 import wdb_survgroup
 import wdb_compound
@@ -76,6 +77,11 @@ heavypair = Read('heavypair',
                  lambda c: wdb_heavypair.detect(c.seg, c.tree, c.cmap),
                  lambda c, spec: wdb_heavypair.execute(c.seg, spec),
                  'two-key COUNT(*) top-N from a count-sorted pair sidecar')
+
+countpos = Read('countpos',
+                lambda c: wdb_countpos.detect(c.seg, c.tree, c.cmap),
+                lambda c, spec: wdb_countpos.execute(c.seg, spec),
+                'two-key COUNT(*) top-K via per-row count-class column presence-scan')
 
 scanpair = Read('scanpair',
                 lambda c: wdb_scanpair.detect(c.seg, c.tree, c.cmap),

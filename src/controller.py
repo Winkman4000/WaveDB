@@ -38,6 +38,7 @@ def _agg_or_group(tree):
 _READ_ORDER = (
     R.cube,                 # pre-materialized cube
     R.dict_count,           # dictionary per-code counts
+    R.countpos,             # two-key COUNT(*) top-K via per-row count-class presence-scan (opt-in)
     R.heavypair,            # two-key COUNT(*) top-N from a count-sorted pair sidecar
     R.scanpair,             # two-key COUNT(*) top-N, high-card non-key filter via code-space scan
     R.survivor_group,       # filtered high-card group via survivor ranges

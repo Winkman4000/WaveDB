@@ -8,6 +8,8 @@ sys.path.insert(0, src)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # for _cbnorm
 import _cbnorm as N
 from wdb_db import Database
+if os.environ.get('WDB_COUNTPOS') == '1':   # opt-in: route 2-key COUNT(*) top-K through countpos
+    import wdb_countpos; wdb_countpos.enable()
 def nh(rows):
     return N.limit_hash(rows), len(rows)
 try:
