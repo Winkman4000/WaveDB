@@ -10,6 +10,8 @@ import _cbnorm as N
 from wdb_db import Database
 if os.environ.get('WDB_COUNTPOS') == '1':   # opt-in: route 2-key COUNT(*) top-K through countpos
     import wdb_countpos; wdb_countpos.enable()
+if os.environ.get('WDB_GRIDWALK') == '1':   # opt-in: route 2-key COUNT(*) top-K through gridwalk
+    import wdb_gridwalk; wdb_gridwalk.enable()
 def nh(rows):
     return N.limit_hash(rows), len(rows)
 try:
