@@ -13,9 +13,10 @@ structure is ~27 MB (walked identity 6.9 + counts 20 + head 0.4) vs heavypair's 
 countpos column's 200 MB -- 6x lighter, microsecond reads.
 
 v1 scope (this module): serves 2-key COUNT(*) top-K (ORDER BY COUNT(*) DESC, or unordered LIMIT) from
-the count-head; NO WHERE/HAVING/DISTINCT/JOIN; declines when LIMIT exceeds the head (the gap-encoded
-bulk + append-tail maintenance is the documented next layer). RAM-resident, never persisted. Gated
-behind _ENABLED (default False); when disabled detect returns None and routing is unchanged.
+the count-head; NO WHERE/HAVING/DISTINCT/JOIN; for LIMIT beyond the head it decodes the gap-encoded
+bulk (all heavy cells, byte-block frame-of-reference over dict-order gaps) and takes top-lim by count.
+Append-tail maintenance is the documented next layer. RAM-resident, never persisted. Gated behind
+_ENABLED (default False); when disabled detect returns None and routing is unchanged.
 """
 import numpy as np
 import wdb_sql
@@ -59,6 +60,65 @@ def _vals(seg, col):
     return v
 
 
+_BULK_B = 128             # bulk block size; per-block byte-width frame-of-reference over dict-order gaps
+
+
+def _bulk_encode(gid, cnt):
+    """Gap-encoded bulk: ALL heavy filled cells (not just the head). gid sorted ascending in code
+    order; store within-block deltas at the block's byte-width (frame-of-reference), the big
+    cross-block gap absorbed by an explicit per-block anchor. Counts stay flat for random access.
+    ~16 MB gid (vs 81 MB explicit) + ~20 MB counts on SearchPhrase x UserID. Has per-block anchors
+    for future point-lookup/maintenance. Returns a dict; RAM-resident, never persisted."""
+    n = int(gid.size)
+    B = _BULK_B
+    nb = (n + B - 1) // B
+    pad = nb * B - n
+    gp = np.concatenate([gid, np.full(pad, gid[-1], dtype=np.int64)]).reshape(nb, B)
+    wd = np.diff(gp, axis=1, prepend=gp[:, :1])          # within-block deltas; col0 == 0
+    anchors = np.ascontiguousarray(gp[:, 0])             # absolute gid at each block start
+    maxd = wd.max(axis=1)
+    nbits = np.where(maxd > 0, np.floor(np.log2(np.maximum(maxd, 1))).astype(np.int64) + 1, 1)
+    widths = np.maximum(np.ceil(nbits / 8).astype(np.int64), 1).astype(np.uint8)  # bytes/delta 1..8
+    buffers = {}
+    for w in np.unique(widths):
+        w = int(w)
+        bidx = np.flatnonzero(widths == w)
+        blk = wd[bidx]                                   # (m, B) int64
+        le = np.zeros((bidx.size, B, w), dtype=np.uint8)
+        for bp in range(w):
+            le[:, :, bp] = (blk >> (8 * bp)) & 0xFF
+        buffers[w] = np.ascontiguousarray(le.reshape(-1))
+    cstore = cnt.astype(np.uint16) if int(cnt.max()) < 65536 else cnt.astype(np.uint32)
+    return {'n': n, 'B': B, 'nb': nb, 'anchors': anchors, 'widths': widths,
+            'buffers': buffers, 'cnt': cstore}
+
+
+def _bulk_decode_all(bulk):
+    """Reconstruct (gid, cnt) for all heavy cells in code order. Vectorized per byte-width group:
+    unpack LE bytes -> within-block deltas -> cumsum + anchor. Round-trip exact."""
+    n = bulk['n']; B = bulk['B']; nb = bulk['nb']
+    anchors = bulk['anchors']; widths = bulk['widths']; buffers = bulk['buffers']
+    out = np.empty(nb * B, dtype=np.int64)
+    ar = np.arange(B)
+    for w, buf in buffers.items():
+        bidx = np.flatnonzero(widths == w)
+        v = buf.reshape(bidx.size, B, w).astype(np.int64)
+        val = np.zeros((bidx.size, B), dtype=np.int64)
+        for bp in range(w):
+            val += v[:, :, bp] << (8 * bp)
+        rec = np.cumsum(val, axis=1) + anchors[bidx][:, None]
+        out[(bidx[:, None] * B + ar)] = rec
+    return out[:n], bulk['cnt']
+
+
+def _bulk_nbytes(bulk):
+    """Resident size of the bulk in bytes (anchors + widths + packed deltas + counts)."""
+    b = bulk['anchors'].nbytes + bulk['widths'].nbytes + bulk['cnt'].nbytes
+    for buf in bulk['buffers'].values():
+        b += buf.nbytes
+    return int(b)
+
+
 def _build(seg, cols):
     """Filled-cell head: occurring heavy pairs (count>=2) as grid-ids, the top _HEAD_N by count,
     count-descending. Stores grid-id + count per head cell (identity is the grid-id's coordinates).
@@ -78,7 +138,8 @@ def _build(seg, cols):
     h = h[np.argsort(cnt[h], kind='stable')[::-1]]   # count descending
     head_gid = np.ascontiguousarray(gid[h], dtype=np.int64)
     head_cnt = np.ascontiguousarray(cnt[h], dtype=np.int64)
-    return head_gid, head_cnt, Vb, int(gid.size)
+    bulk = _bulk_encode(gid, cnt)        # full heavy-cell coverage, gap-encoded, for LIMIT beyond head
+    return head_gid, head_cnt, Vb, int(gid.size), bulk
 
 
 def _load(seg, cols):
@@ -180,26 +241,51 @@ def execute(seg, spec):
     loaded = _load(seg, cols)
     if loaded is None:
         return None
-    head_gid, head_cnt, Vb, nheavy = loaded
-    if lim <= 0 or lim > head_gid.size:
-        return None
-    if not spec.get('unordered') and head_cnt.size > lim and int(head_cnt[lim - 1]) == int(head_cnt[lim]):
+    head_gid, head_cnt, Vb, nheavy, bulk = loaded
+    if lim <= 0:
         return None
     a, b = sorted(cols)
-    sel_gid = head_gid[:lim]; sel_cnt = head_cnt[:lim]
+    if lim <= head_gid.size:
+        # hot path: top-K is a direct slice of the pre-sorted count-head
+        if not spec.get('unordered') and head_cnt.size > lim and int(head_cnt[lim - 1]) == int(head_cnt[lim]):
+            return None
+        sel_gid = head_gid[:lim]; sel_cnt = head_cnt[:lim]
+    else:
+        # beyond the head: decode the gap-encoded bulk (all heavy cells) and take top-lim by count
+        if bulk is None or lim > bulk['n']:
+            return None
+        gid_all, cnt_all = _bulk_decode_all(bulk)
+        cnt_all = cnt_all.astype(np.int64)
+        kk = min(lim + 1, cnt_all.size)
+        part = np.argpartition(cnt_all, -kk)[-kk:]
+        order_idx = part[np.argsort(cnt_all[part], kind='stable')[::-1]]
+        if not spec.get('unordered') and order_idx.size > lim and int(cnt_all[order_idx[lim - 1]]) == int(cnt_all[order_idx[lim]]):
+            return None
+        sel = order_idx[:lim]
+        sel_gid = gid_all[sel]; sel_cnt = cnt_all[sel]
+    # materialize: hoist per-row-invariant work out of the loop; vectorize coordinate + value decode.
+    # (identical rows/order to a naive per-cell decode; the large-LIMIT bulk path was Python-bound here.)
+    codesA = sel_gid // Vb
+    codesB = sel_gid - codesA * Vb
+    code_by_col = {a: codesA, b: codesB}
+    plan = []                         # (proj_index, key_col) per position; key_col is None for COUNT
+    decoded = {}
+    for pi, p in enumerate(proj):
+        if pi == ci:
+            plan.append((pi, None)); continue
+        col = cols[knames.index(wdb_sql._proj_colname(p))]
+        plan.append((pi, col))
+        if col not in decoded:
+            decoded[col] = [wdb_sql._pyval(x) for x in V[col][code_by_col[col].astype(np.intp)]]
+    cnt_list = sel_cnt.astype(np.int64).tolist()
+    nproj = len(proj)
     rows_out = []
-    for g, cnt_val in zip(sel_gid, sel_cnt):
-        g = int(g)
-        by_col = {a: g // Vb, b: g % Vb}
-        row = [None] * len(proj)
-        row[ci] = int(cnt_val)
-        for pi, p in enumerate(proj):
-            if pi == ci:
-                continue
-            knm = wdb_sql._proj_colname(p)
-            col = cols[knames.index(knm)]
-            row[pi] = wdb_sql._pyval(V[col][int(by_col[col])])
-        rows_out.append(tuple(row))
+    ap = rows_out.append
+    for i in range(sel_gid.size):
+        row = [None] * nproj
+        for pi, col in plan:
+            row[pi] = cnt_list[i] if col is None else decoded[col][i]
+        ap(tuple(row))
     rows_out = workers.finalize(rows_out, proj, spec['order'], lim)
     _HITS += 1
     return rows_out, [wdb_sql._alias(p) for p in proj]
