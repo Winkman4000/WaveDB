@@ -15,6 +15,7 @@ from wdb_engine import Segment
 import os
 import wdb_ddl, wdb_dml, wdb_sql, wdb_merge, wdb_compact, wdb_join, wdb_fkptr, wdb_bsi_exec, wdb_cube, wdb_gbcount, wdb_survgroup, wdb_compound, wdb_groupdistinct, wdb_gdsidecar, wdb_groupmix
 import read_methods, controller
+import wdb_gridwalk_live
 import commands
 import numpy as np
 import functools
@@ -122,6 +123,12 @@ class Database:
                 return controller.route_single_segment(ctx)
             if hot is None and not segs:
                 raise ValueError(f"table {name!r} has no data yet")
+            if len(segs) == 1 and hot is not None:
+                # one cold segment + a hot buffer: try the gridwalk base + maintenance fast path for
+                # 2-key COUNT(*) top-K; it declines (None) for any other shape or a new dict value.
+                live = wdb_gridwalk_live.try_live(segs[0], hot, tree, cmap)
+                if live is not None:
+                    return live
             return wdb_merge.merge_query(segs, hot, sql, col_map=cmap)
         raise NotImplementedError(f"unsupported statement: {type(tree).__name__}")
 
