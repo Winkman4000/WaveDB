@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import pandas as pd, numpy as np, sqlglot
 from wdb_db import Database
 from wdb_engine import Segment
-import wdb_encode, wdb_heavypair as HP
+import wdb_encode, wdb_heavypair as HP, wdb_gridwalk as GW
 
 
 def _build(d):
@@ -38,8 +38,13 @@ def test_heavypair_answers_and_declines():
         assert sorted(res[0]) == sorted(old), f"{res[0]} != {old}"
         # full heavy set (LIMIT == #heavy pairs = 4): answered
         assert _try(seg, "SELECT k1, k2, COUNT(*) FROM t GROUP BY k1, k2 ORDER BY COUNT(*) DESC LIMIT 4") is not None
-        # routes through the real db.run path
-        h0 = HP._HITS; db.run(sql3); assert HP._HITS > h0, "db.run should route through heavypair"
+        # routes through the real db.run path (with gridwalk -- the default 2-key read -- stood down,
+        # so heavypair, its fallback, gets the query)
+        GW.disable()
+        try:
+            h0 = HP._HITS; db.run(sql3); assert HP._HITS > h0, "db.run should route through heavypair"
+        finally:
+            GW.enable()
         # declines: LIMIT past the heavy set would need singletons (5 > 4 heavy pairs)
         assert _try(seg, "SELECT k1, k2, COUNT(*) FROM t GROUP BY k1, k2 ORDER BY COUNT(*) DESC LIMIT 5") is None
         # declines: WHERE (restrict not in this node's shape)

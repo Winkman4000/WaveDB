@@ -15,8 +15,8 @@ countpos column's 200 MB -- 6x lighter, microsecond reads.
 v1 scope (this module): serves 2-key COUNT(*) top-K (ORDER BY COUNT(*) DESC, or unordered LIMIT) from
 the count-head; NO WHERE/HAVING/DISTINCT/JOIN; for LIMIT beyond the head it decodes the gap-encoded
 bulk (all heavy cells, byte-block frame-of-reference over dict-order gaps) and takes top-lim by count.
-Append-tail maintenance is the documented next layer. RAM-resident, never persisted. Gated behind
-_ENABLED (default False); when disabled detect returns None and routing is unchanged.
+Append-tail maintenance is the documented next layer. RAM-resident, never persisted. Live by default
+(_ENABLED True); disable() restores the prior routing (heavypair/scan) for the shapes it handles.
 """
 import numpy as np
 import wdb_sql
@@ -24,7 +24,7 @@ import workers
 import wdb_policies as P
 E = wdb_sql.E
 
-_ENABLED = False          # opt-in; default off keeps existing routing byte-identical
+_ENABLED = True           # live by default: gridwalk is the primary 2-key COUNT(*) top-K read
 _HEAD_N = 200000          # count-ordered head depth; serves any LIMIT up to this, declines beyond
 _HITS = 0
 _CACHE = {}               # (seg.path,(a,b),N) -> (head_gid, head_cnt, Vb, nheavy); RAM-resident

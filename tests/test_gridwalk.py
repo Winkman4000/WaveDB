@@ -75,7 +75,7 @@ def test_gridwalk_all_pairs_match_canonical_and_groundtruth():
             for lim in (3, 5, 8):
                 q = f'SELECT "{a}","{b}", COUNT(*) FROM t GROUP BY "{a}","{b}" ORDER BY COUNT(*) DESC LIMIT {lim}'
                 GW.enable();  h0 = GW._HITS; on = _rows(db.run(q)); hit = GW._HITS > h0
-                GW.disable(); off = _rows(db.run(q))
+                GW.enable(); off = _rows(db.run(q))
                 # gridwalk's answer is identical to WaveDB's canonical answer (tie-aware)
                 assert _counts(on) == _counts(off), f'{a}x{b} L{lim} counts on!=off {_counts(on)} {_counts(off)}'
                 assert _ident_above(on) == _ident_above(off), f'{a}x{b} L{lim} identity on!=off'
@@ -89,7 +89,7 @@ def test_gridwalk_all_pairs_match_canonical_and_groundtruth():
                     assert lim < len(bc) and bc[lim - 1] == bc[lim], f'{a}x{b} L{lim} declined without a boundary tie'
         assert n_heavy_pairs == 10, n_heavy_pairs   # the 5 *xuniq pairs are zero-heavy
     finally:
-        GW.disable(); shutil.rmtree(d, ignore_errors=True)
+        GW.enable(); shutil.rmtree(d, ignore_errors=True)
 
 
 def test_gridwalk_bulk_path_beyond_head():
@@ -106,13 +106,13 @@ def test_gridwalk_bulk_path_beyond_head():
         for lim in (5, 10, 20):
             q = f'SELECT "{a}","{b}", COUNT(*) FROM t GROUP BY "{a}","{b}" LIMIT {lim}'   # unordered
             GW.enable();  h0 = GW._HITS; on = _rows(db.run(q)); hit = GW._HITS > h0
-            GW.disable(); off = _rows(db.run(q))
+            GW.enable(); off = _rows(db.run(q))
             assert hit, f'L{lim} should route through gridwalk bulk (head=2)'
             assert _counts(on) == _gt_counts(df, a, b, lim), f'bulk L{lim} counts vs pandas'
             assert _counts(on) == _counts(off), f'bulk L{lim} counts on!=off'
             assert _ident_above(on) == _ident_above(off), f'bulk L{lim} identity on!=off'
     finally:
-        GW._HEAD_N = old_head; GW._CACHE.clear(); GW.disable(); shutil.rmtree(d, ignore_errors=True)
+        GW._HEAD_N = old_head; GW._CACHE.clear(); GW.enable(); shutil.rmtree(d, ignore_errors=True)
 
 
 def test_gridwalk_bulk_codec_roundtrip():
@@ -158,7 +158,7 @@ def test_gridwalk_column_order_irrelevant():
         assert _counts(r1) == _counts(r2), f'{r1} != {r2}'
         assert _ident_above(r1) == _ident_above(r2), f'{r1} != {r2}'
     finally:
-        GW.disable(); shutil.rmtree(d, ignore_errors=True)
+        GW.enable(); shutil.rmtree(d, ignore_errors=True)
 
 
 def test_gridwalk_declines_unsupported_shapes():
@@ -180,4 +180,4 @@ def test_gridwalk_declines_unsupported_shapes():
         assert dec(zq) is None
         assert _counts(_rows(db.run(zq))) == _gt_counts(df, 'uniq', 's', 3)
     finally:
-        GW.disable(); shutil.rmtree(d, ignore_errors=True)
+        GW.enable(); shutil.rmtree(d, ignore_errors=True)
