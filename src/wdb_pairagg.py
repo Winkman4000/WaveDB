@@ -73,7 +73,7 @@ def _gather_partition(idx, ca, cb, Vb, pay, S, NT):
         lo = w * chunk; hi = min(lo + chunk, n)
         for j in range(lo, hi):
             r = idx[j]; g = np.int64(ca[r]) * Vb + np.int64(cb[r]); G[j] = g
-            for p in range(Pn): PY[j, p] = pay[r, p]
+            for p in range(Pn): PY[j, p] = pay[j, p]     # pay is SURVIVOR-aligned (compact)
             lhist[w, g % S] += 1
     base = np.zeros(S + 1, np.int64)
     for s in range(S):
@@ -235,6 +235,17 @@ def _build_mask(seg, pcol, op, lit):
     return (codes != code) if code >= 0 else np.ones(codes.size, dtype=bool)
 
 
+def _survivor_payload(seg, pc, idx):
+    """Decode payload values for the SURVIVOR rows only (late materialization). A clean dict column
+    gathers Vd[codes[idx]] -- ~13M values instead of decoding all 100M. Columns with overrides, or
+    affine/const modes (whose full decode is already cheap), take the correct seg.values()[idx] path."""
+    c = seg.cols[pc]
+    if c['mode'] not in (4, 6) and seg._overrides(pc) is None:
+        Vd = np.asarray(seg._typed_dict(pc))
+        return Vd[seg._raw_codes(pc)[idx]]
+    return seg.values(pc)[idx]
+
+
 def execute(seg, spec):
     global _HITS
     kcols = spec['kcols']; a, b = kcols[0], kcols[1]
@@ -256,13 +267,13 @@ def execute(seg, spec):
     pay_specs = [(a2[0], a2[1]) for a2 in spec['aggs'] if a2[0] in ('SUM', 'AVG')]
     payphys = [spec['col_map'].get(c, c) if spec['col_map'] else c for _, c in pay_specs]
     Pn = max(1, len(payphys))
-    payF = np.zeros((caF.size, Pn), np.int64)
+    pay_s = np.zeros((idx.size, Pn), np.int64)     # SURVIVOR-aligned payload (late materialization)
     for p, pc in enumerate(payphys):
-        vals = seg.values(pc)                # canonical mode-agnostic decode; dt==0 => integer
+        vals = _survivor_payload(seg, pc, idx)
         if vals.dtype.kind not in ('i', 'u'):
-            return None                      # non-integer payload -> fused_agg
-        payF[:, p] = vals                    # assignment casts to int64 directly (no extra copy)
-    PG, PPY, base = _gather_partition(idx, caF, cbF, Vb, payF, _NSHARD, _NT)
+            return None                            # non-integer payload -> fused_agg
+        pay_s[:, p] = vals
+    PG, PPY, base = _gather_partition(idx, caF, cbF, Vb, pay_s, _NSHARD, _NT)
     out_g, out_c, out_p, ndist = _agg_shards(PG, PPY, base, _NSHARD, _TSIZE)
     segs_g = []; segs_c = []; segs_p = []                 # gather each shard's occupied region
     for s in range(_NSHARD):
