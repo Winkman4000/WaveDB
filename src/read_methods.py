@@ -20,6 +20,7 @@ import wdb_gbcount
 import wdb_heavypair
 import wdb_countpos
 import wdb_gridwalk
+import wdb_pairagg
 import wdb_scanpair
 import wdb_survgroup
 import wdb_compound
@@ -83,6 +84,11 @@ gridwalk = Read('gridwalk',
                 lambda c: wdb_gridwalk.detect(c.seg, c.tree, c.cmap),
                 lambda c, spec: wdb_gridwalk.execute(c.seg, spec),
                 'two-key COUNT(*) top-K via grid filled-cell + count-ordered head')
+
+pairagg = Read('pairagg',
+               lambda c: wdb_pairagg.detect(c.seg, c.tree, c.cmap),
+               lambda c, spec: wdb_pairagg.execute(c.seg, spec),
+               'filtered 2-key top-K by count with COUNT/SUM/AVG via parallel sparse hash-agg')
 
 countpos = Read('countpos',
                 lambda c: wdb_countpos.detect(c.seg, c.tree, c.cmap),

@@ -50,6 +50,7 @@ _READ_ORDER = (
     R.cluster_slice,        # contiguous slice of a clustered structure
     R.cluster_group_slice,  # clustered group-runs as slices
     R.bsi_filter,           # bit-sliced index filter (throughput-only; detect gates on esc)
+    R.pairagg,              # filtered 2-key top-K by count + COUNT/SUM/AVG via parallel sparse hash-agg
     R.fused_agg,            # single-table fused fast path
 )
 
