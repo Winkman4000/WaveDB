@@ -29,7 +29,7 @@ env = dict(os.environ); env['PYTHONPATH'] = SRC
 # optional: per-query winning read from a path run (bench/path_run.py). Joined by idx if present.
 _PATHS_F = os.path.join(os.path.dirname(OUT), "clickbench_paths.json")
 PATHS = json.load(open(_PATHS_F)) if os.path.exists(_PATHS_F) else {}
-out = []; print("idx | cold_ms warm_ms | duck_ms | ratio(warm) | read | ok", flush=True)
+out = []; print("idx | cold_ms warm_ms | duck_ms | ratio(warm) | read | status", flush=True)
 for i, q in enumerate(qs):
     try: dh, dn, dms = duck(q)
     except Exception: dh, dn, dms = None, None, None
@@ -39,18 +39,26 @@ for i, q in enumerate(qs):
         w = json.loads(ln[-1]) if ln else {'err': 'noout:' + (p.stderr.strip()[-90:] or '?')}
     except subprocess.TimeoutExpired:
         w = {'err': 'TIMEOUT>%ds' % T}
-    ok = bool(w.get('hash') == dh) if ('hash' in w and dh is not None) else '?'
+    if w.get('err'):
+        status = 'timeout' if 'TIMEOUT' in w['err'] else 'err'
+    elif ('hash' in w and dh is not None):
+        status = 'ok' if w['hash'] == dh else 'false'
+    else:
+        status = 'n/a'
     ratio = (dms / w['warm_ms']) if (w.get('warm_ms') and dms) else None
-    read = PATHS.get(str(i), "?")
-    print("Q%02d | %s %s | %s | %s | %-14s | %s%s" % (i,
+    read = PATHS.get(str(i), "-")
+    print("Q%02d | %s %s | %s | %s | %-12s | %s" % (i,
         ('%.0f' % w['cold_ms'] if w.get('cold_ms') else '----'),
         ('%.1f' % w['warm_ms'] if w.get('warm_ms') else '----'),
-        ('%.1f' % dms if dms else '----'), ('%.2fx' % ratio if ratio else '-'), read, ok,
-        ('  <' + w['err'] if w.get('err') else '')), flush=True)
-    out.append({'idx': i, 'read': read, **{k: w.get(k) for k in ('cold_ms','warm_ms','nrows','err')},
-                'duck_ms': dms, 'ratio': ratio, 'ok': ok})
-okc = sum(1 for r in out if r['ok'] is True)
-fast = sum(1 for r in out if r['ratio'] and r['ratio'] >= 1 and r['ok'] is True)
-rr = [r['ratio'] for r in out if r['ratio'] and r['ok'] is True]
-print("\nSUMMARY ok=%d/43 faster=%d median_ratio_ok=%.2fx" % (okc, fast, st.median(rr) if rr else 0), flush=True)
+        ('%.1f' % dms if dms else '----'), ('%.2fx' % ratio if ratio else '-'), read, status), flush=True)
+    out.append({'idx': i, 'read': read, 'status': status,
+                **{k: w.get(k) for k in ('cold_ms','warm_ms','nrows','err')},
+                'duck_ms': dms, 'ratio': ratio})
+okc = sum(1 for r in out if r['status'] == 'ok')
+falsec = sum(1 for r in out if r['status'] == 'false')
+toc = sum(1 for r in out if r['status'] == 'timeout')
+fast = sum(1 for r in out if r['ratio'] and r['ratio'] >= 1 and r['status'] == 'ok')
+rr = [r['ratio'] for r in out if r['ratio'] and r['status'] == 'ok']
+print("\nSUMMARY  ok=%d  false=%d  timeout=%d  (/43)   faster=%d   median_ratio_ok=%.2fx"
+      % (okc, falsec, toc, fast, st.median(rr) if rr else 0), flush=True)
 json.dump(out, open(OUT, 'w'), indent=0)
