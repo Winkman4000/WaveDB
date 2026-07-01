@@ -10,7 +10,7 @@ drift -- all read as wrong despite being correct. This normalizes so only real d
 Hashes are order-independent (GROUP BY output order is unspecified): a small-result sorted md5
 (limit_hash) and a commutative md5-sum fingerprint for large full sets (full_fp), both stable across
 processes (md5, not Python hash())."""
-import datetime, re, hashlib
+import datetime, re, hashlib, math
 _TS = re.compile(r'^(\d{4}-\d\d-\d\d)(?:[ T](\d\d:\d\d:\d\d))?(?:\.\d+)?$')
 
 def _cn(v):                                   # canonical number
@@ -19,7 +19,10 @@ def _cn(v):                                   # canonical number
     f = float(v)
     if f != f:              return ('f', 'nan')
     if f.is_integer() and abs(f) < 2**53: return ('i', int(f))    # 5.0 -> ('i',5) == int 5
-    return ('f', round(f, 3))
+    # 3 decimals for normal magnitudes, but never more than ~12 significant figures: absorbs float
+    # summation drift on huge values (e.g. AVG(UserID) ~ 2.5e18) without hiding real differences.
+    dec = 3 if f == 0.0 else min(3, 11 - math.floor(math.log10(abs(f))))
+    return ('f', round(f, dec))
 
 def norm_cell(v):
     if v is None: return None

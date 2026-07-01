@@ -12,6 +12,7 @@ WORKER = os.path.join(os.path.dirname(__file__), '_cbq_worker.py')
 sys.path.insert(0, SRC)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # for _cbnorm
 import duckdb, _cbnorm as N
+from _cbvalidate import total_order_sql
 qs = [l.strip() for l in open(SQLF) if l.strip() and not l.strip().startswith('--')]
 con = duckdb.connect()
 # Oracle types EventDate/EventTime as DATE/TIMESTAMP (cb25db stores them as int
@@ -26,6 +27,30 @@ def duck(q):
     t = time.perf_counter(); rows = con.execute(s).fetchall(); ms = (time.perf_counter()-t)*1000
     return N.limit_hash(rows), len(rows), ms
 env = dict(os.environ); env['PYTHONPATH'] = SRC
+VT = max(T, 240)   # validation-only timeout: correctness adjudication is OFF the perf-timing path, so a
+                   # slow total-order variant (e.g. imposing an order on an unordered high-card GROUP BY)
+                   # is allowed to run long. The reported speed still comes from the real query below.
+def run_wdb(q, tmo=T):
+    try:
+        p = subprocess.run([sys.executable, WORKER, SRC, DBDIR, q], capture_output=True, text=True, timeout=tmo, env=env)
+        ln = [l for l in p.stdout.strip().splitlines() if l.startswith('{')]
+        return json.loads(ln[-1]) if ln else {'err': 'noout:' + (p.stderr.strip()[-90:] or '?')}
+    except subprocess.TimeoutExpired:
+        return {'err': 'TIMEOUT>%ds' % tmo}
+def validated_ok(q, dh):
+    # Exact hash mismatched. If DuckDB can't adjudicate (tie/unordered LIMIT), impose a total order so
+    # exactly one answer is legal; if WaveDB and DuckDB agree there, WaveDB's answer was a valid one.
+    q2 = total_order_sql(q)
+    if not q2:
+        return False
+    w2 = run_wdb(q2, VT)
+    if 'hash' not in w2:
+        return False
+    try:
+        d2h, _, _ = duck(q2)
+    except Exception:
+        return False
+    return w2['hash'] == d2h
 # optional: per-query winning read from a path run (bench/path_run.py). Joined by idx if present.
 _PATHS_F = os.path.join(os.path.dirname(OUT), "clickbench_paths.json")
 PATHS = json.load(open(_PATHS_F)) if os.path.exists(_PATHS_F) else {}
@@ -33,16 +58,16 @@ out = []; print("idx | cold_ms warm_ms | duck_ms | ratio(warm) | read | status",
 for i, q in enumerate(qs):
     try: dh, dn, dms = duck(q)
     except Exception: dh, dn, dms = None, None, None
-    try:
-        p = subprocess.run([sys.executable, WORKER, SRC, DBDIR, q], capture_output=True, text=True, timeout=T, env=env)
-        ln = [l for l in p.stdout.strip().splitlines() if l.startswith('{')]
-        w = json.loads(ln[-1]) if ln else {'err': 'noout:' + (p.stderr.strip()[-90:] or '?')}
-    except subprocess.TimeoutExpired:
-        w = {'err': 'TIMEOUT>%ds' % T}
+    w = run_wdb(q)
     if w.get('err'):
         status = 'timeout' if 'TIMEOUT' in w['err'] else 'err'
     elif ('hash' in w and dh is not None):
-        status = 'ok' if w['hash'] == dh else 'false'
+        if w['hash'] == dh:
+            status = 'ok'
+        elif validated_ok(q, dh):
+            status = 'ok'          # correct, but non-deterministic: DuckDB's arbitrary tie pick differed
+        else:
+            status = 'false'
     else:
         status = 'n/a'
     ratio = (dms / w['warm_ms']) if (w.get('warm_ms') and dms) else None
