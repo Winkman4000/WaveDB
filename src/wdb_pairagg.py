@@ -20,6 +20,7 @@ or any shape outside the above; detect declines the rest.
 """
 import numpy as np
 import wdb_sql
+import wdb_compound
 import workers
 import wdb_policies as P
 from numba import njit, prange
@@ -71,7 +72,7 @@ def _gather_partition(idx, ca, cb, Vb, pay, S, NT):
     for w in prange(NT):
         lo = w * chunk; hi = min(lo + chunk, n)
         for j in range(lo, hi):
-            r = idx[j]; g = ca[r] * Vb + cb[r]; G[j] = g
+            r = idx[j]; g = np.int64(ca[r]) * Vb + np.int64(cb[r]); G[j] = g
             for p in range(Pn): PY[j, p] = pay[r, p]
             lhist[w, g % S] += 1
     base = np.zeros(S + 1, np.int64)
@@ -219,22 +220,27 @@ def detect(seg, tree, col_map):
 
 
 def _build_mask(seg, pcol, op, lit):
-    V = np.asarray(seg._typed_dict(pcol))
-    key = lit.encode('utf-8', 'surrogatepass') if (V.dtype.kind == 'S' and isinstance(lit, str)) else lit
+    """Row mask for `pcol = lit` / `pcol <> lit`. Find the literal's code CHEAPLY via _code_of
+    (O(1) for empty string / int dicts -- no full-dict materialize); only a non-empty string
+    literal falls back to the full sorted-dict searchsorted."""
+    dt = seg.cols[pcol].get('dt')
+    key = lit.encode('utf-8', 'surrogatepass') if (dt == 1 and isinstance(lit, str)) else lit
+    code = wdb_compound._code_of(seg, pcol, key)
+    if code is None:                             # non-empty string literal: fall back to full dict
+        V = np.asarray(seg._typed_dict(pcol)); pos = int(np.searchsorted(V, key))
+        code = pos if (0 <= pos < V.size and V[pos] == key) else -1
     codes = seg._raw_codes(pcol)
-    pos = int(np.searchsorted(V, key))
-    found = 0 <= pos < V.size and V[pos] == key
     if op == '=':
-        return (codes == pos) if found else np.zeros(codes.size, dtype=bool)
-    return (codes != pos) if found else np.ones(codes.size, dtype=bool)
+        return (codes == code) if code >= 0 else np.zeros(codes.size, dtype=bool)
+    return (codes != code) if code >= 0 else np.ones(codes.size, dtype=bool)
 
 
 def execute(seg, spec):
     global _HITS
     kcols = spec['kcols']; a, b = kcols[0], kcols[1]
     lim = spec['lim']
-    caF = seg._raw_codes(a).astype(np.int64)
-    cbF = seg._raw_codes(b).astype(np.int64)
+    caF = seg._raw_codes(a)                  # native-width codes; cast to int64 inside the kernel
+    cbF = seg._raw_codes(b)
     Vb = int(cbF.max()) + 1 if cbF.size else 1
     if caF.size and int(caF.max()) * Vb + int(cbF.max()) >= (1 << 62):
         return None                          # gid would overflow int64 -> fused_agg
@@ -276,9 +282,8 @@ def execute(seg, spec):
         o = np.lexsort((cg, -cc))[:lim]
         sel_gid = cg[o]; sel_cnt = cc[o].astype(np.int64); sel_pay = cp[o]
     codesA = sel_gid // Vb; codesB = sel_gid - codesA * Vb
-    VA = np.asarray(seg._typed_dict(a)); VB = np.asarray(seg._typed_dict(b))
-    valA = [wdb_sql._pyval(x) for x in VA[codesA.astype(np.intp)]]
-    valB = [wdb_sql._pyval(x) for x in VB[codesB.astype(np.intp)]]
+    valA = [wdb_sql._pyval(seg.fetch(a, int(cd))) for cd in codesA]   # O(1) per winner -- no full-dict materialize
+    valB = [wdb_sql._pyval(seg.fetch(b, int(cd))) for cd in codesB]
     keyval = {a: valA, b: valB}
     kn2phys = dict(zip(spec['knames'], kcols))
     proj = spec['proj']
