@@ -4,17 +4,19 @@ parallel SPARSE hash aggregate (numba).
 The shape the dense group-by (fused_agg) loses on: two group keys with millions of distinct pairs, an
 optional single-column WHERE, COUNT(*) plus per-group SUM/AVG, ordered by count with a LIMIT. The dense
 path builds a bin for every possible group and sorts them all; here we keep a bin only for pairs that
-actually occur (open-addressing hash), fold the payload sums into the same pass, and track the top-K
-live so the winners fall out with no post-scan. Rows are partitioned across shards by key so each core
-owns a disjoint, cache-resident table -- no cross-core merge of counts.
+actually occur (open-addressing hash), fold the payload sums into the same pass, then take the exact
+top-K over the (few million) real pairs in numpy. Rows are partitioned across shards by key so each
+core owns a disjoint, cache-resident table -- no cross-core merge of counts.
 
 Scope (v1, conservative -- declines to fused_agg on anything else, which stays correct):
   - exactly 2 bare dictionary-coded group keys (mode != 4/affine);
   - projections = the 2 keys + COUNT(*) and any number of SUM(col)/AVG(col) over int-valued columns;
   - optional WHERE `col = literal` or `col <> literal` on a dict column (NULL-safe exact code match);
   - ORDER BY COUNT(*) DESC and a LIMIT;
-  - declines when the LIMIT boundary is tied (returned set is the unique correct top-K), or on any
-    non-int payload / unsupported predicate / other shape.
+  - boundary ties resolved deterministically (count DESC, then gid ASC) over the full sparse distinct
+    set -- exact top-K even when the LIMIT boundary is tied.
+Declines (execute -> None -> fused_agg) only on non-integer payload, gid overflow, empty survivors,
+or any shape outside the above; detect declines the rest.
 """
 import numpy as np
 import wdb_sql
@@ -93,16 +95,19 @@ def _gather_partition(idx, ca, cb, Vb, pay, S, NT):
 
 
 @njit(parallel=True, cache=True)
-def _agg_shards(PG, PPY, base, S, tsize, K):
-    Pn = PPY.shape[1]
-    rk = np.full((S, K), -1, np.int64); rc = np.zeros((S, K), np.int64)
-    rp = np.zeros((S, K, Pn), np.int64)
+def _agg_shards(PG, PPY, base, S, tsize):
+    """Per-shard open-addressing hash agg (count + P payload sums), then compact ALL distinct pairs.
+    Shard s writes its distinct (gid, count, payload) into its own partition region starting at
+    base[s]; ndist[s] records how many. Returning the full distinct set (not a per-shard top-K) lets
+    the exact top-K + deterministic tie-break happen in numpy over the sparse pairs -- correct on
+    boundary ties, which a per-shard live top-K cannot guarantee."""
+    n = PG.size; Pn = PPY.shape[1]
+    out_g = np.empty(n, np.int64); out_c = np.empty(n, np.int64); out_p = np.empty((n, Pn), np.int64)
+    ndist = np.zeros(S, np.int64)
     for s in prange(S):
         lo = base[s]; hi = base[s + 1]; m = tsize - 1
         keys = np.full(tsize, -1, np.int64); cnts = np.zeros(tsize, np.int64)
-        psum = np.zeros((tsize, Pn), np.int64); tpos = np.full(tsize, -1, np.int64)
-        tk_h = np.full(K, -1, np.int64); tk_c = np.zeros(K, np.int64)
-        filled = 0; curmin = 0; minpos = 0
+        psum = np.zeros((tsize, Pn), np.int64)
         for j in range(lo, hi):
             g = PG[j]; h = (g * 2654435761) & m
             while True:
@@ -111,32 +116,14 @@ def _agg_shards(PG, PPY, base, S, tsize, K):
                 elif k == g: cnts[h] += 1; break
                 else: h = (h + 1) & m
             for p in range(Pn): psum[h, p] += PPY[j, p]
-            c = cnts[h]; pos = tpos[h]
-            if pos >= 0:
-                tk_c[pos] = c
-                if pos == minpos:
-                    mn = 0
-                    for jj in range(1, filled):
-                        if tk_c[jj] < tk_c[mn]: mn = jj
-                    minpos = mn; curmin = tk_c[mn]
-            elif filled < K:
-                tk_c[filled] = c; tk_h[filled] = h; tpos[h] = filled; filled += 1
-                if filled == K:
-                    mn = 0
-                    for jj in range(1, K):
-                        if tk_c[jj] < tk_c[mn]: mn = jj
-                    minpos = mn; curmin = tk_c[mn]
-            elif c > curmin:
-                oh = tk_h[minpos]; tpos[oh] = -1
-                tk_c[minpos] = c; tk_h[minpos] = h; tpos[h] = minpos
-                mn = 0
-                for jj in range(1, K):
-                    if tk_c[jj] < tk_c[mn]: mn = jj
-                minpos = mn; curmin = tk_c[mn]
-        for j in range(filled):
-            hh = tk_h[j]; rk[s, j] = keys[hh]; rc[s, j] = cnts[hh]
-            for p in range(Pn): rp[s, j, p] = psum[hh, p]
-    return rk, rc, rp
+        w = lo
+        for h in range(tsize):
+            if keys[h] != -1:
+                out_g[w] = keys[h]; out_c[w] = cnts[h]
+                for p in range(Pn): out_p[w, p] = psum[h, p]
+                w += 1
+        ndist[s] = w - lo
+    return out_g, out_c, out_p, ndist
 
 
 def _dict_col(seg, phys):
@@ -216,10 +203,9 @@ def detect(seg, tree, col_map):
     if not all(_dict_col(seg, c) for c in kcols):
         return None
     paycols = [col_map.get(a[1], a[1]) if col_map else a[1] for a in aggs if a[0] in ('SUM', 'AVG')]
-    for pc in paycols:                       # payload: ANY storage mode (values decoded later), but int-valued
-        if seg.cols.get(pc) is None:
-            return None
-        if np.asarray(seg._typed_dict(pc)).dtype.kind not in ('i', 'u'):
+    for pc in paycols:                       # payload: any storage mode, but must be integer-typed (dt==0)
+        c = seg.cols.get(pc)
+        if c is None or c.get('dt') != 0:    # cheap metadata check -- NO column decode in detect
             return None
     pred = _single_col_eq_predicate(tree)
     if pred is None:
@@ -266,24 +252,29 @@ def execute(seg, spec):
     Pn = max(1, len(payphys))
     payF = np.zeros((caF.size, Pn), np.int64)
     for p, pc in enumerate(payphys):
-        vals = np.asarray(seg.values(pc))    # canonical mode-agnostic decode (handles affine/mode-4)
+        vals = seg.values(pc)                # canonical mode-agnostic decode; dt==0 => integer
         if vals.dtype.kind not in ('i', 'u'):
             return None                      # non-integer payload -> fused_agg
-        payF[:, p] = vals.astype(np.int64)
+        payF[:, p] = vals                    # assignment casts to int64 directly (no extra copy)
     PG, PPY, base = _gather_partition(idx, caF, cbF, Vb, payF, _NSHARD, _NT)
-    rk, rc, rp = _agg_shards(PG, PPY, base, _NSHARD, _TSIZE, lim + 1)
-    fk = rk.reshape(-1); fc = rc.reshape(-1); fp = rp.reshape(-1, Pn)
-    good = fc > 0
-    fk = fk[good]; fc = fc[good]; fp = fp[good]
-    if fk.size == 0:
+    out_g, out_c, out_p, ndist = _agg_shards(PG, PPY, base, _NSHARD, _TSIZE)
+    segs_g = []; segs_c = []; segs_p = []                 # gather each shard's occupied region
+    for s in range(_NSHARD):
+        lo = int(base[s]); dct = int(ndist[s])
+        if dct:
+            segs_g.append(out_g[lo:lo + dct]); segs_c.append(out_c[lo:lo + dct]); segs_p.append(out_p[lo:lo + dct])
+    if not segs_g:
         return []
-    take = min(lim + 1, fk.size)
-    part = np.argpartition(fc, -take)[-take:]
-    o = part[np.argsort(fc[part], kind='stable')[::-1]]
-    if o.size > lim and int(fc[o[lim - 1]]) == int(fc[o[lim]]):
-        return None
-    o = o[:lim]
-    sel_gid = fk[o]; sel_cnt = fc[o].astype(np.int64); sel_pay = fp[o]
+    allg = np.concatenate(segs_g); allc = np.concatenate(segs_c); allp = np.concatenate(segs_p)
+    if allg.size <= lim:                                  # exact top-K over the full sparse distinct set,
+        o = np.lexsort((allg, -allc))                     #   tie-break count DESC then gid ASC (deterministic)
+        sel_gid = allg[o]; sel_cnt = allc[o].astype(np.int64); sel_pay = allp[o]
+    else:
+        cb = np.partition(allc, allg.size - lim)[allg.size - lim]   # the lim-th largest count
+        cand = allc >= cb                                 # top-lim plus every pair tied at the boundary
+        cg = allg[cand]; cc = allc[cand]; cp = allp[cand]
+        o = np.lexsort((cg, -cc))[:lim]
+        sel_gid = cg[o]; sel_cnt = cc[o].astype(np.int64); sel_pay = cp[o]
     codesA = sel_gid // Vb; codesB = sel_gid - codesA * Vb
     VA = np.asarray(seg._typed_dict(a)); VB = np.asarray(seg._typed_dict(b))
     valA = [wdb_sql._pyval(x) for x in VA[codesA.astype(np.intp)]]
