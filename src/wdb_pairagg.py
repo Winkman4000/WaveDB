@@ -31,6 +31,8 @@ _HITS = 0
 _NT = 16
 _NSHARD = 64
 _TSIZE = 1 << 18
+_SORT_MIN = 30_000_000   # above this many survivors the sparse hash oversubscribes (near-unique keys);
+                         # switch to sort + adjacent-run scan, which never melts. Q32 is the case.
 
 
 def enable():
@@ -246,6 +248,41 @@ def _survivor_payload(seg, pc, idx):
     return seg.values(pc)[idx]
 
 
+def _sort_counts(gid):
+    """Distinct gids + COUNT per pair via sort + adjacent-run scan -- gid only, payload deferred. A run
+    of length c is one pair occurring c times. This is the whole high-cardinality aggregate: no hash to
+    oversubscribe, and payload never moves here."""
+    sg = np.sort(gid)
+    change = np.ones(sg.size, dtype=bool)
+    np.not_equal(sg[1:], sg[:-1], out=change[1:])
+    starts = np.nonzero(change)[0]
+    return sg[starts], np.diff(np.append(starts, sg.size)).astype(np.int64)
+
+
+def _winner_payload(seg, payphys, gid, sel_gid, idx):
+    """SUM of each payload column over the rows of each winning pair, materialized for the <=K winners
+    ONLY. searchsorted locates the few winner gids across all rows (one vectorized pass), then payload is
+    DECODED for just the matched member rows (~K + duplicate members) -- never the full 100M column.
+    Returns (K, Pn) aligned to sel_gid, so AVG = sum/count stays exact (integer payload, tiny totals)."""
+    order = np.argsort(sel_gid); ws = sel_gid[order]
+    pos = np.searchsorted(ws, gid)
+    valid = pos < ws.size
+    pos2 = np.where(valid, pos, 0)
+    match = valid & (ws[pos2] == gid)
+    srows = np.nonzero(match)[0]                 # survivor indices of the winning pairs' member rows
+    wp = pos2[match]                             # which winner (ws order) each matched row belongs to
+    Pn = len(payphys)
+    sums_ws = np.zeros((ws.size, Pn), np.int64)
+    if Pn:
+        orows = idx[srows]                       # survivor index -> original row index
+        for p, pc in enumerate(payphys):
+            vals = _survivor_payload(seg, pc, orows)
+            sums_ws[:, p] = np.rint(np.bincount(wp, weights=vals.astype(np.float64),
+                                                minlength=ws.size)).astype(np.int64)
+    inv = np.empty(order.size, np.int64); inv[order] = np.arange(order.size)
+    return sums_ws[inv]
+
+
 def execute(seg, spec):
     global _HITS
     kcols = spec['kcols']; a, b = kcols[0], kcols[1]
@@ -267,31 +304,51 @@ def execute(seg, spec):
     pay_specs = [(a2[0], a2[1]) for a2 in spec['aggs'] if a2[0] in ('SUM', 'AVG')]
     payphys = [spec['col_map'].get(c, c) if spec['col_map'] else c for _, c in pay_specs]
     Pn = max(1, len(payphys))
-    pay_s = np.zeros((idx.size, Pn), np.int64)     # SURVIVOR-aligned payload (late materialization)
-    for p, pc in enumerate(payphys):
-        vals = _survivor_payload(seg, pc, idx)
-        if vals.dtype.kind not in ('i', 'u'):
-            return None                            # non-integer payload -> fused_agg
-        pay_s[:, p] = vals
-    PG, PPY, base = _gather_partition(idx, caF, cbF, Vb, pay_s, _NSHARD, _NT)
-    out_g, out_c, out_p, ndist = _agg_shards(PG, PPY, base, _NSHARD, _TSIZE)
-    segs_g = []; segs_c = []; segs_p = []                 # gather each shard's occupied region
-    for s in range(_NSHARD):
-        lo = int(base[s]); dct = int(ndist[s])
-        if dct:
-            segs_g.append(out_g[lo:lo + dct]); segs_c.append(out_c[lo:lo + dct]); segs_p.append(out_p[lo:lo + dct])
-    if not segs_g:
-        return []
-    allg = np.concatenate(segs_g); allc = np.concatenate(segs_c); allp = np.concatenate(segs_p)
-    if allg.size <= lim:                                  # exact top-K over the full sparse distinct set,
-        o = np.lexsort((allg, -allc))                     #   tie-break count DESC then gid ASC (deterministic)
-        sel_gid = allg[o]; sel_cnt = allc[o].astype(np.int64); sel_pay = allp[o]
+    if idx.size > _SORT_MIN:                              # near-unique keys -> sort, hash would melt
+        if idx.size == caF.size:                          # no filter: idx is arange, skip the gather
+            gid = caF.astype(np.int64) * Vb + cbF.astype(np.int64)
+        else:
+            gid = caF[idx].astype(np.int64) * Vb + cbF[idx].astype(np.int64)
+        allg, allc = _sort_counts(gid)                    # payload deferred to the winners (below)
+        allp = None
     else:
-        cb = np.partition(allc, allg.size - lim)[allg.size - lim]   # the lim-th largest count
-        cand = allc >= cb                                 # top-lim plus every pair tied at the boundary
-        cg = allg[cand]; cc = allc[cand]; cp = allp[cand]
-        o = np.lexsort((cg, -cc))[:lim]
-        sel_gid = cg[o]; sel_cnt = cc[o].astype(np.int64); sel_pay = cp[o]
+        gid = None
+        pay_s = np.zeros((idx.size, Pn), np.int64)         # SURVIVOR-aligned payload (hash path needs it all)
+        for p, pc in enumerate(payphys):
+            vals = _survivor_payload(seg, pc, idx)
+            if vals.dtype.kind not in ('i', 'u'):
+                return None                                # non-integer payload -> fused_agg
+            pay_s[:, p] = vals
+        PG, PPY, base = _gather_partition(idx, caF, cbF, Vb, pay_s, _NSHARD, _NT)
+        out_g, out_c, out_p, ndist = _agg_shards(PG, PPY, base, _NSHARD, _TSIZE)
+        segs_g = []; segs_c = []; segs_p = []             # gather each shard's occupied region
+        for s in range(_NSHARD):
+            lo = int(base[s]); dct = int(ndist[s])
+            if dct:
+                segs_g.append(out_g[lo:lo + dct]); segs_c.append(out_c[lo:lo + dct]); segs_p.append(out_p[lo:lo + dct])
+        if not segs_g:
+            return []
+        allg = np.concatenate(segs_g); allc = np.concatenate(segs_c); allp = np.concatenate(segs_p)
+    if allg.size <= lim:                                  # whole distinct set fits -> just order it
+        o = np.lexsort((allg, -allc))
+    elif allp is None:                                    # SORT path: allg is gid-ascending, counts small
+        maxc = int(allc.max())                            # count-bucket top-K: no O(n) partition
+        hist = np.bincount(allc, minlength=maxc + 1)      # how many pairs at each (tiny) count value
+        cum = 0; boundary = 1
+        for c in range(maxc, 0, -1):
+            cum += int(hist[c])
+            if cum >= lim:
+                boundary = c; break
+        above = np.nonzero(allc > boundary)[0]            # every pair above the boundary count (< lim of them)
+        at = np.nonzero(allc == boundary)[0][:lim - above.size]   # allg gid-ascending -> first = smallest gid
+        sel_idx = np.concatenate((above, at))
+        o = sel_idx[np.lexsort((allg[sel_idx], -allc[sel_idx]))]  # count DESC, gid ASC over the few winners
+    else:                                                 # HASH path: few distinct pairs, partition is cheap
+        cbnd = np.partition(allc, allg.size - lim)[allg.size - lim]
+        cand = np.nonzero(allc >= cbnd)[0]                # top-lim plus every pair tied at the boundary
+        o = cand[np.lexsort((allg[cand], -allc[cand]))[:lim]]
+    sel_gid = allg[o]; sel_cnt = allc[o].astype(np.int64)
+    sel_pay = allp[o] if allp is not None else _winner_payload(seg, payphys, gid, sel_gid, idx)
     codesA = sel_gid // Vb; codesB = sel_gid - codesA * Vb
     valA = [wdb_sql._pyval(seg.fetch(a, int(cd))) for cd in codesA]   # O(1) per winner -- no full-dict materialize
     valB = [wdb_sql._pyval(seg.fetch(b, int(cd))) for cd in codesB]
