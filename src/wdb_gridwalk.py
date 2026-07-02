@@ -12,22 +12,31 @@ Measured (100M cb25db, SearchPhrase x UserID): head read top-10 = ~2 us, exact; 
 structure is ~27 MB (walked identity 6.9 + counts 20 + head 0.4) vs heavypair's 161 MB and the per-row
 countpos column's 200 MB -- 6x lighter, microsecond reads.
 
-v1 scope (this module): serves 2-key COUNT(*) top-K (ORDER BY COUNT(*) DESC, or unordered LIMIT) from
-the count-head; NO WHERE/HAVING/DISTINCT/JOIN; for LIMIT beyond the head it decodes the gap-encoded
-bulk (all heavy cells, byte-block frame-of-reference over dict-order gaps) and takes top-lim by count.
+v2 scope (this module): serves 2-key COUNT(*) top-K (ORDER BY COUNT(*) DESC, or unordered LIMIT), plus
+SUM/AVG(int col) payload computed winner-only at read (one match pass locates the <=K winners' member
+rows; only those decode); NO WHERE/HAVING/DISTINCT/JOIN/OFFSET. The head is a CANONICAL prefix (count
+DESC, gid ASC), so a count plateau at the LIMIT boundary resolves deterministically -- never a decline
+(the plateau is a set of equally-correct answers; we emit the canonical one and the total-order
+validator agrees). A LIMIT deeper than the heavy set fills from `ones` (the _ONES_N smallest singleton
+gids, count 1) -- exception-defined pairs like WatchID x ClientIP (4 heavy cells in 100M) are served
+as: 4 cells + deterministic singleton fill. For LIMIT beyond the head it decodes the gap-encoded bulk
+(all heavy cells, byte-block frame-of-reference over dict-order gaps).
 Append-tail maintenance is the documented next layer. RAM-resident, never persisted. Live by default
 (_ENABLED True); disable() restores the prior routing (heavypair/scan) for the shapes it handles.
 """
 import numpy as np
 import wdb_sql
+import wdb_pairagg
 import workers
 import wdb_policies as P
 E = wdb_sql.E
 
 _ENABLED = True           # live by default: gridwalk is the primary 2-key COUNT(*) top-K read
 _HEAD_N = 200000          # count-ordered head depth; serves any LIMIT up to this, declines beyond
+_ONES_N = 1024            # singleton fill head: the _ONES_N smallest count-1 gids, for LIMIT > nheavy
+_POS_MAX = 8192           # store member-row positions when total stored cells <= this (payload O(K))
 _HITS = 0
-_CACHE = {}               # (seg.path,(a,b),N) -> (head_gid, head_cnt, Vb, nheavy); RAM-resident
+_CACHE = {}               # (seg.path,(a,b),N) -> (head_gid, head_cnt, Vb, nheavy, bulk, ones, pos)
 _VCACHE = {}              # (seg.path,col) -> by-code value dict (decode)
 
 
@@ -120,9 +129,12 @@ def _bulk_nbytes(bulk):
 
 
 def _build(seg, cols):
-    """Filled-cell head: occurring heavy pairs (count>=2) as grid-ids, the top _HEAD_N by count,
-    count-descending. Stores grid-id + count per head cell (identity is the grid-id's coordinates).
-    Returns (head_gid int64, head_cnt int64, Vb int, nheavy int) or None."""
+    """Filled-cell head: occurring heavy pairs (count>=2) as grid-ids, the top _HEAD_N in the
+    DETERMINISTIC total order (count DESC, gid ASC) -- so the head is a canonical prefix even when a
+    count plateau crosses its boundary. Also keeps `ones`: the _ONES_N smallest count-1 gids, so a
+    LIMIT deeper than the heavy set fills deterministically from singletons (exception-defined pairs
+    like WatchID x ClientIP have nheavy ~ a handful and the answer is mostly fill).
+    Returns (head_gid int64, head_cnt int64, Vb int, nheavy int, bulk|None, ones int64) or None."""
     a, b = sorted(cols)
     ca = seg._raw_codes(a).astype(np.int64); cb = seg._raw_codes(b).astype(np.int64)
     if ca.size == 0:
@@ -131,15 +143,34 @@ def _build(seg, cols):
     gid_all, cnt_all = np.unique(ca * Vb + cb, return_counts=True)   # filled cells, code order
     heavy = cnt_all >= 2
     gid = gid_all[heavy]; cnt = cnt_all[heavy]
-    if gid.size == 0:
+    ones = np.ascontiguousarray(gid_all[~heavy][:_ONES_N], dtype=np.int64)  # ascending = smallest gids
+    if gid.size == 0 and ones.size == 0:
         return None
-    k = min(_HEAD_N, gid.size)
-    h = np.argpartition(cnt, -k)[-k:]                # the k largest by count
-    h = h[np.argsort(cnt[h], kind='stable')[::-1]]   # count descending
-    head_gid = np.ascontiguousarray(gid[h], dtype=np.int64)
-    head_cnt = np.ascontiguousarray(cnt[h], dtype=np.int64)
-    bulk = _bulk_encode(gid, cnt)        # full heavy-cell coverage, gap-encoded, for LIMIT beyond head
-    return head_gid, head_cnt, Vb, int(gid.size), bulk
+    if gid.size:
+        o = np.lexsort((gid, -cnt))                  # canonical total order: count DESC, gid ASC
+        k = min(_HEAD_N, gid.size)
+        head_gid = np.ascontiguousarray(gid[o[:k]], dtype=np.int64)
+        head_cnt = np.ascontiguousarray(cnt[o[:k]], dtype=np.int64)
+        bulk = _bulk_encode(gid, cnt)    # full heavy-cell coverage, gap-encoded, for LIMIT beyond head
+    else:                                # all-singleton pair: the fully exception-defined extreme
+        head_gid = np.empty(0, np.int64); head_cnt = np.empty(0, np.int64); bulk = None
+    # Exception-defined pairs (few cells stored in total): also record the MEMBER ROW POSITIONS of
+    # every stored cell, so SUM/AVG payload at read is a direct row gather + decode of ~K rows --
+    # no per-query pass over the 100M codes. ~1 KB for WatchID x ClientIP (4 heavy + ones).
+    pos = None
+    stored = np.concatenate((gid, ones)) if ones.size else gid
+    if 0 < stored.size <= _POS_MAX:
+        key = ca * Vb + cb
+        st = np.sort(stored)
+        p = np.searchsorted(st, key)
+        valid = p < st.size
+        p2 = np.where(valid, p, 0)
+        match = valid & (st[p2] == key)
+        rows = np.nonzero(match)[0]
+        rgid = key[rows]
+        o2 = np.argsort(rgid, kind='stable')
+        pos = (np.ascontiguousarray(rgid[o2]), np.ascontiguousarray(rows[o2]))
+    return head_gid, head_cnt, Vb, int(gid.size), bulk, ones, pos
 
 
 def _load(seg, cols):
@@ -193,20 +224,29 @@ def detect(seg, tree, col_map):
     if not P.no_select_distinct(tree): return None
     if not P.no_having(tree):          return None
     if not P.has_limit(tree):          return None
+    if wdb_sql._offset(tree):          return None
     if P.has_where(tree):              return None
     group = tree.args.get('group')
     if group is None or len(group.expressions) != 2:
         return None
     proj = tree.expressions
-    if len(proj) != 3:
+    keys = []; aggs = []                # 2 bare keys + COUNT(*) + any SUM/AVG(int col) payload
+    for i, p in enumerate(proj):
+        ak = wdb_sql._agg_kind(p)
+        if ak is None:
+            if wdb_sql._proj_colname(p) is None:
+                return None
+            keys.append(i)
+        elif ak[0] == 'COUNT_STAR':
+            aggs.append(('COUNT_STAR', None, i))
+        elif ak[0] in ('SUM', 'AVG') and isinstance(ak[1], str):
+            aggs.append((ak[0], ak[1], i))
+        else:
+            return None
+    if len(keys) != 2 or sum(1 for a2 in aggs if a2[0] == 'COUNT_STAR') != 1:
         return None
-    ci = _count_index(proj)
-    if ci is None:
-        return None
-    key_proj = [p for i, p in enumerate(proj) if i != ci]
-    if any(wdb_sql._agg_kind(p) is not None for p in key_proj):
-        return None
-    knames = [wdb_sql._proj_colname(p) for p in key_proj]
+    ci = next(a2[2] for a2 in aggs if a2[0] == 'COUNT_STAR')
+    knames = [wdb_sql._proj_colname(proj[i]) for i in keys]
     gnames = [wdb_sql._colname(g) for g in group.expressions]
     if any(k is None for k in knames) or any(g is None for g in gnames):
         return None
@@ -217,74 +257,134 @@ def detect(seg, tree, col_map):
         if not P.columns_exist(seg, col):  return None
         if not P.not_positional(seg, col): return None
     if not P.no_deleted_rows(seg):         return None
+    payphys = [col_map.get(c, c) if col_map else c for kind, c, _ in aggs if kind != 'COUNT_STAR']
+    for pc in payphys:                     # payload must be integer-typed; cheap metadata check only
+        c = seg.cols.get(pc)
+        if c is None or c.get('dt') != 0:
+            return None
     order = tree.args.get('order')
     if order is None or not order.expressions:
         unordered = True
     elif _order_is_count_desc(tree, proj, ci):
         unordered = False
+        # Secondary ORDER BY keys are honored ONLY if they match this read's stored tiebreak exactly:
+        # count DESC then gid ASC, i.e. the keys ascending in name-sorted physical order. Any other
+        # secondary order would change plateau MEMBERSHIP, so decline (pairagg/scan serve it).
+        extra = order.expressions[1:]
+        if extra:
+            tb = []
+            for oe in extra:
+                if oe.args.get('desc'):
+                    return None
+                nm = wdb_sql._colname(oe.this)
+                if nm is None:
+                    return None
+                tb.append(col_map.get(nm, nm) if col_map else nm)
+            if tb != sorted(cols):
+                return None
     else:
         return None
     Vs = {col: _vals(seg, col) for col in cols}
     if any(v is None for v in Vs.values()):
         return None
     return {'cols': cols, 'ci': ci, 'lim': wdb_sql._limit(tree), 'proj': proj,
-            'knames': knames, 'V': Vs, 'order': tree.args.get('order'), 'unordered': unordered}
+            'knames': knames, 'V': Vs, 'order': tree.args.get('order'), 'unordered': unordered,
+            'payphys': payphys}
 
 
 def execute(seg, spec):
-    """Top-K = a direct slice of the count-ordered head. Decode each head cell's grid-id back to
-    (codeA, codeB) -> values. Declines if LIMIT exceeds the head or the boundary count is tied (for
-    ORDERED queries), so countpos/heavypair/scan back it up."""
+    """Top-K = a direct slice of the canonical count-ordered head (count DESC, gid ASC -- a plateau at
+    the LIMIT boundary resolves deterministically instead of declining; the total-order validator
+    agrees with this pick). A LIMIT deeper than the heavy set fills from `ones` (smallest singleton
+    gids, count 1). SUM/AVG payload is computed for the <=K winners ONLY: one vectorized match pass
+    over the cached codes locates the winners' member rows, and only those rows' payload is decoded."""
     global _HITS
     cols = spec['cols']; ci = spec['ci']; lim = spec['lim']; proj = spec['proj']
     knames = spec['knames']; V = spec['V']
     loaded = _load(seg, cols)
     if loaded is None:
         return None
-    head_gid, head_cnt, Vb, nheavy, bulk = loaded
+    head_gid, head_cnt, Vb, nheavy, bulk, ones, pos = loaded
     if lim <= 0:
         return None
     a, b = sorted(cols)
     if lim <= head_gid.size:
-        # hot path: top-K is a direct slice of the pre-sorted count-head
-        if not spec.get('unordered') and head_cnt.size > lim and int(head_cnt[lim - 1]) == int(head_cnt[lim]):
-            return None
+        # hot path: the head is a canonical prefix -- top-K is a direct slice, plateaus included
         sel_gid = head_gid[:lim]; sel_cnt = head_cnt[:lim]
-    else:
-        # beyond the head: decode the gap-encoded bulk (all heavy cells) and take top-lim by count
-        if bulk is None or lim > bulk['n']:
-            return None
+    elif lim <= nheavy:
+        # beyond the head but within the heavy set: decode the gap-encoded bulk, canonical top-lim
         gid_all, cnt_all = _bulk_decode_all(bulk)
         cnt_all = cnt_all.astype(np.int64)
-        kk = min(lim + 1, cnt_all.size)
-        part = np.argpartition(cnt_all, -kk)[-kk:]
-        order_idx = part[np.argsort(cnt_all[part], kind='stable')[::-1]]
-        if not spec.get('unordered') and order_idx.size > lim and int(cnt_all[order_idx[lim - 1]]) == int(cnt_all[order_idx[lim]]):
+        o = np.lexsort((gid_all, -cnt_all))[:lim]
+        sel_gid = gid_all[o]; sel_cnt = cnt_all[o]
+    else:
+        # LIMIT deeper than the heavy set: every heavy cell + deterministic singleton fill (count 1,
+        # smallest gids first). Exception-defined pairs (nheavy ~ handful) live here.
+        fill = lim - nheavy
+        if ones is None:
             return None
-        sel = order_idx[:lim]
-        sel_gid = gid_all[sel]; sel_cnt = cnt_all[sel]
+        if fill > ones.size:
+            if ones.size >= _ONES_N:
+                return None                          # ones truncated: unseen singletons exist -> scan
+            fill = ones.size                         # ones COMPLETE: every distinct cell is in hand,
+                                                     # so the exact answer simply has < lim rows
+        if nheavy == 0:
+            hg = np.empty(0, np.int64); hc = np.empty(0, np.int64)
+        elif nheavy <= head_gid.size:
+            hg, hc = head_gid, head_cnt              # head already holds ALL heavy, canonical order
+        else:
+            gid_all, cnt_all = _bulk_decode_all(bulk)
+            cnt_all = cnt_all.astype(np.int64)
+            o = np.lexsort((gid_all, -cnt_all))
+            hg, hc = gid_all[o], cnt_all[o]
+        sel_gid = np.concatenate((hg, ones[:fill]))
+        sel_cnt = np.concatenate((hc, np.ones(fill, np.int64)))
+    # winner-only payload. Preferred: stored member-row positions (exception-defined pairs) -> a direct
+    # gather+decode of ~K rows, no pass over the codes. Fallback: one vectorized match pass.
+    payphys = spec.get('payphys') or []
+    if payphys:
+        if pos is not None:
+            pg, pr = pos
+            lo = np.searchsorted(pg, sel_gid, side='left')
+            hi = np.searchsorted(pg, sel_gid, side='right')
+            wp = np.repeat(np.arange(sel_gid.size), hi - lo)
+            rows_idx = (np.concatenate([pr[l:h] for l, h in zip(lo, hi)])
+                        if sel_gid.size else np.empty(0, np.int64))
+            sel_pay = np.zeros((sel_gid.size, len(payphys)), np.int64)
+            for p_i, pc in enumerate(payphys):
+                vals = wdb_pairagg._survivor_payload(seg, pc, rows_idx)
+                sel_pay[:, p_i] = np.rint(np.bincount(wp, weights=vals.astype(np.float64),
+                                                      minlength=sel_gid.size)).astype(np.int64)
+        else:
+            gid_rows = seg._raw_codes(a).astype(np.int64) * Vb + seg._raw_codes(b).astype(np.int64)
+            sel_pay = wdb_pairagg._winner_payload(seg, payphys, gid_rows, sel_gid, None)
     # materialize: hoist per-row-invariant work out of the loop; vectorize coordinate + value decode.
-    # (identical rows/order to a naive per-cell decode; the large-LIMIT bulk path was Python-bound here.)
     codesA = sel_gid // Vb
     codesB = sel_gid - codesA * Vb
     code_by_col = {a: codesA, b: codesB}
-    plan = []                         # (proj_index, key_col) per position; key_col is None for COUNT
     decoded = {}
     for pi, p in enumerate(proj):
-        if pi == ci:
-            plan.append((pi, None)); continue
+        if wdb_sql._agg_kind(p) is not None:
+            continue
         col = cols[knames.index(wdb_sql._proj_colname(p))]
-        plan.append((pi, col))
         if col not in decoded:
             decoded[col] = [wdb_sql._pyval(x) for x in V[col][code_by_col[col].astype(np.intp)]]
     cnt_list = sel_cnt.astype(np.int64).tolist()
-    nproj = len(proj)
     rows_out = []
     ap = rows_out.append
     for i in range(sel_gid.size):
-        row = [None] * nproj
-        for pi, col in plan:
-            row[pi] = cnt_list[i] if col is None else decoded[col][i]
+        row = []; payptr = 0
+        for p in proj:
+            ak = wdb_sql._agg_kind(p)
+            if ak is None:
+                col = cols[knames.index(wdb_sql._proj_colname(p))]
+                row.append(decoded[col][i])
+            elif ak[0] == 'COUNT_STAR':
+                row.append(cnt_list[i])
+            elif ak[0] == 'SUM':
+                row.append(int(sel_pay[i, payptr])); payptr += 1
+            else:                                    # AVG = exact integer sum / count
+                row.append(float(sel_pay[i, payptr]) / float(cnt_list[i])); payptr += 1
         ap(tuple(row))
     rows_out = workers.finalize(rows_out, proj, spec['order'], lim)
     _HITS += 1

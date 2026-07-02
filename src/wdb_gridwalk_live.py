@@ -94,6 +94,8 @@ def try_live(seg, hot_path, tree, col_map):
     spec = GW.detect(seg, tree, col_map)
     if spec is None:
         return None
+    if spec.get('payphys'):            # SUM/AVG payload: the maintained structure holds counts only
+        return None
     cols = spec['cols']; lim = spec['lim']; proj = spec['proj']; ci = spec['ci']
     knames = spec['knames']; V = spec['V']; unordered = spec.get('unordered')
     if lim <= 0:

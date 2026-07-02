@@ -67,11 +67,13 @@ def test_gridwalk_all_pairs_match_canonical_and_groundtruth():
         assert len(elig) == 6, elig
         pairs = list(itertools.combinations(sorted(elig), 2))
         assert len(pairs) == 15, len(pairs)
-        n_heavy_pairs = 0
+        n_heavy_pairs = 0; n_built = 0
         for a, b in pairs:
             built = GW._build(seg, [a, b])
             if built is not None:
-                n_heavy_pairs += 1
+                n_built += 1
+                if built[3] > 0:                     # nheavy > 0: pair has heavy cells
+                    n_heavy_pairs += 1
             for lim in (3, 5, 8):
                 q = f'SELECT "{a}","{b}", COUNT(*) FROM t GROUP BY "{a}","{b}" ORDER BY COUNT(*) DESC LIMIT {lim}'
                 GW.enable();  h0 = GW._HITS; on = _rows(db.run(q)); hit = GW._HITS > h0
@@ -82,12 +84,12 @@ def test_gridwalk_all_pairs_match_canonical_and_groundtruth():
                 assert len(on) == len(off), f'{a}x{b} L{lim} nrows {len(on)} {len(off)}'
                 # and the counts are objectively right (independent oracle)
                 assert _counts(on) == _gt_counts(df, a, b, lim), f'{a}x{b} L{lim} counts vs pandas'
-                # heavy pairs at small LIMIT with a clean boundary should actually route through gridwalk
-                if built is not None and lim <= built[3] and not hit:
-                    # only acceptable reason to decline is a tie at the boundary
-                    bc = sorted((df.groupby([a, b]).size().values), reverse=True)
-                    assert lim < len(bc) and bc[lim - 1] == bc[lim], f'{a}x{b} L{lim} declined without a boundary tie'
-        assert n_heavy_pairs == 10, n_heavy_pairs   # the 5 *xuniq pairs are zero-heavy
+                # v2: a plateau at the boundary RESOLVES deterministically (never declines), so any
+                # LIMIT within the heavy set must route through gridwalk.
+                if built is not None and lim <= built[3]:
+                    assert hit, f'{a}x{b} L{lim} declined within the heavy set'
+        assert n_built == 15, n_built              # v2: zero-heavy pairs build too (ones-only fill)
+        assert n_heavy_pairs == 10, n_heavy_pairs  # the 5 *xuniq pairs are zero-heavy
     finally:
         GW.enable(); shutil.rmtree(d, ignore_errors=True)
 
@@ -175,9 +177,12 @@ def test_gridwalk_declines_unsupported_shapes():
         assert dec('SELECT "s",COUNT(*) FROM t GROUP BY "s" ORDER BY COUNT(*) DESC LIMIT 3') is None
         assert dec('SELECT "s","n","mid",COUNT(*) FROM t GROUP BY "s","n","mid" ORDER BY COUNT(*) DESC LIMIT 3') is None
         assert dec('SELECT DISTINCT "s","n" FROM t GROUP BY "s","n" LIMIT 3') is None
-        # zero-heavy (near-unique key): gridwalk declines, but the query is still answered right
+        # zero-heavy (near-unique key): v2 SERVES it -- every cell is a singleton, so the answer is a
+        # deterministic fill from `ones` (smallest gids). Must match the pandas ground truth.
         zq = 'SELECT "uniq","s", COUNT(*) FROM t GROUP BY "uniq","s" ORDER BY COUNT(*) DESC LIMIT 3'
-        assert dec(zq) is None
+        zr = dec(zq)
+        assert zr is not None, 'zero-heavy pair should serve via singleton fill'
+        assert _counts([tuple(r) for r in zr[0]]) == _gt_counts(df, 'uniq', 's', 3)
         assert _counts(_rows(db.run(zq))) == _gt_counts(df, 'uniq', 's', 3)
     finally:
         GW.enable(); shutil.rmtree(d, ignore_errors=True)

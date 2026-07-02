@@ -205,6 +205,21 @@ def detect(seg, tree, col_map):
     kcols = [col_map.get(n, n) if col_map else n for n in knames]
     if not all(_dict_col(seg, c) for c in kcols):
         return None
+    # Secondary ORDER BY keys are honored ONLY if they match this read's deterministic tiebreak exactly:
+    # count DESC then gid ASC, i.e. the keys ascending in PROJECTION order (kcols). Any other secondary
+    # order would change plateau membership, so decline (the scan serves it exactly).
+    extra = order.expressions[1:]
+    if extra:
+        tb = []
+        for oe in extra:
+            if oe.args.get('desc'):
+                return None
+            nm = wdb_sql._colname(oe.this)
+            if nm is None:
+                return None
+            tb.append(col_map.get(nm, nm) if col_map else nm)
+        if tb != kcols:
+            return None
     paycols = [col_map.get(a[1], a[1]) if col_map else a[1] for a in aggs if a[0] in ('SUM', 'AVG')]
     for pc in paycols:                       # payload: any storage mode, but must be integer-typed (dt==0)
         c = seg.cols.get(pc)
@@ -263,6 +278,7 @@ def _winner_payload(seg, payphys, gid, sel_gid, idx):
     """SUM of each payload column over the rows of each winning pair, materialized for the <=K winners
     ONLY. searchsorted locates the few winner gids across all rows (one vectorized pass), then payload is
     DECODED for just the matched member rows (~K + duplicate members) -- never the full 100M column.
+    idx maps survivor index -> original row index (None = identity, i.e. no filter -- gridwalk's case).
     Returns (K, Pn) aligned to sel_gid, so AVG = sum/count stays exact (integer payload, tiny totals)."""
     order = np.argsort(sel_gid); ws = sel_gid[order]
     pos = np.searchsorted(ws, gid)
@@ -274,7 +290,7 @@ def _winner_payload(seg, payphys, gid, sel_gid, idx):
     Pn = len(payphys)
     sums_ws = np.zeros((ws.size, Pn), np.int64)
     if Pn:
-        orows = idx[srows]                       # survivor index -> original row index
+        orows = srows if idx is None else idx[srows]   # survivor index -> original row index
         for p, pc in enumerate(payphys):
             vals = _survivor_payload(seg, pc, orows)
             sums_ws[:, p] = np.rint(np.bincount(wp, weights=vals.astype(np.float64),
