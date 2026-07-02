@@ -30,6 +30,27 @@ def _parse_sql_cached(sql):
     workload can't grow it without limit."""
     return sqlglot.parse_one(sql, read='duckdb')
 
+
+_PW_SEGS = {}   # per-WORKER-process: (dbdir, seg_path) -> Segment (opened once, reused across tasks)
+
+def _prewarm_worker(task):
+    """Build one pair's structure in a prewarm worker process. The Segment is opened once per
+    (worker, segment) and reused; the built tuple pickles back to the parent. Build transients
+    (the np.unique sort buffers) die WITH the pool -- so the long-lived parent's heap holds only
+    the structures, not ~30 GB of allocator retention (measured on the serial path)."""
+    dbdir, table, seg_path, a, b = task
+    import time
+    import wdb_gridwalk as GW
+    key = (dbdir, seg_path)
+    seg = _PW_SEGS.get(key)
+    if seg is None:
+        seg = Database.open(dbdir).open_segment(seg_path, table)
+        _PW_SEGS[key] = seg
+    t0 = time.perf_counter()
+    built = GW._build(seg, [a, b])
+    nb = GW.structure_nbytes(built) if built is not None else 0
+    return built, nb, round(time.perf_counter() - t0, 2)
+
 class Database:
     def __init__(self, catalog):
         self.cat = catalog
@@ -76,46 +97,63 @@ class Database:
             arr = wdb_fkptr.load(child_seg_path, fk_col); self._ptr_cache[ck] = (key, arr); return arr
         return hit[1]
 
-    def prewarm(self, table=None, budget_bytes=4 << 30, verbose=True):
+    def prewarm(self, table=None, budget_bytes=4 << 30, workers=None, verbose=True):
         """Eager launch classification + build: walk EVERY eligible column pair of every table and
         materialize its gridwalk structure into RAM, under a structures budget. Exhaustive by
         construction -- every pair ends the loop CLASSIFIED in the returned manifest (built, or
         deferred with the reason), so no pair-shaped query can fall through unclassified. RAM-only
         by design (disk stays compressed); the one-time build cost moves from first-query to launch,
         which also makes the total footprint VISIBLE here instead of a mid-query surprise.
-        Returns (manifest, totals)."""
+
+        workers=N builds pairs across N processes (each peaks ~2-3 GB transient on a 100M segment;
+        size N to RAM). Budget is applied to results IN TASK ORDER, so built/deferred decisions are
+        deterministic and identical to the serial pass. Returns (manifest, totals)."""
         import itertools, time
         import wdb_gridwalk as GW
         import wdb_policies as P
-        manifest = []
-        tot_bytes = 0; t_all = time.perf_counter()
+        t_all = time.perf_counter()
+        tasks = []; segN = {}
         for t in ([table] if table else self.cat.list_tables()):
             for path in self.cat.segment_paths(t):
                 seg = self.open_segment(path, t)
+                segN[path] = int(seg.N)
                 elig = sorted(c for c in seg.cols
                               if seg.cols[c].get('mode') != 4 and P.not_positional(seg, c))
-                for a, b in itertools.combinations(elig, 2):
+                tasks.extend((t, path, a, b) for a, b in itertools.combinations(elig, 2))
+        manifest = []; tot_bytes = 0
+
+        def _apply(outs_iter):
+            nonlocal tot_bytes
+            for (tt, p, a, b), (built, nb, dt) in zip(tasks, outs_iter):
+                ent = {'table': tt, 'pair': (a, b), 'build_s': dt}
+                if built is None:
+                    ent.update(status='empty', bytes=0)
+                elif tot_bytes + nb > budget_bytes:
+                    ent.update(status='deferred_budget', bytes=nb, nheavy=int(built[3]))
+                else:                                   # resident: insert into gridwalk's RAM cache
+                    GW._CACHE[(p, (a, b), segN[p])] = built
+                    tot_bytes += nb
+                    ent.update(status='built', bytes=nb, nheavy=int(built[3]), ones=int(built[5].size))
+                manifest.append(ent)
+                if verbose:
+                    print("prewarm %-44s %-16s %10.1f KB  nheavy=%-10s %6.2fs" % (
+                        "%s.%s x %s" % (tt, a, b), ent['status'], ent['bytes'] / 1024,
+                        ent.get('nheavy', '-'), dt), flush=True)
+
+        if workers and int(workers) > 1:
+            from concurrent.futures import ProcessPoolExecutor
+            args = [(self.cat.dbdir, tt, p, a, b) for (tt, p, a, b) in tasks]
+            with ProcessPoolExecutor(max_workers=int(workers)) as ex:
+                _apply(ex.map(_prewarm_worker, args, chunksize=1))   # yields in task order
+        else:
+            def _serial():
+                for (tt, p, a, b) in tasks:
+                    seg = self.open_segment(p, tt)
                     t0 = time.perf_counter()
-                    ok = GW.build(seg, [a, b])
-                    dt = time.perf_counter() - t0
-                    ent = {'table': t, 'pair': (a, b), 'build_s': round(dt, 2)}
-                    if not ok:
-                        ent.update(status='empty', bytes=0)
-                    else:
-                        built = GW._load(seg, [a, b])
-                        nb = GW.structure_nbytes(built)
-                        if tot_bytes + nb > budget_bytes:
-                            GW.cache_pop(seg, [a, b])   # classified, deliberately not resident
-                            ent.update(status='deferred_budget', bytes=nb, nheavy=int(built[3]))
-                        else:
-                            tot_bytes += nb
-                            ent.update(status='built', bytes=nb, nheavy=int(built[3]),
-                                       ones=int(built[5].size))
-                    manifest.append(ent)
-                    if verbose:
-                        print("prewarm %-44s %-16s %10.1f KB  nheavy=%-10s %6.2fs" % (
-                            "%s.%s x %s" % (t, a, b), ent['status'], ent['bytes'] / 1024,
-                            ent.get('nheavy', '-'), dt), flush=True)
+                    built = GW._build(seg, [a, b])
+                    nb = GW.structure_nbytes(built) if built is not None else 0
+                    yield built, nb, round(time.perf_counter() - t0, 2)
+            _apply(_serial())
         return manifest, {'pairs': len(manifest), 'built_bytes': tot_bytes,
                           'wall_s': round(time.perf_counter() - t_all, 1)}
 
