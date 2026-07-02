@@ -97,7 +97,10 @@ def try_live(seg, hot_path, tree, col_map):
     if spec.get('payphys'):            # SUM/AVG payload: the maintained structure holds counts only
         return None
     cols = spec['cols']; lim = spec['lim']; proj = spec['proj']; ci = spec['ci']
-    knames = spec['knames']; V = spec['V']; unordered = spec.get('unordered')
+    knames = spec['knames']; unordered = spec.get('unordered')
+    V = {c: GW._vals(seg, c) for c in cols}    # live mode needs the dicts (hot value->code lookup)
+    if any(v is None for v in V.values()):
+        return None
     if lim <= 0:
         return None
     base = _base(seg, cols)

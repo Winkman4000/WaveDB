@@ -76,6 +76,49 @@ class Database:
             arr = wdb_fkptr.load(child_seg_path, fk_col); self._ptr_cache[ck] = (key, arr); return arr
         return hit[1]
 
+    def prewarm(self, table=None, budget_bytes=4 << 30, verbose=True):
+        """Eager launch classification + build: walk EVERY eligible column pair of every table and
+        materialize its gridwalk structure into RAM, under a structures budget. Exhaustive by
+        construction -- every pair ends the loop CLASSIFIED in the returned manifest (built, or
+        deferred with the reason), so no pair-shaped query can fall through unclassified. RAM-only
+        by design (disk stays compressed); the one-time build cost moves from first-query to launch,
+        which also makes the total footprint VISIBLE here instead of a mid-query surprise.
+        Returns (manifest, totals)."""
+        import itertools, time
+        import wdb_gridwalk as GW
+        import wdb_policies as P
+        manifest = []
+        tot_bytes = 0; t_all = time.perf_counter()
+        for t in ([table] if table else self.cat.list_tables()):
+            for path in self.cat.segment_paths(t):
+                seg = self.open_segment(path, t)
+                elig = sorted(c for c in seg.cols
+                              if seg.cols[c].get('mode') != 4 and P.not_positional(seg, c))
+                for a, b in itertools.combinations(elig, 2):
+                    t0 = time.perf_counter()
+                    ok = GW.build(seg, [a, b])
+                    dt = time.perf_counter() - t0
+                    ent = {'table': t, 'pair': (a, b), 'build_s': round(dt, 2)}
+                    if not ok:
+                        ent.update(status='empty', bytes=0)
+                    else:
+                        built = GW._load(seg, [a, b])
+                        nb = GW.structure_nbytes(built)
+                        if tot_bytes + nb > budget_bytes:
+                            GW.cache_pop(seg, [a, b])   # classified, deliberately not resident
+                            ent.update(status='deferred_budget', bytes=nb, nheavy=int(built[3]))
+                        else:
+                            tot_bytes += nb
+                            ent.update(status='built', bytes=nb, nheavy=int(built[3]),
+                                       ones=int(built[5].size))
+                    manifest.append(ent)
+                    if verbose:
+                        print("prewarm %-44s %-16s %10.1f KB  nheavy=%-10s %6.2fs" % (
+                            "%s.%s x %s" % (t, a, b), ent['status'], ent['bytes'] / 1024,
+                            ent.get('nheavy', '-'), dt), flush=True)
+        return manifest, {'pairs': len(manifest), 'built_bytes': tot_bytes,
+                          'wall_s': round(time.perf_counter() - t_all, 1)}
+
     def _table_in(self, tree):
         f = tree.find(E.From)
         if f is None: raise NotImplementedError("SELECT without FROM")

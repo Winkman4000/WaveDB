@@ -35,6 +35,8 @@ _ENABLED = True           # live by default: gridwalk is the primary 2-key COUNT
 _HEAD_N = 200000          # count-ordered head depth; serves any LIMIT up to this, declines beyond
 _ONES_N = 1024            # singleton fill head: the _ONES_N smallest count-1 gids, for LIMIT > nheavy
 _POS_MAX = 8192           # store member-row positions when total stored cells <= this (payload O(K))
+_POSROWS_MAX = 1 << 16    # ...AND their member rows <= this: positions cost bytes per ROW, and a
+                          # low-card pair's handful of cells holds ALL 100M rows (measured 1.5 GB!)
 _HITS = 0
 _CACHE = {}               # (seg.path,(a,b),N) -> (head_gid, head_cnt, Vb, nheavy, bulk, ones, pos)
 _VCACHE = {}              # (seg.path,col) -> by-code value dict (decode)
@@ -159,7 +161,8 @@ def _build(seg, cols):
     # no per-query pass over the 100M codes. ~1 KB for WatchID x ClientIP (4 heavy + ones).
     pos = None
     stored = np.concatenate((gid, ones)) if ones.size else gid
-    if 0 < stored.size <= _POS_MAX:
+    nmember = int(cnt.sum()) + int(ones.size)    # positions scale with MEMBER ROWS, not cells --
+    if 0 < stored.size <= _POS_MAX and nmember <= _POSROWS_MAX:   # a low-card pair's few cells hold ALL rows
         key = ca * Vb + cb
         st = np.sort(stored)
         p = np.searchsorted(st, key)
@@ -190,6 +193,23 @@ def _load(seg, cols):
 def build(seg, cols):
     """Eagerly materialize a pair's count-head into the RAM cache. Returns True if available."""
     return _load(seg, cols) is not None
+
+
+def structure_nbytes(built):
+    """Resident bytes of one pair's structure (head + bulk + ones + positions)."""
+    head_gid, head_cnt, Vb, nheavy, bulk, ones, pos = built
+    b = head_gid.nbytes + head_cnt.nbytes + ones.nbytes
+    if bulk is not None:
+        b += _bulk_nbytes(bulk)
+    if pos is not None:
+        b += pos[0].nbytes + pos[1].nbytes
+    return int(b)
+
+
+def cache_pop(seg, cols):
+    """Drop one pair's structure from the RAM cache (budget eviction)."""
+    a, b = sorted(cols)
+    _CACHE.pop((seg.path, (a, b), int(seg.N)), None)
 
 
 def _count_index(proj):
@@ -284,9 +304,10 @@ def detect(seg, tree, col_map):
                 return None
     else:
         return None
-    Vs = {col: _vals(seg, col) for col in cols}
-    if any(v is None for v in Vs.values()):
-        return None
+    Vs = None                              # winners decode via seg.fetch (O(1) per cell) -- NEVER the
+    for col in cols:                       # full value dict (SearchPhrase's dict is ~12 GB / 12.8 s to
+        if seg.cols[col].get('mode') == 4:  # materialize, for 10 winners). Metadata-only gate here.
+            return None
     return {'cols': cols, 'ci': ci, 'lim': wdb_sql._limit(tree), 'proj': proj,
             'knames': knames, 'V': Vs, 'order': tree.args.get('order'), 'unordered': unordered,
             'payphys': payphys}
@@ -300,7 +321,7 @@ def execute(seg, spec):
     over the cached codes locates the winners' member rows, and only those rows' payload is decoded."""
     global _HITS
     cols = spec['cols']; ci = spec['ci']; lim = spec['lim']; proj = spec['proj']
-    knames = spec['knames']; V = spec['V']
+    knames = spec['knames']
     loaded = _load(seg, cols)
     if loaded is None:
         return None
@@ -358,7 +379,7 @@ def execute(seg, spec):
         else:
             gid_rows = seg._raw_codes(a).astype(np.int64) * Vb + seg._raw_codes(b).astype(np.int64)
             sel_pay = wdb_pairagg._winner_payload(seg, payphys, gid_rows, sel_gid, None)
-    # materialize: hoist per-row-invariant work out of the loop; vectorize coordinate + value decode.
+    # materialize: fetch-decode each winner cell's coordinates -- O(1) per value, no dict materialize
     codesA = sel_gid // Vb
     codesB = sel_gid - codesA * Vb
     code_by_col = {a: codesA, b: codesB}
@@ -368,7 +389,7 @@ def execute(seg, spec):
             continue
         col = cols[knames.index(wdb_sql._proj_colname(p))]
         if col not in decoded:
-            decoded[col] = [wdb_sql._pyval(x) for x in V[col][code_by_col[col].astype(np.intp)]]
+            decoded[col] = [wdb_sql._pyval(seg.fetch(col, int(c))) for c in code_by_col[col]]
     cnt_list = sel_cnt.astype(np.int64).tolist()
     rows_out = []
     ap = rows_out.append
