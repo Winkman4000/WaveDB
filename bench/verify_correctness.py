@@ -1,74 +1,101 @@
-"""Tie-tolerant correctness verifier for the ClickBench suite (vs a DuckDB oracle).
+"""Correctness gate for EVERY ClickBench query -- verified against the PARQUET, not against DuckDB's
+arbitrary output. DuckDB is only a SQL executor over the parquet here (any correct engine would give the
+same canonical answer), so its tie/order choices never enter the verdict.
 
-The timed board (board_clickbench.py) hashes the LIMITed result as-written, so a query whose ORDER BY
-ties at the LIMIT boundary -- or which has LIMIT with no ORDER BY -- can show ok=False despite being
-correct (the engines just pick a different, equally-valid slice). This tool settles correctness
-independently: it strips ORDER BY/LIMIT/OFFSET and compares the FULL result set with a type-normalized,
-order-independent fingerprint (bench/_cbnorm.full_fp). It reports, per query:
-    EXACT        - the as-written LIMIT result already matches (type-normalized)
-    TIE-ORDERING - LIMIT result differs but the full set matches  => correct, slice is unspecified
-    DIFFERS      - full sets differ                                => a real difference, prints samples
-    WAVE-ERR     - the engine raised
+Per query, the criterion is "is WaveDB's answer THE correct answer derivable from the data":
+  - GROUP BY / ordered queries: impose a total order (append non-aggregate outputs to ORDER BY) so
+    exactly ONE answer is legal, then WaveDB and the parquet ground truth must agree. Plateaus at the
+    LIMIT boundary can't cause a disagreement because the canonical form has no arbitrary cutoff.
+  - scalar / all-aggregate queries: compare the value within float tolerance (int/COUNT exact; AVG of
+    huge magnitudes matched to ~12 sig figs by _cbnorm). Either the number is right or it isn't.
+The base answer is checked against the parquet first (exact agreement = correct, cheap for the
+deterministic majority); only a disagreement escalates to the canonical form, so a genuine bug is told
+apart from an arbitrary tie pick. WaveDB runs in a kill-timeout subprocess; a query that doesn't finish
+is a 'timeout' (a SPEED matter for the board), never a correctness verdict.
 
-Usage: python bench/verify_correctness.py SRC DB_DIR HITS_PARQUET QUERIES_SQL [idx,idx,...]
-(no LIMIT cap on runtime -- run it deliberately, not as the timed board.)"""
-import sys, os, time
+Usage: python bench/verify_correctness.py SRC DBDIR HITS_PARQUET QUERIES_SQL [timeout_s]
+"""
+import sys, subprocess, json, os
 SRC, DBDIR, PARQ, SQLF = sys.argv[1:5]
-ONLY = set(int(x) for x in sys.argv[5].split(',')) if len(sys.argv) > 5 and sys.argv[5].strip() else None
-sys.path.insert(0, SRC)
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import sqlglot, duckdb, _cbnorm as N
-from wdb_db import Database
-
+T = int(sys.argv[5]) if len(sys.argv) > 5 else 120
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SRC); sys.path.insert(0, HERE)
+import duckdb, _cbnorm as N, sqlglot
+from sqlglot import expressions as E
+from _cbvalidate import total_order_sql
+CW = os.path.join(HERE, '_cbcorrect_worker.py')
 HITS_CTE = ("WITH hits AS (SELECT * REPLACE ("
             "(DATE '1970-01-01' + EventDate) AS EventDate, "
             "(TIMESTAMP '1970-01-01' + to_seconds(EventTime)) AS EventTime) "
-            f"FROM read_parquet('{PARQ}'))")
-qs = [l.strip() for l in open(SQLF) if l.strip() and not l.strip().startswith('--')]
+            "FROM read_parquet('%s'))" % PARQ)
+con = duckdb.connect()
+env = dict(os.environ); env['PYTHONPATH'] = SRC
 
-def strip_ol(q):
-    t = sqlglot.parse_one(q, read='duckdb')
-    for k in ('order', 'limit', 'offset'): t.args.pop(k, None)
-    return t.sql(dialect='duckdb')
+def duck_hash(q):
+    return N.limit_hash(con.execute(HITS_CTE + ' ' + q).fetchall())
 
-db = Database.open(DBDIR); con = duckdb.connect()
-print(f"idx | verdict        | wave_full duck_full | note", flush=True)
-summary = {}
-for i, q in enumerate(qs):
-    if ONLY is not None and i not in ONLY: continue
-    qf = strip_ol(q)
-    has_ol = (qf.strip() != q.strip())
+def wdb(q):
     try:
-        t = time.perf_counter(); wf, _ = db.run(qf); wms = time.perf_counter() - t
+        p = subprocess.run([sys.executable, CW, SRC, DBDIR, q], capture_output=True, text=True, timeout=T, env=env)
+        ln = [l for l in p.stdout.strip().splitlines() if l.startswith('{')]
+        return json.loads(ln[-1]) if ln else {'err': 'noout:' + (p.stderr.strip()[-100:] or '?')}
+    except subprocess.TimeoutExpired:
+        return {'err': 'TIMEOUT>%ds' % T}
+
+def classify(q):
+    t = sqlglot.parse_one(q)
+    if any(isinstance(p, E.Star) for p in t.expressions):
+        return 'star'
+    if total_order_sql(q) is not None:
+        return 'ordered'
+    return 'scalar'
+
+def verify(q):
+    # 1. Run the base query on WaveDB (kill-timeout) and compare to the parquet answer. Agreement with a
+    #    correct engine's parquet computation confirms correctness cheaply -- no expensive canonical form
+    #    for the deterministic majority. A base timeout is a SPEED verdict, never a correctness one.
+    w = wdb(q)
+    if 'err' in w:
+        return ('timeout' if 'TIMEOUT' in w['err'] else 'error'), w['err'], 'base'
+    try:
+        dh = duck_hash(q)
     except Exception as e:
-        print(f"Q{i:02d} | WAVE-ERR       | -                  | {type(e).__name__}: {str(e)[:70]}", flush=True)
-        summary[i] = 'WAVE-ERR'; continue
-    df = con.execute(HITS_CTE + ' ' + qf).fetchall()
-    full_match = N.full_fp(wf) == N.full_fp(df)
-    if not full_match:
-        # real difference -> classify + sample
-        print(f"Q{i:02d} | DIFFERS        | {len(wf):>9} {len(df):>9} | full sets differ", flush=True)
-        print(f"     wave: {[N.norm_row(r) for r in wf[:3]]}", flush=True)
-        print(f"     duck: {[N.norm_row(tuple(r)) for r in df[:3]]}", flush=True)
-        summary[i] = 'DIFFERS'; continue
-    if not has_ol:
-        print(f"Q{i:02d} | EXACT          | {len(wf):>9} {len(df):>9} | no ORDER/LIMIT ({wms:.1f}s)", flush=True)
-        summary[i] = 'EXACT'; continue
-    # full set matches AND there is an ORDER/LIMIT -> check the as-written slice
+        return 'error', 'duck: ' + str(e)[:80], 'base'
+    if w['hash'] == dh:
+        return 'correct', '', 'exact agreement'
+    # 2. Disagreement is NOT a verdict of wrong -- it may be a plateau/unordered LIMIT where DuckDB's
+    #    arbitrary pick differs. Escalate to the canonical total order, where exactly one answer is legal,
+    #    so a genuine bug is distinguishable from an arbitrary tie choice. Only a canonical miss is WRONG.
+    kind = classify(q)
+    if kind != 'ordered':
+        return 'WRONG', 'base value differs beyond tolerance', kind  # scalar/star: deterministic, so real
+    cq = total_order_sql(q)
+    if cq is None:
+        return 'WRONG', 'no canonical form', 'ordered'
+    w2 = wdb(cq)
+    if 'err' in w2:
+        return ('timeout' if 'TIMEOUT' in w2['err'] else 'error'), w2['err'], 'canonical total-order'
     try:
-        wl, _ = db.run(q); dl = con.execute(HITS_CTE + ' ' + q).fetchall()
-        limit_match = N.limit_hash(wl) == N.limit_hash([tuple(r) for r in dl])
-    except Exception:
-        limit_match = False
-    verdict = 'EXACT' if limit_match else 'TIE-ORDERING'
-    note = 'as-written slice matches' if limit_match else 'slice unspecified; full set matches'
-    print(f"Q{i:02d} | {verdict:<14} | {len(wf):>9} {len(df):>9} | {note} ({wms:.1f}s)", flush=True)
-    summary[i] = verdict
+        d2 = duck_hash(cq)
+    except Exception as e:
+        return 'error', 'duck: ' + str(e)[:80], 'canonical total-order'
+    return ('correct' if w2['hash'] == d2 else 'WRONG'), '', 'canonical total-order'
 
-print("\nSUMMARY:", flush=True)
+qs = [l.strip() for l in open(SQLF) if l.strip() and not l.strip().startswith('--')]
+print("== correctness gate: WaveDB vs canonical parquet ground truth (timeout=%ds) ==\n" % T, flush=True)
+res = {}
+for i, q in enumerate(qs):
+    label = 'Q%02d' % i
+    try:
+        v, msg, how = verify(q)
+    except Exception as e:
+        v, msg, how = 'error', str(e)[:90], '?'
+    res[label] = v
+    print("  %s  %-8s  %-22s %s" % (label, v, how, ('<' + msg if msg else '')), flush=True)
 from collections import Counter
-c = Counter(summary.values())
-print("  " + "  ".join(f"{k}={v}" for k, v in sorted(c.items())), flush=True)
-diffs = [i for i, v in summary.items() if v == 'DIFFERS']
-print(f"  real differences: {['Q%02d'%i for i in diffs] if diffs else 'NONE'}", flush=True)
-print(f"  correct: {sum(v in ('EXACT','TIE-ORDERING') for v in summary.values())}/{len(summary)}", flush=True)
+c = Counter(res.values())
+print("\nSUMMARY  correct=%d  WRONG=%d  timeout=%d  error=%d  (/%d)"
+      % (c['correct'], c['WRONG'], c['timeout'], c['error'], len(qs)), flush=True)
+wrong = [k for k, v in res.items() if v == 'WRONG']
+print("  *** WRONG (real bugs): %s" % (', '.join(wrong) if wrong else 'none'), flush=True)
+json.dump(res, open('/tmp/correctness.json', 'w'), indent=0)

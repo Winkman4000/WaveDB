@@ -44,6 +44,21 @@ def norm_cell(v):
 
 def norm_row(r): return tuple(norm_cell(v) for v in r)
 
+def _cn_exact(v):                             # like _cn but NEVER rounds a float
+    if isinstance(v, bool): return ('b', v)
+    if isinstance(v, int):  return ('i', v)
+    f = float(v)
+    if f != f:              return ('f', 'nan')
+    if f.is_integer() and abs(f) < 2**53: return ('i', int(f))
+    return ('f', f)
+
+def norm_cell_exact(v):
+    """Like norm_cell but keeps full float precision. The correctness harness does its own tolerant
+    comparison, so it must NOT pre-round -- a rounded value compared to full-precision truth false-fails."""
+    if v is None: return None
+    if isinstance(v, (bool, int, float)): return _cn_exact(v)
+    return norm_cell(v)
+
 def limit_hash(rows):                         # order-insensitive multiset hash (small results)
     h = hashlib.md5()
     for r in sorted((norm_row(x) for x in rows), key=repr): h.update(repr(r).encode())
