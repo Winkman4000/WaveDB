@@ -177,17 +177,29 @@ def _dict_bytes(p, zc):
     return out
 
 def _code_section(codes, bits):
-    """Per-row code array (mode 0/1/2): 1 tag byte + payload. tag 0 = raw bit-packed (current);
-    tag 1 = zstd of byte-aligned codes. Picks the smaller (gated) -- clustered/skewed code
-    arrays compress hugely (measured 34x on a sorted key), incompressible ones stay raw, paying
-    only the 1-byte tag. Byte-aligned (not bit-packed) before zstd: lets its matching work."""
-    packed = _pack_codes(codes, bits)
+    """Per-row code array (mode 0/1/2): 1 tag byte + payload. tag 0 = raw bit-packed; tag 1 = zstd
+    of byte-aligned codes; tag 2 = STAIRCASE (codes non-decreasing in row order, e.g. time-ordered
+    ingest): store only the gap-packed rows where the code ticks +1 -- the norm is 'same as the row
+    above', the steps are the exceptions. EventTime measured: 3.13 MB zstd -> 1.37 MB steps, and
+    the steps serve point reads/GROUP BY with NO decode. Smallest candidate wins; incompressible
+    arrays stay raw, paying only the tag byte."""
+    arr = np.asarray(codes, dtype=np.int64)
+    stair = None
+    if arr.size:
+        d = np.diff(arr)
+        if int(arr[0]) == 0 and (d.size == 0 or (int(d.min()) >= 0 and int(d.max()) <= 1)):
+            steps = (np.nonzero(d)[0] + 1).astype(np.int64)      # rows where the code ticks +1
+            gaps = np.diff(np.concatenate(([0], steps)))
+            gbits = max(1, int(gaps.max()).bit_length()) if gaps.size else 1
+            pay = _pack_codes(gaps, gbits) if gaps.size else b''
+            stair = bytes([2, gbits]) + struct.pack('<I', steps.size) + pay
+    packed = bytes([0]) + _pack_codes(codes, bits)
     width = 1 if bits <= 8 else (2 if bits <= 16 else 4)
     wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[width]
     z = zstd.ZstdCompressor(level=CODE_ZSTD_LEVEL).compress(np.asarray(codes, dtype=wdt).tobytes())
-    if len(z) + 6 < len(packed):                 # tag(1)+width(1)+zlen(4) overhead
-        return bytes([1, width]) + struct.pack('<I', len(z)) + z
-    return bytes([0]) + packed
+    zsec = bytes([1, width]) + struct.pack('<I', len(z)) + z
+    best = min((s for s in (stair, zsec, packed) if s is not None), key=len)
+    return best
 
 def _serialize_column(p, zc):
     """Normal blob (mode 0/1/2), or mode-4 affine blob (header + WSQ1 seqcodec blob)."""

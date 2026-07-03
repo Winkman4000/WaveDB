@@ -78,6 +78,10 @@ def _column_spans(buf):
         code_enc = int(buf[off]); off += 1
         if code_enc == 0:
             off += (N * bits + 7) // 8
+        elif code_enc == 2:                          # staircase: gbits u8 + nsteps u32 + gap-packed
+            gbits = int(buf[off]); off += 1
+            nsteps = struct.unpack_from('<I', buf, off)[0]; off += 4
+            off += (nsteps * gbits + 7) // 8
         else:
             off += 1  # cwidth
             czlen = struct.unpack_from('<I', buf, off)[0]; off += 4 + czlen

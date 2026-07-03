@@ -20,6 +20,7 @@ import wdb_gbcount
 import wdb_heavypair
 import wdb_countpos
 import wdb_gridwalk
+import wdb_stair
 import wdb_pairagg
 import wdb_scanpair
 import wdb_survgroup
@@ -69,6 +70,11 @@ cube = Read('cube',
             lambda c: wdb_cube.detect(c.seg, c.tree, c.cmap),
             lambda c, spec: wdb_cube.execute(c.seg, spec),
             'pre-materialized cube')
+
+stair = Read('stair',
+             lambda c: wdb_stair.detect(c.seg, c.tree, c.cmap),
+             lambda c, spec: wdb_stair.execute(c.seg, spec),
+             'staircase-column group-by from step positions')
 
 dict_count = Read('dict_count',
                   lambda c: wdb_gbcount.detect(c.seg, c.tree, c.cmap),

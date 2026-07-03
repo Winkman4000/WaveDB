@@ -37,6 +37,7 @@ def _agg_or_group(tree):
 # first whose detect fires AND whose execute returns rows wins.
 _READ_ORDER = (
     R.cube,                 # pre-materialized cube
+    R.stair,                # staircase column: single-key GROUP BY from step positions (no decode)
     R.dict_count,           # dictionary per-code counts
     R.gridwalk,             # two-key COUNT(*) top-K via grid filled-cell + count-ordered head (opt-in)
     R.countpos,             # two-key COUNT(*) top-K via per-row count-class presence-scan (opt-in)

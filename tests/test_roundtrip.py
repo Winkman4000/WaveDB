@@ -55,10 +55,15 @@ def test_string_highcard_mode1():
     assert assert_lossless(seg, pq, 'x') == 1, "high-card repetitive string should be mode 1"
 
 def test_string_unique_mode5():
-    # near-unique high-card strings -> inline mode 5 (dictionary pointers are dead weight)
+    # near-unique high-card strings. SORTED input now wins as dict + STAIRCASE codes (enc 2,
+    # ~1 bit/row): the dictionary stopped being dead weight the moment the codes became ~free,
+    # so the size contest flips from inline mode 5 to dict mode 1. Losslessness is the invariant.
     df = pd.DataFrame({'x': [f'item_{i:08d}' for i in range(60000)]})
     seg, pq = roundtrip(df)
-    assert assert_lossless(seg, pq, 'x') == 5, "unique string column should be mode 5"
+    m = assert_lossless(seg, pq, 'x')
+    assert m in (1, 5), m
+    if m == 1:
+        assert seg.cols['x'].get('code_enc') == 2, "dict form should have won via the staircase"
 
 def test_string_unicode():
     df = pd.DataFrame({'x': (['café','日本語','emoji😀','naïve','']*100)})

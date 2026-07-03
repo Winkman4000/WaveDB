@@ -44,7 +44,7 @@ def test_clustered_string_compresses_and_is_lossless():
         s = np.random.default_rng(3).choice(['ok','retry','fail','queued','cancel','timeout'],
                                              1_000_000, p=[.7,.1,.05,.08,.04,.03]); s.sort()
         seg, w, _ = _enc(pd.DataFrame({'s': s}))
-        assert seg.cols['s']['code_enc'] == 1
+        assert seg.cols['s']['code_enc'] == 2   # fully sorted -> staircase beats zstd (v2 contract)
         assert np.array_equal(np.array([x.decode() for x in seg.values('s')]), s)
 
 def test_code_width_variants_lossless():
@@ -73,7 +73,7 @@ def test_queries_match_oracle_on_compressed_column():
         amt = np.random.default_rng(6).integers(0, 100, n).astype(np.int64)
         df = pd.DataFrame({'cat': cat, 'amt': amt})
         seg, w, pq = _enc(df)
-        assert seg.cols['cat']['code_enc'] == 1
+        assert seg.cols['cat']['code_enc'] == 2   # fully sorted -> staircase beats zstd (v2 contract)
         con = duckdb.connect()
         for sql in ["SELECT COUNT(*) FROM TBL WHERE cat = 'c1000'",
                     "SELECT cat, COUNT(*) FROM TBL GROUP BY cat",

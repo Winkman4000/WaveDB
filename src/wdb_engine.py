@@ -96,9 +96,14 @@ class Segment:
                     zlen = struct.unpack_from('<I',buf,off)[0]; off += 4
                     meta['z'] = buf[off:off+zlen]; off += zlen
                     meta['vals'] = None; meta['raw'] = None  # decoded lazily
-            code_enc = int(buf[off]); off += 1; meta['code_enc'] = code_enc   # 0=raw bitpack, 1=zstd codes
+            code_enc = int(buf[off]); off += 1; meta['code_enc'] = code_enc   # 0=bitpack, 1=zstd, 2=staircase
             if code_enc == 0:
                 nb = (self.N*bits+7)//8; meta['cstart'] = off; off += nb
+            elif code_enc == 2:                # staircase: gap-packed step rows (see Segment.stairs)
+                meta['gbits'] = int(buf[off]); off += 1
+                meta['nsteps'] = struct.unpack_from('<I', buf, off)[0]; off += 4
+                nb = (meta['nsteps']*meta['gbits']+7)//8
+                meta['cstart'] = off; off += nb
             else:
                 meta['cwidth'] = int(buf[off]); off += 1
                 czlen = struct.unpack_from('<I', buf, off)[0]; off += 4
@@ -252,6 +257,11 @@ class Segment:
             fm = self._fd_map(c)
             cc = fm[x_codes].astype(self._cdt(int(fm.max()) + 1 if fm.size else 1))
             self._codes[nm] = cc; return cc
+        if c.get('code_enc', 0) == 2:                # staircase: codes = repeat(arange, step gaps)
+            st = self.stairs(nm)
+            cnts = np.diff(np.concatenate(([0], st, [self.N])))
+            cc = np.repeat(np.arange(cnts.size, dtype=self._cdt(cnts.size)), cnts)
+            self._codes[nm] = cc; return cc
         if c.get('code_enc', 0) == 1:                # zstd of byte-aligned codes (clustered/skewed)
             raw = self._dz.decompress(self.buf[c['cstart']:c['cstart']+c['czlen']].tobytes())
             wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
@@ -260,6 +270,28 @@ class Segment:
         bits = c['bits']; base = c['cstart']
         cc = self._bitunpack(base, 0, self.N, bits)  # now returns native width
         self._codes[nm] = cc; return cc
+    def stairs(self, nm):
+        """Step rows of a STAIRCASE column (codes non-decreasing in row order, e.g. time-ordered
+        ingest): the row indices where the code ticks +1. Per-value counts and row spans derive
+        from these by diff -- GROUP BY/point reads with NO code decode. code_enc=2 columns carry
+        them gap-packed in the file (unpacked here in ~ms); legacy encodings get a one-time
+        monotonicity probe over the decoded codes, cached. None when not a staircase."""
+        c = self.cols.get(nm)
+        if c is None or c.get('mode') in (4, 6):
+            return None
+        if '_steps' in c:
+            return c['_steps']
+        if c.get('code_enc', 0) == 2:
+            gaps = self._bitunpack(c['cstart'], 0, c['nsteps'], c['gbits']).astype(np.int64)
+            c['_steps'] = np.cumsum(gaps)
+            return c['_steps']
+        a = self._raw_codes(nm)
+        d = np.diff(a.astype(np.int64)) if a.size else np.empty(0, np.int64)
+        if a.size and int(a[0]) == 0 and (d.size == 0 or (int(d.min()) >= 0 and int(d.max()) <= 1)):
+            c['_steps'] = (np.nonzero(d)[0] + 1).astype(np.int64)
+        else:
+            c['_steps'] = None
+        return c['_steps']
     def _effective(self, nm):
         """Effective code space for a column with overrides. An override value that ALREADY
         exists in the dictionary reuses that value's code (so it merges with existing rows in
@@ -496,6 +528,9 @@ class Segment:
         c = self.cols[nm]
         if c['mode'] == 4: return np.arange(lo, hi, dtype=np.int64)
         if c['mode'] == 6: return np.zeros(hi - lo, dtype=np.int64)
+        if c.get('code_enc', 0) == 2:                # staircase: code(row) = #steps at-or-before row
+            st = self.stairs(nm)                     # O((hi-lo) log nsteps), touches no code bytes
+            return np.searchsorted(st, np.arange(lo, hi), side='right').astype(np.int64)
         if c['mode'] in (3, 5) or c.get('code_enc', 0) == 1:
             return self._raw_codes(nm)[lo:hi]
         return self._bitunpack(c['cstart'], lo, hi, c['bits'])
