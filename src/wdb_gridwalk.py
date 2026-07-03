@@ -418,21 +418,33 @@ def execute(seg, spec):
         if col not in decoded:
             decoded[col] = [wdb_sql._pyval(seg.fetch(col, int(c))) for c in code_by_col[col]]
     cnt_list = sel_cnt.astype(np.int64).tolist()
+    # emission plan hoisted OUT of the row loop: per-projection kind/source computed ONCE (at K=1M
+    # the per-row _agg_kind/_proj_colname re-parse measured 7s of pure loop-invariant recompute)
+    plan = []                       # ('key', column-list) | ('cnt', None) | ('sum'|'avg', payptr)
+    payptr = 0
+    for p in proj:
+        ak = wdb_sql._agg_kind(p)
+        if ak is None:
+            plan.append(('key', decoded[cols[knames.index(wdb_sql._proj_colname(p))]]))
+        elif ak[0] == 'COUNT_STAR':
+            plan.append(('cnt', None))
+        elif ak[0] == 'SUM':
+            plan.append(('sum', payptr)); payptr += 1
+        else:
+            plan.append(('avg', payptr)); payptr += 1
     rows_out = []
     ap = rows_out.append
     for i in range(sel_gid.size):
-        row = []; payptr = 0
-        for p in proj:
-            ak = wdb_sql._agg_kind(p)
-            if ak is None:
-                col = cols[knames.index(wdb_sql._proj_colname(p))]
-                row.append(decoded[col][i])
-            elif ak[0] == 'COUNT_STAR':
+        row = []
+        for kind, src in plan:
+            if kind == 'key':
+                row.append(src[i])
+            elif kind == 'cnt':
                 row.append(cnt_list[i])
-            elif ak[0] == 'SUM':
-                row.append(int(sel_pay[i, payptr])); payptr += 1
+            elif kind == 'sum':
+                row.append(int(sel_pay[i, src]))
             else:                                    # AVG = exact integer sum / count
-                row.append(float(sel_pay[i, payptr]) / float(cnt_list[i])); payptr += 1
+                row.append(float(sel_pay[i, src]) / float(cnt_list[i]))
         ap(tuple(row))
     rows_out = workers.finalize(rows_out, proj, spec['order'], lim)
     _HITS += 1
