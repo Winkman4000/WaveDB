@@ -40,6 +40,7 @@ def _prewarm_worker(task):
     the structures, not ~30 GB of allocator retention (measured on the serial path)."""
     dbdir, table, seg_path, a, b = task
     import time
+    import numpy as np
     import wdb_gridwalk as GW
     key = (dbdir, seg_path)
     seg = _PW_SEGS.get(key)
@@ -47,6 +48,8 @@ def _prewarm_worker(task):
         seg = Database.open(dbdir).open_segment(seg_path, table)
         _PW_SEGS[key] = seg
     t0 = time.perf_counter()
+    if b is None:                        # column-nd task: the column's true distinct count (FD input)
+        return int(np.unique(seg._raw_codes(a)).size), 0, round(time.perf_counter() - t0, 2)
     built = GW._build(seg, [a, b])
     nb = GW.structure_nbytes(built) if built is not None else 0
     return built, nb, round(time.perf_counter() - t0, 2)
@@ -97,7 +100,62 @@ class Database:
             arr = wdb_fkptr.load(child_seg_path, fk_col); self._ptr_cache[ck] = (key, arr); return arr
         return hit[1]
 
-    def prewarm(self, table=None, budget_bytes=4 << 30, workers=None, verbose=True):
+    def _fd_postpass(self, manifest, colnd, segN, GW, verbose=True):
+        """Exhaustive FD classification over the completed survey -- FREE, because every pair's full
+        distinct count (nd) was computed by its build and every column's nd came back from the pool.
+        FD knowledge (parent->child where nd(pair) == nd(parent)) is recorded for every proven pair;
+        TWIN deferral additionally requires near-bijection (child/parent nd ratio >= 0.90) AND a fat
+        structure -- an FD with heavy collapse (a near-key like WatchID, a hierarchy like
+        EventTime->EventDate) does NOT make the parent-side slice substitutable, and deferring tiny
+        exception-defined slices saves nothing while costing a first-touch rebuild. Deferred twins
+        rebuild-on-touch exactly, so nothing becomes unanswerable. Returns bytes freed."""
+        fd = {}; parents = set(); twins = {}
+        for ent in manifest:
+            ndp = ent.get('nd')
+            if not ndp:
+                continue
+            a, b = ent['pair']; p = ent['path']
+            na = colnd.get((p, a)); nb2 = colnd.get((p, b))
+            if ndp == na:
+                par, ch = a, b          # a determines b (bijection also lands here: lexicographic parent)
+            elif ndp == nb2:
+                par, ch = b, a
+            else:
+                continue
+            if ch in fd or ch in parents or par in fd:
+                continue                # no chains/cycles in v1
+            fd[ch] = par; parents.add(par)
+            ratio = colnd[(p, ch)] / max(1, colnd[(p, par)])
+            if verbose:
+                print("prewarm FD PROVEN: %s -> %s (nd(pair)=%d == nd(%s), child/parent nd ratio %.3f)"
+                      % (par, ch, ndp, par, ratio), flush=True)
+            # TWINS require near-bijection: an FD with heavy collapse (near-key parents like WatchID,
+            # hierarchies like EventTime->EventDate) does NOT make (X,parent) substitutable by
+            # (X,child) -- those are different matrices and different query shapes. Only a ~1:1
+            # relabeling makes the parent-side copy redundant.
+            if ratio >= 0.90:
+                twins[ch] = par
+        freed = 0
+        for ent in manifest:
+            if ent['status'] != 'built' or ent['bytes'] < (8 << 20):
+                continue                # deferring small structures saves nothing, costs first-touch
+            a, b = ent['pair']; p = ent['path']
+            for ch, par in twins.items():
+                if par in (a, b) and ch not in (a, b):
+                    GW._CACHE.pop((p, (a, b), segN[p]), None)
+                    x = a if b == par else b
+                    ent['status'] = 'twin_deferred'
+                    ent['via'] = tuple(sorted((x, ch)))
+                    freed += ent['bytes']
+                    if verbose:
+                        print("prewarm twin-deferred %-32s (twin of %s x %s)  -%.1f MB" % (
+                            "%s x %s" % (a, b), *ent['via'], ent['bytes'] / 1048576), flush=True)
+                    break
+        if fd and verbose:
+            print("prewarm FD post-pass freed %.1f MB" % (freed / 1048576), flush=True)
+        return freed
+
+    def prewarm(self, table=None, budget_bytes=4 << 30, workers=None, fd_derive=True, verbose=True):
         """Eager launch classification + build: walk EVERY eligible column pair of every table and
         materialize its gridwalk structure into RAM, under a structures budget. Exhaustive by
         construction -- every pair ends the loop CLASSIFIED in the returned manifest (built, or
@@ -112,28 +170,28 @@ class Database:
         import wdb_gridwalk as GW
         import wdb_policies as P
         t_all = time.perf_counter()
-        tasks = []; segN = {}
+        tasks = []; col_tasks = []; segN = {}; manifest = []; tot_bytes = 0; colnd = {}
         for t in ([table] if table else self.cat.list_tables()):
             for path in self.cat.segment_paths(t):
                 seg = self.open_segment(path, t)
                 segN[path] = int(seg.N)
                 elig = sorted(c for c in seg.cols
                               if seg.cols[c].get('mode') != 4 and P.not_positional(seg, c))
+                col_tasks.extend((t, path, c) for c in elig)
                 tasks.extend((t, path, a, b) for a, b in itertools.combinations(elig, 2))
-        manifest = []; tot_bytes = 0
 
         def _apply(outs_iter):
             nonlocal tot_bytes
             for (tt, p, a, b), (built, nb, dt) in zip(tasks, outs_iter):
-                ent = {'table': tt, 'pair': (a, b), 'build_s': dt}
+                ent = {'table': tt, 'pair': (a, b), 'path': p, 'build_s': dt}
                 if built is None:
                     ent.update(status='empty', bytes=0)
                 elif tot_bytes + nb > budget_bytes:
-                    ent.update(status='deferred_budget', bytes=nb, nheavy=int(built[3]))
+                    ent.update(status='deferred_budget', bytes=nb, nheavy=int(built[3]), nd=int(built[7]))
                 else:                                   # resident: insert into gridwalk's RAM cache
                     GW._CACHE[(p, (a, b), segN[p])] = built
                     tot_bytes += nb
-                    ent.update(status='built', bytes=nb, nheavy=int(built[3]), ones=int(built[5].size))
+                    ent.update(status='built', bytes=nb, nheavy=int(built[3]), ones=int(built[5].size), nd=int(built[7]))
                 manifest.append(ent)
                 if verbose:
                     print("prewarm %-44s %-16s %10.1f KB  nheavy=%-10s %6.2fs" % (
@@ -142,10 +200,17 @@ class Database:
 
         if workers and int(workers) > 1:
             from concurrent.futures import ProcessPoolExecutor
+            cargs = [(self.cat.dbdir, tt, p, c, None) for (tt, p, c) in col_tasks]
             args = [(self.cat.dbdir, tt, p, a, b) for (tt, p, a, b) in tasks]
             with ProcessPoolExecutor(max_workers=int(workers)) as ex:
+                for (tt, p, c), (v, _z, _dt) in zip(col_tasks, ex.map(_prewarm_worker, cargs, chunksize=1)):
+                    colnd[(p, c)] = int(v)
                 _apply(ex.map(_prewarm_worker, args, chunksize=1))   # yields in task order
         else:
+            import numpy as _np
+            for (tt, p, c) in col_tasks:
+                seg = self.open_segment(p, tt)
+                colnd[(p, c)] = int(_np.unique(seg._raw_codes(c)).size)
             def _serial():
                 for (tt, p, a, b) in tasks:
                     seg = self.open_segment(p, tt)
@@ -154,7 +219,10 @@ class Database:
                     nb = GW.structure_nbytes(built) if built is not None else 0
                     yield built, nb, round(time.perf_counter() - t0, 2)
             _apply(_serial())
+        freed = self._fd_postpass(manifest, colnd, segN, GW, verbose) if fd_derive else 0
+        tot_bytes -= freed
         return manifest, {'pairs': len(manifest), 'built_bytes': tot_bytes,
+                          'fd_freed_bytes': freed,
                           'wall_s': round(time.perf_counter() - t_all, 1)}
 
     def _table_in(self, tree):

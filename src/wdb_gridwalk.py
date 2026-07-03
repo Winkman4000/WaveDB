@@ -38,7 +38,7 @@ _POS_MAX = 8192           # store member-row positions when total stored cells <
 _POSROWS_MAX = 1 << 16    # ...AND their member rows <= this: positions cost bytes per ROW, and a
                           # low-card pair's handful of cells holds ALL 100M rows (measured 1.5 GB!)
 _HITS = 0
-_CACHE = {}               # (seg.path,(a,b),N) -> (head_gid, head_cnt, Vb, nheavy, bulk, ones, pos)
+_CACHE = {}               # (seg.path,(a,b),N) -> (head_gid, head_cnt, Vb, nheavy, bulk, ones, pos, nd)
 _VCACHE = {}              # (seg.path,col) -> by-code value dict (decode)
 
 
@@ -76,10 +76,12 @@ _BULK_B = 128             # bulk block size; per-block byte-width frame-of-refer
 
 def _bulk_encode(gid, cnt):
     """Gap-encoded bulk: ALL heavy filled cells (not just the head). gid sorted ascending in code
-    order; store within-block deltas at the block's byte-width (frame-of-reference), the big
-    cross-block gap absorbed by an explicit per-block anchor. Counts stay flat for random access.
-    ~16 MB gid (vs 81 MB explicit) + ~20 MB counts on SearchPhrase x UserID. Has per-block anchors
-    for future point-lookup/maintenance. Returns a dict; RAM-resident, never persisted."""
+    order; within-block deltas BIT-PACKED at the block's exact bit-width (frame-of-reference), the
+    big cross-block gap absorbed by an explicit per-block anchor (per-block streams stay byte-aligned
+    because B=128 is divisible by 8). Counts use the NORM-IMPLICIT law when one count value dominates
+    the class (>=50%): the modal count is declared once, a bitmap marks deviants, and only deviants
+    carry an explicit count -- the exceptions of the exceptions. Otherwise counts stay flat.
+    Has per-block anchors for future point-lookup/maintenance. RAM-resident, never persisted."""
     n = int(gid.size)
     B = _BULK_B
     nb = (n + B - 1) // B
@@ -88,45 +90,68 @@ def _bulk_encode(gid, cnt):
     wd = np.diff(gp, axis=1, prepend=gp[:, :1])          # within-block deltas; col0 == 0
     anchors = np.ascontiguousarray(gp[:, 0])             # absolute gid at each block start
     maxd = wd.max(axis=1)
-    nbits = np.where(maxd > 0, np.floor(np.log2(np.maximum(maxd, 1))).astype(np.int64) + 1, 1)
-    widths = np.maximum(np.ceil(nbits / 8).astype(np.int64), 1).astype(np.uint8)  # bytes/delta 1..8
+    nbits = np.where(maxd > 0, np.floor(np.log2(np.maximum(maxd, 1))).astype(np.int64) + 1,
+                     1).astype(np.uint8)                 # exact bits/delta per block, 1..64
     buffers = {}
-    for w in np.unique(widths):
-        w = int(w)
-        bidx = np.flatnonzero(widths == w)
-        blk = wd[bidx]                                   # (m, B) int64
-        le = np.zeros((bidx.size, B, w), dtype=np.uint8)
-        for bp in range(w):
-            le[:, :, bp] = (blk >> (8 * bp)) & 0xFF
-        buffers[w] = np.ascontiguousarray(le.reshape(-1))
-    cstore = cnt.astype(np.uint16) if int(cnt.max()) < 65536 else cnt.astype(np.uint32)
-    return {'n': n, 'B': B, 'nb': nb, 'anchors': anchors, 'widths': widths,
-            'buffers': buffers, 'cnt': cstore}
+    for k in np.unique(nbits):
+        k = int(k)
+        bidx = np.flatnonzero(nbits == k)
+        blk = wd[bidx]                                   # (m, B) int64, every value < 2^k
+        shifts = np.arange(k - 1, -1, -1, dtype=np.int64)
+        bits = ((blk[:, :, None] >> shifts) & 1).astype(np.uint8)   # MSB-first within each delta
+        buffers[k] = np.packbits(bits.reshape(-1))
+    out = {'n': n, 'B': B, 'nb': nb, 'anchors': anchors, 'nbits': nbits, 'buffers': buffers}
+    cdt = np.uint16 if int(cnt.max()) < 65536 else np.uint32
+    vals, freq = np.unique(cnt, return_counts=True)
+    mi = int(freq.argmax()); mode = int(vals[mi])
+    if n >= 4096 and freq[mi] / n >= 0.5:                # norm-implicit: the class's modal count
+        exc = cnt != mode
+        out['cnorm'] = mode
+        out['cbits'] = np.packbits(exc)
+        out['cexc'] = np.ascontiguousarray(cnt[exc], dtype=cdt)
+    else:
+        out['cnt'] = cnt.astype(cdt)
+    return out
 
 
 def _bulk_decode_all(bulk):
-    """Reconstruct (gid, cnt) for all heavy cells in code order. Vectorized per byte-width group:
-    unpack LE bytes -> within-block deltas -> cumsum + anchor. Round-trip exact."""
+    """Reconstruct (gid, cnt) for all heavy cells in code order. Vectorized per bit-width group in
+    block slabs (bounds the unpack transient); counts re-expand from the norm + deviants when the
+    norm-implicit law applied. Round-trip exact."""
     n = bulk['n']; B = bulk['B']; nb = bulk['nb']
-    anchors = bulk['anchors']; widths = bulk['widths']; buffers = bulk['buffers']
+    anchors = bulk['anchors']; nbits = bulk['nbits']; buffers = bulk['buffers']
     out = np.empty(nb * B, dtype=np.int64)
     ar = np.arange(B)
-    for w, buf in buffers.items():
-        bidx = np.flatnonzero(widths == w)
-        v = buf.reshape(bidx.size, B, w).astype(np.int64)
-        val = np.zeros((bidx.size, B), dtype=np.int64)
-        for bp in range(w):
-            val += v[:, :, bp] << (8 * bp)
-        rec = np.cumsum(val, axis=1) + anchors[bidx][:, None]
-        out[(bidx[:, None] * B + ar)] = rec
-    return out[:n], bulk['cnt']
+    SLAB = 8192                                          # blocks per unpack slab
+    for k, buf in buffers.items():
+        k = int(k)
+        bidx = np.flatnonzero(nbits == k)
+        shifts = np.arange(k - 1, -1, -1, dtype=np.int64)
+        bpb = (B * k) // 8                               # bytes per block (byte-aligned: 8 | B)
+        for s in range(0, bidx.size, SLAB):
+            sl = bidx[s:s + SLAB]; m = sl.size
+            bits = np.unpackbits(buf[s * bpb:(s + m) * bpb], count=m * B * k)
+            val = (bits.reshape(m, B, k).astype(np.int64) << shifts).sum(axis=2)
+            rec = np.cumsum(val, axis=1) + anchors[sl][:, None]
+            out[(sl[:, None] * B + ar)] = rec
+    if 'cnorm' in bulk:
+        cnt = np.full(n, bulk['cnorm'], dtype=np.int64)
+        mask = np.unpackbits(bulk['cbits'], count=n).astype(bool)
+        cnt[mask] = bulk['cexc']
+    else:
+        cnt = bulk['cnt']
+    return out[:n], cnt
 
 
 def _bulk_nbytes(bulk):
-    """Resident size of the bulk in bytes (anchors + widths + packed deltas + counts)."""
-    b = bulk['anchors'].nbytes + bulk['widths'].nbytes + bulk['cnt'].nbytes
+    """Resident size of the bulk in bytes (anchors + bit-widths + packed deltas + counts)."""
+    b = bulk['anchors'].nbytes + bulk['nbits'].nbytes
     for buf in bulk['buffers'].values():
         b += buf.nbytes
+    if 'cnorm' in bulk:
+        b += bulk['cbits'].nbytes + bulk['cexc'].nbytes + 8
+    else:
+        b += bulk['cnt'].nbytes
     return int(b)
 
 
@@ -136,13 +161,15 @@ def _build(seg, cols):
     count plateau crosses its boundary. Also keeps `ones`: the _ONES_N smallest count-1 gids, so a
     LIMIT deeper than the heavy set fills deterministically from singletons (exception-defined pairs
     like WatchID x ClientIP have nheavy ~ a handful and the answer is mostly fill).
-    Returns (head_gid int64, head_cnt int64, Vb int, nheavy int, bulk|None, ones int64) or None."""
+    Returns (head_gid, head_cnt, Vb, nheavy, bulk|None, ones, pos|None, nd) or None; nd is the pair's
+    FULL distinct-cell count (heavy + singletons), recorded for the survey's FD post-pass."""
     a, b = sorted(cols)
     ca = seg._raw_codes(a).astype(np.int64); cb = seg._raw_codes(b).astype(np.int64)
     if ca.size == 0:
         return None
     Vb = int(cb.max()) + 1
     gid_all, cnt_all = np.unique(ca * Vb + cb, return_counts=True)   # filled cells, code order
+    nd = int(gid_all.size)               # the pair's FULL distinct count -- the survey's FD input
     heavy = cnt_all >= 2
     gid = gid_all[heavy]; cnt = cnt_all[heavy]
     ones = np.ascontiguousarray(gid_all[~heavy][:_ONES_N], dtype=np.int64)  # ascending = smallest gids
@@ -152,7 +179,7 @@ def _build(seg, cols):
         o = np.lexsort((gid, -cnt))                  # canonical total order: count DESC, gid ASC
         k = min(_HEAD_N, gid.size)
         head_gid = np.ascontiguousarray(gid[o[:k]], dtype=np.int64)
-        head_cnt = np.ascontiguousarray(cnt[o[:k]], dtype=np.int64)
+        head_cnt = np.ascontiguousarray(cnt[o[:k]], dtype=np.uint32)   # counts < 2^32 always (N=100M)
         bulk = _bulk_encode(gid, cnt)    # full heavy-cell coverage, gap-encoded, for LIMIT beyond head
     else:                                # all-singleton pair: the fully exception-defined extreme
         head_gid = np.empty(0, np.int64); head_cnt = np.empty(0, np.int64); bulk = None
@@ -173,7 +200,7 @@ def _build(seg, cols):
         rgid = key[rows]
         o2 = np.argsort(rgid, kind='stable')
         pos = (np.ascontiguousarray(rgid[o2]), np.ascontiguousarray(rows[o2]))
-    return head_gid, head_cnt, Vb, int(gid.size), bulk, ones, pos
+    return head_gid, head_cnt, Vb, int(gid.size), bulk, ones, pos, nd
 
 
 def _load(seg, cols):
@@ -197,7 +224,7 @@ def build(seg, cols):
 
 def structure_nbytes(built):
     """Resident bytes of one pair's structure (head + bulk + ones + positions)."""
-    head_gid, head_cnt, Vb, nheavy, bulk, ones, pos = built
+    head_gid, head_cnt, Vb, nheavy, bulk, ones, pos, _nd = built
     b = head_gid.nbytes + head_cnt.nbytes + ones.nbytes
     if bulk is not None:
         b += _bulk_nbytes(bulk)
@@ -325,7 +352,7 @@ def execute(seg, spec):
     loaded = _load(seg, cols)
     if loaded is None:
         return None
-    head_gid, head_cnt, Vb, nheavy, bulk, ones, pos = loaded
+    head_gid, head_cnt, Vb, nheavy, bulk, ones, pos, _nd = loaded
     if lim <= 0:
         return None
     a, b = sorted(cols)
