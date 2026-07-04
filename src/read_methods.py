@@ -21,6 +21,7 @@ import wdb_heavypair
 import wdb_countpos
 import wdb_gridwalk
 import wdb_stair
+import wdb_blockstats
 import wdb_pairagg
 import wdb_scanpair
 import wdb_survgroup
@@ -70,6 +71,11 @@ cube = Read('cube',
             lambda c: wdb_cube.detect(c.seg, c.tree, c.cmap),
             lambda c, spec: wdb_cube.execute(c.seg, spec),
             'pre-materialized cube')
+
+blockstats = Read('blockstats',
+                  lambda c: wdb_blockstats.detect(c.seg, c.tree, c.cmap),
+                  lambda c, spec: wdb_blockstats.execute(c.seg, spec),
+                  'whole-table aggregates from per-block statistics (disk-only)')
 
 stair = Read('stair',
              lambda c: wdb_stair.detect(c.seg, c.tree, c.cmap),

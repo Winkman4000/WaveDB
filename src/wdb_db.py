@@ -50,6 +50,9 @@ def _prewarm_worker(task):
     t0 = time.perf_counter()
     if b is None:                        # column-nd task: the column's true distinct count (FD input)
         return int(np.unique(seg._raw_codes(a)).size), 0, round(time.perf_counter() - t0, 2)
+    if b == '':                          # block-stats task: per-block aggregates for the disk-only read
+        import wdb_blockstats
+        return wdb_blockstats.build(seg, a), 0, round(time.perf_counter() - t0, 2)
     built = GW._build(seg, [a, b])
     nb = GW.structure_nbytes(built) if built is not None else 0
     return built, nb, round(time.perf_counter() - t0, 2)
@@ -170,7 +173,7 @@ class Database:
         import wdb_gridwalk as GW
         import wdb_policies as P
         t_all = time.perf_counter()
-        tasks = []; col_tasks = []; segN = {}; manifest = []; tot_bytes = 0; colnd = {}
+        tasks = []; col_tasks = []; stat_tasks = []; segN = {}; manifest = []; tot_bytes = 0; colnd = {}
         for t in ([table] if table else self.cat.list_tables()):
             for path in self.cat.segment_paths(t):
                 seg = self.open_segment(path, t)
@@ -178,6 +181,9 @@ class Database:
                 elig = sorted(c for c in seg.cols
                               if seg.cols[c].get('mode') != 4 and P.not_positional(seg, c))
                 col_tasks.extend((t, path, c) for c in elig)
+                import wdb_blockstats
+                stat_tasks.extend((t, path, c) for c in sorted(seg.cols)
+                                  if wdb_blockstats.eligible(seg, c))
                 tasks.extend((t, path, a, b) for a, b in itertools.combinations(elig, 2))
 
         def _apply(outs_iter):
@@ -202,15 +208,22 @@ class Database:
             from concurrent.futures import ProcessPoolExecutor
             cargs = [(self.cat.dbdir, tt, p, c, None) for (tt, p, c) in col_tasks]
             args = [(self.cat.dbdir, tt, p, a, b) for (tt, p, a, b) in tasks]
+            sargs = [(self.cat.dbdir, tt, p, c, '') for (tt, p, c) in stat_tasks]
             with ProcessPoolExecutor(max_workers=int(workers)) as ex:
                 for (tt, p, c), (v, _z, _dt) in zip(col_tasks, ex.map(_prewarm_worker, cargs, chunksize=1)):
                     colnd[(p, c)] = int(v)
+                import wdb_blockstats
+                for (tt, p, c), (st, _z, _dt) in zip(stat_tasks, ex.map(_prewarm_worker, sargs, chunksize=1)):
+                    wdb_blockstats.install(p, segN[p], c, st)
                 _apply(ex.map(_prewarm_worker, args, chunksize=1))   # yields in task order
         else:
             import numpy as _np
+            import wdb_blockstats
             for (tt, p, c) in col_tasks:
                 seg = self.open_segment(p, tt)
                 colnd[(p, c)] = int(_np.unique(seg._raw_codes(c)).size)
+            for (tt, p, c) in stat_tasks:
+                wdb_blockstats.build(self.open_segment(p, tt), c)
             def _serial():
                 for (tt, p, a, b) in tasks:
                     seg = self.open_segment(p, tt)

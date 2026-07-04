@@ -11,7 +11,7 @@ import sys, os, tempfile, uuid, math, datetime, re
 from decimal import Decimal
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import duckdb, sqlglot, sqlglot.expressions as E
-import wdb_encode, wdb_join, wdb_sql, wdb_bsi_exec, wdb_groupdistinct
+import wdb_encode, wdb_join, wdb_sql, wdb_bsi_exec, wdb_groupdistinct, wdb_blockstats
 from wdb_db import Database
 
 _DB = None; _CON = None
@@ -122,8 +122,10 @@ def _classify(db, q):
     tree = sqlglot.parse_one(q, read='duckdb')
     cand = _is_fusion_candidate(tree)
     fb = wdb_join._FAST_HITS; bb = wdb_bsi_exec._BSI_HITS; gd = wdb_groupdistinct._HITS
+    bs = wdb_blockstats._HITS
     rows = db.run(q)[0]
     if wdb_bsi_exec._BSI_HITS > bb: return 'bsi', rows
+    if wdb_blockstats._HITS > bs: return 'fast', rows      # per-block stats: aggregates, no row data
     if wdb_groupdistinct._HITS > gd: return 'fast', rows   # group-wise COUNT(DISTINCT) code-hash kernel
     if wdb_join._FAST_HITS > fb: return 'fast', rows
     return ('fallback' if cand else 'rows'), rows
