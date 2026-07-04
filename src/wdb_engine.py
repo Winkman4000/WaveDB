@@ -463,6 +463,93 @@ class Segment:
             cp, sl = struct.unpack_from('<HH', raw, o); o += 4
             suf = raw[o:o+sl]; o += sl; prev = prev[:cp] + suf
         return prev
+    def values_at(self, nm, codes):
+        """BATCH fetch+pyval: emission-ready Python values for an array of dict codes, exactly
+        matching [_pyval(fetch(nm, c)) for c in codes] but without 2M Python calls at deep K.
+        Dedupes codes, decompresses each touched dict CHUNK once, walks each front-coded restart
+        block once, and converts scalars via .tolist() (C-speed). min(point, pop) inside the dict."""
+        import wdb_sql
+        codes = np.asarray(codes)
+        if codes.size == 0:
+            return []
+        c = self.cols[nm]
+        V = int(c['V'])
+        if int(codes.max()) >= V:                    # synthetic override codes: rare, per-code path
+            return [wdb_sql._pyval(self.fetch(nm, int(x))) for x in codes]
+        u, inv = np.unique(codes, return_inverse=True)
+        uv = [None] * u.size                         # value per unique code
+        nullmask = c['has_null'] and int(u[-1]) == V - 1
+        work = u[:-1] if nullmask else u             # null code decodes to None; skip the walk for it
+        mode = c['mode']
+        if work.size == 0:
+            pass
+        elif mode == 6:
+            v = wdb_sql._pyval(self._synth[nm])
+            for i in range(work.size): uv[i] = v
+        elif mode == 4:
+            arr = self._seq_decode(c)[work]
+            vals = (arr.view(f"datetime64[{_DT_UNITS[c['aux']]}]") if c['dt'] == 3 else arr)
+            for i, v in enumerate(vals): uv[i] = wdb_sql._pyval(v)
+        elif mode == 5:
+            d = c.get('_idict')
+            if d is None: self._raw_codes(nm); d = c['_idict']
+            for i, cd in enumerate(work.tolist()): uv[i] = wdb_sql._pyval(d[cd])
+        elif mode == 2:
+            arr = self._dict_ints(c)[work]
+            if c['dt'] == 3:
+                vals = arr.view(f"datetime64[{_DT_UNITS[c['aux']]}]")
+                for i in range(vals.size): uv[i] = wdb_sql._pyval(vals[i])
+            else:
+                uv[:work.size] = arr.tolist()        # C-speed int conversion
+        elif mode in (0, 3):
+            vals = c['vals']; dt = c['dt']
+            if dt == 0:
+                for i, cd in enumerate(work.tolist()): uv[i] = int(vals[cd])
+            elif dt == 2:
+                for i, cd in enumerate(work.tolist()): uv[i] = struct.unpack('<d', vals[cd])[0]
+            elif dt == 3:
+                unit = _DT_UNITS[c['aux']]
+                for i, cd in enumerate(work.tolist()):
+                    uv[i] = wdb_sql._pyval(np.int64(struct.unpack('<q', vals[cd])[0]).view(f'datetime64[{unit}]'))
+            else:
+                for i, cd in enumerate(work.tolist()): uv[i] = wdb_sql._pyval(vals[cd])
+        else:                                        # front-coded string dict (chunked or whole)
+            R = c['R']; restarts = c['restarts']
+            chunked = c.get('chunked')
+            if not chunked and c.get('raw') is None:
+                c['raw'] = self._dz.decompress(c['z'])
+            wl = work.tolist()
+            i = 0
+            while i < len(wl):                       # one walk per touched restart block
+                cd = wl[i]; rb = cd // R
+                j = i
+                while j < len(wl) and wl[j] // R == rb:
+                    j += 1
+                if chunked:
+                    ch = cd // c['CHUNK']
+                    buf = c['chunks'].get(ch)
+                    if buf is None:
+                        fb = c['chunk_base'] + int(c['chunk_foff'][ch])
+                        fe = c['chunk_base'] + int(c['chunk_foff'][ch + 1])
+                        buf = self._dz.decompress(bytes(self.buf[fb:fe])); c['chunks'][ch] = buf
+                    o = int(restarts[rb]) - int(c['chunk_ustart'][ch])
+                else:
+                    buf = c['raw']; o = int(restarts[rb])
+                prev = b''; k = i
+                last_rel = wl[j - 1] - rb * R
+                for step in range(last_rel + 1):
+                    cp, sl = struct.unpack_from('<HH', buf, o); o += 4
+                    prev = prev[:cp] + buf[o:o + sl]; o += sl
+                    if rb * R + step == wl[k]:
+                        try: uv[k] = prev.decode('utf-8', 'surrogatepass')
+                        except Exception: uv[k] = prev
+                        k += 1
+                i = j
+        out = [None] * codes.size                    # scatter uniques back to input order
+        uvl = uv
+        for pos, ui in enumerate(inv.tolist()):
+            out[pos] = uvl[ui]
+        return out
     def presence_mask(self):
         """Bool array (len N, True=live) from the presence sidecar, or None if all rows live.
         Lazily loaded and cached. None lets callers take the unmasked fast path."""

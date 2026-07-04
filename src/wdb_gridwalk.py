@@ -406,7 +406,8 @@ def execute(seg, spec):
         else:
             gid_rows = seg._raw_codes(a).astype(np.int64) * Vb + seg._raw_codes(b).astype(np.int64)
             sel_pay = wdb_pairagg._winner_payload(seg, payphys, gid_rows, sel_gid, None)
-    # materialize: fetch-decode each winner cell's coordinates -- O(1) per value, no dict materialize
+    # materialize: BATCH decode each winner key column (values_at: touched dict chunks decompressed
+    # once, restart blocks walked once, C-speed scalar conversion) -- no per-row fetch calls
     codesA = sel_gid // Vb
     codesB = sel_gid - codesA * Vb
     code_by_col = {a: codesA, b: codesB}
@@ -416,36 +417,23 @@ def execute(seg, spec):
             continue
         col = cols[knames.index(wdb_sql._proj_colname(p))]
         if col not in decoded:
-            decoded[col] = [wdb_sql._pyval(seg.fetch(col, int(c))) for c in code_by_col[col]]
-    cnt_list = sel_cnt.astype(np.int64).tolist()
-    # emission plan hoisted OUT of the row loop: per-projection kind/source computed ONCE (at K=1M
-    # the per-row _agg_kind/_proj_colname re-parse measured 7s of pure loop-invariant recompute)
-    plan = []                       # ('key', column-list) | ('cnt', None) | ('sum'|'avg', payptr)
+            decoded[col] = seg.values_at(col, code_by_col[col])
+    cnt64 = sel_cnt.astype(np.int64)
+    cnt_list = cnt64.tolist()
+    # emission: per-projection COLUMN lists built vectorized, rows assembled by zip (C speed)
+    emit = []
     payptr = 0
     for p in proj:
         ak = wdb_sql._agg_kind(p)
         if ak is None:
-            plan.append(('key', decoded[cols[knames.index(wdb_sql._proj_colname(p))]]))
+            emit.append(decoded[cols[knames.index(wdb_sql._proj_colname(p))]])
         elif ak[0] == 'COUNT_STAR':
-            plan.append(('cnt', None))
+            emit.append(cnt_list)
         elif ak[0] == 'SUM':
-            plan.append(('sum', payptr)); payptr += 1
-        else:
-            plan.append(('avg', payptr)); payptr += 1
-    rows_out = []
-    ap = rows_out.append
-    for i in range(sel_gid.size):
-        row = []
-        for kind, src in plan:
-            if kind == 'key':
-                row.append(src[i])
-            elif kind == 'cnt':
-                row.append(cnt_list[i])
-            elif kind == 'sum':
-                row.append(int(sel_pay[i, src]))
-            else:                                    # AVG = exact integer sum / count
-                row.append(float(sel_pay[i, src]) / float(cnt_list[i]))
-        ap(tuple(row))
+            emit.append(sel_pay[:, payptr].tolist()); payptr += 1
+        else:                                        # AVG = exact integer sum / count (float64 both ways)
+            emit.append((sel_pay[:, payptr].astype(np.float64) / cnt64).tolist()); payptr += 1
+    rows_out = list(zip(*emit)) if emit else []
     rows_out = workers.finalize(rows_out, proj, spec['order'], lim)
     _HITS += 1
     return rows_out, [wdb_sql._alias(p) for p in proj]
