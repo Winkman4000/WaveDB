@@ -2,7 +2,8 @@
 """WaveDB engine — loads a WVDB3 segment, resolves columns by name from the header.
 Generic: knows nothing about any specific dataset. Handles plain (mode 0) and
 front-coded (mode 1) string dictionaries transparently."""
-import struct, numpy as np, zstandard as zstd
+import struct
+import threading, numpy as np, zstandard as zstd
 _DT_UNITS = ['us','ns','ms','s','D','h','m','M','Y','W']
 
 class Segment:
@@ -17,7 +18,7 @@ class Segment:
         off = 5
         self.n_cols = struct.unpack_from('<H',buf,off)[0]; off += 2
         self.N = struct.unpack_from('<I',buf,off)[0]; off += 4
-        self.cols = {}; self.order = []; self._dz = zstd.ZstdDecompressor()
+        self.cols = {}; self.order = []; self._dzl = threading.local()
         for _ in range(self.n_cols):
             nl = struct.unpack_from('<H',buf,off)[0]; off += 2
             nm = bytes(buf[off:off+nl]).decode(); off += nl
@@ -236,6 +237,18 @@ class Segment:
         # smallest unsigned width that holds codes 0..ndist-1 (keeps the scanned array compact)
         return (np.uint8 if ndist <= 256 else np.uint16 if ndist <= 65536
                 else np.uint32 if ndist <= 4294967296 else np.int64)
+
+    @property
+    def _dz(self):
+        """Thread-local zstd decompressor. ZstdDecompressor instances are NOT thread-safe for
+        concurrent operations: a single shared one under threaded reads produced intermittent
+        'Data corruption detected' errors and hard segfaults (measured: 8-way parallel column
+        decodes failed with the shared instance, 3/3 clean with per-thread instances). Every
+        existing self._dz.decompress(...) call site works unchanged through this property."""
+        d = getattr(self._dzl, 'dz', None)
+        if d is None:
+            d = self._dzl.dz = zstd.ZstdDecompressor()
+        return d
 
     def _raw_codes(self, nm):
         if nm in self._codes: return self._codes[nm]
