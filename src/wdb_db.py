@@ -55,7 +55,9 @@ def _prewarm_worker(task):
         return wdb_blockstats.build(seg, a), 0, round(time.perf_counter() - t0, 2)
     built = GW._build(seg, [a, b])
     nb = GW.structure_nbytes(built) if built is not None else 0
-    return built, nb, round(time.perf_counter() - t0, 2)
+    if sum(v.nbytes for v in seg._codes.values()) > (3 << 29):   # hard 1.5 GB bound per worker:
+        seg._codes.clear()          # workers are transient build vessels; unbounded per-process code
+    return built, nb, round(time.perf_counter() - t0, 2)          # caches OOM cgroup-limited boxes
 
 class Database:
     def __init__(self, catalog):
