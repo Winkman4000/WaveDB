@@ -39,6 +39,7 @@ _READ_ORDER = (
     R.cube,                 # pre-materialized cube
     R.blockstats,           # whole-table aggregates from per-block stats: no row data touched
     R.stair,                # staircase column: single-key GROUP BY from step positions (no decode)
+    R.wherescan,            # conjunctive WHERE: stair spans + blocked-frame predicate scan, disk-only
     R.dict_count,           # dictionary per-code counts
     R.gridwalk,             # two-key COUNT(*) top-K via grid filled-cell + count-ordered head (opt-in)
     R.countpos,             # two-key COUNT(*) top-K via per-row count-class presence-scan (opt-in)
@@ -68,6 +69,14 @@ def route_single_segment(ctx):
     # window). Any query with OFFSET goes straight to the general scan, which
     # materializes the full ordered result and applies LIMIT/OFFSET together.
     if wdb_sql._offset(ctx.tree):
+        # wherescan is the one structure read that applies OFFSET itself (it materializes the
+        # full ordered group set and slices [off:off+lim]) -- let it try before the scan.
+        spec = R.wherescan.detect(ctx)
+        if spec is not None:
+            rows = R.wherescan.execute(ctx, spec)
+            if rows is not None:
+                if _PATH_SINK is not None: _PATH_SINK(ctx, R.wherescan.name)
+                return rows
         if _PATH_SINK is not None: _PATH_SINK(ctx, 'general_scan')
         return R.general_scan(ctx)
     if _agg_or_group(ctx.tree):

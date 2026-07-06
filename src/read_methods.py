@@ -22,6 +22,7 @@ import wdb_countpos
 import wdb_gridwalk
 import wdb_stair
 import wdb_blockstats
+import wdb_wherescan
 import wdb_pairagg
 import wdb_scanpair
 import wdb_survgroup
@@ -76,6 +77,11 @@ blockstats = Read('blockstats',
                   lambda c: wdb_blockstats.detect(c.seg, c.tree, c.cmap),
                   lambda c, spec: wdb_blockstats.execute(c.seg, spec),
                   'whole-table aggregates from per-block statistics (disk-only)')
+
+wherescan = Read('wherescan',
+                 lambda c: wdb_wherescan.detect(c.seg, c.tree, c.cmap),
+                 lambda c, spec: wdb_wherescan.execute(c.seg, spec),
+                 'conjunctive WHERE via stair spans + parallel blocked-frame scan (disk-only)')
 
 stair = Read('stair',
              lambda c: wdb_stair.detect(c.seg, c.tree, c.cmap),
