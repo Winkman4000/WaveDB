@@ -82,6 +82,11 @@ def _column_spans(buf):
             gbits = int(buf[off]); off += 1
             nsteps = struct.unpack_from('<I', buf, off)[0]; off += 4
             off += (nsteps * gbits + 7) // 8
+        elif code_enc == 3:                          # blocked: cwidth u8 + BR u32 + nfr u32 + offs + frames
+            off += 1
+            nfr = struct.unpack_from('<II', buf, off)[1]; off += 8
+            boffs = np.asarray(buf[off:off + (nfr + 1) * 4]).view(np.uint32); off += (nfr + 1) * 4
+            off += int(boffs[-1])
         else:
             off += 1  # cwidth
             czlen = struct.unpack_from('<I', buf, off)[0]; off += 4 + czlen

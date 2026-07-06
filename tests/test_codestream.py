@@ -28,7 +28,7 @@ def test_clustered_int_compresses_and_is_lossless():
         col = np.minimum(np.random.default_rng(1).zipf(1.2, 1_000_000), 200000).astype(np.int64); col.sort()
         seg, w, _ = _enc(pd.DataFrame({'x': col}))
         raw = (seg.N * seg.cols['x']['bits'] + 7) // 8
-        assert seg.cols['x']['code_enc'] == 1, "clustered codes should compress"
+        assert seg.cols['x']['code_enc'] in (1, 3), "clustered codes should compress (sealed or blocked)"
         assert os.path.getsize(w) * 5 < raw, "should be far smaller than raw bit-packed codes"
         assert np.array_equal(seg.values('x'), col)
 
@@ -88,5 +88,5 @@ def test_real_pipeline_runlength_below_mode4_threshold():
     base = np.random.default_rng(7).integers(0, 80_000, 250_000)
     col = np.repeat(base, 4).astype(np.int64)[:1_000_000]
     seg, w, _ = _enc(pd.DataFrame({'x': col}))
-    assert seg.cols['x']['mode'] in (0, 2) and seg.cols['x'].get('code_enc') == 1
+    assert seg.cols['x']['mode'] in (0, 2) and seg.cols['x'].get('code_enc') in (1, 3)
     assert np.array_equal(seg.values('x'), col)

@@ -25,6 +25,7 @@ FC_THRESHOLD = 50000
 NUM_THRESHOLD = 50000   # delta-code numeric dictionaries above this cardinality (mode 2)
 R = 128
 ZSTD_LEVEL = 9
+BLOCK_ROWS = int(os.environ.get('WDB_BLOCK_ROWS', 524288))   # rows per enc=3 frame
 CODE_ZSTD_LEVEL = 19    # code-stream compression: clustered/skewed code arrays compress hugely
 CHUNK_DICT = bool(int(os.environ.get('WDB_CHUNK_DICT', '1')))   # block-segment front-coded dicts (default on; WDB_CHUNK_DICT=0 to opt out)
 CHUNK_DICT_VALS = 16384                                          # values per independent zstd frame (mult of R)
@@ -199,6 +200,20 @@ def _code_section(codes, bits):
     z = zstd.ZstdCompressor(level=CODE_ZSTD_LEVEL).compress(np.asarray(codes, dtype=wdt).tobytes())
     zsec = bytes([1, width]) + struct.pack('<I', len(z)) + z
     best = min((s for s in (stair, zsec, packed) if s is not None), key=len)
+    if best is zsec:
+        # tag 3 = BLOCKED frames: independent zstd frame per BLOCK_ROWS rows + a frame offset
+        # index. Buys pop/scan/prune access (touched frames only, ~0.6 ms/frame) for a measured
+        # +1-9% per column at 512K rows (knee sweep) -- adopted when within 10% of the seal.
+        # Bitpack (already point-readable) and staircase still win outright when smaller.
+        a = np.asarray(codes, dtype=wdt)
+        cxb = zstd.ZstdCompressor(level=CODE_ZSTD_LEVEL)
+        frames = [cxb.compress(a[i:i + BLOCK_ROWS].tobytes()) for i in range(0, a.size, BLOCK_ROWS)]
+        offs = np.zeros(len(frames) + 1, dtype=np.uint32)
+        np.cumsum([len(f) for f in frames], out=offs[1:])
+        blocked = (bytes([3, width]) + struct.pack('<II', BLOCK_ROWS, len(frames))
+                   + offs.tobytes() + b''.join(frames))
+        if len(blocked) <= len(zsec) * 1.10:
+            best = blocked
     return best
 
 def _serialize_column(p, zc):

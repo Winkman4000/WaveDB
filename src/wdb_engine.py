@@ -97,7 +97,7 @@ class Segment:
                     zlen = struct.unpack_from('<I',buf,off)[0]; off += 4
                     meta['z'] = buf[off:off+zlen]; off += zlen
                     meta['vals'] = None; meta['raw'] = None  # decoded lazily
-            code_enc = int(buf[off]); off += 1; meta['code_enc'] = code_enc   # 0=bitpack, 1=zstd, 2=staircase
+            code_enc = int(buf[off]); off += 1; meta['code_enc'] = code_enc   # 0=bitpack, 1=zstd, 2=staircase, 3=blocked
             if code_enc == 0:
                 nb = (self.N*bits+7)//8; meta['cstart'] = off; off += nb
             elif code_enc == 2:                # staircase: gap-packed step rows (see Segment.stairs)
@@ -105,6 +105,11 @@ class Segment:
                 meta['nsteps'] = struct.unpack_from('<I', buf, off)[0]; off += 4
                 nb = (meta['nsteps']*meta['gbits']+7)//8
                 meta['cstart'] = off; off += nb
+            elif code_enc == 3:                # blocked: independent zstd frame per BR rows + offset index
+                meta['cwidth'] = int(buf[off]); off += 1
+                meta['BR'], nfr = struct.unpack_from('<II', buf, off); off += 8
+                meta['boffs'] = np.frombuffer(buf, dtype=np.uint32, count=nfr+1, offset=off); off += 4*(nfr+1)
+                meta['cstart'] = off; meta['czlen'] = int(meta['boffs'][-1]); off += meta['czlen']
             else:
                 meta['cwidth'] = int(buf[off]); off += 1
                 czlen = struct.unpack_from('<I', buf, off)[0]; off += 4
@@ -279,6 +284,14 @@ class Segment:
             raw = self._dz.decompress(self.buf[c['cstart']:c['cstart']+c['czlen']].tobytes())
             wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
             cc = np.frombuffer(raw, dtype=wdt)       # native width (was upcast to int64)
+            self._codes[nm] = cc; return cc
+        if c.get('code_enc', 0) == 3:                # blocked: decompress every frame, concat
+            wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
+            cc = np.empty(self.N, dtype=wdt)
+            BR = c['BR']; base = c['cstart']; bo = c['boffs']; dz = self._dz
+            for j in range(bo.size - 1):
+                raw = dz.decompress(self.buf[base+int(bo[j]):base+int(bo[j+1])].tobytes())
+                cc[j*BR:j*BR+len(raw)//wdt().itemsize] = np.frombuffer(raw, dtype=wdt)
             self._codes[nm] = cc; return cc
         bits = c['bits']; base = c['cstart']
         cc = self._bitunpack(base, 0, self.N, bits)  # now returns native width
@@ -631,9 +644,42 @@ class Segment:
         if c.get('code_enc', 0) == 2:                # staircase: code(row) = #steps at-or-before row
             st = self.stairs(nm)                     # O((hi-lo) log nsteps), touches no code bytes
             return np.searchsorted(st, np.arange(lo, hi), side='right').astype(np.int64)
+        if c.get('code_enc', 0) == 3:                # blocked: touched frames only
+            if nm in self._codes:
+                return self._codes[nm][lo:hi]
+            wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
+            BR = c['BR']; base = c['cstart']; bo = c['boffs']; dz = self._dz
+            out = np.empty(hi - lo, dtype=wdt)
+            for j in range(lo // BR, (hi - 1) // BR + 1):
+                raw = np.frombuffer(dz.decompress(self.buf[base+int(bo[j]):base+int(bo[j+1])].tobytes()), dtype=wdt)
+                a = max(lo, j*BR); b = min(hi, j*BR + raw.size)
+                out[a-lo:b-lo] = raw[a-j*BR:b-j*BR]
+            return out
         if c['mode'] in (3, 5) or c.get('code_enc', 0) == 1:
             return self._raw_codes(nm)[lo:hi]
         return self._bitunpack(c['cstart'], lo, hi, c['bits'])
+
+    def codes_at(self, nm, rows):
+        """Batch point-pop: codes at the given sorted-or-not row positions, decompressing ONLY the
+        touched enc=3 frames (~0.6 ms each). min(point, pop): callers with huge scattered row sets
+        fall through to the cached full decode automatically once it exists. Non-blocked encodings
+        answer from their own point paths (bitpack arithmetic, stair searchsorted, full decode)."""
+        rows = np.asarray(rows, dtype=np.int64)
+        if rows.size == 0:
+            return np.empty(0, dtype=np.int64)
+        c = self.cols[nm]
+        if c.get('code_enc', 0) != 3 or nm in self._codes:
+            return np.asarray(self._raw_codes(nm))[rows] if c.get('code_enc', 0) != 2 else \
+                np.searchsorted(self.stairs(nm), rows, side='right').astype(np.int64)
+        wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
+        BR = c['BR']; base = c['cstart']; bo = c['boffs']; dz = self._dz
+        out = np.empty(rows.size, dtype=wdt)
+        blks = rows // BR
+        for j in np.unique(blks):
+            m = blks == j
+            raw = np.frombuffer(dz.decompress(self.buf[base+int(bo[j]):base+int(bo[j+1])].tobytes()), dtype=wdt)
+            out[m] = raw[rows[m] - j*BR]
+        return out
 
     def values_range(self, nm, lo, hi):
         """Decoded values for rows [lo, hi) only (the cluster-slice read). Mirrors _base_values'
