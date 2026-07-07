@@ -44,12 +44,16 @@ def _lit_bytes(v):
 
 
 def _litval(node):
-    """Python value of a Literal, unwrapping CAST('..' AS DATE/TIMESTAMP) shells."""
+    """Python value of a Literal, unwrapping CAST('..' AS DATE/TIMESTAMP) and unary minus."""
     n = node
-    while isinstance(n, E.Cast):
+    neg = False
+    while isinstance(n, (E.Cast, E.Neg, E.Paren)):
+        if isinstance(n, E.Neg):
+            neg = not neg
         n = n.this
     if isinstance(n, E.Literal):
-        return wdb_sql._literal_value(n)
+        v = wdb_sql._literal_value(n)
+        return -v if neg and isinstance(v, (int, float)) else v
     return None
 
 
@@ -110,12 +114,25 @@ def _col_lit(node):
     if op is None:
         return None
     a, b = node.this, node.expression
-    if isinstance(a, E.Column) and isinstance(b, (E.Literal, E.Cast)):
+    if isinstance(a, E.Column) and isinstance(b, (E.Literal, E.Cast, E.Neg)):
         return a.name, _litval(b), op
-    if isinstance(b, E.Column) and isinstance(a, (E.Literal, E.Cast)):
+    if isinstance(b, E.Column) and isinstance(a, (E.Literal, E.Cast, E.Neg)):
         flip = {'>=': '<=', '<=': '>='}
         return b.name, _litval(a), flip.get(op, op)
     return None
+
+
+def _in_list(node):
+    """(colname, [literals]) for `col IN (lit, ...)` -- every member must be a literal."""
+    if not isinstance(node, E.In) or not isinstance(node.this, E.Column):
+        return None
+    vals = []
+    for x in node.expressions:
+        v = _litval(x)
+        if v is None:
+            return None
+        vals.append(v)
+    return node.this.name, vals
 
 def _case_key(p, seg, col_map):
     """The Q39 pattern: CASE WHEN <conj of col = int-literal> THEN <column> ELSE <literal>."""
@@ -156,11 +173,19 @@ def detect(seg, tree, col_map):
     where = tree.args.get('where')
     if where is None:
         return None
-    spans, eqs, flags = [], [], []
+    spans, eqs, flags, ins = [], [], [], []
     for cn in _conjuncts(where.this):
         cl = _col_lit(cn)
         if cl is None:
-            return None
+            il = _in_list(cn)
+            if il is None:
+                return None
+            col = col_map.get(il[0], il[0]) if col_map else il[0]
+            if not P.columns_exist(seg, col):   return None
+            if seg._effective(col) is not None: return None
+            if seg.cols[col].get('mode') not in (0, 1, 2, 4): return None
+            ins.append((col, il[1]))
+            continue
         col = col_map.get(cl[0], cl[0]) if col_map else cl[0]
         if not P.columns_exist(seg, col):   return None
         if seg._effective(col) is not None: return None
@@ -219,7 +244,7 @@ def detect(seg, tree, col_map):
             return None
     lim = wdb_sql._limit(tree)
     off = wdb_sql._offset(tree) or 0
-    return {'spans': spans, 'eqs': eqs, 'flags': flags, 'keys': keys, 'aggs': aggs,
+    return {'spans': spans, 'eqs': eqs, 'flags': flags, 'ins': ins, 'keys': keys, 'aggs': aggs,
             'proj': proj, 'ordered': order is not None, 'lim': lim, 'off': int(off)}
 
 # ---------------------------------------------------------------- execution
@@ -335,6 +360,20 @@ def execute(seg, spec):
             pos = pos[cc != code] if op == '<>' else pos[cc == code]
     else:
         pos = np.arange(lo, hi, dtype=np.int64)
+    for col, vals in spec.get('ins', ()):
+        if pos.size == 0: break
+        c = seg.cols[col]
+        if c['mode'] == 4:
+            want = np.array([int(v) for v in vals], dtype=np.int64)
+            vv = np.asarray(seg._seq_decode(c))[pos]
+            pos = pos[np.isin(vv, want)]
+        else:
+            codes = [_code_of(seg, col, v) for v in vals]
+            codes = np.array([k for k in codes if k is not None], dtype=np.int64)
+            if codes.size == 0:
+                pos = np.empty(0, np.int64); break
+            cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
+            pos = pos[np.isin(cc, codes)]
     for col, val, op in spec['flags']:
         if pos.size == 0: break
         vv = np.asarray(seg._seq_decode(seg.cols[col]))[pos]
