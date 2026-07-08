@@ -1,27 +1,23 @@
-"""diskpair: disk-only two-key GROUP BY COUNT top-K -- the scan-merge read.
+"""diskpair: disk-only N-key GROUP BY COUNT top-K -- the scan-merge read.
 
-The proof that pair structures are optional: the bare Q16 shape (SELECT a, b, COUNT(*) GROUP BY
-a, b ORDER BY count DESC LIMIT k, no WHERE) answered by streaming the blocked (enc=3) code
-frames -- never touching the codes cache, never consulting a structure. Measured on ClickBench
-Q16: 0.70-0.75 s vs DuckDB's 0.79-0.80, exact, from a 2.58 s first draft in five profiled rounds.
+The proof that pair structures are optional, generalized to any key count. The bare shape
+(SELECT k1..kN, COUNT(*) GROUP BY k1..kN ORDER BY count DESC LIMIT k, no WHERE) is answered by
+streaming the blocked (enc=3) code frames -- never touching the codes cache, never consulting a
+structure. Measured: Q16 (2-key) 0.70-0.84 s vs DuckDB 0.79-0.89, exact, wins.
 
-Pipeline:
-  1. Parallel block scan (per-thread zstd): decompress both columns' frames.
-  2. NORM SPLIT -- the norm/exception law applied to counting: if one column has a dominant code
-     (SearchPhrase's '' covers 86.8% of rows), those rows' pair keys collapse to the other
-     column's code alone, so they take a dense bincount lane (per-thread table, one vectorized
-     sum to merge) and never enter the sort. Exceptions (13.2M rows) compose real pair keys.
-  3. Per-thread np.unique -> K sorted partial runs.
-  4. wdb_kernels.kway_topk: loser-tree merge streaming straight into a top-K heap -- the merged
-     array is never materialized. Norm-lane top-K via compiled dense scan.
-  5. Winners (<= 2K codes) decode by point fetches.
+Keys may be blocked dict columns or ONE derived minute-of(EventTime) key: the stair column's
+step rows give each block's codes by searchsorted (no decode), and a 1.4M-entry code->minute
+table (dict seconds // 60 % 60) turns them into the derived key -- the stripe insight: row
+position IS the timestamp, so the third key is nearly free.
 
-Placement: AFTER gridwalk -- a resident structure answers in ~2.5 ms and should. This read is
-the floor beneath it: any segment without structures gets DuckDB-beating pair queries anyway.
-Residency stays a promotion, never a requirement.
+Pipeline: parallel per-thread block scan -> progressive radix key fold (declines if the key
+space overflows i64) -> [2-key only] NORM SPLIT: a dominant first-block code (SearchPhrase's ''
+at 86.8%) collapses its rows to the other key: dense bincount lane, vectorized merge -> per-
+thread sorted partials -> wdb_kernels.kway_topk: numba loser-tree merge streaming equal-key
+accumulation into a top-K heap, merged stream never materialized -> winners decoded by fetches.
 
-Declines: WHERE (wherescan's territory), >2 keys (v2), aggregates beyond COUNT(*), non-dict
-key columns, deleted rows, overrides.
+Placement: AFTER gridwalk. Resident structures answer in ~2.5 ms and should; this is the floor
+beneath them. Residency stays a promotion, never a requirement.
 """
 import numpy as np
 import zstandard as zstd
@@ -34,7 +30,8 @@ import wdb_kernels as K
 _ENABLED = True
 _HITS = 0
 _SCAN_THREADS = 14
-_NORM_MIN_SHARE = 0.5              # first-block modal share needed to open the bincount lane
+_NORM_MIN_SHARE = 0.5
+_MAX_KEYS = 4
 
 
 def enable():
@@ -43,6 +40,23 @@ def enable():
 
 def disable():
     global _ENABLED; _ENABLED = False
+
+
+def _minute_key(p, seg, col_map):
+    """extract(minute FROM col) over a stair datetime column -> derived key spec."""
+    inner = p.this if isinstance(p, E.Alias) else p
+    if not isinstance(inner, E.Extract):
+        return None
+    unit = inner.this.name.lower() if hasattr(inner.this, 'name') else str(inner.this).lower()
+    if unit != 'minute' or not isinstance(inner.expression, E.Column):
+        return None
+    col = inner.expression.name
+    col = col_map.get(col, col) if col_map else col
+    if not P.columns_exist(seg, col):
+        return None
+    if seg.stairs(col) is None or seg.cols[col].get('dt') != 3:
+        return None
+    return {'kind': 'minute', 'src': col, 'V': 60}
 
 
 def detect(seg, tree, col_map):
@@ -54,8 +68,6 @@ def detect(seg, tree, col_map):
     if tree.args.get('where') is not None:
         return None
     proj = tree.expressions
-    if len(proj) != 3:
-        return None
     keys, cnt_pi = [], None
     for pi, p in enumerate(proj):
         ak = wdb_sql._agg_kind(p)
@@ -63,6 +75,10 @@ def detect(seg, tree, col_map):
             if ak[0] != 'COUNT_STAR' or cnt_pi is not None:
                 return None
             cnt_pi = pi
+            continue
+        mk = _minute_key(p, seg, col_map)
+        if mk is not None:
+            keys.append((pi, mk))
             continue
         nm = wdb_sql._proj_colname(p)
         if nm is None:
@@ -72,12 +88,19 @@ def detect(seg, tree, col_map):
         if seg._effective(col) is not None: return None
         c = seg.cols[col]
         if c.get('mode') not in (0, 1, 2) or c.get('code_enc') != 3:
-            return None                 # both keys must be blocked dict columns
-        keys.append((pi, col))
-    if len(keys) != 2 or cnt_pi is None:
+            return None
+        keys.append((pi, {'kind': 'col', 'src': col, 'V': int(c['V'])}))
+    if cnt_pi is None or not (2 <= len(keys) <= _MAX_KEYS):
         return None
+    if sum(1 for _pi, k in keys if k['kind'] == 'minute') > 1:
+        return None
+    span = 1
+    for _pi, k in keys:
+        span *= k['V']
+        if span > (1 << 62):
+            return None                 # composite would overflow the i64 key fold
     group = tree.args.get('group')
-    if group is None or len(group.expressions) != 2:
+    if group is None or len(group.expressions) != len(keys):
         return None
     order = tree.args.get('order')
     if order is None or len(order.expressions) != 1:
@@ -99,7 +122,6 @@ def detect(seg, tree, col_map):
 
 
 def _modal_share(seg, col):
-    """(modal_code, share) from the column's first block -- the norm-lane probe."""
     c = seg.cols[col]
     dz = zstd.ZstdDecompressor()
     bo = c['boffs']; base = c['cstart']
@@ -110,45 +132,75 @@ def _modal_share(seg, col):
     return m, bc[m] / raw.size
 
 
+def _block_geometry(seg, keys):
+    """(NB, BR) from the first blocked key column -- all enc=3 columns share BLOCK_ROWS."""
+    for _pi, k in keys:
+        if k['kind'] == 'col':
+            c = seg.cols[k['src']]
+            return c['boffs'].size - 1, int(c['BR'])
+    return 0, 0
+
+
 def execute(seg, spec):
     global _HITS
-    (piA, colA), (piB, colB) = spec['keys']
-    cA, cB = seg.cols[colA], seg.cols[colB]
-    VA, VB = int(cA['V']), int(cB['V'])
-    # norm lane: pick the key column with a dominant first-block code (or none)
-    mB, shB = _modal_share(seg, colB)
-    mA, shA = _modal_share(seg, colA)
-    if shB >= _NORM_MIN_SHARE and shB >= shA:
-        norm_col, norm_code, other = colB, mB, colA
-    elif shA >= _NORM_MIN_SHARE:
-        norm_col, norm_code, other = colA, mA, colB
-    else:
-        norm_col, norm_code, other = None, -1, None
-    wA = {1: np.uint8, 2: np.uint16, 4: np.uint32}[cA['cwidth']]
-    wB = {1: np.uint8, 2: np.uint16, 4: np.uint32}[cB['cwidth']]
-    boA, baA = cA['boffs'], cA['cstart']
-    boB, baB = cB['boffs'], cB['cstart']
+    keys = spec['keys']
+    NB, BR = _block_geometry(seg, keys)
+    if NB == 0:
+        return None
+    N = int(seg.N)
+    # per-key block readers
+    readers = []
+    minute_tab = None
+    for _pi, k in keys:
+        if k['kind'] == 'minute':
+            st = seg.stairs(k['src'])
+            secs = np.asarray(seg._dict_ints(seg.cols[k['src']]), dtype=np.int64)
+            minute_tab = ((secs // 60) % 60).astype(np.int64)
+            readers.append(('minute', st))
+        else:
+            c = seg.cols[k['src']]
+            readers.append(('col', (c['boffs'], c['cstart'],
+                                    {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']])))
+    # norm lane: 2 plain dict keys only
+    norm_idx = -1; norm_code = -1
+    if len(keys) == 2 and all(k['kind'] == 'col' for _pi, k in keys):
+        m0, s0 = _modal_share(seg, keys[0][1]['src'])
+        m1, s1 = _modal_share(seg, keys[1][1]['src'])
+        if s1 >= _NORM_MIN_SHARE and s1 >= s0:
+            norm_idx, norm_code = 1, m1
+        elif s0 >= _NORM_MIN_SHARE:
+            norm_idx, norm_code = 0, m0
+    radix = [k['V'] for _pi, k in keys]
     buf = seg.buf
-    NB = boA.size - 1
-    Vnorm = int(seg.cols[other]['V']) if norm_col else 0
     K10 = spec['off'] + spec['lim']
 
     def work(js):
         dz = zstd.ZstdDecompressor()
         norm_vals, exc = [], []
         for j in js:
-            a = np.frombuffer(dz.decompress(buf[baA + int(boA[j]):baA + int(boA[j + 1])].tobytes()), dtype=wA)
-            b = np.frombuffer(dz.decompress(buf[baB + int(boB[j]):baB + int(boB[j + 1])].tobytes()), dtype=wB)
-            key = a.astype(np.int64) * VB + b
-            if norm_col is not None:
-                nm = (b == norm_code) if norm_col == colB else (a == norm_code)
-                oth = a if norm_col == colB else b
-                norm_vals.append(oth[nm])
+            a, b = j * BR, min(N, (j + 1) * BR)
+            cols = []
+            for kind, meta in readers:
+                if kind == 'minute':
+                    codes = np.searchsorted(meta, np.arange(a, b), side='right')
+                    cols.append(minute_tab[codes])
+                else:
+                    bo, base, wdt = meta
+                    cols.append(np.frombuffer(
+                        dz.decompress(buf[base + int(bo[j]):base + int(bo[j + 1])].tobytes()),
+                        dtype=wdt))
+            key = cols[0].astype(np.int64)
+            for ci in range(1, len(cols)):
+                key = key * radix[ci] + cols[ci]
+            if norm_idx >= 0:
+                nm = cols[norm_idx] == norm_code
+                oth = cols[1 - norm_idx]
+                norm_vals.append(np.asarray(oth[nm]))
                 exc.append(key[~nm])
             else:
                 exc.append(key)
-        tab = (np.bincount(np.concatenate(norm_vals), minlength=Vnorm).astype(np.int32)
-               if norm_col is not None and norm_vals else None)
+        tab = (np.bincount(np.concatenate(norm_vals), minlength=radix[1 - norm_idx]).astype(np.int32)
+               if norm_idx >= 0 and norm_vals else None)
         ek = np.concatenate(exc) if exc else np.empty(0, np.int64)
         g, c = np.unique(ek, return_counts=True)
         return tab, g, c.astype(np.int64)
@@ -156,35 +208,43 @@ def execute(seg, spec):
     W = min(_SCAN_THREADS, NB) or 1
     with ThreadPoolExecutor(W) as ex:
         parts = list(ex.map(work, np.array_split(np.arange(NB), W)))
-    keys = np.concatenate([p[1] for p in parts])
-    vals = np.concatenate([p[2] for p in parts])
+    kk = np.concatenate([p[1] for p in parts])
+    vv = np.concatenate([p[2] for p in parts])
     offs = np.zeros(len(parts) + 1, np.int64)
     np.cumsum([p[1].size for p in parts], out=offs[1:])
-    tc, tk = K.kway_topk(keys, vals, offs, K10)
-    cand = [(int(tc[i]), int(tk[i] // VB), int(tk[i] % VB)) for i in range(K10) if tc[i] > 0]
-    if norm_col is not None:
+    tc, tk = K.kway_topk(kk, vv, offs, K10)
+    cand = [(int(tc[i]), int(tk[i])) for i in range(K10) if tc[i] > 0]
+    if norm_idx >= 0:
         etab = None
         for p in parts:
             if p[0] is not None:
                 etab = p[0] if etab is None else etab + p[0]
         if etab is not None:
-            ec, ek2 = (K.top10_i32(etab, K10) if K.HAVE_NUMBA else
-                       (lambda ti: (etab[ti].astype(np.int64), ti.astype(np.int64)))(
-                           np.argpartition(-etab, min(K10, etab.size - 1))[:K10]))
-            for i in range(min(K10, len(ec))):
+            if K.HAVE_NUMBA:
+                ec, ek2 = K.top10_i32(etab, K10)
+            else:
+                ti = np.argpartition(-etab, min(K10, etab.size - 1))[:K10]
+                ec, ek2 = etab[ti].astype(np.int64), ti.astype(np.int64)
+            for i in range(len(ec)):
                 if ec[i] > 0:
                     oc = int(ek2[i])
-                    if norm_col == colB:
-                        cand.append((int(ec[i]), oc, norm_code))
-                    else:
-                        cand.append((int(ec[i]), norm_code, oc))
-    cand.sort(key=lambda x: (-x[0], x[1], x[2]))
+                    comp = (oc * radix[1] + norm_code) if norm_idx == 1 else (norm_code * radix[1] + oc)
+                    cand.append((int(ec[i]), comp))
+    cand.sort(key=lambda x: (-x[0], x[1]))
     cand = cand[spec['off']: spec['off'] + spec['lim']]
     out = []
-    for n, ka, kb in cand:
-        row = [None, None, None]
-        row[spec['keys'][0][0]] = wdb_sql._pyval(seg.fetch(colA, ka))
-        row[spec['keys'][1][0]] = wdb_sql._pyval(seg.fetch(colB, kb))
+    for n, comp in cand:
+        parts_k = []
+        rem = comp
+        for ci in range(len(keys) - 1, -1, -1):
+            parts_k.append(rem % radix[ci]); rem //= radix[ci]
+        parts_k.reverse()
+        row = [None] * len(spec['proj'])
+        for (pi, k), code in zip(keys, parts_k):
+            if k['kind'] == 'minute':
+                row[pi] = int(code)
+            else:
+                row[pi] = wdb_sql._pyval(seg.fetch(k['src'], int(code)))
         row[spec['cnt_pi']] = n
         out.append(tuple(row))
     _HITS += 1
