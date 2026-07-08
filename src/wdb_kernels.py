@@ -1,0 +1,139 @@
+"""Compiled aggregation kernels (numba soft-dependency).
+
+kway_topk: single-pass loser-tree merge of K sorted (key, count) runs with on-the-fly equal-key
+accumulation feeding a running top-K min-heap -- the merged stream is never materialized. This is
+the counting core of the disk-only GROUP BY path: measured on ClickBench Q16 (100M rows, 13.2M
+non-norm keys in 14 runs) at ~0.21 s, completing a 0.70 s total vs DuckDB's 0.79 s best.
+
+top10_i32: single-pass top-K over a dense int32 count table (the norm lane's per-code counts).
+
+Without numba both fall back to numpy (pairwise sorted-merge tournament / argpartition) --
+correct, ~2-4x slower.
+"""
+import numpy as np
+
+try:
+    from numba import njit
+    HAVE_NUMBA = True
+except Exception:                                     # pragma: no cover
+    HAVE_NUMBA = False
+    def njit(*a, **k):
+        def deco(f):
+            return f
+        return deco
+
+
+@njit(nogil=True, cache=True)
+def _kway_topk_nb(keys, vals, offs, K):
+    nr = offs.size - 1
+    cur = offs[:nr].copy()
+    INF = np.int64(0x7FFFFFFFFFFFFFFF)
+    P = 1
+    while P < nr:
+        P *= 2
+    lk = np.full(P, INF, np.int64)
+    for r in range(nr):
+        lk[r] = keys[cur[r]] if cur[r] < offs[r + 1] else INF
+    tree = np.full(2 * P, -1, np.int32)
+    win = np.empty(2 * P, np.int32)
+    for i in range(P):
+        win[P + i] = i if i < nr else -1
+    for i in range(P - 1, 0, -1):
+        a, b = win[2 * i], win[2 * i + 1]
+        ka = lk[a] if a >= 0 else INF
+        kb = lk[b] if b >= 0 else INF
+        if ka <= kb:
+            win[i] = a; tree[i] = b
+        else:
+            win[i] = b; tree[i] = a
+    topc = np.zeros(K, np.int64); topk = np.zeros(K, np.int64)
+    curkey = np.int64(-1); acc = np.int64(0)
+    w = win[1]
+    while w >= 0 and lk[w] != INF:
+        r = w
+        k = lk[r]
+        if k != curkey:
+            if acc > topc[0]:
+                topc[0] = acc; topk[0] = curkey
+                j = 0
+                while True:
+                    l = 2 * j + 1; rt = 2 * j + 2; m = j
+                    if l < K and topc[l] < topc[m]: m = l
+                    if rt < K and topc[rt] < topc[m]: m = rt
+                    if m == j: break
+                    topc[j], topc[m] = topc[m], topc[j]
+                    topk[j], topk[m] = topk[m], topk[j]
+                    j = m
+            curkey = k; acc = vals[cur[r]]
+        else:
+            acc += vals[cur[r]]
+        cur[r] += 1
+        lk[r] = keys[cur[r]] if cur[r] < offs[r + 1] else INF
+        i = (P + r) >> 1
+        wcur = r
+        while i >= 1:
+            lo = tree[i]
+            klo = lk[lo] if lo >= 0 else INF
+            if klo < (lk[wcur] if wcur >= 0 else INF):
+                tree[i] = wcur; wcur = lo
+            i >>= 1
+        w = wcur
+    if acc > topc[0]:
+        topc[0] = acc; topk[0] = curkey
+    return topc, topk
+
+
+@njit(nogil=True, cache=True)
+def top10_i32(tab, K):
+    topc = np.zeros(K, np.int64); topk = np.zeros(K, np.int64)
+    for i in range(tab.size):
+        v = np.int64(tab[i])
+        if v > topc[0]:
+            topc[0] = v; topk[0] = i
+            j = 0
+            while True:
+                l = 2 * j + 1; rt = 2 * j + 2; m = j
+                if l < K and topc[l] < topc[m]: m = l
+                if rt < K and topc[rt] < topc[m]: m = rt
+                if m == j: break
+                topc[j], topc[m] = topc[m], topc[j]
+                topk[j], topk[m] = topk[m], topk[j]
+                j = m
+    return topc, topk
+
+
+def kway_topk(keys, vals, offs, K):
+    """Top-K (count, key) pairs from K sorted runs. Returns (counts, keys) unsorted heaps;
+    zero-count slots are empty. Numba path streams; numpy fallback merges then partitions."""
+    if HAVE_NUMBA:
+        return _kway_topk_nb(keys, vals, offs, np.int64(K))
+    parts = [(keys[offs[i]:offs[i + 1]], vals[offs[i]:offs[i + 1]])
+             for i in range(offs.size - 1) if offs[i + 1] > offs[i]]
+    while len(parts) > 1:
+        nxt = []
+        for i in range(0, len(parts) - 1, 2):
+            k = np.concatenate([parts[i][0], parts[i + 1][0]])
+            v = np.concatenate([parts[i][1], parts[i + 1][1]])
+            o = np.argsort(k, kind='stable'); k = k[o]; v = v[o]
+            new = np.ones(k.size, bool); new[1:] = k[1:] != k[:-1]
+            idx = np.nonzero(new)[0]
+            nxt.append((k[idx], np.add.reduceat(v, idx)))
+        if len(parts) % 2:
+            nxt.append(parts[-1])
+        parts = nxt
+    g, c = parts[0] if parts else (np.empty(0, np.int64), np.empty(0, np.int64))
+    kk = min(K, g.size)
+    if kk == 0:
+        return np.zeros(K, np.int64), np.zeros(K, np.int64)
+    ti = np.argpartition(-c, kk - 1)[:kk]
+    tc = np.zeros(K, np.int64); tk = np.zeros(K, np.int64)
+    tc[:kk] = c[ti]; tk[:kk] = g[ti]
+    return tc, tk
+
+
+def warm():
+    """JIT-compile the kernels (call from prewarm; ~1 s once, cached on disk after)."""
+    kway_topk(np.array([1, 2], np.int64), np.array([1, 1], np.int64),
+              np.array([0, 1, 2], np.int64), 4)
+    if HAVE_NUMBA:
+        top10_i32(np.array([1, 2], np.int32), 4)

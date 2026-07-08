@@ -23,6 +23,7 @@ import wdb_gridwalk
 import wdb_stair
 import wdb_blockstats
 import wdb_wherescan
+import wdb_diskpair
 import wdb_pairagg
 import wdb_scanpair
 import wdb_survgroup
@@ -102,6 +103,11 @@ gridwalk = Read('gridwalk',
                 lambda c: wdb_gridwalk.detect(c.seg, c.tree, c.cmap),
                 lambda c, spec: wdb_gridwalk.execute(c.seg, spec),
                 'two-key COUNT(*) top-K via grid filled-cell + count-ordered head')
+
+diskpair = Read('diskpair',
+                lambda c: wdb_diskpair.detect(c.seg, c.tree, c.cmap),
+                lambda c, spec: wdb_diskpair.execute(c.seg, spec),
+                'disk-only 2-key GROUP BY count top-K: blocked-frame scan + norm split + k-way merge')
 
 pairagg = Read('pairagg',
                lambda c: wdb_pairagg.detect(c.seg, c.tree, c.cmap),

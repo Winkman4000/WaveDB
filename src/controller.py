@@ -42,6 +42,7 @@ _READ_ORDER = (
     R.wherescan,            # conjunctive WHERE: stair spans + blocked-frame predicate scan, disk-only
     R.dict_count,           # dictionary per-code counts
     R.gridwalk,             # two-key COUNT(*) top-K via grid filled-cell + count-ordered head (opt-in)
+    R.diskpair,             # disk-only pair GROUP BY: scan-merge floor beneath the structures
     R.countpos,             # two-key COUNT(*) top-K via per-row count-class presence-scan (opt-in)
     R.heavypair,            # two-key COUNT(*) top-N from a count-sorted pair sidecar
     R.scanpair,             # two-key COUNT(*) top-N, high-card non-key filter via code-space scan
@@ -71,12 +72,13 @@ def route_single_segment(ctx):
     if wdb_sql._offset(ctx.tree):
         # wherescan is the one structure read that applies OFFSET itself (it materializes the
         # full ordered group set and slices [off:off+lim]) -- let it try before the scan.
-        spec = R.wherescan.detect(ctx)
-        if spec is not None:
-            rows = R.wherescan.execute(ctx, spec)
-            if rows is not None:
-                if _PATH_SINK is not None: _PATH_SINK(ctx, R.wherescan.name)
-                return rows
+        for rd in (R.wherescan, R.diskpair):     # the reads that apply OFFSET themselves
+            spec = rd.detect(ctx)
+            if spec is not None:
+                rows = rd.execute(ctx, spec)
+                if rows is not None:
+                    if _PATH_SINK is not None: _PATH_SINK(ctx, rd.name)
+                    return rows
         if _PATH_SINK is not None: _PATH_SINK(ctx, 'general_scan')
         return R.general_scan(ctx)
     if _agg_or_group(ctx.tree):
