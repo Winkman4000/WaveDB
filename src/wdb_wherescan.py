@@ -341,7 +341,7 @@ def detect(seg, tree, col_map):
                 return None
     order = tree.args.get('order')
     if order is not None:
-        if len(order.expressions) != 1 or not order.expressions[0].args.get('desc'):
+        if not order.expressions or not order.expressions[0].args.get('desc'):
             return None
         onm = order.expressions[0].this
         cnt_idx = [pi for pi, k, _ in aggs if k == 'COUNT_STAR']
@@ -350,6 +350,17 @@ def detect(seg, tree, col_map):
         tgt = onm.name if isinstance(onm, E.Column) else None
         if tgt is None or tgt not in (wdb_sql._alias(proj[cnt_idx[0]]), 'COUNT', 'count'):
             return None
+        # trailing ASC key columns (the validator's total-order tiebreak) are exactly the
+        # canonical emission order (count desc, composite asc = value asc) -- accept them
+        knames = {k['src'] for _pi, k in keys if k.get('kind') == 'col'}
+        kalias = {wdb_sql._alias(proj[pi]) for pi, _k in keys}
+        for oe2 in order.expressions[1:]:
+            if oe2.args.get('desc') or not isinstance(oe2.this, E.Column):
+                return None
+            n2 = oe2.this.name
+            n2m = col_map.get(n2, n2) if col_map else n2
+            if n2m not in knames and n2 not in kalias:
+                return None
     lim = wdb_sql._limit(tree)
     off = wdb_sql._offset(tree) or 0
     return {'spans': spans, 'eqs': eqs, 'flags': flags, 'ins': ins, 'likes': likes,
