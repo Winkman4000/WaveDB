@@ -269,7 +269,20 @@ def detect(seg, tree, col_map):
         return None                      # need a positive driver (= or LIKE) or a stair span
     # projections: plain key columns, aggregates, the CASE derived key, or bare * (rows mode)
     proj = tree.expressions
-    if len(proj) == 1 and isinstance(proj[0], E.Star):
+    star = len(proj) == 1 and isinstance(proj[0], E.Star)
+    plain_cols = None
+    if not star and tree.args.get('group') is None:
+        pc = []
+        for p in proj:
+            inner = p.this if isinstance(p, E.Alias) else p
+            if not isinstance(inner, E.Column):
+                pc = None; break
+            nm2 = col_map.get(inner.name, inner.name) if col_map else inner.name
+            if not P.columns_exist(seg, nm2):
+                pc = None; break
+            pc.append(nm2)
+        plain_cols = pc
+    if star or plain_cols:
         if tree.args.get('group') is not None:
             return None
         order = tree.args.get('order')
@@ -295,6 +308,7 @@ def detect(seg, tree, col_map):
         return {'spans': spans, 'eqs': eqs, 'flags': flags, 'ins': ins, 'likes': likes,
                 'drive_eq': drive_eq, 'drive_like': drive_like, 'mode': 'rows',
                 'ocol': ocol, 'tiebreak': tiebreak,
+                'out_cols': (list(col_map.values()) if col_map else None) if star else plain_cols,
                 'lim': int(lim), 'off': int(wdb_sql._offset(tree) or 0)}
     keys, aggs = [], []
     for pi, p in enumerate(proj):
@@ -546,7 +560,7 @@ def execute(seg, spec):
             sel = pos[:cut]
         else:
             sel = pos[spec['off']: spec['off'] + spec['lim']]
-        cols = list(seg.cols.keys())
+        cols = spec.get('out_cols') or list(seg.cols.keys())
         vals = []
         for cn in cols:
             c = seg.cols[cn]

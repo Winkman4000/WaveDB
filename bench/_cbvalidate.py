@@ -24,6 +24,7 @@ def total_order_sql(q):
                 'SearchEngineID,SearchPhrase,Title,TraficSourceID,URL,URLHash,UserID,WatchID,'
                 'WindowClientHeight,WindowClientWidth').split(',')
         keys = [E.Ordered(this=E.column(c)) for c in HITS]
+        t.set('expressions', [E.column(c) for c in HITS])   # explicit columns: identical order in both engines
         order = t.args.get('order')
         if order is None:
             t.set('order', E.Order(expressions=keys))
