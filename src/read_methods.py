@@ -24,6 +24,7 @@ import wdb_stair
 import wdb_blockstats
 import wdb_wherescan
 import wdb_diskpair
+import wdb_regexgroup
 import wdb_pairagg
 import wdb_scanpair
 import wdb_survgroup
@@ -78,6 +79,11 @@ blockstats = Read('blockstats',
                   lambda c: wdb_blockstats.detect(c.seg, c.tree, c.cmap),
                   lambda c, spec: wdb_blockstats.execute(c.seg, spec),
                   'whole-table aggregates from per-block statistics (disk-only)')
+
+regexgroup = Read('regexgroup',
+                  lambda c: wdb_regexgroup.detect(c.seg, c.tree, c.cmap),
+                  lambda c, spec: wdb_regexgroup.execute(c.seg, spec),
+                  'GROUP BY REGEXP_REPLACE(dict col): per-code counts + dict-level regex')
 
 wherescan = Read('wherescan',
                  lambda c: wdb_wherescan.detect(c.seg, c.tree, c.cmap),

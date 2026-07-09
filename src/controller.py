@@ -39,6 +39,7 @@ _READ_ORDER = (
     R.cube,                 # pre-materialized cube
     R.blockstats,           # whole-table aggregates from per-block stats: no row data touched
     R.stair,                # staircase column: single-key GROUP BY from step positions (no decode)
+    R.regexgroup,           # GROUP BY regex over the dict: per-code counts, V-level strings
     R.wherescan,            # conjunctive WHERE: stair spans + blocked-frame predicate scan, disk-only
     R.dict_count,           # dictionary per-code counts
     R.gridwalk,             # two-key COUNT(*) top-K via grid filled-cell + count-ordered head (opt-in)
@@ -104,6 +105,12 @@ def route_single_segment(ctx):
             rows = R.cluster_topk.execute(ctx, spec)
             if rows is not None:
                 if _PATH_SINK is not None: _PATH_SINK(ctx, R.cluster_topk.name)
+                return rows
+        spec = R.wherescan.detect(ctx)       # rows mode: WHERE + ORDER BY cluster col LIMIT k
+        if spec is not None:
+            rows = R.wherescan.execute(ctx, spec)
+            if rows is not None:
+                if _PATH_SINK is not None: _PATH_SINK(ctx, R.wherescan.name)
                 return rows
     if _PATH_SINK is not None: _PATH_SINK(ctx, 'general_scan')
     return R.general_scan(ctx)

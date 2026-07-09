@@ -24,6 +24,8 @@ import sqlglot.expressions as E
 from concurrent.futures import ThreadPoolExecutor
 import wdb_sql
 import wdb_policies as P
+import wdb_gdsidecar
+import os
 
 _ENABLED = True
 _HITS = 0
@@ -164,6 +166,58 @@ def _case_key(p, seg, col_map):
     return {'kind': 'case', 'conds': conds, 'src': src, 'default': dflt}
 
 
+def _count_distinct(p):
+    """colname for COUNT(DISTINCT col)."""
+    inner = p.this if isinstance(p, E.Alias) else p
+    if isinstance(inner, E.Count) and isinstance(inner.this, E.Distinct):
+        exprs = inner.this.expressions
+        if len(exprs) == 1 and isinstance(exprs[0], E.Column):
+            return exprs[0].name
+    return None
+
+
+def _like(node):
+    """(col, needle, negate) for `col [NOT] LIKE '%needle%'` -- contains form only."""
+    neg = False
+    n = node
+    if isinstance(n, E.Not):
+        n = n.this; neg = True
+    if not isinstance(n, E.Like) or not isinstance(n.this, E.Column):
+        return None
+    neg = neg or bool(n.args.get('negate'))      # sqlglot: NOT LIKE == Like(negate=True)
+    pat = _litval(n.expression)
+    if not isinstance(pat, str) or len(pat) < 3:
+        return None
+    if not (pat.startswith('%') and pat.endswith('%')):
+        return None
+    needle = pat[1:-1]
+    if '%' in needle or '_' in needle:
+        return None                      # only the plain contains form
+    return n.this.name, needle, neg
+
+
+def _like_flags(seg, col, needle):
+    """Boolean flag[code] = dict value contains needle. THE DICT IS THE HAYSTACK: the row data
+    is never string-compared -- all distinct values are scanned once (C-speed buffer find with
+    per-string skip), and the predicate collapses to a code-set membership test."""
+    vals = seg._typed_dict(col)
+    V = len(vals)
+    bs = [v if isinstance(v, (bytes, bytearray)) else
+          (v.encode() if isinstance(v, str) else bytes(v)) for v in vals]
+    lens = np.fromiter((len(v) for v in bs), np.int64, V)
+    offs = np.zeros(V + 1, np.int64); np.cumsum(lens, out=offs[1:])
+    hay = b''.join(bs)
+    nd = needle.encode() if isinstance(needle, str) else needle
+    flag = np.zeros(V, bool)
+    pos = hay.find(nd)
+    while pos >= 0:
+        i = int(np.searchsorted(offs, pos, side='right')) - 1
+        if pos + len(nd) <= offs[i + 1]:
+            flag[i] = True
+        pos = hay.find(nd, int(offs[i + 1]))     # skip the rest of this string either way
+    return flag
+
+
 def detect(seg, tree, col_map):
     if not _ENABLED:                    return None
     if not P.no_joins(tree):            return None
@@ -173,18 +227,27 @@ def detect(seg, tree, col_map):
     where = tree.args.get('where')
     if where is None:
         return None
-    spans, eqs, flags, ins = [], [], [], []
+    spans, eqs, flags, ins, likes = [], [], [], [], []
     for cn in _conjuncts(where.this):
         cl = _col_lit(cn)
         if cl is None:
             il = _in_list(cn)
-            if il is None:
+            if il is not None:
+                col = col_map.get(il[0], il[0]) if col_map else il[0]
+                if not P.columns_exist(seg, col):   return None
+                if seg._effective(col) is not None: return None
+                if seg.cols[col].get('mode') not in (0, 1, 2, 4): return None
+                ins.append((col, il[1]))
+                continue
+            lk = _like(cn)
+            if lk is None:
                 return None
-            col = col_map.get(il[0], il[0]) if col_map else il[0]
+            col = col_map.get(lk[0], lk[0]) if col_map else lk[0]
             if not P.columns_exist(seg, col):   return None
             if seg._effective(col) is not None: return None
-            if seg.cols[col].get('mode') not in (0, 1, 2, 4): return None
-            ins.append((col, il[1]))
+            if seg.cols[col].get('mode') not in (0, 1):
+                return None              # substring haystack needs a string dict
+            likes.append((col, lk[1], lk[2]))
             continue
         col = col_map.get(cl[0], cl[0]) if col_map else cl[0]
         if not P.columns_exist(seg, col):   return None
@@ -198,22 +261,49 @@ def detect(seg, tree, col_map):
             eqs.append((col, cl[1], cl[2]))
         else:
             return None
-    if not eqs and not spans:
+    if not eqs and not spans and not likes:
         return None                      # unselective flag-only shapes stay with the scan family
-    if eqs and eqs[0][2] != '=':
-        return None                      # the driving scan predicate must be an equality
-    # projections: plain key columns, COUNT(*)/SUM/AVG aggregates, or the CASE derived key
+    drive_eq = next((i for i, e in enumerate(eqs) if e[2] == '='), None)
+    drive_like = next((i for i, l in enumerate(likes) if not l[2]), None)
+    if drive_eq is None and drive_like is None and not spans:
+        return None                      # need a positive driver (= or LIKE) or a stair span
+    # projections: plain key columns, aggregates, the CASE derived key, or bare * (rows mode)
     proj = tree.expressions
+    if len(proj) == 1 and isinstance(proj[0], E.Star):
+        if tree.args.get('group') is not None:
+            return None
+        order = tree.args.get('order')
+        if order is None or len(order.expressions) != 1:
+            return None
+        oe = order.expressions[0]
+        ocol = oe.this.name if isinstance(oe.this, E.Column) else None
+        ocol = col_map.get(ocol, ocol) if (col_map and ocol) else ocol
+        if ocol is None or oe.args.get('desc') or seg.stairs(ocol) is None:
+            return None                  # rows mode rides the cluster order: ASC on a stair column
+        lim = wdb_sql._limit(tree)
+        if lim is None or lim <= 0 or lim > 100000:
+            return None
+        return {'spans': spans, 'eqs': eqs, 'flags': flags, 'ins': ins, 'likes': likes,
+                'drive_eq': drive_eq, 'drive_like': drive_like, 'mode': 'rows',
+                'lim': int(lim), 'off': int(wdb_sql._offset(tree) or 0)}
     keys, aggs = [], []
     for pi, p in enumerate(proj):
+        cd = _count_distinct(p)
+        if cd is not None:
+            col = col_map.get(cd, cd) if col_map else cd
+            if not P.columns_exist(seg, col):   return None
+            if seg.cols[col].get('mode') not in (0, 1, 2): return None
+            aggs.append((pi, 'COUNT_D', col, )); continue
         ak = wdb_sql._agg_kind(p)
         if ak is not None:
             if ak[0] == 'COUNT_STAR':
                 aggs.append((pi, 'COUNT_STAR', None)); continue
-            if ak[0] not in ('SUM', 'AVG') or not isinstance(ak[1], str):
+            if ak[0] not in ('SUM', 'AVG', 'MIN') or not isinstance(ak[1], str):
                 return None
             col = col_map.get(ak[1], ak[1]) if col_map else ak[1]
             if not P.columns_exist(seg, col):   return None
+            if ak[0] == 'MIN' and seg.cols[col].get('mode') in (0, 1, 2):
+                aggs.append((pi, 'MIN_DICT', col)); continue
             if seg.cols[col].get('dt') != 0:    return None
             aggs.append((pi, ak[0], col)); continue
         ck = _case_key(p, seg, col_map)
@@ -231,6 +321,13 @@ def detect(seg, tree, col_map):
         return None
     if group is not None and len(group.expressions) != len(keys):
         return None                      # every key projection must be grouped (and vice versa)
+    # resident structures outrank the scan: a gd sidecar serving this exact
+    # (group key, COUNT DISTINCT target) shape keeps the query (doctrine: min(point, pop))
+    if len(keys) == 1 and keys[0][1].get('kind') == 'col':
+        for a in aggs:
+            if a[1] == 'COUNT_D' and os.path.exists(
+                    wdb_gdsidecar.sidecar_path(seg.path, keys[0][1]['src'], a[2])):
+                return None
     order = tree.args.get('order')
     if order is not None:
         if len(order.expressions) != 1 or not order.expressions[0].args.get('desc'):
@@ -244,8 +341,10 @@ def detect(seg, tree, col_map):
             return None
     lim = wdb_sql._limit(tree)
     off = wdb_sql._offset(tree) or 0
-    return {'spans': spans, 'eqs': eqs, 'flags': flags, 'ins': ins, 'keys': keys, 'aggs': aggs,
-            'proj': proj, 'ordered': order is not None, 'lim': lim, 'off': int(off)}
+    return {'spans': spans, 'eqs': eqs, 'flags': flags, 'ins': ins, 'likes': likes,
+            'drive_eq': drive_eq, 'drive_like': drive_like, 'mode': 'group',
+            'keys': keys, 'aggs': aggs, 'proj': proj, 'ordered': order is not None,
+            'lim': lim, 'off': int(off)}
 
 # ---------------------------------------------------------------- execution
 def _bound_code(seg, col, val, side):
@@ -338,28 +437,62 @@ def _scan_eq(seg, col, code, lo, hi, negate=False):
     h = np.nonzero(cc != code)[0] if negate else np.nonzero(cc == code)[0]
     return h + lo
 
+def _scan_flag(seg, col, flag, lo, hi):
+    """Positions in [lo, hi) where flag[code] is set -- the LIKE frame scan: parallel enc=3
+    decompress, one fancy-index per frame; the substring test happened once, in the dict."""
+    c = seg.cols[col]
+    if c.get('code_enc', 0) == 3 and col not in seg._codes:
+        wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
+        BR = c['BR']; base = c['cstart']; bo = c['boffs']; buf = seg.buf
+        j0, j1 = lo // BR, (hi - 1) // BR + 1
+        def scan(js):
+            import zstandard as zstd
+            dz = zstd.ZstdDecompressor(); out = []
+            for j in js:
+                raw = np.frombuffer(dz.decompress(buf[base+int(bo[j]):base+int(bo[j+1])].tobytes()), dtype=wdt)
+                a, b = max(lo, j*BR), min(hi, j*BR + raw.size)
+                h = np.nonzero(flag[raw[a-j*BR:b-j*BR]])[0]
+                if h.size: out.append(h + a)
+            return np.concatenate(out) if out else np.empty(0, np.int64)
+        W = min(_SCAN_THREADS, max(1, j1 - j0))
+        with ThreadPoolExecutor(W) as ex:
+            parts = list(ex.map(scan, np.array_split(np.arange(j0, j1), W)))
+        parts = [p for p in parts if p.size]
+        return np.concatenate(parts) if parts else np.empty(0, np.int64)
+    cc = np.asarray(seg._raw_codes_range(col, lo, hi))
+    return np.nonzero(flag[cc])[0] + lo
+
+
 def execute(seg, spec):
     global _HITS
     lo, hi = _span_rows(seg, spec['spans'])
+    likes = spec.get('likes', [])
+    lflags = [(col, _like_flags(seg, col, needle), neg) for col, needle, neg in likes] if likes else []
+    de, dl = spec.get('drive_eq'), spec.get('drive_like')
     if hi <= lo:
         pos = np.empty(0, np.int64)
-    elif spec['eqs']:
-        col, val, _op = spec['eqs'][0]
+    elif de is not None:
+        col, val, _op = spec['eqs'][de]
         code = _code_of(seg, col, val)
-        if code is None:
-            pos = np.empty(0, np.int64)
-        else:
-            pos = _scan_eq(seg, col, int(code), lo, hi)
-        for col, val, op in spec['eqs'][1:]:
-            if pos.size == 0: break
-            code = _code_of(seg, col, val)
-            if code is None:
-                if op == '=': pos = np.empty(0, np.int64)
-                continue
-            cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
-            pos = pos[cc != code] if op == '<>' else pos[cc == code]
+        pos = _scan_eq(seg, col, int(code), lo, hi) if code is not None else np.empty(0, np.int64)
+    elif dl is not None:
+        col, fl, _n = lflags[dl]
+        pos = _scan_flag(seg, col, fl, lo, hi)
     else:
         pos = np.arange(lo, hi, dtype=np.int64)
+    for i, (col, val, op) in enumerate(spec['eqs']):
+        if i == de or pos.size == 0: continue
+        code = _code_of(seg, col, val)
+        if code is None:
+            if op == '=': pos = np.empty(0, np.int64)
+            continue
+        cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
+        pos = pos[cc != code] if op == '<>' else pos[cc == code]
+    for i, (col, fl, neg) in enumerate(lflags):
+        if i == dl or pos.size == 0: continue
+        cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
+        m = fl[cc]
+        pos = pos[~m] if neg else pos[m]
     for col, vals in spec.get('ins', ()):
         if pos.size == 0: break
         c = seg.cols[col]
@@ -379,6 +512,22 @@ def execute(seg, spec):
         vv = np.asarray(seg._seq_decode(seg.cols[col]))[pos]
         pos = pos[vv != val] if op == '<>' else pos[vv == val]
 
+    # ---- rows mode: SELECT * ordered by the cluster column -- positions ARE the order
+    if spec.get('mode') == 'rows':
+        sel = pos[spec['off']: spec['off'] + spec['lim']]
+        cols = list(seg.cols.keys())
+        vals = []
+        for cn in cols:
+            c = seg.cols[cn]
+            if c['mode'] == 4:
+                vals.append(np.asarray(seg._seq_decode(c))[sel])
+            else:
+                cc = np.asarray(seg.codes_at(cn, sel)).astype(np.int64)
+                vals.append([wdb_sql._pyval(seg.fetch(cn, int(k))) for k in cc])
+        out = [tuple(vals[ci][ri] for ci in range(len(cols))) for ri in range(sel.size)]
+        _HITS += 1
+        return out, cols
+
     # ---- aggregates only (no GROUP BY)
     if not spec['keys']:
         row = []
@@ -388,6 +537,12 @@ def execute(seg, spec):
             if pos.size == 0:
                 row.append(None); continue
             c = seg.cols[col]
+            if kind == 'MIN_DICT':
+                cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
+                row.append(wdb_sql._pyval(seg.fetch(col, int(cc.min())))); continue
+            if kind == 'COUNT_D':
+                cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
+                row.append(int(np.unique(cc).size)); continue
             if c['mode'] == 4:
                 v = np.asarray(seg._seq_decode(c))[pos]
             else:
@@ -448,6 +603,14 @@ def execute(seg, spec):
                 _t, kind, col = kind_or_key
                 if kind == 'COUNT_STAR':
                     row.append(int(cnt[gi]))
+                elif kind == 'MIN_DICT':
+                    grows = pos[ginv == gi]
+                    cc2 = np.asarray(seg.codes_at(col, grows)).astype(np.int64)
+                    row.append(wdb_sql._pyval(seg.fetch(col, int(cc2.min()))))
+                elif kind == 'COUNT_D':
+                    grows = pos[ginv == gi]
+                    cc2 = np.asarray(seg.codes_at(col, grows)).astype(np.int64)
+                    row.append(int(np.unique(cc2).size))
                 else:
                     c = seg.cols[col]
                     grows = pos[ginv == gi]
