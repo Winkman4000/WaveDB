@@ -166,18 +166,24 @@ def execute(seg, spec):
     col = spec['col']
     counts = _code_counts(seg, col)
     vals = seg._typed_dict(col)
-    sv = pd.Series([v.decode('utf-8', 'replace') if isinstance(v, (bytes, bytearray)) else str(v)
-                    for v in vals])
-    lens = sv.str.len().to_numpy(np.int64)
+    # stay in BYTES end to end: no per-value decode (measured 15.7 s on 19.7M Referers);
+    # compiled bytes regex; only the surviving group labels ever become str
+    bs = [v if isinstance(v, (bytes, bytearray)) else str(v).encode() for v in vals]
+    lens = np.fromiter((len(v) for v in bs), np.int64, len(bs))
+    # duck's length() counts CHARACTERS: char len = byte len - UTF-8 continuation bytes,
+    # counted in one vectorized pass over the joined buffer (no per-value decode)
+    offs = np.zeros(len(bs) + 1, np.int64); np.cumsum(lens, out=offs[1:])
+    cont = (np.frombuffer(b''.join(bs), dtype=np.uint8) & 0xC0) == 0x80
+    cs = np.zeros(offs[-1] + 1, np.int64); np.cumsum(cont, out=cs[1:])
+    lens = lens - (cs[offs[1:]] - cs[offs[:-1]])
     empty_code = None
-    try:
-        e = np.nonzero((lens == 0))[0]
-        if e.size:
-            empty_code = int(e[0])
-    except Exception:
-        pass
-    labels = sv.str.replace(spec['pat'], spec['rep'], regex=True)
-    lab_ids, uniq = pd.factorize(labels, sort=False)
+    e = np.nonzero(lens == 0)[0]
+    if e.size:
+        empty_code = int(e[0])
+    rx = re.compile(spec['pat'].encode())
+    rep = spec['rep'].encode().replace(b'\\1', b'\\1')
+    labels = [rx.sub(rep, v) for v in bs]
+    lab_ids, uniq = pd.factorize(np.array(labels, dtype=object), sort=False)
     G = len(uniq)
     w = counts.astype(np.int64)
     if empty_code is not None:
@@ -191,7 +197,9 @@ def execute(seg, spec):
     keep = keep[gcnt[keep] > 0]
     rows = []
     for g in keep:
-        rows.append((str(uniq[g]), float(glen[g]) / gcnt[g], int(gcnt[g]), int(min_code[g])))
+        lab = uniq[g]
+        lab = lab.decode('utf-8', 'replace') if isinstance(lab, (bytes, bytearray)) else str(lab)
+        rows.append((lab, float(glen[g]) / gcnt[g], int(gcnt[g]), int(min_code[g])))
     osel = spec['osel']
     if osel is not None:
         kind = 'K' if osel == spec['rk_pi'] else spec['aggs'][osel][0]
