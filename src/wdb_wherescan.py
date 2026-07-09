@@ -199,7 +199,12 @@ def _like(node):
 def _like_flags(seg, col, needle):
     """Boolean flag[code] = dict value contains needle. THE DICT IS THE HAYSTACK: the row data
     is never string-compared -- all distinct values are scanned once (C-speed buffer find with
-    per-string skip), and the predicate collapses to a code-set membership test."""
+    per-string skip), and the predicate collapses to a code-set membership test. Memoized for
+    the process lifetime (transient; dies with the worker -- not a persisted structure)."""
+    memo = seg.__dict__.setdefault('_ws_like_memo', {})
+    mk = (col, needle)
+    if mk in memo:
+        return memo[mk]
     vals = seg._typed_dict(col)
     V = len(vals)
     bs = [v if isinstance(v, (bytes, bytearray)) else
@@ -215,6 +220,7 @@ def _like_flags(seg, col, needle):
         if pos + len(nd) <= offs[i + 1]:
             flag[i] = True
         pos = hay.find(nd, int(offs[i + 1]))     # skip the rest of this string either way
+    memo[mk] = flag
     return flag
 
 
@@ -565,7 +571,7 @@ def execute(seg, spec):
         for cn in cols:
             c = seg.cols[cn]
             if c['mode'] == 4:
-                vals.append(np.asarray(seg._seq_decode(c))[sel])
+                vals.append([int(x) for x in np.asarray(seg._seq_decode(c))[sel]])
             else:
                 cc = np.asarray(seg.codes_at(cn, sel)).astype(np.int64)
                 vals.append([wdb_sql._pyval(seg.fetch(cn, int(k))) for k in cc])
