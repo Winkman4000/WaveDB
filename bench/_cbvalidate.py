@@ -18,8 +18,18 @@ def total_order_sql(q):
     if not isinstance(t, E.Select):
         return None
     projs = t.expressions
-    if any(isinstance(p, E.Star) for p in projs):   # bare `SELECT *` (NOT COUNT(*), whose star is nested)
-        return None
+    if any(isinstance(p, E.Star) for p in projs):   # bare `SELECT *`: tiebreak on the full hits schema
+        HITS = ('AdvEngineID,ClientIP,CounterID,DontCountHits,EventDate,EventTime,IsDownload,IsLink,'
+                'IsRefresh,MobilePhone,MobilePhoneModel,Referer,RefererHash,RegionID,ResolutionWidth,'
+                'SearchEngineID,SearchPhrase,Title,TraficSourceID,URL,URLHash,UserID,WatchID,'
+                'WindowClientHeight,WindowClientWidth').split(',')
+        keys = [E.Ordered(this=E.column(c)) for c in HITS]
+        order = t.args.get('order')
+        if order is None:
+            t.set('order', E.Order(expressions=keys))
+        else:
+            order.set('expressions', list(order.expressions) + keys)
+        return t.sql()
     keys = []
     for p in projs:
         e = p.this if isinstance(p, E.Alias) else p

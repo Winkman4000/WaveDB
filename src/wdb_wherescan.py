@@ -273,18 +273,28 @@ def detect(seg, tree, col_map):
         if tree.args.get('group') is not None:
             return None
         order = tree.args.get('order')
-        if order is None or len(order.expressions) != 1:
+        if order is None or not order.expressions:
             return None
         oe = order.expressions[0]
         ocol = oe.this.name if isinstance(oe.this, E.Column) else None
         ocol = col_map.get(ocol, ocol) if (col_map and ocol) else ocol
         if ocol is None or oe.args.get('desc') or seg.stairs(ocol) is None:
             return None                  # rows mode rides the cluster order: ASC on a stair column
+        tiebreak = []
+        for oe2 in order.expressions[1:]:
+            if oe2.args.get('desc') or not isinstance(oe2.this, E.Column):
+                return None
+            tc = oe2.this.name
+            tc = col_map.get(tc, tc) if col_map else tc
+            if not P.columns_exist(seg, tc):
+                return None
+            tiebreak.append(tc)
         lim = wdb_sql._limit(tree)
         if lim is None or lim <= 0 or lim > 100000:
             return None
         return {'spans': spans, 'eqs': eqs, 'flags': flags, 'ins': ins, 'likes': likes,
                 'drive_eq': drive_eq, 'drive_like': drive_like, 'mode': 'rows',
+                'ocol': ocol, 'tiebreak': tiebreak,
                 'lim': int(lim), 'off': int(wdb_sql._offset(tree) or 0)}
     keys, aggs = [], []
     for pi, p in enumerate(proj):
@@ -322,8 +332,9 @@ def detect(seg, tree, col_map):
     if group is not None and len(group.expressions) != len(keys):
         return None                      # every key projection must be grouped (and vice versa)
     # resident structures outrank the scan: a gd sidecar serving this exact
-    # (group key, COUNT DISTINCT target) shape keeps the query (doctrine: min(point, pop))
-    if len(keys) == 1 and keys[0][1].get('kind') == 'col':
+    # (group key, COUNT DISTINCT target) shape keeps the query (doctrine: min(point, pop)).
+    # LIKE conjuncts disqualify the sidecar (it can only filter eq/in shapes), so no defer.
+    if not likes and len(keys) == 1 and keys[0][1].get('kind') == 'col':
         for a in aggs:
             if a[1] == 'COUNT_D' and os.path.exists(
                     wdb_gdsidecar.sidecar_path(seg.path, keys[0][1]['src'], a[2])):
@@ -514,7 +525,16 @@ def execute(seg, spec):
 
     # ---- rows mode: SELECT * ordered by the cluster column -- positions ARE the order
     if spec.get('mode') == 'rows':
-        sel = pos[spec['off']: spec['off'] + spec['lim']]
+        K = spec['off'] + spec['lim']
+        if spec.get('tiebreak') and pos.size > K:
+            # total order: extend to the full plateau of the K-th row's cluster value,
+            # decode, sort by the complete ORDER BY column list, then slice
+            oc = np.asarray(seg.codes_at(spec['ocol'], pos)).astype(np.int64)
+            kc = oc[K - 1]
+            cut = int(np.searchsorted(oc, kc, side='right'))
+            sel = pos[:cut]
+        else:
+            sel = pos[spec['off']: spec['off'] + spec['lim']]
         cols = list(seg.cols.keys())
         vals = []
         for cn in cols:
@@ -525,6 +545,10 @@ def execute(seg, spec):
                 cc = np.asarray(seg.codes_at(cn, sel)).astype(np.int64)
                 vals.append([wdb_sql._pyval(seg.fetch(cn, int(k))) for k in cc])
         out = [tuple(vals[ci][ri] for ci in range(len(cols))) for ri in range(sel.size)]
+        if spec.get('tiebreak') and len(out) > spec['lim']:
+            oi = [cols.index(spec['ocol'])] + [cols.index(c) for c in spec['tiebreak']]
+            out.sort(key=lambda r: tuple(('' if r[i] is None else r[i]) for i in oi))
+            out = out[spec['off']: spec['off'] + spec['lim']]
         _HITS += 1
         return out, cols
 
