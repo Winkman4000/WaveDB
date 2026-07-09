@@ -17,6 +17,15 @@ from concurrent.futures import ThreadPoolExecutor
 import wdb_sql
 import wdb_policies as P
 
+_FORK_BS = None
+_FORK_RX = None
+_FORK_REP = None
+
+
+def _fork_chunk(se):
+    rx = re.compile(_FORK_RX)
+    return [rx.sub(_FORK_REP, v) for v in _FORK_BS[se[0]:se[1]]]
+
 _ENABLED = True
 _HITS = 0
 _SCAN_THREADS = 14
@@ -192,9 +201,19 @@ def _derive(seg, col, spec):
     e = np.nonzero(lens == 0)[0]
     if e.size:
         empty_code = int(e[0])
-    rx = re.compile(spec['pat'].encode())
-    rep = spec['rep'].encode().replace(b'\\1', b'\\1')
-    labels = [rx.sub(rep, v) for v in bs]
+    global _FORK_BS, _FORK_RX, _FORK_REP
+    _FORK_BS, _FORK_RX, _FORK_REP = bs, spec['pat'].encode(), spec['rep'].encode()
+    try:
+        import multiprocessing as mp
+        with mp.get_context('fork').Pool(6) as pool:      # COW: children inherit bs, no copy in
+            V2 = len(bs); step = (V2 + 5) // 6
+            parts = pool.map(_fork_chunk, [(i, min(V2, i + step)) for i in range(0, V2, step)])
+        labels = [x for part in parts for x in part]
+    except Exception:
+        rx = re.compile(_FORK_RX)
+        labels = [rx.sub(_FORK_REP, v) for v in bs]
+    finally:
+        _FORK_BS = None
     lab_ids, uniq = pd.factorize(np.array(labels, dtype=object), sort=False)
     return counts, lens, lab_ids, uniq, empty_code
 
