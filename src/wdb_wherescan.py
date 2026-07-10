@@ -125,7 +125,10 @@ def _col_lit(node):
 
 
 def _in_list(node):
-    """(colname, [literals]) for `col IN (lit, ...)` -- every member must be a literal."""
+    """(colname, [literals], negate) for `col [NOT] IN (lit, ...)`."""
+    neg = False
+    if isinstance(node, E.Not):
+        node = node.this; neg = True
     if not isinstance(node, E.In) or not isinstance(node.this, E.Column):
         return None
     vals = []
@@ -134,7 +137,7 @@ def _in_list(node):
         if v is None:
             return None
         vals.append(v)
-    return node.this.name, vals
+    return node.this.name, vals, neg
 
 def _case_key(p, seg, col_map):
     """The Q39 pattern: CASE WHEN <conj of col = int-literal> THEN <column> ELSE <literal>."""
@@ -177,7 +180,8 @@ def _count_distinct(p):
 
 
 def _like(node):
-    """(col, needle, negate) for `col [NOT] LIKE '%needle%'` -- contains form only."""
+    """(col, needle, kind, negate) for `col [NOT] LIKE pat` -- kinds: contains '%x%',
+    prefix 'x%', suffix '%x'. No interior wildcards."""
     neg = False
     n = node
     if isinstance(n, E.Not):
@@ -186,23 +190,28 @@ def _like(node):
         return None
     neg = neg or bool(n.args.get('negate'))      # sqlglot: NOT LIKE == Like(negate=True)
     pat = _litval(n.expression)
-    if not isinstance(pat, str) or len(pat) < 3:
+    if not isinstance(pat, str) or len(pat) < 2:
         return None
-    if not (pat.startswith('%') and pat.endswith('%')):
+    if pat.startswith('%') and pat.endswith('%'):
+        needle, kind = pat[1:-1], 'contains'
+    elif pat.endswith('%'):
+        needle, kind = pat[:-1], 'prefix'
+    elif pat.startswith('%'):
+        needle, kind = pat[1:], 'suffix'
+    else:
         return None
-    needle = pat[1:-1]
-    if '%' in needle or '_' in needle:
-        return None                      # only the plain contains form
-    return n.this.name, needle, neg
+    if not needle or '%' in needle or '_' in needle:
+        return None
+    return n.this.name, needle, kind, neg
 
 
-def _like_flags(seg, col, needle):
+def _like_flags(seg, col, needle, kind='contains'):
     """Boolean flag[code] = dict value contains needle. THE DICT IS THE HAYSTACK: the row data
     is never string-compared -- all distinct values are scanned once (C-speed buffer find with
     per-string skip), and the predicate collapses to a code-set membership test. Memoized for
     the process lifetime (transient; dies with the worker -- not a persisted structure)."""
     memo = seg.__dict__.setdefault('_ws_like_memo', {})
-    mk = (col, needle)
+    mk = (col, needle, kind)
     if mk in memo:
         return memo[mk]
     vals = seg._typed_dict(col)
@@ -214,12 +223,31 @@ def _like_flags(seg, col, needle):
     hay = b''.join(bs)
     nd = needle.encode() if isinstance(needle, str) else needle
     flag = np.zeros(V, bool)
-    pos = hay.find(nd)
-    while pos >= 0:
-        i = int(np.searchsorted(offs, pos, side='right')) - 1
-        if pos + len(nd) <= offs[i + 1]:
-            flag[i] = True
-        pos = hay.find(nd, int(offs[i + 1]))     # skip the rest of this string either way
+    if kind == 'prefix':
+        # value-sorted dict: a prefix is a contiguous code range -- two bisects, no scan
+        lo = _bound_code(seg, col, nd, 'left')
+        up = nd.rstrip(b'\xff')
+        hi = V if not up else _bound_code(seg, col, up[:-1] + bytes([up[-1] + 1]), 'left')
+        if lo is not None and hi is not None:
+            flag[lo:hi] = True
+    elif kind == 'suffix':
+        # end-anchored: every occurrence checked (no per-string skip -- a mid-string hit
+        # must not shadow a real end hit)
+        pos = hay.find(nd)
+        while pos >= 0:
+            i = int(np.searchsorted(offs, pos, side='right')) - 1
+            if pos + len(nd) == offs[i + 1]:
+                flag[i] = True
+                pos = hay.find(nd, int(offs[i + 1]))
+            else:
+                pos = hay.find(nd, pos + 1)
+    else:
+        pos = hay.find(nd)
+        while pos >= 0:
+            i = int(np.searchsorted(offs, pos, side='right')) - 1
+            if pos + len(nd) <= offs[i + 1]:
+                flag[i] = True
+            pos = hay.find(nd, int(offs[i + 1]))     # skip the rest of this string either way
     memo[mk] = flag
     return flag
 
@@ -233,8 +261,32 @@ def detect(seg, tree, col_map):
     where = tree.args.get('where')
     if where is None:
         return None
-    spans, eqs, flags, ins, likes = [], [], [], [], []
+    spans, eqs, flags, ins, likes, nulls = [], [], [], [], [], []
+    conjs = []
     for cn in _conjuncts(where.this):
+        if isinstance(cn, E.Between):            # sugar: col >= low AND col <= high
+            if not isinstance(cn.this, E.Column):
+                return None
+            conjs.append(E.GTE(this=cn.this.copy(), expression=cn.args['low']))
+            conjs.append(E.LTE(this=cn.this.copy(), expression=cn.args['high']))
+        else:
+            conjs.append(cn)
+    for cn in conjs:
+        isn = cn
+        want_null = None
+        if isinstance(isn, E.Not) and isinstance(isn.this, E.Is):
+            isn = isn.this; want_null = False
+        elif isinstance(isn, E.Is):
+            want_null = True
+        if want_null is not None:
+            if not isinstance(isn.this, E.Column) or not isinstance(isn.expression, E.Null):
+                return None
+            col = col_map.get(isn.this.name, isn.this.name) if col_map else isn.this.name
+            if not P.columns_exist(seg, col):   return None
+            if seg._effective(col) is not None: return None
+            if seg.cols[col].get('mode') not in (0, 1, 2, 4): return None
+            nulls.append((col, want_null))
+            continue
         cl = _col_lit(cn)
         if cl is None:
             il = _in_list(cn)
@@ -243,7 +295,7 @@ def detect(seg, tree, col_map):
                 if not P.columns_exist(seg, col):   return None
                 if seg._effective(col) is not None: return None
                 if seg.cols[col].get('mode') not in (0, 1, 2, 4): return None
-                ins.append((col, il[1]))
+                ins.append((col, il[1], il[2]))
                 continue
             lk = _like(cn)
             if lk is None:
@@ -253,7 +305,7 @@ def detect(seg, tree, col_map):
             if seg._effective(col) is not None: return None
             if seg.cols[col].get('mode') not in (0, 1):
                 return None              # substring haystack needs a string dict
-            likes.append((col, lk[1], lk[2]))
+            likes.append((col, lk[1], lk[2], lk[3]))
             continue
         col = col_map.get(cl[0], cl[0]) if col_map else cl[0]
         if not P.columns_exist(seg, col):   return None
@@ -270,7 +322,7 @@ def detect(seg, tree, col_map):
     if not eqs and not spans and not likes:
         return None                      # unselective flag-only shapes stay with the scan family
     drive_eq = next((i for i, e in enumerate(eqs) if e[2] == '='), None)
-    drive_like = next((i for i, l in enumerate(likes) if not l[2]), None)
+    drive_like = next((i for i, l in enumerate(likes) if not l[3]), None)
     if drive_eq is None and drive_like is None and not spans:
         return None                      # need a positive driver (= or LIKE) or a stair span
     # projections: plain key columns, aggregates, the CASE derived key, or bare * (rows mode)
@@ -312,7 +364,7 @@ def detect(seg, tree, col_map):
         if lim is None or lim <= 0 or lim > 100000:
             return None
         return {'spans': spans, 'eqs': eqs, 'flags': flags, 'ins': ins, 'likes': likes,
-                'drive_eq': drive_eq, 'drive_like': drive_like, 'mode': 'rows',
+                'nulls': nulls, 'drive_eq': drive_eq, 'drive_like': drive_like, 'mode': 'rows',
                 'ocol': ocol, 'tiebreak': tiebreak,
                 'out_cols': (list(col_map.values()) if col_map else None) if star else plain_cols,
                 'lim': int(lim), 'off': int(wdb_sql._offset(tree) or 0)}
@@ -328,6 +380,11 @@ def detect(seg, tree, col_map):
         if ak is not None:
             if ak[0] == 'COUNT_STAR':
                 aggs.append((pi, 'COUNT_STAR', None)); continue
+            if ak[0] == 'COUNT' and len(ak) > 1 and isinstance(ak[1], str):
+                col = col_map.get(ak[1], ak[1]) if col_map else ak[1]
+                if not P.columns_exist(seg, col):   return None
+                if seg.cols[col].get('mode') not in (0, 1, 2, 4): return None
+                aggs.append((pi, 'COUNT_COL', col)); continue
             if ak[0] not in ('SUM', 'AVG', 'MIN') or not isinstance(ak[1], str):
                 return None
             col = col_map.get(ak[1], ak[1]) if col_map else ak[1]
@@ -368,7 +425,11 @@ def detect(seg, tree, col_map):
         if not cnt_idx:
             return None
         tgt = onm.name if isinstance(onm, E.Column) else None
-        if tgt is None or tgt not in (wdb_sql._alias(proj[cnt_idx[0]]), 'COUNT', 'count'):
+        if tgt is None:
+            ak2 = wdb_sql._agg_kind(onm)
+            if ak2 is None or ak2[0] != 'COUNT_STAR':
+                return None
+        elif tgt not in (wdb_sql._alias(proj[cnt_idx[0]]), 'COUNT', 'count'):
             return None
         # trailing ASC key columns (the validator's total-order tiebreak) are exactly the
         # canonical emission order (count desc, composite asc = value asc) -- accept them
@@ -384,7 +445,7 @@ def detect(seg, tree, col_map):
     lim = wdb_sql._limit(tree)
     off = wdb_sql._offset(tree) or 0
     return {'spans': spans, 'eqs': eqs, 'flags': flags, 'ins': ins, 'likes': likes,
-            'drive_eq': drive_eq, 'drive_like': drive_like, 'mode': 'group',
+            'nulls': nulls, 'drive_eq': drive_eq, 'drive_like': drive_like, 'mode': 'group',
             'keys': keys, 'aggs': aggs, 'proj': proj, 'ordered': order is not None,
             'lim': lim, 'off': int(off)}
 
@@ -509,7 +570,7 @@ def execute(seg, spec):
     global _HITS
     lo, hi = _span_rows(seg, spec['spans'])
     likes = spec.get('likes', [])
-    lflags = [(col, _like_flags(seg, col, needle), neg) for col, needle, neg in likes] if likes else []
+    lflags = [(col, _like_flags(seg, col, needle, kind), neg) for col, needle, kind, neg in likes] if likes else []
     de, dl = spec.get('drive_eq'), spec.get('drive_like')
     if hi <= lo:
         pos = np.empty(0, np.int64)
@@ -535,20 +596,34 @@ def execute(seg, spec):
         cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
         m = fl[cc]
         pos = pos[~m] if neg else pos[m]
-    for col, vals in spec.get('ins', ()):
+    for col, vals, ineg in spec.get('ins', ()):
         if pos.size == 0: break
         c = seg.cols[col]
         if c['mode'] == 4:
             want = np.array([int(v) for v in vals], dtype=np.int64)
             vv = np.asarray(seg._seq_decode(c))[pos]
-            pos = pos[np.isin(vv, want)]
+            m = np.isin(vv, want)
+            pos = pos[~m] if ineg else pos[m]
         else:
             codes = [_code_of(seg, col, v) for v in vals]
             codes = np.array([k for k in codes if k is not None], dtype=np.int64)
             if codes.size == 0:
-                pos = np.empty(0, np.int64); break
+                if not ineg:
+                    pos = np.empty(0, np.int64); break
+                continue
             cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
-            pos = pos[np.isin(cc, codes)]
+            m = np.isin(cc, codes)
+            pos = pos[~m] if ineg else pos[m]
+    for col, want_null in spec.get('nulls', ()):
+        if pos.size == 0: break
+        c = seg.cols[col]
+        if c['mode'] == 4 or not c.get('has_null'):
+            if want_null:
+                pos = np.empty(0, np.int64)      # column carries no nulls
+            continue
+        nc = int(c['V']) - 1
+        cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
+        pos = pos[cc == nc] if want_null else pos[cc != nc]
     for col, val, op in spec['flags']:
         if pos.size == 0: break
         vv = np.asarray(seg._seq_decode(seg.cols[col]))[pos]
@@ -592,6 +667,12 @@ def execute(seg, spec):
             if pos.size == 0:
                 row.append(None); continue
             c = seg.cols[col]
+            if kind == 'COUNT_COL':
+                c2 = seg.cols[col]
+                if c2['mode'] == 4 or not c2.get('has_null'):
+                    row.append(int(pos.size)); continue
+                cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
+                row.append(int((cc != int(c2['V']) - 1).sum())); continue
             if kind == 'MIN_DICT':
                 cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
                 row.append(wdb_sql._pyval(seg.fetch(col, int(cc.min())))); continue
@@ -658,6 +739,14 @@ def execute(seg, spec):
                 _t, kind, col = kind_or_key
                 if kind == 'COUNT_STAR':
                     row.append(int(cnt[gi]))
+                elif kind == 'COUNT_COL':
+                    c2 = seg.cols[col]
+                    grows = pos[ginv == gi]
+                    if c2['mode'] == 4 or not c2.get('has_null'):
+                        row.append(int(grows.size))
+                    else:
+                        cc2 = np.asarray(seg.codes_at(col, grows)).astype(np.int64)
+                        row.append(int((cc2 != int(c2['V']) - 1).sum()))
                 elif kind == 'MIN_DICT':
                     grows = pos[ginv == gi]
                     cc2 = np.asarray(seg.codes_at(col, grows)).astype(np.int64)
