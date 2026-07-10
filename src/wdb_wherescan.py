@@ -252,6 +252,67 @@ def _like_flags(seg, col, needle, kind='contains'):
     return flag
 
 
+def _disjuncts(node):
+    if isinstance(node, E.Or):
+        return _disjuncts(node.this) + _disjuncts(node.expression)
+    if isinstance(node, E.Paren):
+        return _disjuncts(node.this)
+    return [node]
+
+
+def _atom(seg, node, col_map):
+    """Parse one disjunct into a row-evaluable atom, or None.
+    Atoms: ('eq', col, val, neg) | ('in', col, vals, neg) | ('like', col, needle, kind, neg)
+         | ('null', col, want) | ('flag', col, int, op) | ('range', col, val, op)"""
+    isn = node
+    want_null = None
+    if isinstance(isn, E.Not) and isinstance(isn.this, E.Is):
+        isn = isn.this; want_null = False
+    elif isinstance(isn, E.Is):
+        want_null = True
+    if want_null is not None:
+        if not isinstance(isn.this, E.Column) or not isinstance(isn.expression, E.Null):
+            return None
+        col = col_map.get(isn.this.name, isn.this.name) if col_map else isn.this.name
+        if not P.columns_exist(seg, col) or seg._effective(col) is not None:
+            return None
+        if seg.cols[col].get('mode') not in (0, 1, 2, 4):
+            return None
+        return ('null', col, want_null)
+    cl = _col_lit(node)
+    if cl is not None:
+        col = col_map.get(cl[0], cl[0]) if col_map else cl[0]
+        if not P.columns_exist(seg, col) or seg._effective(col) is not None:
+            return None
+        c = seg.cols[col]
+        if cl[2] in ('=', '<>'):
+            if c.get('mode') == 4:
+                return ('flag', col, int(cl[1]), cl[2])
+            if c.get('mode') in (0, 1, 2):
+                return ('eq', col, cl[1], cl[2] == '<>')
+            return None
+        if cl[2] in ('>=', '<=') and seg.stairs(col) is not None:
+            return ('range', col, cl[1], cl[2])
+        return None
+    il = _in_list(node)
+    if il is not None:
+        col = col_map.get(il[0], il[0]) if col_map else il[0]
+        if not P.columns_exist(seg, col) or seg._effective(col) is not None:
+            return None
+        if seg.cols[col].get('mode') not in (0, 1, 2, 4):
+            return None
+        return ('in', col, il[1], il[2])
+    lk = _like(node)
+    if lk is not None:
+        col = col_map.get(lk[0], lk[0]) if col_map else lk[0]
+        if not P.columns_exist(seg, col) or seg._effective(col) is not None:
+            return None
+        if seg.cols[col].get('mode') not in (0, 1):
+            return None
+        return ('like', col, lk[1], lk[2], lk[3])
+    return None
+
+
 def detect(seg, tree, col_map):
     if not _ENABLED:                    return None
     if not P.no_joins(tree):            return None
@@ -271,7 +332,18 @@ def detect(seg, tree, col_map):
             conjs.append(E.LTE(this=cn.this.copy(), expression=cn.args['high']))
         else:
             conjs.append(cn)
+    ors = []
     for cn in conjs:
+        node = cn.this if isinstance(cn, E.Paren) else cn
+        if isinstance(node, E.Or):
+            atoms = []
+            for dj in _disjuncts(node):
+                a = _atom(seg, dj, col_map)
+                if a is None:
+                    return None          # every disjunct must be in vocabulary
+                atoms.append(a)
+            ors.append(atoms)
+            continue
         isn = cn
         want_null = None
         if isinstance(isn, E.Not) and isinstance(isn.this, E.Is):
@@ -319,12 +391,22 @@ def detect(seg, tree, col_map):
             eqs.append((col, cl[1], cl[2]))
         else:
             return None
-    if not eqs and not spans and not likes:
+    if not eqs and not spans and not likes and not ors:
         return None                      # unselective flag-only shapes stay with the scan family
     drive_eq = next((i for i, e in enumerate(eqs) if e[2] == '='), None)
     drive_like = next((i for i, l in enumerate(likes) if not l[3]), None)
-    if drive_eq is None and drive_like is None and not spans:
-        return None                      # need a positive driver (= or LIKE) or a stair span
+    drive_or = None
+    if drive_eq is None and drive_like is None:
+        # an OR group of positive membership atoms on dict columns can drive: one union flag
+        # per column, one frame scan each, positions unioned
+        for oi, atoms in enumerate(ors):
+            if all(((a[0] == 'eq' and not a[3]) or (a[0] == 'in' and not a[3]) or
+                    (a[0] == 'like' and not a[4])) and
+                   seg.cols[a[1]].get('mode') in (0, 1, 2) for a in atoms):
+                drive_or = oi
+                break
+    if drive_eq is None and drive_like is None and drive_or is None and not spans:
+        return None                      # need a positive driver (=, LIKE, OR-union) or a stair span
     # projections: plain key columns, aggregates, the CASE derived key, or bare * (rows mode)
     proj = tree.expressions
     star = len(proj) == 1 and isinstance(proj[0], E.Star)
@@ -364,7 +446,8 @@ def detect(seg, tree, col_map):
         if lim is None or lim <= 0 or lim > 100000:
             return None
         return {'spans': spans, 'eqs': eqs, 'flags': flags, 'ins': ins, 'likes': likes,
-                'nulls': nulls, 'drive_eq': drive_eq, 'drive_like': drive_like, 'mode': 'rows',
+                'nulls': nulls, 'ors': ors, 'drive_eq': drive_eq, 'drive_like': drive_like,
+                'drive_or': drive_or, 'mode': 'rows',
                 'ocol': ocol, 'tiebreak': tiebreak,
                 'out_cols': (list(col_map.values()) if col_map else None) if star else plain_cols,
                 'lim': int(lim), 'off': int(wdb_sql._offset(tree) or 0)}
@@ -445,7 +528,8 @@ def detect(seg, tree, col_map):
     lim = wdb_sql._limit(tree)
     off = wdb_sql._offset(tree) or 0
     return {'spans': spans, 'eqs': eqs, 'flags': flags, 'ins': ins, 'likes': likes,
-            'nulls': nulls, 'drive_eq': drive_eq, 'drive_like': drive_like, 'mode': 'group',
+            'nulls': nulls, 'ors': ors, 'drive_eq': drive_eq, 'drive_like': drive_like,
+            'drive_or': drive_or, 'mode': 'group',
             'keys': keys, 'aggs': aggs, 'proj': proj, 'ordered': order is not None,
             'lim': lim, 'off': int(off)}
 
@@ -566,6 +650,69 @@ def _scan_flag(seg, col, flag, lo, hi):
     return np.nonzero(flag[cc])[0] + lo
 
 
+def _or_union_flag(seg, atoms):
+    """Union flag table for a same-column OR group of positive membership atoms."""
+    col = atoms[0][1]
+    V = int(seg.cols[col]['V'])
+    flag = np.zeros(V, bool)
+    for a in atoms:
+        if a[0] == 'eq':
+            k = _code_of(seg, col, a[2])
+            if k is not None:
+                flag[k] = True
+        elif a[0] == 'in':
+            for v in a[2]:
+                k = _code_of(seg, col, v)
+                if k is not None:
+                    flag[k] = True
+        else:                                    # like
+            flag |= _like_flags(seg, col, a[2], a[3])
+    return flag
+
+
+def _atom_mask(seg, a, pos, ccache):
+    """Boolean mask over pos for one atom; per-column code gathers cached for the query."""
+    col = a[1]
+    c = seg.cols[col]
+    if a[0] == 'flag' or (c['mode'] == 4):
+        if col not in ccache:
+            ccache[col] = np.asarray(seg._seq_decode(c))[pos]
+        vv = ccache[col]
+        if a[0] == 'flag':
+            return vv != a[2] if a[3] == '<>' else vv == a[2]
+        if a[0] == 'in':
+            m = np.isin(vv, np.array([int(v) for v in a[2]], np.int64))
+            return ~m if a[3] else m
+        return np.zeros(pos.size, bool) if a[0] == 'null' and a[2] else np.ones(pos.size, bool)
+    if col not in ccache:
+        ccache[col] = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
+    cc = ccache[col]
+    if a[0] == 'eq':
+        k = _code_of(seg, col, a[2])
+        if k is None:
+            return np.ones(pos.size, bool) if a[3] else np.zeros(pos.size, bool)
+        return cc != k if a[3] else cc == k
+    if a[0] == 'in':
+        ks = np.array([k for k in (_code_of(seg, col, v) for v in a[2]) if k is not None], np.int64)
+        m = np.isin(cc, ks) if ks.size else np.zeros(pos.size, bool)
+        return ~m if a[3] else m
+    if a[0] == 'like':
+        fl = _like_flags(seg, col, a[2], a[3])
+        m = fl[cc]
+        return ~m if a[4] else m
+    if a[0] == 'null':
+        if not c.get('has_null'):
+            return np.zeros(pos.size, bool) if a[2] else np.ones(pos.size, bool)
+        nc = int(c['V']) - 1
+        return cc == nc if a[2] else cc != nc
+    if a[0] == 'range':
+        b = _bound_code(seg, col, a[2], 'left' if a[3] == '>=' else 'right')
+        if b is None:
+            return np.zeros(pos.size, bool)
+        return cc >= b if a[3] == '>=' else cc < b
+    return np.zeros(pos.size, bool)
+
+
 def execute(seg, spec):
     global _HITS
     lo, hi = _span_rows(seg, spec['spans'])
@@ -581,6 +728,16 @@ def execute(seg, spec):
     elif dl is not None:
         col, fl, _n = lflags[dl]
         pos = _scan_flag(seg, col, fl, lo, hi)
+    elif spec.get('drive_or') is not None:
+        atoms = spec['ors'][spec['drive_or']]
+        bycol = {}
+        for a in atoms:
+            bycol.setdefault(a[1], []).append(a)
+        parts = [_scan_flag(seg, col, _or_union_flag(seg, grp), lo, hi)
+                 for col, grp in bycol.items()]
+        pos = parts[0]
+        for pp in parts[1:]:
+            pos = np.union1d(pos, pp)
     else:
         pos = np.arange(lo, hi, dtype=np.int64)
     for i, (col, val, op) in enumerate(spec['eqs']):
@@ -624,6 +781,14 @@ def execute(seg, spec):
         nc = int(c['V']) - 1
         cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
         pos = pos[cc == nc] if want_null else pos[cc != nc]
+    for oi, atoms in enumerate(spec.get('ors', ())):
+        if oi == spec.get('drive_or') or pos.size == 0:
+            continue
+        ccache = {}
+        m = _atom_mask(seg, atoms[0], pos, ccache)
+        for a in atoms[1:]:
+            m |= _atom_mask(seg, a, pos, ccache)
+        pos = pos[m]
     for col, val, op in spec['flags']:
         if pos.size == 0: break
         vv = np.asarray(seg._seq_decode(seg.cols[col]))[pos]
