@@ -468,12 +468,14 @@ def detect(seg, tree, col_map):
                 if not P.columns_exist(seg, col):   return None
                 if seg.cols[col].get('mode') not in (0, 1, 2, 4): return None
                 aggs.append((pi, 'COUNT_COL', col)); continue
-            if ak[0] not in ('SUM', 'AVG', 'MIN') or not isinstance(ak[1], str):
+            if ak[0] not in ('SUM', 'AVG', 'MIN', 'MAX') or not isinstance(ak[1], str):
                 return None
             col = col_map.get(ak[1], ak[1]) if col_map else ak[1]
             if not P.columns_exist(seg, col):   return None
             if ak[0] == 'MIN' and seg.cols[col].get('mode') in (0, 1, 2):
                 aggs.append((pi, 'MIN_DICT', col)); continue
+            if ak[0] == 'MAX' and seg.cols[col].get('mode') in (0, 1, 2):
+                aggs.append((pi, 'MAX_DICT', col)); continue
             if seg.cols[col].get('dt') != 0:    return None
             aggs.append((pi, ak[0], col)); continue
         ck = _case_key(p, seg, col_map)
@@ -838,9 +840,15 @@ def execute(seg, spec):
                     row.append(int(pos.size)); continue
                 cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
                 row.append(int((cc != int(c2['V']) - 1).sum())); continue
-            if kind == 'MIN_DICT':
+            if kind in ('MIN_DICT', 'MAX_DICT'):
+                c2 = seg.cols[col]
                 cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
-                row.append(wdb_sql._pyval(seg.fetch(col, int(cc.min())))); continue
+                if kind == 'MAX_DICT' and c2.get('has_null'):
+                    cc = cc[cc != int(c2['V']) - 1]        # nulls sit at V-1: MAX ignores them
+                    if cc.size == 0:
+                        row.append(None); continue
+                k2 = int(cc.min()) if kind == 'MIN_DICT' else int(cc.max())
+                row.append(wdb_sql._pyval(seg.fetch(col, k2))); continue
             if kind == 'COUNT_D':
                 cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
                 row.append(int(np.unique(cc).size)); continue
@@ -912,10 +920,17 @@ def execute(seg, spec):
                     else:
                         cc2 = np.asarray(seg.codes_at(col, grows)).astype(np.int64)
                         row.append(int((cc2 != int(c2['V']) - 1).sum()))
-                elif kind == 'MIN_DICT':
+                elif kind in ('MIN_DICT', 'MAX_DICT'):
+                    c2 = seg.cols[col]
                     grows = pos[ginv == gi]
                     cc2 = np.asarray(seg.codes_at(col, grows)).astype(np.int64)
-                    row.append(wdb_sql._pyval(seg.fetch(col, int(cc2.min()))))
+                    if kind == 'MAX_DICT' and c2.get('has_null'):
+                        cc2 = cc2[cc2 != int(c2['V']) - 1]
+                    if cc2.size == 0:
+                        row.append(None)
+                    else:
+                        k2 = int(cc2.min()) if kind == 'MIN_DICT' else int(cc2.max())
+                        row.append(wdb_sql._pyval(seg.fetch(col, k2)))
                 elif kind == 'COUNT_D':
                     grows = pos[ginv == gi]
                     cc2 = np.asarray(seg.codes_at(col, grows)).astype(np.int64)
