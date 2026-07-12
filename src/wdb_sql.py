@@ -1331,6 +1331,8 @@ def _eval_pred(seg, node, seg_col):
         cre=re.compile(rx, flags)
         def tostr(x): return x.decode('utf-8','surrogatepass') if isinstance(x,(bytes,bytearray)) else ('' if x is None else str(x))
         m = np.fromiter((bool(cre.match(tostr(x))) for x in a), dtype=bool, count=len(a))
+        if node.args.get('negate'):      # sqlglot: NOT LIKE == Like(negate=True), not Not(Like)
+            m = ~m
         if nmask is not None: m = m & ~nmask
         return m
     if isinstance(node, E.Is):
