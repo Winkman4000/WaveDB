@@ -26,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 import wdb_sql
 import wdb_policies as P
 import wdb_kernels as K
+import wdb_scalar
 
 _ENABLED = True
 _HITS = 0
@@ -80,6 +81,13 @@ def detect(seg, tree, col_map):
         if mk is not None:
             keys.append((pi, mk))
             continue
+        sp = wdb_scalar.parse(seg, p, col_map)
+        if sp is not None:
+            c2 = seg.cols[sp['col']]
+            if c2.get('code_enc') == 3 or seg.stairs(sp['col']) is not None:
+                keys.append((pi, {'kind': 'scalar', 'spec': sp, 'src': sp['col'],
+                                  'V': int(c2['V'])}))      # surrogate V <= dict V (safe fold bound)
+                continue
         nm = wdb_sql._proj_colname(p)
         if nm is None:
             return None
@@ -157,6 +165,15 @@ def execute(seg, spec):
             secs = np.asarray(seg._dict_ints(seg.cols[k['src']]), dtype=np.int64)
             minute_tab = ((secs // 60) % 60).astype(np.int64)
             readers.append(('minute', st))
+        elif k['kind'] == 'scalar':
+            surr, svals = wdb_scalar.surrogate(seg, k['spec'])
+            k['V'] = len(svals)                      # true surrogate cardinality for the fold
+            c = seg.cols[k['src']]
+            if c.get('code_enc') == 3:
+                readers.append(('scalar', (surr, c['boffs'], c['cstart'],
+                                           {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']])))
+            else:
+                readers.append(('scalar_stair', (surr, seg.stairs(k['src']))))
         else:
             c = seg.cols[k['src']]
             readers.append(('col', (c['boffs'], c['cstart'],
@@ -184,6 +201,16 @@ def execute(seg, spec):
                 if kind == 'minute':
                     codes = np.searchsorted(meta, np.arange(a, b), side='right')
                     cols.append(minute_tab[codes])
+                elif kind == 'scalar':
+                    surr, bo2, base2, wdt2 = meta
+                    codes = np.frombuffer(
+                        dz.decompress(buf[base2 + int(bo2[j]):base2 + int(bo2[j + 1])].tobytes()),
+                        dtype=wdt2)
+                    cols.append(surr[codes])
+                elif kind == 'scalar_stair':
+                    surr, st2 = meta
+                    codes = np.searchsorted(st2, np.arange(a, b), side='right')
+                    cols.append(surr[codes])
                 else:
                     bo, base, wdt = meta
                     cols.append(np.frombuffer(
@@ -243,6 +270,9 @@ def execute(seg, spec):
         for (pi, k), code in zip(keys, parts_k):
             if k['kind'] == 'minute':
                 row[pi] = int(code)
+            elif k['kind'] == 'scalar':
+                v = wdb_scalar.surrogate(seg, k['spec'])[1][int(code)]
+                row[pi] = v.item() if hasattr(v, 'item') else v
             else:
                 row[pi] = wdb_sql._pyval(seg.fetch(k['src'], int(code)))
         row[spec['cnt_pi']] = n

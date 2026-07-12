@@ -25,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 import wdb_sql
 import wdb_policies as P
 import wdb_gdsidecar
+import wdb_scalar
 import os
 
 _ENABLED = True
@@ -481,6 +482,9 @@ def detect(seg, tree, col_map):
         ck = _case_key(p, seg, col_map)
         if ck is not None:
             keys.append((pi, ck)); continue
+        sp = wdb_scalar.parse(seg, p, col_map)
+        if sp is not None:
+            keys.append((pi, {'kind': 'scalar', 'spec': sp, 'src': sp['col']})); continue
         nm = wdb_sql._proj_colname(p)
         if nm is None:
             return None
@@ -867,7 +871,12 @@ def execute(seg, spec):
     # ---- GROUP BY: gather keys at survivor positions, factorize-then-combine (overflow-safe)
     kcols = {}
     for _pi, k in spec['keys']:
-        srcs = [k['src']] if k['kind'] == 'col' else [k['src']] + [c for c, _ in k['conds']]
+        if k['kind'] == 'scalar':
+            srcs = [k['src']]
+        elif k['kind'] == 'col':
+            srcs = [k['src']]
+        else:
+            srcs = [k['src']] + [c for c, _ in k['conds']]
         for s in srcs:
             if s in kcols: continue
             c = seg.cols[s]
@@ -877,7 +886,10 @@ def execute(seg, spec):
                 kcols[s] = np.asarray(seg.codes_at(s, pos)).astype(np.int64)
     keyarr = []
     for _pi, k in spec['keys']:
-        if k['kind'] == 'col':
+        if k['kind'] == 'scalar':
+            surr, _vals = wdb_scalar.surrogate(seg, k['spec'])
+            keyarr.append((k, surr[kcols[k['src']]]))
+        elif k['kind'] == 'col':
             keyarr.append((k, kcols[k['src']]))
         else:
             m = np.ones(pos.size, bool)
@@ -948,6 +960,10 @@ def execute(seg, spec):
             else:
                 _t, kk, aa = kind_or_key
                 a = int(aa[r])
+                if kk['kind'] == 'scalar':
+                    v = wdb_scalar.surrogate(seg, kk['spec'])[1][a]
+                    row.append(v.item() if hasattr(v, 'item') else v)
+                    continue
                 if kk['kind'] == 'case' and a < 0:
                     row.append(kk['default'] if isinstance(kk['default'], str) else str(kk['default']))
                 else:
