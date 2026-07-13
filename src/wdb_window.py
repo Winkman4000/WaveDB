@@ -229,25 +229,25 @@ def execute(seg, spec):
     if spec['lim'] is not None:
         sel_s = sel_s[spec['off']: spec['off'] + spec['lim']]
         sel_file = sel_file[spec['off']: spec['off'] + spec['lim']]
-    colvals = {}
-    for _pi, nm in spec['cols']:
+    # emission: one column list per projection slot, assembled by zip (C-speed) --
+    # per-row python loops died here at 28.6M output rows
+    slots = [None] * len(spec['proj'])
+    for pi, nm in spec['cols']:
         c = seg.cols[nm]
         if c['mode'] == 4:
-            colvals[nm] = np.asarray(seg._seq_decode(c))[sel_file]
+            slots[pi] = np.asarray(seg._seq_decode(c))[sel_file].tolist()
         else:
             cc = np.asarray(seg.codes_at(nm, sel_file)).astype(np.int64)
-            colvals[nm] = [wdb_sql._pyval(seg.fetch(nm, int(x))) for x in cc]
-    out = []
-    for ri in range(sel_s.size):
-        row = [None] * len(spec['proj'])
-        for pi, nm in spec['cols']:
-            v = colvals[nm][ri]
-            row[pi] = v.item() if hasattr(v, 'item') else v
-        for pi, w in spec['wins']:
-            v = results[w['alias']][sel_s[ri]]
-            if hasattr(v, 'item'):
-                v = v.item()
-            row[pi] = v
-        out.append(tuple(row))
+            if sel_file.size > 10000:
+                dv = seg._typed_dict(nm)
+                dvals = np.array([wdb_sql._pyval(x) for x in dv], dtype=object)
+                slots[pi] = dvals[cc].tolist()           # one bulk gather, never per-fetch
+            else:
+                slots[pi] = [wdb_sql._pyval(seg.fetch(nm, int(x))) for x in cc]
+    for pi, w in spec['wins']:
+        arr = results[w['alias']]
+        sel = arr[sel_s]
+        slots[pi] = sel.tolist() if hasattr(sel, 'tolist') else list(sel)
+    out = list(zip(*slots)) if slots else []
     _HITS += 1
     return out, [wdb_sql._alias(p) for p in spec['proj']]
