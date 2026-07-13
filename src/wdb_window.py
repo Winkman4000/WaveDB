@@ -243,18 +243,19 @@ def execute(seg, spec):
             elif c.get('dt') == 3:
                 secs = np.asarray(seg._dict_ints(c), dtype=np.int64)[cc]
                 slots[pi] = secs.astype('datetime64[s]').tolist()    # C-speed datetime conversion
-            elif c.get('dt') == 0 and c.get('mode') == 2:
-                slots[pi] = np.asarray(seg._dict_ints(c), dtype=np.int64)[cc].tolist()  # pure gather
-            else:
-                # strings: decode only the codes that APPEAR (sparse selections skip the dict tail)
+            elif c.get('dt') == 0:
+                import wdb_wherescan as WS
+                tbl = WS._num_table(seg, nm)             # any int-valued dict: pure gather
+                slots[pi] = tbl.astype(np.int64)[cc].tolist()
+            elif int(c['V']) > 100_000 and sel_file.size < int(c['V']) // 4:
+                # big string dict, sparse selection: decode only the codes that APPEAR
                 uq, inv = np.unique(cc, return_inverse=True)
-                if uq.size < len(seg._typed_dict(nm)) // 4:
-                    dvals = np.array([wdb_sql._pyval(seg.fetch(nm, int(k))) for k in uq], dtype=object)
-                else:
-                    dv = seg._typed_dict(nm)
-                    full = np.array([wdb_sql._pyval(x) for x in dv], dtype=object)
-                    dvals = full[uq]
+                dvals = np.array([wdb_sql._pyval(seg.fetch(nm, int(k))) for k in uq], dtype=object)
                 slots[pi] = dvals[inv].tolist()
+            else:
+                dv = seg._typed_dict(nm)
+                full = np.array([wdb_sql._pyval(x) for x in dv], dtype=object)
+                slots[pi] = full[cc].tolist()
     for pi, w in spec['wins']:
         arr = results[w['alias']]
         sel = arr[sel_s]
