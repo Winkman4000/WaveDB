@@ -294,6 +294,9 @@ class Database:
                 if live is not None:
                     return live
             return wdb_merge.merge_query(segs, hot, sql, col_map=cmap)
+        import wdb_setops
+        if wdb_setops.is_setop(tree):
+            return wdb_setops.execute(self, tree, esc)
         raise NotImplementedError(f"unsupported statement: {type(tree).__name__}")
 
     def create_fk_pointer(self, child, fk_col, parent, parent_key):
