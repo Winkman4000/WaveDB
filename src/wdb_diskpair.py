@@ -98,8 +98,8 @@ def detect(seg, tree, col_map):
         if c.get('mode') not in (0, 1, 2) or c.get('code_enc') != 3:
             return None
         keys.append((pi, {'kind': 'col', 'src': col, 'V': int(c['V'])}))
-    if cnt_pi is None or not (2 <= len(keys) <= _MAX_KEYS):
-        return None
+    if cnt_pi is None or not (1 <= len(keys) <= _MAX_KEYS):
+        return None                      # single-key: the fold degenerates, the merge still applies
     if sum(1 for _pi, k in keys if k['kind'] == 'minute') > 1:
         return None
     span = 1
@@ -141,10 +141,16 @@ def _modal_share(seg, col):
 
 
 def _block_geometry(seg, keys):
-    """(NB, BR) from the first blocked key column -- all enc=3 columns share BLOCK_ROWS."""
+    """(NB, BR): all enc=3 columns share BLOCK_ROWS, so any blocked column supplies the
+    geometry -- a key column first (col or scalar over one), else any blocked column in the
+    segment (a pure stair-derived key still needs block bounds for the parallel split)."""
     for _pi, k in keys:
-        if k['kind'] == 'col':
-            c = seg.cols[k['src']]
+        if k['kind'] in ('col', 'scalar'):
+            c = seg.cols.get(k['src'])
+            if c is not None and c.get('code_enc') == 3:
+                return c['boffs'].size - 1, int(c['BR'])
+    for c in seg.cols.values():
+        if c.get('code_enc') == 3:
             return c['boffs'].size - 1, int(c['BR'])
     return 0, 0
 
