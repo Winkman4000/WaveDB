@@ -63,7 +63,9 @@ def _minute_key(p, seg, col_map):
 def detect(seg, tree, col_map):
     if not _ENABLED:                    return None
     if not P.no_joins(tree):            return None
-    if not P.no_select_distinct(tree):  return None
+    distinct = bool(tree.args.get('distinct'))
+    if not distinct and not P.no_select_distinct(tree):
+        return None
     if not P.no_having(tree):           return None
     if not P.no_deleted_rows(seg):      return None
     if tree.args.get('where') is not None:
@@ -98,7 +100,10 @@ def detect(seg, tree, col_map):
         if c.get('mode') not in (0, 1, 2) or c.get('code_enc') != 3:
             return None
         keys.append((pi, {'kind': 'col', 'src': col, 'V': int(c['V'])}))
-    if cnt_pi is None or not (1 <= len(keys) <= _MAX_KEYS):
+    if distinct:
+        if cnt_pi is not None or not (1 <= len(keys) <= _MAX_KEYS):
+            return None                  # DISTINCT mode: keys only, no aggregates
+    elif cnt_pi is None or not (1 <= len(keys) <= _MAX_KEYS):
         return None                      # single-key: the fold degenerates, the merge still applies
     if sum(1 for _pi, k in keys if k['kind'] == 'minute') > 1:
         return None
@@ -108,6 +113,13 @@ def detect(seg, tree, col_map):
         if span > (1 << 62):
             return None                 # composite would overflow the i64 key fold
     group = tree.args.get('group')
+    if distinct:
+        if group is not None or tree.args.get('order') is not None:
+            return None                  # v1: bare DISTINCT (no group/order); LIMIT optional
+        lim = wdb_sql._limit(tree)
+        return {'keys': keys, 'cnt_pi': None, 'distinct': True,
+                'lim': None if lim is None else int(lim),
+                'off': int(wdb_sql._offset(tree) or 0), 'proj': proj}
     if group is None or len(group.expressions) != len(keys):
         return None
     order = tree.args.get('order')
@@ -184,9 +196,9 @@ def execute(seg, spec):
             c = seg.cols[k['src']]
             readers.append(('col', (c['boffs'], c['cstart'],
                                     {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']])))
-    # norm lane: 2 plain dict keys only
+    # norm lane: 2 plain dict keys only (counting aid -- DISTINCT has no counts to split)
     norm_idx = -1; norm_code = -1
-    if len(keys) == 2 and all(k['kind'] == 'col' for _pi, k in keys):
+    if not spec.get('distinct') and len(keys) == 2 and all(k['kind'] == 'col' for _pi, k in keys):
         m0, s0 = _modal_share(seg, keys[0][1]['src'])
         m1, s1 = _modal_share(seg, keys[1][1]['src'])
         if s1 >= _NORM_MIN_SHARE and s1 >= s0:
@@ -195,7 +207,7 @@ def execute(seg, spec):
             norm_idx, norm_code = 0, m0
     radix = [k['V'] for _pi, k in keys]
     buf = seg.buf
-    K10 = spec['off'] + spec['lim']
+    K10 = spec['off'] + (spec['lim'] or 0)   # unused in DISTINCT mode (lim may be None)
 
     def work(js):
         dz = zstd.ZstdDecompressor()
@@ -241,6 +253,46 @@ def execute(seg, spec):
     W = min(_SCAN_THREADS, NB) or 1
     with ThreadPoolExecutor(W) as ex:
         parts = list(ex.map(work, np.array_split(np.arange(NB), W)))
+    if spec.get('distinct'):
+        uniq = np.unique(np.concatenate([p[1] for p in parts]))
+        if spec['off'] or spec['lim'] is not None:
+            end = None if spec['lim'] is None else spec['off'] + spec['lim']
+            uniq = uniq[spec['off']: end]
+        # decompose composites into per-key code columns
+        comp = uniq
+        keycodes = []
+        for ci in range(len(keys) - 1, -1, -1):
+            keycodes.append(comp % radix[ci]); comp = comp // radix[ci]
+        keycodes.reverse()
+        # decode: point fetches when small, one bulk dict gather per column when large
+        BULK = uniq.size > 10000
+        colvals = []
+        for (pi, k), codes in zip(keys, keycodes):
+            if k['kind'] == 'minute':
+                colvals.append(codes.astype(np.int64))
+            elif k['kind'] == 'scalar':
+                svals = wdb_scalar.surrogate(seg, k['spec'])[1]
+                colvals.append([svals[int(c)] for c in codes] if not BULK
+                               else np.array(svals, dtype=object)[codes])
+            elif BULK:
+                dvals = np.array(seg._typed_dict(k['src']), dtype=object)
+                colvals.append(dvals[codes])
+            else:
+                colvals.append([wdb_sql._pyval(seg.fetch(k['src'], int(c))) for c in codes])
+        out = []
+        for ri in range(uniq.size):
+            row = [None] * len(spec['proj'])
+            for (pi, k), cv in zip(keys, colvals):
+                v = cv[ri]
+                if isinstance(v, (bytes, bytearray)):
+                    v = v.decode('utf-8', 'replace')
+                elif hasattr(v, 'item'):
+                    v = v.item()
+                row[pi] = v
+            out.append(tuple(row))
+        global _HITS
+        _HITS += 1
+        return out, [wdb_sql._alias(p) for p in spec['proj']]
     kk = np.concatenate([p[1] for p in parts])
     vv = np.concatenate([p[2] for p in parts])
     offs = np.zeros(len(parts) + 1, np.int64)
