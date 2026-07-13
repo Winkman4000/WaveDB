@@ -279,7 +279,8 @@ class Database:
             phys = self.cat.phys_map(name)
             import wdb_subquery
             if wdb_subquery.has_subquery(tree):
-                return self.run(wdb_subquery.rewrite(self, tree).sql())
+                tree = wdb_subquery.rewrite(self, tree)   # in-tree: no sql-text roundtrip
+                sql = tree.sql()                          # for reads that consume raw sql
             cmap = {c: phys.get(c, c) for c in self.cat.column_names(name)}  # complete logical->physical
             paths = self.cat.segment_paths(name)
             segs = [self.open_segment(p, name) for p in paths]

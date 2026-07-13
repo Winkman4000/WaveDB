@@ -892,8 +892,22 @@ def execute(seg, spec):
             m = np.isin(vv, want)
             pos = pos[~m] if ineg else pos[m]
         else:
-            codes = [_code_of(seg, col, v) for v in vals]
-            codes = np.array([k for k in codes if k is not None], dtype=np.int64)
+            if len(vals) > 500:
+                # bulk bind: one dict pass beats N bisects for large IN lists
+                dv = seg._typed_dict(col)
+                idx = {(x if isinstance(x, (bytes, bytearray)) else str(x).encode()
+                        if isinstance(x, str) else x): i for i, x in enumerate(dv)}
+                codes = []
+                for v in vals:
+                    kk = idx.get(v.encode() if isinstance(v, str) else v)
+                    if kk is None and not isinstance(v, (str, bytes, bytearray)):
+                        kk = idx.get(v)
+                    if kk is not None:
+                        codes.append(kk)
+                codes = np.array(codes, dtype=np.int64)
+            else:
+                codes = [_code_of(seg, col, v) for v in vals]
+                codes = np.array([k for k in codes if k is not None], dtype=np.int64)
             if codes.size == 0:
                 if not ineg:
                     pos = np.empty(0, np.int64); break
