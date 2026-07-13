@@ -180,6 +180,48 @@ def _count_distinct(p):
     return None
 
 
+_SCMP = {'GT': '>', 'GTE': '>=', 'LT': '<', 'LTE': '<=', 'EQ': '=', 'NEQ': '<>'}
+
+
+def _scalar_cmp(seg, node, col_map):
+    """(spec, op, lit) for <scalar(col)> <cmp> <literal> -- evaluated as a flag table over the
+    scalar's code->value table: the comparison happens once per DISTINCT value."""
+    import wdb_scalar
+    tn = type(node).__name__
+    if tn not in _SCMP:
+        return None
+    a, b = node.this, node.expression
+    lit = None
+    if isinstance(b, E.Literal):
+        expr, lit = a, b
+    elif isinstance(a, E.Literal):
+        expr, lit = b, a
+        tn = {'GT': 'LT', 'GTE': 'LTE', 'LT': 'GT', 'LTE': 'GTE'}.get(tn, tn)
+    else:
+        return None
+    sp = wdb_scalar.parse(seg, expr, col_map)
+    if sp is None:
+        return None
+    v = lit.this
+    try:
+        v = int(str(v))
+    except Exception:
+        v = str(v)
+    return sp, _SCMP[tn], v
+
+
+def _scalar_flag(seg, sp, op, lit):
+    """flag[code] = table[code] <op> lit, memoized via the underlying scalar table."""
+    import wdb_scalar
+    t = wdb_scalar.table(seg, sp)
+    if op == '>':   return t > lit
+    if op == '>=':  return t >= lit
+    if op == '<':   return t < lit
+    if op == '<=':  return t <= lit
+    if op == '=':   return t == lit
+    return t != lit
+
+
 def _like(node):
     """(col, needle, kind, negate) for `col [NOT] LIKE pat` -- kinds: contains '%x%',
     prefix 'x%', suffix '%x'. No interior wildcards."""
@@ -323,7 +365,7 @@ def detect(seg, tree, col_map):
     where = tree.args.get('where')
     if where is None:
         return None
-    spans, eqs, flags, ins, likes, nulls = [], [], [], [], [], []
+    spans, eqs, flags, ins, likes, nulls, sflags = [], [], [], [], [], [], []
     conjs = []
     for cn in _conjuncts(where.this):
         if isinstance(cn, E.Between):            # sugar: col >= low AND col <= high
@@ -372,7 +414,11 @@ def detect(seg, tree, col_map):
                 continue
             lk = _like(cn)
             if lk is None:
-                return None
+                sc = _scalar_cmp(seg, cn, col_map)
+                if sc is None:
+                    return None
+                sflags.append(sc)
+                continue
             col = col_map.get(lk[0], lk[0]) if col_map else lk[0]
             if not P.columns_exist(seg, col):   return None
             if seg._effective(col) is not None: return None
@@ -392,7 +438,7 @@ def detect(seg, tree, col_map):
             eqs.append((col, cl[1], cl[2]))
         else:
             return None
-    if not eqs and not spans and not likes and not ors:
+    if not eqs and not spans and not likes and not ors and not sflags:
         return None                      # unselective flag-only shapes stay with the scan family
     drive_eq = next((i for i, e in enumerate(eqs) if e[2] == '='), None)
     drive_like = next((i for i, l in enumerate(likes) if not l[3]), None)
@@ -406,8 +452,15 @@ def detect(seg, tree, col_map):
                    seg.cols[a[1]].get('mode') in (0, 1, 2) for a in atoms):
                 drive_or = oi
                 break
-    if drive_eq is None and drive_like is None and drive_or is None and not spans:
-        return None                      # need a positive driver (=, LIKE, OR-union) or a stair span
+    drive_sf = None
+    if drive_eq is None and drive_like is None and drive_or is None:
+        for si, (sp2, _op2, _l2) in enumerate(sflags):
+            if seg.cols[sp2['col']].get('code_enc') == 3:
+                drive_sf = si
+                break
+    if drive_eq is None and drive_like is None and drive_or is None and drive_sf is None \
+            and not spans:
+        return None                      # need a positive driver (=, LIKE, OR, scalar) or a span
     # projections: plain key columns, aggregates, the CASE derived key, or bare * (rows mode)
     proj = tree.expressions
     star = len(proj) == 1 and isinstance(proj[0], E.Star)
@@ -447,8 +500,9 @@ def detect(seg, tree, col_map):
         if lim is None or lim <= 0 or lim > 100000:
             return None
         return {'spans': spans, 'eqs': eqs, 'flags': flags, 'ins': ins, 'likes': likes,
-                'nulls': nulls, 'ors': ors, 'drive_eq': drive_eq, 'drive_like': drive_like,
-                'drive_or': drive_or, 'mode': 'rows',
+                'nulls': nulls, 'ors': ors, 'sflags': sflags, 'drive_eq': drive_eq,
+                'drive_like': drive_like, 'drive_or': drive_or, 'drive_sf': drive_sf,
+                'mode': 'rows',
                 'ocol': ocol, 'tiebreak': tiebreak,
                 'out_cols': (list(col_map.values()) if col_map else None) if star else plain_cols,
                 'lim': int(lim), 'off': int(wdb_sql._offset(tree) or 0)}
@@ -534,8 +588,9 @@ def detect(seg, tree, col_map):
     lim = wdb_sql._limit(tree)
     off = wdb_sql._offset(tree) or 0
     return {'spans': spans, 'eqs': eqs, 'flags': flags, 'ins': ins, 'likes': likes,
-            'nulls': nulls, 'ors': ors, 'drive_eq': drive_eq, 'drive_like': drive_like,
-            'drive_or': drive_or, 'mode': 'group',
+            'nulls': nulls, 'ors': ors, 'sflags': sflags, 'drive_eq': drive_eq,
+            'drive_like': drive_like, 'drive_or': drive_or, 'drive_sf': drive_sf,
+            'mode': 'group',
             'keys': keys, 'aggs': aggs, 'proj': proj, 'ordered': order is not None,
             'lim': lim, 'off': int(off)}
 
@@ -734,6 +789,9 @@ def execute(seg, spec):
     elif dl is not None:
         col, fl, _n = lflags[dl]
         pos = _scan_flag(seg, col, fl, lo, hi)
+    elif spec.get('drive_sf') is not None:
+        sp2, op2, l2 = spec['sflags'][spec['drive_sf']]
+        pos = _scan_flag(seg, sp2['col'], _scalar_flag(seg, sp2, op2, l2), lo, hi)
     elif spec.get('drive_or') is not None:
         atoms = spec['ors'][spec['drive_or']]
         bycol = {}
@@ -795,6 +853,12 @@ def execute(seg, spec):
         for a in atoms[1:]:
             m |= _atom_mask(seg, a, pos, ccache)
         pos = pos[m]
+    for si, (sp2, op2, l2) in enumerate(spec.get('sflags', ())):
+        if si == spec.get('drive_sf') or pos.size == 0:
+            continue
+        fl = _scalar_flag(seg, sp2, op2, l2)
+        cc = np.asarray(seg.codes_at(sp2['col'], pos)).astype(np.int64)
+        pos = pos[fl[cc]]
     for col, val, op in spec['flags']:
         if pos.size == 0: break
         vv = np.asarray(seg._seq_decode(seg.cols[col]))[pos]
