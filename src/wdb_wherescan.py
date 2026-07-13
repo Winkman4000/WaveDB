@@ -242,8 +242,10 @@ def _like(node):
     elif pat.startswith('%'):
         needle, kind = pat[1:], 'suffix'
     else:
-        return None
-    if not needle or '%' in needle or '_' in needle:
+        needle, kind = pat, 'general'
+    if kind != 'general' and (not needle or '%' in needle or '_' in needle):
+        needle, kind = pat, 'general'    # interior wildcards: the general regex path
+    if not needle:
         return None
     return n.this.name, needle, kind, neg
 
@@ -266,6 +268,19 @@ def _like_flags(seg, col, needle, kind='contains'):
     hay = b''.join(bs)
     nd = needle.encode() if isinstance(needle, str) else needle
     flag = np.zeros(V, bool)
+    if kind == 'general':
+        # arbitrary wildcards: SQL pattern -> anchored bytes regex, evaluated once per
+        # DISTINCT value (the dict-level law; %->.*  _->.)
+        import re
+        rx = re.compile(b'^' + re.escape(nd).replace(b'\\%', b'.*').replace(b'%', b'.*')
+                        .replace(b'_', b'.') + b'$', re.DOTALL)
+        pos0 = 0
+        for i in range(V):
+            if rx.match(hay[pos0:int(offs[i + 1])]):
+                flag[i] = True
+            pos0 = int(offs[i + 1])
+        memo[mk] = flag
+        return flag
     if kind == 'prefix':
         # value-sorted dict: a prefix is a contiguous code range -- two bisects, no scan
         lo = _bound_code(seg, col, nd, 'left')
@@ -360,7 +375,32 @@ def detect(seg, tree, col_map):
     if not _ENABLED:                    return None
     if not P.no_joins(tree):            return None
     if not P.no_select_distinct(tree):  return None
-    if not P.no_having(tree):           return None
+    having = tree.args.get('having')
+    hterms = []
+    if having is not None:
+        for hc in _conjuncts(having.this):
+            tn = type(hc).__name__
+            if tn not in _SCMP:
+                return None
+            hexpr, hlit = hc.this, hc.expression
+            if isinstance(hexpr, E.Literal):
+                hexpr, hlit = hlit, hexpr
+                tn = {'GT': 'LT', 'GTE': 'LTE', 'LT': 'GT', 'LTE': 'GTE'}.get(tn, tn)
+            if not isinstance(hlit, E.Literal):
+                return None
+            hk = wdb_sql._agg_kind(hexpr)
+            if hk is None or hk[0] not in ('COUNT_STAR', 'SUM', 'AVG'):
+                return None
+            hcol = None
+            if hk[0] != 'COUNT_STAR':
+                hcol = col_map.get(hk[1], hk[1]) if col_map else hk[1]
+                if not P.columns_exist(seg, hcol) or seg.cols[hcol].get('dt') != 0:
+                    return None
+            try:
+                hval = float(str(hlit.this))
+            except Exception:
+                return None
+            hterms.append((hk[0], hcol, _SCMP[tn], hval))
     if not P.no_deleted_rows(seg):      return None
     where = tree.args.get('where')
     if where is None:
@@ -441,7 +481,10 @@ def detect(seg, tree, col_map):
     if not eqs and not spans and not likes and not ors and not sflags:
         return None                      # unselective flag-only shapes stay with the scan family
     drive_eq = next((i for i, e in enumerate(eqs) if e[2] == '='), None)
-    drive_like = next((i for i, l in enumerate(likes) if not l[3]), None)
+    # a like is only THE driver when no eq drives -- execute skips lflags[drive_like],
+    # so marking one while an eq drives silently drops that LIKE as a filter
+    drive_like = None if drive_eq is not None else \
+        next((i for i, l in enumerate(likes) if not l[3]), None)
     drive_or = None
     if drive_eq is None and drive_like is None:
         # an OR group of positive membership atoms on dict columns can drive: one union flag
@@ -477,7 +520,7 @@ def detect(seg, tree, col_map):
             pc.append(nm2)
         plain_cols = pc
     if star or plain_cols:
-        if tree.args.get('group') is not None:
+        if tree.args.get('group') is not None or hterms:
             return None
         order = tree.args.get('order')
         if order is None or not order.expressions:
@@ -551,6 +594,8 @@ def detect(seg, tree, col_map):
         return None
     if group is not None and len(group.expressions) != len(keys):
         return None                      # every key projection must be grouped (and vice versa)
+    if hterms and not keys:
+        return None                      # HAVING without groups: the fallback's territory
     # resident structures outrank the scan: a gd sidecar serving this exact
     # (group key, COUNT DISTINCT target) shape keeps the query (doctrine: min(point, pop)).
     # LIKE conjuncts disqualify the sidecar (it can only filter eq/in shapes), so no defer.
@@ -590,7 +635,7 @@ def detect(seg, tree, col_map):
     return {'spans': spans, 'eqs': eqs, 'flags': flags, 'ins': ins, 'likes': likes,
             'nulls': nulls, 'ors': ors, 'sflags': sflags, 'drive_eq': drive_eq,
             'drive_like': drive_like, 'drive_or': drive_or, 'drive_sf': drive_sf,
-            'mode': 'group',
+            'mode': 'group', 'having': hterms,
             'keys': keys, 'aggs': aggs, 'proj': proj, 'ordered': order is not None,
             'lim': lim, 'off': int(off)}
 
@@ -684,6 +729,16 @@ def _scan_eq(seg, col, code, lo, hi, negate=False):
     cc = np.asarray(seg._raw_codes_range(col, lo, hi))
     h = np.nonzero(cc != code)[0] if negate else np.nonzero(cc == code)[0]
     return h + lo
+
+def _num_table(seg, col):
+    """code -> numeric value for any int-valued dict column (mode 2 int-dict layout or a
+    generic mode-0/1 dict whose values are ints)."""
+    c = seg.cols[col]
+    try:
+        return np.asarray(seg._dict_ints(c), dtype=np.float64)
+    except Exception:
+        return np.array([float(v) for v in seg._typed_dict(col)], dtype=np.float64)
+
 
 def _scan_flag(seg, col, flag, lo, hi):
     """Positions in [lo, hi) where flag[code] is set -- the LIKE frame scan: parallel enc=3
@@ -924,7 +979,7 @@ def execute(seg, spec):
                 v = np.asarray(seg._seq_decode(c))[pos]
             else:
                 cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
-                v = np.asarray(seg._dict_ints(c))[cc] if c['mode'] == 2 else \
+                v = _num_table(seg, col)[cc] if c['mode'] == 2 else \
                     np.asarray([int(seg.fetch(col, int(k))) for k in np.unique(cc)])[
                         np.searchsorted(np.unique(cc), cc)]
             row.append(int(v.sum(dtype=np.int64)) if kind == 'SUM'
@@ -973,6 +1028,24 @@ def execute(seg, spec):
     g, ginv = np.unique(comp, return_inverse=True)
     cnt = np.bincount(ginv)
     order = np.lexsort((g, -cnt)) if spec['ordered'] else np.arange(g.size)
+    if spec.get('having'):
+        hmask = np.ones(cnt.size, bool)
+        for hkind, hcol, hop, hval in spec['having']:
+            if hkind == 'COUNT_STAR':
+                arr = cnt.astype(np.float64)
+            else:
+                c2 = seg.cols[hcol]
+                if c2['mode'] == 4:
+                    v = np.asarray(seg._seq_decode(c2))[pos].astype(np.float64)
+                else:
+                    v = _num_table(seg, hcol)[np.asarray(seg.codes_at(hcol, pos)).astype(np.int64)]
+                sums = np.bincount(ginv, weights=v, minlength=cnt.size)
+                arr = sums if hkind == 'SUM' else sums / np.maximum(cnt, 1)
+            m = (arr > hval if hop == '>' else arr >= hval if hop == '>=' else
+                 arr < hval if hop == '<' else arr <= hval if hop == '<=' else
+                 arr == hval if hop == '=' else arr != hval)
+            hmask &= m
+        order = order[hmask[order]]
     sel = order[spec['off']: spec['off'] + spec['lim']] if spec['lim'] is not None else order[spec['off']:]
     rep = np.empty(sel.size, np.int64)
     for i, gi in enumerate(sel):
@@ -1018,7 +1091,7 @@ def execute(seg, spec):
                         v = np.asarray(seg._seq_decode(c))[grows]
                     else:
                         cc2 = np.asarray(seg.codes_at(col, grows)).astype(np.int64)
-                        v = np.asarray(seg._dict_ints(c))[cc2]
+                        v = _num_table(seg, col)[cc2]
                     row.append(int(v.sum(dtype=np.int64)) if kind == 'SUM'
                                else float(v.sum(dtype=np.float64)) / v.size)
             else:

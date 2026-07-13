@@ -472,6 +472,9 @@ def _topk_prefilter(tree, proj, col_results, counts, present, gkeys):
     `a >= thresh` (desc) / `a <= thresh` (asc), with all boundary ties kept, can never exclude one."""
     if not gkeys:
         return present
+    if tree.args.get('having') is not None:
+        return present                   # HAVING can disqualify winners: the top-k-by-order
+                                         # superset is no longer provable -- keep every group
     order = tree.args.get('order')
     lim = wdb_sql._limit(tree)
     if order is None or lim is None or lim <= 0:
