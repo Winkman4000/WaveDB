@@ -277,6 +277,9 @@ class Database:
                 sql = _rw; tree = _parse_sql_cached(_rw)         # fall through to the single-table path
             name = self._table_in(tree)
             phys = self.cat.phys_map(name)
+            import wdb_subquery
+            if wdb_subquery.has_subquery(tree):
+                return self.run(wdb_subquery.rewrite(self, tree).sql())
             cmap = {c: phys.get(c, c) for c in self.cat.column_names(name)}  # complete logical->physical
             paths = self.cat.segment_paths(name)
             segs = [self.open_segment(p, name) for p in paths]

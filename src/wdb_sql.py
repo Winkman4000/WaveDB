@@ -1032,7 +1032,12 @@ def _lit_for_col(seg, colname, lit, arr_kind):
     if c['dt'] == 3:                       # datetime: parse string/number to int64 epoch
         return _parse_temporal(lit.this, seg.unit(colname))
     if not lit.is_string:
-        return int(lit.this) if arr_kind in 'iu' else float(lit.this)
+        if arr_kind in 'iu':
+            try:
+                return int(lit.this)
+            except ValueError:
+                return float(lit.this)   # float literal vs int column: numpy compares fine
+        return float(lit.this)
     v = lit.this.encode()
     return v
 
@@ -1340,6 +1345,8 @@ def _eval_pred(seg, node, seg_col):
         if isinstance(node.expression, E.Null):
             return nmask if nmask is not None else np.zeros(len(a), dtype=bool)  # IS NULL
         raise NotImplementedError("IS <non-null-literal>")
+    if isinstance(node, E.Boolean):
+        return np.full(seg.N, bool(node.this), dtype=bool)   # TRUE/FALSE literal predicates
     raise NotImplementedError(f"predicate {type(node).__name__}")
 
 def _apply_having(rows, proj, node, seg_col):
