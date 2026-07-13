@@ -25,6 +25,7 @@ import wdb_blockstats
 import wdb_wherescan
 import wdb_diskpair
 import wdb_regexgroup
+import wdb_window
 import wdb_pairagg
 import wdb_scanpair
 import wdb_survgroup
@@ -84,6 +85,11 @@ regexgroup = Read('regexgroup',
                   lambda c: wdb_regexgroup.detect(c.seg, c.tree, c.cmap),
                   lambda c, spec: wdb_regexgroup.execute(c.seg, spec),
                   'GROUP BY REGEXP_REPLACE(dict col): per-code counts + dict-level regex')
+
+window = Read('window',
+              lambda c: wdb_window.detect(c.seg, c.tree, c.cmap),
+              lambda c, spec: wdb_window.execute(c.seg, spec),
+              'window functions on the fused motion: one placement, two coordinates')
 
 wherescan = Read('wherescan',
                  lambda c: wdb_wherescan.detect(c.seg, c.tree, c.cmap),

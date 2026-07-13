@@ -31,6 +31,11 @@ def _agg_or_group(tree):
     return (tree.args.get('group') is not None
             or tree.args.get('distinct') is not None
             or any(wdb_sql._agg_kind(e) for e in tree.expressions))
+def _has_window(tree):
+    import sqlglot.expressions as E
+    return any(isinstance((p.this if isinstance(p, E.Alias) else p), E.Window)
+               for p in tree.expressions)
+
 
 
 # The single-segment read order -- the "try state". Each is a read_methods.Read; the
@@ -40,6 +45,7 @@ _READ_ORDER = (
     R.blockstats,           # whole-table aggregates from per-block stats: no row data touched
     R.stair,                # staircase column: single-key GROUP BY from step positions (no decode)
     R.regexgroup,           # GROUP BY regex over the dict: per-code counts, V-level strings
+    R.window,               # window fns: stable scatter by partition, lanes inherit cluster order
     R.wherescan,            # conjunctive WHERE: stair spans + blocked-frame predicate scan, disk-only
     R.dict_count,           # dictionary per-code counts
     R.gridwalk,             # two-key COUNT(*) top-K via grid filled-cell + count-ordered head (opt-in)
@@ -82,7 +88,7 @@ def route_single_segment(ctx):
                     return rows
         if _PATH_SINK is not None: _PATH_SINK(ctx, 'general_scan')
         return R.general_scan(ctx)
-    if _agg_or_group(ctx.tree):
+    if _agg_or_group(ctx.tree) or _has_window(ctx.tree):
         for read in _READ_ORDER:
             spec = read.detect(ctx)
             if spec is None:
