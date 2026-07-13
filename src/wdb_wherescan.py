@@ -269,16 +269,27 @@ def _like_flags(seg, col, needle, kind='contains'):
     nd = needle.encode() if isinstance(needle, str) else needle
     flag = np.zeros(V, bool)
     if kind == 'general':
-        # arbitrary wildcards: SQL pattern -> anchored bytes regex, evaluated once per
-        # DISTINCT value (the dict-level law; %->.*  _->.)
+        # arbitrary wildcards, evaluated once per DISTINCT value (the dict-level law).
+        # '%' spans bytes safely in UTF-8 (literal segments byte-match exactly), but '_'
+        # means one CHARACTER -- multi-byte text forces the decoded path.
         import re
-        rx = re.compile(b'^' + re.escape(nd).replace(b'\\%', b'.*').replace(b'%', b'.*')
-                        .replace(b'_', b'.') + b'$', re.DOTALL)
-        pos0 = 0
-        for i in range(V):
-            if rx.match(hay[pos0:int(offs[i + 1])]):
-                flag[i] = True
-            pos0 = int(offs[i + 1])
+        if b'_' in nd:
+            pat = needle if isinstance(needle, str) else needle.decode('utf-8', 'replace')
+            rx = re.compile('^' + re.escape(pat).replace('\\%', '.*').replace('%', '.*')
+                            .replace('_', '.') + '$', re.DOTALL)
+            pos0 = 0
+            for i in range(V):
+                if rx.match(hay[pos0:int(offs[i + 1])].decode('utf-8', 'replace')):
+                    flag[i] = True
+                pos0 = int(offs[i + 1])
+        else:
+            rx = re.compile(b'^' + re.escape(nd).replace(b'\\%', b'.*').replace(b'%', b'.*')
+                            + b'$', re.DOTALL)
+            pos0 = 0
+            for i in range(V):
+                if rx.match(hay[pos0:int(offs[i + 1])]):
+                    flag[i] = True
+                pos0 = int(offs[i + 1])
         memo[mk] = flag
         return flag
     if kind == 'prefix':
