@@ -489,7 +489,7 @@ def detect(seg, tree, col_map):
             eqs.append((col, cl[1], cl[2]))
         else:
             return None
-    if not eqs and not spans and not likes and not ors and not sflags:
+    if not eqs and not spans and not likes and not ors and not sflags and not ins:
         return None                      # unselective flag-only shapes stay with the scan family
     drive_eq = next((i for i, e in enumerate(eqs) if e[2] == '='), None)
     # a like is only THE driver when no eq drives -- execute skips lflags[drive_like],
@@ -512,9 +512,16 @@ def detect(seg, tree, col_map):
             if seg.cols[sp2['col']].get('code_enc') == 3:
                 drive_sf = si
                 break
+    drive_in = None
+    if drive_eq is None and drive_like is None and drive_or is None and drive_sf is None:
+        for ii, (icol, _iv, ineg) in enumerate(ins):
+            c2 = seg.cols[icol]
+            if not ineg and c2.get('mode') in (0, 1, 2) and c2.get('code_enc') == 3:
+                drive_in = ii            # a positive IN drives: union flag over its codes
+                break
     if drive_eq is None and drive_like is None and drive_or is None and drive_sf is None \
-            and not spans:
-        return None                      # need a positive driver (=, LIKE, OR, scalar) or a span
+            and drive_in is None and not spans:
+        return None                      # need a positive driver (=, LIKE, OR, IN, scalar) or a span
     # projections: plain key columns, aggregates, the CASE derived key, or bare * (rows mode)
     proj = tree.expressions
     star = len(proj) == 1 and isinstance(proj[0], E.Star)
@@ -556,7 +563,7 @@ def detect(seg, tree, col_map):
         return {'spans': spans, 'eqs': eqs, 'flags': flags, 'ins': ins, 'likes': likes,
                 'nulls': nulls, 'ors': ors, 'sflags': sflags, 'drive_eq': drive_eq,
                 'drive_like': drive_like, 'drive_or': drive_or, 'drive_sf': drive_sf,
-                'mode': 'rows',
+                'drive_in': drive_in, 'mode': 'rows',
                 'ocol': ocol, 'tiebreak': tiebreak,
                 'out_cols': (list(col_map.values()) if col_map else None) if star else plain_cols,
                 'lim': int(lim), 'off': int(wdb_sql._offset(tree) or 0)}
@@ -646,7 +653,7 @@ def detect(seg, tree, col_map):
     return {'spans': spans, 'eqs': eqs, 'flags': flags, 'ins': ins, 'likes': likes,
             'nulls': nulls, 'ors': ors, 'sflags': sflags, 'drive_eq': drive_eq,
             'drive_like': drive_like, 'drive_or': drive_or, 'drive_sf': drive_sf,
-            'mode': 'group', 'having': hterms,
+            'drive_in': drive_in, 'mode': 'group', 'having': hterms,
             'keys': keys, 'aggs': aggs, 'proj': proj, 'ordered': order is not None,
             'lim': lim, 'off': int(off)}
 
@@ -749,6 +756,24 @@ def _num_table(seg, col):
         return np.asarray(seg._dict_ints(c), dtype=np.float64)
     except Exception:
         return np.array([float(v) for v in seg._typed_dict(col)], dtype=np.float64)
+
+
+def _in_codes(seg, col, vals):
+    """Dict codes for an IN list: one typed-dict pass beats N bisects past ~500 values."""
+    if len(vals) > 500:
+        dv = seg._typed_dict(col)
+        idx = {(x if isinstance(x, (bytes, bytearray)) else str(x).encode()
+                if isinstance(x, str) else x): i for i, x in enumerate(dv)}
+        codes = []
+        for v in vals:
+            kk = idx.get(v.encode() if isinstance(v, str) else v)
+            if kk is None and not isinstance(v, (str, bytes, bytearray)):
+                kk = idx.get(v)
+            if kk is not None:
+                codes.append(kk)
+        return np.array(codes, dtype=np.int64)
+    codes = [_code_of(seg, col, v) for v in vals]
+    return np.array([k for k in codes if k is not None], dtype=np.int64)
 
 
 def _scan_flag(seg, col, flag, lo, hi):
@@ -858,6 +883,12 @@ def execute(seg, spec):
     elif spec.get('drive_sf') is not None:
         sp2, op2, l2 = spec['sflags'][spec['drive_sf']]
         pos = _scan_flag(seg, sp2['col'], _scalar_flag(seg, sp2, op2, l2), lo, hi)
+    elif spec.get('drive_in') is not None:
+        icol, ivals, _n = spec['ins'][spec['drive_in']]
+        ks = _in_codes(seg, icol, ivals)
+        fl = np.zeros(int(seg.cols[icol]['V']), bool)
+        fl[ks] = True
+        pos = _scan_flag(seg, icol, fl, lo, hi)
     elif spec.get('drive_or') is not None:
         atoms = spec['ors'][spec['drive_or']]
         bycol = {}
@@ -883,8 +914,9 @@ def execute(seg, spec):
         cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
         m = fl[cc]
         pos = pos[~m] if neg else pos[m]
-    for col, vals, ineg in spec.get('ins', ()):
-        if pos.size == 0: break
+    for ii, (col, vals, ineg) in enumerate(spec.get('ins', ())):
+        if ii == spec.get('drive_in') or pos.size == 0:
+            continue
         c = seg.cols[col]
         if c['mode'] == 4:
             want = np.array([int(v) for v in vals], dtype=np.int64)
@@ -892,22 +924,7 @@ def execute(seg, spec):
             m = np.isin(vv, want)
             pos = pos[~m] if ineg else pos[m]
         else:
-            if len(vals) > 500:
-                # bulk bind: one dict pass beats N bisects for large IN lists
-                dv = seg._typed_dict(col)
-                idx = {(x if isinstance(x, (bytes, bytearray)) else str(x).encode()
-                        if isinstance(x, str) else x): i for i, x in enumerate(dv)}
-                codes = []
-                for v in vals:
-                    kk = idx.get(v.encode() if isinstance(v, str) else v)
-                    if kk is None and not isinstance(v, (str, bytes, bytearray)):
-                        kk = idx.get(v)
-                    if kk is not None:
-                        codes.append(kk)
-                codes = np.array(codes, dtype=np.int64)
-            else:
-                codes = [_code_of(seg, col, v) for v in vals]
-                codes = np.array([k for k in codes if k is not None], dtype=np.int64)
+            codes = _in_codes(seg, col, vals)
             if codes.size == 0:
                 if not ineg:
                     pos = np.empty(0, np.int64); break
