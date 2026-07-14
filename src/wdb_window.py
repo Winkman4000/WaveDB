@@ -27,7 +27,8 @@ _HITS = 0
 _MAX_FULL = 1_000_000
 
 _FNS = {'RowNumber': 'row_number', 'Rank': 'rank', 'DenseRank': 'dense_rank',
-        'Lag': 'lag', 'Lead': 'lead', 'Sum': 'sum', 'Count': 'count'}
+        'Lag': 'lag', 'Lead': 'lead', 'Sum': 'sum', 'Count': 'count',
+        'Avg': 'avg', 'Min': 'min', 'Max': 'max'}
 
 
 def enable():
@@ -47,7 +48,7 @@ def _parse_window(seg, p, col_map):
     if kind is None:
         return None
     arg_col = None
-    if kind in ('lag', 'lead', 'sum'):
+    if kind in ('lag', 'lead', 'sum', 'avg', 'min', 'max'):
         a = fn.this
         if not isinstance(a, E.Column):
             return None
@@ -56,20 +57,31 @@ def _parse_window(seg, p, col_map):
         if not isinstance(fn.this, E.Star) and fn.this is not None:
             return None
     part = inner.args.get('partition_by') or []
-    if len(part) != 1 or not isinstance(part[0], E.Column):
+    if not (1 <= len(part) <= 3) or not all(isinstance(x, E.Column) for x in part):
         return None
-    pcol = col_map.get(part[0].name, part[0].name) if col_map else part[0].name
+    pcols = tuple((col_map.get(x.name, x.name) if col_map else x.name) for x in part)
     order = inner.args.get('order')
-    ocol = None
+    ocol = None; odesc = False
     if order is not None:
-        if len(order.expressions) != 1 or order.expressions[0].args.get('desc'):
+        if len(order.expressions) != 1:
             return None
-        oc = order.expressions[0].this
+        oe = order.expressions[0]
+        odesc = bool(oe.args.get('desc'))
+        oc = oe.this
         if not isinstance(oc, E.Column):
             return None
         ocol = col_map.get(oc.name, oc.name) if col_map else oc.name
-    return {'kind': kind, 'arg': arg_col, 'pcol': pcol, 'ocol': ocol,
-            'alias': wdb_sql._alias(p)}
+    frame = None
+    fs = inner.args.get('spec')
+    if fs is not None:
+        if (fs.args.get('kind') == 'ROWS' and fs.args.get('start_side') == 'PRECEDING'
+                and str(fs.args.get('end')) == 'CURRENT ROW'
+                and str(fs.args.get('start')).isdigit()):
+            frame = ('rows', int(str(fs.args.get('start'))))
+        else:
+            return None                  # other frames: fallback's territory
+    return {'kind': kind, 'arg': arg_col, 'pcols': pcols, 'ocol': ocol, 'odesc': odesc,
+            'frame': frame, 'alias': wdb_sql._alias(p)}
 
 
 def detect(seg, tree, col_map):
@@ -93,23 +105,38 @@ def detect(seg, tree, col_map):
         cols.append((pi, nm))
     if not wins:
         return None
-    pcols = {w['pcol'] for _pi, w in wins}
-    ocols = {w['ocol'] for _pi, w in wins}
-    if len(pcols) != 1 or len(ocols) != 1:
-        return None                      # v1: one shared window spec
-    pcol = next(iter(pcols)); ocol = next(iter(ocols))
-    if not P.columns_exist(seg, pcol) or seg._effective(pcol) is not None:
-        return None
-    if seg.cols[pcol].get('mode') not in (0, 1, 2):
-        return None
-    if ocol is not None and seg.stairs(ocol) is None:
-        return None                      # v1 order: the cluster stair (or file order)
+    psets = {w['pcols'] for _pi, w in wins}
+    osets = {(w['ocol'], w['odesc']) for _pi, w in wins}
+    if len(psets) != 1 or len(osets) != 1:
+        return None                      # one shared window spec (frames may differ per fn)
+    pcols = next(iter(psets)); ocol, odesc = next(iter(osets))
+    span = 1
+    for pcn in pcols:
+        if not P.columns_exist(seg, pcn) or seg._effective(pcn) is not None:
+            return None
+        if seg.cols[pcn].get('mode') not in (0, 1, 2):
+            return None
+        span *= int(seg.cols[pcn]['V'])
+        if span > (1 << 62):
+            return None
+    if ocol is not None:
+        if not P.columns_exist(seg, ocol):
+            return None
+        o_stair = seg.stairs(ocol) is not None
+        o_dict = seg.cols[ocol].get('mode') in (0, 1, 2)
+        if not o_stair and not o_dict:
+            return None                  # order: cluster stair or a dict column
+        oV = int(seg.cols[ocol]['V'])
+        if span * oV > (1 << 62):
+            return None
     for _pi, w in wins:
         if w['arg'] is not None:
             if not P.columns_exist(seg, w['arg']):
                 return None
-            if w['kind'] == 'sum' and seg.cols[w['arg']].get('dt') != 0:
+            if w['kind'] in ('sum', 'avg', 'min', 'max') and seg.cols[w['arg']].get('dt') != 0:
                 return None
+        if w['frame'] is not None and w['kind'] not in ('sum', 'avg', 'count'):
+            return None                  # framed min/max: sliding extremes, later
     qual = tree.args.get('qualify')
     qterms = None
     if qual is not None:
@@ -129,7 +156,7 @@ def detect(seg, tree, col_map):
     lim = wdb_sql._limit(tree)
     if qterms is None and (lim is None or lim > _MAX_FULL):
         return None                      # unbounded full-window output: fallback's territory
-    return {'cols': cols, 'wins': wins, 'pcol': pcol, 'ocol': ocol,
+    return {'cols': cols, 'wins': wins, 'pcols': pcols, 'ocol': ocol, 'odesc': odesc,
             'qterms': qterms, 'lim': lim, 'off': int(wdb_sql._offset(tree) or 0),
             'proj': proj}
 
@@ -142,11 +169,35 @@ def _numvals(seg, col):
     return WS._num_table(seg, col)[np.asarray(seg._raw_codes(col)).astype(np.int64)]
 
 
+def _order_codes_file(seg, ocol):
+    """Per-row order codes in FILE order: stair columns via searchsorted, dicts via raw codes."""
+    if seg.stairs(ocol) is not None:
+        return np.searchsorted(seg.stairs(ocol), np.arange(int(seg.N)), side='right')
+    return np.asarray(seg._raw_codes(ocol)).astype(np.int64)
+
+
 def execute(seg, spec):
     global _HITS
     N = int(seg.N)
-    pc = np.asarray(seg._raw_codes(spec['pcol'])).astype(np.int64)
-    perm = K.part_scatter(pc, int(seg.cols[spec['pcol']]['V']))   # THE FUSED MOTION, compiled
+    # composite partition code (the radix fold)
+    pc = np.asarray(seg._raw_codes(spec['pcols'][0])).astype(np.int64)
+    span = int(seg.cols[spec['pcols'][0]]['V'])
+    for pcn in spec['pcols'][1:]:
+        v2 = int(seg.cols[pcn]['V'])
+        pc = pc * v2 + np.asarray(seg._raw_codes(pcn)).astype(np.int64)
+        span *= v2
+    ocol, odesc = spec['ocol'], spec['odesc']
+    o_stair_asc = (ocol is not None and seg.stairs(ocol) is not None and not odesc)
+    if ocol is None or o_stair_asc:
+        # order inherited from the walk: pure partition scatter (compiled when span is small)
+        perm = (K.part_scatter(pc, span) if span <= 50_000_000
+                else np.argsort(pc, kind='stable'))
+    else:
+        # the TWO-AXIS fused motion: one composite integer places both dimensions at once
+        ofc = _order_codes_file(seg, ocol)
+        oV = int(seg.cols[ocol]['V'])
+        okey = (oV - 1 - ofc) if odesc else ofc
+        perm = np.argsort(pc * oV + okey, kind='stable')
     ps = pc[perm]
     newlane = np.ones(N, bool); newlane[1:] = ps[1:] != ps[:-1]
     lane_start = np.nonzero(newlane)[0]
@@ -155,8 +206,8 @@ def execute(seg, spec):
     # order-value tie groups (peers): SQL's default frame is RANGE -- peers share the
     # aggregate value of their whole tie group (evaluated at the group's END)
     tie_ends = None; tg = None
-    if spec['ocol'] is not None:
-        oc_all = np.searchsorted(seg.stairs(spec['ocol']), perm, side='right')
+    if ocol is not None:
+        oc_all = _order_codes_file(seg, ocol)[perm]
         tie_new = newlane.copy()
         tie_new[1:] |= oc_all[1:] != oc_all[:-1]
         tg = np.cumsum(tie_new) - 1
@@ -196,20 +247,43 @@ def execute(seg, spec):
                 out_s = dec
             else:
                 out_s = shifted
-        elif k == 'sum':
+        elif k in ('sum', 'avg', 'count'):
+            vv = _numvals(seg, w['arg'])[perm] if w['arg'] is not None else None
+            cs = np.cumsum(vv) if vv is not None else None
+            if w['frame'] is not None:               # ROWS k PRECEDING .. CURRENT ROW
+                fk = w['frame'][1]
+                lo_i = np.maximum(np.arange(N, dtype=np.int64) - fk,
+                                  lane_start[lane_id_sorted])
+                nrow = (np.arange(N, dtype=np.int64) - lo_i + 1).astype(np.int64)
+                if k == 'count':
+                    out_s = nrow
+                else:
+                    cs0 = np.concatenate(([0.0], cs))
+                    wsum = cs0[np.arange(1, N + 1)] - cs0[lo_i]
+                    out_s = wsum if k == 'sum' else wsum / nrow
+            elif spec['ocol'] is None:               # whole-partition aggregate
+                if k == 'count':
+                    out_s = lane_len[lane_id_sorted].astype(np.int64)
+                else:
+                    lane_tot = np.add.reduceat(vv, lane_start)
+                    out_s = (lane_tot[lane_id_sorted] if k == 'sum'
+                             else lane_tot[lane_id_sorted] / lane_len[lane_id_sorted])
+            else:                                    # RANGE default: peers share group-end
+                if k == 'count':
+                    out_s = (tie_ends[tg] - lane_start[lane_id_sorted] + 1).astype(np.int64)
+                else:
+                    base = np.where(lane_start > 0, cs[lane_start - 1], 0.0)
+                    rs = cs[tie_ends[tg]] - base[lane_id_sorted]
+                    out_s = rs if k == 'sum' else \
+                        rs / (tie_ends[tg] - lane_start[lane_id_sorted] + 1)
+        else:                                        # running min / max
             vv = _numvals(seg, w['arg'])[perm]
-            cs = np.cumsum(vv)
-            base = np.where(lane_start > 0, cs[lane_start - 1], 0.0)
             if spec['ocol'] is None:
-                lane_tot = np.add.reduceat(vv, lane_start)
-                out_s = lane_tot[lane_id_sorted]         # no ORDER: whole-partition aggregate
+                seg_ext = (np.minimum if k == 'min' else np.maximum).reduceat(vv, lane_start)
+                out_s = seg_ext[lane_id_sorted]
             else:
-                out_s = cs[tie_ends[tg]] - base[lane_id_sorted]   # RANGE: peers share group-end
-        else:                                    # count
-            if spec['ocol'] is None:
-                out_s = lane_len[lane_id_sorted].astype(np.int64)
-            else:
-                out_s = (tie_ends[tg] - lane_start[lane_id_sorted] + 1).astype(np.int64)
+                run = (K.seg_cummin if k == 'min' else K.seg_cummax)(vv, lane_start)
+                out_s = run[tie_ends[tg]]                # RANGE: group-end value for peers
         results[w['alias']] = out_s
     # selection: QUALIFY on window results (lane-space), else first off+lim rows
     if spec['qterms'] is not None:

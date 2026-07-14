@@ -171,6 +171,50 @@ def part_scatter(codes, K):
     return np.argsort(codes, kind='stable')
 
 
+@njit(nogil=True, parallel=True, cache=True)
+def _seg_cumminmax_nb(vals, lane_start, lane_of, do_min):
+    """Segmented cumulative min/max: running extreme within each lane (parallel over lanes)."""
+    out = np.empty(vals.size, vals.dtype)
+    L = lane_start.size
+    for li in numba.prange(L):
+        lo = lane_start[li]
+        hi = lane_start[li + 1] if li + 1 < L else vals.size
+        cur = vals[lo]
+        out[lo] = cur
+        for i in range(lo + 1, hi):
+            v = vals[i]
+            if (v < cur) == do_min and v != cur:
+                cur = v
+            elif do_min and v < cur:
+                cur = v
+            elif not do_min and v > cur:
+                cur = v
+            out[i] = cur
+    return out
+
+
+def seg_cummin(vals, lane_start):
+    if HAVE_NUMBA:
+        return _seg_cumminmax_nb(vals, lane_start, None, True)
+    out = vals.copy()
+    for li in range(lane_start.size):
+        lo = lane_start[li]
+        hi = lane_start[li + 1] if li + 1 < lane_start.size else vals.size
+        out[lo:hi] = np.minimum.accumulate(vals[lo:hi])
+    return out
+
+
+def seg_cummax(vals, lane_start):
+    if HAVE_NUMBA:
+        return _seg_cumminmax_nb(vals, lane_start, None, False)
+    out = vals.copy()
+    for li in range(lane_start.size):
+        lo = lane_start[li]
+        hi = lane_start[li + 1] if li + 1 < lane_start.size else vals.size
+        out[lo:hi] = np.maximum.accumulate(vals[lo:hi])
+    return out
+
+
 def warm():
     """JIT-compile the kernels (call from prewarm; ~1 s once, cached on disk after)."""
     kway_topk(np.array([1, 2], np.int64), np.array([1, 1], np.int64),
