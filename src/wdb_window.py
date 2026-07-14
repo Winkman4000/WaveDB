@@ -161,12 +161,26 @@ def detect(seg, tree, col_map):
             'proj': proj}
 
 
-def _numvals(seg, col):
+def _int_table(seg, col):
+    """code -> int64 value, exact: _dict_ints when the layout has it, typed-dict otherwise.
+    Never float64 -- values past 2**53 lose low bits there (caught live: UserID)."""
+    c = seg.cols[col]
+    try:
+        return np.asarray(seg._dict_ints(c), dtype=np.int64)
+    except Exception:
+        return np.array([int(v) for v in seg._typed_dict(col)], dtype=np.int64)
+
+
+def _numvals(seg, col, exact_int=False):
     c = seg.cols[col]
     if c['mode'] == 4:
-        return np.asarray(seg._seq_decode(c), dtype=np.float64)
+        arr = np.asarray(seg._seq_decode(c))
+        return arr if exact_int and arr.dtype.kind in 'iu' else arr.astype(np.float64)
+    codes = np.asarray(seg._raw_codes(col)).astype(np.int64)
+    if exact_int:
+        return _int_table(seg, col)[codes]
     import wdb_wherescan as WS
-    return WS._num_table(seg, col)[np.asarray(seg._raw_codes(col)).astype(np.int64)]
+    return WS._num_table(seg, col)[codes]
 
 
 def _order_codes_file(seg, ocol):
@@ -277,7 +291,7 @@ def execute(seg, spec):
                     out_s = rs if k == 'sum' else \
                         rs / (tie_ends[tg] - lane_start[lane_id_sorted] + 1)
         else:                                        # running min / max
-            vv = _numvals(seg, w['arg'])[perm]
+            vv = _numvals(seg, w['arg'], exact_int=True)[perm]
             if spec['ocol'] is None:
                 seg_ext = (np.minimum if k == 'min' else np.maximum).reduceat(vv, lane_start)
                 out_s = seg_ext[lane_id_sorted]
@@ -318,9 +332,8 @@ def execute(seg, spec):
                 secs = np.asarray(seg._dict_ints(c), dtype=np.int64)[cc]
                 slots[pi] = secs.astype('datetime64[s]').tolist()    # C-speed datetime conversion
             elif c.get('dt') == 0:
-                import wdb_wherescan as WS
-                tbl = WS._num_table(seg, nm)             # any int-valued dict: pure gather
-                slots[pi] = tbl.astype(np.int64)[cc].tolist()
+                slots[pi] = _int_table(seg, nm)[cc].tolist()   # int64 end-to-end: float64
+                                                               # mangles ints past 2**53
             elif int(c['V']) > 100_000 and sel_file.size < int(c['V']) // 4:
                 # big string dict, sparse selection: decode only the codes that APPEAR
                 uq, inv = np.unique(cc, return_inverse=True)
