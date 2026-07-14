@@ -14,6 +14,7 @@ import numpy as np
 
 try:
     from numba import njit
+    import numba
     HAVE_NUMBA = True
 except Exception:                                     # pragma: no cover
     HAVE_NUMBA = False
@@ -131,9 +132,49 @@ def kway_topk(keys, vals, offs, K):
     return tc, tk
 
 
+@njit(nogil=True, parallel=True, cache=True)
+def _part_scatter_nb(codes, K):
+    """Stable parallel counting scatter: perm such that codes[perm] is grouped by code with
+    original order preserved inside each group -- the fused motion, compiled. Two passes:
+    per-chunk histograms -> exclusive global/chunk offsets -> stable scatter."""
+    N = codes.size
+    T = numba.get_num_threads()
+    chunk = (N + T - 1) // T
+    hist = np.zeros((T, K), np.int64)
+    for t in numba.prange(T):
+        lo = t * chunk
+        hi = min(N, lo + chunk)
+        for i in range(lo, hi):
+            hist[t, codes[i]] += 1
+    offs = np.zeros((T, K), np.int64)
+    run = np.int64(0)
+    for k in range(K):
+        for t in range(T):
+            offs[t, k] = run
+            run += hist[t, k]
+    perm = np.empty(N, np.int64)
+    for t in numba.prange(T):
+        lo = t * chunk
+        hi = min(N, lo + chunk)
+        cur = offs[t].copy()
+        for i in range(lo, hi):
+            c = codes[i]
+            perm[cur[c]] = i
+            cur[c] += 1
+    return perm
+
+
+def part_scatter(codes, K):
+    """Stable grouping permutation by small-int key; numba parallel, numpy fallback."""
+    if HAVE_NUMBA:
+        return _part_scatter_nb(codes, np.int64(K))
+    return np.argsort(codes, kind='stable')
+
+
 def warm():
     """JIT-compile the kernels (call from prewarm; ~1 s once, cached on disk after)."""
     kway_topk(np.array([1, 2], np.int64), np.array([1, 1], np.int64),
               np.array([0, 1, 2], np.int64), 4)
     if HAVE_NUMBA:
         top10_i32(np.array([1, 2], np.int32), 4)
+        part_scatter(np.array([1, 0, 1], np.int64), 2)

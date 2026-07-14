@@ -20,6 +20,7 @@ import numpy as np
 import sqlglot.expressions as E
 import wdb_sql
 import wdb_policies as P
+import wdb_kernels as K
 
 _ENABLED = True
 _HITS = 0
@@ -145,7 +146,7 @@ def execute(seg, spec):
     global _HITS
     N = int(seg.N)
     pc = np.asarray(seg._raw_codes(spec['pcol'])).astype(np.int64)
-    perm = np.argsort(pc, kind='stable')         # THE FUSED MOTION: one placement, two axes
+    perm = K.part_scatter(pc, int(seg.cols[spec['pcol']]['V']))   # THE FUSED MOTION, compiled
     ps = pc[perm]
     newlane = np.ones(N, bool); newlane[1:] = ps[1:] != ps[:-1]
     lane_start = np.nonzero(newlane)[0]
@@ -223,9 +224,8 @@ def execute(seg, spec):
         sel_s = np.nonzero(m)[0]
     else:
         sel_s = np.arange(N)
-    sel_file = perm[sel_s]
-    o = np.argsort(sel_file, kind='stable')      # emit in file (cluster) order
-    sel_s, sel_file = sel_s[o], sel_file[o]
+    sel_file = perm[sel_s]                       # lane-order emission: no outer ORDER BY,
+                                                 # so no order is promised -- the reorder died
     if spec['lim'] is not None:
         sel_s = sel_s[spec['off']: spec['off'] + spec['lim']]
         sel_file = sel_file[spec['off']: spec['off'] + spec['lim']]
