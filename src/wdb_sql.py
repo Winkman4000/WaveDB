@@ -1281,7 +1281,17 @@ def _eval_pred(seg, node, seg_col):
     if isinstance(node, E.Not): return ~_eval_pred(seg,node.this,seg_col)
     if isinstance(node, E.Paren): return _eval_pred(seg,node.this,seg_col)
     if isinstance(node, (E.EQ,E.NEQ,E.GT,E.LT,E.GTE,E.LTE)):
-        col=_colname(node.this); cn=seg_col(col); lit=node.expression
+        col=_colname(node.this)
+        if col is None:                        # LHS isn't a bare column: try scalar-expression
+            import wdb_wherescan as _WS
+            sc = _WS._scalar_cmp(seg, node, None)
+            if sc is not None:
+                sp, op, lit2 = sc
+                fl = _WS._scalar_flag(seg, sp, op, lit2)
+                codes = np.asarray(seg._raw_codes(seg_col(sp['col']))).astype(np.int64)
+                return fl[codes]
+            raise NotImplementedError(f"predicate LHS {type(node.this).__name__}")
+        cn=seg_col(col); lit=node.expression
         if not (isinstance(lit,E.Literal) or (isinstance(lit,E.Neg) and isinstance(lit.this,E.Literal))):
             raise NotImplementedError("non-literal RHS")
         if isinstance(node, (E.EQ, E.NEQ)):

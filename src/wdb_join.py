@@ -598,6 +598,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         return _colmemo[k]
 
     def resolve(node):
+        if not isinstance(node, E.Column):
+            raise _FastUnsupported            # scalar expressions etc.: not fusable, fall back
         a, nm = node.table, node.name
         if not a:                               # unqualified: find the unique table owning the column
             owners = [al for al, cs in cols_of.items() if nm in cs]

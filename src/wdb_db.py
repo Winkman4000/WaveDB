@@ -270,6 +270,10 @@ class Database:
         if result is not commands._NOT_A_COMMAND:
             return result
         if isinstance(tree, E.Select):
+            import wdb_cte
+            if wdb_cte.has_cte(tree):
+                tree = wdb_cte.rewrite(tree)      # flatten views before anything resolves
+                sql = tree.sql()
             if tree.args.get('joins'):
                 _rw = wdb_join.denorm_rewrite(self, tree)        # join that groups by a denormalised parent
                 if _rw is None:                                  # column -> single-table cube read; else gather
