@@ -28,7 +28,8 @@ def _tables(tree):
     if f is None or len(joins) != 1 or not isinstance(f.this, E.Table):
         return None
     j = joins[0]
-    if (j.side or '').upper() not in ('', 'INNER') or (j.kind or '').upper() not in ('', 'INNER'):
+    side = (j.side or '').upper()
+    if side not in ('', 'INNER', 'LEFT') or (j.kind or '').upper() not in ('', 'INNER'):
         return None
     if not isinstance(j.this, E.Table):
         return None
@@ -39,7 +40,7 @@ def _tables(tree):
     a, b = on.this, on.expression
     if not (isinstance(a, E.Column) and isinstance(b, E.Column)):
         return None
-    return (t1.name, t1.alias or t1.name), (t2.name, t2.alias or t2.name), (a, b)
+    return (t1.name, t1.alias or t1.name), (t2.name, t2.alias or t2.name), (a, b), side
 
 
 def _split_where(tree, quals1, quals2):
@@ -74,7 +75,7 @@ def try_execute(db, tree):
     t = _tables(tree)
     if t is None:
         return None
-    (n1, a1), (n2, a2), (ka, kb) = t
+    (n1, a1), (n2, a2), (ka, kb), side = t
     try:
         sizes = {a1: db.cat.get_table(n1).get('rows'), a2: db.cat.get_table(n2).get('rows')}
     except KeyError:
@@ -84,13 +85,16 @@ def try_execute(db, tree):
             (a1, a2, n1, n2, ka, kb), (a2, a1, n2, n1, kb, ka)):
         if fk.table != fact_al or dk.table != dim_al:
             continue
-        out = _try_orientation(db, tree, fact_al, dim_al, fact_tn, dim_tn, fk.name, dk.name)
+        if side == 'LEFT' and fact_al != (t[0][1]):
+            continue                             # LEFT keeps the FROM side's rows: fact must be left
+        out = _try_orientation(db, tree, fact_al, dim_al, fact_tn, dim_tn, fk.name, dk.name,
+                               left=(side == 'LEFT'))
         if out is not None:
             return out
     return None
 
 
-def _try_orientation(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey):
+def _try_orientation(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey, left=False):
     proj = tree.expressions
     dim_cols, fact_cols, aggs = [], [], []
     for pi, p in enumerate(proj):
@@ -121,6 +125,8 @@ def _try_orientation(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey):
     if sw is None:
         return None
     fact_conds, dim_conds = sw
+    if left and dim_conds:
+        left = False                             # WHERE on the dim side nullifies LEFT
     if tree.args.get('having') is not None or tree.args.get('qualify') is not None:
         return None
     # ---- dim side: key + needed attributes, filtered ----
@@ -128,17 +134,26 @@ def _try_orientation(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey):
     dsel = 'SELECT ' + ', '.join([dkey] + need) + ' FROM ' + dim_tn
     if dim_conds:
         dsel += ' WHERE ' + ' AND '.join(_strip_qual(c).sql() for c in dim_conds)
+    dpaths = db.cat.segment_paths(dim_tn)
+    if len(dpaths) == 1:
+        dseg_n = int(db.open_segment(dpaths[0], dim_tn).N)
+        if dseg_n > _DIM_CAP:
+            if left:
+                return None
+            return _giant_m2o(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey,
+                              proj, dim_cols, fact_cols, aggs, fact_conds, dim_conds)
     drows_out = db.run(dsel)
     drows = drows_out[0] if isinstance(drows_out, tuple) else drows_out
     if len(drows) > _DIM_CAP:
         return None
     dmap = {}
     for r in drows:
-        if r[0] in dmap:
-            return None                          # one-to-many dimension: would multiply rows
-        dmap[r[0]] = r[1:]
-    if not dmap:
+        dmap.setdefault(r[0], []).append(r[1:])  # one-to-many: each match multiplies the row
+    if not dmap and not left:
         return [], [wdb_sql._alias(p) for p in proj]
+    multi = any(len(v) > 1 for v in dmap.values())
+    if multi and any(kd in ('MIN', 'MAX') for _pi, kd in aggs):
+        pass                                     # MIN/MAX are duplication-immune: fine
     attr_idx = {nm: i for i, nm in enumerate(need)}
     keys = list(dmap.keys())
     # ---- fact side: single-table, key IN (semi-join), grouped by (key + fact group cols) ----
@@ -147,7 +162,8 @@ def _try_orientation(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey):
             return "'" + v.replace("'", "''") + "'"
         return str(v)
     fact_where = [_strip_qual(c).sql() for c in fact_conds]
-    fact_where.append(fkey + ' IN (' + ', '.join(lit(k) for k in keys) + ')')
+    if not left:
+        fact_where.append(fkey + ' IN (' + ', '.join(lit(k) for k in keys) + ')')
     if aggs:
         gcols = [fkey] + sorted({nm for _pi, nm in fact_cols})
         fexpr = list(gcols)
@@ -156,7 +172,7 @@ def _try_orientation(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey):
             inner = p.this if isinstance(p, E.Alias) else p
             fexpr.append(_strip_qual(inner).sql() + ' AS __a%d' % pi)
         fsel = ('SELECT ' + ', '.join(fexpr) + ' FROM ' + fact_tn
-                + ' WHERE ' + ' AND '.join(fact_where)
+                + ((' WHERE ' + ' AND '.join(fact_where)) if fact_where else '')
                 + ' GROUP BY ' + ', '.join(gcols))
         frows_out = db.run(fsel)
         frows = frows_out[0] if isinstance(frows_out, tuple) else frows_out
@@ -164,28 +180,31 @@ def _try_orientation(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey):
         fpos = {nm: i for i, nm in enumerate(gcols)}
         acc = {}
         for r in frows:
-            dvals = dmap.get(r[0])
-            if dvals is None:
-                continue
-            gkey = []
-            for pi, nm in dim_cols:
-                gkey.append(dvals[attr_idx[nm]])
-            for pi, nm in fact_cols:
-                gkey.append(r[fpos[nm]])
-            gkey = tuple(gkey)
+            matches = dmap.get(r[0])
+            if matches is None:
+                if not left:
+                    continue
+                matches = [tuple([None] * len(need))]
             avals = r[len(gcols):]
-            cur = acc.get(gkey)
-            if cur is None:
-                acc[gkey] = list(avals)
-            else:
-                for i, (_pi, kd) in enumerate(aggs):
-                    v = avals[i]
-                    if kd in ('COUNT_STAR', 'SUM'):
-                        cur[i] = cur[i] + v
-                    elif kd == 'MIN':
-                        cur[i] = v if v < cur[i] else cur[i]
-                    else:
-                        cur[i] = v if v > cur[i] else cur[i]
+            for dvals in matches:
+                gkey = []
+                for pi, nm in dim_cols:
+                    gkey.append(dvals[attr_idx[nm]])
+                for pi, nm in fact_cols:
+                    gkey.append(r[fpos[nm]])
+                gkey = tuple(gkey)
+                cur = acc.get(gkey)
+                if cur is None:
+                    acc[gkey] = list(avals)
+                else:
+                    for i, (_pi, kd) in enumerate(aggs):
+                        v = avals[i]
+                        if kd in ('COUNT_STAR', 'SUM'):
+                            cur[i] = cur[i] + v
+                        elif kd == 'MIN':
+                            cur[i] = v if v < cur[i] else cur[i]
+                        else:
+                            cur[i] = v if v > cur[i] else cur[i]
         rows = []
         for gkey, avals in acc.items():
             row = [None] * len(proj)
@@ -204,7 +223,7 @@ def _try_orientation(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey):
             return None
         fexpr = [fkey] + sorted({nm for _pi, nm in fact_cols})
         fsel = ('SELECT ' + ', '.join(fexpr) + ' FROM ' + fact_tn
-                + ' WHERE ' + ' AND '.join(fact_where))
+                + ((' WHERE ' + ' AND '.join(fact_where)) if fact_where else ''))
         if tree.args.get('order') is None:
             fsel += ' LIMIT ' + str(lim * 2)
         frows_out = db.run(fsel)
@@ -212,15 +231,117 @@ def _try_orientation(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey):
         fpos = {nm: i for i, nm in enumerate(fexpr)}
         rows = []
         for r in frows:
-            dvals = dmap.get(r[0])
-            if dvals is None:
-                continue
-            row = [None] * len(proj)
-            for pi, nm in dim_cols:
-                row[pi] = dvals[attr_idx[nm]]
-            for pi, nm in fact_cols:
-                row[pi] = r[fpos[nm]]
-            rows.append(tuple(row))
+            matches = dmap.get(r[0])
+            if matches is None:
+                if not left:
+                    continue
+                matches = [tuple([None] * len(need))]
+            for dvals in matches:
+                row = [None] * len(proj)
+                for pi, nm in dim_cols:
+                    row[pi] = dvals[attr_idx[nm]]
+                for pi, nm in fact_cols:
+                    row[pi] = r[fpos[nm]]
+                rows.append(tuple(row))
+    order = tree.args.get('order')
+    if order is not None:
+        names = [wdb_sql._alias(p) for p in proj]
+        for oe in reversed(order.expressions):
+            nm = oe.this.name if isinstance(oe.this, E.Column) else None
+            if nm is None or nm not in names:
+                return None
+            idx = names.index(nm)
+            rows.sort(key=lambda r: (r[idx] is None, r[idx]), reverse=bool(oe.args.get('desc')))
+    lim = wdb_sql._limit(tree)
+    off = wdb_sql._offset(tree) or 0
+    if lim is not None or off:
+        rows = rows[off: None if lim is None else off + lim]
+    return rows, [wdb_sql._alias(p) for p in proj]
+
+
+def _giant_m2o(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey,
+               proj, dim_cols, fact_cols, aggs, fact_conds, dim_conds):
+    """Both sides giant, many-to-one: the join is three gathers and a bincount. The
+    dictionaries meet ONCE (both value-sorted: one searchsorted builds the translation);
+    the dim key's raw codes give a row-per-code map; then every fact row's group cell is
+    attr_codes[rowof[translate[key_codes]]] -- integers end to end, no row ever decodes."""
+    import numpy as np
+    if fact_cols or not aggs or not dim_cols or len(dim_cols) > 2:
+        return None                              # v1: dim-attr grouping + aggregates only
+    if any(kd not in ('COUNT_STAR', 'SUM') for _pi, kd in aggs):
+        return None
+    fpaths = db.cat.segment_paths(fact_tn)
+    dpaths = db.cat.segment_paths(dim_tn)
+    if len(fpaths) != 1 or len(dpaths) != 1:
+        return None
+    fseg = db.open_segment(fpaths[0], fact_tn)
+    dseg = db.open_segment(dpaths[0], dim_tn)
+    import wdb_window as WN
+    try:
+        fk_vals = WN._int_table(fseg, fkey)
+        dk_vals = WN._int_table(dseg, dkey)
+    except Exception:
+        return None                              # v1: integer-valued key dictionaries
+    # the introduction: two sorted dictionaries, one merge
+    t_pos = np.searchsorted(dk_vals, fk_vals)
+    t_pos_c = np.minimum(t_pos, dk_vals.size - 1)
+    trans = np.where(dk_vals[t_pos_c] == fk_vals, t_pos_c, -1).astype(np.int64)
+    # dim row per key code (m2o requires unique keys)
+    dkc = np.asarray(dseg._raw_codes(dkey)).astype(np.int64)
+    N2 = int(dseg.N)
+    if np.unique(dkc).size < N2:
+        return None                              # duplicate keys: multiplying join
+    keep_dim = np.ones(N2, bool)
+    for c in dim_conds:
+        keep_dim &= wdb_sql._eval_pred(dseg, _strip_qual(c),
+                                       lambda nm: nm)
+    rowof = np.full(dk_vals.size, -1, dtype=np.int64)
+    rowof[dkc[keep_dim]] = np.nonzero(keep_dim)[0]
+    # fact side: key codes -> dim row, masked by fact conditions
+    fkc = np.asarray(fseg._raw_codes(fkey)).astype(np.int64)
+    frow = np.where(trans[fkc] >= 0, rowof[np.maximum(trans[fkc], 0)], -1)
+    keep = frow >= 0
+    for c in fact_conds:
+        keep &= wdb_sql._eval_pred(fseg, _strip_qual(c), lambda nm: nm)
+    frow_k = frow[keep]
+    # group cells: composed dim-attr codes (radix fold), aggregated by bincount
+    acodes_all, spans, atabs = [], [], []
+    for _pi, nm in dim_cols:
+        c2 = dseg.cols.get(nm)
+        if c2 is None or c2.get('mode') not in (0, 1, 2):
+            return None
+        ac = np.asarray(dseg._raw_codes(nm)).astype(np.int64)
+        acodes_all.append(ac[frow_k]); spans.append(int(c2['V'])); atabs.append(nm)
+    comp = acodes_all[0]
+    for i in range(1, len(acodes_all)):
+        comp = comp * spans[i] + acodes_all[i]
+    total = 1
+    for v in spans:
+        total *= v
+    if total > 50_000_000:
+        return None
+    counts = np.bincount(comp, minlength=total)
+    sums = {}
+    for pi, kd in aggs:
+        if kd == 'SUM':
+            p = proj[pi]
+            inner = p.this if isinstance(p, E.Alias) else p
+            v = WN._numvals(fseg, inner.this.name)[keep]
+            sums[pi] = np.bincount(comp, weights=v, minlength=total)
+    live = np.nonzero(counts)[0]
+    rows = []
+    for cell in live:
+        rem = int(cell); key_codes = []
+        for i in range(len(spans) - 1, -1, -1):
+            key_codes.append(rem % spans[i]); rem //= spans[i]
+        key_codes.reverse()
+        row = [None] * len(proj)
+        for (pi, nm), kc in zip(dim_cols, key_codes):
+            v = wdb_sql._pyval(dseg.fetch(nm, int(kc)))
+            row[pi] = v.decode('utf-8', 'replace') if isinstance(v, (bytes, bytearray)) else v
+        for pi, kd in aggs:
+            row[pi] = int(counts[cell]) if kd == 'COUNT_STAR' else float(sums[pi][cell])
+        rows.append(tuple(row))
     order = tree.args.get('order')
     if order is not None:
         names = [wdb_sql._alias(p) for p in proj]
