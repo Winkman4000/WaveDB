@@ -1317,8 +1317,18 @@ def _eval_pred(seg, node, seg_col):
         if nmask is not None: res = res & ~nmask
         return res
     if isinstance(node, E.In):
-        col=_colname(node.this); a, nmask = _col(seg, seg_col(col))
+        col=_colname(node.this)
         lits=node.args.get('expressions') or []
+        c0 = seg.cols.get(seg_col(col))
+        if (c0 is not None and c0.get('mode') in (0, 1, 2) and len(lits) > 64
+                and all(isinstance(L, E.Literal) for L in lits)):
+            # big literal lists on dict columns: bind values to CODES once, isin over raw
+            # codes -- never decode the column (a 4k-value NOT IN was minutes of string decode)
+            import wdb_wherescan as _WS
+            vals0 = [(L.this if L.is_string else str(L.this)) for L in lits]
+            tcs = _WS._in_codes(seg, seg_col(col), vals0)
+            return np.isin(np.asarray(seg._raw_codes(seg_col(col))).astype(np.int64), tcs)
+        a, nmask = _col(seg, seg_col(col))
         vals=[]
         for L in lits:
             neg = isinstance(L, E.Neg) and isinstance(L.this, E.Literal)   # IN (-1, 6): -1 parses as Neg(Literal)
