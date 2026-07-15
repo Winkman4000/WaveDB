@@ -99,6 +99,12 @@ def table_agg(db, tree):
     """Single-table aggregate routed through the SAME fused engine as joins: a 0-join chain (fact only, every
     cptr is None). Reuses predicate fusion, high-card factorise, and vectorised assembly. Raises
     _FastUnsupported on anything not fusable so the caller falls back to the mature single-table executor."""
+    w = tree.args.get('where')
+    if w is not None:
+        for innode in w.find_all(E.In):
+            if len(innode.args.get('expressions') or []) > 256:
+                raise _FastUnsupported       # giant literal lists: the pandas tail decodes the
+                                             # world; the fallback's code-space isin is the path
     return _fast_pointer_agg(db, tree, _build_chain(db, tree))
 
 
