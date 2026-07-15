@@ -286,6 +286,8 @@ class Database:
                 return wdb_groupsets.execute(self, tree)   # each set is a plain fast GROUP BY
             import wdb_subquery
             if wdb_subquery.has_subquery(tree):
+                tree = tree.copy()                        # never mutate the parse cache:
+                                                          # repeat runs must see pristine trees
                 dec = wdb_subquery._try_window_decorrelate(self, tree)
                 if dec is not None:                       # self-join becomes one placement
                     t2, drop = dec
