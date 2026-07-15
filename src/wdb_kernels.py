@@ -215,6 +215,59 @@ def seg_cummax(vals, lane_start):
     return out
 
 
+@njit(nogil=True, parallel=True, cache=True)
+def _seg_slidext_nb(vals, lane_start, k, do_min):
+    """Sliding window min/max over ROWS k PRECEDING .. CURRENT ROW, per lane: the classic
+    monotonic deque, one deque per lane, parallel over lanes."""
+    N = vals.size
+    out = np.empty(N, vals.dtype)
+    L = lane_start.size
+    for li in numba.prange(L):
+        lo = lane_start[li]
+        hi = lane_start[li + 1] if li + 1 < L else N
+        m = hi - lo
+        dq = np.empty(m, np.int64)          # indices, front..back monotonic
+        head = 0; tail = 0                   # deque in dq[head:tail]
+        for i in range(lo, hi):
+            lo_w = i - k
+            while head < tail and dq[head] < lo_w:
+                head += 1
+            v = vals[i]
+            if do_min:
+                while head < tail and vals[dq[tail - 1]] >= v:
+                    tail -= 1
+            else:
+                while head < tail and vals[dq[tail - 1]] <= v:
+                    tail -= 1
+            dq[tail] = i; tail += 1
+            out[i] = vals[dq[head]]
+    return out
+
+
+def seg_slidmin(vals, lane_start, k):
+    if HAVE_NUMBA:
+        return _seg_slidext_nb(vals, lane_start, np.int64(k), True)
+    out = vals.copy()
+    for li in range(lane_start.size):
+        lo = lane_start[li]
+        hi = lane_start[li + 1] if li + 1 < lane_start.size else vals.size
+        for i in range(lo, hi):
+            out[i] = vals[max(lo, i - k):i + 1].min()
+    return out
+
+
+def seg_slidmax(vals, lane_start, k):
+    if HAVE_NUMBA:
+        return _seg_slidext_nb(vals, lane_start, np.int64(k), False)
+    out = vals.copy()
+    for li in range(lane_start.size):
+        lo = lane_start[li]
+        hi = lane_start[li + 1] if li + 1 < lane_start.size else vals.size
+        for i in range(lo, hi):
+            out[i] = vals[max(lo, i - k):i + 1].max()
+    return out
+
+
 def warm():
     """JIT-compile the kernels (call from prewarm; ~1 s once, cached on disk after)."""
     kway_topk(np.array([1, 2], np.int64), np.array([1, 1], np.int64),

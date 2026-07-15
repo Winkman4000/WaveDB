@@ -135,8 +135,8 @@ def detect(seg, tree, col_map):
                 return None
             if w['kind'] in ('sum', 'avg', 'min', 'max') and seg.cols[w['arg']].get('dt') != 0:
                 return None
-        if w['frame'] is not None and w['kind'] not in ('sum', 'avg', 'count'):
-            return None                  # framed min/max: sliding extremes, later
+        if w['frame'] is not None and w['kind'] not in ('sum', 'avg', 'count', 'min', 'max'):
+            return None
     qual = tree.args.get('qualify')
     qterms = None
     if qual is not None:
@@ -166,6 +166,16 @@ def detect(seg, tree, col_map):
                 if not P.columns_exist(seg, nm) or seg.cols[nm].get('dt') != 0:
                     return None
                 qterms.append(('col', a.name, WS._SCMP[tn], nm))          # alias <op> col
+            elif isinstance(a, E.Column) and a.name not in aliases and isinstance(b, E.Literal):
+                nm = col_map.get(a.name, a.name) if col_map else a.name   # plain col <op> lit
+                if not P.columns_exist(seg, nm):
+                    return None
+                v = str(b.this)
+                try:
+                    v = float(v) if not b.is_string else v
+                except ValueError:
+                    pass
+                qterms.append(('pcol', nm, WS._SCMP[tn], v))
             else:
                 return None
     lim = wdb_sql._limit(tree)
@@ -305,9 +315,12 @@ def execute(seg, spec):
                     rs = cs[tie_ends[tg]] - base[lane_id_sorted]
                     out_s = rs if k == 'sum' else \
                         rs / (tie_ends[tg] - lane_start[lane_id_sorted] + 1)
-        else:                                        # running min / max
+        else:                                        # min / max: running or sliding
             vv = _numvals(seg, w['arg'], exact_int=True)[perm]
-            if spec['ocol'] is None:
+            if w['frame'] is not None:                   # ROWS k PRECEDING: monotonic deque
+                fk = w['frame'][1]
+                out_s = (K.seg_slidmin if k == 'min' else K.seg_slidmax)(vv, lane_start, fk)
+            elif spec['ocol'] is None:
                 seg_ext = (np.minimum if k == 'min' else np.maximum).reduceat(vv, lane_start)
                 out_s = seg_ext[lane_id_sorted]
             else:
@@ -319,11 +332,29 @@ def execute(seg, spec):
         m = np.ones(N, bool)
         for term in spec['qterms']:
             al, op = term[1], term[2]
-            arr = results[al]
-            if hasattr(arr, 'dtype') and arr.dtype == object:
-                arr = np.array([float(x) if x is not None else np.nan for x in arr])
+            if term[0] != 'pcol':
+                arr = results[al]
+                if hasattr(arr, 'dtype') and arr.dtype == object:
+                    arr = np.array([float(x) if x is not None else np.nan for x in arr])
             if term[0] == 'lit':
                 val = term[3]
+            elif term[0] == 'pcol':
+                nm, v = term[1], term[3]
+                if isinstance(v, str):
+                    import wdb_wherescan as WS2
+                    fl = np.zeros(int(seg.cols[nm]['V']), bool)
+                    code = WS2._code_of(seg, nm, v)
+                    if code is not None:
+                        fl[code] = True
+                    cc = np.asarray(seg._raw_codes(nm)).astype(np.int64)[perm]
+                    cmpv = fl[cc]
+                    m &= (cmpv if op == '=' else ~cmpv)
+                    continue
+                arr2 = _numvals(seg, nm, exact_int=False)[perm]
+                m &= (arr2 > v if op == '>' else arr2 >= v if op == '>=' else
+                      arr2 < v if op == '<' else arr2 <= v if op == '<=' else
+                      arr2 == v if op == '=' else arr2 != v)
+                continue
             else:
                 val = _numvals(seg, term[3], exact_int=False)[perm]   # col compare, lane-space
             m &= (arr > val if op == '>' else arr >= val if op == '>=' else
