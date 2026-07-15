@@ -51,9 +51,14 @@ def order_col_index(q, hdr):
 def norm(x):
     if hasattr(x, 'item'):
         x = x.item()
-    if isinstance(x, float):
-        return round(x, 4)
-    return str(x)
+    if isinstance(x, bool) or x is None:
+        return str(x)
+    if isinstance(x, (int, float)):
+        return round(float(x), 4)        # int-vs-float emission parity across engines
+    try:
+        return round(float(x), 4)
+    except (TypeError, ValueError):
+        return str(x)
 
 
 def validate(kind, q, w, hdr, d):
