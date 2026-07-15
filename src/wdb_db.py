@@ -283,6 +283,15 @@ class Database:
             phys = self.cat.phys_map(name)
             import wdb_subquery
             if wdb_subquery.has_subquery(tree):
+                dec = wdb_subquery._try_window_decorrelate(self, tree)
+                if dec is not None:                       # self-join becomes one placement
+                    t2, drop = dec
+                    out = self.run(t2.sql())
+                    rows, hdr = out if isinstance(out, tuple) else (out, None)
+                    rows = [r[:drop] + r[drop + 1:] for r in rows]
+                    if hdr:
+                        hdr = hdr[:drop] + hdr[drop + 1:]
+                    return rows, hdr
                 tree = wdb_subquery.rewrite(self, tree)   # in-tree: no sql-text roundtrip
                 sql = tree.sql()                          # for reads that consume raw sql
             cmap = {c: phys.get(c, c) for c in self.cat.column_names(name)}  # complete logical->physical

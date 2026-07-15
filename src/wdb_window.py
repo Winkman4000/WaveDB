@@ -143,15 +143,30 @@ def detect(seg, tree, col_map):
         qterms = []
         aliases = {w['alias'] for _pi, w in wins}
         import wdb_wherescan as WS
+        _FLIP = {'>': '<', '>=': '<=', '<': '>', '<=': '>=', '=': '=', '<>': '<>'}
         for qc in WS._conjuncts(qual.this):
             tn = type(qc).__name__
-            if tn not in WS._SCMP or not isinstance(qc.this, E.Column):
+            if tn not in WS._SCMP:
                 return None
-            if qc.this.name not in aliases or not isinstance(qc.expression, E.Literal):
-                return None
-            try:
-                qterms.append((qc.this.name, WS._SCMP[tn], float(str(qc.expression.this))))
-            except Exception:
+            a, b = qc.this, qc.expression
+            if isinstance(a, E.Column) and a.name in aliases and isinstance(b, E.Literal):
+                try:
+                    qterms.append(('lit', a.name, WS._SCMP[tn], float(str(b.this))))
+                except Exception:
+                    return None
+            elif isinstance(a, E.Column) and isinstance(b, E.Column) \
+                    and b.name in aliases and a.name not in aliases:
+                nm = col_map.get(a.name, a.name) if col_map else a.name
+                if not P.columns_exist(seg, nm) or seg.cols[nm].get('dt') != 0:
+                    return None
+                qterms.append(('col', b.name, _FLIP[WS._SCMP[tn]], nm))   # alias <flip> col
+            elif isinstance(b, E.Column) and isinstance(a, E.Column) \
+                    and a.name in aliases and b.name not in aliases:
+                nm = col_map.get(b.name, b.name) if col_map else b.name
+                if not P.columns_exist(seg, nm) or seg.cols[nm].get('dt') != 0:
+                    return None
+                qterms.append(('col', a.name, WS._SCMP[tn], nm))          # alias <op> col
+            else:
                 return None
     lim = wdb_sql._limit(tree)
     if qterms is None and (lim is None or lim > _MAX_FULL):
@@ -302,10 +317,15 @@ def execute(seg, spec):
     # selection: QUALIFY on window results (lane-space), else first off+lim rows
     if spec['qterms'] is not None:
         m = np.ones(N, bool)
-        for al, op, val in spec['qterms']:
+        for term in spec['qterms']:
+            al, op = term[1], term[2]
             arr = results[al]
-            if arr.dtype == object:
+            if hasattr(arr, 'dtype') and arr.dtype == object:
                 arr = np.array([float(x) if x is not None else np.nan for x in arr])
+            if term[0] == 'lit':
+                val = term[3]
+            else:
+                val = _numvals(seg, term[3], exact_int=False)[perm]   # col compare, lane-space
             m &= (arr > val if op == '>' else arr >= val if op == '>=' else
                   arr < val if op == '<' else arr <= val if op == '<=' else
                   arr == val if op == '=' else arr != val)

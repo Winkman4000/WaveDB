@@ -19,11 +19,22 @@ _MAX_IN = 2_000_000
 
 def has_subquery(tree):
     w = tree.args.get('where')
-    return w is not None and any(True for _ in w.find_all(E.Subquery))
+    if w is None:
+        return False
+    return (any(True for _ in w.find_all(E.Subquery))
+            or any(True for _ in w.find_all(E.Exists)))
 
 
 def _run_inner(db, sub):
     inner = sub.this
+    tn, alias = _inner_tables(inner)
+    if alias is not None:
+        quals = {alias} if alias != tn else {tn}
+        for col in inner.find_all(E.Column):
+            if col.table and col.table not in quals:
+                raise NotImplementedError(
+                    "correlated subquery shape not supported (outer ref %s.%s)"
+                    % (col.table, col.name))
     try:
         out = db.run(inner.sql())
     except (NotImplementedError, KeyError) as e:
@@ -43,11 +54,127 @@ def _lit(v):
     return E.Literal.string(str(v))
 
 
+def _inner_tables(sel):
+    f = sel.args.get('from_') or sel.args.get('from')
+    if f is None or not isinstance(f.this, E.Table):
+        return None, None
+    return f.this.name, (f.this.alias or f.this.name)
+
+
+def _corr_eq(sel, outer_names):
+    """Split the inner WHERE into (the single outer-eq correlation, remaining conjuncts).
+    Returns (inner_col, outer_col, rest) or None."""
+    import wdb_wherescan as WS
+    w = sel.args.get('where')
+    if w is None:
+        return None
+    _tn, alias = _inner_tables(sel)
+    if alias is None:
+        return None
+    # SQL scoping: an alias HIDES the table name inside the subquery, so with FROM hits h2,
+    # a 'hits.'-qualified column refers to the OUTER query's hits
+    inner_quals = {alias} if alias != _tn else {_tn}
+    def is_outer(x):
+        return bool(x.table) and x.table not in inner_quals
+    corr, rest = None, []
+    for c in WS._conjuncts(w.this):
+        cols = list(c.find_all(E.Column))
+        if not any(is_outer(x) for x in cols):
+            rest.append(c)
+            continue
+        if (type(c).__name__ != 'EQ' or len(cols) != 2 or corr is not None
+                or not isinstance(c.this, E.Column) or not isinstance(c.expression, E.Column)):
+            return None
+        a, b = c.this, c.expression
+        if not is_outer(a) and is_outer(b):
+            corr = (a.name, b.name)
+        elif not is_outer(b) and is_outer(a):
+            corr = (b.name, a.name)
+        else:
+            return None
+    return None if corr is None else (corr[0], corr[1], rest)
+
+
+def _try_window_decorrelate(db, tree):
+    """x <cmp> (SELECT AGG(y) FROM <same table> t2 WHERE t2.g = outer.g) as the WHOLE WHERE
+    -> the window read: QUALIFY x <cmp> AGG(y) OVER (PARTITION BY g). Self-joins become one
+    placement."""
+    w = tree.args.get('where')
+    if w is None or tree.args.get('group') is not None:
+        return None
+    cmp_node = w.this
+    if type(cmp_node).__name__ not in ('GT', 'GTE', 'LT', 'LTE'):
+        return None
+    a, b = cmp_node.this, cmp_node.expression
+    flip = False
+    if isinstance(a, E.Subquery):
+        a, b, flip = b, a, True
+    if not (isinstance(a, E.Column) and isinstance(b, E.Subquery)):
+        return None
+    inner = b.this
+    f = tree.args.get('from_') or tree.args.get('from')
+    itn, _al = _inner_tables(inner)
+    if f is None or itn is None or f.this.name != itn:
+        return None                              # v1: self-table only
+    if len(inner.expressions) != 1:
+        return None
+    import wdb_sql
+    ak = wdb_sql._agg_kind(inner.expressions[0])
+    if ak is None or ak[0] not in ('SUM', 'AVG', 'MIN', 'MAX', 'COUNT_STAR'):
+        return None
+    ce = _corr_eq(inner, None)
+    if ce is None or ce[2]:
+        return None                              # v1: pure eq-correlation, no extra conds
+    icol, ocol = ce[0], ce[1]
+    if icol != ocol:
+        return None                              # partition key must be the same column
+    fname = {'SUM': 'SUM', 'AVG': 'AVG', 'MIN': 'MIN', 'MAX': 'MAX', 'COUNT_STAR': 'COUNT'}[ak[0]]
+    arg = '*' if ak[0] == 'COUNT_STAR' else ak[1]
+    win_sql = f"{fname}({arg}) OVER (PARTITION BY {icol}) AS __corr0"
+    new = tree.copy()
+    new.set('where', None)
+    proj = list(new.expressions)
+    import sqlglot
+    proj.append(sqlglot.parse_one(f"SELECT {win_sql} FROM x").expressions[0])
+    new.set('expressions', proj)
+    op = {'GT': '>', 'GTE': '>=', 'LT': '<', 'LTE': '<='}[type(cmp_node).__name__]
+    if flip:
+        op = {'>': '<', '>=': '<=', '<': '>', '<=': '>='}[op]
+    qual = sqlglot.parse_one(f"SELECT 1 FROM x QUALIFY {a.name} {op} __corr0")
+    new.set('qualify', qual.args['qualify'])
+    return new, len(proj) - 1                    # tree + index of the helper column to strip
+
+
 def rewrite(db, tree):
     """Substitute every uncorrelated WHERE subquery; returns the rewritten tree."""
     w = tree.args.get('where')
     if w is None:
         return tree
+    # EXISTS with an equality correlation -> semi-join as IN; NOT EXISTS -> null-safe NOT IN
+    for ex in list(w.find_all(E.Exists)):
+        inner = ex.this
+        ce = _corr_eq(inner, None)
+        if ce is None:
+            raise NotImplementedError("EXISTS without a single eq-correlation")
+        icol, ocol, rest = ce
+        sub = inner.copy()
+        sub.set('expressions', [E.column(icol)])
+        if rest:
+            r = rest[0].copy()
+            for x in rest[1:]:
+                r = E.And(this=r, expression=x.copy())
+            sub.set('where', E.Where(this=r))
+        else:
+            sub.set('where', None)
+        in_node = E.In(this=E.column(ocol), query=E.Subquery(this=sub))
+        in_node.set('_exists_rewrite', True)   # NOT EXISTS drops inner NULLs; it does NOT
+                                               # inherit NOT IN's null-poisoning rule
+        negated = isinstance(ex.parent, E.Not)
+        if negated:
+            isnull = E.Is(this=E.column(ocol), expression=E.Null())
+            ex.parent.replace(E.Paren(this=E.Or(this=E.Not(this=in_node), expression=isnull)))
+        else:
+            ex.replace(in_node)
     # IN (SELECT ...) -- handle In nodes carrying a query arg (NOT IN arrives as Not(In))
     for node in list(w.find_all(E.In)):
         sub = node.args.get('query')
@@ -62,7 +189,7 @@ def rewrite(db, tree):
         if len(vals) > _MAX_IN:
             raise NotImplementedError("IN subquery result too large (%d values)" % len(vals))
         negated = isinstance(node.parent, E.Not)
-        if negated and has_null:
+        if negated and has_null and not node.args.get('_exists_rewrite'):
             target = node.parent
             target.replace(E.false())        # NOT IN with an inner NULL: no row qualifies
             continue
