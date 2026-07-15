@@ -192,7 +192,13 @@ def join_query(db, sql, columnar=False):
             return _fast_pointer_agg(db, tree, chain, columnar)  # fully fused
         except _FastUnsupported:
             return _chain_pandas(db, tree, chain)                # same chain, pandas agg/predicate tail
-    # Not an FK chain (e.g. a join that has no stored pointer) -> single-join pandas hash merge.
+    # Not an FK chain (e.g. a join that has no stored pointer): before the pandas hash merge,
+    # try the dictionary route -- dim conditions become semi-joins, dim grouping becomes
+    # group-by-key + cell-space post-map. The introductions happen in dict space.
+    import wdb_fastjoin
+    fj = wdb_fastjoin.try_execute(db, tree)
+    if fj is not None:
+        return fj
     if not joins or len(joins) != 1:
         raise NotImplementedError("join: non-FK multi-join needs a hash join (not yet supported)")
     jn = joins[0]
