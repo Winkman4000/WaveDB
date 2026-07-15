@@ -281,6 +281,9 @@ class Database:
                 sql = _rw; tree = _parse_sql_cached(_rw)         # fall through to the single-table path
             name = self._table_in(tree)
             phys = self.cat.phys_map(name)
+            import wdb_groupsets
+            if wdb_groupsets.has_grouping(tree):
+                return wdb_groupsets.execute(self, tree)   # each set is a plain fast GROUP BY
             import wdb_subquery
             if wdb_subquery.has_subquery(tree):
                 dec = wdb_subquery._try_window_decorrelate(self, tree)
