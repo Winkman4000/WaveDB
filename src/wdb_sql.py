@@ -174,7 +174,28 @@ def _factorize_obj(vals):
     return u, out
 
 
-_SCALAR_FNS = { 'LENGTH': _fn_length, 'REGEXP_REPLACE': _fn_regexp_replace }
+def _fn_lower(td, params=None):
+    """LOWER of each dict value in char space (utf-8 decode -> .lower()); the introductions
+    happen once per distinct value, never per row."""
+    out = np.empty(len(td), dtype=object)
+    for i, v in enumerate(td):
+        if v is None: out[i] = None
+        elif isinstance(v, (bytes, bytearray)): out[i] = v.decode('utf-8', 'replace').lower()
+        else: out[i] = str(v).lower()
+    return out
+
+
+def _fn_upper(td, params=None):
+    out = np.empty(len(td), dtype=object)
+    for i, v in enumerate(td):
+        if v is None: out[i] = None
+        elif isinstance(v, (bytes, bytearray)): out[i] = v.decode('utf-8', 'replace').upper()
+        else: out[i] = str(v).upper()
+    return out
+
+
+_SCALAR_FNS = { 'LENGTH': _fn_length, 'REGEXP_REPLACE': _fn_regexp_replace,
+                'LOWER': _fn_lower, 'UPPER': _fn_upper }
 
 def _scalar_fn(node):
     """Classify a scalar fn over a single column -> ('sfn', fname, colname, params) or None.
@@ -189,6 +210,8 @@ def _scalar_fn(node):
         return None
     fname = None
     if isinstance(g, E.Length): fname = 'LENGTH'
+    elif isinstance(g, E.Lower): fname = 'LOWER'
+    elif isinstance(g, E.Upper): fname = 'UPPER'
     elif isinstance(g, (E.Anonymous, E.Func)):
         nm = (getattr(g, 'name', '') or '').upper()
         if nm in _SCALAR_FNS: fname = nm

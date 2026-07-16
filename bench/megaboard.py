@@ -23,7 +23,8 @@ import pandas as pd
 con.register('rdim', pd.read_parquet(os.path.join(FJ, 'dim.parquet')))
 con.register('gdim', pd.read_parquet(os.path.join(FJ, 'gdim.parquet')))
 CTE = ("WITH hits AS (SELECT * REPLACE ((DATE '1970-01-01'+EventDate) AS EventDate,"
-       "(TIMESTAMP '1970-01-01'+to_seconds(EventTime)) AS EventTime) FROM read_parquet('%s'))" % PQ)
+       "(TIMESTAMP '1970-01-01'+to_seconds(EventTime)) AS EventTime)"
+       " FROM read_parquet('%s', file_row_number=true))" % PQ)
 
 
 def rows_of(r):
@@ -88,7 +89,9 @@ def validate(kind, q, w, hdr, d):
 
 
 results = []
-for name, kind, q in QUERIES:
+for entry in QUERIES:
+    name, kind, q = entry[0], entry[1], entry[2]
+    q_duck = entry[3] if len(entry) > 3 else q      # optional duck-side override (frame tiebreaks)
     try:
         t = time.perf_counter(); w = rows_of(db.run(q)); w1 = time.perf_counter() - t
         out = db.run(q)
@@ -99,7 +102,7 @@ for name, kind, q in QUERIES:
         print('%-16s WAVE-ERROR %s' % (name, str(e)[:90]), flush=True)
         results.append((name, None, None, False)); continue
     try:
-        dq = duck_sql(q)
+        dq = duck_sql(q_duck)
         t = time.perf_counter(); d = con.execute(dq).fetchall(); d1 = time.perf_counter() - t
         t = time.perf_counter(); con.execute(dq).fetchall(); d2 = time.perf_counter() - t
         dt = min(d1, d2)

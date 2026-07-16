@@ -87,8 +87,10 @@ QUERIES = [
     ('w-partavg',       'S', "SELECT SearchEngineID, AVG(ResolutionWidth) OVER (PARTITION BY SearchEngineID) AS aw FROM hits QUALIFY aw > 1500"),
     ('w-desc-last',     'N', "SELECT UserID, EventTime, ROW_NUMBER() OVER (PARTITION BY UserID ORDER BY EventTime DESC) AS rn FROM hits QUALIFY rn = 1"),
     ('w-multipart',     'S', "SELECT CounterID, RegionID, COUNT(*) OVER (PARTITION BY CounterID, RegionID) AS n FROM hits QUALIFY n > 1000000"),
-    ('w-frame-avg',     'N', "SELECT UserID, AVG(ResolutionWidth) OVER (PARTITION BY UserID ORDER BY EventTime ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS ma FROM hits QUALIFY ma > 2000"),
-    ('w-frame-max',     'N', "SELECT RegionID, MAX(ResolutionWidth) OVER (PARTITION BY RegionID ORDER BY EventTime ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS sx FROM hits QUALIFY sx = 0"),
+    ('w-frame-avg',     'S', "SELECT UserID, AVG(ResolutionWidth) OVER (PARTITION BY UserID ORDER BY EventTime ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS ma FROM hits QUALIFY ma > 2000",
+                             "SELECT UserID, AVG(ResolutionWidth) OVER (PARTITION BY UserID ORDER BY EventTime, file_row_number ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS ma FROM hits QUALIFY ma > 2000"),
+    ('w-frame-max',     'S', "SELECT RegionID, MAX(ResolutionWidth) OVER (PARTITION BY RegionID ORDER BY EventTime ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS sx FROM hits QUALIFY sx = 0",
+                             "SELECT RegionID, MAX(ResolutionWidth) OVER (PARTITION BY RegionID ORDER BY EventTime, file_row_number ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS sx FROM hits QUALIFY sx = 0"),
     ('w-q-mixed',       'S', "SELECT RegionID, ResolutionWidth, COUNT(*) OVER (PARTITION BY RegionID) AS n FROM hits QUALIFY n > 5000000 AND ResolutionWidth > 1900"),
     # ---- grouping sets (3) ----
     ('gs-rollup',       'M', "SELECT RegionID, SearchEngineID, COUNT(*) AS c FROM hits GROUP BY ROLLUP(RegionID, SearchEngineID) ORDER BY c DESC LIMIT 15"),
@@ -106,7 +108,7 @@ QUERIES = [
     ('t-datewindow',    'C', "SELECT COUNT(*) FROM hits WHERE EventDate >= '2013-07-14' AND EventDate <= '2013-07-16'"),
     ('t-minute',        'M', "SELECT RegionID, extract(minute FROM EventTime) AS m, COUNT(*) AS c FROM hits WHERE CounterID = 62 GROUP BY RegionID, m ORDER BY c DESC LIMIT 10"),
     ('t-null',          'C', "SELECT COUNT(*) FROM hits WHERE DontCountHits IS NULL"),
-    ('t-bool',          'C', "SELECT COUNT(*) FROM hits WHERE IsMobile = 1 AND SearchPhrase <> ''"),
+    ('t-bool',          'C', "SELECT COUNT(*) FROM hits WHERE MobilePhone = 1 AND SearchPhrase <> ''"),
     ('t-bigint',        'M', "SELECT UserID, COUNT(*) AS c FROM hits GROUP BY UserID ORDER BY c DESC LIMIT 10"),
     # ---- window fns: remaining distinct shapes (5) ----
     ('w-rank',          'N', "SELECT RegionID, RANK() OVER (PARTITION BY RegionID ORDER BY EventDate) AS r FROM hits QUALIFY r = 1"),
