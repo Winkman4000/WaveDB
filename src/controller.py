@@ -112,6 +112,12 @@ def route_single_segment(ctx):
             if rows is not None:
                 if _PATH_SINK is not None: _PATH_SINK(ctx, R.cluster_topk.name)
                 return rows
+        spec = R.value_topk.detect(ctx)      # ordered dump: partition the key, decode k rows
+        if spec is not None:
+            rows = R.value_topk.execute(ctx, spec)
+            if rows is not None:
+                if _PATH_SINK is not None: _PATH_SINK(ctx, R.value_topk.name)
+                return rows
         spec = R.wherescan.detect(ctx)       # rows mode: WHERE + ORDER BY cluster col LIMIT k
         if spec is not None:
             rows = R.wherescan.execute(ctx, spec)

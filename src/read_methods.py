@@ -174,6 +174,13 @@ cluster_topk = Read('cluster_topk',
                     lambda c, spec: wdb_clustertopk.execute(c.seg, spec),
                     'cluster-ordered projection top-K')
 
+# --- value top-K dump: ORDER BY numeric/temporal col LIMIT k, no full sort ---
+import wdb_valtopk
+value_topk = Read('value_topk',
+                  lambda c: wdb_valtopk.detect(c.seg, c.tree, c.cmap),
+                  lambda c, spec: wdb_valtopk.execute(c.seg, spec),
+                  'partition-bounded ordered dump')
+
 # --- clustered-structure slices (detect = the cheap slice/group-slice guard) --------
 
 cluster_slice = Read('cluster_slice',
