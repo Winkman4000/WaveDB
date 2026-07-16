@@ -215,8 +215,98 @@ def _order_codes_file(seg, ocol):
     return np.asarray(seg._raw_codes(ocol)).astype(np.int64)
 
 
+def _try_stream_pairs(seg, spec):
+    """Jackson's discovery-in-motion: the pair counter reports pairs AS IT FINDS them and
+    stops at k -- a LIMIT-only LAG/LEAD dump reads a PREFIX of the disk, not the file.
+    Sound because the walk IS the order (stair order column): the first two encounters of a
+    partition code are the true first two members, so LAG at the second and LEAD at the
+    first are known the instant the pair completes. Anything unknowable (LEAD at the
+    second member) is simply never emitted."""
+    if spec['qterms'] is not None or spec['lim'] is None or spec['off']:
+        return None
+    if len(spec['pcols']) != 1 or not spec['wins']:
+        return None
+    kinds = [w['kind'] for _pi, w in spec['wins']]
+    if not all(k in ('lag', 'lead') for k in kinds):
+        return None
+    if any(w['frame'] is not None for _pi, w in spec['wins']):
+        return None
+    ocol, odesc = spec['ocol'], spec['odesc']
+    if ocol is None or seg.stairs(ocol) is None or odesc:
+        return None                              # the walk must BE the order
+    pcol = spec['pcols'][0]
+    c0 = seg.cols[pcol]
+    if c0.get('mode') not in (0, 1, 2):
+        return None
+    V = int(c0['V'])
+    if V > 60_000_000:
+        return None
+    lim = spec['lim']
+    rows_per_pair = 1 if 'lead' in kinds else 2
+    need = (lim + rows_per_pair - 1) // rows_per_pair
+    N = int(seg.N)
+    step = 1 << 18
+    cap = min(N, max(step * 16, need * 256))
+    first = np.full(V, -1, dtype=np.int64)
+    done = np.zeros(V, dtype=bool)
+    p1s, p2s = [], []
+    lo = 0
+    while lo < cap and len(p1s) < need:
+        hi = min(lo + step, cap)
+        blk = np.asarray(seg._raw_codes_range(pcol, lo, hi)).astype(np.int64)
+        for i in range(blk.size):
+            code = blk[i]
+            if done[code]:
+                continue
+            pv = first[code]
+            if pv < 0:
+                first[code] = lo + i
+            else:
+                p1s.append(int(pv)); p2s.append(lo + i)
+                done[code] = True
+                if len(p1s) >= need:
+                    break
+        lo = hi
+    if len(p1s) < need:
+        return None                              # the prefix ran dry: full path serves
+    if rows_per_pair == 2:
+        pos = np.empty(2 * len(p1s), np.int64)
+        pos[0::2] = p1s; pos[1::2] = p2s
+        mate = np.empty(pos.size, np.int64)
+        mate[0::2] = p2s; mate[1::2] = p1s
+        isf = np.zeros(pos.size, bool); isf[0::2] = True
+    else:
+        pos = np.asarray(p1s, np.int64)
+        mate = np.asarray(p2s, np.int64)
+        isf = np.ones(pos.size, bool)
+    pos, mate, isf = pos[:lim], mate[:lim], isf[:lim]
+    def dec_at(nm, positions):
+        cc = np.asarray(seg.codes_at(nm, positions)).astype(np.int64)
+        return [wdb_sql._pyval(seg.fetch(nm, int(x))) for x in cc]
+    slots = [None] * len(spec['proj'])
+    for pi, nm in spec['cols']:
+        c = seg.cols[nm]
+        if c['mode'] == 4:
+            slots[pi] = np.asarray(seg._seq_decode(c))[pos].tolist()
+        else:
+            slots[pi] = dec_at(nm, pos)
+    for pi, w in spec['wins']:
+        mv = dec_at(w['arg'], mate)
+        if w['kind'] == 'lag':
+            slots[pi] = [None if isf[i] else mv[i] for i in range(pos.size)]
+        else:
+            slots[pi] = [mv[i] if isf[i] else None for i in range(pos.size)]
+    out = list(zip(*slots)) if slots else []
+    global _HITS
+    _HITS += 1
+    return out, [wdb_sql._alias(p) for p in spec['proj']]
+
+
 def execute(seg, spec):
     global _HITS
+    st = _try_stream_pairs(seg, spec)
+    if st is not None:
+        return st
     N = int(seg.N)
     # composite partition code (the radix fold)
     pc = np.asarray(seg._raw_codes(spec['pcols'][0])).astype(np.int64)
@@ -288,7 +378,7 @@ def execute(seg, spec):
                 else np.argsort(pc, kind='stable'))
     else:
         # the TWO-AXIS fused motion: one composite integer places both dimensions at once
-        ofc = _order_codes_file(seg, ocol)
+        ofc = _ocodes()
         oV = int(seg.cols[ocol]['V'])
         okey = (oV - 1 - ofc) if odesc else ofc
         perm = np.argsort(pc * oV + okey, kind='stable')
