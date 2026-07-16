@@ -227,23 +227,59 @@ def execute(seg, spec):
         span *= v2
     sub = None
     if spec['qterms'] is None and spec['lim'] is not None and span <= 60_000_000:
-        # LIMIT-only dump: Jackson's pointer-count selection. One bincount over the
-        # partition codes IS the family-size table; take the biggest families until they
-        # cover off+lim, and the whole motion runs on ONLY those rows. Selecting complete
-        # families by CODE guarantees every emitted answer is correct -- a row's window
-        # value only needs its own partition present.
+        # LIMIT-only dump: Jackson's pointer-count selection, refined. The pointer counts
+        # per partition code are the family sizes (one bincount); the SMALLEST families
+        # with pairs (size >= 2) cover the ask with the least motion -- and when the order
+        # column is the stair, the walk itself IS the order, so encounter order is birth
+        # order. Threshold via a histogram OF the sizes: no argsort over millions of
+        # families, O(N) end to end. Complete families by code keep every answer correct.
         need = spec['off'] + spec['lim']
         if need * 4 < N:
             sizes = np.bincount(pc, minlength=span)
-            fam_desc = np.argsort(sizes)[::-1]
-            cum = np.cumsum(sizes[fam_desc])
-            m = int(np.searchsorted(cum, need)) + 1
-            keepmask = np.zeros(sizes.size, bool)
-            keepmask[fam_desc[:m]] = True
-            sub = np.nonzero(keepmask[pc])[0]
-            pc = pc[sub]
-            N = sub.size
-    _rows = (lambda a: a[sub]) if sub is not None else (lambda a: a)
+            hist = np.bincount(np.minimum(sizes, 1_000_000))
+            contrib = np.arange(hist.size, dtype=np.int64) * hist
+            contrib[:2] = 0                          # size-1 families: valid but last resort
+            cumrows = np.cumsum(contrib)
+            t = int(np.searchsorted(cumrows, need))
+            chosen, got = [], 0
+            for sz in range(2, min(t, hist.size - 1) + 1):
+                if got >= need:
+                    break
+                cs = np.nonzero(sizes == sz)[0]
+                take = min(cs.size, (need - got + sz - 1) // sz)
+                chosen.append(cs[:take]); got += take * sz
+            if got < need:                            # not enough pairs: size-1 fill, then big
+                cs = np.nonzero(sizes == 1)[0][:need - got]
+                chosen.append(cs); got += cs.size
+            if got < need:
+                cs = np.argsort(sizes)[::-1][:32]
+                chosen.append(cs); got = int(sizes[cs].sum())
+            if got >= need and chosen:
+                keepmask = np.zeros(sizes.size, bool)
+                keepmask[np.concatenate(chosen)] = True
+                sub = np.nonzero(keepmask[pc])[0]
+                pc = pc[sub]
+                N = sub.size
+    if sub is None:
+        _rows = lambda a: a
+        _load = lambda col, exact=False: _numvals(seg, col, exact_int=exact)
+        _ocodes = lambda: _order_codes_file(seg, ocol)
+    else:
+        _rows = lambda a: a[sub]
+        def _load(col, exact=False):                 # subset-THEN-gather: the translation
+            c = seg.cols[col]                        # table meets only the chosen rows
+            if c['mode'] == 4:
+                arr = np.asarray(seg._seq_decode(c))[sub]
+                return arr if exact and arr.dtype.kind in 'iu' else arr.astype(np.float64)
+            codes = np.asarray(seg._raw_codes(col)).astype(np.int64)[sub]
+            if exact:
+                return _int_table(seg, col)[codes]
+            import wdb_wherescan as WS
+            return WS._num_table(seg, col)[codes]
+        def _ocodes():
+            if seg.stairs(ocol) is not None:
+                return np.searchsorted(seg.stairs(ocol), sub, side='right')
+            return np.asarray(seg._raw_codes(ocol)).astype(np.int64)[sub]
     ocol, odesc = spec['ocol'], spec['odesc']
     o_stair_asc = (ocol is not None and seg.stairs(ocol) is not None and not odesc)
     if ocol is None or o_stair_asc:
@@ -265,7 +301,7 @@ def execute(seg, spec):
     # aggregate value of their whole tie group (evaluated at the group's END)
     tie_ends = None; tg = None
     if ocol is not None:
-        oc_all = _rows(_order_codes_file(seg, ocol))[perm]
+        oc_all = _ocodes()[perm]
         tie_new = newlane.copy()
         tie_new[1:] |= oc_all[1:] != oc_all[:-1]
         tg = np.cumsum(tie_new) - 1
@@ -288,7 +324,7 @@ def execute(seg, spec):
         elif k in ('lag', 'lead'):
             v = np.asarray(seg._raw_codes(w['arg'])).astype(np.int64) \
                 if seg.cols[w['arg']]['mode'] != 4 else None
-            vals_s = (_rows(_numvals(seg, w['arg']))[perm] if v is None
+            vals_s = (_load(w['arg'])[perm] if v is None
                       else _rows(v)[perm])
             shifted = np.empty(N, dtype=object)
             if k == 'lag':
@@ -306,7 +342,7 @@ def execute(seg, spec):
             else:
                 out_s = shifted
         elif k in ('sum', 'avg', 'count'):
-            vv = _rows(_numvals(seg, w['arg']))[perm] if w['arg'] is not None else None
+            vv = _load(w['arg'])[perm] if w['arg'] is not None else None
             cs = np.cumsum(vv) if vv is not None else None
             if w['frame'] is not None:               # ROWS k PRECEDING .. CURRENT ROW
                 fk = w['frame'][1]
@@ -335,7 +371,7 @@ def execute(seg, spec):
                     out_s = rs if k == 'sum' else \
                         rs / (tie_ends[tg] - lane_start[lane_id_sorted] + 1)
         else:                                        # min / max: running or sliding
-            vv = _rows(_numvals(seg, w['arg'], exact_int=True))[perm]
+            vv = _load(w['arg'], exact=True)[perm]
             if w['frame'] is not None:                   # ROWS k PRECEDING: monotonic deque
                 fk = w['frame'][1]
                 out_s = (K.seg_slidmin if k == 'min' else K.seg_slidmax)(vv, lane_start, fk)
@@ -369,13 +405,13 @@ def execute(seg, spec):
                     cmpv = fl[cc]
                     m &= (cmpv if op == '=' else ~cmpv)
                     continue
-                arr2 = _rows(_numvals(seg, nm, exact_int=False))[perm]
+                arr2 = _load(nm)[perm]
                 m &= (arr2 > v if op == '>' else arr2 >= v if op == '>=' else
                       arr2 < v if op == '<' else arr2 <= v if op == '<=' else
                       arr2 == v if op == '=' else arr2 != v)
                 continue
             else:
-                val = _rows(_numvals(seg, term[3], exact_int=False))[perm]   # col compare, lane-space
+                val = _load(term[3])[perm]   # col compare, lane-space
             m &= (arr > val if op == '>' else arr >= val if op == '>=' else
                   arr < val if op == '<' else arr <= val if op == '<=' else
                   arr == val if op == '=' else arr != val)
