@@ -221,6 +221,10 @@ def _try_orientation(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey, lef
         lim = wdb_sql._limit(tree)
         if lim is None or lim > 1_000_000:
             return None
+        st = _stream_dump(db, tree, fact_tn, fkey, fact_conds, dmap, need, attr_idx,
+                          dim_cols, fact_cols, proj, lim, left)
+        if st is not None:
+            return st
         fexpr = [fkey] + sorted({nm for _pi, nm in fact_cols})
         fsel = ('SELECT ' + ', '.join(fexpr) + ' FROM ' + fact_tn
                 + ((' WHERE ' + ' AND '.join(fact_where)) if fact_where else ''))
@@ -256,6 +260,110 @@ def _try_orientation(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey, lef
     off = wdb_sql._offset(tree) or 0
     if lim is not None or off:
         rows = rows[off: None if lim is None else off + lim]
+    return rows, [wdb_sql._alias(p) for p in proj]
+
+
+def _stream_dump(db, tree, fact_tn, fkey, fact_conds, dmap, need, attr_idx,
+                 dim_cols, fact_cols, proj, lim, left):
+    """The library run, Jackson's pattern: walk the fact table shelf by shelf, glance at
+    code stickers against the golden-list flag card, toss matches in the cart, and LEAVE
+    the moment it holds LIMIT rows. A prefix of the disk answers the join dump; a walk cap
+    falls back to the full path when matches are too rare."""
+    import numpy as np
+    if tree.args.get('order') is not None or lim > 100_000:
+        return None
+    fpaths = db.cat.segment_paths(fact_tn)
+    if len(fpaths) != 1:
+        return None
+    fseg = db.open_segment(fpaths[0], fact_tn)
+    kc0 = fseg.cols.get(fkey)
+    if kc0 is None or kc0.get('mode') not in (0, 1, 2):
+        return None
+    import wdb_wherescan as WS
+    # per-block evaluable conditions: eq / neq against a literal, in code space
+    conds = []
+    for c in fact_conds:
+        tn = type(c).__name__
+        if tn not in ('EQ', 'NEQ') or not isinstance(c.this, E.Column) \
+                or not isinstance(c.expression, E.Literal):
+            return None
+        nm = c.this.name
+        cc = fseg.cols.get(nm)
+        if cc is None or cc.get('mode') not in (0, 1, 2):
+            return None
+        lv = c.expression.this if c.expression.is_string else str(c.expression.this)
+        code = WS._code_of(fseg, nm, lv)
+        conds.append((nm, tn, code))
+    V = int(kc0['V'])
+    flag = np.zeros(V + 1, bool)
+    if not left:
+        tc = WS._in_codes(fseg, fkey, [str(k) for k in dmap.keys()])
+        tc = np.asarray(tc, dtype=np.int64)
+        if tc.size == 0:
+            return [], [wdb_sql._alias(p) for p in proj]
+        flag[tc] = True
+    N = int(fseg.N)
+    step = 1 << 18
+    cap = min(N, max(step * 64, lim * 512))
+    hits = []
+    lo = 0
+    while lo < cap and len(hits) < lim:
+        hi = min(lo + step, cap)
+        m = None
+        if not left:
+            kcb = np.asarray(fseg._raw_codes_range(fkey, lo, hi)).astype(np.int64)
+            m = flag[kcb]
+        for nm, tn, code in conds:
+            cb = np.asarray(fseg._raw_codes_range(nm, lo, hi)).astype(np.int64)
+            if code is None:
+                cm = np.zeros(cb.size, bool) if tn == 'EQ' else np.ones(cb.size, bool)
+            else:
+                cm = (cb == code) if tn == 'EQ' else (cb != code)
+            m = cm if m is None else (m & cm)
+        if m is None:
+            m = np.ones(hi - lo, bool)
+        for p0 in np.nonzero(m)[0]:
+            hits.append(lo + int(p0))
+            if len(hits) >= lim:
+                break
+        lo = hi
+    if len(hits) < lim and lo < N:
+        return None                              # cart still hungry: full path serves
+    pos = np.asarray(hits[:lim], dtype=np.int64)
+    def dec_at(nm, positions):
+        cc = np.asarray(fseg.codes_at(nm, positions)).astype(np.int64)
+        cache = {}
+        out = []
+        for x in cc:
+            x = int(x)
+            v = cache.get(x, cache)
+            if v is cache:
+                v = wdb_sql._pyval(fseg.fetch(nm, x))
+                if isinstance(v, (bytes, bytearray)):
+                    v = v.decode('utf-8', 'replace')
+                cache[x] = v
+            out.append(v)
+        return out
+    kvals = dec_at(fkey, pos)
+    fvals = {nm: dec_at(nm, pos) for nm in sorted({nm for _pi, nm in fact_cols})}
+    rows = []
+    for i in range(pos.size):
+        matches = dmap.get(kvals[i])
+        if matches is None:
+            if not left:
+                continue
+            matches = [tuple([None] * len(attr_idx))]
+        for dvals in matches:
+            row = [None] * len(proj)
+            for pi, nm in dim_cols:
+                row[pi] = dvals[attr_idx[nm]]
+            for pi, nm in fact_cols:
+                row[pi] = fvals[nm][i]
+            rows.append(tuple(row))
+            if len(rows) >= lim:
+                break
+        if len(rows) >= lim:
+            break
     return rows, [wdb_sql._alias(p) for p in proj]
 
 
