@@ -1540,9 +1540,9 @@ def _build_chain(db, tree, allow_hash=True):
             child_a, parent_a, fk_col = aA, aB, kA
         elif kB in fkB and fkB[kB]['parent'] == tA and fkB[kB]['parent_key'] == kA:
             child_a, parent_a, fk_col = aB, aA, kB
-        elif _key_is_unique(db, tB, kB):                                         # non-FK: parent = unique-key side
+        elif allow_hash and _key_is_unique(db, tB, kB):                          # non-FK: parent = unique-key side
             child_a, parent_a, fk_col = aA, aB, ('hash', kA, kB)                 # built as a runtime hash pointer
-        elif _key_is_unique(db, tA, kA):
+        elif allow_hash and _key_is_unique(db, tA, kA):
             child_a, parent_a, fk_col = aB, aA, ('hash', kB, kA)
         else:
             raise _FastUnsupported                                               # neither key unique -> not a pointer

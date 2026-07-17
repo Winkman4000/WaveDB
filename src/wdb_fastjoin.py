@@ -398,8 +398,10 @@ def _giant_m2o(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey,
     # dim row per key code (m2o requires unique keys)
     dkc = np.asarray(dseg._raw_codes(dkey)).astype(np.int64)
     N2 = int(dseg.N)
-    if np.unique(dkc).size < N2:
+    kcounts = np.bincount(dkc, minlength=dk_vals.size)
+    if kcounts.max() > 1:
         return None                              # duplicate keys: multiplying join
+                                                 # (bincount, not np.unique: no 9 s sort)
     keep_dim = np.ones(N2, bool)
     for c in dim_conds:
         keep_dim &= wdb_sql._eval_pred(dseg, _strip_qual(c),

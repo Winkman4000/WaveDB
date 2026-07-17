@@ -61,7 +61,7 @@ def test_hashjoin_parent_column_aggregate():
 def test_hashjoin_where_parent_and_child():
     _match("SELECT d.label, SUM(f.amt) " + _J + "WHERE d.w > 200 AND f.amt > 100 GROUP BY d.label", expect_fast=False)
 def test_hashjoin_whole_table_aggregate():
-    _match("SELECT SUM(f.amt) " + _J)
+    _match("SELECT SUM(f.amt) " + _J, expect_fast=False)
 def test_hashjoin_plain_projection_via_chain_pandas():
     # plain projection is agg-only-fast, so it routes through _chain_pandas using the SAME hash pointer
     _match("SELECT f.fid, d.label " + _J + "WHERE f.fid < 6 ORDER BY f.fid", expect_fast=False)
