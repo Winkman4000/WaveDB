@@ -188,27 +188,35 @@ def denorm_rewrite(db, tree):
 def join_query(db, sql, columnar=False):
     tree = sqlglot.parse_one(sql, read='duckdb')
     joins = tree.args.get('joins')
+    import wdb_sql as _ws
+    has_aggs = any(_ws._agg_kind(p) is not None for p in tree.expressions)
+    chain = None
     # FK-pointer fast path: handles 1..N joins as a chain/star of pre-resolved pointers.
-    try:
-        chain = _build_chain(db, tree)
-    except _FastUnsupported:
-        chain = None
-    if chain is not None:
+    # Building a chain can RESOLVE POINTERS ON THE FLY (an O(N) hash over the fact) -- so
+    # it only runs eagerly for aggregates, where the fused pointer path owns precedence.
+    # Plain dumps try the dict-space route first: a one-block walk must not pay a
+    # full-table probe as routing overhead.
+    if has_aggs:
         try:
-            return _fast_pointer_agg(db, tree, chain, columnar)  # fully fused
+            chain = _build_chain(db, tree)
         except _FastUnsupported:
-            import wdb_fastjoin
-            fj = wdb_fastjoin.try_execute(db, tree)              # dict-space route beats the
-            if fj is not None:                                   # pandas tail when it applies
-                return fj
-            return _chain_pandas(db, tree, chain)                # same chain, pandas agg/predicate tail
-    # Not an FK chain (e.g. a join that has no stored pointer): before the pandas hash merge,
-    # try the dictionary route -- dim conditions become semi-joins, dim grouping becomes
-    # group-by-key + cell-space post-map. The introductions happen in dict space.
+            chain = None
+        if chain is not None:
+            try:
+                return _fast_pointer_agg(db, tree, chain, columnar)  # fully fused
+            except _FastUnsupported:
+                pass
     import wdb_fastjoin
-    fj = wdb_fastjoin.try_execute(db, tree)
-    if fj is not None:
+    fj = wdb_fastjoin.try_execute(db, tree)      # dict-space: semi-joins, cell post-maps,
+    if fj is not None:                           # streaming dumps
         return fj
+    if chain is None:
+        try:
+            chain = _build_chain(db, tree)       # lazy: only when the tail will use it
+        except _FastUnsupported:
+            chain = None
+    if chain is not None:
+        return _chain_pandas(db, tree, chain)    # same chain, pandas agg/predicate tail
     if not joins or len(joins) != 1:
         raise NotImplementedError("join: non-FK multi-join needs a hash join (not yet supported)")
     jn = joins[0]
