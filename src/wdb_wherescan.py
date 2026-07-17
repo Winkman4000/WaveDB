@@ -767,6 +767,15 @@ def _in_codes(seg, col, vals):
         codes = []
         for v in vals:
             kk = idx.get(v.encode() if isinstance(v, str) else v)
+            if kk is None and isinstance(v, str):
+                # coerce like _code_of: string literals against numeric dicts
+                try:
+                    kk = idx.get(int(v))
+                except ValueError:
+                    try:
+                        kk = idx.get(float(v))
+                    except ValueError:
+                        kk = None
             if kk is None and not isinstance(v, (str, bytes, bytearray)):
                 kk = idx.get(v)
             if kk is not None:

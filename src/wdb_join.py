@@ -197,6 +197,10 @@ def join_query(db, sql, columnar=False):
         try:
             return _fast_pointer_agg(db, tree, chain, columnar)  # fully fused
         except _FastUnsupported:
+            import wdb_fastjoin
+            fj = wdb_fastjoin.try_execute(db, tree)              # dict-space route beats the
+            if fj is not None:                                   # pandas tail when it applies
+                return fj
             return _chain_pandas(db, tree, chain)                # same chain, pandas agg/predicate tail
     # Not an FK chain (e.g. a join that has no stored pointer): before the pandas hash merge,
     # try the dictionary route -- dim conditions become semi-joins, dim grouping becomes

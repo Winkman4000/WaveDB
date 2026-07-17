@@ -297,7 +297,8 @@ def _stream_dump(db, tree, fact_tn, fkey, fact_conds, dmap, need, attr_idx,
     V = int(kc0['V'])
     flag = np.zeros(V + 1, bool)
     if not left:
-        tc = WS._in_codes(fseg, fkey, [str(k) for k in dmap.keys()])
+        tc = WS._in_codes(fseg, fkey, list(dmap.keys()))   # values AS-IS: the bulk
+                                                           # binder matches native types
         tc = np.asarray(tc, dtype=np.int64)
         if tc.size == 0:
             return [], [wdb_sql._alias(p) for p in proj]
