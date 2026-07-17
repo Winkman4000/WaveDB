@@ -198,8 +198,8 @@ def join_query(db, sql, columnar=False):
     # full-table probe as routing overhead.
     if has_aggs:
         try:
-            chain = _build_chain(db, tree)
-        except _FastUnsupported:
+            chain = _build_chain(db, tree, allow_hash=False)     # STORED pointers only:
+        except _FastUnsupported:                                 # pre-resolved and free
             chain = None
         if chain is not None:
             try:
@@ -216,7 +216,10 @@ def join_query(db, sql, columnar=False):
         except _FastUnsupported:
             chain = None
     if chain is not None:
-        return _chain_pandas(db, tree, chain)    # same chain, pandas agg/predicate tail
+        try:
+            return _fast_pointer_agg(db, tree, chain, columnar)  # hashed chain, fused agg
+        except _FastUnsupported:
+            return _chain_pandas(db, tree, chain)    # same chain, pandas agg/predicate tail
     if not joins or len(joins) != 1:
         raise NotImplementedError("join: non-FK multi-join needs a hash join (not yet supported)")
     jn = joins[0]
@@ -1512,7 +1515,7 @@ def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
     return ptr.astype(np.int64)
 
 
-def _build_chain(db, tree):
+def _build_chain(db, tree, allow_hash=True):
     frm = tree.find(E.From).this
     tables = [(frm.name, frm.alias or frm.name)]
     for jn in (tree.args.get('joins') or []):
@@ -1592,6 +1595,9 @@ def _build_chain(db, tree):
             if parent_a not in keep: continue                                    # pruned hop: skip the gather
             if child_a in composed and parent_a not in composed:
                 if isinstance(fk_col, tuple) and fk_col and fk_col[0] == 'hash':
+                    if not allow_hash:
+                        raise _FastUnsupported   # O(N) hash as ROUTING is forbidden: the
+                                                 # dict-space route gets its turn first
                     p = _hash_pointer(db, alias2t[child_a], fk_col[1], seg_of[child_a],
                                       alias2t[parent_a], fk_col[2], seg_of[parent_a])
                 else:

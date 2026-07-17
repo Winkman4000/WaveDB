@@ -50,13 +50,16 @@ def _match(q, expect_fast=True):
 _J = "FROM fact f JOIN dim d ON f.dimid = d.did "
 
 def test_hashjoin_agg_parent_groupkey():
-    _match("SELECT d.label, SUM(f.amt) " + _J + "GROUP BY d.label")
+    # dim-attr grouping with fact-side aggs is fastjoin territory now: the dict-space route
+    # outranks on-the-fly hashing (which is O(N) routing overhead at scale)
+    _match("SELECT d.label, SUM(f.amt) " + _J + "GROUP BY d.label", expect_fast=False)
 def test_hashjoin_count_parent_gather():
-    _match("SELECT d.label, COUNT(*) " + _J + "GROUP BY d.label")
+    _match("SELECT d.label, COUNT(*) " + _J + "GROUP BY d.label", expect_fast=False)
 def test_hashjoin_parent_column_aggregate():
-    _match("SELECT d.label, SUM(d.w) " + _J + "GROUP BY d.label")
+    # served by fastjoin's reversed orientation (dim-as-fact, o2m multiplication)
+    _match("SELECT d.label, SUM(d.w) " + _J + "GROUP BY d.label", expect_fast=False)
 def test_hashjoin_where_parent_and_child():
-    _match("SELECT d.label, SUM(f.amt) " + _J + "WHERE d.w > 200 AND f.amt > 100 GROUP BY d.label")
+    _match("SELECT d.label, SUM(f.amt) " + _J + "WHERE d.w > 200 AND f.amt > 100 GROUP BY d.label", expect_fast=False)
 def test_hashjoin_whole_table_aggregate():
     _match("SELECT SUM(f.amt) " + _J)
 def test_hashjoin_plain_projection_via_chain_pandas():
