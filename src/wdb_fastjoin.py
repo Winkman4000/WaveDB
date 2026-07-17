@@ -162,7 +162,11 @@ def _try_orientation(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey, lef
             return "'" + v.replace("'", "''") + "'"
         return str(v)
     fact_where = [_strip_qual(c).sql() for c in fact_conds]
-    if not left:
+    if not left and not aggs:
+        # dump path only: the IN drives the row scan. The AGG path never needs it -- the
+        # post-map enforces INNER at the CELL level (dmap.get drops unmatched keys among
+        # thousands of cells), and a complete dimension's IN filters nothing while pushing
+        # a millisecond groupby off every fast read into the general grind.
         fact_where.append(fkey + ' IN (' + ', '.join(lit(k) for k in keys) + ')')
     if aggs:
         gcols = [fkey] + sorted({nm for _pi, nm in fact_cols})
