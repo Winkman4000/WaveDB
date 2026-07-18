@@ -939,7 +939,13 @@ def execute(seg, spec):
                     pos = np.empty(0, np.int64); break
                 continue
             cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
-            m = np.isin(cc, codes)
+            V = int(c.get('V', 0))
+            if 0 < V <= 100_000_000:
+                flag = np.zeros(V + 1, dtype=bool)   # flag-gather: one pass, no sort --
+                flag[codes] = True                   # np.isin uniques/sorts 100M codes
+                m = flag[cc]
+            else:
+                m = np.isin(cc, codes)
             pos = pos[~m] if ineg else pos[m]
     for col, want_null in spec.get('nulls', ()):
         if pos.size == 0: break

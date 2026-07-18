@@ -180,6 +180,13 @@ def rewrite(db, tree):
         sub = node.args.get('query')
         if sub is None:
             continue
+        inner = sub.this
+        if (isinstance(inner, E.Select) and not inner.args.get('distinct')
+                and not inner.args.get('group') and not inner.args.get('limit')
+                and len(inner.expressions) == 1
+                and isinstance(inner.expressions[0], E.Column)):
+            inner.set('distinct', E.Distinct())   # IN cares about the SET: dedup in the
+                                                  # engine's code space, not python-side
         rows = _run_inner(db, sub)
         if rows and len(rows[0]) != 1:
             raise ValueError("IN subquery must return one column")
