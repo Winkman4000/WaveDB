@@ -1045,9 +1045,13 @@ def execute(seg, spec):
                 v = np.asarray(seg._seq_decode(c))[pos]
             else:
                 cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
-                v = _num_table(seg, col)[cc] if c['mode'] == 2 else \
-                    np.asarray([int(seg.fetch(col, int(k))) for k in np.unique(cc)])[
-                        np.searchsorted(np.unique(cc), cc)]
+                if c['mode'] == 2:
+                    v = _num_table(seg, col)[cc]
+                else:
+                    import wdb_window as _WN
+                    v = _WN._int_table(seg, col)[cc]   # one dict-sized table, one gather:
+                                                       # the old path called np.unique TWICE
+                                                       # over 33M survivor codes (6.3 s)
             row.append(int(v.sum(dtype=np.int64)) if kind == 'SUM'
                        else float(v.sum(dtype=np.float64)) / v.size)
         _HITS += 1
