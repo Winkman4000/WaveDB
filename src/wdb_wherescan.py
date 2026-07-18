@@ -855,7 +855,16 @@ def _atom_mask(seg, a, pos, ccache):
         return cc != k if a[3] else cc == k
     if a[0] == 'in':
         ks = np.array([k for k in (_code_of(seg, col, v) for v in a[2]) if k is not None], np.int64)
-        m = np.isin(cc, ks) if ks.size else np.zeros(pos.size, bool)
+        if not ks.size:
+            m = np.zeros(pos.size, bool)
+        else:
+            V = int(c.get('V', 0))
+            if 0 < V <= 100_000_000:
+                flag = np.zeros(V + 1, dtype=bool)   # flag-gather beats np.isin's
+                flag[ks] = True                      # sort/unique over 100M codes
+                m = flag[cc]
+            else:
+                m = np.isin(cc, ks)
         return ~m if a[3] else m
     if a[0] == 'like':
         fl = _like_flags(seg, col, a[2], a[3])
