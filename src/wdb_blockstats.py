@@ -10,6 +10,7 @@ Correctness gates: SUM served only when provably exact in float64 (nonnull_count
 else declined to the exact paths; AVG always float (matches SQL double semantics); nulls excluded
 from SUM/AVG/MIN/MAX and included in COUNT(*), per SQL. Declines overrides/deleted rows/WHERE/GROUP."""
 import numpy as np
+import wdb_qmem
 import wdb_sql
 import workers
 import wdb_policies as P
@@ -18,7 +19,7 @@ E = wdb_sql.E
 _ENABLED = True
 _HITS = 0
 _BR = 32768
-_SCACHE = {}          # (seg.path, col, N) -> stats dict
+_SCACHE = wdb_qmem.register({})          # (seg.path, col, N) -> stats dict
 
 
 def enable():

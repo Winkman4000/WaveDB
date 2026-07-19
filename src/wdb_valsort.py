@@ -21,6 +21,7 @@ WHERE is exactly `C <> ''`; no GROUP BY / HAVING / DISTINCT / JOIN; no deleted r
 Anything else -> None (caller scans).
 """
 import numpy as np
+import wdb_qmem
 import wdb_sql
 import workers
 import wdb_gbcount
@@ -28,7 +29,7 @@ import wdb_policies as P
 E = wdb_sql.E
 
 _HITS = 0
-_CACHE = {}   # (seg.path, col, N) -> (dup_codes_asc, dup_counts) | None
+_CACHE = wdb_qmem.register({})   # (seg.path, col, N) -> (dup_codes_asc, dup_counts) | None
 
 
 def _dupcounts(seg, col):

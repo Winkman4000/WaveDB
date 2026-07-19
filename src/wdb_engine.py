@@ -123,6 +123,18 @@ class Segment:
         self._synth = {}                        # mode-6 synthetic constant columns (ADD COLUMN)
         self._tdict = {}                        # memo: decoded base dict per column (immutable .wdb)
         self._resident = {}                     # memo: full per-row decoded array, kept resident for chunk reads
+    def drop_derived(self):
+        """Jackson's law (see wdb_qmem): everything derived from data dies at query end --
+        decompressed codes, decoded dicts, resident arrays, effective/count memos, and
+        sidecar loads (presence, override, cluster, cube: they lazy-reload on next touch).
+        The memmap stays: it IS the file. cols/order/synth stay: file-shape metadata."""
+        self._codes.clear(); self._tdict.clear(); self._resident.clear()
+        for a in ('_eff', '_ccounts'):
+            d = getattr(self, a, None)
+            if isinstance(d, dict):
+                d.clear()
+        self._presence = 0; self._ov = 0; self._cluster = 0; self._cubes = 0
+
     def resident_values(self, nm):
         """Decode the column ONCE and keep the full per-row array resident, so cluster-slice
         reads over a sorted segment are a plain memory slice with no per-query decode. This

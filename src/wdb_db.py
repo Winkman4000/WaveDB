@@ -22,12 +22,8 @@ import functools
 
 @functools.lru_cache(maxsize=2048)
 def _parse_sql_cached(sql):
-    """Parse SQL -> AST, memoised per process. Parsing is ~half the wall time of a fast query
-    (cProfile: 46% of COUNT(*), and the entire cost of parse-bound shapes), and the SQL->AST map is
-    pure, so caching it makes repeated queries (the common case: dashboards, prepared statements,
-    throughput workers looping one query) parse exactly once. Returns the SAME tree on a hit -- safe
-    because the executor only READS the tree (validated by the full suite). Bounded so a distinct-query
-    workload can't grow it without limit."""
+    """Parse SQL -> AST. Uncached by law (wdb_qmem): the memo was removed with the
+    tree-mutation bug, and query-keyed caches grow with history, not with the file."""
     return sqlglot.parse_one(sql, read='duckdb')
 
 
@@ -264,6 +260,19 @@ class Database:
         return cols, names
 
     def run(self, sql, escalate=None):
+        """Depth-guarded: recursive runs (subquery rewrites, join sub-queries) share
+        memory within one outer query; at depth 0 wdb_qmem.flush forgets everything
+        data-derived. A query leaves the engine as if it was never there."""
+        import wdb_qmem
+        self._qdepth = getattr(self, '_qdepth', 0) + 1
+        try:
+            return self._run_impl(sql, escalate)
+        finally:
+            self._qdepth -= 1
+            if self._qdepth == 0:
+                wdb_qmem.flush(self)
+
+    def _run_impl(self, sql, escalate=None):
         esc = self.escalate if escalate is None else escalate
         tree = _parse_sql_cached(sql)
         result = commands.route(self, sql, tree)

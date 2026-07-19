@@ -25,6 +25,7 @@ Append-tail maintenance is the documented next layer. RAM-resident, never persis
 (_ENABLED True); disable() restores the prior routing (heavypair/scan) for the shapes it handles.
 """
 import numpy as np
+import wdb_qmem
 import wdb_sql
 import wdb_pairagg
 import workers
@@ -38,8 +39,8 @@ _POS_MAX = 8192           # store member-row positions when total stored cells <
 _POSROWS_MAX = 1 << 16    # ...AND their member rows <= this: positions cost bytes per ROW, and a
                           # low-card pair's handful of cells holds ALL 100M rows (measured 1.5 GB!)
 _HITS = 0
-_CACHE = {}               # (seg.path,(a,b),N) -> (head_gid, head_cnt, Vb, nheavy, bulk, ones, pos, nd)
-_VCACHE = {}              # (seg.path,col) -> by-code value dict (decode)
+_CACHE = wdb_qmem.register({})               # (seg.path,(a,b),N) -> (head_gid, head_cnt, Vb, nheavy, bulk, ones, pos, nd)
+_VCACHE = wdb_qmem.register({})              # (seg.path,col) -> by-code value dict (decode)
 
 
 def enable():

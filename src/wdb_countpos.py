@@ -22,6 +22,7 @@ Gated behind _ENABLED (default False) so the shipped heavypair path is untouched
 promoted; when disabled detect returns None and the query routes to heavypair exactly as before.
 """
 import numpy as np
+import wdb_qmem
 import wdb_sql
 import workers
 import wdb_policies as P
@@ -30,8 +31,8 @@ E = wdb_sql.E
 _FMT = 1
 _ENABLED = False          # opt-in; default off keeps the shipped heavypair path byte-identical
 _HITS = 0
-_CACHE = {}               # (seg.path,(a,b),N) -> (countcol, dcs); RAM-resident, never persisted
-_VCACHE = {}              # (seg.path,col) -> by-code value dict (decode)
+_CACHE = wdb_qmem.register({})               # (seg.path,(a,b),N) -> (countcol, dcs); RAM-resident, never persisted
+_VCACHE = wdb_qmem.register({})              # (seg.path,col) -> by-code value dict (decode)
 
 
 def enable():

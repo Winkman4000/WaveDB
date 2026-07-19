@@ -18,13 +18,14 @@ sidecar is built lazily on first eligible query and persisted next to the segmen
 keyed by column — general across any table/column. Staleness-guarded by seg.N.
 """
 import os, pickle, numpy as np
+import wdb_qmem
 import wdb_sql
 import workers
 import wdb_policies as P
 E = wdb_sql.E
 
 _HITS = 0   # telemetry: queries answered from a count projection
-_CACHE = {}  # (seg.path, col, N) -> (codes, counts), so a repeated query never re-reads the sidecar
+_CACHE = wdb_qmem.register({})  # (seg.path, col, N) -> (codes, counts), so a repeated query never re-reads the sidecar
 
 
 def _path(seg, col):

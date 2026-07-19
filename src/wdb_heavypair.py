@@ -30,6 +30,7 @@ this is the Q17 shape). If the heavy block holds < N pairs, decline to the scan 
 is a future v2). The loaded block is heap-resident in _CACHE across queries for the process lifetime.
 """
 import os, pickle, numpy as np
+import wdb_qmem
 import wdb_sql
 import workers
 import wdb_policies as P
@@ -37,7 +38,7 @@ E = wdb_sql.E
 
 _FMT = 2        # sidecar format version (1 = no landmarks; 2 = with landmarks)
 
-_VCACHE = {}    # (seg.path, col) -> by-code value dict (built once; high-card dicts are big)
+_VCACHE = wdb_qmem.register({})    # (seg.path, col) -> by-code value dict (built once; high-card dicts are big)
 
 def _vals(seg, col):
     """By-code value dictionary (sorted, indexable by code), or None for non-value-identity
@@ -57,7 +58,7 @@ def _vals(seg, col):
     return v
 
 _HITS = 0
-_CACHE = {}     # (seg.path, (a,b), N) -> (codesA, codesB, counts, landmarks); heap-resident across queries
+_CACHE = wdb_qmem.register({})     # (seg.path, (a,b), N) -> (codesA, codesB, counts, landmarks); heap-resident across queries
 
 # Per-pair on/off. A disabled (name-sorted) pair is blocked from getting a sidecar: detect declines,
 # so the query falls through to the scan and no RAM is spent on that pair. The operator's RAM-budget

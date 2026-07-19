@@ -16,6 +16,7 @@ counts and applies the current hot buffer, so it is robust to any hot mutation (
 not just appends.
 """
 import numpy as np
+import wdb_qmem
 import pandas as pd
 import wdb_sql
 import workers
@@ -24,7 +25,7 @@ from wdb_gridwalk_maint import GwMaint
 
 _ENABLED = True
 _HITS = 0
-_BASE_CACHE = {}          # (seg.path,(a,b),N) -> (base_gid, base_cnt, ones_gid, Vb); RAM-resident
+_BASE_CACHE = wdb_qmem.register({})          # (seg.path,(a,b),N) -> (base_gid, base_cnt, ones_gid, Vb); RAM-resident
 
 
 def enable():
