@@ -1043,17 +1043,27 @@ def execute(seg, spec):
                 row.append(int(np.unique(cc).size)); continue
             if c['mode'] == 4:
                 v = np.asarray(seg._seq_decode(c))[pos]
-            else:
-                cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
-                if c['mode'] == 2:
-                    v = _num_table(seg, col)[cc]
-                else:
-                    import wdb_window as _WN
-                    v = _WN._int_table(seg, col)[cc]   # one dict-sized table, one gather:
-                                                       # the old path called np.unique TWICE
-                                                       # over 33M survivor codes (6.3 s)
-            row.append(int(v.sum(dtype=np.int64)) if kind == 'SUM'
-                       else float(v.sum(dtype=np.float64)) / v.size)
+                import wdb_exactint as XI
+                row.append(XI.fold_values(v) if kind == 'SUM'
+                           else XI.exact_avg(XI.fold_values(v), v.size)); continue
+            cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
+            if c['mode'] == 2 and c.get('dt') != 0:
+                v = _num_table(seg, col)[cc]
+                row.append(float(v.sum(dtype=np.float64)) if kind == 'SUM'
+                           else float(v.sum(dtype=np.float64)) / v.size); continue
+            # int values (dict modes 0/1, and mode-2 ints): EXACT at any magnitude via
+            # dictionary arithmetic -- bincount the survivor codes (V-sized counts),
+            # two-limb fold (wdb_exactint). Also faster than the 33M gather+sum, and
+            # nulls (codes past the value table) are properly excluded.
+            import wdb_exactint as XI
+            import wdb_window as _WN
+            tab = _WN._int_table(seg, col)
+            cnts = np.bincount(cc, minlength=tab.size)
+            if cnts.size > tab.size:
+                cnts = cnts[:tab.size]     # null codes live past the dict's values:
+            n = int(cnts.sum())            # SQL aggs exclude them
+            s = XI.fold_counts(cnts, tab)
+            row.append((s if n else None) if kind == 'SUM' else XI.exact_avg(s, n))
         _HITS += 1
         return [tuple(row)], [wdb_sql._alias(p) for p in spec['proj']]
 

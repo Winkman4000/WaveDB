@@ -95,12 +95,130 @@ def _chain_pandas(db, tree, ctx):
     return rows, [wdb_sql._alias(p) for p in proj]
 
 
+def _exact_scalar(db, tree):
+    """No-WHERE, no-GROUP scalar aggregates over dict-int columns, by DICTIONARY
+    ARITHMETIC: one bincount of raw codes per column, then SUM exact at any magnitude
+    (two-limb fold, wdb_exactint -- float64 drifts and int64 wraps at SUM(UserID) scale),
+    AVG correctly rounded from the exact SUM, MIN/MAX off the value-ordered dict's
+    present codes, COUNTs from the counts. Declines (None) on any other shape."""
+    import wdb_exactint as XI
+    if (tree.args.get('where') is not None or tree.args.get('group') is not None
+            or tree.args.get('joins') or tree.args.get('having') is not None
+            or tree.args.get('distinct') is not None or tree.args.get('order') is not None
+            or wdb_sql._limit(tree) is not None or wdb_sql._offset(tree)):
+        return None
+    frm = tree.find(E.From)
+    if frm is None or not isinstance(frm.this, E.Table):
+        return None
+    name = frm.this.name
+    try:
+        paths = db.cat.segment_paths(name)
+    except Exception:
+        return None
+    if len(paths) != 1:
+        return None
+    seg = db.open_segment(paths[0], name)
+    if seg.presence_mask() is not None:
+        return None                                  # DELETEs falsify raw-code counts
+    specs = []
+    for p in tree.expressions:
+        ak = wdb_sql._agg_kind(p)
+        if ak is None:
+            return None
+        if ak[0] == 'COUNT_STAR':
+            specs.append(('COUNT_STAR', None)); continue
+        if ak[0] not in ('SUM', 'AVG', 'MIN', 'MAX', 'COUNT') or not isinstance(ak[1], str):
+            return None
+        col = ak[1]
+        c = seg.cols.get(col)
+        if c is None or c.get('mode') not in (0, 1, 2):
+            return None
+        if c.get('mode') == 2 and ak[0] in ('SUM', 'AVG', 'MIN', 'MAX') and c.get('dt') != 0:
+            return None                              # float mode-2 stays on the float path
+        if seg._effective(col) is not None:
+            return None                              # UPDATE overrides falsify raw codes
+        if ak[0] in ('SUM', 'AVG', 'MIN', 'MAX') and c.get('dt') != 0:
+            return None                              # datetimes keep their typed emission
+        specs.append((ak[0], col))
+    import wdb_window as WN
+    cnts = {}
+    def counts_of(col, tabsize):
+        if col not in cnts:
+            cc = np.asarray(seg._raw_codes(col)).astype(np.int64)
+            cn = np.bincount(cc, minlength=tabsize)
+            if cn.size > tabsize:
+                cn = cn[:tabsize]                    # null codes live past the dict's
+            cnts[col] = cn                           # values: SQL aggs exclude them
+        return cnts[col]
+    N = int(seg.N)
+    row = []
+    for kind, col in specs:
+        if kind == 'COUNT_STAR':
+            row.append(N); continue
+        tab = WN._int_table(seg, col)
+        cn = counts_of(col, tab.size)
+        if kind == 'COUNT':
+            row.append(int(cn.sum())); continue
+        if kind in ('MIN', 'MAX'):
+            nz = np.flatnonzero(cn)
+            row.append(None if nz.size == 0
+                       else int(tab[int(nz[0] if kind == 'MIN' else nz[-1])])); continue
+        n = int(cn.sum())
+        s = XI.fold_counts(cn, tab)
+        row.append((s if n else None) if kind == 'SUM' else XI.exact_avg(s, n))
+    global _FAST_HITS
+    _FAST_HITS += 1
+    return [tuple(row)], [wdb_sql._alias(p) for p in tree.expressions]
+
+
+def _sum_overflow_gate(db, tree):
+    """Raise _FastUnsupported when a SUM/AVG argument is a dict-int column whose extremes
+    times N could exceed 2^53: the fused engine accumulates float64, which drifts there
+    (SUM(UserID) at 100M: ~1e13 absolute error). Falling through reaches wherescan's
+    exact two-limb fold. Extremes cost two point-fetches on the value-ordered dict."""
+    risky = []
+    for p in tree.expressions:
+        ak = wdb_sql._agg_kind(p)
+        if ak and ak[0] in ('SUM', 'AVG') and isinstance(ak[1], str):
+            risky.append(ak[1])
+    if not risky:
+        return
+    frm = tree.find(E.From)
+    if frm is None or not isinstance(frm.this, E.Table):
+        return
+    try:
+        paths = db.cat.segment_paths(frm.this.name)
+    except Exception:
+        return
+    if len(paths) != 1:
+        return
+    seg = db.open_segment(paths[0], frm.this.name)
+    for col in risky:
+        c = seg.cols.get(col)
+        if c is None or c.get('mode') not in (0, 1, 2) or c.get('dt') != 0:
+            continue
+        nd = int(c.get('n_dict') or c['V'])
+        if nd == 0:
+            continue
+        try:
+            lov = int(seg.fetch(col, 0)); hiv = int(seg.fetch(col, nd - 1))
+        except Exception:
+            continue
+        if max(abs(lov), abs(hiv)) * max(int(seg.N), 1) >= (1 << 53):
+            raise _FastUnsupported
+
+
 def table_agg(db, tree):
     """Single-table aggregate routed through the SAME fused engine as joins: a 0-join chain (fact only, every
     cptr is None). Reuses predicate fusion, high-card factorise, and vectorised assembly. Raises
     _FastUnsupported on anything not fusable so the caller falls back to the mature single-table executor."""
     w = tree.args.get('where')
-    if w is not None:
+    if w is None:
+        ex = _exact_scalar(db, tree)         # dict-arithmetic scalars: exact hugeint SUM,
+        if ex is not None:                   # correctly-rounded AVG, dict-edge MIN/MAX
+            return ex
+    _sum_overflow_gate(db, tree)             # big-int SUM/AVG: decline so the exact
+    if w is not None:                        # wherescan fold serves instead of float64
         for innode in w.find_all(E.In):
             if len(innode.args.get('expressions') or []) > 256:
                 raise _FastUnsupported       # giant literal lists: the pandas tail decodes the
