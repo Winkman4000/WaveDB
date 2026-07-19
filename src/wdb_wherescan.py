@@ -1144,8 +1144,9 @@ def execute(seg, spec):
             hmask &= m
         order = order[hmask[order]]
     sel = order[spec['off']: spec['off'] + spec['lim']] if spec['lim'] is not None else order[spec['off']:]
-    _, first = np.unique(ginv, return_index=True)   # first row of every group, one pass
-    rep = first[sel]
+    first = np.empty(cnt.size, np.int64)            # first row of every group, one pass,
+    first[ginv[::-1]] = np.arange(pos.size - 1, -1, -1, dtype=np.int64)   # no sort: reversed
+    rep = first[sel]                                # writes -- last write is the earliest row
     # ONE gather per agg column over all pos, then every group's aggregate vectorized --
     # the per-group codes_at gathers re-decompressed the frames each group's scattered
     # members touch (gs-cube: 1,165 gathers, 8,773 zstd calls for a 4-column query).
