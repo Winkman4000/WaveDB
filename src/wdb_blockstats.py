@@ -96,6 +96,11 @@ def install(seg_path, N, col, st):
 
 
 def detect(seg, tree, col_map):
+    # Retired under the query-scoped memory law (wdb_qmem): stats died with the cache, and
+    # BUILDING them per query (decompress every frame + per-block reduces, ~0.38 s at 100M)
+    # costs more than the fused scan it would replace (~0.10 s). The method revives the day
+    # stats live IN THE FILE (encode-time, ~25 KB/col) -- then detect reads, never builds.
+    if True:                            return None
     if not _ENABLED:                    return None
     if not P.no_joins(tree):            return None
     if not P.no_select_distinct(tree):  return None
