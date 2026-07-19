@@ -519,9 +519,17 @@ def detect(seg, tree, col_map):
             if not ineg and c2.get('mode') in (0, 1, 2) and c2.get('code_enc') == 3:
                 drive_in = ii            # a positive IN drives: union flag over its codes
                 break
+    drive_neq = None
     if drive_eq is None and drive_like is None and drive_or is None and drive_sf is None \
             and drive_in is None and not spans:
-        return None                      # need a positive driver (=, LIKE, OR, IN, scalar) or a span
+        for ei, (ecol, _ev, eop) in enumerate(eqs):
+            c2 = seg.cols[ecol]
+            if eop == '<>' and c2.get('mode') in (0, 1, 2) and c2.get('code_enc') == 3:
+                drive_neq = ei           # a lone <> drives: same frame scan, inverted card
+                break
+    if drive_eq is None and drive_like is None and drive_or is None and drive_sf is None \
+            and drive_in is None and drive_neq is None and not spans:
+        return None                      # need a driver (=, <>, LIKE, OR, IN, scalar) or a span
     # projections: plain key columns, aggregates, the CASE derived key, or bare * (rows mode)
     proj = tree.expressions
     star = len(proj) == 1 and isinstance(proj[0], E.Star)
@@ -563,7 +571,7 @@ def detect(seg, tree, col_map):
         return {'spans': spans, 'eqs': eqs, 'flags': flags, 'ins': ins, 'likes': likes,
                 'nulls': nulls, 'ors': ors, 'sflags': sflags, 'drive_eq': drive_eq,
                 'drive_like': drive_like, 'drive_or': drive_or, 'drive_sf': drive_sf,
-                'drive_in': drive_in, 'mode': 'rows',
+                'drive_in': drive_in, 'drive_neq': drive_neq, 'mode': 'rows',
                 'ocol': ocol, 'tiebreak': tiebreak,
                 'out_cols': (list(col_map.values()) if col_map else None) if star else plain_cols,
                 'lim': int(lim), 'off': int(wdb_sql._offset(tree) or 0)}
@@ -653,7 +661,7 @@ def detect(seg, tree, col_map):
     return {'spans': spans, 'eqs': eqs, 'flags': flags, 'ins': ins, 'likes': likes,
             'nulls': nulls, 'ors': ors, 'sflags': sflags, 'drive_eq': drive_eq,
             'drive_like': drive_like, 'drive_or': drive_or, 'drive_sf': drive_sf,
-            'drive_in': drive_in, 'mode': 'group', 'having': hterms,
+            'drive_in': drive_in, 'drive_neq': drive_neq, 'mode': 'group', 'having': hterms,
             'keys': keys, 'aggs': aggs, 'proj': proj, 'ordered': order is not None,
             'lim': lim, 'off': int(off)}
 
@@ -907,6 +915,15 @@ def execute(seg, spec):
         fl = np.zeros(int(seg.cols[icol]['V']), bool)
         fl[ks] = True
         pos = _scan_flag(seg, icol, fl, lo, hi)
+    elif spec.get('drive_neq') is not None:
+        ncol, nval, _op = spec['eqs'][spec['drive_neq']]
+        fl = np.ones(int(seg.cols[ncol]['V']), bool)
+        kc = _code_of(seg, ncol, nval)
+        if kc is not None:
+            fl[kc] = False
+        if seg.cols[ncol].get('has_null'):
+            fl[-1] = False               # SQL: NULL <> x is not TRUE
+        pos = _scan_flag(seg, ncol, fl, lo, hi)
     elif spec.get('drive_or') is not None:
         atoms = spec['ors'][spec['drive_or']]
         bycol = {}
@@ -920,7 +937,7 @@ def execute(seg, spec):
     else:
         pos = np.arange(lo, hi, dtype=np.int64)
     for i, (col, val, op) in enumerate(spec['eqs']):
-        if i == de or pos.size == 0: continue
+        if i == de or i == spec.get('drive_neq') or pos.size == 0: continue
         code = _code_of(seg, col, val)
         if code is None:
             if op == '=': pos = np.empty(0, np.int64)
