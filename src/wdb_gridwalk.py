@@ -35,6 +35,7 @@ E = wdb_sql.E
 _ENABLED = True           # live by default: gridwalk is the primary 2-key COUNT(*) top-K read
 _HEAD_N = 200000          # count-ordered head depth; serves any LIMIT up to this, declines beyond
 _ONES_N = 1024            # singleton fill head: the _ONES_N smallest count-1 gids, for LIMIT > nheavy
+_BINC_MAX = 1 << 24     # composite spaces up to 16.7M cells go by bincount (128 MB transient, query-scoped)
 _POS_MAX = 8192           # store member-row positions when total stored cells <= this (payload O(K))
 _POSROWS_MAX = 1 << 16    # ...AND their member rows <= this: positions cost bytes per ROW, and a
                           # low-card pair's handful of cells holds ALL 100M rows (measured 1.5 GB!)
@@ -169,7 +170,15 @@ def _build(seg, cols):
     if ca.size == 0:
         return None
     Vb = int(cb.max()) + 1
-    gid_all, cnt_all = np.unique(ca * Vb + cb, return_counts=True)   # filled cells, code order
+    key = ca * Vb + cb
+    Va = int(ca.max()) + 1
+    if Va * Vb <= _BINC_MAX:             # small composite space: bincount the grid directly --
+        full = np.bincount(key, minlength=Va * Vb)   # no 100M sort (np.unique sorts)
+        gid_all = np.flatnonzero(full)               # ascending = unique's code order
+        cnt_all = full[gid_all]
+        del full
+    else:
+        gid_all, cnt_all = np.unique(key, return_counts=True)   # filled cells, code order
     nd = int(gid_all.size)               # the pair's FULL distinct count -- the survey's FD input
     heavy = cnt_all >= 2
     gid = gid_all[heavy]; cnt = cnt_all[heavy]
@@ -191,7 +200,6 @@ def _build(seg, cols):
     stored = np.concatenate((gid, ones)) if ones.size else gid
     nmember = int(cnt.sum()) + int(ones.size)    # positions scale with MEMBER ROWS, not cells --
     if 0 < stored.size <= _POS_MAX and nmember <= _POSROWS_MAX:   # a low-card pair's few cells hold ALL rows
-        key = ca * Vb + cb
         st = np.sort(stored)
         p = np.searchsorted(st, key)
         valid = p < st.size
