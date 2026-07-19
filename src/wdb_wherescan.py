@@ -1144,9 +1144,62 @@ def execute(seg, spec):
             hmask &= m
         order = order[hmask[order]]
     sel = order[spec['off']: spec['off'] + spec['lim']] if spec['lim'] is not None else order[spec['off']:]
-    rep = np.empty(sel.size, np.int64)
-    for i, gi in enumerate(sel):
-        rep[i] = int(np.nonzero(ginv == gi)[0][0])
+    _, first = np.unique(ginv, return_index=True)   # first row of every group, one pass
+    rep = first[sel]
+    # ONE gather per agg column over all pos, then every group's aggregate vectorized --
+    # the per-group codes_at gathers re-decompressed the frames each group's scattered
+    # members touch (gs-cube: 1,165 gathers, 8,773 zstd calls for a 4-column query).
+    G = cnt.size
+    _cells = {}
+    _gath = {}
+    def _codes_all(col):
+        if col not in _gath:
+            c3 = seg.cols[col]
+            if c3['mode'] == 4:
+                _gath[col] = np.asarray(seg._seq_decode(c3))[pos]
+            else:
+                _gath[col] = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
+        return _gath[col]
+    for pi3, kind3, col3 in spec['aggs']:
+        if kind3 == 'COUNT_STAR':
+            continue
+        c3 = seg.cols[col3]
+        if kind3 == 'COUNT_COL':
+            if c3['mode'] == 4 or not c3.get('has_null'):
+                _cells[pi3] = np.bincount(ginv, minlength=G)
+            else:
+                m3 = _codes_all(col3) != int(c3['V']) - 1
+                _cells[pi3] = np.bincount(ginv[m3], minlength=G)
+        elif kind3 in ('MIN_DICT', 'MAX_DICT'):
+            cc3 = _codes_all(col3)
+            if kind3 == 'MAX_DICT':
+                if c3.get('has_null'):
+                    m3 = cc3 != int(c3['V']) - 1
+                    acc = np.full(G, -1, np.int64)
+                    np.maximum.at(acc, ginv[m3], cc3[m3])
+                else:
+                    acc = np.full(G, -1, np.int64)
+                    np.maximum.at(acc, ginv, cc3)
+            else:
+                acc = np.full(G, np.iinfo(np.int64).max, np.int64)
+                np.minimum.at(acc, ginv, cc3)
+            _cells[pi3] = acc
+        elif kind3 == 'COUNT_D':
+            cc3 = _codes_all(col3)
+            Vc3 = int(cc3.max()) + 1 if cc3.size else 1
+            u3 = np.unique(ginv.astype(np.int64) * Vc3 + cc3)
+            _cells[pi3] = np.bincount((u3 // Vc3).astype(np.int64), minlength=G)
+        else:                                            # SUM / AVG
+            if c3['mode'] == 4:
+                v3 = _codes_all(col3)
+            else:
+                v3 = _num_table(seg, col3)[_codes_all(col3)]
+            if kind3 == 'SUM':
+                acc = np.zeros(G, np.int64)
+                np.add.at(acc, ginv, v3.astype(np.int64))
+                _cells[pi3] = acc
+            else:
+                _cells[pi3] = np.bincount(ginv, weights=v3.astype(np.float64), minlength=G)
     rows_out = []
     for i, gi in enumerate(sel):
         r = int(rep[i]); row = []
@@ -1158,39 +1211,19 @@ def execute(seg, spec):
                 _t, kind, col = kind_or_key
                 if kind == 'COUNT_STAR':
                     row.append(int(cnt[gi]))
-                elif kind == 'COUNT_COL':
-                    c2 = seg.cols[col]
-                    grows = pos[ginv == gi]
-                    if c2['mode'] == 4 or not c2.get('has_null'):
-                        row.append(int(grows.size))
-                    else:
-                        cc2 = np.asarray(seg.codes_at(col, grows)).astype(np.int64)
-                        row.append(int((cc2 != int(c2['V']) - 1).sum()))
+                elif kind in ('COUNT_COL', 'COUNT_D'):
+                    row.append(int(_cells[_pi][gi]))
                 elif kind in ('MIN_DICT', 'MAX_DICT'):
-                    c2 = seg.cols[col]
-                    grows = pos[ginv == gi]
-                    cc2 = np.asarray(seg.codes_at(col, grows)).astype(np.int64)
-                    if kind == 'MAX_DICT' and c2.get('has_null'):
-                        cc2 = cc2[cc2 != int(c2['V']) - 1]
-                    if cc2.size == 0:
-                        row.append(None)
+                    k2 = int(_cells[_pi][gi])
+                    if (kind == 'MAX_DICT' and k2 < 0) or \
+                            (kind == 'MIN_DICT' and k2 == np.iinfo(np.int64).max):
+                        row.append(None)             # a group whose every member was null
                     else:
-                        k2 = int(cc2.min()) if kind == 'MIN_DICT' else int(cc2.max())
                         row.append(wdb_sql._pyval(seg.fetch(col, k2)))
-                elif kind == 'COUNT_D':
-                    grows = pos[ginv == gi]
-                    cc2 = np.asarray(seg.codes_at(col, grows)).astype(np.int64)
-                    row.append(int(np.unique(cc2).size))
-                else:
-                    c = seg.cols[col]
-                    grows = pos[ginv == gi]
-                    if c['mode'] == 4:
-                        v = np.asarray(seg._seq_decode(c))[grows]
-                    else:
-                        cc2 = np.asarray(seg.codes_at(col, grows)).astype(np.int64)
-                        v = _num_table(seg, col)[cc2]
-                    row.append(int(v.sum(dtype=np.int64)) if kind == 'SUM'
-                               else float(v.sum(dtype=np.float64)) / v.size)
+                elif kind == 'SUM':
+                    row.append(int(_cells[_pi][gi]))
+                else:                                # AVG
+                    row.append(float(_cells[_pi][gi]) / int(cnt[gi]))
             else:
                 _t, kk, aa = kind_or_key
                 a = int(aa[r])
