@@ -131,10 +131,12 @@ def _exact_scalar(db, tree):
             return None
         col = ak[1]
         c = seg.cols.get(col)
-        if c is None or c.get('mode') not in (0, 1, 2):
+        if c is None or c.get('mode') not in (0, 1, 2, 4):
             return None
-        if c.get('mode') == 2 and ak[0] in ('SUM', 'AVG', 'MIN', 'MAX') and c.get('dt') != 0:
-            return None                              # float mode-2 stays on the float path
+        if c.get('mode') in (2, 4) and ak[0] in ('SUM', 'AVG', 'MIN', 'MAX') and c.get('dt') != 0:
+            return None                              # float/typed stay on their own paths
+        if c.get('mode') == 4 and c.get('has_null'):
+            return None                              # seq nulls: keep the mature path
         if seg._effective(col) is not None:
             return None                              # UPDATE overrides falsify raw codes
         if ak[0] in ('SUM', 'AVG', 'MIN', 'MAX') and c.get('dt') != 0:
@@ -151,10 +153,27 @@ def _exact_scalar(db, tree):
             cnts[col] = cn                           # values: SQL aggs exclude them
         return cnts[col]
     N = int(seg.N)
+    seqs = {}
     row = []
     for kind, col in specs:
         if kind == 'COUNT_STAR':
             row.append(N); continue
+        c = seg.cols[col]
+        if c.get('mode') == 4:                       # sequence codec: decode once, exact fold
+            if col not in seqs:
+                seqs[col] = np.asarray(seg._seq_decode(c))
+            v = seqs[col]
+            if kind == 'COUNT':
+                row.append(int(v.size))
+            elif kind == 'MIN':
+                row.append(int(v.min()) if v.size else None)
+            elif kind == 'MAX':
+                row.append(int(v.max()) if v.size else None)
+            elif kind == 'SUM':
+                row.append(XI.fold_values(v) if v.size else None)
+            else:
+                row.append(XI.exact_avg(XI.fold_values(v), int(v.size)))
+            continue
         tab = WN._int_table(seg, col)
         cn = counts_of(col, tab.size)
         if kind == 'COUNT':
