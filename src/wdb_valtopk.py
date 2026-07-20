@@ -75,24 +75,32 @@ def execute(seg, spec):
     import wdb_window as WN
     keys, lim = spec['keys'], spec['lim']
     kcol, kdesc = keys[0]
-    v0 = WN._numvals(seg, kcol, exact_int=True)
-    N = v0.size
+    codes0 = np.asarray(seg._raw_codes(kcol)).astype(np.int64)
+    N = codes0.size
     k = min(lim, N)
     if k == N:
         cand_idx = np.arange(N)
     else:
+        # codes are ranks: the k-th boundary VALUE is the k-th boundary CODE -- one
+        # bincount + cumsum on the board replaces np.partition over 100M materialized
+        # values (2.3s -> ~0.3s; the primary's values are never built at all)
+        V = int(seg.cols[kcol]['V'])
+        cn = np.bincount(codes0, minlength=V)
         if kdesc:
-            thr = np.partition(v0, N - k)[N - k]
-            cand = v0 >= thr
+            j = int(np.searchsorted(np.cumsum(cn[::-1]), k))
+            cand = codes0 >= (V - 1 - j)
         else:
-            thr = np.partition(v0, k - 1)[k - 1]
-            cand = v0 <= thr
+            j = int(np.searchsorted(np.cumsum(cn), k))
+            cand = codes0 <= j
         cand_idx = np.nonzero(cand)[0]
         if cand_idx.size > _CAND_CAP:
             return None                          # boundary tie explosion: fall through
     arrs = []
     for c, d in keys:
-        a = v0[cand_idx] if c == kcol else WN._numvals(seg, c, exact_int=True)[cand_idx]
+        if c == kcol:
+            a = codes0[cand_idx]                 # rank order == value order, ties == ties
+        else:
+            a = WN._numvals(seg, c, exact_int=True)[cand_idx]
         if a.dtype.kind == 'f':
             arrs.append(-a if d else a)
         else:
