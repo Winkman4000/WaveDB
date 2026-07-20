@@ -311,22 +311,41 @@ def _try_stream_pairs(seg, spec):
     return out, [wdb_sql._alias(p) for p in spec['proj']]
 
 
+def _rn1_emit_col(seg, nm, cc):
+    """Winner-code emission mirroring the generic slot rules: datetime64 C-speed for
+    temporal, int-table (nline) for ints, point-fetch for small, sparse decode for big
+    string sets. cc is an int64 code array."""
+    c = seg.cols[nm]
+    if cc.size <= 10000:
+        return [wdb_sql._pyval(seg.fetch(nm, int(x))) for x in cc]
+    if c.get('dt') == 3:
+        vals = np.asarray(seg._dict_ints(c), dtype=np.int64)[cc]
+        u = seg.unit(nm)                             # stored unit, not an assumption
+        return vals.astype('datetime64[%s]' % u).astype('datetime64[us]').tolist()
+    if c.get('dt') == 0 and c.get('mode') == 2:
+        return _int_table(seg, nm)[cc].tolist()
+    uq, inv = np.unique(cc, return_inverse=True)
+    dvals = np.array([wdb_sql._pyval(seg.fetch(nm, int(k))) for k in uq], dtype=object)
+    return dvals[inv].tolist()
+
+
 def _try_rn1(seg, spec):
-    """QUALIFY ROW_NUMBER()=1 over (PARTITION p ORDER o ASC), projecting only p, o, rn:
-    the answer is the per-partition MINIMUM order code -- codes are ranks, so no sort,
-    no permutation, no row motion. One walk feeds a V-sized board (compiled group_min);
-    winners emit by point-fetch. Only decode when needed, never more than needed."""
+    """QUALIFY ROW_NUMBER()=1 over (PARTITION p ORDER o ASC|DESC), projecting only p, o,
+    rn: the answer is the per-partition MINIMUM (or MAXIMUM) order code -- codes are
+    ranks, so no sort, no permutation, no row motion. One compiled pass feeds a V-sized
+    board of cups; winners emit through the vectorized slot rules. Only decode when
+    needed, never more than needed."""
     wins = spec['wins']
     if len(wins) != 1 or wins[0][1]['kind'] != 'row_number':
         return None
     alias = wins[0][1]['alias']
     if spec['qterms'] != [('lit', alias, '=', 1.0)]:
         return None
-    if len(spec['pcols']) != 1 or spec['ocol'] is None or spec['odesc']:
+    if len(spec['pcols']) != 1 or spec['ocol'] is None:
         return None
     pcol, ocol = spec['pcols'][0], spec['ocol']
     cp, co = seg.cols[pcol], seg.cols[ocol]
-    if cp.get('mode') not in (0, 1) or co.get('mode') not in (0, 1):
+    if cp.get('mode') not in (0, 1, 2) or co.get('mode') not in (0, 1, 2):
         return None
     if cp.get('has_null') or co.get('has_null'):
         return None
@@ -344,25 +363,25 @@ def _try_rn1(seg, spec):
     pc = np.asarray(seg._raw_codes(pcol)).astype(np.int64)
     oc = np.asarray(seg._raw_codes(ocol)).astype(np.int64)
     import wdb_kernels as K
-    acc = K.group_min(pc, oc, int(cp['V']))
-    big = np.iinfo(np.int64).max
-    live = np.flatnonzero(acc != big)
+    if spec['odesc']:
+        acc = K.group_max(pc, oc, int(cp['V']))
+        live = np.flatnonzero(acc >= 0)              # cups start at -1: filled == present
+    else:
+        acc = K.group_min(pc, oc, int(cp['V']))
+        live = np.flatnonzero(acc != np.iinfo(np.int64).max)
     if spec['lim'] is not None:
         live = live[spec['off']:spec['off'] + spec['lim']]
-    rows = []
-    for g in live.tolist():
-        row = []
-        for kind in emit:
-            if kind == 'p':
-                row.append(wdb_sql._pyval(seg.fetch(pcol, g)))
-            elif kind == 'o':
-                row.append(wdb_sql._pyval(seg.fetch(ocol, int(acc[g]))))
-            else:
-                row.append(1)
-        rows.append(tuple(row))
+    slots = []
+    for kind in emit:
+        if kind == 'p':
+            slots.append(_rn1_emit_col(seg, pcol, live))
+        elif kind == 'o':
+            slots.append(_rn1_emit_col(seg, ocol, np.asarray(acc)[live]))
+        else:
+            slots.append([1] * int(live.size))
     global _HITS
     _HITS += 1
-    return rows, [wdb_sql._alias(p) for p in spec['proj']]
+    return list(zip(*slots)), [wdb_sql._alias(p) for p in spec['proj']]
 
 
 def execute(seg, spec):

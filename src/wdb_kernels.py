@@ -190,6 +190,24 @@ def group_min(pc, oc, K):
     return acc
 
 
+@njit(nogil=True, cache=True)
+def _group_max_nb(pc, oc, acc):
+    for i in range(pc.size):
+        v = oc[i]
+        if v > acc[pc[i]]:
+            acc[pc[i]] = v
+    return acc
+
+
+def group_max(pc, oc, K):
+    """Per-group maximum: the DESC rn=1 mirror. Codes are >= 0, so -1 marks empty."""
+    acc = np.full(K, np.int64(-1), np.int64)
+    if HAVE_NUMBA:
+        return _group_max_nb(pc.astype(np.int64), oc.astype(np.int64), acc)
+    np.maximum.at(acc, pc, oc)
+    return acc
+
+
 @njit(nogil=True, parallel=True, cache=True)
 def _seg_cumminmax_nb(vals, lane_start, lane_of, do_min):
     """Segmented cumulative min/max: running extreme within each lane (parallel over lanes)."""
