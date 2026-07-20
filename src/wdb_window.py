@@ -311,11 +311,68 @@ def _try_stream_pairs(seg, spec):
     return out, [wdb_sql._alias(p) for p in spec['proj']]
 
 
+def _try_rn1(seg, spec):
+    """QUALIFY ROW_NUMBER()=1 over (PARTITION p ORDER o ASC), projecting only p, o, rn:
+    the answer is the per-partition MINIMUM order code -- codes are ranks, so no sort,
+    no permutation, no row motion. One walk feeds a V-sized board (compiled group_min);
+    winners emit by point-fetch. Only decode when needed, never more than needed."""
+    wins = spec['wins']
+    if len(wins) != 1 or wins[0][1]['kind'] != 'row_number':
+        return None
+    alias = wins[0][1]['alias']
+    if spec['qterms'] != [('lit', alias, '=', 1.0)]:
+        return None
+    if len(spec['pcols']) != 1 or spec['ocol'] is None or spec['odesc']:
+        return None
+    pcol, ocol = spec['pcols'][0], spec['ocol']
+    cp, co = seg.cols[pcol], seg.cols[ocol]
+    if cp.get('mode') not in (0, 1) or co.get('mode') not in (0, 1):
+        return None
+    if cp.get('has_null') or co.get('has_null'):
+        return None
+    emit = []                                        # per projection: ('p'|'o'|'rn')
+    for p in spec['proj']:
+        nm = wdb_sql._proj_colname(p)
+        if nm == pcol:
+            emit.append('p')
+        elif nm == ocol:
+            emit.append('o')
+        elif isinstance(p, E.Column) and p.name == alias or wdb_sql._alias(p) == alias:
+            emit.append('rn')
+        else:
+            return None
+    pc = np.asarray(seg._raw_codes(pcol)).astype(np.int64)
+    oc = np.asarray(seg._raw_codes(ocol)).astype(np.int64)
+    import wdb_kernels as K
+    acc = K.group_min(pc, oc, int(cp['V']))
+    big = np.iinfo(np.int64).max
+    live = np.flatnonzero(acc != big)
+    if spec['lim'] is not None:
+        live = live[spec['off']:spec['off'] + spec['lim']]
+    rows = []
+    for g in live.tolist():
+        row = []
+        for kind in emit:
+            if kind == 'p':
+                row.append(wdb_sql._pyval(seg.fetch(pcol, g)))
+            elif kind == 'o':
+                row.append(wdb_sql._pyval(seg.fetch(ocol, int(acc[g]))))
+            else:
+                row.append(1)
+        rows.append(tuple(row))
+    global _HITS
+    _HITS += 1
+    return rows, [wdb_sql._alias(p) for p in spec['proj']]
+
+
 def execute(seg, spec):
     global _HITS
     st = _try_stream_pairs(seg, spec)
     if st is not None:
         return st
+    fp = _try_rn1(seg, spec)
+    if fp is not None:
+        return fp
     N = int(seg.N)
     # composite partition code (the radix fold)
     pc = np.asarray(seg._raw_codes(spec['pcols'][0])).astype(np.int64)

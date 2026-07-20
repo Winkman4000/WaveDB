@@ -171,6 +171,25 @@ def part_scatter(codes, K):
     return np.argsort(codes, kind='stable')
 
 
+@njit(nogil=True, cache=True)
+def _group_min_nb(pc, oc, acc):
+    for i in range(pc.size):
+        v = oc[i]
+        if v < acc[pc[i]]:
+            acc[pc[i]] = v
+    return acc
+
+
+def group_min(pc, oc, K):
+    """Per-group minimum of oc keyed by pc (one pass, no sort): the rn=1 window shape.
+    acc[g] = min over rows of group g; untouched groups stay at int64 max."""
+    acc = np.full(K, np.iinfo(np.int64).max, np.int64)
+    if HAVE_NUMBA:
+        return _group_min_nb(pc.astype(np.int64), oc.astype(np.int64), acc)
+    np.minimum.at(acc, pc, oc)
+    return acc
+
+
 @njit(nogil=True, parallel=True, cache=True)
 def _seg_cumminmax_nb(vals, lane_start, lane_of, do_min):
     """Segmented cumulative min/max: running extreme within each lane (parallel over lanes)."""
