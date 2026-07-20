@@ -196,7 +196,18 @@ class Segment:
             suf = raw[o:o+sl]; o += sl; s = prev[:cp]+suf; vals.append(s); prev = s; i += 1
         return vals
     def _dict_ints(self, c):
-        # mode 2: reconstruct sorted int64 dictionary from delta+zstd (once, cached)
+        # mode 2: the .nline sidecar memmaps directly when present -- the fixed number
+        # line: zero per-query rebuild, the OS page cache owns the bytes, and the map
+        # survives drop_derived lawfully (it IS a file, seg.buf's class). Every caller
+        # of this choke point points at the line for free. Else delta+zstd -> cumsum,
+        # memoized per query as before.
+        if '_nline' not in c:
+            import os
+            nm = next((k for k, v in self.cols.items() if v is c), None)
+            p = os.path.realpath(self.path) + '.nline.' + str(nm)
+            c['_nline'] = np.memmap(p, dtype='<i8', mode='r') if nm and os.path.exists(p) else None
+        if c['_nline'] is not None:
+            return c['_nline']
         if c.get('intvals') is None:
             raw = self._dz.decompress(c['z2'])
             d = np.frombuffer(raw, dtype=np.int64)
