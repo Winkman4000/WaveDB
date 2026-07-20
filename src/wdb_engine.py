@@ -133,6 +133,15 @@ class Segment:
             d = getattr(self, a, None)
             if isinstance(d, dict):
                 d.clear()
+        for c in self.cols.values():
+            if c.get('mode') not in (0, 3) and 'vals' in c:
+                c['vals'] = None                 # lazily-decoded dicts die too (modes 0/3
+            for k in ('intvals', 'raw', 'seqvals', 'ivals', 'fdmap'):   # parse eagerly at
+                if k in c:                       # open: file-shape metadata, they stay)
+                    c[k] = None
+            ch = c.get('chunks')
+            if isinstance(ch, dict):
+                ch.clear()
         self._presence = 0; self._ov = 0; self._cluster = 0; self._cubes = 0
 
     def resident_values(self, nm):
