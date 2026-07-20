@@ -17,6 +17,7 @@ map, db handle, segment path, raw sql, and the throughput/latency flag.
 """
 import wdb_cube
 import wdb_gbcount
+import wdb_groupself
 import wdb_heavypair
 import wdb_countpos
 import wdb_gridwalk
@@ -90,6 +91,11 @@ window = Read('window',
               lambda c: wdb_window.detect(c.seg, c.tree, c.cmap),
               lambda c, spec: wdb_window.execute(c.seg, spec),
               'window functions on the fused motion: one placement, two coordinates')
+
+groupself = Read('groupself',
+                 lambda c: wdb_groupself.detect(c.seg, c.tree, c.cmap),
+                 lambda c, spec: wdb_groupself.execute(c.seg, spec),
+                 'the counting board: GROUP BY K with WHERE on K -- bins, not rows')
 
 wherescan = Read('wherescan',
                  lambda c: wdb_wherescan.detect(c.seg, c.tree, c.cmap),

@@ -46,6 +46,7 @@ _READ_ORDER = (
     R.stair,                # staircase column: single-key GROUP BY from step positions (no decode)
     R.regexgroup,           # GROUP BY regex over the dict: per-code counts, V-level strings
     R.window,               # window fns: stable scatter by partition, lanes inherit cluster order
+    R.groupself,            # counting board: GROUP BY K + WHERE on K, bins not rows
     R.wherescan,            # conjunctive WHERE: stair spans + blocked-frame predicate scan, disk-only
     R.dict_count,           # dictionary per-code counts
     R.gridwalk,             # two-key COUNT(*) top-K via grid filled-cell + count-ordered head (opt-in)
