@@ -26,11 +26,15 @@ def _term(cj, col):
     """One WHERE conjunct as a bin operation on `col`, or None (not our shape)."""
     if isinstance(cj, E.Not) and isinstance(cj.this, E.In):
         node = cj.this
+        if node.args.get('query') is not None or node.args.get('_codes') is not None:
+            return None                           # subquery/code-set IN: wherescan's job
         if not (isinstance(node.this, E.Column) and node.this.name == col):
             return None
         vals = [WS._litval(x) for x in node.expressions]
         return None if any(v is None for v in vals) else ('nin', vals)
     if isinstance(cj, E.In):
+        if cj.args.get('query') is not None or cj.args.get('_codes') is not None:
+            return None                           # subquery/code-set IN: wherescan's job
         if not (isinstance(cj.this, E.Column) and cj.this.name == col):
             return None
         vals = [WS._litval(x) for x in cj.expressions]

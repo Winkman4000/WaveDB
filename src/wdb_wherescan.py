@@ -132,6 +132,10 @@ def _in_list(node):
         node = node.this; neg = True
     if not isinstance(node, E.In) or not isinstance(node.this, E.Column):
         return None
+    if node.args.get('_codes') is not None:       # same-column subquery, pre-resolved to
+        return node.this.name, {'_codes': node.args['_codes']}, neg   # a code set upstream
+    if node.args.get('query') is not None:
+        return None                               # unresolved subquery: not a literal list
     vals = []
     for x in node.expressions:
         v = _litval(x)
@@ -767,11 +771,14 @@ def _num_table(seg, col):
 
 
 def _in_codes(seg, col, vals):
-    """Dict codes for an IN list. The dict-pass path decodes the ENTIRE dictionary
+    """Dict codes for an IN list. Pre-resolved code sets (same-column subqueries) pass
+    straight through. The dict-pass path decodes the ENTIRE dictionary
     (V-proportional: ~6s for SearchPhrase's 6M) while bisects cost only the probes
     (each _code_of is O(log V) point-fetches, never materializing). The old fixed
     500-value threshold was calibrated in the leak era when the decoded dict was
     retained and free; honestly priced, the crossover scales with the dictionary."""
+    if isinstance(vals, dict):
+        return np.asarray(vals['_codes'], dtype=np.int64)
     c = seg.cols[col]
     nd = int(c.get('n_dict') or c.get('V') or 0)
     if len(vals) * 64 > nd:
@@ -836,10 +843,7 @@ def _or_union_flag(seg, atoms):
             if k is not None:
                 flag[k] = True
         elif a[0] == 'in':
-            for v in a[2]:
-                k = _code_of(seg, col, v)
-                if k is not None:
-                    flag[k] = True
+            flag[_in_codes(seg, col, a[2])] = True
         else:                                    # like
             flag |= _like_flags(seg, col, a[2], a[3])
     return flag
@@ -868,7 +872,7 @@ def _atom_mask(seg, a, pos, ccache):
             return np.ones(pos.size, bool) if a[3] else np.zeros(pos.size, bool)
         return cc != k if a[3] else cc == k
     if a[0] == 'in':
-        ks = np.array([k for k in (_code_of(seg, col, v) for v in a[2]) if k is not None], np.int64)
+        ks = _in_codes(seg, col, a[2])
         if not ks.size:
             m = np.zeros(pos.size, bool)
         else:

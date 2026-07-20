@@ -17,6 +17,88 @@ import sqlglot.expressions as E
 _MAX_IN = 2_000_000
 
 
+def _samecol_codes(db, tree, node, sub):
+    """C IN (SELECT C FROM sametable WHERE <simple conjuncts>): the inner's answer is a
+    SET OF CODES -- scan the inner WHERE to positions, gather C's codes there, unique.
+    No strings exist anywhere; the outer receives codes on the node ('_codes') and the
+    query arg stays attached so every codes-unaware consumer declines exactly as before
+    (fail closed, loud not wrong). Returns (codes, inner_has_null) or None."""
+    import numpy as np
+    import wdb_policies as P
+    import wdb_wherescan as WS
+    if not isinstance(node.this, E.Column):
+        return None
+    C = node.this.name
+    inner = sub.this
+    if not isinstance(inner, E.Select):
+        return None
+    exprs = inner.expressions
+    if len(exprs) != 1 or not isinstance(exprs[0], E.Column) or exprs[0].name != C:
+        return None
+    if inner.args.get('group') or inner.args.get('limit') or inner.args.get('order'):
+        return None
+    itn, alias = _inner_tables(inner)
+    f = tree.args.get('from_') or tree.args.get('from')
+    if itn is None or f is None or not isinstance(f.this, E.Table) or f.this.name != itn:
+        return None
+    iw = inner.args.get('where')
+    if iw is not None:
+        quals = ({alias} if alias != itn else {itn}) if alias else {itn}
+        for col in iw.find_all(E.Column):
+            if col.table and col.table not in quals:
+                return None                       # correlated: not our shape
+    paths = db.cat.segment_paths(itn)
+    if len(paths) != 1:
+        return None
+    seg = db.open_segment(paths[0], itn)
+    if not P.no_deleted_rows(seg):
+        return None
+    cC = seg.cols.get(C)
+    if cC is None or cC.get('mode') not in (0, 1, 2) or seg._effective(C) is not None:
+        return None
+    pos = None
+    if iw is not None:
+        for cj in WS._conjuncts(iw.this):
+            cl = WS._col_lit(cj)
+            if cl is None:
+                return None
+            col2, val, op = cl[0], cl[1], cl[2]
+            if op not in ('=', '<>'):
+                return None
+            c2 = seg.cols.get(col2)
+            if c2 is None or c2.get('mode') not in (0, 1, 2) or seg._effective(col2) is not None:
+                return None
+            V2 = int(c2['V'])
+            kc = WS._code_of(seg, col2, val)
+            fl = np.zeros(V2, dtype=bool)
+            if op == '=':
+                if kc is None:
+                    return np.empty(0, np.int64), False    # absent literal: empty inner set
+                fl[kc] = True
+            else:
+                fl[:] = True
+                if kc is not None:
+                    fl[kc] = False
+                if c2.get('has_null'):
+                    fl[V2 - 1] = False                     # NULL <> lit is not TRUE
+            p = WS._scan_flag(seg, col2, fl, 0, seg.N)
+            pos = p if pos is None else np.intersect1d(pos, p, assume_unique=True)
+            if pos.size == 0:
+                break
+    if pos is None:
+        cn = np.bincount(np.asarray(seg._raw_codes(C)), minlength=int(cC['V']))
+        codes = np.flatnonzero(cn > 0).astype(np.int64)
+    else:
+        codes = np.unique(np.asarray(seg.codes_at(C, pos)).astype(np.int64))
+    has_null = False
+    if cC.get('has_null'):
+        nullc = int(cC['V']) - 1
+        if codes.size and int(codes[-1]) == nullc:
+            has_null = True
+            codes = codes[:-1]
+    return codes, has_null
+
+
 def has_subquery(tree):
     w = tree.args.get('where')
     if w is None:
@@ -187,6 +269,19 @@ def rewrite(db, tree):
                 and isinstance(inner.expressions[0], E.Column)):
             inner.set('distinct', E.Distinct())   # IN cares about the SET: dedup in the
                                                   # engine's code space, not python-side
+        sc = _samecol_codes(db, tree, node, sub)
+        if sc is not None:
+            codes, in_null = sc
+            negated = isinstance(node.parent, E.Not)
+            if negated and in_null and not node.args.get('_exists_rewrite'):
+                node.parent.replace(E.false())    # NOT IN with an inner NULL: no row qualifies
+                continue
+            if codes.size == 0:
+                (node.parent if negated else node).replace(
+                    E.true() if negated else E.false())
+                continue
+            node.set('_codes', codes)             # query arg stays: codes-unaware paths
+            continue                              # decline as before (fail closed)
         rows = _run_inner(db, sub)
         if rows and len(rows[0]) != 1:
             raise ValueError("IN subquery must return one column")
