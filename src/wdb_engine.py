@@ -205,8 +205,9 @@ class Segment:
             import os
             nm = next((k for k, v in self.cols.items() if v is c), None)
             p = os.path.realpath(self.path) + '.nline.' + str(nm)
-            c['_nline'] = np.memmap(p, dtype='<i8', mode='r') if nm and os.path.exists(p) else None
-        if c['_nline'] is not None:
+            c['_nline'] = np.memmap(p, dtype='<i8', mode='r').view(np.ndarray) \
+                if nm and os.path.exists(p) else None   # ndarray view: same mapped bytes,
+        if c['_nline'] is not None:                     # no memmap-subclass gather tax
             return c['_nline']
         if c.get('intvals') is None:
             raw = self._dz.decompress(c['z2'])

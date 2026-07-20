@@ -196,7 +196,7 @@ def _int_table(seg, col):
     if '_nline' not in c:
         import os
         p = os.path.realpath(seg.path) + '.nline.' + col   # segments reach files through
-        c['_nline'] = np.memmap(p, dtype='<i8', mode='r') if os.path.exists(p) else None   # symlinks
+        c['_nline'] = np.memmap(p, dtype='<i8', mode='r').view(np.ndarray) if os.path.exists(p) else None   # symlinks; ndarray view drops subclass gather tax
     if c['_nline'] is not None:
         return c['_nline']
     try:
