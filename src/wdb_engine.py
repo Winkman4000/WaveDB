@@ -701,17 +701,22 @@ class Segment:
         if rows.size == 0:
             return np.empty(0, dtype=np.int64)
         c = self.cols[nm]
-        if c.get('code_enc', 0) != 3 or nm in self._codes:
+        if c.get('code_enc', 0) != 3 or nm in self._codes or rows.size >= (self.N >> 2):
+            # huge row sets: ONE full decode + one vectorized gather beats touching every
+            # frame through a positional walk (sq-nested passed ~90M positions here)
             return np.asarray(self._raw_codes(nm))[rows] if c.get('code_enc', 0) != 2 else \
                 np.searchsorted(self.stairs(nm), rows, side='right').astype(np.int64)
         wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
         BR = c['BR']; base = c['cstart']; bo = c['boffs']; dz = self._dz
         out = np.empty(rows.size, dtype=wdt)
         blks = rows // BR
-        for j in np.unique(blks):
-            m = blks == j
+        order = np.argsort(blks, kind='stable')     # group rows by frame in one sort --
+        rs = rows[order]; bs = blks[order]          # the old per-block mask rescan was
+        ub, starts = np.unique(bs, return_index=True)   # O(blocks x pos) comparisons
+        ends = np.append(starts[1:], bs.size)
+        for j, s, e in zip(ub.tolist(), starts.tolist(), ends.tolist()):
             raw = np.frombuffer(dz.decompress(self.buf[base+int(bo[j]):base+int(bo[j+1])].tobytes()), dtype=wdt)
-            out[m] = raw[rows[m] - j*BR]
+            out[order[s:e]] = raw[rs[s:e] - j*BR]
         return out
 
     def values_range(self, nm, lo, hi):
