@@ -1341,6 +1341,14 @@ def _eval_pred(seg, node, seg_col):
         return res
     if isinstance(node, E.In):
         col=_colname(node.this)
+        kcs = node.args.get('_codes')
+        if kcs is not None:
+            # same-column subquery pre-resolved to a CODE SET upstream: membership over raw
+            # codes, no strings anywhere (NULL never matches: the null code is not in the set)
+            return np.isin(np.asarray(seg._raw_codes(seg_col(col))).astype(np.int64),
+                           np.asarray(kcs, dtype=np.int64))
+        if node.args.get('query') is not None:
+            raise NotImplementedError("IN with unresolved subquery")
         lits=node.args.get('expressions') or []
         c0 = seg.cols.get(seg_col(col))
         if (c0 is not None and c0.get('mode') in (0, 1, 2) and len(lits) > 64

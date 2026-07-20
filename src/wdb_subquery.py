@@ -280,8 +280,11 @@ def rewrite(db, tree):
                 (node.parent if negated else node).replace(
                     E.true() if negated else E.false())
                 continue
-            node.set('_codes', codes)             # query arg stays: codes-unaware paths
-            continue                              # decline as before (fail closed)
+            node.set('_codes', codes)             # query arg stays AND the subquery node
+            node.set('expressions', [sub])        # sits in expressions as a sentinel: any
+            continue                              # literal-parser chokes and declines --
+                                                  # empty expressions would silently match
+                                                  # nothing (fail closed, loud not wrong)
         rows = _run_inner(db, sub)
         if rows and len(rows[0]) != 1:
             raise ValueError("IN subquery must return one column")

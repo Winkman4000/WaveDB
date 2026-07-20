@@ -940,6 +940,13 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             return leaf(node.this, mk)
         if isinstance(node, E.In):
             def mk(seg, pcol):
+                kcs = node.args.get('_codes')
+                if kcs is not None:              # same-column subquery pre-resolved to a
+                    return np.isin(              # CODE SET: membership over raw codes,
+                        np.asarray(seg.codes(pcol)).astype(np.int64),   # no strings
+                        np.asarray(kcs, dtype=np.int64))
+                if node.args.get('query') is not None:
+                    raise _FastUnsupported       # unresolved subquery: not a literal list
                 exprs = node.args.get('expressions') or []
                 c = seg.cols[pcol]
                 if c['dt'] == 1 and c['mode'] != 4:
