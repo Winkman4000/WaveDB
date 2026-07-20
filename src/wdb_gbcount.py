@@ -32,24 +32,43 @@ def _path(seg, col):
     return f"{seg.path}.{col}.gbc"
 
 
-def _code_values(seg, col):
-    """The column's by-code value dictionary (engine-cached, indexable by code), or None if the
-    column isn't a value-identity dictionary we can decode (mode-4 affine, etc.). Returns the RAW
-    dict (no per-value conversion) so the caller decodes only the few codes it actually emits."""
+def _fetchable(seg, col):
+    """Can this column's values be point-fetched by code (seg.fetch)? A pure capability
+    check -- touches NO data. The old version materialized the ENTIRE dictionary here
+    (dict_vals: 18.3M string reconstructions for URL) so the emit could index ten codes.
+    The rule: only decode when needed, never more than needed -- the emit point-fetches."""
     c = seg.cols[col]
     if c['mode'] == 4:
-        return None
-    if c['dt'] == 1:                                    # string dict (modes 0/1): list of bytes
-        try:
-            return seg.dict_vals(col)
-        except Exception:
-            return None
-    if c['dt'] == 0 and c['mode'] == 2:                 # high-card int: sorted int64 dictionary
-        try:
-            return seg._dict_ints(c)
-        except Exception:
-            return None
-    return None                                         # other encodings: let the scan path handle it (v1)
+        return False
+    if c['dt'] == 1 and c['mode'] in (0, 1):            # string dict: restart-walk fetch
+        return True
+    if c['dt'] == 0 and c['mode'] == 2:                 # high-card int: nline/dict fetch
+        return True
+    return False
+
+
+class _FetchDecoder:
+    """Lazy by-code decoder: indexable like a materialized dictionary, but every [code]
+    is a point-fetch (restart-walk for strings, nline/dict for ints). The rule: only
+    decode when needed, never more than needed. len() is n_dict -- metadata, no data."""
+    __slots__ = ('_seg', '_col', '_n')
+
+    def __init__(self, seg, col):
+        self._seg = seg; self._col = col
+        c = seg.cols[col]
+        self._n = int(c.get('n_dict') or c.get('V') or 0)
+
+    def __len__(self):
+        return self._n
+
+    def __getitem__(self, code):
+        return self._seg.fetch(self._col, int(code))
+
+
+def _code_values(seg, col):
+    """Shared by gdsidecar/groupdistinct/survgroup: a LAZY by-code decoder (or None).
+    Materializes nothing -- the old version decoded ENTIRE dictionaries here."""
+    return _FetchDecoder(seg, col) if _fetchable(seg, col) else None
 
 
 def _build(seg, col):
@@ -160,11 +179,10 @@ def detect(seg, tree, col_map):
     if not P.no_deleted_rows(seg):     return None      # deleted rows make stored counts stale
     if not _order_is_count_desc(tree, proj, ci):
         return None
-    V = _code_values(seg, col)                          # by-code value dict (O(V) metadata, engine-cached)
-    if V is None:
+    if not _fetchable(seg, col):                        # capability only: NO data touched
         return None
     return {'col': col, 'ci': ci, 'ki': ki, 'lim': lim, 'proj': proj,
-            'V': V, 'order': tree.args.get('order')}
+            'order': tree.args.get('order')}
 
 
 def execute(seg, spec):
@@ -173,7 +191,7 @@ def execute(seg, spec):
     a LIMIT past the stored heavy hitters, or a tie straddling the LIMIT boundary."""
     global _HITS
     col = spec['col']; ci = spec['ci']; ki = spec['ki']; lim = spec['lim']
-    proj = spec['proj']; V = spec['V']
+    proj = spec['proj']
     loaded = _load(seg, col)
     if loaded is None:
         return None
@@ -187,8 +205,8 @@ def execute(seg, spec):
     rows = []
     for code, n in zip(hc[:lim].tolist(), hn[:lim].tolist()):
         row = [None, None]
-        row[ki] = wdb_sql._pyval(V[code])               # decode only the N emitted keys
-        row[ci] = int(n)
+        row[ki] = wdb_sql._pyval(seg.fetch(col, int(code)))   # decode ONLY the N emitted keys:
+        row[ci] = int(n)                                      # point-fetch, never the dictionary
         rows.append(tuple(row))
     rows = workers.finalize(rows, proj, spec['order'], lim)
     _HITS += 1
