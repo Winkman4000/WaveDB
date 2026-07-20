@@ -195,8 +195,8 @@ def _int_table(seg, col):
     c = seg.cols[col]
     if '_nline' not in c:
         import os
-        p = seg.path + '.nline.' + col
-        c['_nline'] = np.memmap(p, dtype='<i8', mode='r') if os.path.exists(p) else None
+        p = os.path.realpath(seg.path) + '.nline.' + col   # segments reach files through
+        c['_nline'] = np.memmap(p, dtype='<i8', mode='r') if os.path.exists(p) else None   # symlinks
     if c['_nline'] is not None:
         return c['_nline']
     try:
