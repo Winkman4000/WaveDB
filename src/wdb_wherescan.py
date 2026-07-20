@@ -767,8 +767,14 @@ def _num_table(seg, col):
 
 
 def _in_codes(seg, col, vals):
-    """Dict codes for an IN list: one typed-dict pass beats N bisects past ~500 values."""
-    if len(vals) > 500:
+    """Dict codes for an IN list. The dict-pass path decodes the ENTIRE dictionary
+    (V-proportional: ~6s for SearchPhrase's 6M) while bisects cost only the probes
+    (each _code_of is O(log V) point-fetches, never materializing). The old fixed
+    500-value threshold was calibrated in the leak era when the decoded dict was
+    retained and free; honestly priced, the crossover scales with the dictionary."""
+    c = seg.cols[col]
+    nd = int(c.get('n_dict') or c.get('V') or 0)
+    if len(vals) * 64 > nd:
         dv = seg._typed_dict(col)
         idx = {(x if isinstance(x, (bytes, bytearray)) else str(x).encode()
                 if isinstance(x, str) else x): i for i, x in enumerate(dv)}
