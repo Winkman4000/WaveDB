@@ -187,9 +187,18 @@ def detect(seg, tree, col_map):
 
 
 def _int_table(seg, col):
-    """code -> int64 value, exact: _dict_ints when the layout has it, typed-dict otherwise.
+    """code -> int64 value, exact. A flat .nline sidecar memmaps directly when present --
+    the fixed number line: file layout IS the compute layout, the OS page cache owns the
+    bytes, zero per-query rebuild. The map survives drop_derived lawfully (it IS a file,
+    same class as seg.buf). Else _dict_ints when the layout has it, typed-dict otherwise.
     Never float64 -- values past 2**53 lose low bits there (caught live: UserID)."""
     c = seg.cols[col]
+    if '_nline' not in c:
+        import os
+        p = seg.path + '.nline.' + col
+        c['_nline'] = np.memmap(p, dtype='<i8', mode='r') if os.path.exists(p) else None
+    if c['_nline'] is not None:
+        return c['_nline']
     try:
         return np.asarray(seg._dict_ints(c), dtype=np.int64)
     except Exception:
