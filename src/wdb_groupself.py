@@ -90,10 +90,27 @@ def detect(seg, tree, col_map):
     ki = 1 - ci
     if wdb_sql._agg_kind(proj[ki]) is not None:
         return None
-    knm = wdb_sql._proj_colname(proj[ki])
-    gnm = wdb_sql._colname(tree.args.get('group').expressions[0])
-    if knm is None or gnm is None or knm != gnm:
-        return None
+    kp = proj[ki]
+    kexpr = kp.this if isinstance(kp, E.Alias) else kp
+    lower = isinstance(kexpr, E.Lower)
+    ge = tree.args.get('group').expressions[0]
+    if lower:
+        # LOWER(col) AS l ... GROUP BY l: the key is the lower-collation gid --
+        # the lmap folds the board's V bins into G groups, no strings anywhere
+        if not isinstance(kexpr.this, E.Column):
+            return None
+        knm = kexpr.this.name
+        kalias = wdb_sql._alias(kp)
+        gmatch = ((isinstance(ge, E.Column) and ge.name == kalias)
+                  or (isinstance(ge, E.Lower) and isinstance(ge.this, E.Column)
+                      and ge.this.name == knm))
+        if not gmatch:
+            return None
+    else:
+        knm = wdb_sql._proj_colname(kp)
+        gnm = wdb_sql._colname(ge)
+        if knm is None or gnm is None or knm != gnm:
+            return None
     col = col_map.get(knm, knm) if col_map else knm
     if not P.columns_exist(seg, col):  return None
     if not P.not_positional(seg, col): return None
@@ -101,6 +118,8 @@ def detect(seg, tree, col_map):
     c = seg.cols[col]
     if c.get('mode') not in (0, 1):
         return None                                      # dict columns (v1)
+    if lower and c.get('has_null'):
+        return None                                      # NULL under LOWER: scan path
     if seg._effective(col) is not None:
         return None
     terms = []
@@ -136,7 +155,7 @@ def detect(seg, tree, col_map):
     if lim is None or wdb_sql._offset(tree):
         return None
     return {'col': col, 'ci': ci, 'ki': ki, 'lim': int(lim), 'terms': terms,
-            'having': hv, 'proj': proj, 'order': order}
+            'having': hv, 'proj': proj, 'order': order, 'lower': lower}
 
 
 def execute(seg, spec):
@@ -161,6 +180,18 @@ def execute(seg, spec):
             for k in kcs:
                 if k is not None:
                     cn[k] = 0
+    rep = None
+    if spec.get('lower'):
+        # fold the V bins into G lower-collation groups through the memmapped lmap:
+        # WHERE already acted in original code space (rows filtered), the fold is V-sized
+        import wdb_lmap
+        lr = wdb_lmap.load_or_build(seg, col)
+        if lr is None:
+            return None
+        mp, rep = lr
+        cg = np.zeros(rep.size, np.int64)
+        np.add.at(cg, np.asarray(mp), cn)
+        cn = cg
     live = cn > 0
     if spec['having'] is not None:
         op, val = spec['having']
@@ -186,7 +217,11 @@ def execute(seg, spec):
     rows = []
     for g in sel.tolist():
         row = [None, None]
-        row[spec['ki']] = wdb_sql._pyval(seg.fetch(col, int(g)))   # decode ONLY winners
+        if rep is not None:
+            import wdb_lmap
+            row[spec['ki']] = wdb_lmap._lower(seg.fetch(col, int(rep[g])))
+        else:
+            row[spec['ki']] = wdb_sql._pyval(seg.fetch(col, int(g)))   # decode ONLY winners
         row[spec['ci']] = int(cn[g])
         rows.append(tuple(row))
     rows = workers.finalize(rows, spec['proj'], spec['order'], spec['lim'])
