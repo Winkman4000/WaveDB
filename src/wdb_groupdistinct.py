@@ -168,19 +168,14 @@ def execute(seg, det, tree):
     if gmax * k >= (1 << 62):                            # pack would overflow int64 -> decline
         return None
 
-    counts = None
     if _HAVE_NUMBA:
-        # the stamp board: scatter rows GROUP-MAJOR (compiled), then one sequential
-        # pass over a reusable Vt-sized epoch board -- stamp[u] != group means first
-        # sighting of this (group, user) pair, count it, stamp it. No hashing, no
-        # probing, no per-row branch misses on collisions. NULL targets skipped in-kernel.
-        import wdb_kernels as K
-        perm = K.part_scatter(grp, gmax)
-        counts = K.stamp_distinct(tgt[perm], grp[perm], k, gmax, null_tgt=tnull)
-    if counts is None and _HAVE_NUMBA:
+        # (measured, 2026-07: a group-major scatter + epoch-stamp board was tried here
+        # and reverted -- it pays the same board-sized cache misses as the hash probe
+        # PLUS two full-N gathers the walk never needs. The walk runs in raw order and
+        # is near single-thread optimal; beating duck's 0.4s needs parallel kernels.)
         capbits = max(20, min(28, int(np.ceil(np.log2(max(N, 2)))) + 1))
         counts = _walk(grp, tgt, np.int64(k), gmax, np.int64(tnull), capbits)
-    if counts is None:
+    else:
         keep = (tgt != tnull) if tnull >= 0 else slice(None)
         key = grp[keep].astype(np.int64) * k + tgt[keep].astype(np.int64)
         uq = np.unique(key)

@@ -303,31 +303,6 @@ def rnk_mark(pc, k, K):
     return rn
 
 
-@njit(nogil=True, cache=True)
-def _stamp_distinct_nb(uc_sorted, gc_sorted, stamp, counts, null_tgt):
-    for i in range(uc_sorted.size):
-        u = uc_sorted[i]
-        if u == null_tgt:                        # COUNT(DISTINCT) ignores NULL
-            continue
-        g = gc_sorted[i]
-        if stamp[u] != g + 1:
-            stamp[u] = g + 1
-            counts[g] += 1
-
-
-def stamp_distinct(uc_sorted, gc_sorted, Vu, Vg, null_tgt=-1):
-    """COUNT(DISTINCT u) per group over GROUP-MAJOR rows: one reusable stamp board
-    (epoch = group code + 1, never reset) counts each (group, user) pair once.
-    null_tgt rows are skipped (COUNT(DISTINCT) ignores NULL)."""
-    if not HAVE_NUMBA:
-        return None
-    stamp = np.zeros(Vu, np.int32)
-    counts = np.zeros(Vg, np.int64)
-    _stamp_distinct_nb(uc_sorted.astype(np.int64), gc_sorted.astype(np.int64),
-                       stamp, counts, np.int64(null_tgt))
-    return counts
-
-
 @njit(nogil=True, parallel=True, cache=True)
 def _seg_cumminmax_nb(vals, lane_start, lane_of, do_min):
     """Segmented cumulative min/max: running extreme within each lane (parallel over lanes)."""
