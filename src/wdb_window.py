@@ -329,6 +329,67 @@ def _rn1_emit_col(seg, nm, cc):
     return dvals[inv].tolist()
 
 
+_PC_MAX = 1 << 26      # composite board cap: 67M cells, a transient the pod yawns at
+
+
+def _try_partcount(seg, spec):
+    """COUNT(*) OVER (PARTITION BY a[, b]) projecting only the partition cols + n, with
+    optional QUALIFY on n: the club-size question. One bean board over the composite
+    key, one gather so every row looks up its own club, vectorized emission. No sort,
+    no parade -- reuses the g-2key composite-board idea with a per-row lookup."""
+    wins = spec['wins']
+    if len(wins) != 1:
+        return None
+    w = wins[0][1]
+    if w['kind'] != 'count' or w['ocol'] is not None or w['frame'] is not None:
+        return None
+    pcols = list(w['pcols'])
+    if not (1 <= len(pcols) <= 2):
+        return None
+    alias = w['alias']
+    qt = spec['qterms'] or []
+    if qt and (len(qt) != 1 or qt[0][0] != 'lit' or qt[0][1] != alias):
+        return None
+    for nm in pcols:
+        c = seg.cols[nm]
+        if c.get('mode') not in (0, 1, 2) or c.get('has_null'):
+            return None
+    emit = []
+    for p in spec['proj']:
+        nm = wdb_sql._proj_colname(p)
+        if nm in pcols:
+            emit.append(pcols.index(nm))
+        elif (isinstance(p, E.Column) and p.name == alias) or wdb_sql._alias(p) == alias:
+            emit.append('n')
+        else:
+            return None
+    Vs = [int(seg.cols[nm]['V']) for nm in pcols]
+    tot = Vs[0] * (Vs[1] if len(Vs) == 2 else 1)
+    if tot > _PC_MAX:
+        return None
+    cs = [np.asarray(seg._raw_codes(nm)).astype(np.int64) for nm in pcols]
+    key = cs[0] if len(cs) == 1 else cs[0] * Vs[1] + cs[1]
+    n = np.bincount(key, minlength=tot)[key]         # every row looks up its club
+    if qt:
+        op, val = qt[0][2], qt[0][3]
+        m = (n > val) if op == '>' else (n >= val) if op == '>=' else \
+            (n < val) if op == '<' else (n <= val) if op == '<=' else (n == val)
+        sel = np.flatnonzero(m)
+    else:
+        sel = np.arange(key.size)
+    if spec['lim'] is not None:
+        sel = sel[spec['off']:spec['off'] + spec['lim']]
+    slots = []
+    for e in emit:
+        if e == 'n':
+            slots.append(n[sel].tolist())
+        else:
+            slots.append(_rn1_emit_col(seg, pcols[e], cs[e][sel]))
+    global _HITS
+    _HITS += 1
+    return list(zip(*slots)), [wdb_sql._alias(p) for p in spec['proj']]
+
+
 def _try_rn1(seg, spec):
     """QUALIFY ROW_NUMBER()=1 over (PARTITION p ORDER o ASC|DESC), projecting only p, o,
     rn: the answer is the per-partition MINIMUM (or MAXIMUM) order code -- codes are
@@ -390,6 +451,9 @@ def execute(seg, spec):
     if st is not None:
         return st
     fp = _try_rn1(seg, spec)
+    if fp is not None:
+        return fp
+    fp = _try_partcount(seg, spec)
     if fp is not None:
         return fp
     N = int(seg.N)
