@@ -208,6 +208,80 @@ def group_max(pc, oc, K):
     return acc
 
 
+@njit(nogil=True, cache=True)
+def _frame_sum_keyed_nb(pc, vals, k, ring, rsum, rcnt, rpos, osum, ocnt):
+    W = k + 1
+    for i in range(pc.size):
+        p = pc[i]
+        v = vals[i]
+        if rcnt[p] >= W:
+            rsum[p] -= ring[p * W + rpos[p]]
+        else:
+            rcnt[p] += 1
+        ring[p * W + rpos[p]] = v
+        rpos[p] = (rpos[p] + 1) % W
+        rsum[p] += v
+        osum[i] = rsum[p]
+        ocnt[i] = rcnt[p]
+
+
+def frame_sum_keyed(pc, vals, k, K):
+    """ROWS k PRECEDING running sum per partition, in WALK order: per-partition ring
+    of the last k+1 values plus a running sum -- no permutation, no scatter-back.
+    Returns (framesum, framecount) per row. Requires walk order == frame order
+    (stairs-ascending order column); numba only (caller declines otherwise)."""
+    if not HAVE_NUMBA:
+        return None
+    W = k + 1
+    ring = np.zeros(K * W, np.int64)
+    rsum = np.zeros(K, np.int64)
+    rcnt = np.zeros(K, np.int32)
+    rpos = np.zeros(K, np.int32)
+    osum = np.empty(pc.size, np.int64)
+    ocnt = np.empty(pc.size, np.int32)
+    _frame_sum_keyed_nb(pc.astype(np.int64), vals.astype(np.int64), np.int64(k),
+                        ring, rsum, rcnt, rpos, osum, ocnt)
+    return osum, ocnt
+
+
+@njit(nogil=True, cache=True)
+def _frame_ext_keyed_nb(pc, vals, k, ring, rcnt, rpos, do_max, out):
+    W = k + 1
+    for i in range(pc.size):
+        p = pc[i]
+        if rcnt[p] < W:
+            rcnt[p] += 1
+        ring[p * W + rpos[p]] = vals[i]
+        rpos[p] = (rpos[p] + 1) % W
+        n = rcnt[p]
+        base = p * W
+        best = ring[base]
+        if do_max:
+            for j in range(1, n):
+                if ring[base + j] > best:
+                    best = ring[base + j]
+        else:
+            for j in range(1, n):
+                if ring[base + j] < best:
+                    best = ring[base + j]
+        out[i] = best
+
+
+def frame_ext_keyed(pc, vals, k, K, do_max):
+    """ROWS k PRECEDING running min/max per partition, in WALK order: ring of the
+    last k+1 values, extremum rescanned over <= k+1 slots per row (k is small)."""
+    if not HAVE_NUMBA:
+        return None
+    W = k + 1
+    ring = np.zeros(K * W, np.int64)
+    rcnt = np.zeros(K, np.int32)
+    rpos = np.zeros(K, np.int32)
+    out = np.empty(pc.size, np.int64)
+    _frame_ext_keyed_nb(pc.astype(np.int64), vals.astype(np.int64), np.int64(k),
+                        ring, rcnt, rpos, do_max, out)
+    return out
+
+
 @njit(nogil=True, parallel=True, cache=True)
 def _seg_cumminmax_nb(vals, lane_start, lane_of, do_min):
     """Segmented cumulative min/max: running extreme within each lane (parallel over lanes)."""

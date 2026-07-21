@@ -390,6 +390,83 @@ def _try_partcount(seg, spec):
     return list(zip(*slots)), [wdb_sql._alias(p) for p in spec['proj']]
 
 
+def _try_frame_keyed(seg, spec):
+    """SUM/AVG/MIN/MAX OVER (PARTITION p ORDER o ROWS k PRECEDING..CURRENT) where the
+    order column's stairs prove walk order == frame order: one compiled pass in RAW
+    walk order carrying per-partition ring state. No permutation, no scatter-back,
+    no order codes at all -- the stairs gate proves the order, values ride the walk.
+    Tie behavior identical to the generic path (both preserve walk order in-lane)."""
+    wins = spec['wins']
+    if len(wins) != 1:
+        return None
+    w = wins[0][1]
+    if w['kind'] not in ('sum', 'avg', 'min', 'max') or w['frame'] is None:
+        return None
+    fkind, k = w['frame']
+    if fkind != 'rows' or not (0 <= k <= 64):
+        return None
+    if len(w['pcols']) != 1 or w['ocol'] is None or w['odesc']:
+        return None
+    pcol, ocol, acol = w['pcols'][0], w['ocol'], w['arg']
+    if seg.stairs(ocol) is None:
+        return None                                  # walk order must BE frame order
+    cp, ca = seg.cols[pcol], seg.cols[acol]
+    if cp.get('mode') not in (0, 1, 2) or cp.get('has_null'):
+        return None
+    if ca.get('dt') != 0 or ca.get('has_null'):
+        return None
+    if ca.get('mode') not in (0, 1, 2, 4):
+        return None
+    alias = w['alias']
+    qt = spec['qterms'] or []
+    if qt and (len(qt) != 1 or qt[0][0] != 'lit' or qt[0][1] != alias):
+        return None
+    emit = []
+    for p in spec['proj']:
+        nm = wdb_sql._proj_colname(p)
+        if nm == pcol:
+            emit.append('p')
+        elif (isinstance(p, E.Column) and p.name == alias) or wdb_sql._alias(p) == alias:
+            emit.append('w')
+        else:
+            return None
+    import wdb_kernels as K
+    pc = np.asarray(seg._raw_codes(pcol)).astype(np.int64)
+    if ca['mode'] == 4:
+        vals = np.asarray(seg._seq_decode(ca)).astype(np.int64)
+    else:
+        vals = _int_table(seg, acol)[np.asarray(seg._raw_codes(acol)).astype(np.int64)]
+    Vp = int(cp['V'])
+    if w['kind'] in ('sum', 'avg'):
+        got = K.frame_sum_keyed(pc, vals, int(k), Vp)
+        if got is None:
+            return None
+        fs, fc = got
+        out = fs.astype(np.float64) / fc if w['kind'] == 'avg' else fs
+    else:
+        out = K.frame_ext_keyed(pc, vals, int(k), Vp, w['kind'] == 'max')
+        if out is None:
+            return None
+    if qt:
+        op, val = qt[0][2], qt[0][3]
+        m = (out > val) if op == '>' else (out >= val) if op == '>=' else \
+            (out < val) if op == '<' else (out <= val) if op == '<=' else (out == val)
+        sel = np.flatnonzero(m)
+    else:
+        sel = np.arange(pc.size)
+    if spec['lim'] is not None:
+        sel = sel[spec['off']:spec['off'] + spec['lim']]
+    slots = []
+    for e in emit:
+        if e == 'p':
+            slots.append(_rn1_emit_col(seg, pcol, pc[sel]))
+        else:
+            slots.append(np.asarray(out)[sel].tolist())
+    global _HITS
+    _HITS += 1
+    return list(zip(*slots)), [wdb_sql._alias(p) for p in spec['proj']]
+
+
 def _try_rn1(seg, spec):
     """QUALIFY ROW_NUMBER()=1 over (PARTITION p ORDER o ASC|DESC), projecting only p, o,
     rn: the answer is the per-partition MINIMUM (or MAXIMUM) order code -- codes are
@@ -454,6 +531,9 @@ def execute(seg, spec):
     if fp is not None:
         return fp
     fp = _try_partcount(seg, spec)
+    if fp is not None:
+        return fp
+    fp = _try_frame_keyed(seg, spec)
     if fp is not None:
         return fp
     N = int(seg.N)
