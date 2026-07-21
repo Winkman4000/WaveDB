@@ -87,9 +87,9 @@ QUERIES = [
     ('w-partavg',       'S', "SELECT SearchEngineID, AVG(ResolutionWidth) OVER (PARTITION BY SearchEngineID) AS aw FROM hits QUALIFY aw > 1500"),
     ('w-desc-last',     'N', "SELECT UserID, EventTime, ROW_NUMBER() OVER (PARTITION BY UserID ORDER BY EventTime DESC) AS rn FROM hits QUALIFY rn = 1"),
     ('w-multipart',     'S', "SELECT CounterID, RegionID, COUNT(*) OVER (PARTITION BY CounterID, RegionID) AS n FROM hits QUALIFY n > 1000000"),
-    ('w-frame-avg',     'S', "SELECT UserID, AVG(ResolutionWidth) OVER (PARTITION BY UserID ORDER BY EventTime ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS ma FROM hits QUALIFY ma > 2000",
+    ('w-frame-avg',     'W', "SELECT UserID, AVG(ResolutionWidth) OVER (PARTITION BY UserID ORDER BY EventTime ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS ma FROM hits QUALIFY ma > 2000",
                              "SELECT UserID, AVG(ResolutionWidth) OVER (PARTITION BY UserID ORDER BY EventTime, file_row_number ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS ma FROM hits QUALIFY ma > 2000"),
-    ('w-frame-max',     'S', "SELECT RegionID, MAX(ResolutionWidth) OVER (PARTITION BY RegionID ORDER BY EventTime ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS sx FROM hits QUALIFY sx = 0",
+    ('w-frame-max',     'W', "SELECT RegionID, MAX(ResolutionWidth) OVER (PARTITION BY RegionID ORDER BY EventTime ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS sx FROM hits QUALIFY sx = 0",
                              "SELECT RegionID, MAX(ResolutionWidth) OVER (PARTITION BY RegionID ORDER BY EventTime, file_row_number ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS sx FROM hits QUALIFY sx = 0"),
     ('w-q-mixed',       'S', "SELECT RegionID, ResolutionWidth, COUNT(*) OVER (PARTITION BY RegionID) AS n FROM hits QUALIFY n > 5000000 AND ResolutionWidth > 1900"),
     # ---- grouping sets (3) ----

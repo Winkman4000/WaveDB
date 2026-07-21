@@ -37,6 +37,22 @@ def duck_sql(q):
     return CTE + ' ' + q
 
 
+def wtie_duck_sql(q):
+    """Append the parquet row number as the FINAL tiebreak inside every window ORDER.
+    Window queries whose frames straddle order ties have no unique SQL answer (duck
+    itself wobbles run-to-run); WaveDB's walk order IS parquet order, so pinning duck
+    to (order cols, file_row_number) makes duck deterministic AND makes it compute
+    the exact answer WaveDB's stable tie behavior already produces. A match proves
+    the answer; the original 'S' compare against dice was a coin flip."""
+    t = sqlglot.parse_one(q)
+    for w in t.find_all(E.Window):
+        o = w.args.get('order')
+        if o is not None:
+            o.set('expressions', list(o.expressions)
+                  + [E.Ordered(this=E.column('file_row_number'))])
+    return duck_sql(t.sql())
+
+
 def order_col_index(q, hdr):
     t = sqlglot.parse_one(q)
     o = t.args.get('order')
@@ -73,6 +89,13 @@ def validate(kind, q, w, hdr, d):
         return (len(w) == len(d)
                 and sorted(tuple(norm(x) for x in r) for r in w)
                 == sorted(tuple(norm(x) for x in r) for r in d))
+    if kind == 'W':
+        # window-tie: duck rerun pinned to parquet row order (the order WaveDB walks);
+        # full multiset compare against a now-deterministic oracle
+        d2 = con.execute(wtie_duck_sql(q)).fetchall()
+        return (len(w) == len(d2)
+                and sorted(tuple(norm(x) for x in r) for r in w)
+                == sorted(tuple(norm(x) for x in r) for r in d2))
     if kind == 'M':
         if len(w) != len(d):
             return False
