@@ -436,21 +436,37 @@ def _giant_m2o(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey,
     ro[okm] = rowof[trans[okm]]                  # dim row per fact key code (-1: filtered)
     okm &= ro >= 0
     cell_of[okm] = comp_dim[ro[okm]]
-    # fact side: one gather, one mask
+    # fact side -- Jackson's fold: the aggregate is keyed ONLY by dim attributes, so
+    # count at NAME scale first (one bincount of raw key codes; beans need no order),
+    # then fold the 17.6M-entry name board into the cell board at dictionary scale.
+    # No per-row gather exists at all. Row-level filters force the per-row path.
     fkc = np.asarray(fseg._raw_codes(fkey)).astype(np.int64)
-    cells = cell_of[fkc]
-    keep = cells >= 0
-    for c in fact_conds:
-        keep &= wdb_sql._eval_pred(fseg, _strip_qual(c), lambda nm: nm)
-    comp = cells[keep]
-    counts = np.bincount(comp, minlength=total)
     sums = {}
-    for pi, kd in aggs:
-        if kd == 'SUM':
-            p = proj[pi]
-            inner = p.this if isinstance(p, E.Alias) else p
-            v = WN._numvals(fseg, inner.this.name)[keep]
-            sums[pi] = np.bincount(comp, weights=v, minlength=total)
+    if not fact_conds:
+        name_counts = np.bincount(fkc, minlength=fk_vals.size)
+        counts = np.bincount(cell_of + 1, weights=name_counts,
+                             minlength=total + 1)[1:].astype(np.int64)
+        for pi, kd in aggs:
+            if kd == 'SUM':
+                p = proj[pi]
+                inner = p.this if isinstance(p, E.Alias) else p
+                v = WN._numvals(fseg, inner.this.name)
+                name_sums = np.bincount(fkc, weights=v, minlength=fk_vals.size)
+                sums[pi] = np.bincount(cell_of + 1, weights=name_sums,
+                                       minlength=total + 1)[1:]
+    else:
+        cells = cell_of[fkc]
+        keep = cells >= 0
+        for c in fact_conds:
+            keep &= wdb_sql._eval_pred(fseg, _strip_qual(c), lambda nm: nm)
+        comp = cells[keep]
+        counts = np.bincount(comp, minlength=total)
+        for pi, kd in aggs:
+            if kd == 'SUM':
+                p = proj[pi]
+                inner = p.this if isinstance(p, E.Alias) else p
+                v = WN._numvals(fseg, inner.this.name)[keep]
+                sums[pi] = np.bincount(comp, weights=v, minlength=total)
     live = np.nonzero(counts)[0]
     rows = []
     for cell in live:
