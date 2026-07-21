@@ -372,6 +372,41 @@ def _stream_dump(db, tree, fact_tn, fkey, fact_conds, dmap, need, attr_idx,
     return rows, [wdb_sql._alias(p) for p in proj]
 
 
+def _jline_path(fseg, dseg, fkey, dkey):
+    import os
+    return '%s.jline.%s.%s.%s' % (fseg.path, fkey,
+                                  os.path.basename(dseg.path).replace('.', '_'), dkey)
+
+
+def _jline(fseg, dseg, fkey, dkey, fk_vals, dk_vals):
+    """The introduction, written down: fact key code -> dim key code (or -1), aligned
+    to OUR dictionary order so it memmaps by default. Both dictionaries are frozen in
+    files, so this map is an eternal fact -- computed once (one searchsorted), read
+    forever. Filters and attribute picks stay per-query: only the eternal part gets
+    the file. (Jackson: 'pop it on aligned with our order and it's a column.')"""
+    import os
+    import numpy as np
+    p = _jline_path(fseg, dseg, fkey, dkey)
+    try:
+        if os.path.exists(p):
+            mm = np.memmap(p, dtype=np.int32, mode='r')
+            if mm.size == fk_vals.size:
+                return mm
+    except Exception:
+        pass
+    t_pos = np.searchsorted(dk_vals, fk_vals)
+    t_pos_c = np.minimum(t_pos, dk_vals.size - 1)
+    trans = np.where(dk_vals[t_pos_c] == fk_vals, t_pos_c, -1).astype(np.int32)
+    try:
+        tmp = p + '.tmp.%d' % os.getpid()
+        with open(tmp, 'wb') as f:
+            f.write(trans.tobytes())
+        os.replace(tmp, p)
+    except Exception:
+        pass                                     # read-only volume: still serve in-memory
+    return trans
+
+
 def _giant_m2o(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey,
                proj, dim_cols, fact_cols, aggs, fact_conds, dim_conds):
     """Both sides giant, many-to-one: the join is three gathers and a bincount. The
@@ -395,10 +430,8 @@ def _giant_m2o(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey,
         dk_vals = WN._int_table(dseg, dkey)
     except Exception:
         return None                              # v1: integer-valued key dictionaries
-    # the introduction: two sorted dictionaries, one merge
-    t_pos = np.searchsorted(dk_vals, fk_vals)
-    t_pos_c = np.minimum(t_pos, dk_vals.size - 1)
-    trans = np.where(dk_vals[t_pos_c] == fk_vals, t_pos_c, -1).astype(np.int64)
+    # the introduction: written down once, memmapped forever (.jline)
+    trans = np.asarray(_jline(fseg, dseg, fkey, dkey, fk_vals, dk_vals)).astype(np.int64)
     # dim row per key code (m2o requires unique keys)
     dkc = np.asarray(dseg._raw_codes(dkey)).astype(np.int64)
     N2 = int(dseg.N)
