@@ -374,7 +374,7 @@ def _stream_dump(db, tree, fact_tn, fkey, fact_conds, dmap, need, attr_idx,
 
 def _jline_path(fseg, dseg, fkey, dkey):
     import os
-    return '%s.jline.%s.%s.%s' % (fseg.path, fkey,
+    return '%s.jline.%s.%s.%s' % (os.path.realpath(fseg.path), fkey,
                                   os.path.basename(dseg.path).replace('.', '_'), dkey)
 
 
