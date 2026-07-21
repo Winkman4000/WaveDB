@@ -412,29 +412,37 @@ def _giant_m2o(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey,
                                        lambda nm: nm)
     rowof = np.full(dk_vals.size, -1, dtype=np.int64)
     rowof[dkc[keep_dim]] = np.nonzero(keep_dim)[0]
-    # fact side: key codes -> dim row, masked by fact conditions
-    fkc = np.asarray(fseg._raw_codes(fkey)).astype(np.int64)
-    frow = np.where(trans[fkc] >= 0, rowof[np.maximum(trans[fkc], 0)], -1)
-    keep = frow >= 0
-    for c in fact_conds:
-        keep &= wdb_sql._eval_pred(fseg, _strip_qual(c), lambda nm: nm)
-    frow_k = frow[keep]
-    # group cells: composed dim-attr codes (radix fold), aggregated by bincount
-    acodes_all, spans, atabs = [], [], []
+    # compose the WHOLE chain at dictionary scale: fact key code -> dim row -> composed
+    # attr cell, every link V-sized -- the 100M fact rows then pay exactly ONE gather
+    # (the old path gathered trans[fkc] twice, rowof once, and each attr once, all at N)
+    acodes_all, spans = [], []
     for _pi, nm in dim_cols:
         c2 = dseg.cols.get(nm)
         if c2 is None or c2.get('mode') not in (0, 1, 2):
             return None
-        ac = np.asarray(dseg._raw_codes(nm)).astype(np.int64)
-        acodes_all.append(ac[frow_k]); spans.append(int(c2['V'])); atabs.append(nm)
-    comp = acodes_all[0]
-    for i in range(1, len(acodes_all)):
-        comp = comp * spans[i] + acodes_all[i]
+        acodes_all.append(np.asarray(dseg._raw_codes(nm)).astype(np.int64))
+        spans.append(int(c2['V']))
     total = 1
     for v in spans:
         total *= v
     if total > 50_000_000:
         return None
+    comp_dim = acodes_all[0]                     # composed cell per DIM ROW (N2-sized)
+    for i in range(1, len(acodes_all)):
+        comp_dim = comp_dim * spans[i] + acodes_all[i]
+    cell_of = np.full(fk_vals.size, np.int64(-1))
+    okm = trans >= 0
+    ro = np.full(fk_vals.size, -1, np.int64)
+    ro[okm] = rowof[trans[okm]]                  # dim row per fact key code (-1: filtered)
+    okm &= ro >= 0
+    cell_of[okm] = comp_dim[ro[okm]]
+    # fact side: one gather, one mask
+    fkc = np.asarray(fseg._raw_codes(fkey)).astype(np.int64)
+    cells = cell_of[fkc]
+    keep = cells >= 0
+    for c in fact_conds:
+        keep &= wdb_sql._eval_pred(fseg, _strip_qual(c), lambda nm: nm)
+    comp = cells[keep]
     counts = np.bincount(comp, minlength=total)
     sums = {}
     for pi, kd in aggs:
