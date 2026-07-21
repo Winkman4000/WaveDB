@@ -467,6 +467,67 @@ def _try_frame_keyed(seg, spec):
     return list(zip(*slots)), [wdb_sql._alias(p) for p in spec['proj']]
 
 
+def _try_rnk(seg, spec):
+    """QUALIFY ROW_NUMBER() <= k over (PARTITION p ORDER o ASC) where o's stairs prove
+    walk order == order: rn is just ARRIVAL POSITION in the cup, so one compiled pass
+    with a counter per cup marks every winner with its rn. No permutation, no lanes,
+    no order codes at all -- the searchsorted that computed them is deleted whole."""
+    wins = spec['wins']
+    if len(wins) != 1 or wins[0][1]['kind'] != 'row_number':
+        return None
+    w = wins[0][1]
+    alias = w['alias']
+    qt = spec['qterms']
+    if (not qt or len(qt) != 1 or qt[0][0] != 'lit' or qt[0][1] != alias
+            or qt[0][2] != '<='):
+        return None
+    kf = qt[0][3]
+    if kf != int(kf) or not (1 <= int(kf) <= 16):
+        return None
+    k = int(kf)
+    if len(w['pcols']) != 1 or w['ocol'] is None or w['odesc'] or w['frame'] is not None:
+        return None
+    pcol, ocol = w['pcols'][0], w['ocol']
+    if seg.stairs(ocol) is None:
+        return None                              # walk order must BE the window order
+    cp, co = seg.cols[pcol], seg.cols[ocol]
+    if cp.get('mode') not in (0, 1, 2) or cp.get('has_null') or co.get('has_null'):
+        return None
+    emit = []
+    for p in spec['proj']:
+        nm = wdb_sql._proj_colname(p)
+        if nm == pcol:
+            emit.append('p')
+        elif nm == ocol:
+            emit.append('o')
+        elif (isinstance(p, E.Column) and p.name == alias) or wdb_sql._alias(p) == alias:
+            emit.append('r')
+        else:
+            return None
+    import wdb_kernels as K
+    pc = np.asarray(seg._raw_codes(pcol)).astype(np.int64)
+    rn = K.rnk_mark(pc, k, int(cp['V']))
+    if rn is None:
+        return None                              # no numba: fallback's territory
+    sel = np.flatnonzero(rn)
+    if spec['lim'] is not None:
+        sel = sel[spec['off']:spec['off'] + spec['lim']]
+    oc = None
+    if 'o' in emit:
+        oc = np.asarray(seg._raw_codes(ocol)).astype(np.int64)
+    slots = []
+    for e in emit:
+        if e == 'p':
+            slots.append(_rn1_emit_col(seg, pcol, pc[sel]))
+        elif e == 'o':
+            slots.append(_rn1_emit_col(seg, ocol, oc[sel]))
+        else:
+            slots.append(rn[sel].astype(np.int64).tolist())
+    global _HITS
+    _HITS += 1
+    return list(zip(*slots)), [wdb_sql._alias(p) for p in spec['proj']]
+
+
 def _try_rn1(seg, spec):
     """QUALIFY ROW_NUMBER()=1 over (PARTITION p ORDER o ASC|DESC), projecting only p, o,
     rn: the answer is the per-partition MINIMUM (or MAXIMUM) order code -- codes are
@@ -528,6 +589,9 @@ def execute(seg, spec):
     if st is not None:
         return st
     fp = _try_rn1(seg, spec)
+    if fp is not None:
+        return fp
+    fp = _try_rnk(seg, spec)
     if fp is not None:
         return fp
     fp = _try_partcount(seg, spec)

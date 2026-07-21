@@ -282,6 +282,49 @@ def frame_ext_keyed(pc, vals, k, K, do_max):
     return out
 
 
+@njit(nogil=True, cache=True)
+def _rnk_mark_nb(pc, k, cnt, rn):
+    for i in range(pc.size):
+        c = cnt[pc[i]] + 1
+        cnt[pc[i]] = c
+        if c <= k:
+            rn[i] = c
+
+
+def rnk_mark(pc, k, K):
+    """rn <= k in walk order: a counter per cup, rows arriving while the cup holds
+    fewer than k are winners, stamped with their arrival position. rn never needed
+    order codes -- only arrival. Returns int8 rn per row (0 = not a winner)."""
+    if not HAVE_NUMBA:
+        return None
+    cnt = np.zeros(K, np.int32)
+    rn = np.zeros(pc.size, np.int8)
+    _rnk_mark_nb(pc.astype(np.int64), np.int64(k), cnt, rn)
+    return rn
+
+
+@njit(nogil=True, cache=True)
+def _stamp_distinct_nb(uc_sorted, gc_sorted, stamp, counts):
+    for i in range(uc_sorted.size):
+        g = gc_sorted[i]
+        u = uc_sorted[i]
+        if stamp[u] != g + 1:
+            stamp[u] = g + 1
+            counts[g] += 1
+
+
+def stamp_distinct(uc_sorted, gc_sorted, Vu, Vg):
+    """COUNT(DISTINCT u) per group over GROUP-MAJOR rows: one reusable stamp board
+    (epoch = group code + 1, never reset) counts each (group, user) pair once."""
+    if not HAVE_NUMBA:
+        return None
+    stamp = np.zeros(Vu, np.int32)
+    counts = np.zeros(Vg, np.int64)
+    _stamp_distinct_nb(uc_sorted.astype(np.int64), gc_sorted.astype(np.int64),
+                       stamp, counts)
+    return counts
+
+
 @njit(nogil=True, parallel=True, cache=True)
 def _seg_cumminmax_nb(vals, lane_start, lane_of, do_min):
     """Segmented cumulative min/max: running extreme within each lane (parallel over lanes)."""

@@ -168,10 +168,19 @@ def execute(seg, det, tree):
     if gmax * k >= (1 << 62):                            # pack would overflow int64 -> decline
         return None
 
-    if _HAVE_NUMBA:
+    counts = None
+    if _HAVE_NUMBA and tnull < 0:
+        # the stamp board: scatter rows GROUP-MAJOR (compiled), then one sequential
+        # pass over a reusable Vt-sized epoch board -- stamp[u] != group means first
+        # sighting of this (group, user) pair, count it, stamp it. No hashing, no
+        # probing, no per-row branch misses on collisions.
+        import wdb_kernels as K
+        perm = K.part_scatter(grp, gmax)
+        counts = K.stamp_distinct(tgt[perm], grp[perm], k, gmax)
+    if counts is None and _HAVE_NUMBA:
         capbits = max(20, min(28, int(np.ceil(np.log2(max(N, 2)))) + 1))
         counts = _walk(grp, tgt, np.int64(k), gmax, np.int64(tnull), capbits)
-    else:
+    if counts is None:
         keep = (tgt != tnull) if tnull >= 0 else slice(None)
         key = grp[keep].astype(np.int64) * k + tgt[keep].astype(np.int64)
         uq = np.unique(key)
