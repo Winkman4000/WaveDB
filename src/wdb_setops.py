@@ -62,6 +62,7 @@ def _codes_side(db, node):
     w = node.args.get('where')
     pos = None
     if w is not None:
+        conjs = []
         for cj in WS._conjuncts(w.this):
             cl = WS._col_lit(cj)
             if cl is None:
@@ -86,8 +87,14 @@ def _codes_side(db, node):
                     fl[kc] = False
                 if c2.get('has_null'):
                     fl[V2 - 1] = False                       # NULL <> lit is not TRUE
-            p = WS._scan_flag(seg, col2, fl, 0, seg.N)
-            pos = p if pos is None else np.intersect1d(pos, p, assume_unique=True)
+            conjs.append((0 if op == '=' else 1, col2, fl))
+        conjs.sort(key=lambda t: t[0])           # equality first; later conjuncts filter
+        for _sel, col2, fl in conjs:             # positions by code gather -- no intersect
+            if pos is None:
+                pos = WS._scan_flag(seg, col2, fl, 0, seg.N)
+            else:
+                got = np.asarray(seg.codes_at(col2, pos)).astype(np.int64)
+                pos = pos[fl[got]]
             if pos.size == 0:
                 return seg, C, np.zeros(V, dtype=bool)
     pres = np.zeros(V, dtype=bool)

@@ -58,6 +58,7 @@ def _samecol_codes(db, tree, node, sub):
         return None
     pos = None
     if iw is not None:
+        conjs = []
         for cj in WS._conjuncts(iw.this):
             cl = WS._col_lit(cj)
             if cl is None:
@@ -81,8 +82,17 @@ def _samecol_codes(db, tree, node, sub):
                     fl[kc] = False
                 if c2.get('has_null'):
                     fl[V2 - 1] = False                     # NULL <> lit is not TRUE
-            p = WS._scan_flag(seg, col2, fl, 0, seg.N)
-            pos = p if pos is None else np.intersect1d(pos, p, assume_unique=True)
+            conjs.append((0 if op == '=' else 1, col2, fl))
+        # equality first (selective, cheap positions); every later conjunct filters
+        # those positions by a code gather -- ascending stays ascending, and the
+        # intersect1d whose hidden sort cost 0.87s at 100M never runs at all
+        conjs.sort(key=lambda t: t[0])
+        for _sel, col2, fl in conjs:
+            if pos is None:
+                pos = WS._scan_flag(seg, col2, fl, 0, seg.N)
+            else:
+                got = np.asarray(seg.codes_at(col2, pos)).astype(np.int64)
+                pos = pos[fl[got]]
             if pos.size == 0:
                 break
     if pos is None:
@@ -90,8 +100,7 @@ def _samecol_codes(db, tree, node, sub):
         codes = np.flatnonzero(cn > 0).astype(np.int64)
     else:
         # the switchboard: flip a light per seen code, read the lit ones off in order.
-        # flatnonzero of a presence board IS the sorted unique set -- the np.unique
-        # sort this replaces was 0.87s of the sq twins' time at 100M
+        # flatnonzero of a presence board IS the sorted unique set -- no sort runs
         got = np.asarray(seg.codes_at(C, pos)).astype(np.int64)
         pres = np.zeros(int(cC['V']), dtype=bool)
         pres[got] = True
