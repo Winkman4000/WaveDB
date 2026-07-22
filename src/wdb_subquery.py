@@ -89,7 +89,13 @@ def _samecol_codes(db, tree, node, sub):
         cn = np.bincount(np.asarray(seg._raw_codes(C)), minlength=int(cC['V']))
         codes = np.flatnonzero(cn > 0).astype(np.int64)
     else:
-        codes = np.unique(np.asarray(seg.codes_at(C, pos)).astype(np.int64))
+        # the switchboard: flip a light per seen code, read the lit ones off in order.
+        # flatnonzero of a presence board IS the sorted unique set -- the np.unique
+        # sort this replaces was 0.87s of the sq twins' time at 100M
+        got = np.asarray(seg.codes_at(C, pos)).astype(np.int64)
+        pres = np.zeros(int(cC['V']), dtype=bool)
+        pres[got] = True
+        codes = np.flatnonzero(pres).astype(np.int64)
     has_null = False
     if cC.get('has_null'):
         nullc = int(cC['V']) - 1

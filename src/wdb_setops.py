@@ -26,8 +26,119 @@ def _norm_row(r):
     return tuple(out)
 
 
+def _codes_side(db, node):
+    """One union side as lights on a presence board: SELECT C FROM t WHERE <simple
+    =/<> conjuncts> -> bool[V] of C-codes present. None = not our shape (fall back)."""
+    import numpy as np
+    import wdb_policies as P
+    import wdb_wherescan as WS
+    if not isinstance(node, E.Select):
+        return None
+    if (node.args.get('group') or node.args.get('limit') or node.args.get('order')
+            or node.args.get('joins') or node.args.get('having')):
+        return None
+    exprs = node.expressions
+    if len(exprs) != 1 or not isinstance(exprs[0], E.Column):
+        return None
+    C = exprs[0].name
+    f = node.args.get('from_') or node.args.get('from')
+    if f is None or not isinstance(f.this, E.Table):
+        return None
+    tn = f.this.name
+    try:
+        paths = db.cat.segment_paths(tn)
+    except Exception:
+        return None
+    if len(paths) != 1:
+        return None
+    seg = db.open_segment(paths[0], tn)
+    if not P.no_deleted_rows(seg):
+        return None
+    cC = seg.cols.get(C)
+    if (cC is None or cC.get('mode') not in (0, 1, 2) or cC.get('dt') == 3
+            or seg._effective(C) is not None):
+        return None
+    V = int(cC['V'])
+    w = node.args.get('where')
+    pos = None
+    if w is not None:
+        for cj in WS._conjuncts(w.this):
+            cl = WS._col_lit(cj)
+            if cl is None:
+                return None
+            col2, val, op = cl[0], cl[1], cl[2]
+            if op not in ('=', '<>'):
+                return None
+            c2 = seg.cols.get(col2)
+            if (c2 is None or c2.get('mode') not in (0, 1, 2)
+                    or seg._effective(col2) is not None):
+                return None
+            V2 = int(c2['V'])
+            kc = WS._code_of(seg, col2, val)
+            fl = np.zeros(V2, dtype=bool)
+            if op == '=':
+                if kc is None:
+                    return seg, C, np.zeros(V, dtype=bool)   # absent literal: empty side
+                fl[kc] = True
+            else:
+                fl[:] = True
+                if kc is not None:
+                    fl[kc] = False
+                if c2.get('has_null'):
+                    fl[V2 - 1] = False                       # NULL <> lit is not TRUE
+            p = WS._scan_flag(seg, col2, fl, 0, seg.N)
+            pos = p if pos is None else np.intersect1d(pos, p, assume_unique=True)
+            if pos.size == 0:
+                return seg, C, np.zeros(V, dtype=bool)
+    pres = np.zeros(V, dtype=bool)
+    if pos is None:
+        pres = np.bincount(np.asarray(seg._raw_codes(C)), minlength=V) > 0
+    else:
+        got = np.asarray(seg.codes_at(C, pos)).astype(np.int64)
+        pres[got] = True
+    return seg, C, pres
+
+
+def _union_codes(db, node):
+    """SELECT C FROM t WHERE ... UNION SELECT C FROM t WHERE ...: the switchboard.
+    Each side flips lights on a V-sized presence board (positions -> codes; no python
+    row ever exists), union is OR, and only the lit codes decode -- once each. This
+    replaces two general-path executions that boxed 738K python values to dedup them."""
+    import numpy as np
+    import wdb_sql
+    a = _codes_side(db, node.this)
+    if a is None:
+        return None
+    b = _codes_side(db, node.expression)
+    if b is None:
+        return None
+    sa, ca, pa = a
+    sb, cb, pb = b
+    if sa is not sb or ca != cb:
+        return None                              # different code spaces: not our shape
+    seg, C = sa, ca
+    pres = pa | pb
+    cC = seg.cols[C]
+    has_null = bool(cC.get('has_null')) and bool(pres[int(cC['V']) - 1])
+    if cC.get('has_null'):
+        pres[int(cC['V']) - 1] = False
+    rows = []
+    for code in np.flatnonzero(pres):
+        v = wdb_sql._pyval(seg.fetch(C, int(code)))
+        if isinstance(v, (bytes, bytearray)):
+            v = v.decode('utf-8', 'replace')
+        rows.append((v,))
+    if has_null:
+        rows.append((None,))
+    return rows, [C]
+
+
 def _eval(db, node, esc):
     if isinstance(node, _SETOPS):
+        if isinstance(node, E.Union) and node.args.get('distinct'):
+            fast = _union_codes(db, node)
+            if fast is not None:
+                return fast
         lrows, lhdr = _eval(db, node.this, esc)
         rrows, rhdr = _eval(db, node.expression, esc)
         if lrows and rrows and len(lrows[0]) != len(rrows[0]):

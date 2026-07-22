@@ -110,8 +110,17 @@ def execute(seg, spec):
     # decode only the winners
     outcols = []
     for c in spec['pcols']:
-        codes = np.asarray(seg._raw_codes(c)).astype(np.int64)[idx]
         cc = seg.cols[c]
+        if c == kcol:
+            codes = codes0[idx]
+        else:
+            # the winners' name tags only: block-targeted fetch of |idx| positions
+            # instead of decompressing the column's full code stream (0.75s -> ~0.02s
+            # for LIMIT 100). codes_at wants ascending positions; unsort after.
+            srt = np.argsort(idx, kind='stable')
+            got = np.asarray(seg.codes_at(c, idx[srt])).astype(np.int64)
+            codes = np.empty_like(got)
+            codes[srt] = got
         cache = {}
         vals = []
         for code in codes:
