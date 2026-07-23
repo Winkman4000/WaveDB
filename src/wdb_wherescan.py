@@ -32,18 +32,6 @@ _ENABLED = True
 _HITS = 0
 _SCAN_THREADS = 14
 
-_EX = None
-
-
-def _pool():
-    """Persistent scan executor: threads spawn once and live for the process. The
-    per-call `with ThreadPoolExecutor(...)` pattern spawned and joined W threads on
-    EVERY scan -- ~34ms of pure coordination tax on queries whose real work is 5ms."""
-    global _EX
-    if _EX is None:
-        _EX = ThreadPoolExecutor(_SCAN_THREADS)
-    return _EX
-
 
 def enable():
     global _ENABLED; _ENABLED = True
@@ -764,7 +752,8 @@ def _scan_eq(seg, col, code, lo, hi, negate=False):
                 if h.size: out.append(h + a)
             return np.concatenate(out) if out else np.empty(0, np.int64)
         W = min(_SCAN_THREADS, max(1, j1 - j0))
-        parts = list(_pool().map(scan, np.array_split(np.arange(j0, j1), W)))
+        with ThreadPoolExecutor(W) as ex:
+            parts = list(ex.map(scan, np.array_split(np.arange(j0, j1), W)))
         parts = [p for p in parts if p.size]
         return np.concatenate(parts) if parts else np.empty(0, np.int64)
     cc = np.asarray(seg._raw_codes_range(col, lo, hi))
@@ -835,7 +824,8 @@ def _scan_flag(seg, col, flag, lo, hi):
                 if h.size: out.append(h + a)
             return np.concatenate(out) if out else np.empty(0, np.int64)
         W = min(_SCAN_THREADS, max(1, j1 - j0))
-        parts = list(_pool().map(scan, np.array_split(np.arange(j0, j1), W)))
+        with ThreadPoolExecutor(W) as ex:
+            parts = list(ex.map(scan, np.array_split(np.arange(j0, j1), W)))
         parts = [p for p in parts if p.size]
         return np.concatenate(parts) if parts else np.empty(0, np.int64)
     cc = np.asarray(seg._raw_codes_range(col, lo, hi))
