@@ -32,6 +32,18 @@ _ENABLED = True
 _HITS = 0
 _SCAN_THREADS = 14
 
+_EX = None
+
+
+def _pool():
+    """Persistent scan executor: threads spawn once and live for the process. The
+    per-call `with ThreadPoolExecutor(...)` pattern spawned and joined W threads on
+    EVERY scan -- ~34ms of pure coordination tax on queries whose real work is 5ms."""
+    global _EX
+    if _EX is None:
+        _EX = ThreadPoolExecutor(_SCAN_THREADS)
+    return _EX
+
 
 def enable():
     global _ENABLED; _ENABLED = True
@@ -752,8 +764,7 @@ def _scan_eq(seg, col, code, lo, hi, negate=False):
                 if h.size: out.append(h + a)
             return np.concatenate(out) if out else np.empty(0, np.int64)
         W = min(_SCAN_THREADS, max(1, j1 - j0))
-        with ThreadPoolExecutor(W) as ex:
-            parts = list(ex.map(scan, np.array_split(np.arange(j0, j1), W)))
+        parts = list(_pool().map(scan, np.array_split(np.arange(j0, j1), W)))
         parts = [p for p in parts if p.size]
         return np.concatenate(parts) if parts else np.empty(0, np.int64)
     cc = np.asarray(seg._raw_codes_range(col, lo, hi))
@@ -824,8 +835,7 @@ def _scan_flag(seg, col, flag, lo, hi):
                 if h.size: out.append(h + a)
             return np.concatenate(out) if out else np.empty(0, np.int64)
         W = min(_SCAN_THREADS, max(1, j1 - j0))
-        with ThreadPoolExecutor(W) as ex:
-            parts = list(ex.map(scan, np.array_split(np.arange(j0, j1), W)))
+        parts = list(_pool().map(scan, np.array_split(np.arange(j0, j1), W)))
         parts = [p for p in parts if p.size]
         return np.concatenate(parts) if parts else np.empty(0, np.int64)
     cc = np.asarray(seg._raw_codes_range(col, lo, hi))
@@ -907,6 +917,7 @@ def execute(seg, spec):
     likes = spec.get('likes', [])
     lflags = [(col, _like_flags(seg, col, needle, kind), neg) for col, needle, kind, neg in likes] if likes else []
     de, dl = spec.get('drive_eq'), spec.get('drive_like')
+    _dn = None
     if hi <= lo:
         pos = np.empty(0, np.int64)
     elif de is not None:
@@ -945,7 +956,19 @@ def execute(seg, spec):
         for pp in parts[1:]:
             pos = np.union1d(pos, pp)
     else:
-        pos = np.arange(lo, hi, dtype=np.int64)
+        for _ni, (_ncol, _wn) in enumerate(spec.get('nulls', ())):
+            _c2 = seg.cols[_ncol]
+            if _c2['mode'] != 4 and _c2.get('has_null'):
+                _dn = _ni
+                break
+        if _dn is not None:
+            # drive on the null predicate: null is just code V-1, so IS [NOT] NULL is
+            # an equality scan -- never materialize arange(N) to filter it afterward
+            _ncol, _wn = spec['nulls'][_dn]
+            pos = _scan_eq(seg, _ncol, int(seg.cols[_ncol]['V']) - 1, lo, hi,
+                           negate=not _wn)
+        else:
+            pos = np.arange(lo, hi, dtype=np.int64)
     for i, (col, val, op) in enumerate(spec['eqs']):
         if i == de or i == spec.get('drive_neq') or pos.size == 0: continue
         code = _code_of(seg, col, val)
@@ -983,7 +1006,9 @@ def execute(seg, spec):
             else:
                 m = np.isin(cc, codes)
             pos = pos[~m] if ineg else pos[m]
-    for col, want_null in spec.get('nulls', ()):
+    for _ni, (col, want_null) in enumerate(spec.get('nulls', ())):
+        if _ni == _dn:
+            continue                             # already driven
         if pos.size == 0: break
         c = seg.cols[col]
         if c['mode'] == 4 or not c.get('has_null'):

@@ -23,6 +23,15 @@ import numpy as np
 import zstandard as zstd
 import sqlglot.expressions as E
 from concurrent.futures import ThreadPoolExecutor
+
+_EX = None
+
+
+def _pool(w):
+    global _EX
+    if _EX is None:
+        _EX = ThreadPoolExecutor(w)
+    return _EX
 import wdb_sql
 import wdb_policies as P
 import wdb_kernels as K
@@ -251,8 +260,7 @@ def execute(seg, spec):
         return tab, g, c.astype(np.int64)
 
     W = min(_SCAN_THREADS, NB) or 1
-    with ThreadPoolExecutor(W) as ex:
-        parts = list(ex.map(work, np.array_split(np.arange(NB), W)))
+    parts = list(_pool(W).map(work, np.array_split(np.arange(NB), W)))
     if spec.get('distinct'):
         uniq = np.unique(np.concatenate([p[1] for p in parts]))
         if spec['off'] or spec['lim'] is not None:
