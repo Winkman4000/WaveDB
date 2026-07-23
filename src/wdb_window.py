@@ -470,6 +470,72 @@ def _try_running(seg, spec):
     return list(zip(*slots)), hdr
 
 
+def _try_rank(seg, spec):
+    """RANK/DENSE_RANK over (PARTITION p ORDER o) where o's stairs prove walk order
+    == order: one walk, no backward pass -- a batch's rank is fixed the instant the
+    batch begins. Day boundaries ride the stairs; no order codes, no permutation."""
+    wins = spec['wins']
+    if len(wins) != 1:
+        return None
+    w = wins[0][1]
+    if w['kind'] not in ('rank', 'dense_rank') or w['frame'] is not None:
+        return None
+    if len(w['pcols']) != 1 or w['ocol'] is None or w['odesc']:
+        return None
+    pcol, ocol = w['pcols'][0], w['ocol']
+    if seg.stairs(ocol) is None:
+        return None
+    cp = seg.cols[pcol]
+    if cp.get('mode') not in (0, 1, 2) or cp.get('has_null'):
+        return None
+    alias = w['alias']
+    qt = spec['qterms'] or []
+    if qt and (len(qt) != 1 or qt[0][0] != 'lit' or qt[0][1] != alias):
+        return None
+    emit = []
+    for p in spec['proj']:
+        nm = wdb_sql._proj_colname(p)
+        if nm == pcol:
+            emit.append('p')
+        elif (isinstance(p, E.Column) and p.name == alias) or wdb_sql._alias(p) == alias:
+            emit.append('w')
+        else:
+            return None
+    import wdb_kernels as K
+    pc = np.asarray(seg._raw_codes(pcol)).astype(np.int64)
+    out = K.rank_walk(pc, seg.stairs(ocol), int(cp['V']), w['kind'] == 'dense_rank')
+    if out is None:
+        return None
+    if qt:
+        op, val = qt[0][2], qt[0][3]
+        m = (out > val) if op == '>' else (out >= val) if op == '>=' else \
+            (out < val) if op == '<' else (out <= val) if op == '<=' else (out == val)
+        sel = np.flatnonzero(m)
+    else:
+        sel = np.arange(pc.size)
+    if spec['lim'] is not None:
+        sel = sel[spec['off']:spec['off'] + spec['lim']]
+    hdr = [wdb_sql._alias(p) for p in spec['proj']]
+    global _HITS
+    _HITS += 1
+    if sel.size > CR.COL_GATE:
+        cols = []
+        for e in emit:
+            if e == 'p':
+                cols.append(('lazy', pc[sel],
+                             lambda a, _s=seg, _c=pcol: _rn1_emit_col(_s, _c, a)))
+            else:
+                cols.append(('arr', out[sel]))
+        return CR.ColRows(cols, sel.size), hdr
+    slots = []
+    for e in emit:
+        if e == 'p':
+            slots.append(_rn1_emit_col(seg, pcol, pc[sel]))
+        else:
+            slots.append(out[sel].tolist())
+    return list(zip(*slots)), hdr
+
+
 def _try_frame_keyed(seg, spec):
     """SUM/AVG/MIN/MAX OVER (PARTITION p ORDER o ROWS k PRECEDING..CURRENT) where the
     order column's stairs prove walk order == frame order: one compiled pass in RAW
@@ -707,6 +773,9 @@ def execute(seg, spec):
     if fp is not None:
         return fp
     fp = _try_running(seg, spec)
+    if fp is not None:
+        return fp
+    fp = _try_rank(seg, spec)
     if fp is not None:
         return fp
     N = int(seg.N)

@@ -459,6 +459,38 @@ def running_agg(pc, vals, stairs, K, kind):
     return fwd
 
 
+@njit(nogil=True, cache=True)
+def _rank_walk_nb(pc, stairs, last_run, cnt, cur, out, dense):
+    rr = 0
+    for i in range(pc.size):
+        while rr < stairs.size and i >= stairs[rr]:
+            rr += 1
+        p = pc[i]
+        if last_run[p] != rr:
+            last_run[p] = rr
+            if dense:
+                cur[p] += 1                  # dense: how many day-changes my pile has seen
+            else:
+                cur[p] = cnt[p] + 1          # rank: rows already in my pile when my day began
+        out[i] = cur[p]
+        cnt[p] += 1
+
+
+def rank_walk(pc, stairs, K, dense):
+    """RANK/DENSE_RANK over (PARTITION p ORDER stairs-col): one walk, no backward
+    pass -- a batch's rank is fixed the instant the batch begins, nothing later can
+    revise it. Day boundaries ride the stairs in O(1)/row; no order codes exist."""
+    if not HAVE_NUMBA:
+        return None
+    last_run = np.full(K, -1, np.int64)
+    cnt = np.zeros(K, np.int64)
+    cur = np.zeros(K, np.int64)
+    out = np.empty(pc.size, np.int64)
+    _rank_walk_nb(pc.astype(np.int64), np.asarray(stairs).astype(np.int64),
+                  last_run, cnt, cur, out, dense)
+    return out
+
+
 def warm():
     """JIT-compile the kernels (call from prewarm; ~1 s once, cached on disk after)."""
     kway_topk(np.array([1, 2], np.int64), np.array([1, 1], np.int64),
