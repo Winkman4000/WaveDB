@@ -369,8 +369,7 @@ def _try_partcount(seg, spec):
         return None
     cs = [np.asarray(seg._raw_codes(nm)).astype(np.int64) for nm in pcols]
     key = cs[0] if len(cs) == 1 else cs[0] * Vs[1] + cs[1]
-    import wdb_kernels as K
-    n = K.pbincount(key, tot)[key]                   # every row looks up its club
+    n = np.bincount(key, minlength=tot)[key]         # every row looks up its club
     if qt:
         op, val = qt[0][2], qt[0][3]
         m = (n > val) if op == '>' else (n >= val) if op == '>=' else \

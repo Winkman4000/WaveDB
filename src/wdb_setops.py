@@ -99,8 +99,7 @@ def _codes_side(db, node):
                 return seg, C, np.zeros(V, dtype=bool)
     pres = np.zeros(V, dtype=bool)
     if pos is None:
-        import wdb_kernels as WK
-        pres = WK.pbincount(np.asarray(seg._raw_codes(C)), V) > 0
+        pres = np.bincount(np.asarray(seg._raw_codes(C)), minlength=V) > 0
     else:
         got = np.asarray(seg.codes_at(C, pos)).astype(np.int64)
         pres[got] = True
