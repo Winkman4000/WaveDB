@@ -390,6 +390,73 @@ def _try_partcount(seg, spec):
     return list(zip(*slots)), [wdb_sql._alias(p) for p in spec['proj']]
 
 
+def _try_running(seg, spec):
+    """AVG/SUM/MIN/MAX OVER (PARTITION p ORDER o) with the default RANGE frame, where
+    o's stairs prove walk order == time order: the two-walk clipboard. Forward walk
+    carries each partition's running pair (p updated every round, divisor = cards
+    absorbed); tie run-ids ride the stairs in O(1)/row; backward walk promotes
+    same-second peers to the group-final value (the shared plate). No hallways: no
+    order codes, no permutation, no scatter-back."""
+    wins = spec['wins']
+    if len(wins) != 1:
+        return None
+    w = wins[0][1]
+    if w['kind'] not in ('avg', 'sum', 'min', 'max') or w['frame'] is not None:
+        return None
+    if len(w['pcols']) != 1 or w['ocol'] is None or w['odesc']:
+        return None
+    pcol, ocol, acol = w['pcols'][0], w['ocol'], w['arg']
+    if acol is None or seg.stairs(ocol) is None:
+        return None
+    cp, ca = seg.cols[pcol], seg.cols[acol]
+    if cp.get('mode') not in (0, 1, 2) or cp.get('has_null'):
+        return None
+    if ca.get('dt') != 0 or ca.get('has_null') or ca.get('mode') not in (0, 1, 2, 4):
+        return None
+    alias = w['alias']
+    qt = spec['qterms'] or []
+    if qt and (len(qt) != 1 or qt[0][0] != 'lit' or qt[0][1] != alias):
+        return None
+    emit = []
+    for p in spec['proj']:
+        nm = wdb_sql._proj_colname(p)
+        if nm == pcol:
+            emit.append('p')
+        elif (isinstance(p, E.Column) and p.name == alias) or wdb_sql._alias(p) == alias:
+            emit.append('w')
+        else:
+            return None
+    import wdb_kernels as K
+    pc = np.asarray(seg._raw_codes(pcol)).astype(np.int64)
+    if ca['mode'] == 4:
+        vals = np.asarray(seg._seq_decode(ca)).astype(np.int64)
+    else:
+        vals = _int_table(seg, acol)[np.asarray(seg._raw_codes(acol)).astype(np.int64)]
+    out = K.running_agg(pc, vals, seg.stairs(ocol), int(cp['V']), w['kind'])
+    if out is None:
+        return None
+    if qt:
+        op, val = qt[0][2], qt[0][3]
+        m = (out > val) if op == '>' else (out >= val) if op == '>=' else \
+            (out < val) if op == '<' else (out <= val) if op == '<=' else (out == val)
+        sel = np.flatnonzero(m)
+    else:
+        sel = np.arange(pc.size)
+    if spec['lim'] is not None:
+        sel = sel[spec['off']:spec['off'] + spec['lim']]
+    ov = out[sel]
+    wl = ov.tolist() if w['kind'] == 'avg' else ov.astype(np.int64).tolist()
+    slots = []
+    for e in emit:
+        if e == 'p':
+            slots.append(_rn1_emit_col(seg, pcol, pc[sel]))
+        else:
+            slots.append(wl)
+    global _HITS
+    _HITS += 1
+    return list(zip(*slots)), [wdb_sql._alias(p) for p in spec['proj']]
+
+
 def _try_frame_keyed(seg, spec):
     """SUM/AVG/MIN/MAX OVER (PARTITION p ORDER o ROWS k PRECEDING..CURRENT) where the
     order column's stairs prove walk order == frame order: one compiled pass in RAW
@@ -598,6 +665,9 @@ def execute(seg, spec):
     if fp is not None:
         return fp
     fp = _try_frame_keyed(seg, spec)
+    if fp is not None:
+        return fp
+    fp = _try_running(seg, spec)
     if fp is not None:
         return fp
     N = int(seg.N)

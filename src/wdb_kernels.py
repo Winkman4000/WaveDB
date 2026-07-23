@@ -400,6 +400,65 @@ def seg_slidmax(vals, lane_start, k):
     return out
 
 
+@njit(nogil=True, cache=True)
+def _running_nb(pc, vals, stairs, s, c, m, lr, lv, fwd, kind):
+    # kind: 0=avg 1=sum 2=min 3=max 4=count. Forward: each partition's running pair
+    # (p updated every round, divisor = cards absorbed). Tie run-id rides the stairs
+    # in O(1) per row (rr = boundaries crossed == the order code). Backward: promote
+    # tie-group peers to the group-final value (RANGE frame: the shared plate).
+    n = pc.size
+    run = np.empty(n, np.int32)
+    rr = 0
+    for i in range(n):
+        while rr < stairs.size and i >= stairs[rr]:
+            rr += 1
+        run[i] = rr
+        p = pc[i]
+        v = vals[i]
+        if kind == 2:
+            if c[p] == 0 or v < m[p]:
+                m[p] = v
+        elif kind == 3:
+            if c[p] == 0 or v > m[p]:
+                m[p] = v
+        s[p] += v
+        c[p] += 1
+        if kind == 0:
+            fwd[i] = s[p] / c[p]
+        elif kind == 1:
+            fwd[i] = s[p]
+        elif kind == 4:
+            fwd[i] = c[p]
+        else:
+            fwd[i] = m[p]
+    for i in range(n - 1, -1, -1):
+        p = pc[i]
+        if lr[p] == run[i]:
+            fwd[i] = lv[p]
+        else:
+            lr[p] = run[i]
+            lv[p] = fwd[i]
+
+
+def running_agg(pc, vals, stairs, K, kind):
+    """Running aggregate over (PARTITION p ORDER stairs-col), RANGE default frame:
+    two walks of the room, no hallways. Returns float64 per-row values (exact for
+    sum/min/max/count: integers below 2**53; avg = exact-sum / exact-count, duck's
+    own arithmetic). kind: 'avg'|'sum'|'min'|'max'|'count'."""
+    if not HAVE_NUMBA:
+        return None
+    kd = {'avg': 0, 'sum': 1, 'min': 2, 'max': 3, 'count': 4}[kind]
+    s = np.zeros(K, np.float64)
+    c = np.zeros(K, np.int64)
+    m = np.zeros(K, np.float64)
+    lr = np.full(K, -1, np.int64)
+    lv = np.zeros(K, np.float64)
+    fwd = np.empty(pc.size, np.float64)
+    _running_nb(pc.astype(np.int64), vals.astype(np.float64),
+                np.asarray(stairs).astype(np.int64), s, c, m, lr, lv, fwd, kd)
+    return fwd
+
+
 def warm():
     """JIT-compile the kernels (call from prewarm; ~1 s once, cached on disk after)."""
     kway_topk(np.array([1, 2], np.int64), np.array([1, 1], np.int64),
