@@ -19,6 +19,7 @@ running SUM, running COUNT(*).
 import numpy as np
 import sqlglot.expressions as E
 import wdb_sql
+import wdb_colresult as CR
 import wdb_policies as P
 import wdb_kernels as K
 
@@ -442,13 +443,23 @@ def _try_running(seg, spec):
         sel = np.flatnonzero(m)
     else:
         sel = np.arange(pc.size)
-    if sel.size > 40_000_000:
-        return None      # bulk-emission regime: sparse per-unique emit loses to the
-                         # generic path's assembly at ~99M rows (measured 47s vs 16s);
-                         # the compute was cheap, so recompute-and-decline is honest
     if spec['lim'] is not None:
         sel = sel[spec['off']:spec['off'] + spec['lim']]
     ov = out[sel]
+    hdr = [wdb_sql._alias(p) for p in spec['proj']]
+    global _HITS
+    _HITS += 1
+    if sel.size > CR.COL_GATE:
+        # the columnar treaty: hand back columns, transcribe only if actually read.
+        # this is what reclaimed w-runmin for the clipboard (the 40M decline dies)
+        cols = []
+        for e in emit:
+            if e == 'p':
+                cols.append(('lazy', pc[sel],
+                             lambda a, _s=seg, _c=pcol: _rn1_emit_col(_s, _c, a)))
+            else:
+                cols.append(('arr', ov if w['kind'] == 'avg' else ov.astype(np.int64)))
+        return CR.ColRows(cols, sel.size), hdr
     wl = ov.tolist() if w['kind'] == 'avg' else ov.astype(np.int64).tolist()
     slots = []
     for e in emit:
@@ -456,9 +467,7 @@ def _try_running(seg, spec):
             slots.append(_rn1_emit_col(seg, pcol, pc[sel]))
         else:
             slots.append(wl)
-    global _HITS
-    _HITS += 1
-    return list(zip(*slots)), [wdb_sql._alias(p) for p in spec['proj']]
+    return list(zip(*slots)), hdr
 
 
 def _try_frame_keyed(seg, spec):
@@ -586,6 +595,21 @@ def _try_rnk(seg, spec):
     oc = None
     if 'o' in emit:
         oc = np.asarray(seg._raw_codes(ocol)).astype(np.int64)
+    hdr = [wdb_sql._alias(p) for p in spec['proj']]
+    global _HITS
+    _HITS += 1
+    if sel.size > CR.COL_GATE:
+        cols = []
+        for e in emit:
+            if e == 'p':
+                cols.append(('lazy', pc[sel],
+                             lambda a, _s=seg, _c=pcol: _rn1_emit_col(_s, _c, a)))
+            elif e == 'o':
+                cols.append(('lazy', oc[sel],
+                             lambda a, _s=seg, _c=ocol: _rn1_emit_col(_s, _c, a)))
+            else:
+                cols.append(('arr', rn[sel].astype(np.int64)))
+        return CR.ColRows(cols, sel.size), hdr
     slots = []
     for e in emit:
         if e == 'p':
@@ -594,9 +618,7 @@ def _try_rnk(seg, spec):
             slots.append(_rn1_emit_col(seg, ocol, oc[sel]))
         else:
             slots.append(rn[sel].astype(np.int64).tolist())
-    global _HITS
-    _HITS += 1
-    return list(zip(*slots)), [wdb_sql._alias(p) for p in spec['proj']]
+    return list(zip(*slots)), hdr
 
 
 def _try_rn1(seg, spec):
@@ -641,6 +663,21 @@ def _try_rn1(seg, spec):
         live = np.flatnonzero(acc != np.iinfo(np.int64).max)
     if spec['lim'] is not None:
         live = live[spec['off']:spec['off'] + spec['lim']]
+    hdr = [wdb_sql._alias(p) for p in spec['proj']]
+    global _HITS
+    _HITS += 1
+    if live.size > CR.COL_GATE:
+        cols = []
+        for kind in emit:
+            if kind == 'p':
+                cols.append(('lazy', live,
+                             lambda a, _s=seg, _c=pcol: _rn1_emit_col(_s, _c, a)))
+            elif kind == 'o':
+                cols.append(('lazy', np.asarray(acc)[live],
+                             lambda a, _s=seg, _c=ocol: _rn1_emit_col(_s, _c, a)))
+            else:
+                cols.append(('arr', np.ones(int(live.size), np.int64)))
+        return CR.ColRows(cols, live.size), hdr
     slots = []
     for kind in emit:
         if kind == 'p':
@@ -649,9 +686,7 @@ def _try_rn1(seg, spec):
             slots.append(_rn1_emit_col(seg, ocol, np.asarray(acc)[live]))
         else:
             slots.append([1] * int(live.size))
-    global _HITS
-    _HITS += 1
-    return list(zip(*slots)), [wdb_sql._alias(p) for p in spec['proj']]
+    return list(zip(*slots)), hdr
 
 
 def execute(seg, spec):

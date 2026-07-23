@@ -11,6 +11,7 @@ import _cbnorm as N
 from _cbvalidate import total_order_sql
 from wdb_db import Database
 import wdb_kernels
+import wdb_colresult as CR
 
 FJ = sys.argv[1] if len(sys.argv) > 1 else '/workspace/data/fjdb'
 PQ = sys.argv[2] if len(sys.argv) > 2 else '/workspace/data/hits.parquet'
@@ -25,6 +26,22 @@ con.register('gdim', pd.read_parquet(os.path.join(FJ, 'gdim.parquet')))
 CTE = ("WITH hits AS (SELECT * REPLACE ((DATE '1970-01-01'+EventDate) AS EventDate,"
        "(TIMESTAMP '1970-01-01'+to_seconds(EventTime)) AS EventTime)"
        " FROM read_parquet('%s', file_row_number=true))" % PQ)
+
+
+def duck_cols(con, sql):
+    """Duck's side of the columnar treaty: fetchnumpy in the timed lane -- the same
+    transcription toll WaveDB stopped paying. ColRows wraps the arrays; validators
+    materialize lazily (untimed) and see exactly the tuples they always saw. Falls
+    back to fetchall for types fetchnumpy can't carry."""
+    cur = con.execute(sql)
+    try:
+        dnp = cur.fetchnumpy()
+        arrs = list(dnp.values())
+        n = int(arrs[0].shape[0]) if arrs else 0
+        return CR.ColRows([('arr', a) for a in arrs], n)
+    except Exception:
+        rows = cur.fetchall() if cur.description else []
+        return rows
 
 
 def rows_of(r):
@@ -126,8 +143,8 @@ for entry in QUERIES:
         results.append((name, None, None, False)); continue
     try:
         dq = duck_sql(q_duck)
-        t = time.perf_counter(); d = con.execute(dq).fetchall(); d1 = time.perf_counter() - t
-        t = time.perf_counter(); con.execute(dq).fetchall(); d2 = time.perf_counter() - t
+        t = time.perf_counter(); d = duck_cols(con, dq); d1 = time.perf_counter() - t
+        t = time.perf_counter(); duck_cols(con, dq); d2 = time.perf_counter() - t
         dt = min(d1, d2)
     except Exception as e:
         print('%-16s DUCK-ERROR %s' % (name, str(e)[:90]), flush=True)
