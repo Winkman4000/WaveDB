@@ -446,19 +446,31 @@ def pbincount(codes, minlength, weights=None):
         return np.bincount(codes, weights=weights, minlength=minlength)
     import numba as _nb
     nt = min(8, _nb.get_num_threads())
+    if codes.dtype != np.int64:
+        codes = codes.astype(np.int64)           # no silent 800MB copy when already int64
     if weights is None:
-        return _pbincount_nb(codes.astype(np.int64), np.int64(minlength), nt)
-    return _pbincount_w_nb(codes.astype(np.int64),
-                           np.asarray(weights).astype(np.float64),
-                           np.int64(minlength), nt)
+        return _pbincount_nb(codes, np.int64(minlength), nt)
+    w = np.asarray(weights)
+    if w.dtype != np.float64:
+        w = w.astype(np.float64)
+    return _pbincount_w_nb(codes, w, np.int64(minlength), nt)
 
 
 @njit(nogil=True, cache=True)
 def match_eq(raw, code, a, b, jbase, negate):
     """Positions in [a, b) (global rows) whose code equals (or differs from) code.
-    raw = the block's decoded codes starting at global row jbase. nogil: scan worker
-    threads stop serializing on numpy's GIL-held nonzero."""
-    out = np.empty(b - a, np.int64)
+    Two passes: count then exact-size fill -- a block-width scratch per call was
+    800MB of allocator churn per query; matches are usually sparse."""
+    n = 0
+    if negate:
+        for i in range(a - jbase, b - jbase):
+            if raw[i] != code:
+                n += 1
+    else:
+        for i in range(a - jbase, b - jbase):
+            if raw[i] == code:
+                n += 1
+    out = np.empty(n, np.int64)
     k = 0
     if negate:
         for i in range(a - jbase, b - jbase):
@@ -470,19 +482,24 @@ def match_eq(raw, code, a, b, jbase, negate):
             if raw[i] == code:
                 out[k] = jbase + i
                 k += 1
-    return out[:k]
+    return out
 
 
 @njit(nogil=True, cache=True)
 def match_flag(raw, flag, a, b, jbase):
-    """Positions in [a, b) whose code has its flag set -- the nogil LIKE/set scan."""
-    out = np.empty(b - a, np.int64)
+    """Positions in [a, b) whose code has its flag set -- the nogil LIKE/set scan.
+    Two passes, exact-size output (see match_eq)."""
+    n = 0
+    for i in range(a - jbase, b - jbase):
+        if flag[raw[i]]:
+            n += 1
+    out = np.empty(n, np.int64)
     k = 0
     for i in range(a - jbase, b - jbase):
         if flag[raw[i]]:
             out[k] = jbase + i
             k += 1
-    return out[:k]
+    return out
 
 
 def warm():
