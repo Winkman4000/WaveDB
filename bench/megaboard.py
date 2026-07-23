@@ -92,7 +92,10 @@ def norm(x):
     try:
         return round(float(x), 4)
     except (TypeError, ValueError):
-        return str(x)
+        s = str(x)
+        if s.endswith(' 00:00:00'):
+            s = s[:-9]           # datetime64[us] vs date: same day, one dress code
+        return s
 
 
 def validate(kind, q, w, hdr, d):
