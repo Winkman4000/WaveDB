@@ -400,6 +400,91 @@ def seg_slidmax(vals, lane_start, k):
     return out
 
 
+@njit(nogil=True, parallel=True, cache=True)
+def _pbincount_nb(codes, K, nt):
+    boards = np.zeros((nt, K), np.int64)
+    n = codes.size
+    chunk = (n + nt - 1) // nt
+    for t in numba.prange(nt):
+        a = t * chunk
+        b = min(n, a + chunk)
+        for i in range(a, b):
+            boards[t, codes[i]] += 1
+    out = np.zeros(K, np.int64)
+    for t in range(nt):
+        out += boards[t]
+    return out
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _pbincount_w_nb(codes, w, K, nt):
+    boards = np.zeros((nt, K), np.float64)
+    n = codes.size
+    chunk = (n + nt - 1) // nt
+    for t in numba.prange(nt):
+        a = t * chunk
+        b = min(n, a + chunk)
+        for i in range(a, b):
+            boards[t, codes[i]] += w[i]
+    out = np.zeros(K, np.float64)
+    for t in range(nt):
+        out += boards[t]
+    return out
+
+
+_PBC_MAXV = 1 << 22        # 4M cells: per-thread boards stay cheap to zero and merge
+
+
+def pbincount(codes, minlength, weights=None):
+    """The parallel bean board: per-thread private boards, one merge. Exact by
+    construction -- integer counts are order-independent, and the weighted variant
+    stays exact for integer-valued float64 below 2**53 (our SUM regime). Falls back
+    to np.bincount outside the gate (small N, huge V, or no numba). Callers must
+    pass minlength > max(code), which dict codes guarantee structurally."""
+    codes = np.asarray(codes)
+    if not HAVE_NUMBA or codes.size < 2_000_000 or minlength > _PBC_MAXV:
+        return np.bincount(codes, weights=weights, minlength=minlength)
+    import numba as _nb
+    nt = min(8, _nb.get_num_threads())
+    if weights is None:
+        return _pbincount_nb(codes.astype(np.int64), np.int64(minlength), nt)
+    return _pbincount_w_nb(codes.astype(np.int64),
+                           np.asarray(weights).astype(np.float64),
+                           np.int64(minlength), nt)
+
+
+@njit(nogil=True, cache=True)
+def match_eq(raw, code, a, b, jbase, negate):
+    """Positions in [a, b) (global rows) whose code equals (or differs from) code.
+    raw = the block's decoded codes starting at global row jbase. nogil: scan worker
+    threads stop serializing on numpy's GIL-held nonzero."""
+    out = np.empty(b - a, np.int64)
+    k = 0
+    if negate:
+        for i in range(a - jbase, b - jbase):
+            if raw[i] != code:
+                out[k] = jbase + i
+                k += 1
+    else:
+        for i in range(a - jbase, b - jbase):
+            if raw[i] == code:
+                out[k] = jbase + i
+                k += 1
+    return out[:k]
+
+
+@njit(nogil=True, cache=True)
+def match_flag(raw, flag, a, b, jbase):
+    """Positions in [a, b) whose code has its flag set -- the nogil LIKE/set scan."""
+    out = np.empty(b - a, np.int64)
+    k = 0
+    for i in range(a - jbase, b - jbase):
+        if flag[raw[i]]:
+            out[k] = jbase + i
+            k += 1
+    return out[:k]
+
+
 def warm():
     """JIT-compile the kernels (call from prewarm; ~1 s once, cached on disk after)."""
     kway_topk(np.array([1, 2], np.int64), np.array([1, 1], np.int64),
@@ -407,3 +492,8 @@ def warm():
     if HAVE_NUMBA:
         top10_i32(np.array([1, 2], np.int32), 4)
         part_scatter(np.array([1, 0, 1], np.int64), 2)
+        _pbincount_nb(np.array([0, 1, 1], np.int64), 2, 2)
+        _pbincount_w_nb(np.array([0, 1, 1], np.int64), np.ones(3), 2, 2)
+        for _dt in (np.uint8, np.uint16, np.uint32):
+            match_eq(np.array([1, 2, 1], _dt), 1, 0, 3, 0, False)
+            match_flag(np.array([1, 1, 0], _dt), np.array([False, True, False]), 0, 3, 0)

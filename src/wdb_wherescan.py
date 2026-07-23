@@ -22,6 +22,7 @@ Prototype of this exact pipeline ran Q39 (a 45 s timeout) in ~1 s steady-state, 
 import numpy as np
 import sqlglot.expressions as E
 from concurrent.futures import ThreadPoolExecutor
+import wdb_kernels as WK
 import wdb_sql
 import wdb_policies as P
 import wdb_gdsidecar
@@ -747,9 +748,13 @@ def _scan_eq(seg, col, code, lo, hi, negate=False):
             for j in js:
                 raw = np.frombuffer(dz.decompress(buf[base+int(bo[j]):base+int(bo[j+1])].tobytes()), dtype=wdt)
                 a, b = max(lo, j*BR), min(hi, j*BR + raw.size)
-                seg_ = raw[a-j*BR:b-j*BR]
-                h = np.nonzero(seg_ != code)[0] if negate else np.nonzero(seg_ == code)[0]
-                if h.size: out.append(h + a)
+                if WK.HAVE_NUMBA:
+                    h = WK.match_eq(raw, int(code), int(a), int(b), int(j*BR), bool(negate))
+                    if h.size: out.append(h)
+                else:
+                    seg_ = raw[a-j*BR:b-j*BR]
+                    h = np.nonzero(seg_ != code)[0] if negate else np.nonzero(seg_ == code)[0]
+                    if h.size: out.append(h + a)
             return np.concatenate(out) if out else np.empty(0, np.int64)
         W = min(_SCAN_THREADS, max(1, j1 - j0))
         with ThreadPoolExecutor(W) as ex:
@@ -820,8 +825,12 @@ def _scan_flag(seg, col, flag, lo, hi):
             for j in js:
                 raw = np.frombuffer(dz.decompress(buf[base+int(bo[j]):base+int(bo[j+1])].tobytes()), dtype=wdt)
                 a, b = max(lo, j*BR), min(hi, j*BR + raw.size)
-                h = np.nonzero(flag[raw[a-j*BR:b-j*BR]])[0]
-                if h.size: out.append(h + a)
+                if WK.HAVE_NUMBA:
+                    h = WK.match_flag(raw, flag, int(a), int(b), int(j*BR))
+                    if h.size: out.append(h)
+                else:
+                    h = np.nonzero(flag[raw[a-j*BR:b-j*BR]])[0]
+                    if h.size: out.append(h + a)
             return np.concatenate(out) if out else np.empty(0, np.int64)
         W = min(_SCAN_THREADS, max(1, j1 - j0))
         with ThreadPoolExecutor(W) as ex:

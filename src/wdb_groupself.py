@@ -13,6 +13,7 @@ gbcount precedent. A NULL group with no WHERE also declines: SQL emits the
 NULL group, and that is the scan path's job (every WHERE op we accept is
 null-excluding by SQL semantics, so with terms present the null bin zeroes)."""
 import numpy as np
+import wdb_kernels as WK
 import wdb_sql
 import wdb_policies as P
 import workers
@@ -165,7 +166,7 @@ def execute(seg, spec):
     c = seg.cols[col]
     codes = np.asarray(seg._raw_codes(col))
     V = int(c['V'])
-    cn = np.bincount(codes, minlength=V).astype(np.int64)
+    cn = WK.pbincount(codes, V).astype(np.int64)
     if c.get('has_null'):
         cn[V - 1] = 0                # terms present (detect gate): every op excludes NULL
     for op, vals in spec['terms']:

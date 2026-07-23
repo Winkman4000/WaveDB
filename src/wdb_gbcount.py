@@ -18,6 +18,7 @@ sidecar is built lazily on first eligible query and persisted next to the segmen
 keyed by column — general across any table/column. Staleness-guarded by seg.N.
 """
 import os, pickle, numpy as np
+import wdb_kernels as WK
 import wdb_qmem
 import wdb_sql
 import workers
@@ -79,7 +80,7 @@ def _build(seg, col):
     if codes.size == 0:
         return None
     K = int(codes.max()) + 1
-    counts = np.bincount(codes, minlength=K)
+    counts = WK.pbincount(codes, K)
     order = np.argsort(counts, kind='stable')[::-1]      # count descending
     keep = counts[order] >= 2                            # singletons are implicit (count 1), don't store
     hc = np.ascontiguousarray(order[keep], dtype=np.uint32)
