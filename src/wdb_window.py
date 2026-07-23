@@ -442,6 +442,10 @@ def _try_running(seg, spec):
         sel = np.flatnonzero(m)
     else:
         sel = np.arange(pc.size)
+    if sel.size > 40_000_000:
+        return None      # bulk-emission regime: sparse per-unique emit loses to the
+                         # generic path's assembly at ~99M rows (measured 47s vs 16s);
+                         # the compute was cheap, so recompute-and-decline is honest
     if spec['lim'] is not None:
         sel = sel[spec['off']:spec['off'] + spec['lim']]
     ov = out[sel]
