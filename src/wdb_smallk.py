@@ -51,12 +51,24 @@ def detect(seg, tree, col_map):
             return None
     if cnt_i is None:
         return None
-    spans = []
+    spans, kinds = [], []
     for nm in keys:
         c = seg.cols.get(nm)
-        if c is None or c.get('mode') not in (0, 1, 2) or c.get('has_null'):
+        if c is None or c.get('has_null'):
             return None
-        spans.append(int(c['V']))
+        if c.get('mode') in (0, 1, 2):
+            spans.append(int(c['V']))
+            kinds.append(('dict', nm))
+        elif c.get('mode') == 4:
+            # raw-int column: the value IS the code. Only pay the decode once the
+            # cheap shape gates have passed; span = max+1, emission = identity.
+            vals = np.asarray(seg._seq_decode(c))
+            if vals.size == 0 or int(vals.min()) < 0 or int(vals.max()) >= (1 << 20):
+                return None
+            spans.append(int(vals.max()) + 1)
+            kinds.append(('raw', vals))
+        else:
+            return None
     total = 1
     for v in spans:
         total *= v
@@ -74,14 +86,15 @@ def detect(seg, tree, col_map):
         desc = bool(oe.args.get('desc'))
     if not P.no_deleted_rows(seg):
         return None
-    return keys, spans, order_slots, desc, wdb_sql._limit(tree), (wdb_sql._offset(tree) or 0), proj
+    return keys, spans, kinds, order_slots, desc, wdb_sql._limit(tree), (wdb_sql._offset(tree) or 0), proj
 
 
 def execute(seg, spec):
     global _HITS
     _HITS += 1
-    keys, spans, slots, desc, lim, off, proj = spec
-    codes = [np.asarray(seg._raw_codes(nm)) for nm in keys]     # native dtypes: no astype
+    keys, spans, kinds, slots, desc, lim, off, proj = spec
+    codes = [np.asarray(seg._raw_codes(kd[1])) if kd[0] == 'dict' else kd[1]
+             for kd in kinds]                            # native dtypes: no astype
     board = WK.grid_count(codes, spans)
     gid = np.flatnonzero(board)
     cnt = board[gid]
@@ -100,6 +113,9 @@ def execute(seg, spec):
     parts = parts[::-1]                              # per-key code arrays, cells only
     tabs = []
     for i, nm in enumerate(keys):
+        if kinds[i][0] == 'raw':
+            tabs.append(None)                        # identity: the code IS the value
+            continue
         vals = {}
         for code in np.unique(parts[i]):
             v = wdb_sql._pyval(seg.fetch(nm, int(code)))
@@ -112,7 +128,8 @@ def execute(seg, spec):
         row = []
         for kind, ki in slots:
             if kind == 'k':
-                row.append(tabs[ki][int(parts[ki][r])])
+                pv = int(parts[ki][r])
+                row.append(pv if tabs[ki] is None else tabs[ki][pv])
             else:
                 row.append(int(cnt[r]))
         rows.append(tuple(row))
