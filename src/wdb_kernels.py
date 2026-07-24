@@ -491,6 +491,40 @@ def rank_walk(pc, stairs, K, dense):
     return out
 
 
+@njit(nogil=True, cache=True)
+def _grid2_nb(a, b, Vb, board):
+    for i in range(a.size):
+        board[np.int64(a[i]) * Vb + np.int64(b[i])] += 1
+
+
+@njit(nogil=True, cache=True)
+def _grid3_nb(a, b, c, Vb, Vc, board):
+    for i in range(a.size):
+        board[(np.int64(a[i]) * Vb + np.int64(b[i])) * Vc + np.int64(c[i])] += 1
+
+
+def grid_count(codes, spans):
+    """The fused small-K board: one trip over the raw code streams (native dtypes,
+    no astype, no composed key array) dropping beans on one composite board. Only
+    populated cells go cache-hot, so even a 48M-cell board behaves small. Falls
+    back to staged compose+bincount without numba."""
+    total = 1
+    for v in spans:
+        total *= int(v)
+    if HAVE_NUMBA:
+        board = np.zeros(total, np.int64)
+        if len(codes) == 2:
+            _grid2_nb(codes[0], codes[1], np.int64(spans[1]), board)
+        else:
+            _grid3_nb(codes[0], codes[1], codes[2],
+                      np.int64(spans[1]), np.int64(spans[2]), board)
+        return board
+    key = np.asarray(codes[0]).astype(np.int64)
+    for i in range(1, len(codes)):
+        key = key * int(spans[i]) + np.asarray(codes[i]).astype(np.int64)
+    return np.bincount(key, minlength=total)
+
+
 def warm():
     """JIT-compile the kernels (call from prewarm; ~1 s once, cached on disk after)."""
     kway_topk(np.array([1, 2], np.int64), np.array([1, 1], np.int64),
@@ -498,3 +532,5 @@ def warm():
     if HAVE_NUMBA:
         top10_i32(np.array([1, 2], np.int32), 4)
         part_scatter(np.array([1, 0, 1], np.int64), 2)
+        _grid2_nb(np.array([0, 1], np.uint8), np.array([1, 0], np.uint8), 2, np.zeros(4, np.int64))
+        _grid3_nb(np.array([0, 1], np.uint8), np.array([1, 0], np.uint8), np.array([0, 1], np.uint8), 2, 2, np.zeros(8, np.int64))

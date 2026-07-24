@@ -21,6 +21,7 @@ import wdb_groupself
 import wdb_heavypair
 import wdb_countpos
 import wdb_gridwalk
+import wdb_smallk
 import wdb_stair
 import wdb_blockstats
 import wdb_wherescan
@@ -121,6 +122,11 @@ gridwalk = Read('gridwalk',
                 lambda c: wdb_gridwalk.detect(c.seg, c.tree, c.cmap),
                 lambda c, spec: wdb_gridwalk.execute(c.seg, spec),
                 'two-key COUNT(*) top-K via grid filled-cell + count-ordered head')
+
+smallk = Read('smallk',
+              lambda c: wdb_smallk.detect(c.seg, c.tree, c.cmap),
+              lambda c, spec: wdb_smallk.execute(c.seg, spec),
+              'narrow 2-3 key COUNT(*) via one fused pass onto a composite board')
 
 diskpair = Read('diskpair',
                 lambda c: wdb_diskpair.detect(c.seg, c.tree, c.cmap),

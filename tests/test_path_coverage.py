@@ -122,12 +122,15 @@ def _classify(db, q):
     tree = sqlglot.parse_one(q, read='duckdb')
     cand = _is_fusion_candidate(tree)
     fb = wdb_join._FAST_HITS; bb = wdb_bsi_exec._BSI_HITS; gd = wdb_groupdistinct._HITS
+    import wdb_smallk; sk = wdb_smallk._HITS
     bs = wdb_blockstats._HITS
     rows = db.run(q)[0]
     if wdb_bsi_exec._BSI_HITS > bb: return 'bsi', rows
     if wdb_blockstats._HITS > bs: return 'fast', rows      # per-block stats: aggregates, no row data
     if wdb_groupdistinct._HITS > gd: return 'fast', rows   # group-wise COUNT(DISTINCT) code-hash kernel
     if wdb_join._FAST_HITS > fb: return 'fast', rows
+    import wdb_smallk
+    if wdb_smallk._HITS > sk: return 'fast', rows   # narrow-key fused composite board
     return ('fallback' if cand else 'rows'), rows
 
 def _evaluate():

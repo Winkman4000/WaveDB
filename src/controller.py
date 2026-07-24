@@ -49,7 +49,8 @@ _READ_ORDER = (
     R.groupself,            # counting board: GROUP BY K + WHERE on K, bins not rows
     R.wherescan,            # conjunctive WHERE: stair spans + blocked-frame predicate scan, disk-only
     R.dict_count,           # dictionary per-code counts
-    R.gridwalk,             # two-key COUNT(*) top-K via grid filled-cell + count-ordered head (opt-in)
+    R.gridwalk,
+    R.smallk,              # narrow-key pair/triple boards (the small-K weapon)             # two-key COUNT(*) top-K via grid filled-cell + count-ordered head (opt-in)
     R.diskpair,             # disk-only pair GROUP BY: scan-merge floor beneath the structures
     R.countpos,             # two-key COUNT(*) top-K via per-row count-class presence-scan (opt-in)
     R.heavypair,            # two-key COUNT(*) top-N from a count-sorted pair sidecar
