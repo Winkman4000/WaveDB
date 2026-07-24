@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Zero-dependency test runner. Usage: python3 tests/run.py [substring-filter] [--report]
 On completion prints the scoreboard summary (examples/report.md); --report regenerates it."""
+import os
+os.environ.setdefault('WDB_SEQ_NARROW_OK', '1')   # machinery tests build narrow mode-4 toys
 import sys, os, importlib, traceback, time, subprocess
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)

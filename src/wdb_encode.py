@@ -108,7 +108,8 @@ def _try_seq(nm, col, allow_seq=True):
     # column no matter how affine its runs look -- dict codes give free per-row
     # identity (no cumsum reconstruction ever) and pack tighter. Found 2026-07 when
     # six flag/enum columns misfired into mode 4 and every read paid delta-decode.
-    if iv.size:
+    import os as _os
+    if iv.size and _os.environ.get('WDB_SEQ_NARROW_OK') != '1':
         lo = int(iv.min()); hi = int(iv.max())
         if hi - lo < (1 << 16):
             tv = int(np.count_nonzero(np.bincount((iv - lo).astype(np.int64))))
