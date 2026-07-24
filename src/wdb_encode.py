@@ -104,6 +104,16 @@ def _try_seq(nm, col, allow_seq=True):
         dtype = 3; aux = _unit_code(np.datetime_data(data.dtype)[0]); iv = data.view('int64')
     else:
         return None                                   # floats / strings: not eligible
+    # cardinality guard: a narrow column (flags, enums, small ids) is a DICTIONARY
+    # column no matter how affine its runs look -- dict codes give free per-row
+    # identity (no cumsum reconstruction ever) and pack tighter. Found 2026-07 when
+    # six flag/enum columns misfired into mode 4 and every read paid delta-decode.
+    if iv.size:
+        lo = int(iv.min()); hi = int(iv.max())
+        if hi - lo < (1 << 16):
+            tv = int(np.count_nonzero(np.bincount((iv - lo).astype(np.int64))))
+            if tv <= 65536:
+                return None                           # narrow: the dict modes win
     blob = wdb_seqcodec.encode(iv, max_exc_frac=0.2)  # fire only on clear wins (>=80% conform)
     if blob is None:
         return None
