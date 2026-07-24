@@ -380,15 +380,25 @@ def _try_partcount(seg, spec):
         sel = np.arange(key.size)
     if spec['lim'] is not None:
         sel = sel[spec['off']:spec['off'] + spec['lim']]
+    hdr = [wdb_sql._alias(p) for p in spec['proj']]
+    global _HITS
+    _HITS += 1
+    if sel.size > CR.COL_GATE:
+        cols = []
+        for e in emit:
+            if e == 'n':
+                cols.append(('arr', n[sel]))
+            else:
+                cols.append(('lazy', cs[e][sel],
+                             lambda a, _s=seg, _c=pcols[e]: _rn1_emit_col(_s, _c, a)))
+        return CR.ColRows(cols, sel.size), hdr
     slots = []
     for e in emit:
         if e == 'n':
             slots.append(n[sel].tolist())
         else:
             slots.append(_rn1_emit_col(seg, pcols[e], cs[e][sel]))
-    global _HITS
-    _HITS += 1
-    return list(zip(*slots)), [wdb_sql._alias(p) for p in spec['proj']]
+    return list(zip(*slots)), hdr
 
 
 def _try_running(seg, spec):
@@ -602,15 +612,25 @@ def _try_frame_keyed(seg, spec):
         sel = np.arange(pc.size)
     if spec['lim'] is not None:
         sel = sel[spec['off']:spec['off'] + spec['lim']]
+    hdr = [wdb_sql._alias(p) for p in spec['proj']]
+    global _HITS
+    _HITS += 1
+    if sel.size > CR.COL_GATE:
+        cols = []
+        for e in emit:
+            if e == 'p':
+                cols.append(('lazy', pc[sel],
+                             lambda a, _s=seg, _c=pcol: _rn1_emit_col(_s, _c, a)))
+            else:
+                cols.append(('arr', np.asarray(out)[sel]))
+        return CR.ColRows(cols, sel.size), hdr
     slots = []
     for e in emit:
         if e == 'p':
             slots.append(_rn1_emit_col(seg, pcol, pc[sel]))
         else:
             slots.append(np.asarray(out)[sel].tolist())
-    global _HITS
-    _HITS += 1
-    return list(zip(*slots)), [wdb_sql._alias(p) for p in spec['proj']]
+    return list(zip(*slots)), hdr
 
 
 def _try_rnk(seg, spec):
