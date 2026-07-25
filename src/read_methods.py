@@ -26,6 +26,7 @@ import wdb_stair
 import wdb_blockstats
 import wdb_wherescan
 import wdb_diskpair
+import wdb_distinctlim
 import wdb_regexgroup
 import wdb_window
 import wdb_pairagg
@@ -127,6 +128,11 @@ smallk = Read('smallk',
               lambda c: wdb_smallk.detect(c.seg, c.tree, c.cmap),
               lambda c, spec: wdb_smallk.execute(c.seg, spec),
               'narrow 2-3 key COUNT(*) via one fused pass onto a composite board')
+
+distinctlim = Read('distinctlim',
+                   lambda c: wdb_distinctlim.detect(c.seg, c.tree, c.cmap),
+                   lambda c, spec: wdb_distinctlim.execute(c.seg, spec),
+                   'DISTINCT (hour, key) LIMIT n: stair-ridden block walk, early exit')
 
 diskpair = Read('diskpair',
                 lambda c: wdb_diskpair.detect(c.seg, c.tree, c.cmap),

@@ -18,6 +18,7 @@ path. Everything here is INNER equi-join; other kinds fall through untouched.
 """
 import sqlglot.expressions as E
 import wdb_sql
+import wdb_policies as P
 
 _DIM_CAP = 500_000
 
@@ -451,10 +452,23 @@ def _giant_m2o(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey,
     # count at NAME scale first (one bincount of raw key codes; beans need no order),
     # then fold the 17.6M-entry name board into the cell board at dictionary scale.
     # No per-row gather exists at all. Row-level filters force the per-row path.
-    fkc = np.asarray(fseg._raw_codes(fkey)).astype(np.int64)
+    fkc = None
     sums = {}
     if not fact_conds:
-        name_counts = np.bincount(fkc, minlength=fk_vals.size)
+        # fold-over-gbc: per-name counts ARE a gbc sidecar. Dict codes appear >= 1
+        # by construction, so absent-from-heavy means exactly 1. Count-only folds
+        # never touch the fact key stream at all.
+        name_counts = None
+        if not any(kd == 'SUM' for _, kd in aggs) and P.no_deleted_rows(fseg):
+            import wdb_gbcount
+            loaded = wdb_gbcount._load(fseg, fkey)
+            if loaded is not None:
+                hc_, hn_ = loaded
+                name_counts = np.ones(fk_vals.size, np.int64)
+                name_counts[hc_] = hn_
+        if name_counts is None:
+            fkc = np.asarray(fseg._raw_codes(fkey)).astype(np.int64)
+            name_counts = np.bincount(fkc, minlength=fk_vals.size)
         counts = np.bincount(cell_of + 1, weights=name_counts,
                              minlength=total + 1)[1:].astype(np.int64)
         for pi, kd in aggs:
@@ -462,10 +476,13 @@ def _giant_m2o(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey,
                 p = proj[pi]
                 inner = p.this if isinstance(p, E.Alias) else p
                 v = WN._numvals(fseg, inner.this.name)
+                if fkc is None:
+                    fkc = np.asarray(fseg._raw_codes(fkey)).astype(np.int64)
                 name_sums = np.bincount(fkc, weights=v, minlength=fk_vals.size)
                 sums[pi] = np.bincount(cell_of + 1, weights=name_sums,
                                        minlength=total + 1)[1:]
     else:
+        fkc = np.asarray(fseg._raw_codes(fkey)).astype(np.int64)
         cells = cell_of[fkc]
         keep = cells >= 0
         for c in fact_conds:
