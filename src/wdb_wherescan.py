@@ -959,7 +959,15 @@ def execute(seg, spec):
                            negate=not _wn)
         else:
             pos = np.arange(lo, hi, dtype=np.int64)
-    for i, (col, val, op) in enumerate(spec['eqs']):
+    # residual order is ours to choose (conjunction commutes): equalities before
+    # inequalities (eq slashes survivors, neq barely trims), cheap dictionaries
+    # before heavy ones -- the cte-chain lesson: testing a 6.5M-V string column
+    # at 738K rows before a 9K-V column cut them to 5K cost half the query
+    _res = sorted(range(len(spec['eqs'])),
+                  key=lambda _i: (0 if spec['eqs'][_i][2] == '=' else 1,
+                                  int(seg.cols.get(spec['eqs'][_i][0], {}).get('V') or 0)))
+    for i in _res:
+        col, val, op = spec['eqs'][i]
         if i == de or i == spec.get('drive_neq') or pos.size == 0: continue
         code = _code_of(seg, col, val)
         if code is None:

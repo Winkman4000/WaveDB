@@ -158,7 +158,6 @@ def detect(seg, tree, col_map):
     w = tree.args.get('where')
     if w is not None:
         # admit exactly: key <> literal (one conjunct) -- served by cell exclusion
-        import sqlglot.expressions as E
         cj = w.this
         if not isinstance(cj, E.NEQ) or not isinstance(cj.expression, E.Literal):
             return None
@@ -170,7 +169,6 @@ def detect(seg, tree, col_map):
     h = tree.args.get('having')
     if h is not None:
         # admit exactly: COUNT(*) > lit (lit >= 2: the heavy list is complete there)
-        import sqlglot.expressions as E
         hc_ = h.this
         if not isinstance(hc_, E.GT) or wdb_sql._agg_kind(hc_.this) is None:
             return None
@@ -200,16 +198,34 @@ def detect(seg, tree, col_map):
     if wdb_sql._agg_kind(kp) is not None:               # the other projection must be the bare key
         return None
     knm = wdb_sql._proj_colname(kp)
+    shift = 0
+    if knm is None:
+        # affine bijection: (key +/- int) groups IDENTICALLY to key -- shifting every
+        # sticker's number changes nothing about which stickers tie together. Serve
+        # from the key's counts; shift only the emitted winners' labels.
+        inner = kp.this if isinstance(kp, E.Alias) else kp
+        if isinstance(inner, (E.Add, E.Sub)) and isinstance(inner.this, E.Column) \
+                and isinstance(inner.expression, E.Literal):
+            try:
+                lv = float(inner.expression.this)
+            except (TypeError, ValueError):
+                lv = None
+            if lv is not None and lv.is_integer():
+                knm = inner.this.name
+                shift = int(lv) if isinstance(inner, E.Add) else -int(lv)
     gnm = wdb_sql._colname(group.expressions[0])
-    if knm is None or gnm is None or knm != gnm:
+    galias = wdb_sql._alias(kp)
+    if knm is None or gnm is None or (gnm != knm and gnm != galias):
         return None
-    if excl_lit is not None and excl_key != knm:
+    if excl_lit is not None and (excl_key != knm or shift):
         return None                                     # exclusion must be on the key itself
     col = col_map.get(knm, knm) if col_map else knm
     # --- shared segment/column guards (wdb_policies) ---
     if not P.columns_exist(seg, col):  return None
     if not P.not_positional(seg, col): return None
     if not P.no_deleted_rows(seg):     return None      # deleted rows make stored counts stale
+    if shift and seg.cols[col].get('dt') != 0:
+        return None                                     # label shifting is integer business
     if unbounded:
         if tree.args.get('order') is not None:
             return None                                 # unbounded serve emits any order
@@ -223,7 +239,14 @@ def detect(seg, tree, col_map):
         return None
     return {'col': col, 'ci': ci, 'ki': ki, 'lim': lim, 'proj': proj,
             'order': tree.args.get('order'), 'excl_lit': excl_lit,
-            'having_min': having_min, 'unbounded': unbounded}
+            'having_min': having_min, 'unbounded': unbounded, 'shift': shift}
+
+
+def _emit_key(seg, col, code, shift):
+    v = wdb_sql._pyval(seg.fetch(col, int(code)))
+    if shift:
+        return int(v) + shift
+    return v
 
 
 def execute(seg, spec):
@@ -254,7 +277,7 @@ def execute(seg, spec):
             if hm2 is not None and not n > hm2:
                 continue
             row = [None, None]
-            row[ki] = wdb_sql._pyval(seg.fetch(col, code))
+            row[ki] = _emit_key(seg, col, code, spec.get('shift', 0))
             row[ci] = n
             rows.append(tuple(row))
         _HITS += 1
@@ -276,8 +299,8 @@ def execute(seg, spec):
     rows = []
     for code, n in zip(hc[:lim].tolist(), hn[:lim].tolist()):
         row = [None, None]
-        row[ki] = wdb_sql._pyval(seg.fetch(col, int(code)))   # decode ONLY the N emitted keys:
-        row[ci] = int(n)                                      # point-fetch, never the dictionary
+        row[ki] = _emit_key(seg, col, code, spec.get('shift', 0))  # decode ONLY the N emitted
+        row[ci] = int(n)                                           # keys: point-fetch, never the dict
         rows.append(tuple(row))
     rows = workers.finalize(rows, proj, spec['order'], lim)
     _HITS += 1
