@@ -44,6 +44,8 @@ def _fetchable(seg, col):
         return True
     if c['dt'] == 0 and c['mode'] == 2:                 # high-card int: nline/dict fetch
         return True
+    if c['dt'] == 0 and c['mode'] in (0, 1):            # int-valued byte dict: plain point fetch
+        return True                                     # (the j-dim-grp inner: RegionID dt0 mode0)
     return False
 
 
