@@ -180,7 +180,11 @@ def detect(seg, tree, col_map):
         if having_min < 2:
             return None
     if not P.single_group_key(tree):   return None
-    if not P.has_limit(tree):          return None      # only the bounded top-N shape
+    # bounded top-N is the home shape; the UNBOUNDED full-counts shape is also
+    # servable when the dictionary is small (heavy list + implicit singletons =
+    # the complete answer) -- born of join orientation's inner rewrite, which
+    # asks for full single-key counts with no limit
+    unbounded = not P.has_limit(tree)
     group = tree.args.get('group')
     lim = wdb_sql._limit(tree)
     proj = tree.expressions
@@ -204,13 +208,20 @@ def detect(seg, tree, col_map):
     if not P.columns_exist(seg, col):  return None
     if not P.not_positional(seg, col): return None
     if not P.no_deleted_rows(seg):     return None      # deleted rows make stored counts stale
-    if not _order_is_count_desc(tree, proj, ci):
+    if unbounded:
+        if tree.args.get('order') is not None:
+            return None                                 # unbounded serve emits any order
+        col_ = col_map.get(knm, knm) if col_map else knm
+        c_ = seg.cols.get(col_)
+        if c_ is None or int(c_.get('V') or 1 << 30) > 65536:
+            return None                                 # big dicts: unbounded stays scan-side
+    elif not _order_is_count_desc(tree, proj, ci):
         return None
     if not _fetchable(seg, col):                        # capability only: NO data touched
         return None
     return {'col': col, 'ci': ci, 'ki': ki, 'lim': lim, 'proj': proj,
             'order': tree.args.get('order'), 'excl_lit': excl_lit,
-            'having_min': having_min}
+            'having_min': having_min, 'unbounded': unbounded}
 
 
 def execute(seg, spec):
@@ -230,6 +241,22 @@ def execute(seg, spec):
         if kc is not None:
             keep = hc != int(kc)                        # one cell out; count-desc order kept
             hc, hn = hc[keep], hn[keep]
+    if spec.get('unbounded'):
+        V = int(seg.cols[col]['V'])
+        cnt = np.ones(V, np.int64)                      # dict codes appear >= 1;
+        cnt[hc] = hn                                    # absent from heavy == exactly 1
+        hm2 = spec.get('having_min')
+        rows = []
+        for code in range(V):
+            n = int(cnt[code])
+            if hm2 is not None and not n > hm2:
+                continue
+            row = [None, None]
+            row[ki] = wdb_sql._pyval(seg.fetch(col, code))
+            row[ci] = n
+            rows.append(tuple(row))
+        _HITS += 1
+        return rows, [wdb_sql._alias(p) for p in proj]
     hm = spec.get('having_min')
     if hm is not None:
         qual = int(np.count_nonzero(hn > hm))           # hn is count-desc: a clean prefix
