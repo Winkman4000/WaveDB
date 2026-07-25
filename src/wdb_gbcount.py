@@ -152,8 +152,33 @@ def detect(seg, tree, col_map):
     # --- shared shape guards (wdb_policies); filter-free COUNT(*) top-N ---
     if not P.no_joins(tree):           return None
     if not P.no_select_distinct(tree): return None
-    if not P.no_where(tree):           return None
-    if not P.no_having(tree):          return None
+    excl_lit = None
+    w = tree.args.get('where')
+    if w is not None:
+        # admit exactly: key <> literal (one conjunct) -- served by cell exclusion
+        import sqlglot.expressions as E
+        cj = w.this
+        if not isinstance(cj, E.NEQ) or not isinstance(cj.expression, E.Literal):
+            return None
+        if wdb_sql._colname(cj.this) is None:
+            return None
+        excl_lit = cj.expression.this
+        excl_key = wdb_sql._colname(cj.this)
+    having_min = None
+    h = tree.args.get('having')
+    if h is not None:
+        # admit exactly: COUNT(*) > lit (lit >= 2: the heavy list is complete there)
+        import sqlglot.expressions as E
+        hc_ = h.this
+        if not isinstance(hc_, E.GT) or wdb_sql._agg_kind(hc_.this) is None:
+            return None
+        if wdb_sql._agg_kind(hc_.this)[0] != 'COUNT_STAR':
+            return None
+        if not isinstance(hc_.expression, E.Literal):
+            return None
+        having_min = float(hc_.expression.this)
+        if having_min < 2:
+            return None
     if not P.single_group_key(tree):   return None
     if not P.has_limit(tree):          return None      # only the bounded top-N shape
     group = tree.args.get('group')
@@ -172,6 +197,8 @@ def detect(seg, tree, col_map):
     gnm = wdb_sql._colname(group.expressions[0])
     if knm is None or gnm is None or knm != gnm:
         return None
+    if excl_lit is not None and excl_key != knm:
+        return None                                     # exclusion must be on the key itself
     col = col_map.get(knm, knm) if col_map else knm
     # --- shared segment/column guards (wdb_policies) ---
     if not P.columns_exist(seg, col):  return None
@@ -182,7 +209,8 @@ def detect(seg, tree, col_map):
     if not _fetchable(seg, col):                        # capability only: NO data touched
         return None
     return {'col': col, 'ci': ci, 'ki': ki, 'lim': lim, 'proj': proj,
-            'order': tree.args.get('order')}
+            'order': tree.args.get('order'), 'excl_lit': excl_lit,
+            'having_min': having_min}
 
 
 def execute(seg, spec):
@@ -196,7 +224,21 @@ def execute(seg, spec):
     if loaded is None:
         return None
     hc, hn = loaded
-    if lim > hn.size:                                   # would need singletons (count 1): fall through
+    if spec.get('excl_lit') is not None:
+        import wdb_wherescan as WS
+        kc = WS._code_of(seg, col, spec['excl_lit'])
+        if kc is not None:
+            keep = hc != int(kc)                        # one cell out; count-desc order kept
+            hc, hn = hc[keep], hn[keep]
+    hm = spec.get('having_min')
+    if hm is not None:
+        qual = int(np.count_nonzero(hn > hm))           # hn is count-desc: a clean prefix
+        hc, hn = hc[:qual], hn[:qual]
+        lim = min(lim, qual)                            # fewer qualifiers than LIMIT is a
+        if lim == 0:                                    # legitimate short answer, not a decline
+            _HITS += 1
+            return [], [wdb_sql._alias(p) for p in proj]
+    if hm is None and lim > hn.size:                    # would need singletons: fall through
         return None
     if lim < hn.size and int(hn[lim - 1]) == int(hn[lim]):
         return None                                     # a tie straddles the LIMIT boundary: the top-N
