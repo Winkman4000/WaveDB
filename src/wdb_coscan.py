@@ -227,6 +227,11 @@ def execute(seg, spec):
                 excl = np.isin(lo, pl)
                 admit &= ~(const & excl)
     blocks = np.flatnonzero(admit)
+    if blocks.size > nbc // 4:
+        return None      # the veto must earn the walk: without >=75% pruning, reading
+                         # every conjunct stream fully loses to driver+positional
+                         # residuals (measured: f-and3 280->812ms on unclustered data).
+                         # Opportunistic by design -- armed for clustered files.
     def one(j):
         m = None
         a = int(j) * BR
