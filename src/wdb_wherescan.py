@@ -495,7 +495,29 @@ def detect(seg, tree, col_map):
             return None
     if not eqs and not spans and not likes and not ors and not sflags and not ins:
         return None                      # unselective flag-only shapes stay with the scan family
-    drive_eq = next((i for i, e in enumerate(eqs) if e[2] == '='), None)
+    def _eq_cost(col, val):
+        # the driver decides the whole query's scale: RegionID=229 drove cte-chain at
+        # 18.3M survivors when CounterID=62 (738K) sat right next to it. Exact per-code
+        # counts when a .gbc sidecar ALREADY EXISTS (peek only -- driver selection must
+        # never trigger a lazy build); N/V average otherwise.
+        import os
+        if os.path.exists(seg.path + '.' + col + '.gbc'):
+            try:
+                import wdb_gbcount
+                loaded = wdb_gbcount._load(seg, col)
+                if loaded is not None:
+                    k = _code_of(seg, col, val)
+                    if k is None:
+                        return 0                    # absent literal: empty drive, best possible
+                    hc, hn = loaded
+                    j = np.flatnonzero(hc == int(k))
+                    return int(hn[j[0]]) if j.size else 1
+            except Exception:
+                pass
+        V = int(seg.cols[col].get('V') or 1)
+        return max(1, int(seg.N) // max(1, V))
+    _cand = [i for i, e in enumerate(eqs) if e[2] == '=']
+    drive_eq = min(_cand, key=lambda i: _eq_cost(eqs[i][0], eqs[i][1])) if _cand else None
     # a like is only THE driver when no eq drives -- execute skips lflags[drive_like],
     # so marking one while an eq drives silently drops that LIKE as a filter
     drive_like = None if drive_eq is not None else \
