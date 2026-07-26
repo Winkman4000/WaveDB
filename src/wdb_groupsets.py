@@ -55,7 +55,209 @@ def _sets_of(tree):
     return uniq
 
 
+def _fused_2key(db, tree):
+    """Stage B: filtered 2-key CUBE/ROLLUP as ONE grid -- count and weighted-sum boards
+    over the survivors, every grouping set a sideways sum of the same board. Replaces
+    2**k sub-queries (each re-filtering, re-sorting) with one filter + one bincount per
+    aggregate. Narrow by design: single table, one eq conjunct, 2 plain CUBE/ROLLUP keys,
+    COUNT(*)/SUM aggs; anything else declines to composition."""
+    import numpy as np
+    import wdb_policies as P
+    if not P.no_joins(tree) or not P.no_having(tree) or not P.no_select_distinct(tree):
+        return None
+    if tree.args.get('qualify') is not None:
+        return None
+    g = tree.args.get('group')
+    if [x for x in g.expressions if isinstance(x, E.Column)]:
+        return None                                     # plain prefix keys: compose
+    src = (g.args.get('cube') or []) + (g.args.get('rollup') or [])
+    if len(src) != 1 or len(src[0].expressions) != 2:
+        return None
+    knames = [x.name for x in src[0].expressions]
+    w = tree.args.get('where')
+    if w is None:
+        return None
+    cj = w.this
+    if isinstance(cj, E.Paren):
+        cj = cj.this
+    if not isinstance(cj, E.EQ) or not isinstance(cj.expression, E.Literal):
+        return None
+    fcol = wdb_sql._colname(cj.this)
+    if fcol is None:
+        return None
+    flit = cj.expression.this
+    frm = tree.args.get('from_') or tree.args.get('from')
+    if frm is None:
+        return None
+    tabs = list(frm.find_all(E.Table))
+    if len(tabs) != 1:
+        return None
+    tname = tabs[0].name
+    seg = db.open_segment(db.cat.segment_paths(tname)[0], tname)
+    fc = seg.cols.get(fcol)
+    if fc is None or fc.get('mode') not in (0, 1, 2) or fc.get('has_null'):
+        return None
+    aggs = []                                           # (proj_index, kind, col_or_None)
+    keyslot = {}
+    for pi, p in enumerate(tree.expressions):
+        inner = p.this if isinstance(p, E.Alias) else p
+        nm = wdb_sql._colname(inner)
+        if nm in knames:
+            keyslot[nm] = pi
+            continue
+        kd = wdb_sql._agg_kind(p)
+        if kd is None:
+            return None
+        if kd[0] == 'COUNT_STAR':
+            aggs.append((pi, 'COUNT', None))
+        elif kd[0] == 'SUM':
+            ac = wdb_sql._colname(inner.this)
+            if ac is None:
+                return None
+            aggs.append((pi, 'SUM', ac))
+        else:
+            return None
+    if len(keyslot) != 2 or not aggs:
+        return None
+    for nm in knames:
+        c = seg.cols.get(nm)
+        if c is None or c.get('has_null') or c.get('mode') not in (0, 1, 2, 4):
+            return None
+    for _pi, _kd, ac in aggs:
+        if ac is not None:
+            c = seg.cols.get(ac)
+            if c is None or c.get('has_null') or c.get('mode') not in (0, 1, 2, 4):
+                return None
+    if not P.no_deleted_rows(seg):
+        return None
+    # ---- filter: driver scan on the eq column ----
+    import wdb_wherescan as WS
+    import zstandard
+    kc = WS._code_of(seg, fcol, flit)
+    if kc is None:
+        pos = np.empty(0, np.int64)
+    elif fc.get('boffs') is not None and fc.get('BR'):
+        base = fc['cstart']; bo = fc['boffs']; BR = int(fc['BR'])
+        wdt = np.uint8 if fc['cwidth'] == 1 else (np.uint16 if fc['cwidth'] == 2 else np.uint32)
+        dz = zstandard.ZstdDecompressor()
+        parts = []
+        for j in range(len(bo) - 1):
+            raw = np.frombuffer(dz.decompress(seg.buf[base + int(bo[j]):base + int(bo[j + 1])].tobytes()), dtype=wdt)
+            hit = np.flatnonzero(raw == int(kc))
+            if hit.size:
+                parts.append(hit.astype(np.int64) + j * BR)
+        pos = np.concatenate(parts) if parts else np.empty(0, np.int64)
+    else:
+        raw = np.asarray(seg._raw_codes(fcol))
+        pos = np.flatnonzero(raw == int(kc)).astype(np.int64)
+    # ---- key arrays and numeric gathers at survivors only ----
+    import wdb_window as W
+    def keys_at(nm):
+        c = seg.cols[nm]
+        if c.get('mode') == 4:
+            v = np.asarray(seg._seq_decode(c))[pos].astype(np.int64)
+            return v, (int(v.max()) + 1 if v.size else 1), None
+        cc = np.asarray(seg.codes_at(nm, pos)).astype(np.int64) if pos.size else np.empty(0, np.int64)
+        return cc, int(c['V']), c
+    def nums_at(nm):
+        c = seg.cols[nm]
+        if c.get('mode') == 4:
+            return np.asarray(seg._seq_decode(c))[pos].astype(np.float64)
+        cc = np.asarray(seg.codes_at(nm, pos)).astype(np.int64) if pos.size else np.empty(0, np.int64)
+        return np.asarray(W._int_table(seg, nm))[cc].astype(np.float64)
+    k1, K1, c1 = keys_at(knames[0])
+    k2, K2, c2 = keys_at(knames[1])
+    if K1 * K2 > 4_000_000:
+        return None                                     # grid too big: compose instead
+    cells = k1 * K2 + k2
+    boards = {}
+    boards['COUNT'] = np.bincount(cells, minlength=K1 * K2).reshape(K1, K2)
+    for _pi, kd, ac in aggs:
+        if kd == 'SUM' and ('SUM', ac) not in boards:
+            boards[('SUM', ac)] = np.bincount(cells, weights=nums_at(ac),
+                                              minlength=K1 * K2).reshape(K1, K2)
+    nz = boards['COUNT'] > 0
+    def _val(nm, c, code):
+        if c is None:
+            return int(code)                            # mode 4: values are themselves
+        v = wdb_sql._pyval(seg.fetch(nm, int(code)))
+        if isinstance(v, (bytes, bytearray)):
+            v = v.decode('utf-8', 'replace')
+        return v
+    rows = []                                           # (sortkey_tuple, out_row_list)
+    nslots = len(tree.expressions)
+    def emit(level, i, j, cvals):
+        out = [None] * nslots
+        if 'a' in level:
+            out[keyslot[knames[0]]] = ('K1', i)
+        if 'b' in level:
+            out[keyslot[knames[1]]] = ('K2', j)
+        for (pi, kd, ac), v in zip(aggs, cvals):
+            out[pi] = v if v is None else (float(v) if kd == 'SUM' else int(v))
+        rows.append(out)
+    sets = _sets_of(tree)
+    want = set()
+    for st in sets:
+        key = ''.join(sorted('a' if n == knames[0] else 'b' for n in st))
+        want.add(key)
+    for level in want:
+        if level == 'ab':
+            ii, jj = np.nonzero(nz)
+            for i, j in zip(ii.tolist(), jj.tolist()):
+                emit(level, i, j, [boards['COUNT'][i, j] if kd == 'COUNT' else boards[('SUM', ac)][i, j]
+                                   for _pi, kd, ac in aggs])
+        elif level == 'a':
+            cnt = boards['COUNT'].sum(1)
+            for i in np.flatnonzero(cnt).tolist():
+                emit(level, i, 0, [cnt[i] if kd == 'COUNT' else boards[('SUM', ac)].sum(1)[i]
+                                   for _pi, kd, ac in aggs])
+        elif level == 'b':
+            cnt = boards['COUNT'].sum(0)
+            for j in np.flatnonzero(cnt).tolist():
+                emit(level, 0, j, [cnt[j] if kd == 'COUNT' else boards[('SUM', ac)].sum(0)[j]
+                                   for _pi, kd, ac in aggs])
+        else:
+            # the () set aggregates the whole (filtered) input: one row ALWAYS,
+            # COUNT=0 and SUM=NULL over an empty input (duck-verified semantics)
+            emit(level, 0, 0, [int(boards['COUNT'].sum()) if kd == 'COUNT'
+                               else (float(boards[('SUM', ac)].sum()) if pos.size else None)
+                               for _pi, kd, ac in aggs])
+    # ---- outer ORDER BY agg + LIMIT over the union ----
+    order = tree.args.get('order')
+    lim = wdb_sql._limit(tree)
+    if order is not None:
+        oe = order.expressions
+        if len(oe) != 1:
+            return None
+        onm = wdb_sql._colname(oe[0].this)
+        opi = None
+        for pi, p in enumerate(tree.expressions):
+            if wdb_sql._alias(p) == onm or wdb_sql._proj_colname(p) == onm:
+                opi = pi
+        if opi is None or not any(pi == opi for pi, _kd, _ac in aggs):
+            return None                                 # order by a key: compose instead
+        desc = bool(oe[0].args.get('desc'))
+        rows.sort(key=lambda r: (r[opi] if r[opi] is not None else 0), reverse=desc)
+    if lim is not None:
+        rows = rows[:lim]
+    final = []
+    for r in rows:
+        out = []
+        for x in r:
+            if isinstance(x, tuple) and x and x[0] in ('K1', 'K2'):
+                nm, c = (knames[0], c1) if x[0] == 'K1' else (knames[1], c2)
+                out.append(_val(nm, c, x[1]))
+            else:
+                out.append(x)
+        final.append(tuple(out))
+    hdr = [wdb_sql._alias(p) for p in tree.expressions]
+    return final, hdr
+
+
 def execute(db, tree):
+    fused = _fused_2key(db, tree)
+    if fused is not None:
+        return fused
     proj = tree.expressions
     slots = []                                   # ('key', name) | ('agg', proj_index)
     key_names = []
