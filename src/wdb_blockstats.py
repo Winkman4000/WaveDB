@@ -19,12 +19,11 @@ E = wdb_sql.E
 _ENABLED = True
 _HITS = 0
 _BR = 32768
-_SCACHE = {}                             # (seg.path, col, N) -> stats dict. NOT qmem:
-                                         # stats describe an immutable file (84KB/col) and
-                                         # must outlive queries -- query-scoped eviction made
-                                         # every consulting query rebuild them from full
-                                         # column reads (the 190ms 'unaccounted machinery'
-                                         # of the f-and3 audit)
+_SCACHE = wdb_qmem.register({})          # (seg.path, col, N) -> stats dict; qmem per the
+                                         # cold-truth law. Persistence is LAWFUL only on
+                                         # disk: stats are written once as a .bst sidecar
+                                         # (like .gbc), and each query loads them cold in
+                                         # ~1ms -- the file is the only memory.
 
 
 def enable():
@@ -49,6 +48,20 @@ def build(seg, col):
         _SCACHE[key] = None; return None
     c = seg.cols[col]
     N = int(seg.N)
+    fn = seg.path + '.' + col + '.bst.npz'
+    try:
+        import os as _os
+        if _os.path.exists(fn):
+            z = np.load(fn, allow_pickle=False)
+            if int(z['N']) == N:
+                st = {'cnt': np.asarray(z['cnt']), 'nn': np.asarray(z['nn']),
+                      'sum': np.asarray(z['sum']), 'cmin': np.asarray(z['cmin']),
+                      'cmax': np.asarray(z['cmax']), 'mode4': bool(z['mode4']),
+                      'maxabs': float(z['maxabs']), 'dt': int(z['dt'])}
+                _SCACHE[key] = st
+                return st
+    except Exception:
+        pass                                     # unreadable sidecar: recompute below
     nb = (N + _BR - 1) // _BR
     if c['mode'] == 4:
         vals = np.asarray(seg._seq_decode(c))
@@ -91,6 +104,11 @@ def build(seg, col):
                 bsum[j] = 0.0; cmin[j] = np.iinfo(np.int64).max; cmax[j] = -1
     st = {'cnt': cnt, 'nn': nn, 'sum': bsum, 'cmin': cmin, 'cmax': cmax,
           'mode4': codes is None, 'maxabs': maxabs, 'dt': c['dt']}
+    try:
+        np.savez(fn, N=N, cnt=cnt, nn=nn, sum=bsum, cmin=cmin, cmax=cmax,
+                 mode4=(codes is None), maxabs=maxabs, dt=int(c['dt']))
+    except Exception:
+        pass                                     # read-only volume: compute-only mode
     _SCACHE[key] = st
     return st
 
