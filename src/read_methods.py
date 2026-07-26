@@ -25,6 +25,7 @@ import wdb_smallk
 import wdb_stair
 import wdb_blockstats
 import wdb_wherescan
+import wdb_coscan
 import wdb_diskpair
 import wdb_distinctlim
 import wdb_regexgroup
@@ -98,6 +99,11 @@ groupself = Read('groupself',
                  lambda c: wdb_groupself.detect(c.seg, c.tree, c.cmap),
                  lambda c, spec: wdb_groupself.execute(c.seg, spec),
                  'the counting board: GROUP BY K with WHERE on K -- bins, not rows')
+
+coscan = Read('coscan',
+              lambda c: wdb_coscan.detect(c.seg, c.tree, c.cmap),
+              lambda c, spec: wdb_coscan.execute(c.seg, spec),
+              'fused conjunctive COUNT: blockstats veto + one block walk, all predicates together')
 
 wherescan = Read('wherescan',
                  lambda c: wdb_wherescan.detect(c.seg, c.tree, c.cmap),

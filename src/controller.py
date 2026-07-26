@@ -48,6 +48,7 @@ _READ_ORDER = (
     R.window,               # window fns: stable scatter by partition, lanes inherit cluster order
     R.dict_count,           # dictionary per-code counts (sidecar: answers before any scan)
     R.groupself,            # counting board: GROUP BY K + WHERE on K, bins not rows
+    R.coscan,               # fused conjunctive COUNT: zone-map veto, one walk
     R.wherescan,            # conjunctive WHERE: stair spans + blocked-frame predicate scan, disk-only
     R.gridwalk,
     R.smallk,              # narrow-key pair/triple boards (the small-K weapon)             # two-key COUNT(*) top-K via grid filled-cell + count-ordered head (opt-in)
