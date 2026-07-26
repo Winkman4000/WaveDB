@@ -85,9 +85,11 @@ def detect(seg, tree, col_map):
         return None
     for kd, nm, _v in preds:
         c = seg.cols.get(nm)
-        if c is None or c.get('has_null') or c.get('mode') not in (0, 1, 2):
+        if c is None or c.get('has_null') or c.get('mode') not in (0, 1, 2, 4):
             return None
-        if kd == 'range' and c.get('mode') != 2:
+        if c.get('mode') == 4 and kd not in ('eq', 'neq', 'range'):
+            return None                                 # raw-int columns: value predicates only
+        if kd == 'range' and c.get('mode') not in (2, 4):
             return None                                 # code order == value order only there
     if not P.no_deleted_rows(seg):
         return None
@@ -123,8 +125,24 @@ def execute(seg, spec):
     import wdb_wherescan as WS
     N = int(seg.N)
     resolved = []                                       # (kind, col, payload)
+    m4 = {}                                             # mode-4: decoded values ARE the codes
     for kd, nm, v in spec['preds']:
         c = seg.cols[nm]
+        if c.get('mode') == 4:
+            if nm not in m4:
+                m4[nm] = np.asarray(seg._seq_decode(c))
+            if kd == 'range':
+                try:
+                    resolved.append(('range', nm, (int(v[0]), int(v[1]))))
+                except (TypeError, ValueError):
+                    return None
+            else:
+                try:
+                    resolved.append((kd, nm, int(v)))
+                except (TypeError, ValueError):
+                    _HITS += 1
+                    return ([(0,)], [spec['alias']]) if kd == 'eq' else None
+            continue
         if kd in ('eq', 'neq'):
             k = WS._code_of(seg, nm, v)
             if k is None:
@@ -158,8 +176,20 @@ def execute(seg, spec):
     if not resolved:
         _HITS += 1
         return [(N,)], [spec['alias']]
+    # late materialization: heavy streams (big compressed footprint) are NOT
+    # co-scanned -- cheap conjuncts run first with the veto, and heavy columns are
+    # tested only at surviving positions afterward (duck's second trick). A stream
+    # is heavy past ~24MB compressed or a 100K+ dictionary.
+    def _heavy(nm):
+        c = seg.cols[nm]
+        cz = int(c.get('czlen') or 0)
+        return cz > 24_000_000 or int(c.get('V') or 0) > 100_000
+    late = [(kd, nm, pl) for kd, nm, pl in resolved if nm not in m4 and _heavy(nm)]
+    resolved = [(kd, nm, pl) for kd, nm, pl in resolved if (nm in m4) or not _heavy(nm)]
+    if not resolved:
+        return None                                     # all-heavy: the residual path wins
     conforming = [nm for _kd, nm, _pl in resolved
-                  if seg.cols[nm].get('BR') and seg.cols[nm].get('boffs') is not None]
+                  if nm not in m4 and seg.cols[nm].get('BR') and seg.cols[nm].get('boffs') is not None]
     BRs = {int(seg.cols[nm]['BR']) for nm in conforming}
     BR = BRs.pop() if len(BRs) == 1 else (524288 if not BRs else None)
     if BR is None:
@@ -167,7 +197,9 @@ def execute(seg, spec):
     chunked = set(conforming)
     full = {}                                           # unchunked/odd columns: one read, sliced
     for _kd, nm, _pl in resolved:
-        if nm not in chunked and nm not in full:
+        if nm in m4:
+            full[nm] = m4[nm]
+        elif nm not in chunked and nm not in full:
             full[nm] = np.asarray(seg._raw_codes(nm))
     nbc = (N + BR - 1) // BR
     admit = np.ones(nbc, bool)
@@ -215,12 +247,36 @@ def execute(seg, spec):
                 mm = ~np.isin(raw.astype(np.int64), pl)
             m = mm if m is None else (m & mm)
             if not m.any():
-                return 0
-        return int(m.sum())
+                return None
+        return a + np.flatnonzero(m) if late else int(m.sum())
     total = 0
+    parts = []
     if blocks.size:
         with ThreadPoolExecutor(max_workers=min(8, blocks.size)) as ex:
-            for n in ex.map(one, blocks.tolist()):
-                total += n
+            for r in ex.map(one, blocks.tolist()):
+                if r is None:
+                    continue
+                if late:
+                    parts.append(r)
+                else:
+                    total += r
+    if late:
+        pos = np.concatenate(parts) if parts else np.empty(0, np.int64)
+        for kd, nm, pl in late:
+            if pos.size == 0:
+                break
+            cc = np.asarray(seg.codes_at(nm, pos)).astype(np.int64)
+            if kd == 'eq':
+                keep = cc == pl
+            elif kd == 'neq':
+                keep = cc != pl
+            elif kd == 'range':
+                keep = (cc >= pl[0]) & (cc <= pl[1])
+            elif kd == 'in':
+                keep = np.isin(cc, pl)
+            else:
+                keep = ~np.isin(cc, pl)
+            pos = pos[keep]
+        total = int(pos.size)
     _HITS += 1
     return [(total,)], [spec['alias']]
