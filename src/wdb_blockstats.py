@@ -19,7 +19,12 @@ E = wdb_sql.E
 _ENABLED = True
 _HITS = 0
 _BR = 32768
-_SCACHE = wdb_qmem.register({})          # (seg.path, col, N) -> stats dict
+_SCACHE = {}                             # (seg.path, col, N) -> stats dict. NOT qmem:
+                                         # stats describe an immutable file (84KB/col) and
+                                         # must outlive queries -- query-scoped eviction made
+                                         # every consulting query rebuild them from full
+                                         # column reads (the 190ms 'unaccounted machinery'
+                                         # of the f-and3 audit)
 
 
 def enable():
