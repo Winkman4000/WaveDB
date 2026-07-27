@@ -100,21 +100,35 @@ def _counts_lane(seg, kcol, kdesc, need):
     if st is None:
         return None
     cmax, cmin = np.asarray(st['cmax']), np.asarray(st['cmin'])
-    touched = np.flatnonzero(cmax >= j) if kdesc else np.flatnonzero(cmin <= j)
+    # Jackson's split: rows STRICTLY beyond the boundary are mandatory (find them all --
+    # they're the rare codes, few blocks); boundary-code rows are interchangeable filler
+    # (any subset is a lawful top-k), so the first block(s) carrying that common code can
+    # supply the remainder and the rest of the file never opens.
+    if kdesc:
+        strict = np.flatnonzero(cmax >= j + 1)
+        boundary_only = np.flatnonzero(cmax == j)
+        s_cnt = int(cn[j + 1:].sum())
+    else:
+        strict = np.flatnonzero(cmin <= j - 1) if j > 0 else np.zeros(0, dtype=np.int64)
+        boundary_only = np.flatnonzero(cmin == j)
+        s_cnt = int(cn[:j].sum())
+    filler_need = max(0, need - s_cnt)
+    touched = strict
     c = seg.cols[kcol]
     BR = c['BR']; base = c['cstart']; bo = c['boffs']
     wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
     from wdb_blockstats import _BR as SBR
-    if BR != SBR:
-        # stats blocks and storage blocks share the grid only when _BR == BR;
-        # translate stats blocks -> storage blocks conservatively
+    def _to_storage(bl):
+        if BR == SBR:
+            return np.asarray(sorted(set(bl.tolist())), dtype=np.int64)
         ratio = SBR / BR
         sb = set()
-        for b in touched.tolist():
+        for b in bl.tolist():
             lo = int(b * ratio); hi = int(((b + 1) * SBR - 1) // BR)
             for x in range(lo, min(hi + 1, int(bo.size) - 1)):
                 sb.add(x)
-        touched = np.array(sorted(sb), dtype=np.int64)
+        return np.array(sorted(sb), dtype=np.int64)
+    touched = _to_storage(touched)
     import zstandard as _zs
     tl = touched.tolist()
     parts = [None] * len(tl)
@@ -135,6 +149,22 @@ def _counts_lane(seg, kcol, kdesc, need):
             _blk(i)
     pos_parts = [p[0] for p in parts if p is not None]
     code_parts = [p[1] for p in parts if p is not None]
+    got_filler = sum(int((c == j).sum()) for c in code_parts)
+    if got_filler < filler_need:
+        # pass 2: walk boundary-only blocks in file order, stop at quota
+        dz2 = _zs.ZstdDecompressor()
+        seen = set(touched.tolist())             # a storage block scanned in pass 1
+        for b in [x for x in _to_storage(boundary_only).tolist() if x not in seen]:
+            if got_filler >= filler_need:
+                break
+            raw = dz2.decompress(seg.buf[base + int(bo[b]):base + int(bo[b + 1])].tobytes())
+            codes = np.frombuffer(raw, dtype=wdt)
+            loc = np.flatnonzero(codes == j)
+            if loc.size:
+                take = loc[:filler_need - got_filler]
+                pos_parts.append(take.astype(np.int64) + b * BR)
+                code_parts.append(codes[take].astype(np.int64))
+                got_filler += int(take.size)
     if not pos_parts:
         return None
     cand_idx = np.concatenate(pos_parts)
