@@ -1146,11 +1146,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     else:                                                 # multi-key: mixed-radix composite
         K = 1
         for k in gkeys: K *= k['K']
-        _single_dense = (len(gkeys) == 1 and gkeys[0]['cptr'] is None
-                         and K * 64 <= 2_000_000_000)     # 8 lanes x 8B boards <= 2GB:
-        if RT.dense_multigroup_fits(K) or _single_dense:   # a single dict key's codes ARE
-            # dense group ids 0..V-1 -- factorising 100M of them through pandas plus two
-            # int64 casts was g-1key-sum-ord's whole overhead (~0.9s at V=17.6M)
+        if RT.dense_multigroup_fits(K):                    # dense: codegen composes the code INLINE (no array)
             group_op = None
             group_keys = [(k['full'], k['K'], k['cptr']) for k in gkeys]
         else:                                              # high-card: hash-factorise the composite to dense ids
