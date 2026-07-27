@@ -29,6 +29,17 @@ def parse(seg, node, col_map):
         c = col_map.get(cnode.name, cnode.name) if col_map else cnode.name
         return c if c in seg.cols and seg._effective(c) is None else None
 
+    if isinstance(n, E.Column):
+        # identity scalar: a bare int-valued dict column IS its own code->value table.
+        # Ranges and comparisons on dt0 byte dicts become one V-sized compare (the
+        # f-range gate: codes sort by string, values sort by value -- flags fix it)
+        col = rescol(n)
+        if col is None:
+            return None
+        c = seg.cols[col]
+        if c.get('mode') not in (0, 1, 2) or c.get('has_null') or c.get('dt') != 0:
+            return None
+        return {'col': col, 'fn': 'id', 'arg': None}
     tn = type(n).__name__
     if tn in _FN_STR:
         col = rescol(n.this)
@@ -88,6 +99,11 @@ def table(seg, spec):
         return memo[mk]
     col, fn, arg = spec['col'], spec['fn'], spec['arg']
     c = seg.cols[col]
+    if fn == 'id':
+        import wdb_window as _W
+        t = np.asarray(_W._int_table(seg, col), dtype=np.int64)
+        memo[mk] = t
+        return t
     if fn == 'arith':
         base = np.asarray(seg._dict_ints(c), dtype=np.int64) if c['mode'] == 2 else \
             np.array([int(v) for v in seg._typed_dict(col)], dtype=np.int64)
