@@ -491,6 +491,11 @@ def detect(seg, tree, col_map):
             spans.append((col, cl[1], cl[2]))
         elif c.get('mode') in (0, 1, 2) and cl[2] in ('=', '<>'):
             eqs.append((col, cl[1], cl[2]))
+        elif c.get('mode') in (0, 1, 2) and cl[2] in ('>=', '<='):
+            sc = _scalar_cmp(seg, cn, col_map)   # identity scalar: flag[code]=val cmp lit
+            if sc is None:
+                return None                      # no lawful value order (string dict)
+            sflags.append(sc)
         else:
             return None
     if not eqs and not spans and not likes and not ors and not sflags and not ins:
