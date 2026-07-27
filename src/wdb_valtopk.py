@@ -116,15 +116,25 @@ def _counts_lane(seg, kcol, kdesc, need):
                 sb.add(x)
         touched = np.array(sorted(sb), dtype=np.int64)
     import zstandard as _zs
-    pos_parts = []; code_parts = []
-    dz = _zs.ZstdDecompressor()
-    for b in touched.tolist():
-        raw = dz.decompress(seg.buf[base + int(bo[b]):base + int(bo[b + 1])].tobytes())
+    tl = touched.tolist()
+    parts = [None] * len(tl)
+    def _blk(i):                                 # zstd drops the GIL: 8 lanes
+        b = tl[i]
+        raw = _zs.ZstdDecompressor().decompress(
+            seg.buf[base + int(bo[b]):base + int(bo[b + 1])].tobytes())
         codes = np.frombuffer(raw, dtype=wdt)
         loc = np.flatnonzero(codes >= j) if kdesc else np.flatnonzero(codes <= j)
         if loc.size:
-            pos_parts.append(loc.astype(np.int64) + b * BR)
-            code_parts.append(codes[loc].astype(np.int64))
+            parts[i] = (loc.astype(np.int64) + b * BR, codes[loc].astype(np.int64))
+    if len(tl) > 4:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=8) as _ex:
+            list(_ex.map(_blk, range(len(tl))))
+    else:
+        for i in range(len(tl)):
+            _blk(i)
+    pos_parts = [p[0] for p in parts if p is not None]
+    code_parts = [p[1] for p in parts if p is not None]
     if not pos_parts:
         return None
     cand_idx = np.concatenate(pos_parts)
