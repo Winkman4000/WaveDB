@@ -152,19 +152,34 @@ def _counts_lane(seg, kcol, kdesc, need):
     got_filler = sum(int((c == j).sum()) for c in code_parts)
     if got_filler < filler_need:
         # pass 2: walk boundary-only blocks in file order, stop at quota
-        dz2 = _zs.ZstdDecompressor()
         seen = set(touched.tolist())             # a storage block scanned in pass 1
-        for b in [x for x in _to_storage(boundary_only).tolist() if x not in seen]:
-            if got_filler >= filler_need:
-                break
-            raw = dz2.decompress(seg.buf[base + int(bo[b]):base + int(bo[b + 1])].tobytes())
+        walk = [x for x in _to_storage(boundary_only).tolist() if x not in seen]
+        # speculative waves: open 8 boundary blocks at once, then take in FILE ORDER
+        # until quota -- byte-identical rows to the serial walk, wall-clock divided.
+        # Blocks opened past quota are wasted-but-lawful pennies.
+        def _bnd(b):
+            raw = _zs.ZstdDecompressor().decompress(
+                seg.buf[base + int(bo[b]):base + int(bo[b + 1])].tobytes())
             codes = np.frombuffer(raw, dtype=wdt)
-            loc = np.flatnonzero(codes == j)
-            if loc.size:
-                take = loc[:filler_need - got_filler]
-                pos_parts.append(take.astype(np.int64) + b * BR)
-                code_parts.append(codes[take].astype(np.int64))
-                got_filler += int(take.size)
+            return np.flatnonzero(codes == j)[:filler_need]
+        wi = 0
+        from concurrent.futures import ThreadPoolExecutor
+        while got_filler < filler_need and wi < len(walk):
+            wave = walk[wi:wi + 8]
+            wi += 8
+            if len(wave) > 1:
+                with ThreadPoolExecutor(max_workers=8) as _ex:
+                    res = list(_ex.map(_bnd, wave))
+            else:
+                res = [_bnd(wave[0])]
+            for b, loc in zip(wave, res):        # file order decides who fills the quota
+                if got_filler >= filler_need:
+                    break
+                if loc.size:
+                    take = loc[:filler_need - got_filler]
+                    pos_parts.append(take.astype(np.int64) + b * BR)
+                    code_parts.append((np.zeros(take.size, dtype=np.int64) + j))
+                    got_filler += int(take.size)
     if not pos_parts:
         return None
     cand_idx = np.concatenate(pos_parts)
