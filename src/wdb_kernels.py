@@ -13,7 +13,7 @@ correct, ~2-4x slower.
 import numpy as np
 
 try:
-    from numba import njit
+    from numba import njit, prange
     import numba
     HAVE_NUMBA = True
 except Exception:                                     # pragma: no cover
@@ -534,3 +534,22 @@ def warm():
         part_scatter(np.array([1, 0, 1], np.int64), 2)
         _grid2_nb(np.array([0, 1], np.uint8), np.array([1, 0], np.uint8), 2, np.zeros(4, np.int64))
         _grid3_nb(np.array([0, 1], np.uint8), np.array([1, 0], np.uint8), np.array([0, 1], np.uint8), 2, 2, np.zeros(8, np.int64))
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def grouped_sum_codes(kc, vc, vt, K):
+    """sums[k] += vt[vc[i]] for k = kc[i]: the single-key SUM board, fused gather+
+    accumulate, per-thread partials (no atomics, no dtype casts, no factorize)."""
+    T = numba.get_num_threads()
+    part = np.zeros((T, K), np.int64)
+    n = kc.size
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        for i in range(lo, hi):
+            part[t, kc[i]] += vt[vc[i]]
+    out = np.zeros(K, np.int64)
+    for t in range(T):
+        for k in range(K):
+            out[k] += part[t, k]
+    return out

@@ -28,6 +28,7 @@ import wdb_wherescan
 import wdb_coscan
 import wdb_diskpair
 import wdb_distinctlim
+import wdb_sumtopk
 import wdb_regexgroup
 import wdb_window
 import wdb_pairagg
@@ -134,6 +135,11 @@ smallk = Read('smallk',
               lambda c: wdb_smallk.detect(c.seg, c.tree, c.cmap),
               lambda c, spec: wdb_smallk.execute(c.seg, spec),
               'narrow 2-3 key COUNT(*) via one fused pass onto a composite board')
+
+sumtopk = Read('sumtopk',
+               lambda c: wdb_sumtopk.detect(c.seg, c.tree, c.cmap),
+               lambda c, spec: wdb_sumtopk.execute(c.seg, spec),
+               'single big-key SUM top-K: fused board kernel + argpartition, labels for winners only')
 
 distinctlim = Read('distinctlim',
                    lambda c: wdb_distinctlim.detect(c.seg, c.tree, c.cmap),
