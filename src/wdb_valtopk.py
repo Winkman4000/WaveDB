@@ -71,19 +71,84 @@ def detect(seg, tree, col_map):
     return {'pcols': pcols, 'proj': proj, 'keys': rkeys, 'lim': lim}
 
 
+def _counts_lane(seg, kcol, kdesc, need):
+    """Jackson's scale-first cut: the k-th boundary code from shelved counts (gbc), then
+    only blocks whose cmax/cmin admit a candidate are decompressed. The full code stream
+    is never read. mode-2 keys only (int dict: code order == value order, provably)."""
+    import wdb_gbcount
+    import wdb_blockstats as BS
+    got = wdb_gbcount._load(seg, kcol)
+    if got is None:
+        return None
+    hc, hn = got
+    V = int(seg.cols[kcol]['V'])
+    cn = np.zeros(V + 1, dtype=np.int64)
+    cn[np.asarray(hc, dtype=np.int64)] = np.asarray(hn, dtype=np.int64)
+    cn = cn[:V]
+    if kdesc:
+        j = V - 1 - int(np.searchsorted(np.cumsum(cn[::-1]), need))
+    else:
+        j = int(np.searchsorted(np.cumsum(cn), need))
+    st = BS.build(seg, kcol)
+    if st is None:
+        return None
+    cmax, cmin = np.asarray(st['cmax']), np.asarray(st['cmin'])
+    touched = np.flatnonzero(cmax >= j) if kdesc else np.flatnonzero(cmin <= j)
+    c = seg.cols[kcol]
+    BR = c['BR']; base = c['cstart']; bo = c['boffs']
+    wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
+    from wdb_blockstats import _BR as SBR
+    if BR != SBR:
+        # stats blocks and storage blocks share the grid only when _BR == BR;
+        # translate stats blocks -> storage blocks conservatively
+        ratio = SBR / BR
+        sb = set()
+        for b in touched.tolist():
+            lo = int(b * ratio); hi = int(((b + 1) * SBR - 1) // BR)
+            for x in range(lo, min(hi + 1, int(bo.size) - 1)):
+                sb.add(x)
+        touched = np.array(sorted(sb), dtype=np.int64)
+    import zstandard as _zs
+    pos_parts = []; code_parts = []
+    dz = _zs.ZstdDecompressor()
+    for b in touched.tolist():
+        raw = dz.decompress(seg.buf[base + int(bo[b]):base + int(bo[b + 1])].tobytes())
+        codes = np.frombuffer(raw, dtype=wdt)
+        loc = np.flatnonzero(codes >= j) if kdesc else np.flatnonzero(codes <= j)
+        if loc.size:
+            pos_parts.append(loc.astype(np.int64) + b * BR)
+            code_parts.append(codes[loc].astype(np.int64))
+    if not pos_parts:
+        return None
+    cand_idx = np.concatenate(pos_parts)
+    cand_codes = np.concatenate(code_parts)
+    if cand_idx.size > _CAND_CAP:
+        return None
+    return cand_idx, cand_codes
+
+
 def execute(seg, spec):
     import wdb_window as WN
     keys, lim = spec['keys'], spec['lim']
     kcol, kdesc = keys[0]
-    codes0 = np.asarray(seg._raw_codes(kcol)).astype(np.int64)
-    N = codes0.size
+    N = int(seg.N)
     k = min(lim, N)
-    if k == N:
+    codes0 = None
+    cand = None
+    if k < N and len(keys) == 1 and seg.cols[kcol].get('mode') == 2 \
+            and seg.cols[kcol].get('code_enc') == 3:
+        cand = _counts_lane(seg, kcol, kdesc, k)
+    if cand is not None:
+        cand_idx, cand_codes = cand
+    elif k == N:
+        codes0 = np.asarray(seg._raw_codes(kcol)).astype(np.int64)
         cand_idx = np.arange(N)
+        cand_codes = codes0
     else:
         # codes are ranks: the k-th boundary VALUE is the k-th boundary CODE -- one
         # bincount + cumsum on the board replaces np.partition over 100M materialized
         # values (2.3s -> ~0.3s; the primary's values are never built at all)
+        codes0 = np.asarray(seg._raw_codes(kcol)).astype(np.int64)
         V = int(seg.cols[kcol]['V'])
         cn = np.bincount(codes0, minlength=V)
         if kdesc:
@@ -93,12 +158,13 @@ def execute(seg, spec):
             j = int(np.searchsorted(np.cumsum(cn), k))
             cand = codes0 <= j
         cand_idx = np.nonzero(cand)[0]
+        cand_codes = codes0[cand_idx]
         if cand_idx.size > _CAND_CAP:
             return None                          # boundary tie explosion: fall through
     arrs = []
     for c, d in keys:
         if c == kcol:
-            a = codes0[cand_idx]                 # rank order == value order, ties == ties
+            a = cand_codes                       # rank order == value order, ties == ties
         else:
             a = WN._numvals(seg, c, exact_int=True)[cand_idx]
         if a.dtype.kind == 'f':
@@ -112,7 +178,7 @@ def execute(seg, spec):
     for c in spec['pcols']:
         cc = seg.cols[c]
         if c == kcol:
-            codes = codes0[idx]
+            codes = cand_codes[order[:k]]
         else:
             # the winners' name tags only: block-targeted fetch of |idx| positions
             # instead of decompressing the column's full code stream (0.75s -> ~0.02s
