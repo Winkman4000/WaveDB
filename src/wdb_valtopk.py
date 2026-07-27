@@ -75,8 +75,15 @@ def _counts_lane(seg, kcol, kdesc, need):
     """Jackson's scale-first cut: the k-th boundary code from shelved counts (gbc), then
     only blocks whose cmax/cmin admit a candidate are decompressed. The full code stream
     is never read. mode-2 keys only (int dict: code order == value order, provably)."""
+    import os
     import wdb_gbcount
     import wdb_blockstats as BS
+    import wdb_window as WN
+    if not os.path.exists(seg.path + '.' + kcol + '.gbc'):
+        return None                              # peek only: the lane must never lazy-build
+    t = np.asarray(WN._int_table(seg, kcol), dtype=np.int64)
+    if t.size < 2 or not bool(np.all(np.diff(t) >= 0)):
+        return None                              # code order must PROVABLY equal value order
     got = wdb_gbcount._load(seg, kcol)
     if got is None:
         return None
@@ -135,8 +142,8 @@ def execute(seg, spec):
     k = min(lim, N)
     codes0 = None
     cand = None
-    if k < N and len(keys) == 1 and seg.cols[kcol].get('mode') == 2 \
-            and seg.cols[kcol].get('code_enc') == 3:
+    if k < N and len(keys) == 1 and seg.cols[kcol].get('mode') in (0, 1, 2) \
+            and seg.cols[kcol].get('dt') == 0 and seg.cols[kcol].get('code_enc') == 3:
         cand = _counts_lane(seg, kcol, kdesc, k)
     if cand is not None:
         cand_idx, cand_codes = cand
