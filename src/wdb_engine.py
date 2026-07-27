@@ -321,10 +321,21 @@ class Segment:
         if c.get('code_enc', 0) == 3:                # blocked: decompress every frame, concat
             wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
             cc = np.empty(self.N, dtype=wdt)
-            BR = c['BR']; base = c['cstart']; bo = c['boffs']; dz = self._dz
-            for j in range(bo.size - 1):
-                raw = dz.decompress(self.buf[base+int(bo[j]):base+int(bo[j+1])].tobytes())
-                cc[j*BR:j*BR+len(raw)//wdt().itemsize] = np.frombuffer(raw, dtype=wdt)
+            BR = c['BR']; base = c['cstart']; bo = c['boffs']
+            isz = wdt().itemsize
+            def _blk(j):                             # non-overlapping writes; zstd drops the
+                import zstandard as _zs              # GIL, so 8 lanes decompress side by side
+                raw = _zs.ZstdDecompressor().decompress(
+                    self.buf[base + int(bo[j]):base + int(bo[j + 1])].tobytes())
+                cc[j * BR:j * BR + len(raw) // isz] = np.frombuffer(raw, dtype=wdt)
+            nb = int(bo.size) - 1
+            if nb > 4:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=8) as _ex:
+                    list(_ex.map(_blk, range(nb)))
+            else:
+                for j in range(nb):
+                    _blk(j)
             self._codes[nm] = cc; return cc
         bits = c['bits']; base = c['cstart']
         cc = self._bitunpack(base, 0, self.N, bits)  # now returns native width
