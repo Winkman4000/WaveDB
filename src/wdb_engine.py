@@ -730,8 +730,14 @@ class Segment:
         if c.get('code_enc', 0) == 5 and nm not in self._codes and rows.size < (self.N >> 2):
             import wdb_kernels as _WK
             pk = np.frombuffer(self.buf, dtype=np.uint8, count=c['czlen'], offset=c['cstart'])
-            return _WK.enc5_at(pk, np.asarray(c['e5hot']), np.asarray(c['e5patch']),
-                               np.asarray(c['e5off']).astype(np.int64), rows, np.int64(c['BR']))
+            order = np.argsort(rows, kind='stable')
+            rs = np.ascontiguousarray(np.asarray(rows, dtype=np.int64)[order])
+            got = _WK.enc5_at2(pk, np.asarray(c['e5hot']), np.asarray(c['e5patch']),
+                               np.asarray(c['e5off']).astype(np.int64), rs,
+                               np.int64(self.N), np.int64(c['BR']))
+            out = np.empty_like(got)
+            out[order] = got
+            return out
         if c.get('code_enc', 0) != 3 or nm in self._codes or rows.size >= (self.N >> 2):
             # huge row sets: ONE full decode + one vectorized gather beats touching every
             # frame through a positional walk (sq-nested passed ~90M positions here)

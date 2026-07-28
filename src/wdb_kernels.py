@@ -635,3 +635,47 @@ def enc5_findpos(packed, esc_off, pidx, blk, N, BR):
                     break
                 seen += 1
     return pos
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def enc5_at2(packed, hot, patches, esc_off, rows_sorted, N, BR):
+    """Block-grouped point reads: one nibble sweep per touched block serves every
+    requested row in it (the v1 per-row escape re-scan was quadratic within blocks:
+    738K stage-B positions cost 0.46s; this is one bounded pass per block, prange)."""
+    out = np.empty(rows_sorted.size, dtype=np.int64)
+    nreq = rows_sorted.size
+    # block boundaries within the sorted request list
+    nb = (N + BR - 1) // BR
+    starts = np.empty(nreq, dtype=np.int64)
+    for k in range(nreq):
+        starts[k] = rows_sorted[k] // BR
+    # find contiguous runs of equal block id
+    run_lo = np.empty(nreq, dtype=np.int64)
+    nruns = 0
+    for k in range(nreq):
+        if k == 0 or starts[k] != starts[k - 1]:
+            run_lo[nruns] = k
+            nruns += 1
+    for r in prange(nruns):
+        k0 = run_lo[r]
+        k1 = run_lo[r + 1] if r + 1 < nruns else nreq
+        b = starts[k0]
+        lo = b * BR
+        last = rows_sorted[k1 - 1]
+        pi = esc_off[b]
+        k = k0
+        for i in range(lo, last + 1):
+            byte = packed[i >> 1]
+            if (i & 1) == 0:
+                v = np.int64(byte & 0x0F)
+            else:
+                v = np.int64(byte >> 4)
+            while k < k1 and i == rows_sorted[k]:
+                if v < 15:
+                    out[k] = hot[v]
+                else:
+                    out[k] = patches[pi]
+                k += 1
+            if v == 15:
+                pi += 1
+    return out
