@@ -146,7 +146,76 @@ def _order_is_count_desc(tree, proj, ci):
     return ak is not None and ak[0] == 'COUNT_STAR'
 
 
+def _scalar_count_detect(seg, tree, col_map):
+    """SELECT COUNT(*) FROM t WHERE col IN/NOT IN (lits) | col = lit | col <> lit --
+    pure shelf arithmetic. With no_deleted_rows, a code absent from the gbc but present
+    in the dictionary has EXACTLY one row (singletons are trimmed, zeros can't exist),
+    so N - sum(excluded) stays exact without touching a single row."""
+    if not P.no_joins(tree) or tree.args.get('group') is not None:
+        return None
+    if tree.args.get('order') is not None or tree.args.get('having') is not None:
+        return None
+    proj = tree.expressions
+    if len(proj) != 1:
+        return None
+    kd = wdb_sql._agg_kind(proj[0])
+    if kd is None or kd[0] != 'COUNT_STAR':
+        return None
+    w = tree.args.get('where')
+    if w is None:
+        return None
+    node = w.this
+    neg = False
+    if isinstance(node, E.Not):
+        node = node.this
+        neg = True
+    lits = None; colnode = None
+    if isinstance(node, E.In):
+        colnode = node.this
+        lits = [x.this for x in node.expressions if isinstance(x, E.Literal)]
+        if len(lits) != len(node.expressions):
+            return None
+    elif isinstance(node, (E.EQ, E.NEQ)) and isinstance(node.expression, E.Literal):
+        colnode = node.this
+        lits = [node.expression.this]
+        neg = neg ^ isinstance(node, E.NEQ)
+    if lits is None or not isinstance(colnode, E.Column):
+        return None
+    col = (col_map or {}).get(colnode.name, colnode.name) if col_map else colnode.name
+    c = seg.cols.get(col)
+    if c is None or c.get('has_null') or c.get('mode') not in (0, 1, 2):
+        return None
+    if not P.no_deleted_rows(seg):
+        return None
+    if not _fetchable(seg, col):
+        return None
+    return {'scalar': True, 'col': col, 'lits': lits, 'neg': neg,
+            'proj': proj}
+
+
+def _scalar_count_execute(seg, spec):
+    global _HITS
+    got = _load(seg, spec['col'])
+    if got is None:
+        return None
+    hc, hn = got
+    import wdb_wherescan
+    total = 0
+    for lit in spec['lits']:
+        code = wdb_wherescan._code_of(seg, spec['col'], lit)
+        if code is None:
+            continue                                     # not in the dictionary: zero rows
+        m = np.flatnonzero(np.asarray(hc) == code)
+        total += int(np.asarray(hn)[m[0]]) if m.size else 1   # trimmed singleton: exactly one
+    ans = (int(seg.N) - total) if spec['neg'] else total
+    _HITS += 1
+    return [(ans,)], [wdb_sql._alias(spec['proj'][0])]
+
+
 def detect(seg, tree, col_map):
+    sc = _scalar_count_detect(seg, tree, col_map)
+    if sc is not None:
+        return sc
     """ACTIVATION for the count-projection read. A pure decision over query shape +
     segment metadata -- touches no row data. Returns a spec dict the read needs, or
     None to decline. Self-validating, so it's robust called on its own (the controller
@@ -254,6 +323,8 @@ def execute(seg, spec):
     """THE READ: pull the persisted count projection and emit the top-N rows. May still
     decline (return None) on measured boundary conditions that need the loaded sidecar --
     a LIMIT past the stored heavy hitters, or a tie straddling the LIMIT boundary."""
+    if spec.get('scalar'):
+        return _scalar_count_execute(seg, spec)
     global _HITS
     col = spec['col']; ci = spec['ci']; ki = spec['ki']; lim = spec['lim']
     proj = spec['proj']
