@@ -553,3 +553,58 @@ def grouped_sum_codes(kc, vc, vt, K):
         for k in range(K):
             out[k] += part[t, k]
     return out
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def enc5_stream(packed, hot, patches, esc_off, N, BR):
+    """Patched-bucket decode: 4-bit hot pointers unpack + escape patches, per-block
+    independent (the escape-offset table is what makes prange lawful here)."""
+    out = np.empty(N, dtype=np.uint16)
+    nb = (N + BR - 1) // BR
+    for b in prange(nb):
+        lo = b * BR
+        hi = lo + BR
+        if hi > N:
+            hi = N
+        pi = esc_off[b]
+        for i in range(lo, hi):
+            byte = packed[i >> 1]
+            if (i & 1) == 0:
+                v = np.int64(byte & 0x0F)
+            else:
+                v = np.int64(byte >> 4)
+            if v < 15:
+                out[i] = hot[v]
+            else:
+                out[i] = patches[pi]
+                pi += 1
+    return out
+
+
+@njit(nogil=True, cache=True)
+def enc5_at(packed, hot, patches, esc_off, rows, BR):
+    """Point reads on the patched-bucket encoding: one nibble per row; escapes rank
+    themselves with a bounded within-block scan."""
+    out = np.empty(rows.size, dtype=np.int64)
+    for k in range(rows.size):
+        i = rows[k]
+        byte = packed[i >> 1]
+        if (i & 1) == 0:
+            v = np.int64(byte & 0x0F)
+        else:
+            v = np.int64(byte >> 4)
+        if v < 15:
+            out[k] = hot[v]
+        else:
+            b = i // BR
+            seen = np.int64(0)
+            for jj in range(b * BR, i):
+                byte2 = packed[jj >> 1]
+                if (jj & 1) == 0:
+                    v2 = np.int64(byte2 & 0x0F)
+                else:
+                    v2 = np.int64(byte2 >> 4)
+                if v2 == 15:
+                    seen += 1
+            out[k] = patches[esc_off[b] + seen]
+    return out

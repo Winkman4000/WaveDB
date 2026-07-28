@@ -110,6 +110,13 @@ class Segment:
                 meta['BR'], nfr = struct.unpack_from('<II', buf, off); off += 8
                 meta['boffs'] = np.frombuffer(buf, dtype=np.uint32, count=nfr+1, offset=off); off += 4*(nfr+1)
                 meta['cstart'] = off; meta['czlen'] = int(meta['boffs'][-1]); off += meta['czlen']
+            elif code_enc == 5:                # patched buckets: 4-bit hot pointers + escape patches
+                meta['cwidth'] = int(buf[off]); off += 1
+                meta['BR'], nb5, npatch, nhot = struct.unpack_from('<IIQH', buf, off); off += 18
+                meta['e5hot'] = np.frombuffer(buf, dtype=np.uint16, count=nhot, offset=off); off += 2*nhot
+                meta['e5off'] = np.frombuffer(buf, dtype=np.uint32, count=nb5+1, offset=off); off += 4*(nb5+1)
+                meta['e5patch'] = np.frombuffer(buf, dtype=np.uint16, count=npatch, offset=off); off += 2*npatch
+                meta['cstart'] = off; meta['czlen'] = (self.N + 1) // 2; off += meta['czlen']
             else:
                 meta['cwidth'] = int(buf[off]); off += 1
                 czlen = struct.unpack_from('<I', buf, off)[0]; off += 4
@@ -312,6 +319,14 @@ class Segment:
             st = self.stairs(nm)
             cnts = np.diff(np.concatenate(([0], st, [self.N])))
             cc = np.repeat(np.arange(cnts.size, dtype=self._cdt(cnts.size)), cnts)
+            self._codes[nm] = cc; return cc
+        if c.get('code_enc', 0) == 5:                # patched buckets: parallel nibble decode
+            import wdb_kernels as _WK
+            pk = np.frombuffer(self.buf, dtype=np.uint8, count=c['czlen'], offset=c['cstart'])
+            cc = _WK.enc5_stream(pk, np.asarray(c['e5hot']),
+                                 np.asarray(c['e5patch']),
+                                 np.asarray(c['e5off']).astype(np.int64),
+                                 np.int64(self.N), np.int64(c['BR']))
             self._codes[nm] = cc; return cc
         if c.get('code_enc', 0) == 1:                # zstd of byte-aligned codes (clustered/skewed)
             raw = self._dz.decompress(self.buf[c['cstart']:c['cstart']+c['czlen']].tobytes())
@@ -712,6 +727,11 @@ class Segment:
         if rows.size == 0:
             return np.empty(0, dtype=np.int64)
         c = self.cols[nm]
+        if c.get('code_enc', 0) == 5 and nm not in self._codes and rows.size < (self.N >> 2):
+            import wdb_kernels as _WK
+            pk = np.frombuffer(self.buf, dtype=np.uint8, count=c['czlen'], offset=c['cstart'])
+            return _WK.enc5_at(pk, np.asarray(c['e5hot']), np.asarray(c['e5patch']),
+                               np.asarray(c['e5off']).astype(np.int64), rows, np.int64(c['BR']))
         if c.get('code_enc', 0) != 3 or nm in self._codes or rows.size >= (self.N >> 2):
             # huge row sets: ONE full decode + one vectorized gather beats touching every
             # frame through a positional walk (sq-nested passed ~90M positions here)

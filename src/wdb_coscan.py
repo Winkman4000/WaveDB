@@ -30,6 +30,12 @@ def _lit(x):
 
 
 def detect(seg, tree, col_map):
+    # enc-5 (patched buckets) columns: this path's direct block machinery predates the
+    # species; decline so the _raw_codes route (exact, 8-lane) serves until v2 learns nibbles
+    for _c5 in tree.find_all(E.Column):
+        _n5 = (col_map or {}).get(_c5.name, _c5.name) if col_map else _c5.name
+        if _n5 in seg.cols and seg.cols[_n5].get('code_enc') == 5:
+            return None
     if not P.no_joins(tree) or not P.no_having(tree) or not P.no_select_distinct(tree):
         return None
     if tree.args.get('group') is not None or tree.args.get('qualify') is not None:

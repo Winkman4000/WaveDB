@@ -10,6 +10,10 @@ Correctness gates: SUM served only when provably exact in float64 (nonnull_count
 else declined to the exact paths; AVG always float (matches SQL double semantics); nulls excluded
 from SUM/AVG/MIN/MAX and included in COUNT(*), per SQL. Declines overrides/deleted rows/WHERE/GROUP."""
 import numpy as np
+try:
+    import sqlglot.expressions as E
+except Exception:
+    E = None
 import wdb_qmem
 import wdb_sql
 import workers
@@ -119,6 +123,10 @@ def install(seg_path, N, col, st):
 
 
 def detect(seg, tree, col_map):
+    for _c5 in (tree.find_all(E.Column) if E is not None else ()):
+        _n5 = (col_map or {}).get(_c5.name, _c5.name) if col_map else _c5.name
+        if _n5 in seg.cols and seg.cols[_n5].get('code_enc') == 5:
+            return None                          # enc-5: serve via _raw_codes paths for now
     # REVIVED: stats now live beside the file (.bst sidecars, written once, loaded
     # cold in ~1ms per the sidecar precedent) -- detect reads, never builds, exactly
     # as the retirement note prophesied. First-ever query per column pays the one-time

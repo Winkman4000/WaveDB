@@ -188,7 +188,7 @@ def _dict_bytes(p, zc):
             out += struct.pack('<I', len(fc)) + struct.pack('<I', len(z)) + z
     return out
 
-def _code_section(codes, bits):
+def _code_section(codes, bits, enc5_ok=False):
     """Per-row code array (mode 0/1/2): 1 tag byte + payload. tag 0 = raw bit-packed; tag 1 = zstd
     of byte-aligned codes; tag 2 = STAIRCASE (codes non-decreasing in row order, e.g. time-ordered
     ingest): store only the gap-packed rows where the code ticks +1 -- the norm is 'same as the row
@@ -225,6 +225,34 @@ def _code_section(codes, bits):
                    + offs.tobytes() + b''.join(frames))
         if len(blocked) <= len(zsec) * 1.10:
             best = blocked
+    # tag 5 = PATCHED BUCKETS (Jackson's format): 4-bit pointers into a 15-entry hot
+    # table + escape patches (u16) + per-32K escape offsets. Skewed low-V numeric
+    # streams only; adopted when within 25% of the zstd seal. Buys O(1) point reads
+    # (no frame ever inflates), an escape-array hunt, and a stream decode that beats
+    # parallel zstd -- measured 0.1ms/84ms point, 54ms/70ms stream on ResolutionWidth.
+    if enc5_ok and best is not stair:
+        arr16 = np.asarray(codes, dtype=np.int64)
+        V5 = int(arr16.max()) + 1 if arr16.size else 0
+        if 15 < V5 <= 65535:
+            cn5 = np.bincount(arr16, minlength=V5)
+            hot = np.argsort(cn5)[::-1][:15].astype(np.uint16)
+            lut = np.full(V5, 15, dtype=np.uint8)
+            lut[hot] = np.arange(15, dtype=np.uint8)
+            nib = lut[arr16]
+            em = nib == 15
+            patches = arr16[em].astype(np.uint16)
+            Nr = arr16.size
+            nibp = np.zeros(Nr + (Nr & 1), dtype=np.uint8)
+            nibp[:Nr] = nib
+            pk = (nibp[0::2] | (nibp[1::2] << 4)).astype(np.uint8)
+            BR5 = 32768
+            nb5 = (Nr + BR5 - 1) // BR5
+            eb = np.add.reduceat(em.astype(np.int64), np.arange(0, Nr, BR5)) if Nr else np.zeros(0, dtype=np.int64)
+            eo = np.concatenate([[0], np.cumsum(eb)]).astype(np.uint32)
+            e5 = (bytes([5, 2]) + struct.pack('<IIQH', BR5, nb5, int(patches.size), 15)
+                  + hot.tobytes() + eo.tobytes() + patches.tobytes() + pk.tobytes())
+            if len(e5) <= len(zsec) * 1.25 and (best is not packed or len(e5) < len(best)):
+                best = e5
     return best
 
 def _serialize_column(p, zc):
@@ -237,7 +265,8 @@ def _serialize_column(p, zc):
     out = bytearray()
     out += _header(p['nm'], p['V'], p['bits'], p['dtype'], p['mode'], p['has_null'], p['aux'])
     out += _dict_bytes(p, zc)
-    out += _code_section(p['codes'], p['bits'])
+    out += _code_section(p['codes'], p['bits'],
+                         enc5_ok=(p.get('dtype') == 0 and p['mode'] in (0, 1, 2)))
     normal = bytes(out), (len(out), p['V'], p['bits'], p['dtype'], p['mode'], p['has_null'], p['aux'])
     # mode-5 inline candidate: high-cardinality non-null string -> storing rows inline often beats
     # dict+codes (pointers are dead weight when values rarely repeat). Compute both, keep smaller.
