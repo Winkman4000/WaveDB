@@ -96,6 +96,37 @@ def _counts_lane(seg, kcol, kdesc, need):
         j = V - 1 - int(np.searchsorted(np.cumsum(cn[::-1]), need))
     else:
         j = int(np.searchsorted(np.cumsum(cn), need))
+    c5 = seg.cols[kcol]
+    if c5.get('code_enc') == 5:
+        # THE BUCKET HUNT: mandatory codes live in the patch array by construction
+        # (they're rare; hot codes are frequent). Positions come from the escape
+        # offsets + a per-block rank scan -- no block ever inflates, no bst needed.
+        hot5 = np.asarray(c5['e5hot']).astype(np.int64)
+        if kdesc:
+            if bool((hot5 >= j).any()):
+                return None                      # a frequent code beyond the boundary: old path
+            pmask = np.asarray(c5['e5patch']).astype(np.int64) >= j
+        else:
+            if bool((hot5 <= j).any()):
+                return None
+            pmask = np.asarray(c5['e5patch']).astype(np.int64) <= j
+        patch_codes = np.asarray(c5['e5patch']).astype(np.int64)
+        pidx = np.flatnonzero(pmask)
+        if pidx.size == 0 or pidx.size > _CAND_CAP:
+            return None
+        pc = patch_codes[pidx]
+        bnd = pc == j
+        strict_idx = pidx[~bnd]
+        s_cnt5 = int(strict_idx.size)
+        fill_idx = pidx[bnd][:max(0, need - s_cnt5)]
+        pidx = np.sort(np.concatenate([strict_idx, fill_idx]))
+        eo5 = np.asarray(c5['e5off']).astype(np.int64)
+        blk5 = (np.searchsorted(eo5, pidx, side='right') - 1).astype(np.int64)
+        import wdb_kernels as _WK
+        pk5 = np.frombuffer(seg.buf, dtype=np.uint8, count=c5['czlen'], offset=c5['cstart'])
+        pos = _WK.enc5_findpos(pk5, eo5, pidx, blk5, np.int64(seg.N), np.int64(c5['BR']))
+        srt5 = np.argsort(pos)
+        return pos[srt5], patch_codes[pidx][srt5]
     st = BS.build(seg, kcol)
     if st is None:
         return None
@@ -198,7 +229,7 @@ def execute(seg, spec):
     codes0 = None
     cand = None
     if k < N and len(keys) == 1 and seg.cols[kcol].get('mode') in (0, 1, 2) \
-            and seg.cols[kcol].get('dt') == 0 and seg.cols[kcol].get('code_enc') == 3:
+            and seg.cols[kcol].get('dt') == 0 and seg.cols[kcol].get('code_enc') in (3, 5):
         cand = _counts_lane(seg, kcol, kdesc, k)
     if cand is not None:
         cand_idx, cand_codes = cand

@@ -608,3 +608,30 @@ def enc5_at(packed, hot, patches, esc_off, rows, BR):
                     seen += 1
             out[k] = patches[esc_off[b] + seen]
     return out
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def enc5_findpos(packed, esc_off, pidx, blk, N, BR):
+    """Row positions of the given patch-array indices: each escape ranks itself with a
+    bounded within-block nibble scan (blocks independent -> prange)."""
+    pos = np.empty(pidx.size, dtype=np.int64)
+    for k in prange(pidx.size):
+        b = blk[k]
+        want = pidx[k] - esc_off[b]
+        seen = np.int64(0)
+        lo = b * BR
+        hi = lo + BR
+        if hi > N:
+            hi = N
+        for i in range(lo, hi):
+            byte = packed[i >> 1]
+            if (i & 1) == 0:
+                v = np.int64(byte & 0x0F)
+            else:
+                v = np.int64(byte >> 4)
+            if v == 15:
+                if seen == want:
+                    pos[k] = i
+                    break
+                seen += 1
+    return pos
