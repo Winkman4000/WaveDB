@@ -95,8 +95,6 @@ def _fused_2key(db, tree):
     tname = tabs[0].name
     seg = db.open_segment(db.cat.segment_paths(tname)[0], tname)
     fc = seg.cols.get(fcol)
-    if fc is not None and fc.get('code_enc') == 5:
-        return None                              # enc-5 driver: stage B's block loop predates it
     if fc is None or fc.get('mode') not in (0, 1, 2) or fc.get('has_null'):
         return None
     aggs = []                                           # (proj_index, kind, col_or_None)
