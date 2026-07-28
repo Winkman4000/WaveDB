@@ -84,7 +84,7 @@ def route_single_segment(ctx):
     if wdb_sql._offset(ctx.tree):
         # wherescan is the one structure read that applies OFFSET itself (it materializes the
         # full ordered group set and slices [off:off+lim]) -- let it try before the scan.
-        for rd in (R.wherescan, R.diskpair):     # the reads that apply OFFSET themselves
+        for rd in (R.dict_count, R.wherescan, R.diskpair):   # the reads that apply OFFSET themselves
             spec = rd.detect(ctx)
             if spec is not None:
                 rows = rd.execute(ctx, spec)

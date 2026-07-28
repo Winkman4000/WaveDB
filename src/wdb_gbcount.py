@@ -239,7 +239,8 @@ def detect(seg, tree, col_map):
         return None
     return {'col': col, 'ci': ci, 'ki': ki, 'lim': lim, 'proj': proj,
             'order': tree.args.get('order'), 'excl_lit': excl_lit,
-            'having_min': having_min, 'unbounded': unbounded, 'shift': shift}
+            'having_min': having_min, 'unbounded': unbounded, 'shift': shift,
+            'off': wdb_sql._offset(tree)}
 
 
 def _emit_key(seg, col, code, shift):
@@ -290,14 +291,18 @@ def execute(seg, spec):
         if lim == 0:                                    # legitimate short answer, not a decline
             _HITS += 1
             return [], [wdb_sql._alias(p) for p in proj]
-    if hm is None and lim > hn.size:                    # would need singletons: fall through
+    off = int(spec.get('off') or 0)
+    need = lim + off
+    if hm is None and need > hn.size:                   # would need singletons: fall through
         return None
-    if lim < hn.size and int(hn[lim - 1]) == int(hn[lim]):
-        return None                                     # a tie straddles the LIMIT boundary: the top-N
+    if need < hn.size and int(hn[need - 1]) == int(hn[need]):
+        return None                                     # a tie straddles the window's END: the emitted
                                                         # SET is ambiguous -> defer to the scan path so
                                                         # tie-breaking stays consistent with the engine
+    if 0 < off < hn.size and int(hn[off - 1]) == int(hn[off]):
+        return None                                     # a tie straddles the window's START: same law
     rows = []
-    for code, n in zip(hc[:lim].tolist(), hn[:lim].tolist()):
+    for code, n in zip(hc[off:need].tolist(), hn[off:need].tolist()):
         row = [None, None]
         row[ki] = _emit_key(seg, col, code, spec.get('shift', 0))  # decode ONLY the N emitted
         row[ci] = int(n)                                           # keys: point-fetch, never the dict
