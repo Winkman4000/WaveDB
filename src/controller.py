@@ -49,11 +49,10 @@ _READ_ORDER = (
     R.dict_count,           # dictionary per-code counts (sidecar: answers before any scan)
     R.groupself,            # counting board: GROUP BY K + WHERE on K, bins not rows
     R.coscan,               # fused conjunctive COUNT: zone-map veto, one walk
+    R.grid2,               # plain 2-key COUNT grid: one fused pass, narrow detect
     R.wherescan,            # conjunctive WHERE: stair spans + blocked-frame predicate scan, disk-only
     R.gridwalk,
     R.smallk,              # narrow-key pair/triple boards (the small-K weapon)             # two-key COUNT(*) top-K via grid filled-cell + count-ordered head (opt-in)
-    R.grid2,               # plain 2-key COUNT grid (late slot: promotion pending the
-                           # three routing-test updates -- see journal)
     R.sumtopk,             # single big-key SUM top-K: one kernel, k label decodes
     R.distinctlim,         # DISTINCT-LIMIT early exit: stops at n pairs, streams never fully read
     R.diskpair,             # disk-only pair GROUP BY: scan-merge floor beneath the structures

@@ -31,11 +31,13 @@ def _norm(rows):
 def _match(q, expect_fast=True):
     db, con = _fixture()
     import wdb_smallk
-    before = wdb_join._FAST_HITS; sk_before = wdb_smallk._HITS
+    import wdb_grid2
+    before = wdb_join._FAST_HITS; sk_before = wdb_smallk._HITS; g2_before = wdb_grid2._HITS
     g = _norm(db.run(q)[0]); e = _norm([tuple(r) for r in con.execute(q).fetchall()])
     if expect_fast:
         assert (wdb_join._FAST_HITS == before + 1
-                or wdb_smallk._HITS == sk_before + 1), f"accelerated path NOT taken: {q}"
+                or wdb_smallk._HITS == sk_before + 1
+                or wdb_grid2._HITS == g2_before + 1), f"accelerated path NOT taken: {q}"
     assert g == e, f"mismatch {q}\n got {g[:4]}\n exp {e[:4]}"
 
 def test_st_group_sum():        _match("SELECT g, SUM(amt) FROM t GROUP BY g")

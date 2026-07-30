@@ -74,6 +74,9 @@ def detect(seg, tree, col_map):
         onm = wdb_sql._colname(order.expressions[0].this)
         if onm != wdb_sql._alias(proj[ci]):
             return None
+    if order is None and wdb_sql._limit(tree) is not None:
+        return None                              # unordered LIMIT: the subset choice belongs to the
+                                                 # engine's canonical encounter order, not the grid
     if not P.no_deleted_rows(seg):
         return None
     return {'g': gnames, 'ki': ki, 'ci': ci, 'proj': proj, 'fcol': fcol, 'flit': flit,

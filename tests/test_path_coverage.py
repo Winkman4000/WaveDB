@@ -123,6 +123,7 @@ def _classify(db, q):
     cand = _is_fusion_candidate(tree)
     fb = wdb_join._FAST_HITS; bb = wdb_bsi_exec._BSI_HITS; gd = wdb_groupdistinct._HITS
     import wdb_smallk; sk = wdb_smallk._HITS
+    import wdb_grid2; g2 = wdb_grid2._HITS
     bs = wdb_blockstats._HITS
     rows = db.run(q)[0]
     if wdb_bsi_exec._BSI_HITS > bb: return 'bsi', rows
@@ -131,6 +132,7 @@ def _classify(db, q):
     if wdb_join._FAST_HITS > fb: return 'fast', rows
     import wdb_smallk
     if wdb_smallk._HITS > sk: return 'fast', rows   # narrow-key fused composite board
+    if wdb_grid2._HITS > g2: return 'fast', rows    # plain 2-key COUNT grid
     return ('fallback' if cand else 'rows'), rows
 
 def _evaluate():

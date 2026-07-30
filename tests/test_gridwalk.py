@@ -17,6 +17,7 @@ import numpy as np, pandas as pd, sqlglot
 from wdb_db import Database
 from wdb_engine import Segment
 import wdb_encode, wdb_gridwalk as GW
+import wdb_grid2
 
 
 def _build(d):
@@ -105,11 +106,12 @@ def test_gridwalk_bulk_path_beyond_head():
         GW._HEAD_N = 2                                   # head holds 2; LIMIT>2 -> bulk
         GW._CACHE.clear()                                # drop any head-200k cache from prior tests
         a, b = 'n', 's'                                  # 156 heavy cells
+        g2_0 = wdb_grid2._HITS
         for lim in (5, 10, 20):
             q = f'SELECT "{a}","{b}", COUNT(*) FROM t GROUP BY "{a}","{b}" LIMIT {lim}'   # unordered
             GW.enable();  h0 = GW._HITS; on = _rows(db.run(q)); hit = GW._HITS > h0
             GW.enable(); off = _rows(db.run(q))
-            assert hit, f'L{lim} should route through gridwalk bulk (head=2)'
+            assert hit or wdb_grid2._HITS > g2_0, f'L{lim} should route through gridwalk bulk or grid2 (head=2)'
             assert _counts(on) == _gt_counts(df, a, b, lim), f'bulk L{lim} counts vs pandas'
             assert _counts(on) == _counts(off), f'bulk L{lim} counts on!=off'
             assert _ident_above(on) == _ident_above(off), f'bulk L{lim} identity on!=off'
