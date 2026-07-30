@@ -179,7 +179,44 @@ def _scalar_count_detect(seg, tree, col_map):
         colnode = node.this
         lits = [node.expression.this]
         neg = neg ^ isinstance(node, E.NEQ)
-    if lits is None or not isinstance(colnode, E.Column):
+    rng = None
+    if lits is None and not neg:
+        # value ranges: BETWEEN rewrites to GTE+LTE by sqlglot; single-sided too.
+        # The dict is value-sorted, so a range is a contiguous code span.
+        lo = hi = None; lo_inc = hi_inc = True
+        if isinstance(node, E.Between) and isinstance(node.this, E.Column) \
+                and isinstance(node.args.get('low'), E.Literal) \
+                and isinstance(node.args.get('high'), E.Literal):
+            try:
+                node = E.And(this=E.GTE(this=node.this.copy(), expression=node.args['low']),
+                             expression=E.LTE(this=node.this.copy(), expression=node.args['high']))
+            except Exception:
+                pass
+        atoms = [node] if not isinstance(node, E.And) else list(node.flatten())
+        okr = True; rcol = None
+        for a in atoms:
+            if isinstance(a, (E.GTE, E.GT, E.LTE, E.LT)) and isinstance(a.expression, E.Literal) \
+                    and isinstance(a.this, E.Column):
+                if rcol is None:
+                    rcol = a.this.name
+                elif rcol != a.this.name:
+                    okr = False; break
+                try:
+                    v = float(a.expression.this)
+                except (TypeError, ValueError):
+                    okr = False; break
+                if isinstance(a, (E.GTE, E.GT)):
+                    lo, lo_inc = v, isinstance(a, E.GTE)
+                else:
+                    hi, hi_inc = v, isinstance(a, E.LTE)
+            else:
+                okr = False; break
+        if okr and rcol is not None and (lo is not None or hi is not None):
+            colnode = E.Column(this=E.Identifier(this=rcol))
+            colnode.set('this', E.to_identifier(rcol))
+            rng = (lo, lo_inc, hi, hi_inc)
+            lits = []
+    if (lits is None and rng is None) or not isinstance(colnode, E.Column):
         return None
     col = (col_map or {}).get(colnode.name, colnode.name) if col_map else colnode.name
     c = seg.cols.get(col)
@@ -189,8 +226,10 @@ def _scalar_count_detect(seg, tree, col_map):
         return None
     if not _fetchable(seg, col):
         return None
+    if rng is not None and seg.cols[col].get('dt') != 0:
+        return None                                     # value order is integer business
     return {'scalar': True, 'col': col, 'lits': lits, 'neg': neg,
-            'proj': proj}
+            'rng': rng, 'proj': proj}
 
 
 def _scalar_count_execute(seg, spec):
@@ -200,6 +239,24 @@ def _scalar_count_execute(seg, spec):
         return None
     hc, hn = got
     import wdb_wherescan
+    if spec.get('rng') is not None:
+        import wdb_window as _WN
+        t = np.asarray(_WN._int_table(seg, spec['col']), dtype=np.int64)
+        if t.size < 2 or not bool(np.all(np.diff(t) >= 0)):
+            return None                                  # unproven value order: decline
+        lo, lo_inc, hi, hi_inc = spec['rng']
+        c0 = 0 if lo is None else int(np.searchsorted(t, lo, side='left' if lo_inc else 'right'))
+        c1 = t.size if hi is None else int(np.searchsorted(t, hi, side='right' if hi_inc else 'left'))
+        if c1 <= c0:
+            ans = 0
+        else:
+            hca = np.asarray(hc)
+            m = (hca >= c0) & (hca < c1)
+            span = c1 - c0
+            on_shelf = int(m.sum())
+            ans = int(np.asarray(hn)[m].sum()) + (span - on_shelf)  # trimmed singletons: one each
+        _HITS += 1
+        return [(ans,)], [wdb_sql._alias(spec['proj'][0])]
     total = 0
     for lit in spec['lits']:
         code = wdb_wherescan._code_of(seg, spec['col'], lit)
