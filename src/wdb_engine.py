@@ -6,6 +6,19 @@ import struct
 import threading, numpy as np, zstandard as zstd
 _DT_UNITS = ['us','ns','ms','s','D','h','m','M','Y','W']
 
+_POOL = None
+
+
+def _pool():
+    """Persistent 8-lane executor for span decompression: pool spin-up per column read
+    was measurable overhead at board scale."""
+    global _POOL
+    if _POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _POOL = ThreadPoolExecutor(max_workers=8)
+    return _POOL
+
+
 class Segment:
     def __init__(self, path):
         # memmap instead of read(): the file is demand-paged by the OS, so a Segment
@@ -338,19 +351,20 @@ class Segment:
             cc = np.empty(self.N, dtype=wdt)
             BR = c['BR']; base = c['cstart']; bo = c['boffs']
             isz = wdt().itemsize
-            def _blk(j):                             # non-overlapping writes; zstd drops the
-                import zstandard as _zs              # GIL, so 8 lanes decompress side by side
-                raw = _zs.ZstdDecompressor().decompress(
-                    self.buf[base + int(bo[j]):base + int(bo[j + 1])].tobytes())
-                cc[j * BR:j * BR + len(raw) // isz] = np.frombuffer(raw, dtype=wdt)
             nb = int(bo.size) - 1
+            def _span(t, T=8):                       # non-overlapping writes; zstd drops the
+                import zstandard as _zs              # GIL, so 8 lanes decompress side by side.
+                dec = _zs.ZstdDecompressor()         # One span task per worker and one
+                lo = t * nb // T                     # decompressor per span: the per-frame
+                hi = (t + 1) * nb // T               # task dispatch was 2.3s of lock.acquire
+                for j in range(lo, hi):              # across the trench (the shared-function
+                    raw = dec.decompress(            # audit's whale).
+                        self.buf[base + int(bo[j]):base + int(bo[j + 1])].tobytes())
+                    cc[j * BR:j * BR + len(raw) // isz] = np.frombuffer(raw, dtype=wdt)
             if nb > 4:
-                from concurrent.futures import ThreadPoolExecutor
-                with ThreadPoolExecutor(max_workers=8) as _ex:
-                    list(_ex.map(_blk, range(nb)))
+                list(_pool().map(_span, range(8)))
             else:
-                for j in range(nb):
-                    _blk(j)
+                _span(0, 1)
             self._codes[nm] = cc; return cc
         bits = c['bits']; base = c['cstart']
         cc = self._bitunpack(base, 0, self.N, bits)  # now returns native width
