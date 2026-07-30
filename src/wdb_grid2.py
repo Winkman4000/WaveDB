@@ -100,9 +100,8 @@ def execute(seg, spec):
     else:
         lit = -1
         fc = c1
-    cells = WK.grid2_count(np.ascontiguousarray(c1.astype(np.int64)),
-                           np.ascontiguousarray(c2.astype(np.int64)),
-                           np.ascontiguousarray(fc.astype(np.int64)),
+    cells = WK.grid2_count(np.ascontiguousarray(c1), np.ascontiguousarray(c2),
+                           np.ascontiguousarray(fc),
                            np.int64(lit if lit is not None else -1), np.int64(V2), np.int64(K))
     nz = np.flatnonzero(cells)
     if spec['ordered']:

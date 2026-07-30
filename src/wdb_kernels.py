@@ -693,7 +693,7 @@ def gd_pass1(uc, rc, SH, T):
         lo = t * n // T
         hi = (t + 1) * n // T
         for i in range(lo, hi):
-            pc[t, uc[i] >> SH] += 1
+            pc[t, np.int64(uc[i]) >> SH] += 1
     offs = np.zeros(NB + 1, np.int64)
     for b in range(NB):
         s = 0
@@ -702,8 +702,8 @@ def gd_pass1(uc, rc, SH, T):
             pc[t, b] = s
             s += v
         offs[b + 1] = offs[b] + s
-    ku = np.empty(n, np.int64)
-    kr = np.empty(n, np.uint32)
+    ku = np.empty(n, np.uint32)                  # target codes fit u32 (V < 2^32): half the
+    kr = np.empty(n, np.uint32)                  # cardboard, half the scatter bandwidth
     for t in prange(T):
         lo = t * n // T
         hi = (t + 1) * n // T
@@ -711,7 +711,7 @@ def gd_pass1(uc, rc, SH, T):
         for b in range(NB):
             cur[b] = offs[b] + pc[t, b]
         for i in range(lo, hi):
-            b = uc[i] >> SH
+            b = np.int64(uc[i]) >> SH
             p = cur[b]
             ku[p] = uc[i]
             kr[p] = rc[i]
@@ -734,12 +734,12 @@ def gd_pass2_count(ku, kr, offs, SH, VR):
             continue
         cnt = np.zeros(LOW + 1, np.int64)
         for i in range(lo, hi):
-            cnt[(ku[i] & (LOW - 1)) + 1] += 1
+            cnt[(np.int64(ku[i]) & (LOW - 1)) + 1] += 1
         loffs = np.cumsum(cnt)
         cur = loffs[:-1].copy()
         lr = np.empty(hi - lo, np.uint32)
         for i in range(lo, hi):
-            u = ku[i] & (LOW - 1)
+            u = np.int64(ku[i]) & (LOW - 1)
             lr[cur[u]] = kr[i]
             cur[u] += 1
         seen = np.full(VR, -1, np.int64)
@@ -767,9 +767,9 @@ def grid2_count(c1, c2, fc, lit, V2, K):
         lo = t * n // T
         hi = (t + 1) * n // T
         for i in range(lo, hi):
-            if lit >= 0 and fc[i] != lit:
+            if lit >= 0 and np.int64(fc[i]) != lit:
                 continue
-            part[t, c1[i] * V2 + c2[i]] += 1
+            part[t, np.int64(c1[i]) * V2 + np.int64(c2[i])] += 1
     out = np.zeros(K, np.int64)
     for t in range(T):
         for k in range(K):

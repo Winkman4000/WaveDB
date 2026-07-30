@@ -168,8 +168,8 @@ def execute(seg, det, tree):
     if (tnull < 0 and N > 4_000_000 and 0 < VRk <= 262_144 and VTt > 65_536):
         import wdb_kernels as _WK
         SH = max(1, VTt.bit_length() - 12)
-        ku, kr, offs = _WK.gd_pass1(np.ascontiguousarray(tgt.astype(np.int64)),
-                                    np.ascontiguousarray(grp.astype(np.uint32)),
+        ku, kr, offs = _WK.gd_pass1(np.ascontiguousarray(tgt),
+                                    np.ascontiguousarray(grp),
                                     np.int64(SH), np.int64(8))
         counts = _WK.gd_pass2_count(ku, kr, offs, np.int64(SH), np.int64(VRk))
         lim = wdb_sql._limit(tree)
