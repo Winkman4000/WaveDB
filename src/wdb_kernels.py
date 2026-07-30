@@ -679,3 +679,78 @@ def enc5_at2(packed, hot, patches, esc_off, rows_sorted, N, BR):
             if v == 15:
                 pi += 1
     return out
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def gd_pass1(uc, rc, SH, T):
+    """MSD scatter pass 1: group (target, key) rows by the target code's top bits.
+    4096 cursor buckets stay cache-resident; per-thread private counts merge into
+    stable offsets so the pass parallelizes without contention."""
+    n = uc.size
+    NB = 1 << 12
+    pc = np.zeros((T, NB), np.int64)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        for i in range(lo, hi):
+            pc[t, uc[i] >> SH] += 1
+    offs = np.zeros(NB + 1, np.int64)
+    for b in range(NB):
+        s = 0
+        for t in range(T):
+            v = pc[t, b]
+            pc[t, b] = s
+            s += v
+        offs[b + 1] = offs[b] + s
+    ku = np.empty(n, np.int64)
+    kr = np.empty(n, np.uint32)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        cur = np.empty(NB, np.int64)
+        for b in range(NB):
+            cur[b] = offs[b] + pc[t, b]
+        for i in range(lo, hi):
+            b = uc[i] >> SH
+            p = cur[b]
+            ku[p] = uc[i]
+            kr[p] = rc[i]
+            cur[b] = p + 1
+    return ku, kr, offs
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def gd_pass2_count(ku, kr, offs, SH, VR):
+    """MSD pass 2 + marker dedup, fused per bucket: scatter by the low bits (each
+    bucket's targets fully contained), then the L1-resident marker table counts a
+    target's first touch of each key. Per-bucket accumulator rows: no races."""
+    NB = offs.size - 1
+    LOW = 1 << SH
+    ans = np.zeros((NB, VR), np.int64)
+    for b in prange(NB):
+        lo = offs[b]
+        hi = offs[b + 1]
+        if hi <= lo:
+            continue
+        cnt = np.zeros(LOW + 1, np.int64)
+        for i in range(lo, hi):
+            cnt[(ku[i] & (LOW - 1)) + 1] += 1
+        loffs = np.cumsum(cnt)
+        cur = loffs[:-1].copy()
+        lr = np.empty(hi - lo, np.uint32)
+        for i in range(lo, hi):
+            u = ku[i] & (LOW - 1)
+            lr[cur[u]] = kr[i]
+            cur[u] += 1
+        seen = np.full(VR, -1, np.int64)
+        for u in range(LOW):
+            for i in range(loffs[u], loffs[u + 1]):
+                r = lr[i]
+                if seen[r] != u:
+                    seen[r] = u
+                    ans[b, r] += 1
+    total = np.zeros(VR, np.int64)
+    for b in range(NB):
+        for r in range(VR):
+            total[r] += ans[b, r]
+    return total

@@ -159,6 +159,34 @@ def execute(seg, det, tree):
     if grp.shape[0] != tgt.shape[0]:
         return None
     N = grp.shape[0]
+    # THE SCATTER LANE (Jackson's reorganization): no nulls, dict codes both sides,
+    # big target space -> MSD 2-pass scatter groups rows by target, then an
+    # L1-resident marker table counts each target's first touch of every key.
+    # Measured on a-cd-grp: 2.4s walk -> ~0.65s, exact. All transient: cold-truth.
+    VRk = int(grp.max()) + 1 if N else 0
+    VTt = int(tgt.max()) + 1 if N else 0
+    if (tnull < 0 and N > 4_000_000 and 0 < VRk <= 262_144 and VTt > 65_536):
+        import wdb_kernels as _WK
+        SH = max(1, VTt.bit_length() - 12)
+        ku, kr, offs = _WK.gd_pass1(np.ascontiguousarray(tgt.astype(np.int64)),
+                                    np.ascontiguousarray(grp.astype(np.uint32)),
+                                    np.int64(SH), np.int64(8))
+        counts = _WK.gd_pass2_count(ku, kr, offs, np.int64(SH), np.int64(VRk))
+        lim = wdb_sql._limit(tree)
+        present = np.nonzero(counts)[0]
+        sel = present[np.argsort(-counts[present], kind='stable')]
+        if lim is not None:
+            sel = sel[:lim]
+        names = [wdb_sql._alias(p) for p in proj]
+        rows = []
+        for gid in sel.tolist():
+            row = [None, None]
+            row[ki] = wdb_sql._pyval(kdecode[gid] if kdecode is not None else np.int64(gid))
+            row[ci] = int(counts[gid])
+            rows.append(tuple(row))
+        rows = workers.finalize(rows, proj, tree.args.get('order'), lim)
+        _HITS += 1
+        return rows, names
     if N == 0:
         _HITS += 1
         return [], [wdb_sql._alias(p) for p in proj]
