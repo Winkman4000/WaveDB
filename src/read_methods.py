@@ -29,6 +29,7 @@ import wdb_coscan
 import wdb_diskpair
 import wdb_distinctlim
 import wdb_sumtopk
+import wdb_grid2
 import wdb_regexgroup
 import wdb_window
 import wdb_pairagg
@@ -135,6 +136,11 @@ smallk = Read('smallk',
               lambda c: wdb_smallk.detect(c.seg, c.tree, c.cmap),
               lambda c, spec: wdb_smallk.execute(c.seg, spec),
               'narrow 2-3 key COUNT(*) via one fused pass onto a composite board')
+
+grid2 = Read('grid2',
+             lambda c: wdb_grid2.detect(c.seg, c.tree, c.cmap),
+             lambda c, spec: wdb_grid2.execute(c.seg, spec),
+             'plain 2-key COUNT grid: composite bincount, LUT decode, no sorts')
 
 sumtopk = Read('sumtopk',
                lambda c: wdb_sumtopk.detect(c.seg, c.tree, c.cmap),

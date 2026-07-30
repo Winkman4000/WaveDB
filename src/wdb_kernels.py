@@ -754,3 +754,24 @@ def gd_pass2_count(ku, kr, offs, SH, VR):
         for r in range(VR):
             total[r] += ans[b, r]
     return total
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def grid2_count(c1, c2, fc, lit, V2, K):
+    """Composite 2-key COUNT grid with optional eq-filter (lit<0 = unfiltered):
+    per-thread boards, one fused pass, no factorize, no sorts."""
+    T = numba.get_num_threads()
+    part = np.zeros((T, K), np.int64)
+    n = c1.size
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        for i in range(lo, hi):
+            if lit >= 0 and fc[i] != lit:
+                continue
+            part[t, c1[i] * V2 + c2[i]] += 1
+    out = np.zeros(K, np.int64)
+    for t in range(T):
+        for k in range(K):
+            out[k] += part[t, k]
+    return out
