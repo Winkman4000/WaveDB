@@ -105,6 +105,36 @@ def _order_is_distinct_desc(tree, proj, ci):
     return isinstance(inner, E.Count) and isinstance(inner.this, E.Distinct)
 
 
+def _gdc_path(seg, kcol, tcol):
+    return seg.path + '.%s__%s.gdc' % (kcol, tcol)
+
+
+def _gdc_load(seg, kcol, tcol):
+    """The grouped-distinct shelf (Jackson's cut): per-group COUNT(DISTINCT target) is a
+    V-sized fact about an immutable file -- kilobytes on disk, reborn only with the file.
+    Same law as the gbc: lawful V-sized sidecar, no_deleted_rows-gated, cold-truth clean."""
+    import os, pickle
+    p = _gdc_path(seg, kcol, tcol)
+    if not os.path.exists(p):
+        return None
+    try:
+        blob = pickle.load(open(p, 'rb'))
+        if blob.get('n') == int(seg.N):
+            return blob
+    except Exception:
+        pass
+    return None
+
+
+def _gdc_save(seg, kcol, tcol, counts, keys):
+    import pickle
+    try:
+        pickle.dump({'n': int(seg.N), 'counts': counts, 'keys': keys},
+                    open(_gdc_path(seg, kcol, tcol), 'wb'), protocol=4)
+    except Exception:
+        pass
+
+
 def detect(seg, tree, col_map, _allow_group_filter=False):
     """Shape gate shared by the live walk and the materialized sidecar. Returns
     (kcol, tcol, ci, ki, proj) for a `GROUP BY key, COUNT(DISTINCT target)` query inside v1 scope,
@@ -150,6 +180,26 @@ def execute(seg, det, tree):
     global _HITS
     kcol, tcol, ci, ki, proj = det
 
+    # THE SHELF FIRST: an unfiltered per-group distinct count is a stored fact.
+    if P.no_where(tree) and P.no_deleted_rows(seg):
+        blob = _gdc_load(seg, kcol, tcol)
+        if blob is not None:
+            counts = blob['counts']; keys = blob['keys']
+            lim = wdb_sql._limit(tree)
+            present = np.nonzero(counts)[0]
+            sel = present[np.argsort(-counts[present], kind='stable')]
+            if lim is not None:
+                sel = sel[:lim]
+            rows = []
+            for gid in sel.tolist():
+                row = [None, None]
+                row[ki] = keys[gid]
+                row[ci] = int(counts[gid])
+                rows.append(tuple(row))
+            rows = workers.finalize(rows, proj, tree.args.get('order'), lim)
+            _HITS += 1
+            return rows, [wdb_sql._alias(p) for p in proj]
+
     kinfo = _ids(seg, kcol)
     tinfo = _ids(seg, tcol)
     if kinfo is None or tinfo is None:
@@ -172,6 +222,12 @@ def execute(seg, det, tree):
                                     np.ascontiguousarray(grp),
                                     np.int64(SH), np.int64(8))
         counts = _WK.gd_pass2_count(ku, kr, offs, np.int64(SH), np.int64(VRk))
+        if P.no_where(tree) and P.no_deleted_rows(seg):
+            keys = [wdb_sql._pyval(kdecode[g] if kdecode is not None else np.int64(g))
+                    for g in range(VRk)]
+            keys = [k.decode('utf-8', 'replace') if isinstance(k, (bytes, bytearray)) else k
+                    for k in keys]
+            _gdc_save(seg, kcol, tcol, counts, keys)     # birth-on-first-touch, gbc-style
         lim = wdb_sql._limit(tree)
         present = np.nonzero(counts)[0]
         sel = present[np.argsort(-counts[present], kind='stable')]
