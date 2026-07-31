@@ -800,9 +800,20 @@ class Segment:
         rs = rows[order]; bs = blks[order]          # the old per-block mask rescan was
         ub, starts = np.unique(bs, return_index=True)   # O(blocks x pos) comparisons
         ends = np.append(starts[1:], bs.size)
+        import io as _io
+        isz = np.dtype(wdt).itemsize
         for j, s, e in zip(ub.tolist(), starts.tolist(), ends.tolist()):
-            raw = np.frombuffer(dz.decompress(self.buf[base+int(bo[j]):base+int(bo[j+1])].tobytes()), dtype=wdt)
-            out[order[s:e]] = raw[rs[s:e] - j*BR]
+            fb = self.buf[base + int(bo[j]):base + int(bo[j + 1])].tobytes()
+            frame_rows = min(BR, self.N - j * BR)
+            mx = int(rs[s:e].max()) - j * BR
+            need = (mx + 1) * isz
+            if need * 4 <= frame_rows * isz * 3:         # PARTIAL-FRAME READ: zstd streams
+                raw = np.frombuffer(                     # decompress prefixes, so a frame
+                    dz.stream_reader(_io.BytesIO(fb)).read(need),   # is only inflated to its
+                    dtype=wdt)                           # highest requested row (<=75% pays;
+            else:                                        # else the plain full inflate wins)
+                raw = np.frombuffer(dz.decompress(fb), dtype=wdt)
+            out[order[s:e]] = raw[rs[s:e] - j * BR]
         return out
 
     def values_range(self, nm, lo, hi):
