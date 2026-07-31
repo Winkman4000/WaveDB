@@ -709,6 +709,36 @@ def _try_rnk(seg, spec):
     return list(zip(*slots)), hdr
 
 
+def _gdp_path(seg, pcol, ocol, dirn):
+    return seg.path + '.%s__%s.%s.gdp' % (pcol, ocol, dirn)
+
+
+def _gdp_load(seg, pcol, ocol, dirn):
+    """Grouped dict-order pointers (Jackson's shelf, .gdc's sibling): the per-group
+    min/max order-code is a V-sized fact about an immutable file -- ~4B per group on
+    disk. Lazy birth from _try_rn1's own kernel output; N-stamped; cold-truth clean."""
+    import os, pickle
+    p = _gdp_path(seg, pcol, ocol, dirn)
+    if not os.path.exists(p):
+        return None
+    try:
+        blob = pickle.load(open(p, 'rb'))
+        if blob.get('n') == int(seg.N):
+            return np.asarray(blob['acc'])
+    except Exception:
+        pass
+    return None
+
+
+def _gdp_save(seg, pcol, ocol, dirn, acc):
+    import pickle
+    try:
+        pickle.dump({'n': int(seg.N), 'acc': np.asarray(acc)},
+                    open(_gdp_path(seg, pcol, ocol, dirn), 'wb'), protocol=4)
+    except Exception:
+        pass
+
+
 def _try_rn1(seg, spec):
     """QUALIFY ROW_NUMBER()=1 over (PARTITION p ORDER o ASC|DESC), projecting only p, o,
     rn: the answer is the per-partition MINIMUM (or MAXIMUM) order code -- codes are
@@ -740,14 +770,23 @@ def _try_rn1(seg, spec):
             emit.append('rn')
         else:
             return None
-    pc = np.asarray(seg._raw_codes(pcol)).astype(np.int64)
-    oc = np.asarray(seg._raw_codes(ocol)).astype(np.int64)
     import wdb_kernels as K
+    dirn = 'max' if spec['odesc'] else 'min'
+    shelf_ok = P.no_deleted_rows(seg) and seg._effective(pcol) is None \
+        and seg._effective(ocol) is None
+    acc = _gdp_load(seg, pcol, ocol, dirn) if shelf_ok else None
+    if acc is None:
+        pc = np.asarray(seg._raw_codes(pcol)).astype(np.int64)
+        oc = np.asarray(seg._raw_codes(ocol)).astype(np.int64)
+        if spec['odesc']:
+            acc = K.group_max(pc, oc, int(cp['V']))
+        else:
+            acc = K.group_min(pc, oc, int(cp['V']))
+        if shelf_ok:
+            _gdp_save(seg, pcol, ocol, dirn, acc)    # lazy birth from the kernel's own output
     if spec['odesc']:
-        acc = K.group_max(pc, oc, int(cp['V']))
         live = np.flatnonzero(acc >= 0)              # cups start at -1: filled == present
     else:
-        acc = K.group_min(pc, oc, int(cp['V']))
         live = np.flatnonzero(acc != np.iinfo(np.int64).max)
     if spec['lim'] is not None:
         live = live[spec['off']:spec['off'] + spec['lim']]
