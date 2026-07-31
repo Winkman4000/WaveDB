@@ -482,19 +482,27 @@ def _giant_m2o(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey,
                 sums[pi] = np.bincount(cell_of + 1, weights=name_sums,
                                        minlength=total + 1)[1:]
     else:
+        # THE FOLD SURVIVES FILTERS: count the FILTERED rows at name scale (one
+        # bincount of key codes under the mask), then fold the name board into the
+        # cell board at dictionary scale. The old per-row path gathered cell_of at
+        # 100M (a 140MB-table random read), masked it, and bincounted a comp array
+        # minlength=total -- three N-scale passes this replaces with one.
         fkc = np.asarray(fseg._raw_codes(fkey)).astype(np.int64)
-        cells = cell_of[fkc]
-        keep = cells >= 0
+        keep = np.ones(fkc.size, bool)
         for c in fact_conds:
             keep &= wdb_sql._eval_pred(fseg, _strip_qual(c), lambda nm: nm)
-        comp = cells[keep]
-        counts = np.bincount(comp, minlength=total)
+        name_counts = np.bincount(fkc[keep], minlength=fk_vals.size)
+        counts = np.bincount(cell_of + 1, weights=name_counts,
+                             minlength=total + 1)[1:].astype(np.int64)
         for pi, kd in aggs:
             if kd == 'SUM':
                 p = proj[pi]
                 inner = p.this if isinstance(p, E.Alias) else p
-                v = WN._numvals(fseg, inner.this.name)[keep]
-                sums[pi] = np.bincount(comp, weights=v, minlength=total)
+                v = WN._numvals(fseg, inner.this.name)
+                name_sums = np.bincount(fkc[keep], weights=v[keep],
+                                        minlength=fk_vals.size)
+                sums[pi] = np.bincount(cell_of + 1, weights=name_sums,
+                                       minlength=total + 1)[1:]
     live = np.nonzero(counts)[0]
     rows = []
     for cell in live:
