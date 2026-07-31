@@ -798,6 +798,9 @@ def execute(seg, spec):
     fp = _try_rank(seg, spec)
     if fp is not None:
         return fp
+    fp = _try_partagg_sortless(seg, spec)
+    if fp is not None:
+        return fp
     N = int(seg.N)
     # composite partition code (the radix fold)
     pc = np.asarray(seg._raw_codes(spec['pcols'][0])).astype(np.int64)
@@ -1034,6 +1037,104 @@ def execute(seg, spec):
     for pi, w in spec['wins']:
         arr = results[w['alias']]
         sel = arr[sel_s]
+        slots[pi] = sel.tolist() if hasattr(sel, 'tolist') else list(sel)
+    out = list(zip(*slots)) if slots else []
+    _HITS += 1
+    return out, [wdb_sql._alias(p) for p in spec['proj']]
+
+
+def _try_partagg_sortless(seg, spec):
+    """Whole-partition SUM/AVG/COUNT with no window ORDER: partitioning does not need
+    lanes, so it does not need the 100M-row lexsort the generic path pays (untracked
+    C self-time, ~6-8s on w-partavg). One bincount per aggregate in FILE ORDER, a
+    gather per row, a vectorized QUALIFY mask, and the standard column emission.
+    Declines anything with frames, window order, or column-compare qualifiers."""
+    global _HITS
+    if spec.get('ocol') is not None or spec.get('order') is not None:
+        return None
+    for _pi, w in spec['wins']:
+        if w['kind'] not in ('sum', 'avg', 'count') or w.get('frame') is not None:
+            return None
+    if spec['qterms'] is not None:
+        for term in spec['qterms']:
+            if term[0] not in ('lit', 'pcol'):
+                return None
+    N = int(seg.N)
+    pc = np.asarray(seg._raw_codes(spec['pcols'][0])).astype(np.int64)
+    span = int(seg.cols[spec['pcols'][0]]['V'])
+    for pcn in spec['pcols'][1:]:
+        v2 = int(seg.cols[pcn]['V'])
+        pc = pc * v2 + np.asarray(seg._raw_codes(pcn)).astype(np.int64)
+        span *= v2
+    if span > 60_000_000:
+        return None
+    cnt = np.bincount(pc, minlength=span)
+    results = {}
+    for _pi, w in spec['wins']:
+        if w['kind'] == 'count':
+            results[w['alias']] = cnt[pc]
+        else:
+            vv = _numvals(seg, w['arg'])
+            if vv is None:
+                return None
+            tot = np.bincount(pc, weights=vv, minlength=span)
+            results[w['alias']] = (tot[pc] if w['kind'] == 'sum'
+                                   else tot[pc] / cnt[pc])
+    if spec['qterms'] is not None:
+        m = np.ones(N, bool)
+        for term in spec['qterms']:
+            if term[0] == 'pcol':
+                nm, op, v = term[1], term[2], term[3]
+                if isinstance(v, str):
+                    import wdb_wherescan as WS2
+                    fl = np.zeros(int(seg.cols[nm]['V']), bool)
+                    code = WS2._code_of(seg, nm, v)
+                    if code is not None:
+                        fl[code] = True
+                    cmpv = fl[np.asarray(seg._raw_codes(nm)).astype(np.int64)]
+                    m &= (cmpv if op == '=' else ~cmpv)
+                    continue
+                arr2 = _numvals(seg, nm)
+                if arr2 is None:
+                    return None
+                m &= (arr2 > v if op == '>' else arr2 >= v if op == '>=' else
+                      arr2 < v if op == '<' else arr2 <= v if op == '<=' else
+                      arr2 == v if op == '=' else arr2 != v)
+            else:
+                al, op, val = term[1], term[2], term[3]
+                arr = results[al]
+                m &= (arr > val if op == '>' else arr >= val if op == '>=' else
+                      arr < val if op == '<' else arr <= val if op == '<=' else
+                      arr == val if op == '=' else arr != val)
+        sel_file = np.nonzero(m)[0]
+    else:
+        sel_file = np.arange(N)
+    if spec['lim'] is not None:
+        sel_file = sel_file[spec['off']: spec['off'] + spec['lim']]
+    slots = [None] * len(spec['proj'])
+    for pi, nm in spec['cols']:
+        c = seg.cols[nm]
+        if c['mode'] == 4:
+            slots[pi] = np.asarray(seg._seq_decode(c))[sel_file].tolist()
+        else:
+            cc = np.asarray(seg.codes_at(nm, sel_file)).astype(np.int64)
+            if sel_file.size <= 10000:
+                slots[pi] = [wdb_sql._pyval(seg.fetch(nm, int(x))) for x in cc]
+            elif c.get('dt') == 3:
+                secs = np.asarray(seg._dict_ints(c), dtype=np.int64)[cc]
+                slots[pi] = secs.astype('datetime64[s]').tolist()
+            elif c.get('dt') == 0:
+                slots[pi] = _int_table(seg, nm)[cc].tolist()
+            elif int(c['V']) > 100_000 and sel_file.size < int(c['V']) // 4:
+                uq, inv = np.unique(cc, return_inverse=True)
+                dvals = np.array([wdb_sql._pyval(seg.fetch(nm, int(k))) for k in uq], dtype=object)
+                slots[pi] = dvals[inv].tolist()
+            else:
+                dv = seg._typed_dict(nm)
+                full = np.array([wdb_sql._pyval(x) for x in dv], dtype=object)
+                slots[pi] = full[cc].tolist()
+    for pi, w in spec['wins']:
+        sel = results[w['alias']][sel_file]
         slots[pi] = sel.tolist() if hasattr(sel, 'tolist') else list(sel)
     out = list(zip(*slots)) if slots else []
     _HITS += 1
