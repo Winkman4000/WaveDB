@@ -302,9 +302,9 @@ class Database:
                     t2, drop = dec
                     out = self.run(t2.sql())
                     rows, hdr = out if isinstance(out, tuple) else (out, None)
-                    rows = [r[:drop] + r[drop + 1:] for r in rows]
-                    if hdr:
-                        hdr = hdr[:drop] + hdr[drop + 1:]
+                    if hdr and drop < len(hdr) and str(hdr[drop]).startswith('__corr'):
+                        rows = [r[:drop] + r[drop + 1:] for r in rows]   # legacy paths that
+                        hdr = hdr[:drop] + hdr[drop + 1:]                # still emit the helper
                     return rows, hdr
                 tree = wdb_subquery.rewrite(self, tree)   # in-tree: no sql-text roundtrip
                 sql = tree.sql()                          # for reads that consume raw sql

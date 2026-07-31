@@ -182,7 +182,9 @@ def detect(seg, tree, col_map):
     lim = wdb_sql._limit(tree)
     if qterms is None and (lim is None or lim > _MAX_FULL):
         return None                      # unbounded full-window output: fallback's territory
+    hidden = frozenset(pi for pi, w in wins if str(w.get('alias', '')).startswith('__corr'))
     return {'cols': cols, 'wins': wins, 'pcols': pcols, 'ocol': ocol, 'odesc': odesc,
+            'hidden_pis': hidden,
             'qterms': qterms, 'lim': lim, 'off': int(wdb_sql._offset(tree) or 0),
             'proj': proj}
 
@@ -1034,13 +1036,17 @@ def execute(seg, spec):
                 dv = seg._typed_dict(nm)
                 full = np.array([wdb_sql._pyval(x) for x in dv], dtype=object)
                 slots[pi] = full[cc].tolist()
+    hid = spec.get('hidden_pis') or frozenset()
     for pi, w in spec['wins']:
+        if pi in hid:
+            continue                             # QUALIFY-only helper: computed, never emitted
         arr = results[w['alias']]
         sel = arr[sel_s]
         slots[pi] = sel.tolist() if hasattr(sel, 'tolist') else list(sel)
-    out = list(zip(*slots)) if slots else []
+    keep = [i for i in range(len(slots)) if i not in hid]
+    out = list(zip(*[slots[i] for i in keep])) if keep else []
     _HITS += 1
-    return out, [wdb_sql._alias(p) for p in spec['proj']]
+    return out, [wdb_sql._alias(p) for i, p in enumerate(spec['proj']) if i not in hid]
 
 
 def _try_partagg_sortless(seg, spec):
@@ -1133,9 +1139,13 @@ def _try_partagg_sortless(seg, spec):
                 dv = seg._typed_dict(nm)
                 full = np.array([wdb_sql._pyval(x) for x in dv], dtype=object)
                 slots[pi] = full[cc].tolist()
+    hid = spec.get('hidden_pis') or frozenset()
     for pi, w in spec['wins']:
+        if pi in hid:
+            continue
         sel = results[w['alias']][sel_file]
         slots[pi] = sel.tolist() if hasattr(sel, 'tolist') else list(sel)
-    out = list(zip(*slots)) if slots else []
+    keep = [i for i in range(len(slots)) if i not in hid]
+    out = list(zip(*[slots[i] for i in keep])) if keep else []
     _HITS += 1
-    return out, [wdb_sql._alias(p) for p in spec['proj']]
+    return out, [wdb_sql._alias(p) for i, p in enumerate(spec['proj']) if i not in hid]
