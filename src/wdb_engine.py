@@ -728,6 +728,9 @@ class Segment:
         """Per-row codes for rows [lo, hi) ONLY. Raw bit-packed columns (code_enc 0) touch just
         the covering bytes -- the narrow-before-expand read. mode 4/6 are positional (free slice).
         Other encodings full-decode then slice (correct; bigger win awaits block decode)."""
+        if self.cols[nm].get('code_enc', 0) in (5, 6):
+            return self._raw_codes(nm)[lo:hi]    # bucket tags: the range reader predates them;
+                                                 # the cached full decode is exact and 54ms-class
         if lo >= hi:
             return np.empty(0, dtype=np.int64)
         c = self.cols[nm]
