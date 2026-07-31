@@ -208,13 +208,15 @@ def _fused_2key(db, tree):
                                    for _pi, kd, ac in aggs])
         elif level == 'a':
             cnt = boards['COUNT'].sum(1)
-            for i in np.flatnonzero(cnt).tolist():
-                emit(level, i, 0, [cnt[i] if kd == 'COUNT' else boards[('SUM', ac)].sum(1)[i]
-                                   for _pi, kd, ac in aggs])
+            s1 = {ac: boards[('SUM', ac)].sum(1) for _pi, kd, ac in aggs if kd != 'COUNT'}
+            for i in np.flatnonzero(cnt).tolist():          # sums hoisted: the per-row
+                emit(level, i, 0, [cnt[i] if kd == 'COUNT' else s1[ac][i]   # recompute was
+                                   for _pi, kd, ac in aggs])                # 213ms on gs-cube
         elif level == 'b':
             cnt = boards['COUNT'].sum(0)
+            s0 = {ac: boards[('SUM', ac)].sum(0) for _pi, kd, ac in aggs if kd != 'COUNT'}
             for j in np.flatnonzero(cnt).tolist():
-                emit(level, 0, j, [cnt[j] if kd == 'COUNT' else boards[('SUM', ac)].sum(0)[j]
+                emit(level, 0, j, [cnt[j] if kd == 'COUNT' else s0[ac][j]
                                    for _pi, kd, ac in aggs])
         else:
             # the () set aggregates the whole (filtered) input: one row ALWAYS,
