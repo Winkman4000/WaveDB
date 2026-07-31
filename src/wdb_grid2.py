@@ -18,7 +18,32 @@ _K_CAP = 4_000_000
 
 
 def detect(seg, tree, col_map):
-    if not P.no_joins(tree) or not P.no_having(tree) or not P.no_select_distinct(tree):
+    if not P.no_joins(tree) or not P.no_having(tree):
+        return None
+    # DISTINCT k1, k2 (bare, unfiltered, unordered, unbounded): the count grid's
+    # nonzero cells ARE the distinct pairs -- one fused pass, no shelf dependence.
+    if tree.args.get('distinct'):
+        if tree.args.get('where') is not None or tree.args.get('group') is not None \
+                or tree.args.get('order') is not None or wdb_sql._limit(tree) is not None \
+                or wdb_sql._offset(tree):
+            return None
+        proj = tree.expressions
+        if len(proj) != 2 or not all(isinstance(p, E.Column) for p in proj):
+            return None
+        sc = (lambda c: col_map.get(c, c)) if col_map else (lambda c: c)
+        names = [sc(p.name) for p in proj]
+        K = 1
+        for nm in names:
+            c = seg.cols.get(nm)
+            if c is None or c.get('mode') not in (0, 1, 2) or c.get('has_null'):
+                return None
+            K *= int(c.get('V') or 1 << 30)
+        if K > _K_CAP or not P.no_deleted_rows(seg):
+            return None
+        return {'g': names, 'ki': {names[0]: 0, names[1]: 1}, 'ci': None, 'proj': proj,
+                'fcol': None, 'flit': None, 'lim': None, 'ordered': False,
+                'distinct_only': True}
+    if not P.no_select_distinct(tree):
         return None
     if tree.args.get('qualify') is not None:
         return None
@@ -104,6 +129,23 @@ def execute(seg, spec):
                            np.ascontiguousarray(fc),
                            np.int64(lit if lit is not None else -1), np.int64(V2), np.int64(K))
     nz = np.flatnonzero(cells)
+    if spec.get('distinct_only'):
+        lut1 = {}; lut2 = {}
+        rows = []
+        i1, i2 = spec['ki'][g1], spec['ki'][g2]
+        for cell in nz.tolist():
+            a = cell // V2; b = cell % V2
+            if a not in lut1:
+                v = wdb_sql._pyval(seg.fetch(g1, a))
+                lut1[a] = v.decode('utf-8', 'replace') if isinstance(v, (bytes, bytearray)) else v
+            if b not in lut2:
+                v = wdb_sql._pyval(seg.fetch(g2, b))
+                lut2[b] = v.decode('utf-8', 'replace') if isinstance(v, (bytes, bytearray)) else v
+            row = [None, None]
+            row[i1] = lut1[a]; row[i2] = lut2[b]
+            rows.append(tuple(row))
+        _HITS += 1
+        return rows, [wdb_sql._alias(p) for p in spec['proj']]
     if spec['ordered']:
         nz = nz[np.lexsort((nz, -cells[nz]))]
     if spec['lim'] is not None:

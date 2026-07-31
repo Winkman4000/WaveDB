@@ -10,6 +10,7 @@ v1 scope: GROUP BY col with projections {bare col, COUNT(*)}, no WHERE/JOIN/HAVI
 OFFSET, no overrides/deleted rows; ORDER BY COUNT(*) DESC (canonical count-desc, code-asc
 tiebreak), ORDER BY col ASC, or unordered; LIMIT optional when the value space is small."""
 import numpy as np
+import sqlglot.expressions as E
 import wdb_sql
 import wdb_pairagg
 import workers
@@ -84,6 +85,33 @@ def detect(seg, tree, col_map):
     kp = proj[1 - ci]
     if wdb_sql._agg_kind(kp) is not None:
         return None
+    # DERIVED-UNIT GROUPS ON A STAIRCASE (the stair-walk): extract(hour|minute) of a
+    # stair column groups in V-space -- step k's value is the dict's k-th entry, so the
+    # whole query is a unit map over dict values + one weighted bincount of step counts.
+    # No row is ever read.
+    inner = kp.this if isinstance(kp, E.Alias) else kp
+    g0 = tree.args.get('group').expressions[0]
+    if isinstance(inner, E.Extract) and isinstance(inner.expression, E.Column):
+        unit = (inner.this.name if hasattr(inner.this, 'name') else str(inner.this)).lower()
+        alias_nm = kp.alias if isinstance(kp, E.Alias) else None
+        g_matches = (isinstance(g0, E.Extract)
+                     or (isinstance(g0, E.Column) and alias_nm and g0.name == alias_nm))
+        if unit in ('hour', 'minute') and g_matches:
+            dcol = col_map.get(inner.expression.name, inner.expression.name) if col_map \
+                else inner.expression.name
+            if (P.columns_exist(seg, dcol) and P.not_positional(seg, dcol)
+                    and P.no_deleted_rows(seg) and seg._effective(dcol) is None
+                    and seg.cols[dcol].get('dt') == 0
+                    and not seg.cols[dcol].get('has_null')):
+                order = tree.args.get('order')
+                ord_ok = order is None
+                if order is not None and len(order.expressions) == 1:
+                    onm = wdb_sql._colname(order.expressions[0].this)
+                    ord_ok = bool(order.expressions[0].args.get('desc')) \
+                        and onm == wdb_sql._alias(proj[ci])
+                if ord_ok:
+                    return {'col': dcol, 'ci': ci, 'unit': unit, 'proj': proj,
+                            'lim': wdb_sql._limit(tree), 'order': order}
     knm = wdb_sql._proj_colname(kp)
     group = tree.args.get('group')
     gnm = wdb_sql._colname(group.expressions[0])
@@ -108,6 +136,8 @@ def detect(seg, tree, col_map):
 def execute(seg, spec):
     global _HITS
     col = spec['col']
+    if spec.get('unit'):
+        return _unit_execute(seg, spec)
     steps = seg.stairs(col)
     if steps is None:
         return None
@@ -132,5 +162,45 @@ def execute(seg, spec):
         row[1 - ci] = v
         rows.append(tuple(row))
     rows = workers.finalize(rows, spec['proj'], spec['order'], lim)
+    _HITS += 1
+    return rows, [wdb_sql._alias(p) for p in spec['proj']]
+
+
+def _unit_execute(seg, spec):
+    """The stair-walk: per-code counts from step offsets, unit map over dict values,
+    weighted bincount. Emits unit buckets ordered by count."""
+    global _HITS
+    import wdb_window as WN
+    col = spec['col']
+    steps = seg.stairs(col)
+    if steps is None:
+        return None
+    counts = np.diff(np.concatenate(([0], steps, [seg.N]))).astype(np.int64)
+    tv = np.asarray(WN._int_table(seg, col), dtype=np.int64)
+    if tv.size != counts.size:
+        return None
+    if spec['unit'] == 'hour':
+        key = (tv % 86400) // 3600
+        span = 24
+    else:
+        key = (tv % 3600) // 60
+        span = 60
+    agg = np.bincount(key, weights=counts, minlength=span).astype(np.int64)
+    present = np.flatnonzero(agg)
+    sel = present[np.argsort(-agg[present], kind='stable')] if spec.get('order') is not None \
+        else present
+    lim = spec['lim']
+    if lim is not None:
+        if spec.get('order') is not None and lim < sel.size \
+                and int(agg[sel[lim - 1]]) == int(agg[sel[lim]]):
+            return None                          # tie straddles LIMIT: defer
+        sel = sel[:lim]
+    ci = spec['ci']; ki = 1 - ci
+    rows = []
+    for u in sel.tolist():
+        row = [None, None]
+        row[ki] = int(u)
+        row[ci] = int(agg[u])
+        rows.append(tuple(row))
     _HITS += 1
     return rows, [wdb_sql._alias(p) for p in spec['proj']]

@@ -222,7 +222,58 @@ def _axis_filter(seg, where_node, cols, col_map):
     return (phys, isinstance(n, E.NEQ), codes)
 
 
+def detect_distinct(seg, tree, col_map):
+    """SELECT DISTINCT k1, k2 (bare, unfiltered, unordered): the pair sidecar's key
+    list IS the answer. Serves only a COMPLETE table (lm None); int dicts only (v1)."""
+    if not P.no_joins(tree) or tree.args.get('where') is not None:
+        return None
+    if tree.args.get('group') is not None or tree.args.get('order') is not None:
+        return None
+    if wdb_sql._limit(tree) is not None or wdb_sql._offset(tree):
+        return None
+    if not tree.args.get('distinct'):
+        return None
+    proj = tree.expressions
+    if len(proj) != 2 or not all(isinstance(p, E.Column) for p in proj):
+        return None
+    sc = (lambda c: col_map.get(c, c)) if col_map else (lambda c: c)
+    names = [sc(p.name) for p in proj]
+    for nm in names:
+        c = seg.cols.get(nm)
+        if c is None or c.get('mode') not in (0, 1, 2) or c.get('has_null') \
+                or c.get('dt') != 0:
+            return None
+    if not P.no_deleted_rows(seg):
+        return None
+    return {'distinct': True, 'cols': names, 'proj': proj}
+
+
+def execute_distinct(seg, spec):
+    global _HITS
+    import wdb_window as WN
+    got = _load(seg, tuple(spec['cols']))
+    if got is None:
+        return None
+    cA, cB, cn, lm = got
+    if int(np.asarray(cn).sum()) != int(seg.N):
+        return None                              # singleton pairs exist off-shelf: the gbp
+                                                 # trims count-1 pairs, so it cannot name them
+    a, b = sorted(spec['cols'])
+    tA = np.asarray(WN._int_table(seg, a), dtype=np.int64)
+    tB = np.asarray(WN._int_table(seg, b), dtype=np.int64)
+    vA = tA[np.asarray(cA)]
+    vB = tB[np.asarray(cB)]
+    first_is_a = spec['cols'][0] == a
+    rows = list(zip(vA.tolist(), vB.tolist())) if first_is_a \
+        else list(zip(vB.tolist(), vA.tolist()))
+    _HITS += 1
+    return rows, [wdb_sql._alias(p) for p in spec['proj']]
+
+
 def detect(seg, tree, col_map):
+    d = detect_distinct(seg, tree, col_map)
+    if d is not None:
+        return d
     if not P.no_joins(tree):           return None
     if not P.no_select_distinct(tree): return None
     if not P.no_having(tree):          return None
@@ -281,6 +332,8 @@ def detect(seg, tree, col_map):
 
 
 def execute(seg, spec):
+    if spec.get('distinct'):
+        return execute_distinct(seg, spec)
     global _HITS
     cols = spec['cols']; ci = spec['ci']; lim = spec['lim']; proj = spec['proj']
     knames = spec['knames']; V = spec['V']
