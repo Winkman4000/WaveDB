@@ -123,6 +123,16 @@ class Segment:
                 meta['BR'], nfr = struct.unpack_from('<II', buf, off); off += 8
                 meta['boffs'] = np.frombuffer(buf, dtype=np.uint32, count=nfr+1, offset=off); off += 4*(nfr+1)
                 meta['cstart'] = off; meta['czlen'] = int(meta['boffs'][-1]); off += meta['czlen']
+            elif code_enc == 6:                # warm buckets: hot nibble -> warm byte -> u16 cold
+                meta['cwidth'] = int(buf[off]); off += 1
+                meta['BR'], nb6, nwb, npatch6, nhot = struct.unpack_from('<IIQQH', buf, off); off += 26
+                meta['e5hot'] = np.frombuffer(buf, dtype=np.uint16, count=nhot, offset=off); off += 2*nhot
+                meta['e6warm'] = np.frombuffer(buf, dtype=np.uint16, count=255, offset=off); off += 2*255
+                meta['e6o1'] = np.frombuffer(buf, dtype=np.uint32, count=nb6+1, offset=off); off += 4*(nb6+1)
+                meta['e6o2'] = np.frombuffer(buf, dtype=np.uint32, count=nb6+1, offset=off); off += 4*(nb6+1)
+                meta['e6wb'] = np.frombuffer(buf, dtype=np.uint8, count=nwb, offset=off); off += nwb
+                meta['e5patch'] = np.frombuffer(buf, dtype=np.uint16, count=npatch6, offset=off); off += 2*npatch6
+                meta['cstart'] = off; meta['czlen'] = (self.N + 1) // 2; off += meta['czlen']
             elif code_enc == 5:                # patched buckets: 4-bit hot pointers + escape patches
                 meta['cwidth'] = int(buf[off]); off += 1
                 meta['BR'], nb5, npatch, nhot = struct.unpack_from('<IIQH', buf, off); off += 18
@@ -332,6 +342,15 @@ class Segment:
             st = self.stairs(nm)
             cnts = np.diff(np.concatenate(([0], st, [self.N])))
             cc = np.repeat(np.arange(cnts.size, dtype=self._cdt(cnts.size)), cnts)
+            self._codes[nm] = cc; return cc
+        if c.get('code_enc', 0) == 6:                # warm buckets: parallel two-tier decode
+            import wdb_kernels as _WK
+            pk = np.frombuffer(self.buf, dtype=np.uint8, count=c['czlen'], offset=c['cstart'])
+            cc = _WK.enc6_stream(pk, np.asarray(c['e5hot']), np.asarray(c['e6warm']),
+                                 np.asarray(c['e6wb']), np.asarray(c['e5patch']),
+                                 np.asarray(c['e6o1']).astype(np.int64),
+                                 np.asarray(c['e6o2']).astype(np.int64),
+                                 np.int64(self.N), np.int64(c['BR']))
             self._codes[nm] = cc; return cc
         if c.get('code_enc', 0) == 5:                # patched buckets: parallel nibble decode
             import wdb_kernels as _WK
@@ -741,6 +760,19 @@ class Segment:
         if rows.size == 0:
             return np.empty(0, dtype=np.int64)
         c = self.cols[nm]
+        if c.get('code_enc', 0) == 6 and nm not in self._codes and rows.size < (self.N >> 2):
+            import wdb_kernels as _WK
+            pk = np.frombuffer(self.buf, dtype=np.uint8, count=c['czlen'], offset=c['cstart'])
+            order = np.argsort(rows, kind='stable')
+            rs = np.ascontiguousarray(np.asarray(rows, dtype=np.int64)[order])
+            got = _WK.enc6_at2(pk, np.asarray(c['e5hot']), np.asarray(c['e6warm']),
+                               np.asarray(c['e6wb']), np.asarray(c['e5patch']),
+                               np.asarray(c['e6o1']).astype(np.int64),
+                               np.asarray(c['e6o2']).astype(np.int64), rs,
+                               np.int64(self.N), np.int64(c['BR']))
+            out = np.empty_like(got)
+            out[order] = got
+            return out
         if c.get('code_enc', 0) == 5 and nm not in self._codes and rows.size < (self.N >> 2):
             import wdb_kernels as _WK
             pk = np.frombuffer(self.buf, dtype=np.uint8, count=c['czlen'], offset=c['cstart'])

@@ -775,3 +775,82 @@ def grid2_count(c1, c2, fc, lit, V2, K):
         for k in range(K):
             out[k] += part[t, k]
     return out
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def enc6_stream(packed, hot, warm, wbytes, patches, e1off, e2off, N, BR):
+    """Two-tier patched buckets: 4-bit hot -> 8-bit warm -> u16 cold. Both escape
+    levels carry per-block offsets, so every block decodes independently (prange)."""
+    out = np.empty(N, dtype=np.uint16)
+    nb = (N + BR - 1) // BR
+    for b in prange(nb):
+        lo = b * BR
+        hi = lo + BR
+        if hi > N:
+            hi = N
+        p1 = e1off[b]
+        p2 = e2off[b]
+        for i in range(lo, hi):
+            byte = packed[i >> 1]
+            if (i & 1) == 0:
+                v = np.int64(byte & 0x0F)
+            else:
+                v = np.int64(byte >> 4)
+            if v < 15:
+                out[i] = hot[v]
+            else:
+                w = np.int64(wbytes[p1])
+                p1 += 1
+                if w < 255:
+                    out[i] = warm[w]
+                else:
+                    out[i] = patches[p2]
+                    p2 += 1
+    return out
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def enc6_at2(packed, hot, warm, wbytes, patches, e1off, e2off, rows_sorted, N, BR):
+    """Block-grouped point reads for the two-tier encoding: one bounded nibble+warm
+    sweep per touched block serves every requested row in it."""
+    out = np.empty(rows_sorted.size, dtype=np.int64)
+    nreq = rows_sorted.size
+    starts = np.empty(nreq, dtype=np.int64)
+    for k in range(nreq):
+        starts[k] = rows_sorted[k] // BR
+    run_lo = np.empty(nreq, dtype=np.int64)
+    nruns = 0
+    for k in range(nreq):
+        if k == 0 or starts[k] != starts[k - 1]:
+            run_lo[nruns] = k
+            nruns += 1
+    for r in prange(nruns):
+        k0 = run_lo[r]
+        k1 = run_lo[r + 1] if r + 1 < nruns else nreq
+        b = starts[k0]
+        lo = b * BR
+        last = rows_sorted[k1 - 1]
+        p1 = e1off[b]
+        p2 = e2off[b]
+        k = k0
+        for i in range(lo, last + 1):
+            byte = packed[i >> 1]
+            if (i & 1) == 0:
+                v = np.int64(byte & 0x0F)
+            else:
+                v = np.int64(byte >> 4)
+            val = np.int64(-1)
+            if v < 15:
+                val = np.int64(hot[v])
+            else:
+                w = np.int64(wbytes[p1])
+                p1 += 1
+                if w < 255:
+                    val = np.int64(warm[w])
+                else:
+                    val = np.int64(patches[p2])
+                    p2 += 1
+            while k < k1 and i == rows_sorted[k]:
+                out[k] = val
+                k += 1
+    return out

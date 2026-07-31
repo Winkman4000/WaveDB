@@ -253,6 +253,37 @@ def _code_section(codes, bits, enc5_ok=False):
                   + hot.tobytes() + eo.tobytes() + patches.tobytes() + pk.tobytes())
             if len(e5) <= len(zsec) * 1.25 and (best is not packed or len(e5) < len(best)):
                 best = e5
+            elif V5 > 270:
+                # tag 6 = WARM BUCKETS: hot nibble -> warm byte (255 seats) -> u16 cold.
+                # The two-tier sibling for columns whose top-15 is thin but top-270 is
+                # fat (RegionID 49%->94%). Same 1.25 bar, same block independence.
+                hot255 = np.argsort(cn5)[::-1][:270].astype(np.uint16)
+                warm = hot255[15:270]
+                lutw = np.full(V5, 255, dtype=np.uint8)
+                lutw[warm] = np.arange(255, dtype=np.uint8)
+                em1 = nib == 15                          # nibble escapes (reuse enc-5's hot-15)
+                wb = lutw[arr16[em1]]                    # warm byte per nibble-escape
+                em2pos = wb == 255
+                patches6 = arr16[em1][em2pos].astype(np.uint16)
+                BR5b = 32768
+                nb6 = (Nr + BR5b - 1) // BR5b
+                if Nr:
+                    e1b = np.add.reduceat(em1.astype(np.int64), np.arange(0, Nr, BR5b))
+                    full_e2 = np.zeros(Nr, dtype=np.int64)
+                    idx1 = np.flatnonzero(em1)
+                    full_e2[idx1[em2pos]] = 1
+                    e2b = np.add.reduceat(full_e2, np.arange(0, Nr, BR5b))
+                else:
+                    e1b = np.zeros(0, dtype=np.int64); e2b = np.zeros(0, dtype=np.int64)
+                e1o = np.concatenate([[0], np.cumsum(e1b)]).astype(np.uint32)
+                e2o = np.concatenate([[0], np.cumsum(e2b)]).astype(np.uint32)
+                e6 = (bytes([6, 2]) + struct.pack('<IIQQH', BR5b, nb6, int(wb.size),
+                                                  int(patches6.size), 15)
+                      + hot.tobytes() + warm.tobytes()
+                      + e1o.tobytes() + e2o.tobytes()
+                      + wb.tobytes() + patches6.tobytes() + pk.tobytes())
+                if len(e6) <= len(zsec) * 1.25 and (best is not packed or len(e6) < len(best)):
+                    best = e6
     return best
 
 def _serialize_column(p, zc):
