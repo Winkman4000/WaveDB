@@ -101,7 +101,7 @@ def detect(seg, tree, col_map):
                 else inner.expression.name
             if (P.columns_exist(seg, dcol) and P.not_positional(seg, dcol)
                     and P.no_deleted_rows(seg) and seg._effective(dcol) is None
-                    and seg.cols[dcol].get('dt') == 0
+                    and seg.cols[dcol].get('dt') in (0, 3)
                     and not seg.cols[dcol].get('has_null')):
                 order = tree.args.get('order')
                 ord_ok = order is None
