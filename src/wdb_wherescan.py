@@ -929,6 +929,25 @@ def _atom_mask(seg, a, pos, ccache):
     return np.zeros(pos.size, bool)
 
 
+def _fact_small(a):
+    """np.unique(a, return_inverse=True) without the hidden sort: when the value range
+    is narrow (derived keys like minute 0-59 or LENGTH 0-500, and composites over them),
+    a bincount presence table factorizes in O(N). Identical contract; sorted u; falls
+    back to np.unique for wide or empty inputs."""
+    if a.size == 0:
+        return np.unique(a, return_inverse=True)
+    amin = int(a.min()); amax = int(a.max())
+    span = amax - amin + 1
+    if span > (1 << 20):
+        return np.unique(a, return_inverse=True)
+    shifted = (a - amin).astype(np.int64, copy=False)
+    pres = np.bincount(shifted, minlength=span)
+    uvals = np.flatnonzero(pres)
+    rank = np.empty(span, dtype=np.int64)
+    rank[uvals] = np.arange(uvals.size)
+    return (uvals + amin), rank[shifted]
+
+
 def execute(seg, spec):
     global _HITS
     lo, hi = _span_rows(seg, spec['spans'])
@@ -1180,10 +1199,10 @@ def execute(seg, spec):
     comp = np.zeros(pos.size, dtype=np.int64)
     locals_ = []
     for _k, a in keyarr:
-        u, inv = np.unique(a, return_inverse=True)
+        u, inv = _fact_small(a)
         comp = comp * u.size + inv
         locals_.append(u)
-    g, ginv = np.unique(comp, return_inverse=True)
+    g, ginv = _fact_small(comp)
     cnt = np.bincount(ginv)
     order = np.lexsort((g, -cnt)) if spec['ordered'] else np.arange(g.size)
     if spec.get('having'):
