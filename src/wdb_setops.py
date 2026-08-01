@@ -227,9 +227,29 @@ def _try_fused_union(db, node):
     resid_mask = None
     if resid_sql:
         import sqlglot
+        code_arrs = {gcol: gc, kcol: kc}
         for rs in resid_sql:
             pred = sqlglot.parse_one(rs, read='duckdb')
-            m = wdb_sql._eval_pred(seg, pred, lambda nm2: nm2)
+            m = None
+            if isinstance(pred, (E2.EQ, E2.NEQ)) and isinstance(pred.this, E2.Column) \
+                    and isinstance(pred.expression, E2.Literal):
+                rc = pred.this.name
+                cc2 = seg.cols.get(rc)
+                if cc2 is not None and cc2.get('mode') in (0, 1, 2) \
+                        and not cc2.get('has_null'):
+                    lv = pred.expression.this
+                    code2 = WS._code_of(seg, rc, lv)
+                    arr = code_arrs.get(rc)
+                    if arr is None:
+                        arr = np.asarray(seg._raw_codes(rc)).astype(np.int64)
+                        code_arrs[rc] = arr
+                    if code2 is None:             # literal absent from the dictionary:
+                        m = (np.zeros(arr.size, bool) if isinstance(pred, E2.EQ)
+                             else np.ones(arr.size, bool))
+                    else:                         # CODE SPACE, not value space -- the
+                        m = (arr == code2) if isinstance(pred, E2.EQ) else (arr != code2)
+            if m is None:                         # value-space _eval_pred was 2.5s here
+                m = wdb_sql._eval_pred(seg, pred, lambda nm2: nm2)
             if m is None:
                 return None
             resid_mask = m if resid_mask is None else (resid_mask & m)
