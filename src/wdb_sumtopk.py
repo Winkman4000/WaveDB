@@ -101,7 +101,12 @@ def execute(seg, spec):
             max_v = int(vt.max()) if vt.size else 0
             need0 = lim + off
             B = max(need0 * 64, 8192)
-            while B < K and max_v > 0:
+            # STEEPNESS GATE: the stop line only clears when the count curve has a
+            # head. Flat distributions (ClientIP: households, ~uniform) loop the walk
+            # then full-pour anyway -- worse than honest pouring. Require the head to
+            # tower over the tier edge before attempting the walk at all.
+            steep = (hn.size > B and int(hn[0]) >= 8 * int(hn[B]))
+            while steep and B < K and max_v > 0:
                 if B >= hc.size:
                     cand = hc; next_count = 1
                 else:
