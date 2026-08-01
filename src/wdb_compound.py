@@ -161,7 +161,12 @@ def _resolve(seg, conjuncts):
             cc = _codes_in_ranges(seg, col, los, his)
             if op == 'in':
                 cs = [x for x in (_code_of(seg, col, v) for v in cj['const']) if x is not None and x >= 0]
-                m = np.isin(cc, np.array(cs)) if cs else np.zeros(n, bool)
+                if cs:
+                    fl = np.zeros(int(c['V']), bool)      # membership in code space is a
+                    fl[np.asarray(cs, dtype=np.int64)] = True   # V-sized flag + one gather,
+                    m = fl[cc.astype(np.int64, copy=False)]     # not a sort (np.isin was
+                else:                                     # 332ms of sq-nested's 753)
+                    m = np.zeros(n, bool)
             else:
                 cd = _code_of(seg, col, int(cj['const']))
                 if cd is None: return None
