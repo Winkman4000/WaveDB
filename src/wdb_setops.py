@@ -235,6 +235,8 @@ def _try_fused_union(db, node):
             resid_mask = m if resid_mask is None else (resid_mask & m)
     V = int(seg.cols[gcol]['V'])
     rows = []
+    full_dict = None                              # decoded ONCE, shared by every branch
+    cache = {}
     for code in kcodes:
         if code is None:
             continue                              # literal absent: branch yields nothing
@@ -243,17 +245,28 @@ def _try_fused_union(db, node):
             m = m & resid_mask
         cnts = np.bincount(gc[m], minlength=V)
         pres = np.nonzero(cnts)[0]
-        cache = {}
-        for gcd in pres.tolist():
-            v = cache.get(gcd)
-            if v is None:
-                v = wdb_sql._pyval(seg.fetch(gcol, gcd))
-                if isinstance(v, (bytes, bytearray)):
-                    v = v.decode('utf-8', 'replace')
-                cache[gcd] = v
+        if pres.size > 5000 and full_dict is None:
+            dv = seg._typed_dict(gcol)            # wherescan's bulk strategy: one full
+            full_dict = np.array([wdb_sql._pyval(x) for x in dv], dtype=object)
+        if full_dict is not None:
+            vals = full_dict[pres]
+            vals = [v.decode('utf-8', 'replace') if isinstance(v, (bytes, bytearray))
+                    else v for v in vals.tolist()]
+        else:
+            vals = []
+            for gcd in pres.tolist():
+                v = cache.get(gcd)
+                if v is None:
+                    v = wdb_sql._pyval(seg.fetch(gcol, gcd))
+                    if isinstance(v, (bytes, bytearray)):
+                        v = v.decode('utf-8', 'replace')
+                    cache[gcd] = v
+                vals.append(v)
+        cl = cnts[pres].tolist()
+        for i2, v in enumerate(vals):
             row = [None, None]
             row[1 - ci] = v
-            row[ci] = int(cnts[gcd])
+            row[ci] = int(cl[i2])
             rows.append(tuple(row))
     global _HITS
     _HITS += 1
