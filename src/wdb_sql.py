@@ -1343,10 +1343,14 @@ def _eval_pred(seg, node, seg_col):
         col=_colname(node.this)
         kcs = node.args.get('_codes')
         if kcs is not None:
-            # same-column subquery pre-resolved to a CODE SET upstream: membership over raw
-            # codes, no strings anywhere (NULL never matches: the null code is not in the set)
-            return np.isin(np.asarray(seg._raw_codes(seg_col(col))).astype(np.int64),
-                           np.asarray(kcs, dtype=np.int64))
+            # same-column subquery pre-resolved to a CODE SET upstream: membership in code
+            # space is a V-sized flag and one NATIVE-WIDTH gather, not a sort (np.isin +
+            # int64 cast were 390ms of sq-nested; NULL never matches: not in the set)
+            arr = np.asarray(seg._raw_codes(seg_col(col)))
+            V0 = int(seg.cols[seg_col(col)].get('V') or int(arr.max()) + 1)
+            fl = np.zeros(V0, bool)
+            fl[np.asarray(kcs, dtype=np.int64)] = True
+            return fl[arr]
         if node.args.get('query') is not None:
             raise NotImplementedError("IN with unresolved subquery")
         lits=node.args.get('expressions') or []
@@ -1358,7 +1362,12 @@ def _eval_pred(seg, node, seg_col):
             import wdb_wherescan as _WS
             vals0 = [(L.this if L.is_string else str(L.this)) for L in lits]
             tcs = _WS._in_codes(seg, seg_col(col), vals0)
-            return np.isin(np.asarray(seg._raw_codes(seg_col(col))).astype(np.int64), tcs)
+            arr = np.asarray(seg._raw_codes(seg_col(col)))
+            V0 = int(seg.cols[seg_col(col)].get('V') or int(arr.max()) + 1)
+            fl = np.zeros(V0, bool)
+            tcs2 = np.asarray(tcs, dtype=np.int64)
+            fl[tcs2[(tcs2 >= 0) & (tcs2 < V0)]] = True
+            return fl[arr]                       # flag + native gather, not a 100M sort
         a, nmask = _col(seg, seg_col(col))
         vals=[]
         for L in lits:
