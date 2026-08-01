@@ -336,9 +336,17 @@ def _stream_dump(db, tree, fact_tn, fkey, fact_conds, dmap, need, attr_idx,
         if m is None:
             m = np.ones(hi - lo, bool)
         return (np.nonzero(m)[0] + lo).astype(np.int64)
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=len(starts)) as ex:
-        survivors = list(ex.map(_pop, starts))
+    first = _pop(starts[0])
+    if first.size >= lim:                        # front-loaded matches: one pop fills
+        survivors = [first]                      # the cart (j-dump's old fast case)
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        rest = starts[1:]
+        if rest:
+            with ThreadPoolExecutor(max_workers=len(rest)) as ex:
+                survivors = [first] + list(ex.map(_pop, rest))
+        else:
+            survivors = [first]
     quota = -(-lim // len(survivors))
     hits = []
     for sv in survivors:
