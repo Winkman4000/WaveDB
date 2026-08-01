@@ -409,8 +409,6 @@ def _giant_m2o(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey,
         dk_vals = WN._int_table(dseg, dkey)
     except Exception:
         return None                              # v1: integer-valued key dictionaries
-    # the introduction: in memory, per query -- the engine writes nothing
-    trans = _introduce(fk_vals, dk_vals)
     # dim row per key code (m2o requires unique keys)
     dkc = np.asarray(dseg._raw_codes(dkey)).astype(np.int64)
     N2 = int(dseg.N)
@@ -422,8 +420,6 @@ def _giant_m2o(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey,
     for c in dim_conds:
         keep_dim &= wdb_sql._eval_pred(dseg, _strip_qual(c),
                                        lambda nm: nm)
-    rowof = np.full(dk_vals.size, -1, dtype=np.int64)
-    rowof[dkc[keep_dim]] = np.nonzero(keep_dim)[0]
     # compose the WHOLE chain at dictionary scale: fact key code -> dim row -> composed
     # attr cell, every link V-sized -- the 100M fact rows then pay exactly ONE gather
     # (the old path gathered trans[fkc] twice, rowof once, and each attr once, all at N)
@@ -442,12 +438,18 @@ def _giant_m2o(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey,
     comp_dim = acodes_all[0]                     # composed cell per DIM ROW (N2-sized)
     for i in range(1, len(acodes_all)):
         comp_dim = comp_dim * spans[i] + acodes_all[i]
+    # FILTER-FIRST (Jackson's order): the dim constraint shrinks the phone book
+    # BEFORE anyone opens it. Only surviving cards look themselves up in the
+    # sorted fact dictionary -- |survivors| searchsorteds instead of 17.6M --
+    # and the wall chart is scattered directly from the survivors. The old
+    # translate-everything _introduce and its rowof gymnastics are deleted.
+    keep_rows = np.nonzero(keep_dim)[0]
+    vip_keys = dk_vals[dkc[keep_rows]]
+    pos = np.searchsorted(fk_vals, vip_keys)
+    posc = np.minimum(pos, fk_vals.size - 1)
+    okk = fk_vals[posc] == vip_keys
     cell_of = np.full(fk_vals.size, np.int64(-1))
-    okm = trans >= 0
-    ro = np.full(fk_vals.size, -1, np.int64)
-    ro[okm] = rowof[trans[okm]]                  # dim row per fact key code (-1: filtered)
-    okm &= ro >= 0
-    cell_of[okm] = comp_dim[ro[okm]]
+    cell_of[posc[okk]] = comp_dim[keep_rows[okk]]
     # fact side -- Jackson's fold: the aggregate is keyed ONLY by dim attributes, so
     # count at NAME scale first (one bincount of raw key codes; beans need no order),
     # then fold the 17.6M-entry name board into the cell board at dictionary scale.
