@@ -146,6 +146,10 @@ def _try_fused_union(db, node):
     eq-literal on a shared column walk the books ONCE. Shared reads, shared residual
     mask, one bincount per branch, per-branch tally sheets kept separate as UNION ALL
     demands. v1 gate: single table, single group key, COUNT(*) only, same residuals."""
+    # DORMANT: exact and suite-green, but at 792ms vs wherescan's 585 on u-order the
+    # read side still owes tuning (span-parallel column decodes). Arm by deleting
+    # this return once the reads match wherescan's.
+    return None
     import numpy as np
     import wdb_sql, sqlglot.expressions as E2
     import wdb_wherescan as WS
