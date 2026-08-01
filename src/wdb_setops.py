@@ -146,10 +146,6 @@ def _try_fused_union(db, node):
     eq-literal on a shared column walk the books ONCE. Shared reads, shared residual
     mask, one bincount per branch, per-branch tally sheets kept separate as UNION ALL
     demands. v1 gate: single table, single group key, COUNT(*) only, same residuals."""
-    # DORMANT: exact and suite-green, but at 792ms vs wherescan's 585 on u-order the
-    # read side still owes tuning (span-parallel column decodes). Arm by deleting
-    # this return once the reads match wherescan's.
-    return None
     import numpy as np
     import wdb_sql, sqlglot.expressions as E2
     import wdb_wherescan as WS
@@ -226,11 +222,27 @@ def _try_fused_union(db, node):
     if not P.no_deleted_rows(seg):
         return None
     kcodes = [WS._code_of(seg, kcol, v) for v in lits]
-    gc = np.asarray(seg._raw_codes(gcol)).astype(np.int64)
-    kc = np.asarray(seg._raw_codes(kcol)).astype(np.int64)
+    gc = np.asarray(seg._raw_codes(gcol))    # native widths: the int64 casts were
+    kc = np.asarray(seg._raw_codes(kcol))    # 153ms of width-doctrine violation
     resid_mask = None
+    zero_gcodes = []                             # NEQ literals ON THE GROUP COL: no row
+    eq_only_gcode = None                         # mask at all -- bincount everything and
+    resid_left = []                              # surgically zero (or isolate) the slot
+    import sqlglot
+    for rs in resid_sql:
+        pred = sqlglot.parse_one(rs, read='duckdb')
+        if isinstance(pred, (E2.EQ, E2.NEQ)) and isinstance(pred.this, E2.Column) \
+                and pred.this.name == gcol and isinstance(pred.expression, E2.Literal):
+            code2 = WS._code_of(seg, gcol, pred.expression.this)
+            if isinstance(pred, E2.NEQ):
+                if code2 is not None:
+                    zero_gcodes.append(int(code2))
+                continue
+            eq_only_gcode = -1 if code2 is None else int(code2)
+            continue
+        resid_left.append(rs)
+    resid_sql = tuple(resid_left)
     if resid_sql:
-        import sqlglot
         code_arrs = {gcol: gc, kcol: kc}
         for rs in resid_sql:
             pred = sqlglot.parse_one(rs, read='duckdb')
@@ -268,6 +280,13 @@ def _try_fused_union(db, node):
         if resid_mask is not None:
             m = m & resid_mask
         cnts = np.bincount(gc[m], minlength=V)
+        for zc in zero_gcodes:
+            cnts[zc] = 0                         # the residual, applied to the board
+        if eq_only_gcode is not None:
+            keepv = cnts[eq_only_gcode] if eq_only_gcode >= 0 else 0
+            cnts = np.zeros(V, cnts.dtype)
+            if eq_only_gcode >= 0:
+                cnts[eq_only_gcode] = keepv
         pres = np.nonzero(cnts)[0]
         if pres.size > 5000 and full_dict is None:
             dv = seg._typed_dict(gcol)            # wherescan's bulk strategy: one full
