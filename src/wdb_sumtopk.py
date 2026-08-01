@@ -84,64 +84,16 @@ def execute(seg, spec):
     vc = np.asarray(seg._raw_codes(val))
     vt = np.asarray(W._int_table(seg, val), dtype=np.int64)
     K = int(seg.cols[key]['V'])
-    # JACKSON'S FREQUENCY WALK, flag edition: the gbc stores houses count-descending
-    # (the itinerary); a CACHE-RESIDENT bool flag (K bytes of query-lifetime scratch,
-    # ~9.7MB for ClientIP -- fits the pocket) selects candidate rows; only those pour,
-    # compact. Stop line: a skipped house at count c can never beat c * max_value;
-    # the shelf's own numbers clear it 9x in round one. One retry, then honest pour.
-    fastdone = False
-    topvals = None
-    if K > 200_000 and P.no_deleted_rows(seg):
-        import wdb_gbcount
-        loaded = wdb_gbcount._load(seg, key)
-        max_v = int(vt.max()) if vt.size else 0
-        if loaded is not None and max_v > 0:
-            hc = np.asarray(loaded[0]).astype(np.int64)
-            hn = np.asarray(loaded[1]).astype(np.int64)
-            need0 = lim + off
-            B = max(need0 * 64, 8192)
-            for _round in (0, 1):
-                if B >= hc.size:
-                    cand = hc; next_count = 1
-                else:
-                    cand = hc[:B]; next_count = int(hn[B])
-                flag = np.zeros(K, dtype=bool)
-                flag[cand] = True
-                m = flag[kc]
-                kc_sel = kc[m]
-                v_sel = vt[np.asarray(vc)[m]]
-                cs_sorted = np.sort(cand)
-                idx = np.searchsorted(cs_sorted, kc_sel)
-                csums = np.bincount(idx, weights=v_sel,
-                                    minlength=cs_sorted.size).astype(np.int64)
-                if need0 < csums.size:
-                    part = np.argpartition(csums, csums.size - need0)[csums.size - need0:]
-                else:
-                    part = np.arange(csums.size)
-                kth = int(csums[part].min()) if part.size else 0
-                if kth >= next_count * max_v:
-                    top_local = part[np.argsort(csums[part])[::-1]]
-                    top_local = top_local[np.lexsort((cs_sorted[top_local],
-                                                      -csums[top_local]))][off:off + lim]
-                    top = cs_sorted[top_local]
-                    topvals = {int(cs_sorted[i]): int(csums[i])
-                               for i in top_local.tolist()}
-                    fastdone = True
-                    break
-                B *= 8
-    if not fastdone:
-        sums = WK.grouped_sum_codes(kc, vc, vt, K)
+    sums = WK.grouped_sum_codes(kc, vc, vt, K)
     need = lim + off
-    if fastdone:
-        pass
-    elif need >= K:
+    if need >= K:
         top = np.argsort(sums)[::-1][:need]
     else:
         part = np.argpartition(sums, K - need)[K - need:]
         top = part[np.argsort(sums[part])[::-1]]
-    if not fastdone:
-        # ties at the boundary: deterministic: sums desc, then code asc
-        top = top[np.lexsort((top, -sums[top]))][off:off + lim]
+    # ties at the boundary: SQL any-order among equals is fine for M-kind, but be
+    # deterministic: sums desc, then code asc
+    top = top[np.lexsort((top, -sums[top]))][off:off + lim]
     rows = []
     ki, si = spec['ki'], spec['si']
     for code in top.tolist():
@@ -150,7 +102,7 @@ def execute(seg, spec):
             v = v.decode('utf-8', 'replace')
         row = [None, None]
         row[ki] = v
-        row[si] = int(topvals[int(code)]) if topvals is not None else int(sums[code])
+        row[si] = int(sums[code])
         rows.append(tuple(row))
     _HITS += 1
     return rows, [wdb_sql._alias(p) for p in spec['proj']]
