@@ -84,67 +84,16 @@ def execute(seg, spec):
     vc = np.asarray(seg._raw_codes(val))
     vt = np.asarray(W._int_table(seg, val), dtype=np.int64)
     K = int(seg.cols[key]['V'])
-    # JACKSON'S FREQUENCY WALK (the Fagin bound, reinvented): the gbc stores houses
-    # in count-descending order -- the walk's exact itinerary, already on the shelf.
-    # Pour ONLY the top-B houses into a compact board (everyone else into one trash
-    # cup: the existing kernel, relabeled -- zero new kernels), then check the stop
-    # line: a skipped house at count c can never exceed c * max_value, so once the
-    # need-th best candidate clears next_count * max_value the answer is PROVEN.
-    # Zipf stops it in one round; the loop widens and re-pours if ever not.
-    fastdone = False
-    if K > 200_000 and P.no_deleted_rows(seg):
-        import wdb_gbcount
-        loaded = wdb_gbcount._load(seg, key)
-        if loaded is not None:
-            hc, hn = loaded
-            hc = np.asarray(hc).astype(np.int64); hn = np.asarray(hn).astype(np.int64)
-            max_v = int(vt.max()) if vt.size else 0
-            need0 = lim + off
-            B = max(need0 * 64, 8192)
-            # STEEPNESS GATE: the stop line only clears when the count curve has a
-            # head. Flat distributions (ClientIP: households, ~uniform) loop the walk
-            # then full-pour anyway -- worse than honest pouring. Require the head to
-            # tower over the tier edge before attempting the walk at all.
-            steep = (hn.size > B and int(hn[0]) >= 8 * int(hn[B]))
-            while steep and B < K and max_v > 0:
-                if B >= hc.size:
-                    cand = hc; next_count = 1
-                else:
-                    cand = hc[:B]; next_count = int(hn[B])
-                rank = np.full(K, cand.size, dtype=np.int64)
-                rank[cand] = np.arange(cand.size)
-                cups = WK.grouped_sum_codes(rank[kc], vc, vt, int(cand.size) + 1)
-                cs = cups[:cand.size]
-                if need0 < cs.size:
-                    part = np.argpartition(cs, cs.size - need0)[cs.size - need0:]
-                else:
-                    part = np.arange(cs.size)
-                kth = int(cs[part].min()) if part.size else 0
-                if kth >= next_count * max_v:
-                    sums_sp = cs
-                    top_local = part[np.argsort(cs[part])[::-1]]
-                    top_local = top_local[np.lexsort((cand[top_local],
-                                                      -cs[top_local]))][off:off + lim]
-                    top = cand[top_local]
-                    sums = None
-                    topvals = {int(cand[i]): int(cs[i]) for i in top_local.tolist()}
-                    fastdone = True
-                    break
-                B *= 8
-    if not fastdone:
-        sums = WK.grouped_sum_codes(kc, vc, vt, K)
-        topvals = None
+    sums = WK.grouped_sum_codes(kc, vc, vt, K)
     need = lim + off
-    if fastdone:
-        pass
-    elif need >= K:
+    if need >= K:
         top = np.argsort(sums)[::-1][:need]
     else:
         part = np.argpartition(sums, K - need)[K - need:]
         top = part[np.argsort(sums[part])[::-1]]
-    if not fastdone:
-        # ties at the boundary: deterministic: sums desc, then code asc
-        top = top[np.lexsort((top, -sums[top]))][off:off + lim]
+    # ties at the boundary: SQL any-order among equals is fine for M-kind, but be
+    # deterministic: sums desc, then code asc
+    top = top[np.lexsort((top, -sums[top]))][off:off + lim]
     rows = []
     ki, si = spec['ki'], spec['si']
     for code in top.tolist():
@@ -153,7 +102,7 @@ def execute(seg, spec):
             v = v.decode('utf-8', 'replace')
         row = [None, None]
         row[ki] = v
-        row[si] = int(topvals[int(code)]) if topvals is not None else int(sums[code])
+        row[si] = int(sums[code])
         rows.append(tuple(row))
     _HITS += 1
     return rows, [wdb_sql._alias(p) for p in spec['proj']]
