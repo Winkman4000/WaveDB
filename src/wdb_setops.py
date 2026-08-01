@@ -9,6 +9,7 @@ arity mismatches raise loudly (never silently truncate).
 import sqlglot.expressions as E
 
 _SETOPS = (E.Union, E.Intersect, E.Except)
+_HITS = 0
 
 
 def is_setop(tree):
@@ -140,12 +141,135 @@ def _union_codes(db, node):
     return rows, [C]
 
 
+def _try_fused_union(db, node):
+    """One motion (Jackson's order): UNION ALL branches that differ only by one
+    eq-literal on a shared column walk the books ONCE. Shared reads, shared residual
+    mask, one bincount per branch, per-branch tally sheets kept separate as UNION ALL
+    demands. v1 gate: single table, single group key, COUNT(*) only, same residuals."""
+    import numpy as np
+    import wdb_sql, sqlglot.expressions as E2
+    import wdb_wherescan as WS
+    import wdb_policies as P
+    leaves = []
+    def walk(n):
+        if isinstance(n, E2.Union):
+            if n.args.get('distinct'):
+                return False
+            return walk(n.this) and walk(n.expression)
+        if isinstance(n, E2.Select):
+            leaves.append(n)
+            return True
+        return False
+    if not walk(node) or len(leaves) < 2:
+        return None
+    sig = None; lits = []
+    for t in leaves:
+        if t.args.get('joins') or t.args.get('having') or t.args.get('qualify') \
+                or t.args.get('order') or wdb_sql._limit(t) is not None:
+            return None
+        g = t.args.get('group')
+        if g is None or len(g.expressions) != 1 or not isinstance(g.expressions[0], E2.Column):
+            return None
+        gcol = g.expressions[0].name
+        proj = t.expressions
+        if len(proj) != 2:
+            return None
+        ks = [wdb_sql._agg_kind(p) for p in proj]
+        if sorted(x[0] if x else 'COL' for x in (ks[0], ks[1]) if True) != ['COL', 'COUNT_STAR']:
+            if not ((ks[0] is None and ks[1] and ks[1][0] == 'COUNT_STAR')
+                    or (ks[1] is None and ks[0] and ks[0][0] == 'COUNT_STAR')):
+                return None
+        ci = 0 if (ks[0] and ks[0][0] == 'COUNT_STAR') else 1
+        pk = proj[1 - ci]
+        if wdb_sql._proj_colname(pk) != gcol:
+            return None
+        tbl = t.args.get('from_') or t.args.get('from')
+        tn = tbl.this.name if tbl is not None and isinstance(tbl.this, E2.Table) else None
+        if tn is None:
+            return None
+        w = t.args.get('where')
+        if w is None:
+            return None
+        conjs = list(w.this.flatten()) if isinstance(w.this, E2.And) else [w.this]
+        eqs = [c for c in conjs
+               if isinstance(c, E2.EQ) and isinstance(c.this, E2.Column)
+               and c.expression.is_string or
+               (isinstance(c, E2.EQ) and isinstance(c.this, E2.Column)
+                and isinstance(c.expression, E2.Literal))]
+        eqs = [c for c in conjs if isinstance(c, E2.EQ) and isinstance(c.this, E2.Column)
+               and isinstance(c.expression, E2.Literal)]
+        if len(eqs) != 1:
+            return None
+        kcol = eqs[0].this.name
+        lit = eqs[0].expression.this
+        resid = sorted(c.sql() for c in conjs if c is not eqs[0])
+        this_sig = (tn, gcol, kcol, tuple(resid), ci,
+                    tuple(wdb_sql._alias(p) for p in proj))
+        if sig is None:
+            sig = this_sig
+        elif this_sig != sig:
+            return None
+        lits.append(lit)
+    tn, gcol, kcol, resid_sql, ci, hdr = sig
+    paths = db.cat.segment_paths(tn)
+    if len(paths) != 1:
+        return None
+    seg = db.open_segment(paths[0], tn)
+    for nm in (gcol, kcol):
+        c = seg.cols.get(nm)
+        if c is None or c.get('mode') not in (0, 1, 2) or c.get('has_null'):
+            return None
+    if not P.no_deleted_rows(seg):
+        return None
+    kcodes = [WS._code_of(seg, kcol, v) for v in lits]
+    gc = np.asarray(seg._raw_codes(gcol)).astype(np.int64)
+    kc = np.asarray(seg._raw_codes(kcol)).astype(np.int64)
+    resid_mask = None
+    if resid_sql:
+        import sqlglot
+        for rs in resid_sql:
+            pred = sqlglot.parse_one(rs, read='duckdb')
+            m = wdb_sql._eval_pred(seg, pred, lambda nm2: nm2)
+            if m is None:
+                return None
+            resid_mask = m if resid_mask is None else (resid_mask & m)
+    V = int(seg.cols[gcol]['V'])
+    rows = []
+    for code in kcodes:
+        if code is None:
+            continue                              # literal absent: branch yields nothing
+        m = kc == code
+        if resid_mask is not None:
+            m = m & resid_mask
+        cnts = np.bincount(gc[m], minlength=V)
+        pres = np.nonzero(cnts)[0]
+        cache = {}
+        for gcd in pres.tolist():
+            v = cache.get(gcd)
+            if v is None:
+                v = wdb_sql._pyval(seg.fetch(gcol, gcd))
+                if isinstance(v, (bytes, bytearray)):
+                    v = v.decode('utf-8', 'replace')
+                cache[gcd] = v
+            row = [None, None]
+            row[1 - ci] = v
+            row[ci] = int(cnts[gcd])
+            rows.append(tuple(row))
+    global _HITS
+    _HITS += 1
+    return rows, list(hdr)
+
+
 def _eval(db, node, esc):
     if isinstance(node, _SETOPS):
         if isinstance(node, E.Union) and node.args.get('distinct'):
             fast = _union_codes(db, node)
             if fast is not None:
                 return fast
+        if isinstance(node, E.Union) and not node.args.get('distinct'):
+            fused = _try_fused_union(db, node)
+            if fused is not None:
+                return fused
         lrows, lhdr = _eval(db, node.this, esc)
         rrows, rhdr = _eval(db, node.expression, esc)
         if lrows and rrows and len(lrows[0]) != len(rrows[0]):
