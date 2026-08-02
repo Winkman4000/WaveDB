@@ -326,6 +326,22 @@ def _stream_dump(db, tree, fact_tn, fkey, fact_conds, dmap, need, attr_idx,
         if not left:
             kcb = np.asarray(fseg._raw_codes_range(fkey, lo, hi)).astype(np.int64)
             m = flag[kcb]
+            surv = np.nonzero(m)[0]
+            # TWO-STAGE HUNT (Jackson's alignment order): when the flag runs thin,
+            # the thick columns downgrade from streams to TOUCHES -- read them only
+            # at the survivors' positions (partial-frame targeted), never as blocks.
+            # Presence tests like sp<>'' are code!=0 at those rows: no decode ever.
+            if conds and 0 < surv.size and surv.size * 20 < (hi - lo):
+                rows_abs = (surv.astype(np.int64) + lo)
+                keep = np.ones(surv.size, bool)
+                for nm, tn, code in conds:
+                    cb = np.asarray(fseg.codes_at(nm, rows_abs)).astype(np.int64)
+                    if code is None:
+                        cm = np.zeros(cb.size, bool) if tn == 'EQ' else np.ones(cb.size, bool)
+                    else:
+                        cm = (cb == code) if tn == 'EQ' else (cb != code)
+                    keep &= cm
+                return rows_abs[keep]
         for nm, tn, code in conds:
             cb = np.asarray(fseg._raw_codes_range(nm, lo, hi)).astype(np.int64)
             if code is None:
