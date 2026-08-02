@@ -211,14 +211,6 @@ def _code_section(codes, bits, enc5_ok=False):
     z = zstd.ZstdCompressor(level=CODE_ZSTD_LEVEL).compress(np.asarray(codes, dtype=wdt).tobytes())
     zsec = bytes([1, width]) + struct.pack('<I', len(z)) + z
     best = min((s for s in (stair, zsec, packed) if s is not None), key=len)
-    # THE THROUGHPUT LAW (Jackson's ratio): a giant's zstd gain is ORDER-shaped --
-    # the shuffle trial proved it cashable only by sequential decode, ~0.7 GB/s of
-    # manufactured bytes charged per read, forever, under cold-truth. Bitpack reads
-    # at memory speed with O(1) point access and every reader fluent since v1. For
-    # giants (bits > 16), packed takes the crown when within 1.30x of the seal:
-    # bytes are paid once; decode is paid always.
-    if best is zsec and bits > 16 and len(packed) <= len(zsec) * 1.30:
-        best = packed
     if best is zsec:
         # tag 3 = BLOCKED frames: independent zstd frame per BLOCK_ROWS rows + a frame offset
         # index. Buys pop/scan/prune access (touched frames only, ~0.6 ms/frame) for a measured
