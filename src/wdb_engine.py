@@ -123,6 +123,13 @@ class Segment:
                 meta['BR'], nfr = struct.unpack_from('<II', buf, off); off += 8
                 meta['boffs'] = np.frombuffer(buf, dtype=np.uint32, count=nfr+1, offset=off); off += 4*(nfr+1)
                 meta['cstart'] = off; meta['czlen'] = int(meta['boffs'][-1]); off += meta['czlen']
+            elif code_enc == 8:                # sparse-default: presence + checkpoints + literals
+                meta['e8bits'] = int(buf[off]); off += 1
+                meta['e8d'], meta['e8n'], e8rows = struct.unpack_from('<IQQ', buf, off); off += 20
+                meta['e8pres'] = off; off += (e8rows + 7) // 8
+                meta['e8ck'] = off; off += ((e8rows + 65535) // 65536) * 8
+                meta['cstart'] = off
+                off += (meta['e8n'] * meta['e8bits'] + 7) // 8
             elif code_enc == 6:                # warm buckets: hot nibble -> warm byte -> u16 cold
                 meta['cwidth'] = int(buf[off]); off += 1
                 meta['BR'], nb6, nwb, npatch6, nhot = struct.unpack_from('<IIQQH', buf, off); off += 26
@@ -372,6 +379,17 @@ class Segment:
                                  np.asarray(c['e5off']).astype(np.int64),
                                  np.int64(self.N), np.int64(c['BR']))
             self._codes[nm] = cc; return cc
+        if c.get('code_enc', 0) == 8:                # sparse-default: expand + scatter
+            up = np.unpackbits(np.asarray(self.buf[c['e8pres']:c['e8pres'] + (self.N + 7) // 8],
+                                          dtype=np.uint8), count=self.N).astype(bool)
+            out8 = np.full(self.N, c['e8d'], dtype=np.uint32)
+            if c['e8n']:
+                import wdb_kernels as _WK
+                lb = np.ascontiguousarray(
+                    self.buf[c['cstart']:c['cstart'] + (c['e8n'] * c['e8bits'] + 7) // 8 + 5])
+                lits8 = _WK.unpack_any(lb, c['e8n'], c['e8bits'])
+                out8[np.nonzero(up)[0]] = lits8
+            self._codes[nm] = out8; return out8
         if c.get('code_enc', 0) == 1:                # zstd of byte-aligned codes (clustered/skewed)
             raw = self._dz.decompress(self.buf[c['cstart']:c['cstart']+c['czlen']].tobytes())
             wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
@@ -740,7 +758,25 @@ class Segment:
         """Per-row codes for rows [lo, hi) ONLY. Raw bit-packed columns (code_enc 0) touch just
         the covering bytes -- the narrow-before-expand read. mode 4/6 are positional (free slice).
         Other encodings full-decode then slice (correct; bigger win awaits block decode)."""
-        if self.cols[nm].get('code_enc', 0) in (5, 6):
+        enc_r = self.cols[nm].get('code_enc', 0)
+        if enc_r == 8:                               # rank arithmetic: checkpoint + local bits
+            c = self.cols[nm]
+            pb = np.asarray(self.buf[c['e8pres']:c['e8pres'] + (self.N + 7) // 8], dtype=np.uint8)
+            ck = np.frombuffer(self.buf[c['e8ck']:c['e8ck'] + ((self.N + 65535) // 65536) * 8],
+                               dtype=np.uint64)
+            cb = lo >> 16
+            base_row = cb << 16
+            up = np.unpackbits(pb[base_row >> 3:(hi + 7) >> 3],
+                               count=hi - base_row).astype(bool)
+            rank_lo = int(ck[cb]) + int(up[:lo - base_row].sum())
+            seg8 = up[lo - base_row:]
+            nlit = int(seg8.sum())
+            out8 = np.full(hi - lo, c['e8d'], dtype=np.uint32)
+            if nlit:
+                lits8 = self._bitunpack(c['cstart'], rank_lo, rank_lo + nlit, c['e8bits'])
+                out8[np.nonzero(seg8)[0]] = lits8
+            return out8
+        if enc_r in (5, 6):
             return self._raw_codes(nm)[lo:hi]    # bucket tags: the range reader predates them;
                                                  # the cached full decode is exact and 54ms-class
         if lo >= hi:

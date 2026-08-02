@@ -864,3 +864,31 @@ def unpack24_be(b, n):
         j = i * 3
         out[i] = (np.uint32(b[j]) << 16) | (np.uint32(b[j + 1]) << 8) | np.uint32(b[j + 2])
     return out
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def unpack_any(b, n, bits):
+    """MSB-first bitpack -> uint32 at any width <= 25, parallel. The sparse dress's
+    literal lane; the generic sliding-window unpacker cost 400ms where this costs ~40."""
+    out = np.empty(n, dtype=np.uint32)
+    mask = np.uint64((1 << bits) - 1)
+    safe = n - 3 if n > 3 else 0
+    for i in prange(safe):
+        o = i * bits
+        j = o >> 3
+        sh = o & 7
+        acc = np.uint64(0)
+        for kk in range(5):
+            acc = (acc << np.uint64(8)) | np.uint64(b[j + kk])
+        out[i] = np.uint32((acc >> np.uint64(40 - sh - bits)) & mask)
+    for i in range(safe, n):
+        o = i * bits
+        j = o >> 3
+        sh = o & 7
+        acc = np.uint64(0)
+        nb = len(b) - j
+        for kk in range(5):
+            v = np.uint64(b[j + kk]) if kk < nb else np.uint64(0)
+            acc = (acc << np.uint64(8)) | v
+        out[i] = np.uint32((acc >> np.uint64(40 - sh - bits)) & mask)
+    return out
