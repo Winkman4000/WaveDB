@@ -854,3 +854,13 @@ def enc6_at2(packed, hot, warm, wbytes, patches, e1off, e2off, rows_sorted, N, B
                 out[k] = val
                 k += 1
     return out
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def unpack24_be(b, n):
+    """Byte-aligned 24-bit MSB-first lanes -> uint32: the throughput law's read."""
+    out = np.empty(n, dtype=np.uint32)
+    for i in prange(n):
+        j = i * 3
+        out[i] = (np.uint32(b[j]) << 16) | (np.uint32(b[j + 1]) << 8) | np.uint32(b[j + 2])
+    return out

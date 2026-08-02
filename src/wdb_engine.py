@@ -284,6 +284,18 @@ class Segment:
         _od = np.uint8 if bits <= 8 else (np.uint16 if bits <= 16 else (np.uint32 if bits <= 32 else np.int64))
         out = np.empty(n, dtype=_od)
         if n <= 0: return out
+        if bits % 8 == 0:                        # BYTE-ALIGNED FAST PATH (the throughput
+            w = bits // 8                        # law's read): lanes ARE the memory; the
+            raw = self.buf[base + lo * w: base + hi * w]   # sliding-window machinery cost
+            if w == 1:                           # 1.4s at 100Mx24b -- slower than the
+                return np.asarray(raw, dtype=np.uint8).copy()   # zstd it replaced
+            if w == 2:
+                return np.frombuffer(raw, dtype='>u2').astype(np.uint16)
+            if w == 3:
+                import wdb_kernels as _WK
+                return _WK.unpack24_be(np.ascontiguousarray(raw), n)
+            if w == 4:
+                return np.frombuffer(raw, dtype='>u4').astype(np.uint32)
         mask = np.uint64((1 << bits) - 1); CH = 4_000_000
         for c0 in range(lo, hi, CH):
             c1 = min(c0 + CH, hi)
