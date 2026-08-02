@@ -210,7 +210,32 @@ def _code_section(codes, bits, enc5_ok=False):
     wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[width]
     z = zstd.ZstdCompressor(level=CODE_ZSTD_LEVEL).compress(np.asarray(codes, dtype=wdt).tobytes())
     zsec = bytes([1, width]) + struct.pack('<I', len(z)) + z
-    best = min((s for s in (stair, zsec, packed) if s is not None), key=len)
+    # tag 8 = SPARSE-DEFAULT (Jackson's dress): store nothing for the dominant value.
+    # presence bitmap + rank checkpoints + bitpacked literals. Beat zstd outright on
+    # SearchPhrase (50.4 vs 52.6 MB) with zero decoders; adopted on strict size
+    # dominance only -- no knobs, smaller or nothing.
+    sparse = None
+    cn8 = np.bincount(np.asarray(codes, dtype=np.int64)) if codes.size else np.zeros(0)
+    dflt = int(cn8.argmax()) if cn8.size else 0
+    if codes.size and cn8.size and cn8[dflt] * 2 > codes.size:               # majority default: the only shape it fits
+        pres = (np.asarray(codes, dtype=np.int64) != dflt)
+        lits = np.asarray(codes)[pres]
+        pb = np.packbits(pres)
+        CK = 65536
+        nck = (codes.size + CK - 1) // CK
+        per = np.add.reduceat(pres.astype(np.int64),
+                              np.arange(0, codes.size, CK))
+        ck = np.zeros(nck, dtype=np.uint64)
+        if nck > 1:
+            ck[1:] = np.cumsum(per[:-1]).astype(np.uint64)
+        litp = _pack_codes(lits, bits) if lits.size else b''
+        sparse = (bytes([8, bits]) + struct.pack('<IQQ', dflt, lits.size, codes.size)
+                  + pb.tobytes() + ck.tobytes() + litp)
+    cands8 = [s for s in (stair, zsec, packed, sparse) if s is not None]
+    best = min(cands8, key=len)
+    if sparse is not None and os.environ.get('WDB_E8_FORCE'):
+        best = sparse                            # rehearsal-only: exercise the readers
+
     if best is zsec:
         # tag 3 = BLOCKED frames: independent zstd frame per BLOCK_ROWS rows + a frame offset
         # index. Buys pop/scan/prune access (touched frames only, ~0.6 ms/frame) for a measured
