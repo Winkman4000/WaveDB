@@ -307,8 +307,10 @@ def _code_section(codes, bits, enc5_ok=False):
                       + hot.tobytes() + warm.tobytes()
                       + e1o.tobytes() + e2o.tobytes()
                       + wb.tobytes() + patches6.tobytes() + pk.tobytes())
-                if len(e6) <= len(zsec) * 1.25 and (best is not packed or len(e6) < len(best)):
-                    best = e6
+                if len(e6) < len(best):          # post-hits_4 doctrine: the warm tier
+                    best = e6                    # adopts on STRICT dominance only --
+                                                 # its 1.25x access bar died with the
+                                                 # heir whose tolls it never repaid
     return best
 
 def _serialize_column(p, zc):
