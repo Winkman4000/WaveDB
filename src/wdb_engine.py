@@ -784,6 +784,11 @@ class Segment:
         the covering bytes -- the narrow-before-expand read. mode 4/6 are positional (free slice).
         Other encodings full-decode then slice (correct; bigger win awaits block decode)."""
         enc_r = self.cols[nm].get('code_enc', 0)
+        if enc_r == 8 and (nm in self._codes or hi - lo >= 65536):
+            # STREAMING consumers (block-sized ranges): 382 rank-arithmetic calls cost
+            # ~570ms where ONE shared 3-pass read costs ~150 and every block becomes a
+            # view. Small ranges below keep pure rank arithmetic (point-read economics).
+            return self._raw_codes(nm)[lo:hi]
         if enc_r == 8:                               # rank arithmetic: checkpoint + local bits
             c = self.cols[nm]
             pb = np.asarray(self.buf[c['e8pres']:c['e8pres'] + (self.N + 7) // 8], dtype=np.uint8)
