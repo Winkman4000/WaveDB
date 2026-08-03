@@ -1272,11 +1272,19 @@ def _dict_eq_mask(seg, name, neg, lit):
     if c.get('code_enc') == 8 and not c.get('has_null'):
         import wdb_wherescan as _WS
         dcode = _WS._code_of(seg, name, lit)
-        if dcode is not None and int(dcode) == int(c['e8d']):
+        if dcode is None:                       # literal absent from the dictionary
+            return np.ones(int(seg.N), bool) if neg else np.zeros(int(seg.N), bool)
+        if int(dcode) == int(c['e8d']):
             pb = np.asarray(seg.buf[c['e8pres']:c['e8pres'] + (int(seg.N) + 7) // 8],
                             dtype=np.uint8)
             up = np.unpackbits(pb, count=int(seg.N)).astype(bool)
             return up if neg else ~up
+        pl = seg.e8_planes(name)                # non-default literal: mark its rows
+        if pl is not None:                      # from the planes -- never densify
+            pos8, lits8, _d8 = pl
+            m8 = np.zeros(int(seg.N), bool)
+            m8[pos8[lits8 == np.uint32(int(dcode))]] = True
+            return ~m8 if neg else m8
     try:
         codes = seg.codes(name)
     except Exception:
@@ -1359,8 +1367,18 @@ def _eval_pred(seg, node, seg_col):
             # same-column subquery pre-resolved to a CODE SET upstream: membership in code
             # space is a V-sized flag and one NATIVE-WIDTH gather, not a sort (np.isin +
             # int64 cast were 390ms of sq-nested; NULL never matches: not in the set)
-            arr = np.asarray(seg._raw_codes(seg_col(col)))
-            V0 = int(seg.cols[seg_col(col)].get('V') or int(arr.max()) + 1)
+            scol8 = seg_col(col)
+            pl = seg.e8_planes(scol8) if hasattr(seg, 'e8_planes') else None
+            if pl is not None:
+                pos8, lits8, d8 = pl
+                V0 = int(seg.cols[scol8]['V'])
+                fl = np.zeros(V0, bool)
+                fl[np.asarray(kcs, dtype=np.int64)] = True
+                out = np.full(int(seg.N), bool(fl[d8]))
+                out[pos8] = fl[lits8]           # membership painted onto the planes
+                return out
+            arr = np.asarray(seg._raw_codes(scol8))
+            V0 = int(seg.cols[scol8].get('V') or int(arr.max()) + 1)
             fl = np.zeros(V0, bool)
             fl[np.asarray(kcs, dtype=np.int64)] = True
             return fl[arr]
@@ -1375,8 +1393,19 @@ def _eval_pred(seg, node, seg_col):
             import wdb_wherescan as _WS
             vals0 = [(L.this if L.is_string else str(L.this)) for L in lits]
             tcs = _WS._in_codes(seg, seg_col(col), vals0)
-            arr = np.asarray(seg._raw_codes(seg_col(col)))
-            V0 = int(seg.cols[seg_col(col)].get('V') or int(arr.max()) + 1)
+            scol9 = seg_col(col)
+            pl = seg.e8_planes(scol9) if hasattr(seg, 'e8_planes') else None
+            if pl is not None:
+                pos8, lits8, d8 = pl
+                V0 = int(seg.cols[scol9]['V'])
+                fl = np.zeros(V0, bool)
+                tcs2 = np.asarray(tcs, dtype=np.int64)
+                fl[tcs2[(tcs2 >= 0) & (tcs2 < V0)]] = True
+                out = np.full(int(seg.N), bool(fl[d8]))
+                out[pos8] = fl[lits8]
+                return out
+            arr = np.asarray(seg._raw_codes(scol9))
+            V0 = int(seg.cols[scol9].get('V') or int(arr.max()) + 1)
             fl = np.zeros(V0, bool)
             tcs2 = np.asarray(tcs, dtype=np.int64)
             fl[tcs2[(tcs2 >= 0) & (tcs2 < V0)]] = True

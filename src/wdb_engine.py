@@ -836,6 +836,15 @@ class Segment:
         if rows.size == 0:
             return np.empty(0, dtype=np.int64)
         c = self.cols[nm]
+        if c.get('code_enc', 0) == 8 and nm not in self._codes:
+            pos8, lits8, d8 = self.e8_planes(nm)   # point reads: binary search the
+            out = np.full(rows.size, d8, dtype=np.int64)   # positions, never densify
+            if pos8.size:
+                idx = np.searchsorted(pos8, rows)
+                idx2 = np.minimum(idx, pos8.size - 1)
+                hit = pos8[idx2] == rows
+                out[hit] = lits8[idx2[hit]].astype(np.int64)
+            return out
         if c.get('code_enc', 0) == 6 and nm not in self._codes and rows.size < (self.N >> 2):
             import wdb_kernels as _WK
             pk = np.frombuffer(self.buf, dtype=np.uint8, count=c['czlen'], offset=c['cstart'])
