@@ -1275,15 +1275,23 @@ def _dict_eq_mask(seg, name, neg, lit):
         if dcode is None:                       # literal absent from the dictionary
             return np.ones(int(seg.N), bool) if neg else np.zeros(int(seg.N), bool)
         if int(dcode) == int(c['e8d']):
-            pb = np.asarray(seg.buf[c['e8pres']:c['e8pres'] + (int(seg.N) + 7) // 8],
-                            dtype=np.uint8)
-            up = np.unpackbits(pb, count=int(seg.N)).astype(bool)
+            ck9 = '_e8up_' + name
+            up = seg._codes.get(ck9)
+            if up is None:
+                pb = np.asarray(seg.buf[c['e8pres']:c['e8pres'] + (int(seg.N) + 7) // 8],
+                                dtype=np.uint8)
+                up = np.unpackbits(pb, count=int(seg.N)).astype(bool)
+                seg._codes[ck9] = up
             return up if neg else ~up
         pl = seg.e8_planes(name)                # non-default literal: mark its rows
         if pl is not None:                      # from the planes -- never densify
-            pos8, lits8, _d8 = pl
-            m8 = np.zeros(int(seg.N), bool)
-            m8[pos8[lits8 == np.uint32(int(dcode))]] = True
+            ck8 = '_e8m_%s_%d' % (name, int(dcode))
+            m8 = seg._codes.get(ck8)            # query-lifetime cache: detect and
+            if m8 is None:                      # execute phases share one build
+                pos8, lits8, _d8 = pl
+                m8 = np.zeros(int(seg.N), bool)
+                m8[pos8[lits8 == np.uint32(int(dcode))]] = True
+                seg._codes[ck8] = m8
             return ~m8 if neg else m8
     try:
         codes = seg.codes(name)
