@@ -1340,8 +1340,14 @@ def _eval_pred(seg, node, seg_col):
             if sc is not None:
                 sp, op, lit2 = sc
                 fl = _WS._scalar_flag(seg, sp, op, lit2)
-                codes = np.asarray(seg._raw_codes(seg_col(sp['col']))).astype(np.int64)
-                return fl[codes]
+                scol0 = seg_col(sp['col'])
+                pl = seg.e8_planes(scol0) if hasattr(seg, 'e8_planes') else None
+                if pl is not None:              # paint the flag onto the planes: the
+                    pos8, lits8, d8 = pl        # function ran once per DISTINCT value;
+                    out = np.full(int(seg.N), bool(fl[d8]))   # rows never densify
+                    out[pos8] = fl[lits8]
+                    return out
+                return fl[np.asarray(seg._raw_codes(scol0))]   # native width
             raise NotImplementedError(f"predicate LHS {type(node.this).__name__}")
         cn=seg_col(col); lit=node.expression
         if not (isinstance(lit,E.Literal) or (isinstance(lit,E.Neg) and isinstance(lit.this,E.Literal))):
