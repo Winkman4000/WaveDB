@@ -222,8 +222,9 @@ def _try_fused_union(db, node):
     if not P.no_deleted_rows(seg):
         return None
     kcodes = [WS._code_of(seg, kcol, v) for v in lits]
-    gc = np.asarray(seg._raw_codes(gcol))    # native widths: the int64 casts were
-    kc = np.asarray(seg._raw_codes(kcol))    # 153ms of width-doctrine violation
+    gc = None if seg.cols[gcol].get('code_enc') == 8 else \
+        np.asarray(seg._raw_codes(gcol))     # e8 counts in literal space: no dense gc
+    kc = np.asarray(seg._raw_codes(kcol))    # native widths (the int64 casts were 153ms)
     resid_mask = None
     zero_gcodes = []                             # NEQ literals ON THE GROUP COL: no row
     eq_only_gcode = None                         # mask at all -- bincount everything and
@@ -243,7 +244,9 @@ def _try_fused_union(db, node):
         resid_left.append(rs)
     resid_sql = tuple(resid_left)
     if resid_sql:
-        code_arrs = {gcol: gc, kcol: kc}
+        code_arrs = {kcol: kc}
+        if gc is not None:
+            code_arrs[gcol] = gc
         for rs in resid_sql:
             pred = sqlglot.parse_one(rs, read='duckdb')
             m = None
@@ -279,7 +282,17 @@ def _try_fused_union(db, node):
         m = kc == code
         if resid_mask is not None:
             m = m & resid_mask
-        cnts = np.bincount(gc[m], minlength=V)
+        planes = seg.e8_planes(gcol) if hasattr(seg, 'e8_planes') else None
+        if planes is not None:
+            # LITERAL-SPACE COUNT (the differential read): bincount the literals
+            # under the branch mask + one subtraction for the defaults. The 400MB
+            # dense column is never written.
+            pos8, lits8, dflt8 = planes
+            sel8 = m[pos8]
+            cnts = np.bincount(lits8[sel8], minlength=V)
+            cnts[dflt8] += int(m.sum()) - int(sel8.sum())
+        else:
+            cnts = np.bincount(gc[m], minlength=V)
         for zc in zero_gcodes:
             cnts[zc] = 0                         # the residual, applied to the board
         if eq_only_gcode is not None:

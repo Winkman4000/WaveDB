@@ -755,6 +755,30 @@ class Segment:
         i = int(np.searchsorted(vals, lit, 'left' if op == '<' else 'right'))
         return (0, int(off[i]))
 
+    def e8_planes(self, nm):
+        """The sparse dress's planes, served RAW (Jackson's differential read): row
+        positions of the literals + the literal codes + the default. Consumers that
+        count or mask never densify -- 13.2M elements instead of a 400MB write."""
+        c = self.cols.get(nm)
+        if c is None or c.get('code_enc', 0) != 8:
+            return None
+        key = '_e8p_' + nm
+        hit = self._codes.get(key)
+        if hit is not None:
+            return hit
+        import wdb_kernels as _WK
+        pb = np.ascontiguousarray(self.buf[c['e8pres']:c['e8pres'] + (self.N + 7) // 8])
+        ck = np.frombuffer(self.buf[c['e8ck']:c['e8ck'] + ((self.N + 65535) // 65536) * 8],
+                           dtype=np.uint64)
+        pos = np.empty(c['e8n'], dtype=np.int64)
+        _WK.e8_pos(pb, ck, self.N, pos)
+        lb = np.ascontiguousarray(
+            self.buf[c['cstart']:c['cstart'] + (c['e8n'] * c['e8bits'] + 7) // 8 + 8])
+        lits = _WK.unpack_any(lb, c['e8n'], c['e8bits'])
+        res = (pos, lits, int(c['e8d']))
+        self._codes[key] = res
+        return res
+
     def _raw_codes_range(self, nm, lo, hi):
         """Per-row codes for rows [lo, hi) ONLY. Raw bit-packed columns (code_enc 0) touch just
         the covering bytes -- the narrow-before-expand read. mode 4/6 are positional (free slice).
