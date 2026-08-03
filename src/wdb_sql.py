@@ -1264,6 +1264,19 @@ def _dict_eq_mask(seg, name, neg, lit):
         return None
     if seg._overrides(name) is not None:    # override values aren't in the base dict -> value path
         return None
+    # PRESENCE-AS-PREDICATE (the sparse dress's dividend): on an enc-8 column, a
+    # literal that IS the default value answers from the presence bitmap alone --
+    # 12.5MB of bits instead of reconstructing the dense column. sp <> '' becomes
+    # the bitmap verbatim; sp = '' its complement. Non-default literals fall through
+    # to the code scan as ever.
+    if c.get('code_enc') == 8 and not c.get('has_null'):
+        import wdb_wherescan as _WS
+        dcode = _WS._code_of(seg, name, lit)
+        if dcode is not None and int(dcode) == int(c['e8d']):
+            pb = np.asarray(seg.buf[c['e8pres']:c['e8pres'] + (int(seg.N) + 7) // 8],
+                            dtype=np.uint8)
+            up = np.unpackbits(pb, count=int(seg.N)).astype(bool)
+            return up if neg else ~up
     try:
         codes = seg.codes(name)
     except Exception:

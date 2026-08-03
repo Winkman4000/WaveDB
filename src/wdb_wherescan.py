@@ -391,7 +391,7 @@ def detect(seg, tree, col_map):
     # species; decline so the _raw_codes route (exact, 8-lane) serves until v2 learns nibbles
     for _c5 in tree.find_all(E.Column):
         _n5 = (col_map or {}).get(_c5.name, _c5.name) if col_map else _c5.name
-        if _n5 in seg.cols and seg.cols[_n5].get('code_enc') in (5, 6, 8):
+        if _n5 in seg.cols and seg.cols[_n5].get('code_enc') in (5, 6):
             return None
     if not _ENABLED:                    return None
     if not P.no_joins(tree):            return None
