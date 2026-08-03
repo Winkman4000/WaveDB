@@ -929,3 +929,19 @@ def e8_scatter(pos, lits, n, default):
     for i in prange(pos.size):
         out[pos[i]] = lits[i]
     return out
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def unpack_any_off(b, n, bits, bit0):
+    """unpack_any with a starting bit offset: range reads begin mid-byte."""
+    out = np.empty(n, dtype=np.uint32)
+    mask = np.uint64((1 << bits) - 1)
+    for i in prange(n):
+        o = bit0 + i * bits
+        j = o >> 3
+        sh = o & 7
+        acc = np.uint64(0)
+        for kk in range(5):
+            acc = (acc << np.uint64(8)) | np.uint64(b[j + kk])
+        out[i] = np.uint32((acc >> np.uint64(40 - sh - bits)) & mask)
+    return out

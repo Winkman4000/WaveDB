@@ -798,7 +798,13 @@ class Segment:
             nlit = int(seg8.sum())
             out8 = np.full(hi - lo, c['e8d'], dtype=np.uint32)
             if nlit:
-                lits8 = self._bitunpack(c['cstart'], rank_lo, rank_lo + nlit, c['e8bits'])
+                import wdb_kernels as _WK
+                bits8 = c['e8bits']
+                b0 = (rank_lo * bits8) >> 3      # parallel window unpack from the
+                sh0 = (rank_lo * bits8) & 7      # rank's byte, not the slider
+                nb8 = ((sh0 + nlit * bits8) + 7) // 8 + 8
+                lb8 = np.ascontiguousarray(self.buf[c['cstart'] + b0:c['cstart'] + b0 + nb8])
+                lits8 = _WK.unpack_any_off(lb8, nlit, bits8, sh0)
                 out8[np.nonzero(seg8)[0]] = lits8
             return out8
         if enc_r in (5, 6):
