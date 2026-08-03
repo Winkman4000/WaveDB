@@ -379,16 +379,14 @@ class Segment:
                                  np.asarray(c['e5off']).astype(np.int64),
                                  np.int64(self.N), np.int64(c['BR']))
             self._codes[nm] = cc; return cc
-        if c.get('code_enc', 0) == 8:                # sparse-default: expand + scatter
-            up = np.unpackbits(np.asarray(self.buf[c['e8pres']:c['e8pres'] + (self.N + 7) // 8],
-                                          dtype=np.uint8), count=self.N).astype(bool)
-            out8 = np.full(self.N, c['e8d'], dtype=np.uint32)
-            if c['e8n']:
-                import wdb_kernels as _WK
-                lb = np.ascontiguousarray(
-                    self.buf[c['cstart']:c['cstart'] + (c['e8n'] * c['e8bits'] + 7) // 8 + 5])
-                lits8 = _WK.unpack_any(lb, c['e8n'], c['e8bits'])
-                out8[np.nonzero(up)[0]] = lits8
+        if c.get('code_enc', 0) == 8:                # sparse-default: fused parallel expand
+            import wdb_kernels as _WK
+            pb = np.ascontiguousarray(self.buf[c['e8pres']:c['e8pres'] + (self.N + 7) // 8])
+            ck = np.frombuffer(self.buf[c['e8ck']:c['e8ck'] + ((self.N + 65535) // 65536) * 8],
+                               dtype=np.uint64)
+            lb = np.ascontiguousarray(
+                self.buf[c['cstart']:c['cstart'] + (c['e8n'] * c['e8bits'] + 7) // 8 + 8])
+            out8 = _WK.e8_expand(pb, ck, lb, self.N, c['e8bits'], c['e8d'])
             self._codes[nm] = out8; return out8
         if c.get('code_enc', 0) == 1:                # zstd of byte-aligned codes (clustered/skewed)
             raw = self._dz.decompress(self.buf[c['cstart']:c['cstart']+c['czlen']].tobytes())

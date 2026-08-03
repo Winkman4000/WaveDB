@@ -892,3 +892,29 @@ def unpack_any(b, n, bits):
             acc = (acc << np.uint64(8)) | v
         out[i] = np.uint32((acc >> np.uint64(40 - sh - bits)) & mask)
     return out
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def e8_expand(pres_bytes, ck, lit_bytes, n, bits, default):
+    """The sparse dress's fused reconstruct, Jackson's way: no frames means no
+    dependencies -- every 64K chunk expands independently from its checkpoint rank.
+    Presence-walk + literal-unpack + scatter in ONE parallel pass; the serial numpy
+    glue (unpackbits/nonzero/scatter, ~200ms) dies here."""
+    out = np.full(n, np.uint32(default), dtype=np.uint32)
+    nck = (n + 65535) >> 16
+    for cb in prange(nck):
+        row0 = cb << 16
+        row1 = min(row0 + 65536, n)
+        rank = np.int64(ck[cb])
+        for r in range(row0, row1):
+            if (pres_bytes[r >> 3] >> (7 - (r & 7))) & 1:
+                o = rank * bits
+                j = o >> 3
+                sh = o & 7
+                acc = np.uint64(0)
+                for kk in range(5):
+                    acc = (acc << np.uint64(8)) | np.uint64(lit_bytes[j + kk])
+                out[r] = np.uint32((acc >> np.uint64(40 - sh - bits))
+                                   & np.uint64((1 << bits) - 1))
+                rank += 1
+    return out
