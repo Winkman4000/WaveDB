@@ -503,6 +503,18 @@ def _grid3_nb(a, b, c, Vb, Vc, board):
         board[(np.int64(a[i]) * Vb + np.int64(b[i])) * Vc + np.int64(c[i])] += 1
 
 
+@njit(nogil=True, cache=True)
+def _grid2_nb32(a, b, Vb, board):
+    for i in range(a.size):
+        board[np.int64(a[i]) * Vb + np.int64(b[i])] += np.int32(1)
+
+
+@njit(nogil=True, cache=True)
+def _grid3_nb32(a, b, c, Vb, Vc, board):
+    for i in range(a.size):
+        board[(np.int64(a[i]) * Vb + np.int64(b[i])) * Vc + np.int64(c[i])] += np.int32(1)
+
+
 def grid_count(codes, spans):
     """The fused small-K board: one trip over the raw code streams (native dtypes,
     no astype, no composed key array) dropping beans on one composite board. Only
@@ -512,12 +524,14 @@ def grid_count(codes, spans):
     for v in spans:
         total *= int(v)
     if HAVE_NUMBA:
-        board = np.zeros(total, np.int64)
+        # HALF-WIDTH WALL (the weather-proofing cut): counts fit int32 at N=100M;
+        # a 72MB board doubles the cache-resident share of the scatter vs 145MB.
+        board = np.zeros(total, np.int32)
         if len(codes) == 2:
-            _grid2_nb(codes[0], codes[1], np.int64(spans[1]), board)
+            _grid2_nb32(codes[0], codes[1], np.int64(spans[1]), board)
         else:
-            _grid3_nb(codes[0], codes[1], codes[2],
-                      np.int64(spans[1]), np.int64(spans[2]), board)
+            _grid3_nb32(codes[0], codes[1], codes[2],
+                        np.int64(spans[1]), np.int64(spans[2]), board)
         return board
     key = np.asarray(codes[0]).astype(np.int64)
     for i in range(1, len(codes)):
