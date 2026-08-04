@@ -477,7 +477,7 @@ def _giant_m2o(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey,
     except Exception:
         return None                              # v1: integer-valued key dictionaries
     # dim row per key code (m2o requires unique keys)
-    dkc = np.asarray(dseg._raw_codes(dkey)).astype(np.int64)
+    dkc = np.asarray(dseg._raw_codes(dkey))   # native: bincount + gather-index only
     N2 = int(dseg.N)
     kcounts = np.bincount(dkc, minlength=dk_vals.size)
     if kcounts.max() > 1:
@@ -495,14 +495,14 @@ def _giant_m2o(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey,
         c2 = dseg.cols.get(nm)
         if c2 is None or c2.get('mode') not in (0, 1, 2):
             return None
-        acodes_all.append(np.asarray(dseg._raw_codes(nm)).astype(np.int64))
+        acodes_all.append(np.asarray(dseg._raw_codes(nm)))   # native
         spans.append(int(c2['V']))
     total = 1
     for v in spans:
         total *= v
     if total > 50_000_000:
         return None
-    comp_dim = acodes_all[0]                     # composed cell per DIM ROW (N2-sized)
+    comp_dim = acodes_all[0].astype(np.int64)    # ONE widening: compose can overflow u16
     for i in range(1, len(acodes_all)):
         comp_dim = comp_dim * spans[i] + acodes_all[i]
     # FILTER-FIRST (Jackson's order): the dim constraint shrinks the phone book
@@ -536,7 +536,7 @@ def _giant_m2o(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey,
                 name_counts = np.ones(fk_vals.size, np.int64)
                 name_counts[hc_] = hn_
         if name_counts is None:
-            fkc = np.asarray(fseg._raw_codes(fkey)).astype(np.int64)
+            fkc = np.asarray(fseg._raw_codes(fkey))   # native: the 800MB costume dies
             name_counts = np.bincount(fkc, minlength=fk_vals.size)
         counts = np.bincount(cell_of + 1, weights=name_counts,
                              minlength=total + 1)[1:].astype(np.int64)
@@ -546,7 +546,7 @@ def _giant_m2o(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey,
                 inner = p.this if isinstance(p, E.Alias) else p
                 v = WN._numvals(fseg, inner.this.name)
                 if fkc is None:
-                    fkc = np.asarray(fseg._raw_codes(fkey)).astype(np.int64)
+                    fkc = np.asarray(fseg._raw_codes(fkey))   # native
                 name_sums = np.bincount(fkc, weights=v, minlength=fk_vals.size)
                 sums[pi] = np.bincount(cell_of + 1, weights=name_sums,
                                        minlength=total + 1)[1:]
@@ -556,7 +556,7 @@ def _giant_m2o(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey,
         # cell board at dictionary scale. The old per-row path gathered cell_of at
         # 100M (a 140MB-table random read), masked it, and bincounted a comp array
         # minlength=total -- three N-scale passes this replaces with one.
-        fkc = np.asarray(fseg._raw_codes(fkey)).astype(np.int64)
+        fkc = np.asarray(fseg._raw_codes(fkey))   # native
         keep = np.ones(fkc.size, bool)
         for c in fact_conds:
             keep &= wdb_sql._eval_pred(fseg, _strip_qual(c), lambda nm: nm)
