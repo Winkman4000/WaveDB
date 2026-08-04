@@ -838,6 +838,17 @@ def _scan_flag(seg, col, flag, lo, hi):
     """Positions in [lo, hi) where flag[code] is set -- the LIKE frame scan: parallel enc=3
     decompress, one fancy-index per frame; the substring test happened once, in the dict."""
     c = seg.cols[col]
+    if c.get('code_enc', 0) == 8 and hasattr(seg, 'e8_planes'):
+        pl = seg.e8_planes(col)
+        if pl is not None:
+            pos8, lits8, d8 = pl
+            if not bool(flag[d8]):               # the default can't match (a blank never
+                rows = pos8[flag[lits8]]         # contains anything): the answer lives
+                if lo > 0 or hi < seg.N:         # ENTIRELY in the literals. ~15ms, no
+                    a = np.searchsorted(rows, lo)   # reconstruction, no frame scan.
+                    b = np.searchsorted(rows, hi)
+                    rows = rows[a:b]
+                return rows
     if c.get('code_enc', 0) == 3 and col not in seg._codes:
         wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
         BR = c['BR']; base = c['cstart']; bo = c['boffs']; buf = seg.buf
