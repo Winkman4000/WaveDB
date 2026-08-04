@@ -515,6 +515,19 @@ def _grid3_nb32(a, b, c, Vb, Vc, board):
         board[(np.int64(a[i]) * Vb + np.int64(b[i])) * Vc + np.int64(c[i])] += np.int32(1)
 
 
+@njit(nogil=True, cache=True)
+def _grid3_split(a, b, c, Vb, Vc, dcode, board2, board3):
+    """The sparse grid (Jackson's dress on a hot loop): rows carrying the dominant
+    third label pour into a small cache-resident 2-D wall; only the few percent that
+    differ touch the big 3-D wall. Merge puts the 2-D wall into its slice."""
+    for i in range(a.size):
+        ab = np.int64(a[i]) * Vb + np.int64(b[i])
+        if np.int64(c[i]) == dcode:
+            board2[ab] += np.int32(1)
+        else:
+            board3[ab * Vc + np.int64(c[i])] += np.int32(1)
+
+
 def grid_count(codes, spans):
     """The fused small-K board: one trip over the raw code streams (native dtypes,
     no astype, no composed key array) dropping beans on one composite board. Only
@@ -530,8 +543,18 @@ def grid_count(codes, spans):
         if len(codes) == 2:
             _grid2_nb32(codes[0], codes[1], np.int64(spans[1]), board)
         else:
-            _grid3_nb32(codes[0], codes[1], codes[2],
-                        np.int64(spans[1]), np.int64(spans[2]), board)
+            c2 = np.asarray(codes[2])
+            SMP = min(c2.size, 2_000_000)
+            samp = np.bincount(c2[:SMP], minlength=int(spans[2]))
+            dcode = int(samp.argmax()) if samp.size else -1
+            if dcode >= 0 and int(samp[dcode]) * 5 > SMP * 3:   # dominant >60%: split
+                board2 = np.zeros(int(spans[0]) * int(spans[1]), np.int32)
+                _grid3_split(codes[0], codes[1], c2, np.int64(spans[1]),
+                             np.int64(spans[2]), np.int64(dcode), board2, board)
+                board.reshape(-1, int(spans[2]))[:, dcode] += board2
+            else:
+                _grid3_nb32(codes[0], codes[1], codes[2],
+                            np.int64(spans[1]), np.int64(spans[2]), board)
         return board
     key = np.asarray(codes[0]).astype(np.int64)
     for i in range(1, len(codes)):
