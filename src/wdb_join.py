@@ -946,10 +946,15 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     fl = np.zeros(V0, bool)                         # + one gather, never
                     fl[np.asarray(kcs, dtype=np.int64)] = True      # np.isin's 500ms sort
                     pl = seg.e8_planes(pcol) if hasattr(seg, 'e8_planes') else None
-                    if pl is not None:           # sparse dress: paint, never densify
+                    if pl is not None:           # sparse dress: paint ONCE per query
+                        ckm = '_e8mk_' + pcol
+                        hit = seg._codes.get(ckm)
+                        if hit is not None and hit[0] == id(kcs):
+                            return hit[1]
                         pos8, lits8, d8 = pl
                         out = np.full(int(seg.N), bool(fl[d8]))
                         out[pos8] = fl[lits8]
+                        seg._codes[ckm] = (id(kcs), out)
                         return out
                     return fl[np.asarray(seg.codes(pcol))]          # native width
                 if node.args.get('query') is not None:

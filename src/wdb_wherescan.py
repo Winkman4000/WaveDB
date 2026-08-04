@@ -843,11 +843,17 @@ def _scan_flag(seg, col, flag, lo, hi):
         if pl is not None:
             pos8, lits8, d8 = pl
             if not bool(flag[d8]):               # the default can't match (a blank never
-                rows = pos8[flag[lits8]]         # contains anything): the answer lives
-                if lo > 0 or hi < seg.N:         # ENTIRELY in the literals. ~15ms, no
-                    a = np.searchsorted(rows, lo)   # reconstruction, no frame scan.
+                ckm = '_e8sf_' + col             # contains anything): the answer lives
+                hit = seg._codes.get(ckm)        # ENTIRELY in the literals -- and the
+                if hit is not None and hit[0] == id(flag):   # block loop calls this 382
+                    rows = hit[1]                # times: build ONCE per query
+                else:
+                    rows = pos8[flag[lits8]]
+                    seg._codes[ckm] = (id(flag), rows)
+                if lo > 0 or hi < seg.N:
+                    a = np.searchsorted(rows, lo)
                     b = np.searchsorted(rows, hi)
-                    rows = rows[a:b]
+                    return rows[a:b]
                 return rows
     if c.get('code_enc', 0) == 3 and col not in seg._codes:
         wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]

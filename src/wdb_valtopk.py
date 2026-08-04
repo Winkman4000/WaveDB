@@ -228,7 +228,16 @@ def execute(seg, spec):
     k = min(lim, N)
     codes0 = None
     cand = None
-    if k < N and len(keys) == 1 and seg.cols[kcol].get('mode') in (0, 1, 2) \
+    if k < N and len(keys) == 1 and seg.cols[kcol].get('code_enc') == 2:
+        # ORDER BY a STAIR: the file's own order IS the answer. The top-k ascending
+        # are literally the first k rows; descending, the last k reversed. Ties keep
+        # row order, exactly as the lexsort tail produced. 100M-row walk -> k rows.
+        ci = (np.arange(k, dtype=np.int64) if not kdesc
+              else np.arange(N - 1, N - 1 - k, -1, dtype=np.int64))
+        srt0 = np.sort(ci)
+        got0 = np.asarray(seg.codes_at(kcol, srt0)).astype(np.int64)
+        cand = (ci, got0 if not kdesc else got0[::-1])
+    if cand is None and k < N and len(keys) == 1 and seg.cols[kcol].get('mode') in (0, 1, 2) \
             and seg.cols[kcol].get('dt') == 0 and seg.cols[kcol].get('code_enc') in (3, 5):
         cand = _counts_lane(seg, kcol, kdesc, k)
     if cand is not None:
