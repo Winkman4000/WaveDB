@@ -309,6 +309,47 @@ def _stream_dump(db, tree, fact_tn, fkey, fact_conds, dmap, need, attr_idx,
             return [], [wdb_sql._alias(p) for p in proj]
         flag[tc] = True
     N = int(fseg.N)
+    # PRESENCE-FIRST (Jackson's order): when one condition is <>default on a sparse
+    # column, its planes ARE the candidate list, already sorted in row order. No block
+    # walking for that column at all: take candidates front-to-back in chunks, read the
+    # join key ONLY at those positions (a prefix of frames), flag, collect LIMIT, leave.
+    e8i = next((i for i, (nm, tn, code) in enumerate(conds)
+                if tn == 'NEQ' and code is not None
+                and fseg.cols[nm].get('code_enc') == 8
+                and int(code) == int(fseg.cols[nm]['e8d'])
+                and hasattr(fseg, 'e8_planes')), None)
+    if e8i is not None and not left:
+        pos8, _lits8, _d8 = fseg.e8_planes(conds[e8i][0])
+        rest = [c for i, c in enumerate(conds) if i != e8i]
+        got8 = []
+        have = 0
+        CH = max(lim * 64, 65536)
+        for st in range(0, pos8.size, CH):
+            chunk = pos8[st:st + CH]
+            lo2 = int(chunk[0]); hi2 = int(chunk[-1]) + 1
+            loc = chunk - lo2                    # candidates are near-contiguous in row
+            rcspan = np.asarray(fseg._raw_codes_range(fkey, lo2, hi2))   # order: ONE span
+            rc = rcspan[loc].astype(np.int64)    # (a frame or two), not a full decode
+            keep = flag[rc]
+            for nm2, tn2, code2 in rest:
+                cb2 = np.asarray(fseg._raw_codes_range(nm2, lo2, hi2))[loc].astype(np.int64)
+                if code2 is None:
+                    km2 = np.zeros(cb2.size, bool) if tn2 == 'EQ' else np.ones(cb2.size, bool)
+                else:
+                    km2 = (cb2 == code2) if tn2 == 'EQ' else (cb2 != code2)
+                keep &= km2
+            hit = chunk[keep]
+            if hit.size:
+                got8.append(hit)
+                have += int(hit.size)
+                if have >= lim:
+                    break
+        rows_pf = (np.concatenate(got8)[:lim] if got8
+                   else np.empty(0, dtype=np.int64))
+        pf_complete = True                       # candidates fully walked: a short
+    else:                                        # result IS the whole answer
+        rows_pf = None
+        pf_complete = False
     step = 1 << 18
     # PARALLEL SPREAD-POP (Jackson's cart): an unordered LIMIT dump owes the court a
     # COUNT, not an order (N-class validates row count; rows still honor every cond).
@@ -336,7 +377,11 @@ def _stream_dump(db, tree, fact_tn, fkey, fact_conds, dmap, need, attr_idx,
         if m is None:
             m = np.ones(hi - lo, bool)
         return (np.nonzero(m)[0] + lo).astype(np.int64)
-    first = _pop(starts[0])
+    if rows_pf is not None:
+        first = rows_pf
+        starts = starts[:1]                      # presence lane filled the cart: no pops
+    else:
+        first = _pop(starts[0])
     if first.size >= lim:                        # front-loaded matches: one pop fills
         survivors = [first]                      # the cart (j-dump's old fast case)
     else:
@@ -359,23 +404,19 @@ def _stream_dump(db, tree, fact_tn, fkey, fact_conds, dmap, need, attr_idx,
                 hits.extend(extra[:take].tolist())
             if len(hits) >= lim:
                 break
-    if len(hits) < lim:
+    if len(hits) < lim and not pf_complete:
         return None                              # cart still hungry: full path serves
     pos = np.asarray(hits[:lim], dtype=np.int64)
     def dec_at(nm, positions):
-        cc = np.asarray(fseg.codes_at(nm, positions)).astype(np.int64)
-        cache = {}
-        out = []
-        for x in cc:
-            x = int(x)
-            v = cache.get(x, cache)
-            if v is cache:
-                v = wdb_sql._pyval(fseg.fetch(nm, x))
-                if isinstance(v, (bytes, bytearray)):
-                    v = v.decode('utf-8', 'replace')
-                cache[x] = v
-            out.append(v)
-        return out
+        c3 = fseg.cols[nm]
+        if c3.get('code_enc') == 3 and positions.size and \
+                int(positions.max() - positions.min()) < 8_000_000:
+            lo3 = int(positions.min())           # winners span a handful of frames: one
+            span = np.asarray(fseg._raw_codes_range(nm, lo3, int(positions.max()) + 1))
+            cc = span[positions - lo3].astype(np.int64)   # span read, not a full decode
+        else:
+            cc = np.asarray(fseg.codes_at(nm, positions)).astype(np.int64)
+        return fseg.values_at(nm, cc)            # batch: dedupe + POOLED page pops
     kvals = dec_at(fkey, pos)
     fvals = {nm: dec_at(nm, pos) for nm in sorted({nm for _pi, nm in fact_cols})}
     rows = []

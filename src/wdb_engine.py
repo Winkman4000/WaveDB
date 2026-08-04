@@ -667,6 +667,20 @@ class Segment:
             chunked = c.get('chunked')
             if not chunked and c.get('raw') is None:
                 c['raw'] = self._dz.decompress(c['z'])
+            if chunked:
+                CHK = c['CHUNK']
+                need_ch = sorted({int(x) // CHK for x in work.tolist()})
+                missing = [ch for ch in need_ch if ch not in c['chunks']]
+                if len(missing) > 1:             # POOL the page pops: 321 serial pops
+                    from concurrent.futures import ThreadPoolExecutor   # were 265ms of
+                    def _popc(ch):               # j-dump; zstd releases the GIL
+                        import zstandard as _z
+                        fb = c['chunk_base'] + int(c['chunk_foff'][ch])
+                        fe = c['chunk_base'] + int(c['chunk_foff'][ch + 1])
+                        return ch, _z.ZstdDecompressor().decompress(bytes(self.buf[fb:fe]))
+                    with ThreadPoolExecutor(max_workers=min(8, len(missing))) as ex:
+                        for ch, buf2 in ex.map(_popc, missing):
+                            c['chunks'][ch] = buf2
             wl = work.tolist()
             i = 0
             while i < len(wl):                       # one walk per touched restart block
