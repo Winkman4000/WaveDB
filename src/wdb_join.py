@@ -942,17 +942,33 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             def mk(seg, pcol):
                 kcs = node.args.get('_codes')
                 if kcs is not None:              # same-column subquery pre-resolved to a
-                    return np.isin(              # CODE SET: membership over raw codes,
-                        np.asarray(seg.codes(pcol)).astype(np.int64),   # no strings
-                        np.asarray(kcs, dtype=np.int64))
+                    V0 = int(seg.cols[pcol]['V'])                   # CODE SET: a V-flag
+                    fl = np.zeros(V0, bool)                         # + one gather, never
+                    fl[np.asarray(kcs, dtype=np.int64)] = True      # np.isin's 500ms sort
+                    pl = seg.e8_planes(pcol) if hasattr(seg, 'e8_planes') else None
+                    if pl is not None:           # sparse dress: paint, never densify
+                        pos8, lits8, d8 = pl
+                        out = np.full(int(seg.N), bool(fl[d8]))
+                        out[pos8] = fl[lits8]
+                        return out
+                    return fl[np.asarray(seg.codes(pcol))]          # native width
                 if node.args.get('query') is not None:
                     raise _FastUnsupported       # unresolved subquery: not a literal list
                 exprs = node.args.get('expressions') or []
                 c = seg.cols[pcol]
                 if c['dt'] == 1 and c['mode'] != 4:
-                    codes = seg.codes(pcol)
                     tcs = [t for t in (_code_of_literal(seg, pcol, _lit_bytes(seg, pcol, e)) for e in exprs) if t >= 0]
-                    return np.isin(codes, tcs)
+                    V0 = int(c['V'])
+                    fl = np.zeros(V0 + 1, bool)
+                    tcs2 = np.asarray(tcs, dtype=np.int64)
+                    fl[tcs2[(tcs2 >= 0) & (tcs2 < V0)]] = True
+                    pl = seg.e8_planes(pcol) if hasattr(seg, 'e8_planes') else None
+                    if pl is not None:
+                        pos8, lits8, d8 = pl
+                        out = np.full(int(seg.N), bool(fl[d8]))
+                        out[pos8] = fl[lits8]
+                        return out
+                    return fl[np.asarray(seg.codes(pcol))]
                 arr, _ = _col_cached(seg, pcol)
                 vals = [wdb_sql._lit_for_col(seg, pcol, e, arr.dtype.kind) for e in exprs]
                 return np.isin(arr, vals)
