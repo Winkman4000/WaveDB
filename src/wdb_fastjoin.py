@@ -528,9 +528,9 @@ def _giant_m2o(db, tree, fact_al, dim_al, fact_tn, dim_tn, fkey, dkey,
         # by construction, so absent-from-heavy means exactly 1. Count-only folds
         # never touch the fact key stream at all.
         name_counts = None
-        if not any(kd == 'SUM' for _, kd in aggs) and P.no_deleted_rows(fseg):
-            import wdb_gbcount
-            loaded = wdb_gbcount._load(fseg, fkey)
+        if P.no_deleted_rows(fseg):              # the shelf serves counts even when a
+            import wdb_gbcount                   # SUM rides along: only the sum pays a
+            loaded = wdb_gbcount._load(fseg, fkey)   # 100M bincount, never the count
             if loaded is not None:
                 hc_, hn_ = loaded
                 name_counts = np.ones(fk_vals.size, np.int64)
