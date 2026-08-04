@@ -274,6 +274,23 @@ def _try_fused_union(db, node):
             resid_mask = m if resid_mask is None else (resid_mask & m)
     V = int(seg.cols[gcol]['V'])
     rows = []
+    # JACKSON'S STOP LINE: with ORDER BY count DESC LIMIT k on the union, only names
+    # at-or-above the k-th best count can appear -- keep that superset (ties included:
+    # exactness untouchable), decode ONLY those few names. 8,000 serial page-walks
+    # become ~10-40 pooled lookups.
+    trunc_k = None
+    ordx = node.args.get('order')
+    limx = node.args.get('limit')
+    if ordx is not None and limx is not None and len(ordx.expressions) == 1:
+        oe = ordx.expressions[0]
+        if oe.args.get('desc') and isinstance(oe.this, E2.Column):
+            cnt_alias = hdr[ci]
+            if oe.this.name == cnt_alias:
+                try:
+                    trunc_k = int(limx.expression.this)
+                except Exception:
+                    trunc_k = None
+    boards = []
     full_dict = None                              # decoded ONCE, shared by every branch
     cache = {}
     for code in kcodes:
@@ -301,6 +318,9 @@ def _try_fused_union(db, node):
             if eq_only_gcode >= 0:
                 cnts[eq_only_gcode] = keepv
         pres = np.nonzero(cnts)[0]
+        if trunc_k is not None:
+            boards.append((pres, cnts[pres]))    # decode NOTHING yet: names wait for
+            continue                             # the stop line
         if pres.size > 5000 and full_dict is None:
             dv = seg._typed_dict(gcol)            # wherescan's bulk strategy: one full
             full_dict = np.array([wdb_sql._pyval(x) for x in dv], dtype=object)
@@ -324,6 +344,24 @@ def _try_fused_union(db, node):
             row[1 - ci] = v
             row[ci] = int(cl[i2])
             rows.append(tuple(row))
+    if trunc_k is not None and boards:
+        allc = np.concatenate([cn for _p, cn in boards])
+        if allc.size > trunc_k:
+            thresh = np.partition(allc, allc.size - trunc_k)[allc.size - trunc_k]
+        else:
+            thresh = 0
+        for pres_b, cn_b in boards:
+            keepm = cn_b >= thresh
+            codes_k = pres_b[keepm]
+            cl_k = cn_b[keepm].tolist()
+            vals_k = seg.values_at(gcol, codes_k) if codes_k.size else []
+            for i2, v in enumerate(vals_k):
+                if isinstance(v, (bytes, bytearray)):
+                    v = v.decode('utf-8', 'replace')
+                row = [None, None]
+                row[1 - ci] = v
+                row[ci] = int(cl_k[i2])
+                rows.append(tuple(row))
     global _HITS
     _HITS += 1
     return rows, list(hdr)
