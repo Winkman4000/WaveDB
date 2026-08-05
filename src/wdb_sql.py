@@ -226,7 +226,14 @@ def _fval_by_code(seg, fname, cn, params=None):
     key = (id(seg), cn, fname, params)
     m = _SFN_CACHE.get(key)
     if m is None:
-        m = _SCALAR_FNS[fname](seg._typed_dict(cn), params)
+        if fname == 'LENGTH' and hasattr(seg, 'dict_charlens'):
+            m9 = seg.dict_charlens(cn)           # char lengths straight off the dict
+            if m9 is not None:                   # BYTES: no string is ever born
+                m = m9
+            else:
+                m = _SCALAR_FNS[fname](seg._typed_dict(cn), params)
+        else:
+            m = _SCALAR_FNS[fname](seg._typed_dict(cn), params)
         _SFN_CACHE[key] = m
     return m
 

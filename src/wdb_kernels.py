@@ -982,3 +982,37 @@ def unpack_any_off(b, n, bits, bit0):
             acc = (acc << np.uint64(8)) | np.uint64(b[j + kk])
         out[i] = np.uint32((acc >> np.uint64(40 - sh - bits)) & mask)
     return out
+
+
+@njit(nogil=True, cache=True)
+def fc_charlens(a, R, out):
+    """Front-coded walk in pure arithmetic: per entry <HH cp,sl>+suffix; char length =
+    (cp+sl) - continuation bytes, with the prefix chain's continuation counts carried
+    in a cumulative buffer. No bytes object is ever built."""
+    o = np.int64(0); i = np.int64(0); n = np.int64(0)
+    cum = np.zeros(4096, np.int64)               # cum[j] = continuation bytes in prev[:j]
+    plen = np.int64(0)
+    while o < a.size:
+        if i % R == 0:
+            plen = 0
+        cp = np.int64(a[o]) | (np.int64(a[o + 1]) << 8)
+        sl = np.int64(a[o + 2]) | (np.int64(a[o + 3]) << 8)
+        o += 4
+        base = cum[cp] if cp <= plen else cum[plen]
+        j = cp
+        for t in range(sl):
+            b = a[o + t]
+            cont = np.int64(1) if (b & 0xC0) == 0x80 else np.int64(0)
+            base2 = base + cont
+            if j + 1 < 4096:
+                cum[j + 1] = base2
+            base = base2
+            j += 1
+        out[n] = (cp + sl) - base + (cum[cp] if cp <= plen else cum[plen])
+        # rewrite: charlen = total_bytes - total_cont; total_cont = cum[cp] + suffix_cont
+        out[n] = (cp + sl) - base
+        o += sl
+        plen = cp + sl
+        n += 1
+        i += 1
+    return n

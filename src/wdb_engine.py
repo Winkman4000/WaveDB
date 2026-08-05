@@ -245,6 +245,53 @@ class Segment:
             cp, sl = struct.unpack_from('<HH', raw, o); o += 4
             suf = raw[o:o+sl]; o += sl; s = prev[:cp]+suf; vals.append(s); prev = s; i += 1
         return vals
+    def dict_charlens(self, nm):
+        """V-sized CHARACTER lengths read straight off the front-coded dict bytes:
+        UTF-8 chars = bytes minus continuation bytes, tracked through the prefix
+        chain arithmetically. No string is ever decoded. None -> caller falls back."""
+        c = self.cols.get(nm)
+        if c is None or c.get('mode') not in (0, 1) or c.get('dt') != 1:
+            return None
+        got = c.get('charlens')
+        if got is not None:
+            return got
+        import wdb_kernels as _WK
+        if c.get('R') is None:
+            return None                          # not front-coded: fall back
+        R = int(c['R'])
+        outs = []
+        try:
+            if c.get('chunked'):
+                bufs = []
+                for j in range(len(c['chunk_czlen'])):
+                    fb = c['chunk_base'] + int(c['chunk_foff'][j])
+                    fe = c['chunk_base'] + int(c['chunk_foff'][j + 1])
+                    bufs.append(bytes(self.buf[fb:fe]))
+                from concurrent.futures import ThreadPoolExecutor
+                def _one(fb2):
+                    raw = __import__('zstandard').ZstdDecompressor().decompress(fb2)
+                    a = np.frombuffer(raw, dtype=np.uint8)
+                    out = np.empty(a.size // 4 + 1, np.int64)
+                    n = _WK.fc_charlens(a, np.int64(R), out)
+                    return out[:n]
+                with ThreadPoolExecutor(max_workers=min(8, len(bufs))) as ex:
+                    outs = list(ex.map(_one, bufs))
+            else:
+                raw = self._dz.decompress(c['z'])
+                a = np.frombuffer(raw, dtype=np.uint8)
+                out = np.empty(a.size // 4 + 1, np.int64)
+                n = _WK.fc_charlens(a, np.int64(R), out)
+                outs = [out[:n]]
+        except Exception:
+            return None
+        res = np.concatenate(outs) if outs else np.empty(0, np.int64)
+        if res.size != int(c.get('n_dict', c['V'])):
+            return None                          # layout surprise: fail closed
+        if c['has_null'] and res.size == int(c['V']) - 1:
+            res = np.concatenate([res, np.zeros(1, np.int64)])
+        c['charlens'] = res
+        return res
+
     def _dict_ints(self, c):
         # mode 2: the .nline sidecar memmaps directly when present -- the fixed number
         # line: zero per-query rebuild, the OS page cache owns the bytes, and the map
