@@ -269,7 +269,51 @@ def _scalar_count_execute(seg, spec):
     return [(ans,)], [wdb_sql._alias(spec['proj'][0])]
 
 
+def _echo_detect(seg, tree, col_map):
+    """SELECT col FROM t WHERE col = lit -- the projection IS the filter column, so
+    every emitted value IS the literal: count from the shelf, zero row reads."""
+    if not P.no_joins(tree) or tree.args.get('group') is not None:
+        return None
+    if tree.args.get('order') is not None or tree.args.get('having') is not None:
+        return None
+    if not P.no_select_distinct(tree):
+        return None
+    proj = tree.expressions
+    if len(proj) != 1:
+        return None
+    pc = wdb_sql._proj_colname(proj[0])
+    if pc is None:
+        return None
+    w = tree.args.get('where')
+    if w is None or not isinstance(w.this, E.EQ):
+        return None
+    node = w.this
+    if not isinstance(node.expression, E.Literal):
+        return None
+    if not isinstance(node.this, E.Column):
+        return None
+    wc = node.this.name                      # the module's own idiom (scalar detect):
+    col = (col_map or {}).get(wc, wc)        # .name + col_map resolution
+    col_p = (col_map or {}).get(pc, pc)
+    if col != col_p:
+        return None
+    if not P.columns_exist(seg, col) or not P.no_deleted_rows(seg):
+        return None
+    lim = None
+    lx = tree.args.get('limit')
+    if lx is not None:
+        try:
+            lim = int(lx.expression.this)
+        except Exception:
+            return None
+    return {'echo': True, 'col': col, 'lit': node.expression.this,
+            'lim': lim, 'proj': proj}
+
+
 def detect(seg, tree, col_map):
+    ec = _echo_detect(seg, tree, col_map)
+    if ec is not None:
+        return ec
     sc = _scalar_count_detect(seg, tree, col_map)
     if sc is not None:
         return sc
@@ -380,9 +424,28 @@ def execute(seg, spec):
     """THE READ: pull the persisted count projection and emit the top-N rows. May still
     decline (return None) on measured boundary conditions that need the loaded sidecar --
     a LIMIT past the stored heavy hitters, or a tie straddling the LIMIT boundary."""
+    global _HITS
+    if spec.get('echo'):
+        import wdb_wherescan as WS
+        kc = WS._code_of(seg, spec['col'], spec['lit'])
+        if kc is None:
+            rows = []
+        else:
+            loaded = _load(seg, spec['col'])
+            if loaded is None:
+                return None
+            hc, hn = loaded
+            m = hc == int(kc)
+            cnt = int(hn[m][0]) if m.any() else 1   # shelf singleton law: in-dict,
+            v = wdb_sql._pyval(seg.fetch(spec['col'], int(kc)))   # off-shelf = 1 row
+            if isinstance(v, (bytes, bytearray)):
+                v = v.decode('utf-8', 'replace')
+            n = cnt if spec['lim'] is None else min(cnt, spec['lim'])
+            rows = [(v,)] * n
+        _HITS += 1
+        return rows, [wdb_sql._alias(p) for p in spec['proj']]
     if spec.get('scalar'):
         return _scalar_count_execute(seg, spec)
-    global _HITS
     col = spec['col']; ci = spec['ci']; ki = spec['ki']; lim = spec['lim']
     proj = spec['proj']
     loaded = _load(seg, col)

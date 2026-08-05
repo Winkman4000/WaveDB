@@ -279,4 +279,12 @@ fused_agg = Read('fused_agg', _fused_detect, _fused_execute, 'single-table fused
 
 def general_scan(ctx):
     """The general scan -- read the columns directly. Always returns a result."""
+    try:
+        ec = wdb_gbcount._echo_detect(ctx.seg, ctx.tree, ctx.cmap)
+        if ec is not None:                       # SELECT col WHERE col = lit: the
+            r = wdb_gbcount.execute(ctx.seg, ec)  # answer is the literal x count --
+            if r is not None:                    # zero row reads (Q19's lane)
+                return r
+    except Exception:
+        pass
     return wdb_sql.execute(ctx.seg, ctx.sql, col_map=ctx.cmap)
