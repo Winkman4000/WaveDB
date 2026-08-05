@@ -112,22 +112,33 @@ def execute(seg, spec):
     global _HITS
     import wdb_wherescan
     g1, g2 = spec['g']
-    c1 = np.asarray(seg._raw_codes(g1))
-    c2 = np.asarray(seg._raw_codes(g2))
     V2 = int(seg.cols[g2]['V'])
     K = int(seg.cols[g1]['V']) * V2
+    cells = None
     if spec['fcol'] is not None:
         lit = wdb_wherescan._code_of(seg, spec['fcol'], spec['flit'])
         if lit is None:
-            rows = []
-            return rows, [wdb_sql._alias(p) for p in spec['proj']]
-        fc = np.asarray(seg._raw_codes(spec['fcol']))
-    else:
-        lit = -1
-        fc = c1
-    cells = WK.grid2_count(np.ascontiguousarray(c1), np.ascontiguousarray(c2),
-                           np.ascontiguousarray(fc),
-                           np.int64(lit if lit is not None else -1), np.int64(V2), np.int64(K))
+            return [], [wdb_sql._alias(p) for p in spec['proj']]
+        import wdb_fpm
+        pos = wdb_fpm.eq_positions(seg, spec['fcol'], int(lit))
+        if pos is not None and pos.size * 8 < int(seg.N):
+            # SURVIVORS-FIRST (the gs-cube law reaches the grid): the map hands the
+            # classroom's rows in their few frames; keys read AT positions, the pour
+            # shrinks to survivor-size. Whole-column reads never happen.
+            c1p = np.asarray(seg.codes_at(g1, pos)).astype(np.int64)
+            c2p = np.asarray(seg.codes_at(g2, pos)).astype(np.int64)
+            cells = np.bincount(c1p * V2 + c2p, minlength=K)
+    if cells is None:
+        c1 = np.asarray(seg._raw_codes(g1))
+        c2 = np.asarray(seg._raw_codes(g2))
+        if spec['fcol'] is not None:
+            fc = np.asarray(seg._raw_codes(spec['fcol']))
+        else:
+            lit = -1
+            fc = c1
+        cells = WK.grid2_count(np.ascontiguousarray(c1), np.ascontiguousarray(c2),
+                               np.ascontiguousarray(fc),
+                               np.int64(lit if lit is not None else -1), np.int64(V2), np.int64(K))
     nz = np.flatnonzero(cells)
     if spec.get('distinct_only'):
         lut1 = {}; lut2 = {}
