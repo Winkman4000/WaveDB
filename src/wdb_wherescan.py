@@ -69,11 +69,23 @@ def _code_of(seg, col, val):
     if V <= 0:
         return None
     if c['mode'] == 2:
-        arr = seg._dict_ints(c)
         try:
             iv = int(val)
         except (TypeError, ValueError):
             return None
+        if c.get('i2ch') is not None and c.get('intvals') is None:
+            lo2, hi2 = 0, V - 1              # chunked spine: fetch-bisect pops ~6
+            while lo2 <= hi2:                # chunks (cached) instead of inflating
+                mid = (lo2 + hi2) // 2       # the 102MB monolith per lookup
+                fv = int(seg._dict_ints_at(c, np.array([mid], np.int64))[0])
+                if fv == iv:
+                    return mid
+                if fv < iv:
+                    lo2 = mid + 1
+                else:
+                    hi2 = mid - 1
+            return None
+        arr = seg._dict_ints(c)
         k = int(np.searchsorted(arr[:V], iv))
         return k if k < V and int(arr[k]) == iv else None
     if c['dt'] == 0:
