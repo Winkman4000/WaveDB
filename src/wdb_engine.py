@@ -909,18 +909,33 @@ class Segment:
         ends = np.append(starts[1:], bs.size)
         import io as _io
         isz = np.dtype(wdt).itemsize
-        for j, s, e in zip(ub.tolist(), starts.tolist(), ends.tolist()):
-            fb = self.buf[base + int(bo[j]):base + int(bo[j + 1])].tobytes()
-            frame_rows = min(BR, self.N - j * BR)
+
+        def _popf(t):
+            j, s, e = t
+            import zstandard as _z                       # per-task decompressor: the
+            fb = self.buf[base + int(bo[j]):base + int(bo[j + 1])].tobytes()   # shared one
+            frame_rows = min(BR, self.N - j * BR)        # is not thread-safe
             mx = int(rs[s:e].max()) - j * BR
             need = (mx + 1) * isz
+            dz2 = _z.ZstdDecompressor()
             if need * 4 <= frame_rows * isz * 3:         # PARTIAL-FRAME READ: zstd streams
                 raw = np.frombuffer(                     # decompress prefixes, so a frame
-                    dz.stream_reader(_io.BytesIO(fb)).read(need),   # is only inflated to its
-                    dtype=wdt)                           # highest requested row (<=75% pays;
-            else:                                        # else the plain full inflate wins)
-                raw = np.frombuffer(dz.decompress(fb), dtype=wdt)
-            out[order[s:e]] = raw[rs[s:e] - j * BR]
+                    dz2.stream_reader(_io.BytesIO(fb)).read(need),   # is only inflated to
+                    dtype=wdt)                           # its highest requested row
+            else:
+                raw = np.frombuffer(dz2.decompress(fb), dtype=wdt)
+            return j, s, e, raw
+
+        tasks = list(zip(ub.tolist(), starts.tolist(), ends.tolist()))
+        if len(tasks) > 2:                               # POOLED POPS: 95 scattered
+            from concurrent.futures import ThreadPoolExecutor   # winners were 95 serial
+            with ThreadPoolExecutor(max_workers=min(8, len(tasks))) as ex:   # inflations
+                for j, s, e, raw in ex.map(_popf, tasks):
+                    out[order[s:e]] = raw[rs[s:e] - j * BR]
+        else:
+            for t in tasks:
+                j, s, e, raw = _popf(t)
+                out[order[s:e]] = raw[rs[s:e] - j * BR]
         return out
 
     def values_range(self, nm, lo, hi):
