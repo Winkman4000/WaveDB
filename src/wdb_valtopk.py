@@ -251,15 +251,17 @@ def execute(seg, spec):
             fidx = ci0[forced_m]
             need_t = k - int(forced_m.sum())
             pc0 = seg.cols.get(spec['pcols'][0])
-            if need_t > 0 and pc0 is not None and 'BR' in pc0:
+            if need_t * 4 >= k and pc0 is not None and 'BR' in pc0:
+                # the walk pays only when ties are FAT (>=25% of the answer);
+                # thin-tie shapes keep the counts-lane picks untouched
                 BRu = int(pc0['BR'])
                 paid = np.unique(fidx // BRu) if fidx.size else np.empty(0, np.int64)
                 ties = []
                 got_t = 0
                 seen_fr = set()
-                order_fr = list(paid.tolist()) + [f for f in range((N + BRu - 1) // BRu)
-                                                  if f not in set(paid.tolist())]
-                for f in order_fr:
+                paid_set = set(paid.tolist())
+                extra = [f for f in range((N + BRu - 1) // BRu) if f not in paid_set][:4]
+                for f in (paid.tolist() + extra)[:8]:   # hard cap: 8 frames, then the counts-lane picks stand
                     lo_f = f * BRu
                     hi_f = min(lo_f + BRu, N)
                     kc_f = np.asarray(seg.codes_at(kcol, np.arange(lo_f, hi_f, dtype=np.int64)))
