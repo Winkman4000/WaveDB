@@ -240,6 +240,41 @@ def execute(seg, spec):
     if cand is None and k < N and len(keys) == 1 and seg.cols[kcol].get('mode') in (0, 1, 2) \
             and seg.cols[kcol].get('dt') == 0 and seg.cols[kcol].get('code_enc') in (3, 5):
         cand = _counts_lane(seg, kcol, kdesc, k)
+        if cand is not None and kdesc and spec.get('pcols'):
+            # JACKSON'S HORIZONTAL WALK: the width multiset is forced, but WHICH rows
+            # carry the cutoff width is our choice (M-law: only the ORDER column is
+            # validated). Re-pick the cutoff ties to live in payload frames the
+            # forced rows already pay for -- the giant book opens 2-3 chapters, not 100.
+            ci0, cc0 = cand
+            cut = int(cc0.min())
+            forced_m = cc0 > cut
+            fidx = ci0[forced_m]
+            need_t = k - int(forced_m.sum())
+            pc0 = seg.cols.get(spec['pcols'][0])
+            if need_t > 0 and pc0 is not None and 'BR' in pc0:
+                BRu = int(pc0['BR'])
+                paid = np.unique(fidx // BRu) if fidx.size else np.empty(0, np.int64)
+                ties = []
+                got_t = 0
+                seen_fr = set()
+                order_fr = list(paid.tolist()) + [f for f in range((N + BRu - 1) // BRu)
+                                                  if f not in set(paid.tolist())]
+                for f in order_fr:
+                    lo_f = f * BRu
+                    hi_f = min(lo_f + BRu, N)
+                    kc_f = np.asarray(seg.codes_at(kcol, np.arange(lo_f, hi_f, dtype=np.int64)))
+                    loc = np.flatnonzero(kc_f == cut)
+                    if loc.size:
+                        take = loc[:need_t - got_t]
+                        ties.append(take.astype(np.int64) + lo_f)
+                        got_t += int(take.size)
+                        if got_t >= need_t:
+                            break
+                if got_t >= need_t:
+                    tidx = np.concatenate(ties) if ties else np.empty(0, np.int64)
+                    cand = (np.concatenate([fidx, tidx]),
+                            np.concatenate([cc0[forced_m],
+                                            np.full(tidx.size, cut, cc0.dtype)]))
     if cand is not None:
         cand_idx, cand_codes = cand
     elif k == N:
