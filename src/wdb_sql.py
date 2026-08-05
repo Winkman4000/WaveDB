@@ -1283,6 +1283,19 @@ def _dict_eq_mask(seg, name, neg, lit):
                 up = np.unpackbits(pb, count=int(seg.N)).astype(bool)
                 seg._codes[ck9] = up
             return up if neg else ~up
+        c3f = seg.cols.get(name, {})
+        if c3f.get('code_enc') == 3:
+            import wdb_fpm
+            ck7 = '_fpm_%s_%d' % (name, int(dcode))
+            m7 = seg._codes.get(ck7)
+            if m7 is None:
+                pos7 = wdb_fpm.eq_positions(seg, name, int(dcode))
+                if pos7 is not None:             # only frames CONTAINING the code pop
+                    m7 = np.zeros(int(seg.N), bool)
+                    m7[pos7] = True
+                    seg._codes[ck7] = m7
+            if m7 is not None:
+                return ~m7 if neg else m7
         pl = seg.e8_planes(name)                # non-default literal: mark its rows
         if pl is not None:                      # from the planes -- never densify
             ck8 = '_e8m_%s_%d' % (name, int(dcode))

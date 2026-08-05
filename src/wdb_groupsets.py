@@ -148,8 +148,11 @@ def _fused_2key(db, tree):
                 parts.append(hit.astype(np.int64) + j * BR)
         pos = np.concatenate(parts) if parts else np.empty(0, np.int64)
     else:
-        raw = np.asarray(seg._raw_codes(fcol))
-        pos = np.flatnonzero(raw == int(kc)).astype(np.int64)
+        import wdb_fpm
+        pos = wdb_fpm.eq_positions(seg, fcol, int(kc))
+        if pos is None:                          # ineligible column: full read
+            raw = np.asarray(seg._raw_codes(fcol))
+            pos = np.flatnonzero(raw == int(kc)).astype(np.int64)
     # ---- key arrays and numeric gathers at survivors only ----
     import wdb_window as W
     def keys_at(nm):
