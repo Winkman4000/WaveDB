@@ -137,16 +137,24 @@ def _fused_2key(db, tree):
     if kc is None:
         pos = np.empty(0, np.int64)
     elif fc.get('boffs') is not None and fc.get('BR'):
+        import wdb_fpm
+        pos_f = wdb_fpm.eq_positions(seg, fcol, int(kc))
+        if pos_f is not None:
+            pos = pos_f
+            skip_inline = True
+        else:
+            skip_inline = False
         base = fc['cstart']; bo = fc['boffs']; BR = int(fc['BR'])
         wdt = np.uint8 if fc['cwidth'] == 1 else (np.uint16 if fc['cwidth'] == 2 else np.uint32)
         dz = zstandard.ZstdDecompressor()
         parts = []
-        for j in range(len(bo) - 1):
-            raw = np.frombuffer(dz.decompress(seg.buf[base + int(bo[j]):base + int(bo[j + 1])].tobytes()), dtype=wdt)
-            hit = np.flatnonzero(raw == int(kc))
-            if hit.size:
-                parts.append(hit.astype(np.int64) + j * BR)
-        pos = np.concatenate(parts) if parts else np.empty(0, np.int64)
+        if not skip_inline:
+            for j in range(len(bo) - 1):
+                raw = np.frombuffer(dz.decompress(seg.buf[base + int(bo[j]):base + int(bo[j + 1])].tobytes()), dtype=wdt)
+                hit = np.flatnonzero(raw == int(kc))
+                if hit.size:
+                    parts.append(hit.astype(np.int64) + j * BR)
+            pos = np.concatenate(parts) if parts else np.empty(0, np.int64)
     else:
         import wdb_fpm
         pos = wdb_fpm.eq_positions(seg, fcol, int(kc))
