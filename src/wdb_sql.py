@@ -1283,19 +1283,6 @@ def _dict_eq_mask(seg, name, neg, lit):
                 up = np.unpackbits(pb, count=int(seg.N)).astype(bool)
                 seg._codes[ck9] = up
             return up if neg else ~up
-        c3f = seg.cols.get(name, {})
-        if c3f.get('code_enc') == 3:
-            import wdb_fpm
-            ck7 = '_fpm_%s_%d' % (name, int(dcode))
-            m7 = seg._codes.get(ck7)
-            if m7 is None:
-                pos7 = wdb_fpm.eq_positions(seg, name, int(dcode))
-                if pos7 is not None:             # only frames CONTAINING the code pop
-                    m7 = np.zeros(int(seg.N), bool)
-                    m7[pos7] = True
-                    seg._codes[ck7] = m7
-            if m7 is not None:
-                return ~m7 if neg else m7
         pl = seg.e8_planes(name)                # non-default literal: mark its rows
         if pl is not None:                      # from the planes -- never densify
             ck8 = '_e8m_%s_%d' % (name, int(dcode))
@@ -1306,12 +1293,6 @@ def _dict_eq_mask(seg, name, neg, lit):
                 m8[pos8[lits8 == np.uint32(int(dcode))]] = True
                 seg._codes[ck8] = m8
             return ~m8 if neg else m8
-    try:
-        codes = seg.codes(name)
-    except Exception:
-        return None
-    if codes is None or codes.dtype.kind not in 'iu':
-        return None
     td = seg._typed_dict(name)
     td = td if isinstance(td, np.ndarray) else np.asarray(td, dtype=object)
     V = c['V']
@@ -1327,6 +1308,27 @@ def _dict_eq_mask(seg, name, neg, lit):
     mcodes = np.nonzero(match)[0]
     if nullcode is not None:
         mcodes = mcodes[mcodes != nullcode]
+    if c.get('code_enc') == 3 and nullcode is None and len(mcodes) == 1:
+        # FRAME-PRESENCE (Jackson's granularity find), riding the tail's OWN literal
+        # resolution: pop only the frames containing the code -- 25 of 191 for
+        # classroom 62 -- and never read the rest.
+        import wdb_fpm
+        ck7 = '_fpm_%s_%d' % (name, int(mcodes[0]))
+        m7 = seg._codes.get(ck7)
+        if m7 is None:
+            pos7 = wdb_fpm.eq_positions(seg, name, int(mcodes[0]))
+            if pos7 is not None:
+                m7 = np.zeros(int(seg.N), bool)
+                m7[pos7] = True
+                seg._codes[ck7] = m7
+        if m7 is not None:
+            return ~m7 if neg else m7
+    try:
+        codes = seg.codes(name)
+    except Exception:
+        return None
+    if codes is None or codes.dtype.kind not in 'iu':
+        return None
     if len(mcodes) == 0:                    # literal absent: EQ matches nothing, NEQ matches all live
         res = np.zeros(len(codes), dtype=bool)
     elif len(mcodes) == 1:
