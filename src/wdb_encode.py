@@ -158,9 +158,25 @@ def _dict_bytes(p, zc):
     out = bytearray()
     if p['mode'] == 2:
         uniq_i = p['uniq'].astype(np.int64)
-        deltas = np.diff(uniq_i, prepend=np.int64(0)).astype(np.int64)
-        z = zc.compress(deltas.tobytes())
-        out += struct.pack('<I', len(z)) + z
+        I2CH = int(os.environ.get('WDB_I2CHUNK', str(1 << 19)))      # values per chunk (4MB raw)
+        I2MIN = int(os.environ.get('WDB_I2CHUNK_MIN', str(1 << 20)))  # chunk only big dicts
+        if uniq_i.size > I2MIN:
+            # CHUNKED SPINE (the hits_6 dress): each chunk's deltas prepend 0, so every
+            # chunk cumsums to absolutes independently -- point reads pop one ~3MB chunk
+            # instead of inflating a 102MB monolith. Sentinel 0xFFFFFFFF versions the header.
+            zs = []
+            for a in range(0, uniq_i.size, I2CH):
+                ck = uniq_i[a:a + I2CH]
+                zs.append(zc.compress(np.diff(ck, prepend=np.int64(0)).astype(np.int64).tobytes()))
+            out += struct.pack('<I', 0xFFFFFFFF) + struct.pack('<II', I2CH, len(zs))
+            for z in zs:
+                out += struct.pack('<I', len(z))
+            for z in zs:
+                out += z
+        else:
+            deltas = np.diff(uniq_i, prepend=np.int64(0)).astype(np.int64)
+            z = zc.compress(deltas.tobytes())
+            out += struct.pack('<I', len(z)) + z
     else:
         fc = bytearray(); restarts = []; prev = b''
         for i, sv in enumerate(p['valb']):

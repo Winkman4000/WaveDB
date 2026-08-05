@@ -49,7 +49,20 @@ class Segment:
                 meta['vals'] = vals
             elif mode == 2:
                 zlen = struct.unpack_from('<I',buf,off)[0]; off += 4
-                meta['z2'] = buf[off:off+zlen]; off += zlen
+                if zlen == 0xFFFFFFFF:               # chunked spine (hits_6 dress)
+                    i2ch, nch = struct.unpack_from('<II', buf, off); off += 8
+                    zl = np.frombuffer(buf, dtype=np.uint32, count=nch, offset=off)
+                    off += 4 * nch
+                    zoffs = np.zeros(nch + 1, np.int64)
+                    np.cumsum(zl.astype(np.int64), out=zoffs[1:])
+                    meta['i2ch'] = int(i2ch)
+                    meta['i2base'] = off
+                    meta['i2zoffs'] = zoffs
+                    meta['i2chunks'] = {}
+                    off += int(zoffs[-1])
+                    meta['z2'] = None
+                else:
+                    meta['z2'] = buf[off:off+zlen]; off += zlen
                 meta['vals'] = None; meta['intvals'] = None
             elif mode == 3:
                 # FD-reference: dependent column stored as y_by_xcode (Vx Y-codes) into a
@@ -247,10 +260,58 @@ class Segment:
         if c['_nline'] is not None:                     # no memmap-subclass gather tax
             return c['_nline']
         if c.get('intvals') is None:
-            raw = self._dz.decompress(c['z2'])
-            d = np.frombuffer(raw, dtype=np.int64)
-            c['intvals'] = np.cumsum(d)
+            if c.get('i2ch') is not None:            # chunked spine: inflate ALL chunks
+                nch = len(c['i2zoffs']) - 1          # POOLED for full-dict consumers
+                parts = [None] * nch
+                def _popi(ch):
+                    import zstandard as _z
+                    a = c['i2base'] + int(c['i2zoffs'][ch])
+                    b = c['i2base'] + int(c['i2zoffs'][ch + 1])
+                    return ch, np.cumsum(np.frombuffer(
+                        _z.ZstdDecompressor().decompress(bytes(self.buf[a:b])),
+                        dtype=np.int64))
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=8) as ex:
+                    for ch, arr in ex.map(_popi, range(nch)):
+                        parts[ch] = arr
+                c['intvals'] = np.concatenate(parts)
+            else:
+                raw = self._dz.decompress(c['z2'])
+                d = np.frombuffer(raw, dtype=np.int64)
+                c['intvals'] = np.cumsum(d)
         return c['intvals']
+
+    def _dict_ints_at(self, c, idx):
+        """Values at dict indices, popping ONLY the touched chunks (pooled). Falls back
+        to the full spine when unchunked or already inflated."""
+        idx = np.asarray(idx, dtype=np.int64)
+        if c.get('i2ch') is None or c.get('intvals') is not None or idx.size == 0:
+            return self._dict_ints(c)[idx] if idx.size else np.empty(0, np.int64)
+        CH = int(c['i2ch'])
+        chs = np.unique(idx // CH)
+        cache = c['i2chunks']
+        missing = [int(ch) for ch in chs.tolist() if ch not in cache]
+        if missing:
+            def _popi(ch):
+                import zstandard as _z
+                a = c['i2base'] + int(c['i2zoffs'][ch])
+                b = c['i2base'] + int(c['i2zoffs'][ch + 1])
+                return ch, np.cumsum(np.frombuffer(
+                    _z.ZstdDecompressor().decompress(bytes(self.buf[a:b])),
+                    dtype=np.int64))
+            if len(missing) > 1:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=min(8, len(missing))) as ex:
+                    for ch, arr in ex.map(_popi, missing):
+                        cache[ch] = arr
+            else:
+                ch, arr = _popi(missing[0])
+                cache[ch] = arr
+        out = np.empty(idx.size, np.int64)
+        for ch in chs.tolist():
+            m = (idx // CH) == ch
+            out[m] = cache[int(ch)][idx[m] - ch * CH]
+        return out
     def dict_vals(self, nm):
         c = self.cols[nm]
         if c['vals'] is None: c['vals'] = self._decode_fc(c)
@@ -581,11 +642,11 @@ class Segment:
             if d is None: self._raw_codes(nm); d = c['_idict']
             return d[code]
         if c['mode'] == 2:
-            arr = self._dict_ints(c)
+            v2 = int(self._dict_ints_at(c, np.array([code], np.int64))[0])
             if c['dt'] == 3:
                 unit = _DT_UNITS[c['aux']]
-                return np.int64(arr[code]).view(f'datetime64[{unit}]')
-            return int(arr[code])
+                return np.int64(v2).view(f'datetime64[{unit}]')
+            return v2
         if c['mode'] in (0, 3):
             v = c['vals'][code]
             if c['dt'] == 0: return int(v)
@@ -644,7 +705,7 @@ class Segment:
             if d is None: self._raw_codes(nm); d = c['_idict']
             for i, cd in enumerate(work.tolist()): uv[i] = wdb_sql._pyval(d[cd])
         elif mode == 2:
-            arr = self._dict_ints(c)[work]
+            arr = self._dict_ints_at(c, work)
             if c['dt'] == 3:
                 vals = arr.view(f"datetime64[{_DT_UNITS[c['aux']]}]")
                 for i in range(vals.size): uv[i] = wdb_sql._pyval(vals[i])
