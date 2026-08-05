@@ -764,6 +764,14 @@ def _scan_eq(seg, col, code, lo, hi, negate=False):
     """Positions in [lo, hi) where the column's code equals (or differs from) `code`.
     enc=3: parallel decompress of the frames covering the span; other encodings fall back to the
     range read (bitpack touches covering bytes; sealed uses the cached full decode)."""
+    import wdb_fpm
+    p9 = wdb_fpm.eq_positions(seg, col, code)    # the map: pop only frames that
+    if p9 is not None:                           # CONTAIN the code (25/191 for
+        if lo > 0 or hi < seg.N:                 # classroom 62)
+            a9 = np.searchsorted(p9, lo)
+            b9 = np.searchsorted(p9, hi)
+            return p9[a9:b9].astype(np.int64)
+        return p9.astype(np.int64)
     c = seg.cols[col]
     if c.get('code_enc', 0) == 3 and col not in seg._codes:
         wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
