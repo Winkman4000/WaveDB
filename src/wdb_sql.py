@@ -226,7 +226,8 @@ def _fval_by_code(seg, fname, cn, params=None):
     key = (id(seg), cn, fname, params)
     m = _SFN_CACHE.get(key)
     if m is None:
-        if fname == 'LENGTH' and hasattr(seg, 'dict_charlens'):
+        import os as _os
+        if fname == 'LENGTH' and _os.environ.get('WDB_CHARLENS') and hasattr(seg, 'dict_charlens'):
             m9 = seg.dict_charlens(cn)           # char lengths straight off the dict
             if m9 is not None:                   # BYTES: no string is ever born
                 m = m9
