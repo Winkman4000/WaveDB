@@ -77,6 +77,9 @@ def eq_positions(seg, col, code):
     frames = np.flatnonzero(bits[int(code)])
     if frames.size == 0:
         return np.empty(0, np.int64)
+    if frames.size * 2 > bits.shape[1]:          # COMMON code (over half the frames):
+        return None                              # materializing millions of positions
+                                                 # loses to the block scan -- decline
     out = []
     for f in frames.tolist():
         lo = f * BR
