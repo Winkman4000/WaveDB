@@ -1,3 +1,4 @@
+import re
 """WaveDB Database: a directory-backed database you build with SQL.
 
     db = Database.create('/path/mydb')

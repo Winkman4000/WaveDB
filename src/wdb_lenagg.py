@@ -20,6 +20,7 @@ def detect(seg, tree, col_map):
     key = (col_map or {}).get(g.expressions[0].name, g.expressions[0].name)
     aggs = []
     lcol = None
+    lkind = None
     for p in tree.expressions:
         inner = p.this if isinstance(p, E.Alias) else p
         if isinstance(inner, E.Column):
@@ -33,11 +34,18 @@ def detect(seg, tree, col_map):
             continue
         if isinstance(inner, (E.Avg, E.Sum)):
             fn = inner.this
+            kf = None
+            cn2 = None
             if isinstance(fn, E.Length) and isinstance(fn.this, E.Column):
-                c2 = (col_map or {}).get(fn.this.name, fn.this.name)
-                if lcol is not None and c2 != lcol:
+                kf, cn2 = 'chars', fn.this.name
+            elif (isinstance(fn, E.Anonymous) and str(fn.this).upper() == 'STRLEN'
+                  and fn.expressions and isinstance(fn.expressions[0], E.Column)):
+                kf, cn2 = 'bytes', fn.expressions[0].name
+            if kf is not None:
+                c2 = (col_map or {}).get(cn2, cn2)
+                if lcol is not None and (c2 != lcol or kf != lkind):
                     return None
-                lcol = c2
+                lcol, lkind = c2, kf
                 aggs.append(('AVGL' if isinstance(inner, E.Avg) else 'SUML', None))
                 continue
         return None
@@ -66,7 +74,8 @@ def detect(seg, tree, col_map):
     for c in (key, lcol):
         if c not in seg.cols or seg.cols[c].get('code_enc') not in (0, 3, 5, 8):
             return None
-    lens = seg.dict_charlens(lcol) if hasattr(seg, 'dict_charlens') else None
+    lens = (seg.dict_bytelens(lcol) if lkind == 'bytes' else seg.dict_charlens(lcol)) \
+        if hasattr(seg, 'dict_charlens') else None
     if lens is None:
         return None
     lim = None
@@ -88,14 +97,15 @@ def detect(seg, tree, col_map):
         if onm.name not in alias_names:
             return None
         oi = alias_names.index(onm.name)
-    return {'key': key, 'lcol': lcol, 'aggs': aggs, 'excl_empty': excl_empty,
+    return {'key': key, 'lcol': lcol, 'lkind': lkind, 'aggs': aggs, 'excl_empty': excl_empty,
             'hmin': hmin, 'lim': lim, 'oi': oi, 'proj': tree.expressions}
 
 
 def execute(seg, spec):
     global _HITS
     key, lcol = spec['key'], spec['lcol']
-    lens = seg.dict_charlens(lcol)
+    lens = (seg.dict_bytelens(lcol) if spec.get('lkind') == 'bytes'
+            else seg.dict_charlens(lcol))
     if lens is None:
         return None
     kc = np.asarray(seg._raw_codes(key))

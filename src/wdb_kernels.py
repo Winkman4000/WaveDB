@@ -1016,3 +1016,16 @@ def fc_charlens(a, R, out):
         n += 1
         i += 1
     return n
+
+
+@njit(nogil=True, cache=True)
+def fc_bytelens(a, R, out):
+    """Front-coded walk, BYTE lengths: per entry <HH cp,sl>, length = cp + sl."""
+    o = np.int64(0); n = np.int64(0)
+    while o < a.size:
+        cp = np.int64(a[o]) | (np.int64(a[o + 1]) << 8)
+        sl = np.int64(a[o + 2]) | (np.int64(a[o + 3]) << 8)
+        out[n] = cp + sl
+        o += 4 + sl
+        n += 1
+    return n

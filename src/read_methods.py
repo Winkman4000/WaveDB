@@ -66,13 +66,22 @@ class Read:
     """A read = its activation (detect) + its retrieval (execute). The controller calls
     detect(ctx) to route (cheap, preloadable) and execute(ctx, spec) to retrieve. The
     spec is opaque to the controller; only the matching execute interprets it."""
-    __slots__ = ('name', 'detect', 'execute', 'note')
+    __slots__ = ('name', '_detect', 'execute', 'note')
 
     def __init__(self, name, detect, execute, note=''):
         self.name = name
-        self.detect = detect
+        self._detect = detect
         self.execute = execute
         self.note = note
+
+    def detect(self, ctx):
+        # ROUTING LAW: a detect that cannot parse a shape DECLINES -- it never
+        # crashes the route. Novel SQL limbs (e.g. new scalar functions) fall
+        # through to readers that speak them, ultimately the general scan.
+        try:
+            return self._detect(ctx)
+        except Exception:
+            return None
 
 
 # --- structure reads (operators with a clean detect/execute split) -----------------

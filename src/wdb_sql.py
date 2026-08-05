@@ -135,6 +135,16 @@ def _colname(node):
 # over the V distinct values once -> fval_by_code[V], then per-row value is fval_by_code[codes].
 # Same shape as the date-coarsening group key. Registry maps SQL func name -> (typed_dict -> int64[V]).
 
+def _fn_strlen(td, params=None):
+    """BYTE length of each dict value (official ClickBench STRLEN)."""
+    out = np.empty(len(td), dtype=np.int64)
+    for i, v in enumerate(td):
+        if v is None: out[i] = 0
+        elif isinstance(v, (bytes, bytearray)): out[i] = len(v)
+        else: out[i] = len(str(v).encode('utf-8'))
+    return out
+
+
 def _fn_length(td, params=None):
     """CHARACTER length of each dict value (matches DuckDB length()); None -> 0 (slot unused, the
     null mask handles real nulls). Bytes decoded as utf-8 for true char count (ascii: == byte len)."""
@@ -194,7 +204,7 @@ def _fn_upper(td, params=None):
     return out
 
 
-_SCALAR_FNS = { 'LENGTH': _fn_length, 'REGEXP_REPLACE': _fn_regexp_replace,
+_SCALAR_FNS = { 'LENGTH': _fn_length, 'STRLEN': _fn_strlen, 'REGEXP_REPLACE': _fn_regexp_replace,
                 'LOWER': _fn_lower, 'UPPER': _fn_upper }
 
 def _scalar_fn(node):
@@ -226,14 +236,12 @@ def _fval_by_code(seg, fname, cn, params=None):
     key = (id(seg), cn, fname, params)
     m = _SFN_CACHE.get(key)
     if m is None:
+        m9 = None
         if fname == 'LENGTH' and hasattr(seg, 'dict_charlens'):
-            m9 = seg.dict_charlens(cn)           # char lengths straight off the dict
-            if m9 is not None:                   # BYTES: no string is ever born
-                m = m9
-            else:
-                m = _SCALAR_FNS[fname](seg._typed_dict(cn), params)
-        else:
-            m = _SCALAR_FNS[fname](seg._typed_dict(cn), params)
+            m9 = seg.dict_charlens(cn)           # char lengths off the dict bytes
+        elif fname == 'STRLEN' and hasattr(seg, 'dict_bytelens'):
+            m9 = seg.dict_bytelens(cn)           # byte lengths (official STRLEN)
+        m = m9 if m9 is not None else _SCALAR_FNS[fname](seg._typed_dict(cn), params)
         _SFN_CACHE[key] = m
     return m
 
