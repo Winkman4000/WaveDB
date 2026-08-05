@@ -854,13 +854,19 @@ def _scan_flag(seg, col, flag, lo, hi):
                 ckm = '_e8sf_' + col             # contains anything): the answer lives
                 hit = seg._codes.get(ckm)        # ENTIRELY in the literals -- and the
                 if hit is not None and hit[0] == id(flag):   # block loop calls this 382
-                    rows = hit[1]                # times: build ONCE per query
+                    rows, bnd, BSTEP = hit[1], hit[2], hit[3]
                 else:
                     rows = pos8[flag[lits8]]
-                    seg._codes[ckm] = (id(flag), rows)
+                    BSTEP = 262144               # boundaries for EVERY block, once:
+                    bnd = np.searchsorted(rows, np.arange(0, int(seg.N) + BSTEP, BSTEP))
+                    seg._codes[ckm] = (id(flag), rows, bnd, BSTEP)
                 if lo > 0 or hi < seg.N:
-                    a = np.searchsorted(rows, lo)
-                    b = np.searchsorted(rows, hi)
+                    if lo % BSTEP == 0 and (hi % BSTEP == 0 or hi >= seg.N):
+                        a = int(bnd[lo // BSTEP])          # O(1) per block: the 382
+                        b = int(bnd[min(hi // BSTEP, len(bnd) - 1)])   # searches die
+                    else:
+                        a = int(np.searchsorted(rows, lo))
+                        b = int(np.searchsorted(rows, hi))
                     return rows[a:b]
                 return rows
     if c.get('code_enc', 0) == 3 and col not in seg._codes:
