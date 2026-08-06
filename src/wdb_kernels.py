@@ -1201,3 +1201,21 @@ def cd_hunt(bucketed, offs, big, counts, k):
                     m = bestd[t]
             kth = m
     return bestc, bestd, filled
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def cd_alldistinct(bucketed, offs):
+    """Distinct count for EVERY group: per-slice sort + adjacent-diff, groups
+    across threads. Feeds the gdc sidecar's big-key birth."""
+    G = offs.size - 1
+    out = np.zeros(G, np.int64)
+    for g in prange(G):
+        a, b = offs[g], offs[g + 1]
+        if b > a:
+            s = np.sort(bucketed[a:b])
+            d = np.int64(1)
+            for t in range(1, s.size):
+                if s[t] != s[t - 1]:
+                    d += 1
+            out[g] = d
+    return out

@@ -207,7 +207,7 @@ def detect(db, table, seg, segment_path, tree, col_map):
     det = gd.detect(seg, tree, col_map, _allow_group_filter=True)
     if det is None:
         return None
-    kcol, tcol, ci, ki, proj = det
+    kcol, tcol, ci, ki, proj = det[0], det[1], det[2], det[3], det[4]
     entry = db.cat.gd_entry(table, kcol, tcol)
     if entry is None:                                    # pair not materialized -> walk
         return None

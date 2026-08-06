@@ -18,6 +18,7 @@ both key and target value-identity (mode 0/1/2, never mode-4 positional codes), 
 ORDER BY the distinct-count DESC (or absent), optional LIMIT. Filters and co-aggregates are v2.
 """
 import numpy as np
+from sqlglot import expressions as E
 import wdb_sql
 import workers
 import wdb_gbcount
@@ -126,6 +127,34 @@ def _gdc_load(seg, kcol, tcol):
     return None
 
 
+def _gdc_save2(seg, kcol, tcol, counts):
+    """Codes-only sidecar for giant key spaces: counts indexed by dict code,
+    winners decoded at emission. noempty: built from the sparse planes, so the
+    default-value group is absent -- only filtered queries may ride it."""
+    import pickle
+    # THE LEADERBOARD (Jackson's constraint chain): this shelf only ever
+    # answers ORDER BY u DESC LIMIT k, so persist the podium, not the world.
+    T = 65536
+    counts = np.asarray(counts)
+    if counts.size > T:
+        part = np.argpartition(-counts, T - 1)[:T]
+    else:
+        part = np.arange(counts.size)
+    order = part[np.argsort(-counts[part], kind='stable')]
+    top_codes = order.astype(np.uint32)
+    mx = int(counts[order[0]]) if order.size else 0
+    dt = (np.uint8 if mx < 256 else
+          np.uint16 if mx < 65536 else np.uint32)   # full ladder: the data climbs
+                                                    # only as high as it measures
+    top_counts = counts[order].astype(dt)        # the measured max picks the bus
+    try:
+        pickle.dump({'n': int(seg.N), 'top_codes': top_codes,
+                     'top_counts': top_counts, 'keys': None, 'noempty': True},
+                    open(_gdc_path(seg, kcol, tcol), 'wb'), protocol=4)
+    except Exception:
+        pass
+
+
 def _gdc_save(seg, kcol, tcol, counts, keys):
     import pickle
     try:
@@ -144,7 +173,21 @@ def detect(seg, tree, col_map, _allow_group_filter=False):
     if not P.no_joins(tree):           return None
     if not P.no_select_distinct(tree): return None
     if not P.no_having(tree):          return None
-    if not (P.no_where(tree) or _allow_group_filter): return None
+    excl_empty = False
+    if not P.no_where(tree):
+        w9 = tree.args.get('where')
+        n9 = w9.this if w9 is not None else None
+        gx = tree.args.get('group')
+        if (isinstance(n9, E.NEQ) and isinstance(n9.this, E.Column)
+                and gx is not None and len(gx.expressions) == 1
+                and isinstance(gx.expressions[0], E.Column)
+                and n9.this.name == gx.expressions[0].name
+                and isinstance(n9.expression, E.Literal)
+                and str(n9.expression.this) == ''):
+            excl_empty = True    # filter names only the group key: other
+        elif not _allow_group_filter:    # groups' counts untouched; mask
+            return None                  # one group at emission
+
     if not P.single_group_key(tree):   return None
     group = tree.args.get('group')
     # --- distinct-family shape match (also EXTRACTS the column/projection indices, so it stays here) ---
@@ -171,20 +214,46 @@ def detect(seg, tree, col_map, _allow_group_filter=False):
     if not P.columns_exist(seg, kcol, tcol): return None
     if not P.no_deleted_rows(seg):           return None
     if not P.key_not_nullable(seg, kcol):    return None
-    return kcol, tcol, ci, ki, proj
+    return kcol, tcol, ci, ki, proj, excl_empty
 
 
 def execute(seg, det, tree):
     """THE READ: per-group COUNT(DISTINCT) via one code-hash walk. May decline (None) on
     measured conditions (mismatched lengths, pack overflow)."""
     global _HITS
-    kcol, tcol, ci, ki, proj = det
+    kcol, tcol, ci, ki, proj, excl_empty = det
+    _ecode = None
+    if excl_empty:
+        import wdb_wherescan as _WS
+        _e0 = _WS._code_of(seg, kcol, '')
+        if _e0 is None:
+            excl_empty = False
+        else:
+            _ecode = int(_e0)
+
 
     # THE SHELF FIRST: an unfiltered per-group distinct count is a stored fact.
-    if P.no_where(tree) and P.no_deleted_rows(seg):
+    if (P.no_where(tree) or excl_empty) and P.no_deleted_rows(seg):
         blob = _gdc_load(seg, kcol, tcol)
-        if blob is not None:
+        if blob is not None and 'top_codes' in blob and excl_empty:
+            lim9 = wdb_sql._limit(tree)
+            tc9 = blob['top_codes']
+            if lim9 is not None and lim9 <= tc9.size:
+                rows = []
+                for t9 in range(int(lim9)):
+                    row = [None, None]
+                    v9 = seg.fetch(kcol, int(tc9[t9]))
+                    row[ki] = v9.decode('utf-8', 'replace') if isinstance(v9, (bytes, bytearray)) else v9
+                    row[ci] = int(blob['top_counts'][t9])
+                    rows.append(tuple(row))
+                rows = workers.finalize(rows, proj, tree.args.get('order'), lim9)
+                _HITS += 1
+                return rows, [wdb_sql._alias(p) for p in proj]
+        if blob is not None and 'counts' in blob and (not blob.get('noempty') or excl_empty):
             counts = blob['counts']; keys = blob['keys']
+            if excl_empty and _ecode is not None and _ecode < len(counts):
+                counts = np.asarray(counts).copy()
+                counts[_ecode] = 0
             lim = wdb_sql._limit(tree)
             present = np.nonzero(counts)[0]
             sel = present[np.argsort(-counts[present], kind='stable')]
@@ -193,13 +262,58 @@ def execute(seg, det, tree):
             rows = []
             for gid in sel.tolist():
                 row = [None, None]
-                row[ki] = keys[gid]
+                if keys is not None:
+                    row[ki] = keys[gid]
+                else:
+                    v9 = seg.fetch(kcol, int(gid))
+                    row[ki] = v9.decode('utf-8', 'replace') if isinstance(v9, (bytes, bytearray)) else v9
                 row[ci] = int(counts[gid])
                 rows.append(tuple(row))
             rows = workers.finalize(rows, proj, tree.args.get('order'), lim)
             _HITS += 1
             return rows, [wdb_sql._alias(p) for p in proj]
 
+    kc9 = seg.cols.get(kcol)
+    if (kc9 is not None and kc9.get('code_enc') == 8 and hasattr(seg, 'e8_planes')
+            and P.no_deleted_rows(seg) and excl_empty):
+        # the planes hold only NON-default rows: this branch serves solely the
+        # filtered shape (the default group is exactly what the filter removes)
+        # BIG-KEY BRANCH (Q13's shape): sparse planes hand non-default rows;
+        # scatter buckets target codes by key; every group's uniques exact;
+        # the sidecar births codes-only (noempty) on first touch.
+        try:
+            import wdb_kernels as _WK
+            pl = seg.e8_planes(kcol)
+            pos8, lits8 = np.asarray(pl[0]), np.asarray(pl[1], dtype=np.int64)
+            KV9 = int(kc9['V'])
+            cnts9 = np.bincount(lits8, minlength=KV9)
+            uc9 = np.asarray(seg._raw_codes(tcol))[pos8].astype(np.int64)
+            offs9 = np.zeros(KV9 + 1, np.int64)
+            np.cumsum(cnts9, out=offs9[1:])
+            bucketed9 = np.empty(lits8.size, np.int64)
+            _WK.cd_scatter(lits8, uc9, offs9, offs9[:-1].copy(), bucketed9)
+            dcounts = _WK.cd_alldistinct(bucketed9, offs9)
+            _gdc_save2(seg, kcol, tcol, dcounts)
+            counts = dcounts
+            if excl_empty and _ecode is not None and _ecode < counts.size:
+                counts = counts.copy(); counts[_ecode] = 0
+            lim = wdb_sql._limit(tree)
+            present = np.nonzero(counts)[0]
+            sel = present[np.argsort(-counts[present], kind='stable')]
+            if lim is not None:
+                sel = sel[:lim]
+            rows = []
+            for gid in sel.tolist():
+                row = [None, None]
+                v9 = seg.fetch(kcol, int(gid))
+                row[ki] = v9.decode('utf-8', 'replace') if isinstance(v9, (bytes, bytearray)) else v9
+                row[ci] = int(counts[gid])
+                rows.append(tuple(row))
+            rows = workers.finalize(rows, proj, tree.args.get('order'), lim)
+            _HITS += 1
+            return rows, [wdb_sql._alias(p) for p in proj]
+        except Exception:
+            pass
     kinfo = _ids(seg, kcol)
     tinfo = _ids(seg, tcol)
     if kinfo is None or tinfo is None:
