@@ -519,6 +519,16 @@ def detect(seg, tree, col_map):
         # counts when a .gbc sidecar ALREADY EXISTS (peek only -- driver selection must
         # never trigger a lazy build); N/V average otherwise.
         import os
+        try:
+            import wdb_gbshelf
+            sh9 = wdb_gbshelf.open_shelf(seg, col)   # the tiered shelf prices in
+            if sh9 is not None:                      # microseconds; the pickle
+                k = _code_of(seg, col, val)          # below paid 65ms per plan
+                if k is None:
+                    return 0
+                return int(wdb_gbshelf.point(sh9, int(k)))
+        except Exception:
+            pass
         if os.path.exists(seg.path + '.' + col + '.gbc'):
             try:
                 import wdb_gbcount

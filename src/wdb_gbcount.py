@@ -431,12 +431,23 @@ def execute(seg, spec):
         if kc is None:
             rows = []
         else:
-            loaded = _load(seg, spec['col'])
-            if loaded is None:
-                return None
-            hc, hn = loaded
-            m = hc == int(kc)
-            cnt = int(hn[m][0]) if m.any() else 1   # shelf singleton law: in-dict,
+            cnt = None
+            try:
+                import wdb_gbshelf
+                sh = wdb_gbshelf.open_shelf(seg, spec['col'])
+                if sh is None and wdb_gbshelf.birth(seg, spec['col']):
+                    sh = wdb_gbshelf.open_shelf(seg, spec['col'])
+                if sh is not None:
+                    cnt = wdb_gbshelf.point(sh, int(kc))   # tiered-absence shelf:
+            except Exception:                              # mmap-open, 3 bit tests
+                cnt = None
+            if cnt is None:
+                loaded = _load(seg, spec['col'])
+                if loaded is None:
+                    return None
+                hc, hn = loaded
+                m = hc == int(kc)
+                cnt = int(hn[m][0]) if m.any() else 1   # shelf singleton law: in-dict,
             v = wdb_sql._pyval(seg.fetch(spec['col'], int(kc)))   # off-shelf = 1 row
             if isinstance(v, (bytes, bytearray)):
                 v = v.decode('utf-8', 'replace')
