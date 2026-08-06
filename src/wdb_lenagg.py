@@ -9,6 +9,48 @@ from sqlglot import expressions as E
 import wdb_sql
 
 _HITS = 0
+_PRICED = []     # (chosen, fused_ms_est, chain_ms_est) -- the honesty loop's seed
+
+
+def _fn_table(seg, col, lkind):
+    """The V-table for F over col's dictionary. Fast providers for the length
+    family (header arithmetic, no decode); the GENERAL provider evaluates any
+    registered scalar fn once per distinct value. Numeric outputs only."""
+    if not isinstance(lkind, tuple):
+        return None
+    fname, params = lkind
+    if fname == 'LENGTH' and hasattr(seg, 'dict_charlens'):
+        t = seg.dict_charlens(col)
+        if t is not None:
+            return t
+    if fname == 'STRLEN' and hasattr(seg, 'dict_bytelens'):
+        t = seg.dict_bytelens(col)
+        if t is not None:
+            return t
+    try:
+        arr = wdb_sql._fval_by_code(seg, fname, col, params)
+        if arr is not None and np.issubdtype(np.asarray(arr).dtype, np.number):
+            return np.asarray(arr)
+    except Exception:
+        pass
+    return None
+
+
+def _price(seg, key, lcol):
+    """Cost arithmetic from the cards: fused frame-pour vs gather+bincount chain.
+    Returns ('fused'|'chain', est_ms_fused, est_ms_chain)."""
+    try:
+        import wdb_calib
+        mc = wdb_calib.machine_card(getattr(seg, 'db_dir', '.') or '.')
+        N = float(seg.N)
+        fused = (N / 1e6) / max(mc.get('fused_pour_mrps') or 1, 1) * 1000
+        chain = (N / 1e6) / max(mc.get('gather_i64_mrps') or 1, 1) * 1000 \
+            + 2 * (N / 1e6) / max(mc.get('bincount_w_mrps') or 1, 1) * 1000
+        pick = 'fused' if fused <= chain else 'chain'
+        _PRICED.append((pick, round(fused, 1), round(chain, 1)))
+        return pick, fused, chain
+    except Exception:
+        return 'fused', 0.0, 0.0
 
 
 def detect(seg, tree, col_map):
@@ -36,11 +78,10 @@ def detect(seg, tree, col_map):
             fn = inner.this
             kf = None
             cn2 = None
-            if isinstance(fn, E.Length) and isinstance(fn.this, E.Column):
-                kf, cn2 = 'chars', fn.this.name
-            elif (isinstance(fn, E.Anonymous) and str(fn.this).upper() == 'STRLEN'
-                  and fn.expressions and isinstance(fn.expressions[0], E.Column)):
-                kf, cn2 = 'bytes', fn.expressions[0].name
+            sf = wdb_sql._scalar_fn(fn)          # THE ALGEBRA IDENTITY, general form:
+            if sf is not None:                   # agg(F(dictcol)) GROUP BY key ==
+                kf = (sf[1], sf[3])              # weighted pour over F's V-table.
+                cn2 = sf[2]                      # F = ANY registered scalar fn.
             if kf is not None:
                 c2 = (col_map or {}).get(cn2, cn2)
                 if lcol is not None and (c2 != lcol or kf != lkind):
@@ -74,8 +115,7 @@ def detect(seg, tree, col_map):
     for c in (key, lcol):
         if c not in seg.cols or seg.cols[c].get('code_enc') not in (0, 3, 5, 8):
             return None
-    lens = (seg.dict_bytelens(lcol) if lkind == 'bytes' else seg.dict_charlens(lcol)) \
-        if hasattr(seg, 'dict_charlens') else None
+    lens = _fn_table(seg, lcol, lkind)
     if lens is None:
         return None
     lim = None
@@ -104,8 +144,7 @@ def detect(seg, tree, col_map):
 def execute(seg, spec):
     global _HITS
     key, lcol = spec['key'], spec['lcol']
-    lens = (seg.dict_bytelens(lcol) if spec.get('lkind') == 'bytes'
-            else seg.dict_charlens(lcol))
+    lens = _fn_table(seg, lcol, spec.get('lkind'))
     if lens is None:
         return None
     KV = int(seg.cols[key]['V'])
@@ -120,6 +159,7 @@ def execute(seg, spec):
     else:
         lens16 = lens.astype(np.int64)
     import wdb_kernels as WK
+    _price(seg, key, lcol)                       # the bidder's ledger: predict, then act
     BR = 524288
     nfr = (N + BR - 1) // BR
     from concurrent.futures import ThreadPoolExecutor
