@@ -1029,3 +1029,15 @@ def fc_bytelens(a, R, out):
         o += 4 + sl
         n += 1
     return n
+
+
+@njit(nogil=True, cache=True)
+def lenagg_pour(kc, uc, lens, jars, cnts, ec):
+    """Q27's fused pour: one pass, both jars, integer math, no temporaries.
+    jars[k] += lens[u]; cnts[k] += 1 for live rows (u != ec; ec = -1 counts all)."""
+    for i in range(kc.size):
+        u = np.int64(uc[i])
+        if u != ec:
+            kk = np.int64(kc[i])
+            jars[kk] += np.int64(lens[u])
+            cnts[kk] += 1

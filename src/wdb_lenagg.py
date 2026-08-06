@@ -108,21 +108,35 @@ def execute(seg, spec):
             else seg.dict_charlens(lcol))
     if lens is None:
         return None
-    kc = np.asarray(seg._raw_codes(key))
-    uc = np.asarray(seg._raw_codes(lcol))
     KV = int(seg.cols[key]['V'])
-    lw = lens[uc].astype(np.float64)
+    ec = -1
     if spec['excl_empty']:
         import wdb_wherescan as WS
-        ec = WS._code_of(seg, lcol, '')
-        live = (uc != np.uint32(int(ec))).astype(np.float64) if ec is not None else None
+        ec0 = WS._code_of(seg, lcol, '')
+        ec = int(ec0) if ec0 is not None else -1
+    N = int(seg.N)
+    if int(lens.max() if lens.size else 0) < 65536:
+        lens16 = lens.astype(np.uint16)          # the tiny alphabet rides a u16 bus
     else:
-        live = None
-    cnt = np.bincount(kc, weights=live, minlength=KV) if live is not None \
-        else np.bincount(kc, minlength=KV).astype(np.float64)
-    if live is not None:
-        lw = lw * live
-    sums = np.bincount(kc, weights=lw, minlength=KV)
+        lens16 = lens.astype(np.int64)
+    import wdb_kernels as WK
+    BR = 524288
+    nfr = (N + BR - 1) // BR
+    from concurrent.futures import ThreadPoolExecutor
+    def _pour(f):
+        lo, hi = f * BR, min((f + 1) * BR, N)
+        kcf = np.asarray(seg._raw_codes_range(key, lo, hi))
+        ucf = np.asarray(seg._raw_codes_range(lcol, lo, hi))
+        j = np.zeros(KV, np.int64)
+        c = np.zeros(KV, np.int64)
+        WK.lenagg_pour(kcf, ucf, lens16, j, c, np.int64(ec))
+        return j, c
+    sums = np.zeros(KV, np.float64)
+    cnt = np.zeros(KV, np.float64)
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for j, c in ex.map(_pour, range(nfr)):   # frame-fused: pop the aligned pair,
+            sums += j                            # pour while cache-hot, discard
+            cnt += c
     keep = cnt > (spec['hmin'] if spec['hmin'] is not None else 0)
     gs = np.flatnonzero(keep)
     rows = []
