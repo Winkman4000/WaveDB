@@ -1145,3 +1145,59 @@ def fc_hostruns(a, R, brk, hend, labuf, laboff, meta):
     laboff[nr] = lw
     meta[0] = i
     return nr
+
+
+@njit(nogil=True, cache=True)
+def cd_scatter(lits, uc, offs, cur, out):
+    """Jackson's bucket pass: one walk scatters each row's user-code into its
+    phrase's slice. Replaces the 13.2M argsort."""
+    for i in range(lits.size):
+        g = lits[i]
+        out[cur[g]] = uc[i]
+        cur[g] += 1
+
+
+@njit(nogil=True, cache=True)
+def cd_hunt(bucketed, offs, big, counts, k):
+    """The bounded hunt in one kernel: walk groups biggest-first, count uniques
+    by sorting each group's small slice, stop when the next bound falls
+    strictly below the k-th exact answer. Returns (codes, uniques, filled)."""
+    bestd = np.zeros(k, np.int64)
+    bestc = np.zeros(k, np.int64)
+    filled = 0
+    kth = np.int64(-1)
+    for bi in range(big.size):
+        code = big[bi]
+        cnt = counts[code]
+        if cnt == 0 or cnt < kth:
+            break
+        s = np.sort(bucketed[offs[code]:offs[code] + cnt])
+        d = np.int64(1)
+        for t in range(1, s.size):
+            if s[t] != s[t - 1]:
+                d += 1
+        if filled < k:
+            bestd[filled] = d
+            bestc[filled] = code
+            filled += 1
+            if filled == k:
+                # establish kth
+                m = bestd[0]
+                for t in range(k):
+                    if bestd[t] < m:
+                        m = bestd[t]
+                kth = m
+        elif d > kth:
+            # replace the current minimum
+            mi = 0
+            for t in range(1, k):
+                if bestd[t] < bestd[mi]:
+                    mi = t
+            bestd[mi] = d
+            bestc[mi] = code
+            m = bestd[0]
+            for t in range(k):
+                if bestd[t] < m:
+                    m = bestd[t]
+            kth = m
+    return bestc, bestd, filled

@@ -289,6 +289,15 @@ fused_agg = Read('fused_agg', _fused_detect, _fused_execute, 'single-table fused
 def general_scan(ctx):
     """The general scan -- read the columns directly. Always returns a result."""
     try:
+        import wdb_cdgroup
+        cd = wdb_cdgroup.detect(ctx.seg, ctx.tree, ctx.cmap)
+        if cd is not None:
+            r = wdb_cdgroup.execute(ctx.seg, cd)
+            if r is not None:
+                return r
+    except Exception:
+        pass
+    try:
         import wdb_lenagg
         la = wdb_lenagg.detect(ctx.seg, ctx.tree, ctx.cmap)
         if la is not None:
