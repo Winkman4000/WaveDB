@@ -1041,3 +1041,107 @@ def lenagg_pour(kc, uc, lens, jars, cnts, ec):
             kk = np.int64(kc[i])
             jars[kk] += np.int64(lens[u])
             cnts[kk] += 1
+
+
+@njit(nogil=True, cache=True)
+def fc_hostruns(a, R, brk, hend, labuf, laboff, meta):
+    """Jackson's prefix-run walk with the full regex law: byte-exact http(s)
+    schemes, www backtracking, and newlines -- '.' never matches \n, so any
+    \n strictly after the host slash kills the match (a single TRAILING \n
+    survives, labelled host+\n). Runs continue only while the copy-prefix
+    clears the slash AND the tail stays newline-clean."""
+    o = np.int64(0); i = np.int64(0); nr = np.int64(0); lw = np.int64(0)
+    prev = np.zeros(8192, np.uint8)
+    plen = np.int64(0)
+    W = np.int64(-2)          # current run's host-end (the slash); -2 = no run
+    Whs = np.int64(-1)        # current run's host start
+    pnl = np.int64(-1)        # first \n strictly after W in prev, else -1
+    while o < a.size:
+        cp = np.int64(a[o]) | (np.int64(a[o + 1]) << 8)
+        sl = np.int64(a[o + 2]) | (np.int64(a[o + 3]) << 8)
+        o += 4
+        if i % R == 0:
+            cp = np.int64(0)
+        # first \n after W contributed by the copied prefix
+        enl = np.int64(-1)
+        if W >= 0 and pnl >= 0 and pnl < cp:
+            enl = pnl
+        for t in range(sl):
+            b9 = a[o + t]
+            if cp + t < 8192:
+                prev[cp + t] = b9
+            if b9 == 10 and enl < 0 and W >= 0 and cp + t > W:
+                enl = cp + t
+        o += sl
+        plen = cp + sl
+        cont = (W >= 0) and (cp > W) and (enl < 0)
+        if cont:
+            brk[i] = 0
+            hend[i] = W
+            pnl = np.int64(-1)
+            i += 1
+            continue
+        brk[i] = 1
+        hs = np.int64(-1); he = np.int64(-1)
+        okh = (plen > 8 and prev[0] == 104 and prev[1] == 116
+               and prev[2] == 116 and prev[3] == 112)
+        if okh and prev[4] == 58 and prev[5] == 47 and prev[6] == 47:
+            hs = np.int64(7)
+        elif (okh and plen > 9 and prev[4] == 115 and prev[5] == 58
+              and prev[6] == 47 and prev[7] == 47):
+            hs = np.int64(8)
+        if hs >= 0:
+            hs0 = hs
+            if plen > hs + 4 and prev[hs] == 119 and prev[hs+1] == 119 and prev[hs+2] == 119 and prev[hs+3] == 46:
+                hs += 4
+            j2 = hs
+            while j2 < plen and j2 < 8192:
+                if prev[j2] == 47:
+                    he = j2
+                    break
+                j2 += 1
+            if he <= hs and hs != hs0:
+                hs = hs0
+                j2 = hs
+                he = np.int64(-1)
+                while j2 < plen and j2 < 8192:
+                    if prev[j2] == 47:
+                        he = j2
+                        break
+                    j2 += 1
+        # newline law at the break: first \n strictly after he
+        bnl = np.int64(-1)
+        if he > hs:
+            j3 = he + 1
+            while j3 < plen and j3 < 8192:
+                if prev[j3] == 10:
+                    bnl = j3
+                    break
+                j3 += 1
+        matched = (he > hs) and (bnl < 0)   # RE2 law: $ is absolute end --
+                                             # ANY newline after the slash kills it
+        if matched:
+            hend[i] = he
+            W = he
+            Whs = hs
+            pnl = np.int64(-1)
+            a0, b0 = hs, he
+        else:
+            hend[i] = -1
+            W = np.int64(-2)
+            Whs = np.int64(-1)
+            pnl = np.int64(-1)
+            a0 = np.int64(0)
+            b0 = plen if plen < 8192 else np.int64(8192)
+        if lw + (b0 - a0) > labuf.size or nr + 1 >= laboff.size:
+            meta[0] = -1
+            return nr
+        laboff[nr] = lw
+        for t in range(b0 - a0):
+            labuf[lw + t] = prev[a0 + t]
+        lw += b0 - a0
+        nr += 1
+        i += 1
+    laboff[nr] = lw
+    meta[0] = i
+    return nr

@@ -28,6 +28,7 @@ def _fork_chunk(se):
 
 _ENABLED = True
 _HITS = 0
+_RUNROAD = 0
 _SCAN_THREADS = 14
 
 
@@ -57,6 +58,9 @@ def _avg_length(p):
     if not isinstance(inner, E.Avg):
         return None
     a = inner.this
+    if (isinstance(a, E.Anonymous) and str(a.this).upper() == 'STRLEN'
+            and a.expressions and isinstance(a.expressions[0], E.Column)):
+        return a.expressions[0].name, 'STRLEN'
     if isinstance(a, E.Length) and isinstance(a.this, E.Column):
         return a.this.name
     return None
@@ -84,6 +88,7 @@ def detect(seg, tree, col_map):
     if not (isinstance(wl, E.Literal) and wl.this == ''):
         return None
     proj = tree.expressions
+    lenfn = 'LENGTH'
     rk = None; cols = {}
     for pi, p in enumerate(proj):
         r = _regex_key(p)
@@ -93,8 +98,12 @@ def detect(seg, tree, col_map):
             rk = (pi, col, r[1], r[2]); continue
         al = _avg_length(p)
         if al is not None:
+            fn9 = 'LENGTH'
+            if isinstance(al, tuple):
+                al, fn9 = al
             col = col_map.get(al, al) if col_map else al
-            cols[pi] = ('AVG_LEN', col); continue
+            cols[pi] = ('AVG_LEN', col)
+            lenfn = fn9; continue
         ak = wdb_sql._agg_kind(p)
         if ak is not None and ak[0] == 'COUNT_STAR':
             cols[pi] = ('COUNT_STAR', None); continue
@@ -144,7 +153,7 @@ def detect(seg, tree, col_map):
     lim = wdb_sql._limit(tree)
     return {'col': col, 'pat': rk[2], 'rep': rk[3], 'rk_pi': rk[0], 'aggs': cols,
             'hmin': hmin, 'osel': osel, 'lim': lim, 'off': int(wdb_sql._offset(tree) or 0),
-            'proj': proj}
+            'proj': proj, 'lenfn': lenfn}
 
 
 def _code_counts(seg, col):
@@ -180,7 +189,7 @@ def execute(seg, spec):
     import pandas as pd
     col = spec['col']
     memo = seg.__dict__.setdefault('_rg_memo', {})
-    mk = (col, spec['pat'], spec['rep'])
+    mk = (col, spec['pat'], spec['rep'], spec.get('lenfn'))
     if mk in memo:
         counts, lens, lab_ids, uniq, empty_code = memo[mk]
     else:
@@ -189,8 +198,88 @@ def execute(seg, spec):
     return _emit(seg, spec, counts, lens, lab_ids, uniq, empty_code)
 
 
+_CANON_PAT = '^https?://(?:www\\.)?([^/]+)/.*$'
+
+
+def _derive_runs(seg, col, spec):
+    """Jackson's prefix-run road for the canonical hostization: the sorted front-
+    coded dict keeps one website's referers ADJACENT, so the label is constant
+    while the copy-prefix reaches past the host's slash. Labels are produced by
+    a byte walk (no string births, no regex); counts, lengths, MIN and HAVING
+    all ride existing V-tables. Falls back (None) on any layout surprise."""
+    import pandas as pd
+    import wdb_kernels as WK
+    c = seg.cols.get(col)
+    if c is None or c.get('R') is None:
+        return None
+    lens = (seg.dict_bytelens(col) if spec.get('lenfn') == 'STRLEN'
+            else seg.dict_charlens(col))
+    if lens is None:
+        return None
+    R = int(c['R'])
+    try:
+        if c.get('chunked'):
+            bufs = []
+            for j in range(len(c['chunk_czlen'])):
+                fb = c['chunk_base'] + int(c['chunk_foff'][j])
+                fe = c['chunk_base'] + int(c['chunk_foff'][j + 1])
+                bufs.append(bytes(seg.buf[fb:fe]))
+            import zstandard as zstd
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                raws = list(ex.map(lambda b: zstd.ZstdDecompressor().decompress(b), bufs))
+        else:
+            raws = [seg._dz.decompress(c['z'])]
+    except Exception:
+        return None
+    ent_lab = []
+    all_labs = []
+    for raw in raws:
+        a = np.frombuffer(raw, dtype=np.uint8)
+        cap = a.size // 4 + 2
+        brk = np.zeros(cap, np.uint8)
+        hend = np.full(cap, -1, np.int32)
+        lcap = a.size * 3 + (1 << 16)
+        nr = -1
+        for _try in range(4):                    # labels can outgrow the fc bytes
+            labuf = np.empty(lcap, np.uint8)     # (front-coding removed the very
+            laboff = np.empty(cap + 1, np.int64)  # prefixes labels rebuild): retry
+            meta = np.zeros(1, np.int64)         # with a tripled buffer on overflow
+            nr = int(WK.fc_hostruns(a, np.int64(R), brk, hend, labuf, laboff, meta))
+            if int(meta[0]) != -1:
+                break
+            lcap *= 3
+        if int(meta[0]) == -1:
+            return None
+        nent = int(meta[0])
+        rid = np.cumsum(brk[:nent], dtype=np.int64) - 1 + len(all_labs)
+        ent_lab.append(rid)
+        lb = labuf.tobytes()
+        for r in range(nr):
+            all_labs.append(lb[int(laboff[r]):int(laboff[r + 1])])
+    ent_run = np.concatenate(ent_lab) if ent_lab else np.empty(0, np.int64)
+    nd = int(c.get('n_dict', c['V']))
+    if ent_run.size != nd:
+        return None                              # layout surprise: fail closed
+    run_lab, uniq = pd.factorize(np.array(all_labs, dtype=object), sort=False)
+    lab_ids = run_lab[ent_run]
+    counts = _code_counts(seg, col)
+    lens = np.asarray(lens[:nd], np.int64)
+    empty_code = None
+    e = np.nonzero(lens == 0)[0]
+    if e.size:
+        empty_code = int(e[0])
+    return counts, lens, lab_ids, uniq, empty_code
+
+
 def _derive(seg, col, spec):
     import pandas as pd
+    if spec.get('pat') == _CANON_PAT and spec.get('rep') in ('\\1', '\\g<1>'):
+        r9 = _derive_runs(seg, col, spec)
+        if r9 is not None:
+            global _RUNROAD
+            _RUNROAD += 1
+            return r9
     counts = _code_counts(seg, col)
     vals = seg._typed_dict(col)
     # stay in BYTES end to end: no per-value decode (measured 15.7 s on 19.7M Referers);
@@ -202,7 +291,8 @@ def _derive(seg, col, spec):
     offs = np.zeros(len(bs) + 1, np.int64); np.cumsum(lens, out=offs[1:])
     cont = (np.frombuffer(b''.join(bs), dtype=np.uint8) & 0xC0) == 0x80
     cs = np.zeros(offs[-1] + 1, np.int64); np.cumsum(cont, out=cs[1:])
-    lens = lens - (cs[offs[1:]] - cs[offs[:-1]])
+    if spec.get('lenfn') != 'STRLEN':
+        lens = lens - (cs[offs[1:]] - cs[offs[:-1]])
     empty_code = None
     e = np.nonzero(lens == 0)[0]
     if e.size:
