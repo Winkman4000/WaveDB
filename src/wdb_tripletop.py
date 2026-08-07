@@ -90,6 +90,17 @@ def detect(seg, tree, col_map):
     if int(seg.cols[uid]['V']) >= (1 << 25) or int(seg.cols[sp]['V']) >= (1 << 23):
         return None
     ox = tree.args.get('order'); lx = tree.args.get('limit')
+    if ox is None:
+        # THE FREEDOM SHAPE: ORDER-less LIMIT -- any k groups, exact counts.
+        if (lx is None or tree.args.get('where') or dtcol is not None
+                or uid is None or sp is None):
+            return None
+        try:
+            lim9 = int(lx.expression.this)
+        except Exception:
+            return None
+        return {'uid': uid, 'sp': sp, 'dt': None, 'aggs': aggs,
+                'lim': lim9, 'free': True, 'proj': tree.expressions}
     if ox is None or lx is None or len(ox.expressions) != 1:
         return None
     o = ox.expressions[0]
@@ -152,6 +163,8 @@ def execute(seg, spec):
     else:
         ec = np.zeros(1, np.int64)           # never read: has_m gates the branch
         mt = np.zeros(1, np.int64)
+    if spec.get('free'):
+        return _free_serve(seg, spec)
     if dtc is None:
         # JACKSON'S HEAD-FIRST HUNT: '' owns ~87% of rows, so (user, '')
         # dominates the board -- and its counts are pure census arithmetic:
@@ -279,3 +292,44 @@ def execute(seg, spec):
         if theta <= 1:
             return None                      # exhausted: yield to the general road
         theta //= 4
+
+
+def _free_serve(seg, spec):
+    """Jackson's freedom serve for ORDER-less LIMIT: pick k random LOW-COUNT
+    phrase codes -- codes differentiate without decoding -- gather each code's
+    complete instance list from the plane (its whole truth), count per user
+    inside it (exact by construction), decode only the winners."""
+    global _HITS
+    import wdb_sql
+    uid, sp, k = spec['uid'], spec['sp'], spec['lim']
+    pl = seg.e8_planes(sp)
+    pos8 = np.asarray(pl[0], np.int64)
+    lits8 = np.asarray(pl[1], np.int64)
+    spc = np.bincount(lits8, minlength=int(seg.cols[sp]['V']))
+    low = np.flatnonzero((spc >= 1) & (spc <= 4))
+    rng = np.random.default_rng()
+    picks = rng.choice(low, size=min(k, low.size), replace=False)         if low.size else np.empty(0, np.int64)
+    sel = np.flatnonzero(np.isin(lits8, picks))
+    rows9 = pos8[sel]
+    codes9 = lits8[sel]
+    import wdb_pairtop
+    uu = wdb_pairtop._pt_codes(seg, uid, rows9)
+    groups = {}
+    for j in range(rows9.size):
+        groups.setdefault((int(uu[j]), int(codes9[j])), 0)
+        groups[(int(uu[j]), int(codes9[j]))] += 1
+    out = []
+    for (uc9, sc9), c9 in list(groups.items())[:k]:
+        uv = seg.fetch(uid, uc9)
+        sv = seg.fetch(sp, sc9)
+        if isinstance(uv, (bytes, bytearray)):
+            uv = uv.decode('utf-8', 'replace')
+        if isinstance(sv, (bytes, bytearray)):
+            sv = sv.decode('utf-8', 'replace')
+        row = []
+        for a9 in spec['aggs']:
+            row.append(uv if a9[0] == 'K' and a9[1] == uid else
+                       sv if a9[0] == 'K' else c9)
+        out.append(tuple(row))
+    _HITS += 1
+    return out, [wdb_sql._alias(p) for p in spec['proj']]

@@ -211,11 +211,9 @@ def _pt_codes(seg, cn, rows):
         return np.empty(0, np.int64)         # never read the world for nothing
     c = seg.cols[cn]
     if c.get('code_enc') != 0 or c.get('cstart') is None:
-        if rows.size <= 256:
-            # Jackson's cut: decode ONLY the rows in hand -- single-span
-            # codes_at pops one frame per row instead of inflating them all
-            return np.asarray([int(np.asarray(seg.codes_at(cn, np.arange(r, r + 1)))[0])
-                               for r in rows.tolist()], np.int64)
+        if rows.size <= 4096:
+            # the armory's own batch point-pop: touched frames inflate ONCE
+            return np.asarray(seg.codes_at(cn, rows), np.int64)
         return np.asarray(seg._raw_codes(cn), np.int64)[rows]
     bits = int(c['bits'])
     bp = np.asarray(rows, np.int64) * bits
