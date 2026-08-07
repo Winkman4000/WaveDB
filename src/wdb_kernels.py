@@ -1219,3 +1219,45 @@ def cd_alldistinct(bucketed, offs):
                     d += 1
             out[g] = d
     return out
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def tt_survivors(uc, ucnt, pos8, lits8, spc, ec, mt, e0, emptyc, theta, outs, lens):
+    """Q18's fused pass: per-thread chunks walk the rows once -- user bound
+    from the census, phrase bound via two-pointer merge with the sorted
+    sparse planes (no 100M scratch arrays), survivors emit packed 54-bit
+    keys (uid<<29 | minute<<23 | sp) straight into per-thread buffers."""
+    T = outs.shape[0]
+    N = uc.size
+    step = (N + T - 1) // T
+    for t in prange(T):
+        a = t * step
+        b = min(N, a + step)
+        # position the plane cursor at the first plane row >= a
+        lo = np.int64(0); hi = np.int64(pos8.size)
+        while lo < hi:
+            mid = (lo + hi) >> 1
+            if pos8[mid] < a:
+                lo = mid + 1
+            else:
+                hi = mid
+        p = lo
+        w = np.int64(0)
+        for i in range(a, b):
+            u = np.int64(uc[i])
+            if ucnt[u] < theta:
+                if p < pos8.size and pos8[p] == i:
+                    p += 1
+                continue
+            if p < pos8.size and pos8[p] == i:
+                s = np.int64(lits8[p])
+                p += 1
+                if spc[s] < theta:
+                    continue
+            else:
+                s = e0
+                if emptyc < theta:
+                    continue
+            outs[t, w] = (u << 29) | (np.int64(mt[ec[i]]) << 23) | s
+            w += 1
+        lens[t] = w
