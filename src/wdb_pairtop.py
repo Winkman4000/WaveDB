@@ -19,9 +19,19 @@ _HITS = 0
 
 
 def detect(seg, tree, col_map):
-    if tree.args.get('joins') or tree.args.get('with') or tree.args.get('where') \
+    if tree.args.get('joins') or tree.args.get('with') \
             or tree.args.get('having') or tree.args.get('distinct'):
         return None
+    fcol = None
+    w9 = tree.args.get('where')
+    if w9 is not None:
+        n9 = w9.this
+        if (isinstance(n9, E.NEQ) and isinstance(n9.this, E.Column)
+                and isinstance(n9.expression, E.Literal)
+                and str(n9.expression.this) == ''):
+            fcol = (col_map or {}).get(n9.this.name, n9.this.name)
+        else:
+            return None
     g = tree.args.get('group')
     if g is None or len(g.expressions) != 2:
         return None
@@ -87,7 +97,12 @@ def detect(seg, tree, col_map):
     for _, cn in [t for t in aggs if t[0] in ('SUM', 'AVG')]:
         if cn not in seg.cols:
             return None
-    return {'a': a, 'b': b, 'aggs': aggs, 'lim': lim, 'proj': tree.expressions}
+    if fcol is not None:
+        fc9 = seg.cols.get(fcol)
+        if fc9 is None or fc9.get('code_enc') != 8 or fcol in (a, b):
+            return None                      # the prune rides the sparse dress
+    return {'a': a, 'b': b, 'aggs': aggs, 'lim': lim, 'fcol': fcol,
+            'proj': tree.expressions}
 
 
 def execute(seg, spec):
@@ -107,7 +122,7 @@ def execute(seg, spec):
     if ridx is not None:
         if ridx.size > N // 8:
             return None
-        return _finish(seg, spec, ridx)
+        return _finish(seg, spec, _prune(seg, spec, ridx), fpool=_fpool(seg, spec))
     import wdb_kernels as WK
     ac = np.ascontiguousarray(seg._raw_codes(a))
     V9 = int(seg.cols[a]['V'])
@@ -132,7 +147,57 @@ def execute(seg, spec):
         pass                                        # identity; decode only to return
     if ridx.size > N // 8:
         return None                              # not near-unique enough: yield
-    return _finish(seg, spec, ridx)
+    return _finish(seg, spec, _prune(seg, spec, ridx), fpool=_fpool(seg, spec))
+
+
+def _pt2_path(seg, a, b):
+    return seg.path + '.%s__%s.pt2' % (a, b)
+
+
+def _pt2_load(seg, a, b):
+    import os, pickle
+    p = _pt2_path(seg, a, b)
+    if not os.path.exists(p):
+        return None
+    try:
+        b9 = pickle.load(open(p, 'rb'))
+        if int(b9.get('n', -1)) != int(seg.N):
+            return None
+        return b9
+    except Exception:
+        return None
+
+
+def _pt2_save(seg, a, b, rows, gid, ga, gb):
+    import pickle
+    try:
+        pickle.dump({'n': int(seg.N), 'rows': rows.astype(np.uint32),
+                     'gid': gid.astype(np.uint16),
+                     'ga': ga.astype(np.int64), 'gb': gb.astype(np.int64)},
+                    open(_pt2_path(seg, a, b), 'wb'), protocol=4)
+    except Exception:
+        pass
+
+
+def _prune(seg, spec, ridx):
+    """Jackson's order: reduce to the exception rows, THEN prune blanks by
+    ABSENCE -- a row missing from the filter column's plane is '' and is
+    invisible to the query."""
+    fcol = spec.get('fcol')
+    if fcol is None or ridx.size == 0:
+        return ridx
+    pos8 = np.asarray(seg.e8_planes(fcol)[0], np.int64)
+    j = np.searchsorted(pos8, ridx)
+    j2 = np.minimum(j, pos8.size - 1)
+    return ridx[pos8[j2] == ridx]
+
+
+def _fpool(seg, spec):
+    """count-1 filler must come from rows the filter admits."""
+    fcol = spec.get('fcol')
+    if fcol is None:
+        return None
+    return np.asarray(seg.e8_planes(fcol)[0], np.int64)[:262144]
 
 
 def _pt_codes(seg, cn, rows):
@@ -152,10 +217,13 @@ def _pt_codes(seg, cn, rows):
     return ((v >> sh) & np.uint64((1 << bits) - 1)).astype(np.int64)
 
 
-def _finish(seg, spec, ridx):
+def _finish(seg, spec, ridx, fpool=None):
     global _HITS
     a, b, k = spec['a'], spec['b'], spec['lim']
     N = int(seg.N)
+    sh2 = _pt2_load(seg, a, b)
+    if sh2 is not None:
+        return _finish_v2(seg, spec, sh2, fpool)
     acr = _pt_codes(seg, a, ridx)                        # position IS identity:
     bcr = _pt_codes(seg, b, ridx)                        # decode only to return
     key = (acr << 32) | bcr
@@ -167,6 +235,20 @@ def _finish(seg, spec, ridx):
         np.not_equal(key[1:], key[:-1], out=brk[1:])
     st = np.flatnonzero(brk)
     gcnt = np.diff(np.append(st, key.size))
+    if spec.get('fcol') is None and key.size:
+        # NEST THE DIFFERENTIATOR: repeated pairs are a minority of the
+        # exceptions -- partition and store the grouping + codes; future
+        # queries (filtered included) never open a column again.
+        gid9 = np.zeros(key.size, np.int64)
+        rep9 = np.flatnonzero(gcnt >= 2)
+        ga9 = []
+        gb9 = []
+        for j9, gi9 in enumerate(rep9.tolist()):
+            gid9[st[gi9]:st[gi9] + int(gcnt[gi9])] = j9 + 1
+            ga9.append(int(key[st[gi9]] >> 32))
+            gb9.append(int(key[st[gi9]] & 0xFFFFFFFF))
+        _pt2_save(seg, a, b, sidx, gid9,
+                  np.asarray(ga9, np.int64), np.asarray(gb9, np.int64))
     # podium: repeated pairs first, count-1 filler after (LIMIT-tie law)
     top = np.argsort(-gcnt, kind='stable')[:k]
     rows = []
@@ -177,8 +259,9 @@ def _finish(seg, spec, ridx):
         used_rows.append((int(key[s0] >> 32), int(key[s0] & 0xFFFFFFFF), c9, rr))
     n_fill = k - len(used_rows)
     if n_fill > 0:
-        head = np.setdiff1d(np.arange(min(N, 262144), dtype=np.int64), ridx,
-                            assume_unique=True)
+        pool9 = fpool if fpool is not None \
+            else np.arange(min(N, 262144), dtype=np.int64)
+        head = np.setdiff1d(pool9, ridx, assume_unique=True)
         singles = head[:n_fill]
         sc1 = _pt_codes(seg, a, singles)
         sc2 = _pt_codes(seg, b, singles)
@@ -228,3 +311,82 @@ def _col_ints(seg, cn):
     except Exception:
         dv = np.asarray([int(v) for v in seg._typed_dict(cn)], np.int64)
     return dv, codes
+
+
+def _finish_v2(seg, spec, sh2, fpool):
+    """Served entirely from the nested shelf: prune stored rows by the filter
+    column's plane (absence = ''), re-count gids among survivors, aggregates
+    point-read only the winners' rows. No key column is ever opened."""
+    global _HITS
+    a, b, k = spec['a'], spec['b'], spec['lim']
+    N = int(seg.N)
+    rows = np.asarray(sh2['rows'], np.int64)
+    gid = np.asarray(sh2['gid'], np.int64)
+    ga = np.asarray(sh2['ga'], np.int64)
+    gb = np.asarray(sh2['gb'], np.int64)
+    fcol = spec.get('fcol')
+    if fcol is not None and rows.size:
+        pos8 = np.asarray(seg.e8_planes(fcol)[0], np.int64)
+        j = np.searchsorted(pos8, rows)
+        j2 = np.minimum(j, max(0, pos8.size - 1))
+        keep = pos8[j2] == rows if pos8.size else np.zeros(rows.size, bool)
+    else:
+        keep = np.ones(rows.size, bool)
+    G = ga.size
+    cnt = np.bincount(gid[keep], minlength=G + 1)
+    order = np.argsort(-cnt[1:], kind='stable') + 1 if G else np.empty(0, np.int64)
+    used = []
+    for g9 in order.tolist():
+        if cnt[g9] >= 2 and len(used) < k:
+            rr = rows[keep & (gid == g9)]
+            used.append((int(ga[g9 - 1]), int(gb[g9 - 1]), int(cnt[g9]), rr))
+    n_fill = k - len(used)
+    if n_fill > 0:
+        # count-1 filler: surviving one-off shelf rows first, then plane head
+        of = rows[keep & (gid == 0)][:n_fill]
+        oa = _pt_codes(seg, a, of) if of.size else np.empty(0, np.int64)
+        ob = _pt_codes(seg, b, of) if of.size else np.empty(0, np.int64)
+        for j9 in range(of.size):
+            used.append((int(oa[j9]), int(ob[j9]), 1, of[j9:j9 + 1]))
+        n_fill = k - len(used)
+        if n_fill > 0:
+            pool9 = fpool if fpool is not None                 else np.arange(min(N, 262144), dtype=np.int64)
+            head = np.setdiff1d(pool9, rows, assume_unique=False)[:n_fill]
+            ha = _pt_codes(seg, a, head) if head.size else np.empty(0, np.int64)
+            hb = _pt_codes(seg, b, head) if head.size else np.empty(0, np.int64)
+            for j9 in range(head.size):
+                used.append((int(ha[j9]), int(hb[j9]), 1, head[j9:j9 + 1]))
+    allr = np.concatenate([u[3] for u in used]) if used else np.empty(0, np.int64)
+    aggcols = {}
+    for _, cn in [t for t in spec['aggs'] if t[0] in ('SUM', 'AVG')]:
+        cc9 = _pt_codes(seg, cn, allr)
+        c9m = seg.cols[cn]
+        try:
+            uc9 = np.unique(cc9)
+            dv9 = np.asarray(seg._dict_ints_at(c9m, uc9), np.int64)
+            lk9 = dict(zip(uc9.tolist(), dv9.tolist()))
+        except Exception:
+            td9 = seg._typed_dict(cn)
+            lk9 = {int(c): int(td9[int(c)]) for c in np.unique(cc9).tolist()}
+        pos9 = {int(r): i for i, r in enumerate(allr.tolist())}
+        aggcols[cn] = (lk9, cc9, pos9)
+    out = []
+    import wdb_sql
+    for acode, bcode, c9, rr in used[:k]:
+        av = seg.fetch(a, acode)
+        bv = seg.fetch(b, bcode)
+        row = []
+        for t in spec['aggs']:
+            if t[0] == 'K':
+                row.append(av if t[1] == a else bv)
+            elif t[0] == 'C':
+                row.append(c9)
+            else:
+                lk9, cc9, pos9 = aggcols[t[1]]
+                vals = np.asarray([lk9[int(cc9[pos9[int(r)]])] for r in rr],
+                                  np.int64)
+                row.append(int(vals.sum()) if t[0] == 'SUM'
+                           else float(vals.sum()) / c9)
+        out.append(tuple(row))
+    _HITS += 1
+    return out, [wdb_sql._alias(p) for p in spec['proj']]
