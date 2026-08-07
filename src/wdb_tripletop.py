@@ -152,6 +152,87 @@ def execute(seg, spec):
     else:
         ec = np.zeros(1, np.int64)           # never read: has_m gates the branch
         mt = np.zeros(1, np.int64)
+    if dtc is None:
+        # JACKSON'S HEAD-FIRST HUNT: '' owns ~87% of rows, so (user, '')
+        # dominates the board -- and its counts are pure census arithmetic:
+        # E(u) = total(u) - plane(u). Real-phrase pairs are bounded by the
+        # user's PLANE rows, so only users with plane(u) > kth can compete;
+        # usually that set is empty and no row is ever walked.
+        V9u = int(seg.cols[uid]['V'])
+        ucp = uc[pos8]                       # plane rows' users (13.2M)
+        pcnt = np.bincount(ucp, minlength=V9u)
+        # Jackson's cut: top users come off the gbc2 shelf's u16 tail --
+        # outside the >=4 tier, total<=3 so E<=3 and nobody boards. The
+        # M-window widens until kth >= the M-th total (exactness guard).
+        tot9 = None
+        try:
+            import wdb_gbshelf
+            sh0 = wdb_gbshelf.open_shelf(seg, uid)
+            if sh0 is not None and sh0['V'] == V9u:
+                t4pos = np.flatnonzero(np.unpackbits(sh0['bm4'])[:V9u])
+                t4cnt = np.asarray(sh0['tail'], np.int64)
+                board = None
+                M9 = max(64, 4 * k)
+                while True:
+                    M9 = min(M9, t4cnt.size)
+                    part = np.argpartition(-t4cnt, M9 - 1)[:M9] if M9 else np.empty(0, np.int64)
+                    uu = t4pos[part]
+                    EE = t4cnt[part] - pcnt[uu]
+                    kk9 = min(k, int((EE > 0).sum()) + 1)
+                    b2 = sorted(((int(EE[j]), int(uu[j]), int(e0))
+                                 for j in range(uu.size)), reverse=True)[:k]
+                    kth0 = b2[k - 1][0] if len(b2) >= k else 0
+                    Mth = int(np.min(t4cnt[part])) if part.size else 0
+                    if kth0 >= Mth or M9 >= t4cnt.size:
+                        board = b2
+                        break
+                    M9 *= 4                  # a bigger E may hide below: widen
+                if board is not None:
+                    tot9 = True
+        except Exception:
+            tot9 = None
+        if tot9 is None:
+            if ucnt is None:
+                ucnt = np.bincount(uc, minlength=V9u)
+            E = ucnt - pcnt
+            kk9 = min(k, int((E > 0).sum()))
+            topi = np.argpartition(-E, kk9 - 1)[:kk9] if kk9 else np.empty(0, np.int64)
+            board = [(int(E[u]), int(u), int(e0)) for u in topi.tolist()]
+            board.sort(reverse=True)
+        kth9 = board[k - 1][0] if len(board) >= k else 0
+        cand = np.flatnonzero(pcnt > kth9)
+        if cand.size:
+            cm = np.zeros(ucnt.size, bool)
+            cm[cand] = True
+            spm9 = spc > kth9                # the phrase-cut: a pair can't beat
+            sel = np.flatnonzero(cm[ucp] & spm9[lits8])   # kth on a rarer phrase
+            pk = (ucp[sel] << 23) | lits8[sel]
+            pk.sort(kind='stable')
+            b9 = np.empty(pk.size, bool)
+            if pk.size:
+                b9[0] = True
+                np.not_equal(pk[1:], pk[:-1], out=b9[1:])
+                s9 = np.flatnonzero(b9)
+                c9a = np.diff(np.append(s9, pk.size))
+                for j9 in range(s9.size):
+                    board.append((int(c9a[j9]), int(pk[s9[j9]] >> 23),
+                                  int(pk[s9[j9]] & ((1 << 23) - 1))))
+            board.sort(reverse=True)
+        rows = []
+        for c9, u9, s9c in board[:k]:
+            uv = seg.fetch(uid, u9)
+            sv = seg.fetch(sp, s9c)
+            if isinstance(uv, (bytes, bytearray)):
+                uv = uv.decode('utf-8', 'replace')
+            if isinstance(sv, (bytes, bytearray)):
+                sv = sv.decode('utf-8', 'replace')
+            row = []
+            for a9 in spec['aggs']:
+                row.append(uv if a9[0] == 'K' and a9[1] == uid else
+                           sv if a9[0] == 'K' else c9)
+            rows.append(tuple(row))
+        _HITS += 1
+        return rows, [wdb_sql._alias(p) for p in spec['proj']]
     T9 = 32
     theta = 256
     while True:
