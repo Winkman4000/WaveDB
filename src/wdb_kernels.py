@@ -1261,3 +1261,54 @@ def tt_survivors(uc, ucnt, pos8, lits8, spc, ec, mt, e0, emptyc, theta, outs, le
             outs[t, w] = (u << 29) | (np.int64(mt[ec[i]]) << 23) | s
             w += 1
         lens[t] = w
+
+
+@njit(nogil=True, cache=True)
+def pt_census(uc, jar):
+    """u8 saturating census: 'seen once / seen again' is all the singleton-
+    discard law needs. Sequential to keep counts exact (no write races)."""
+    for i in range(uc.size):
+        c = jar[uc[i]]
+        if c < 2:
+            jar[uc[i]] = c + 1
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def pt_collect(uc, jar, outs, lens):
+    """Parallel survivor collection: rows whose ticket repeats (jar==2)."""
+    T = outs.shape[0]
+    N = uc.size
+    step = (N + T - 1) // T
+    for t in prange(T):
+        a = t * step
+        b = min(N, a + step)
+        w = np.int64(0)
+        for i in range(a, b):
+            if jar[uc[i]] >= 2:
+                outs[t, w] = i
+                w += 1
+        lens[t] = w
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def pt_census_bucketed(ku, kr, offs, SH, outs, lens):
+    """Q32's parallel census on gd_pass1's buckets: each bucket owns a disjoint
+    code range, so its jar slice never races. Saturate at 2, collect the rows
+    (companions) of every repeated ticket -- one prange body, no shared writes."""
+    NB = offs.size - 1
+    LOW = 1 << SH
+    for b in prange(NB):
+        lo = offs[b]
+        hi = offs[b + 1]
+        w = np.int64(0)
+        if hi > lo:
+            jar = np.zeros(LOW, np.uint8)
+            for i in range(lo, hi):
+                c = jar[np.int64(ku[i]) & (LOW - 1)]
+                if c < 2:
+                    jar[np.int64(ku[i]) & (LOW - 1)] = c + 1
+            for i in range(lo, hi):
+                if jar[np.int64(ku[i]) & (LOW - 1)] >= 2:
+                    outs[b, w] = kr[i]
+                    w += 1
+        lens[b] = w

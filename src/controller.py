@@ -51,6 +51,7 @@ _READ_ORDER = (
     R.coscan,               # fused conjunctive COUNT: zone-map veto, one walk
     R.grid2,               # plain 2-key COUNT grid: one fused pass, narrow detect
     R.wherescan,            # conjunctive WHERE: stair spans + blocked-frame predicate scan, disk-only
+    R.pairtop,
     R.gridwalk,
     R.smallk,              # narrow-key pair/triple boards (the small-K weapon)             # two-key COUNT(*) top-K via grid filled-cell + count-ordered head (opt-in)
     R.sumtopk,             # single big-key SUM top-K: one kernel, k label decodes

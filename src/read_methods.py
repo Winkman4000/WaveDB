@@ -136,6 +136,11 @@ heavypair = Read('heavypair',
                  lambda c, spec: wdb_heavypair.execute(c.seg, spec),
                  'two-key COUNT(*) top-N from a count-sorted pair sidecar')
 
+import wdb_pairtop
+pairtop = Read('pairtop',
+               lambda c: wdb_pairtop.detect(c.seg, c.tree, c.cmap),
+               lambda c, spec: wdb_pairtop.execute(c.seg, spec))
+
 gridwalk = Read('gridwalk',
                 lambda c: wdb_gridwalk.detect(c.seg, c.tree, c.cmap),
                 lambda c, spec: wdb_gridwalk.execute(c.seg, spec),
