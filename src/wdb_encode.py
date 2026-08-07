@@ -447,6 +447,14 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0)
             wdb_cube.build_and_write(_seg, specs, workers=workers or 4)
         except Exception:
             pass
+    # THE DIFFERENTIATOR LAW (Jackson): a column whose role is differentiation
+    # (V near N) gets its exception shelf born AT ENCODE TIME -- row position
+    # takes over identity; values demote to decode-only. Qualifies only while
+    # the exceptions stay small: repeated rows < 0.75% of the distinct count.
+    try:
+        _birth_differentiator_shelves(out_path)
+    except Exception:
+        pass
     return dict(n_rows=N, n_cols=len(cols), bytes=len(out), seconds=time.time() - t0,
                 sizes=sizes, cluster=None)
 
@@ -534,6 +542,10 @@ def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_s
             wdb_cube.build_and_write(_seg, specs, workers=workers)
         except Exception:
             pass
+    try:
+        _birth_differentiator_shelves(out_path)
+    except Exception:
+        pass
     return dict(n_rows=N, n_cols=len(cols), bytes=len(out), seconds=time.time()-t0,
                 sizes=sizes, cluster=cluster_by)
 
@@ -544,3 +556,25 @@ if __name__ == '__main__':
     r = encode(sys.argv[1], sys.argv[2], cols)
     fc=sum(1 for v in r['sizes'].values() if v[4]==1); fl=sum(1 for v in r['sizes'].values() if v[3]==2); dt=sum(1 for v in r['sizes'].values() if v[3]==3); nu=sum(1 for v in r['sizes'].values() if v[5]==1)
     print(f"Encoded {r['n_cols']} cols x {r['n_rows']:,} rows -> {r['bytes']/1e6:.1f} MB in {r['seconds']:.0f}s ({fc} front-coded, {fl} float, {dt} datetime, {nu} nullable)")
+
+
+def _birth_differentiator_shelves(out_path):
+    import importlib, pickle
+    import numpy as _np
+    eng = importlib.import_module('wdb_engine')
+    seg = eng.Segment(out_path)
+    N = int(seg.N)
+    for cn, c in list(seg.cols.items()):
+        try:
+            V = int(c.get('V') or 0)
+            if V * 2 < N or V < 1024:
+                continue                          # role isn't differentiation
+            codes = _np.asarray(seg._raw_codes(cn))
+            cnt = _np.bincount(codes, minlength=V)
+            rep = _np.flatnonzero(cnt[codes] >= 2)
+            if rep.size >= 0.0075 * V:
+                continue                          # too many exceptions: disqualified
+            pickle.dump({'n': N, 'rows': rep.astype(_np.uint32)},
+                        open(out_path + '.%s.ptrep' % cn, 'wb'), protocol=4)
+        except Exception:
+            continue

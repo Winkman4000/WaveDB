@@ -32,7 +32,7 @@ def detect(seg, tree, col_map):
             or tree.args.get('having') or tree.args.get('distinct'):
         return None
     g = tree.args.get('group')
-    if g is None or len(g.expressions) != 3:
+    if g is None or len(g.expressions) not in (2, 3):
         return None
     cm = col_map or {}
     proj = tree.expressions
@@ -52,8 +52,10 @@ def detect(seg, tree, col_map):
         if ak is not None and ak[0] == 'COUNT_STAR':
             aggs.append(('C',)); continue
         return None
-    if dtcol is None or len(plain) != 2:
+    if len(plain) != 2:
         return None
+    if dtcol is None and len(g.expressions) != 2:
+        return None                          # 3 group keys need the minute
     # group keys must be exactly the two plain columns + the minute (by alias or expr)
     gnames = set()
     for ge in g.expressions:
@@ -64,10 +66,10 @@ def detect(seg, tree, col_map):
             gnames.add('__m__')
         else:
             return None
-    want = set(plain) | ({malias} if malias else {'__m__'})
     if malias and malias in gnames:
         gnames.discard(malias); gnames.add('__m__')
-    if gnames != (set(plain) | {'__m__'}):
+    want9 = set(plain) | ({'__m__'} if dtcol is not None else set())
+    if gnames != want9:
         return None
     # identify sp (enc-8 str) and uid (dict col)
     sp = uid = None
@@ -81,9 +83,10 @@ def detect(seg, tree, col_map):
             uid = cn
     if sp is None or uid is None:
         return None
-    dc = seg.cols.get(dtcol)
-    if dc is None or dc.get('dt') is None:
-        return None
+    if dtcol is not None:
+        dc = seg.cols.get(dtcol)
+        if dc is None or dc.get('dt') is None:
+            return None
     if int(seg.cols[uid]['V']) >= (1 << 25) or int(seg.cols[sp]['V']) >= (1 << 23):
         return None
     ox = tree.args.get('order'); lx = tree.args.get('limit')
@@ -143,8 +146,12 @@ def execute(seg, spec):
         return None
     e0 = int(e0)
     emptyc = N - int(pos8.size)
-    ec = np.ascontiguousarray(seg._raw_codes(dtc))
-    mt = np.ascontiguousarray(_minute_table(seg, dtc))
+    if dtc is not None:
+        ec = np.ascontiguousarray(seg._raw_codes(dtc))
+        mt = np.ascontiguousarray(_minute_table(seg, dtc))
+    else:
+        ec = np.zeros(1, np.int64)           # never read: has_m gates the branch
+        mt = np.zeros(1, np.int64)
     T9 = 32
     theta = 256
     while True:
@@ -153,7 +160,7 @@ def execute(seg, spec):
         lens = np.zeros(T9, np.int64)
         WK.tt_survivors(uc, ucnt, pos8, lits8, spc, ec, mt,
                         np.int64(e0), np.int64(emptyc), np.int64(theta),
-                        outs, lens)
+                        outs, lens, dtc is not None)
         key = np.concatenate([outs[t, :int(lens[t])] for t in range(T9)])             if int(lens.sum()) else np.empty(0, np.int64)
         idx = key                                 # naming kept for flow below
         if key.size:
@@ -173,6 +180,7 @@ def execute(seg, spec):
                     for gi in order.tolist():
                         kk = int(uq[gi]); c9 = int(cn[gi])
                         ucode = kk >> 29; mv = (kk >> 23) & 63; scode = kk & ((1 << 23) - 1)
+                        # dtc None: mv is provably 0 and never emitted
                         uv = seg.fetch(uid, ucode)
                         sv = seg.fetch(sp, scode)
                         if isinstance(uv, (bytes, bytearray)):

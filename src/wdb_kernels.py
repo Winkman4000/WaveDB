@@ -1222,7 +1222,7 @@ def cd_alldistinct(bucketed, offs):
 
 
 @njit(nogil=True, parallel=True, cache=True)
-def tt_survivors(uc, ucnt, pos8, lits8, spc, ec, mt, e0, emptyc, theta, outs, lens):
+def tt_survivors(uc, ucnt, pos8, lits8, spc, ec, mt, e0, emptyc, theta, outs, lens, has_m):
     """Q18's fused pass: per-thread chunks walk the rows once -- user bound
     from the census, phrase bound via two-pointer merge with the sorted
     sparse planes (no 100M scratch arrays), survivors emit packed 54-bit
@@ -1258,7 +1258,10 @@ def tt_survivors(uc, ucnt, pos8, lits8, spc, ec, mt, e0, emptyc, theta, outs, le
                 s = e0
                 if emptyc < theta:
                     continue
-            outs[t, w] = (u << 29) | (np.int64(mt[ec[i]]) << 23) | s
+            if has_m:
+                outs[t, w] = (u << 29) | (np.int64(mt[ec[i]]) << 23) | s
+            else:
+                outs[t, w] = (u << 29) | s   # pair shape: minute bits stay clear
             w += 1
         lens[t] = w
 
