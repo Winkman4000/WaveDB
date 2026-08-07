@@ -168,13 +168,16 @@ def _pt2_load(seg, a, b):
         return None
 
 
-def _pt2_save(seg, a, b, rows, gid, ga, gb):
+def _pt2_save(seg, a, b, rows, gid, ga, gb, ra=None, rb=None):
     import pickle
     try:
-        pickle.dump({'n': int(seg.N), 'rows': rows.astype(np.uint32),
-                     'gid': gid.astype(np.uint16),
-                     'ga': ga.astype(np.int64), 'gb': gb.astype(np.int64)},
-                    open(_pt2_path(seg, a, b), 'wb'), protocol=4)
+        d9 = {'n': int(seg.N), 'rows': rows.astype(np.uint32),
+              'gid': gid.astype(np.uint16),
+              'ga': ga.astype(np.int64), 'gb': gb.astype(np.int64)}
+        if ra is not None:
+            d9['ra'] = np.asarray(ra, np.int64)
+            d9['rb'] = np.asarray(rb, np.int64)
+        pickle.dump(d9, open(_pt2_path(seg, a, b), 'wb'), protocol=4)
     except Exception:
         pass
 
@@ -203,9 +206,17 @@ def _fpool(seg, spec):
 def _pt_codes(seg, cn, rows):
     """True point reads for enc-0: 8-byte windows + shift/mask per row --
     codes_at unpacks the SPAN, and file-wide survivors make span == world."""
+    rows = np.asarray(rows, np.int64)
+    if rows.size == 0:
+        return np.empty(0, np.int64)         # never read the world for nothing
     c = seg.cols[cn]
     if c.get('code_enc') != 0 or c.get('cstart') is None:
-        return np.asarray(seg._raw_codes(cn), np.int64)[np.asarray(rows, np.int64)]
+        if rows.size <= 256:
+            # Jackson's cut: decode ONLY the rows in hand -- single-span
+            # codes_at pops one frame per row instead of inflating them all
+            return np.asarray([int(np.asarray(seg.codes_at(cn, np.arange(r, r + 1)))[0])
+                               for r in rows.tolist()], np.int64)
+        return np.asarray(seg._raw_codes(cn), np.int64)[rows]
     bits = int(c['bits'])
     bp = np.asarray(rows, np.int64) * bits
     by = (bp >> 3) + int(c['cstart'])
@@ -248,7 +259,8 @@ def _finish(seg, spec, ridx, fpool=None):
             ga9.append(int(key[st[gi9]] >> 32))
             gb9.append(int(key[st[gi9]] & 0xFFFFFFFF))
         _pt2_save(seg, a, b, sidx, gid9,
-                  np.asarray(ga9, np.int64), np.asarray(gb9, np.int64))
+                  np.asarray(ga9, np.int64), np.asarray(gb9, np.int64),
+                  ra=key >> 32, rb=key & 0xFFFFFFFF)
     # podium: repeated pairs first, count-1 filler after (LIMIT-tie law)
     top = np.argsort(-gcnt, kind='stable')[:k]
     rows = []
@@ -343,9 +355,15 @@ def _finish_v2(seg, spec, sh2, fpool):
     n_fill = k - len(used)
     if n_fill > 0:
         # count-1 filler: surviving one-off shelf rows first, then plane head
-        of = rows[keep & (gid == 0)][:n_fill]
-        oa = _pt_codes(seg, a, of) if of.size else np.empty(0, np.int64)
-        ob = _pt_codes(seg, b, of) if of.size else np.empty(0, np.int64)
+        om = keep & (gid == 0)
+        of = rows[om][:n_fill]
+        if 'ra' in sh2 and of.size:
+            oi = np.flatnonzero(om)[:n_fill]
+            oa = np.asarray(sh2['ra'], np.int64)[oi]
+            ob = np.asarray(sh2['rb'], np.int64)[oi]
+        else:
+            oa = _pt_codes(seg, a, of) if of.size else np.empty(0, np.int64)
+            ob = _pt_codes(seg, b, of) if of.size else np.empty(0, np.int64)
         for j9 in range(of.size):
             used.append((int(oa[j9]), int(ob[j9]), 1, of[j9:j9 + 1]))
         n_fill = k - len(used)

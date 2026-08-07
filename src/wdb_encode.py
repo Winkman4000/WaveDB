@@ -576,5 +576,56 @@ def _birth_differentiator_shelves(out_path):
                 continue                          # too many exceptions: disqualified
             pickle.dump({'n': N, 'rows': rep.astype(_np.uint32)},
                         open(out_path + '.%s.ptrep' % cn, 'wb'), protocol=4)
+            _expand_pair_shelves(seg, out_path, cn, rep)
+        except Exception:
+            continue
+
+
+def _expand_pair_shelves(seg, out_path, a, rep):
+    """Jackson's eager expansion: the differentiator pairs with every
+    qualifying companion. The law recurses verbatim -- repeated-PAIR rows
+    must stay under 0.75% of the companion's distinct count; low-V columns
+    self-disqualify (their repeats swamp the threshold). Kilobytes total."""
+    import pickle
+    import numpy as _np
+    rep = _np.sort(_np.asarray(rep, _np.int64))
+    if rep.size == 0:
+        return
+    ac = _np.asarray(seg._raw_codes(a), _np.int64)[rep]
+    for y, cy in list(seg.cols.items()):
+        try:
+            if y == a:
+                continue
+            Vy = int(cy.get('V') or 0)
+            if Vy < 1024:
+                continue                          # low V: repeats swamp 0.75%
+            bc = _np.asarray(seg._raw_codes(y), _np.int64)[rep]
+            key = (ac << 32) | bc
+            order = _np.argsort(key, kind='stable')
+            key2 = key[order]
+            sidx = rep[order]
+            brk = _np.empty(key2.size, bool)
+            brk[0] = True
+            _np.not_equal(key2[1:], key2[:-1], out=brk[1:])
+            st = _np.flatnonzero(brk)
+            gcnt = _np.diff(_np.append(st, key2.size))
+            rp = int(gcnt[gcnt >= 2].sum())
+            if rp >= 0.0075 * Vy:
+                continue                          # relationship disqualified
+            gid = _np.zeros(key2.size, _np.int64)
+            repg = _np.flatnonzero(gcnt >= 2)
+            ga = []
+            gb = []
+            for j, gi in enumerate(repg.tolist()):
+                gid[st[gi]:st[gi] + int(gcnt[gi])] = j + 1
+                ga.append(int(key2[st[gi]] >> 32))
+                gb.append(int(key2[st[gi]] & 0xFFFFFFFF))
+            pickle.dump({'n': int(seg.N), 'rows': sidx.astype(_np.uint32),
+                         'gid': gid.astype(_np.uint16),
+                         'ga': _np.asarray(ga, _np.int64),
+                         'gb': _np.asarray(gb, _np.int64),
+                         'ra': key2 >> 32, 'rb': key2 & 0xFFFFFFFF},
+                        open(out_path + '.%s__%s.pt2' % (a, y), 'wb'),
+                        protocol=4)
         except Exception:
             continue
