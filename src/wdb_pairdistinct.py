@@ -100,12 +100,12 @@ def detect(seg, tree, col_map):
 def execute(seg, spec):
     global _HITS
     a, b, u, k = spec['a'], spec['b'], spec['u'], spec['lim']
-    ac = np.asarray(seg._raw_codes(a)).astype(np.int64)
-    bc = np.asarray(seg._raw_codes(b)).astype(np.int64)
+    ac = np.asarray(seg._raw_codes(a))       # narrow dtypes stay narrow --
+    bc = np.asarray(seg._raw_codes(b))       # cast AFTER the typed slice
     e0 = int(WS._code_of(seg, b, ''))
     Vb = int(seg.cols[b]['V'])
     typed = np.flatnonzero(bc != e0)
-    key = ac[typed] * Vb + bc[typed]         # <= Va*Vb cells: bincount land
+    key = ac[typed].astype(np.int64) * Vb + bc[typed]
     ukc = np.bincount(key, minlength=int(seg.cols[a]['V']) * Vb)
     # Jackson's guillotine, sort-free: candidates are pairs whose ROW count
     # could still beat the k-th DISTINCT count; distinct <= rows prunes the
@@ -121,22 +121,20 @@ def execute(seg, spec):
         take = [];
         while idx < live.size and (len(board) < k or int(ukc[live[idx]]) > kth):
             take.append(int(live[idx])); idx += 1
-            if len(take) >= max(k, 12) and len(board) >= k:
-                break
+            if len(take) >= 16:
+                break                            # the u16 jar holds 16 bits
         if not take:
             break
         tk = np.asarray(take, np.int64)
         m9 = np.isin(key, tk)
-        pk = (key[m9] << ubits) | uu_all[m9]
-        pk.sort()                            # ONE flat sort dedups every
-        brk = np.empty(pk.size, bool)        # candidate pair at once
-        if pk.size:
-            brk[0] = True
-            np.not_equal(pk[1:], pk[:-1], out=brk[1:])
-        dk = pk[brk] >> ubits
-        du, dc = np.unique(dk, return_counts=True)
-        for j9 in range(du.size):
-            board.append((int(dc[j9]), int(du[j9])))
+        kk9 = key[m9]
+        pidx = np.searchsorted(np.sort(tk), kk9)   # pair -> batch index
+        tks = np.sort(tk)
+        import wdb_kernels as _WK
+        dc = _WK.pd_stamp(pidx, uu_all[m9],
+                          int(seg.cols[u]['V']), tks.size)
+        for j9 in range(tks.size):           # the stamp jar: one pass,
+            board.append((int(dc[j9]), int(tks[j9])))   # no sort at all
         board.sort(reverse=True)
         board = board[:max(k, 12)]
         kth = board[k - 1][0] if len(board) >= k else 0

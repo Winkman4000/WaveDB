@@ -562,6 +562,31 @@ def grid_count(codes, spans):
     return np.bincount(key, minlength=total)
 
 
+@njit(nogil=True, cache=True)
+def _pd_stamp_nb(pidx, uid, jar, cnt):
+    """First-touch distinct counting, sort-free (Jackson's guillotine finisher):
+    jar[uid] holds a bitmask of pairs that already saw this user (u16: up to 16
+    candidate pairs per batch); one pass, exact even when a user spans pairs."""
+    for i in range(pidx.size):
+        b = np.uint16(1) << np.uint16(pidx[i])
+        w = jar[uid[i]]
+        if w & b == 0:
+            jar[uid[i]] = w | b
+            cnt[pidx[i]] += 1
+
+
+def pd_stamp(pidx, uid, V, npairs):
+    jar = np.zeros(V, np.uint16)
+    cnt = np.zeros(npairs, np.int64)
+    if HAVE_NUMBA:
+        _pd_stamp_nb(pidx.astype(np.int64), uid.astype(np.int64), jar, cnt)
+        return cnt
+    for p in range(npairs):                        # numpy fallback: per-pair unique
+        uu = np.unique(uid[pidx == p])
+        cnt[p] = uu.size
+    return cnt
+
+
 def warm():
     """JIT-compile the kernels (call from prewarm; ~1 s once, cached on disk after)."""
     kway_topk(np.array([1, 2], np.int64), np.array([1, 1], np.int64),
@@ -571,6 +596,7 @@ def warm():
         part_scatter(np.array([1, 0, 1], np.int64), 2)
         _grid2_nb(np.array([0, 1], np.uint8), np.array([1, 0], np.uint8), 2, np.zeros(4, np.int64))
         _grid3_nb(np.array([0, 1], np.uint8), np.array([1, 0], np.uint8), np.array([0, 1], np.uint8), 2, 2, np.zeros(8, np.int64))
+        pd_stamp(np.array([0, 1, 0], np.int64), np.array([3, 3, 3], np.int64), 8, 2)
 
 
 @njit(nogil=True, parallel=True, cache=True)
