@@ -575,6 +575,33 @@ def _pd_stamp_nb(pidx, uid, jar, cnt):
             cnt[pidx[i]] += 1
 
 
+@njit(nogil=True, cache=True)
+def _pd_hunt_nb(key, ut, lut, jar, cnt):
+    """The fused hunt: filter + pair->batch map + first-touch stamp, one pass.
+    lut[pairkey] = batch index or -1; no isin, no searchsorted, no gathers."""
+    for i in range(key.size):
+        p = lut[key[i]]
+        if p >= 0:
+            b = np.uint16(1) << np.uint16(p)
+            w = jar[ut[i]]
+            if w & b == 0:
+                jar[ut[i]] = w | b
+                cnt[p] += 1
+
+
+def pd_hunt(key, ut, lut, V, npairs):
+    jar = np.zeros(V, np.uint16)
+    cnt = np.zeros(npairs, np.int64)
+    if HAVE_NUMBA:
+        _pd_hunt_nb(key, ut.astype(np.int64), lut, jar, cnt)
+        return cnt
+    m = lut[key] >= 0
+    pidx = lut[key[m]]
+    for p in range(npairs):
+        cnt[p] = np.unique(ut[m][pidx == p]).size
+    return cnt
+
+
 def pd_stamp(pidx, uid, V, npairs):
     jar = np.zeros(V, np.uint16)
     cnt = np.zeros(npairs, np.int64)
@@ -597,6 +624,7 @@ def warm():
         _grid2_nb(np.array([0, 1], np.uint8), np.array([1, 0], np.uint8), 2, np.zeros(4, np.int64))
         _grid3_nb(np.array([0, 1], np.uint8), np.array([1, 0], np.uint8), np.array([0, 1], np.uint8), 2, 2, np.zeros(8, np.int64))
         pd_stamp(np.array([0, 1, 0], np.int64), np.array([3, 3, 3], np.int64), 8, 2)
+        pd_hunt(np.array([0, 1, 0], np.int64), np.array([3, 3, 3], np.int64), np.array([0, 1], np.int16), 8, 2)
 
 
 @njit(nogil=True, parallel=True, cache=True)

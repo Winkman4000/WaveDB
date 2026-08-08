@@ -97,23 +97,48 @@ def detect(seg, tree, col_map):
             'proj': tree.expressions}
 
 
+def _tier_shelf(seg, a, b, u):
+    """The dress's serving layer (rule eleven), a birth-on-touch sidecar:
+    typed row positions, both tiny columns' compacted typed codes, AND the
+    differentiator's typed codes -- 'read only what you need' as an mmap
+    slice. Born once; no zstd frame pops again for this query family."""
+    import os
+    p9 = os.path.join(os.path.dirname(seg.path),
+                      'tier2__%s__%s__%s.bin' % (a, b, u))
+    if not os.path.exists(p9):
+        bc0 = np.asarray(seg._raw_codes(b))
+        ac0 = np.asarray(seg._raw_codes(a))
+        uc0 = np.asarray(seg._raw_codes(u))
+        e0 = int(WS._code_of(seg, b, ''))
+        typed0 = np.flatnonzero(bc0 != e0).astype(np.uint32)
+        with open(p9 + '.tmp', 'wb') as f:
+            f.write(np.asarray([typed0.size], np.int64).tobytes())
+            f.write(typed0.tobytes())
+            f.write(ac0[typed0].astype(np.uint8).tobytes())
+            f.write(bc0[typed0].astype(np.uint8).tobytes())
+            f.write(uc0[typed0].astype(np.uint32).tobytes())
+        os.replace(p9 + '.tmp', p9)
+    mm = np.memmap(p9, dtype=np.uint8, mode='r')
+    n9 = int(np.frombuffer(mm[:8], np.int64)[0])
+    typed = np.frombuffer(mm[8:8 + 4 * n9], np.uint32)
+    at = np.frombuffer(mm[8 + 4 * n9:8 + 5 * n9], np.uint8)
+    bt = np.frombuffer(mm[8 + 5 * n9:8 + 6 * n9], np.uint8)
+    ut = np.frombuffer(mm[8 + 6 * n9:8 + 10 * n9], np.uint32)
+    return typed, at, bt, ut
+
+
 def execute(seg, spec):
     global _HITS
     a, b, u, k = spec['a'], spec['b'], spec['u'], spec['lim']
-    ac = np.asarray(seg._raw_codes(a))       # narrow dtypes stay narrow --
-    bc = np.asarray(seg._raw_codes(b))       # cast AFTER the typed slice
-    e0 = int(WS._code_of(seg, b, ''))
     Vb = int(seg.cols[b]['V'])
-    typed = np.flatnonzero(bc != e0)
-    key = ac[typed].astype(np.int64) * Vb + bc[typed]
+    typed, at9, bt9, ut9 = _tier_shelf(seg, a, b, u)
+    key = at9.astype(np.int64) * Vb + bt9
     ukc = np.bincount(key, minlength=int(seg.cols[a]['V']) * Vb)
     # Jackson's guillotine, sort-free: candidates are pairs whose ROW count
     # could still beat the k-th DISTINCT count; distinct <= rows prunes the
     # rest before UserID is ever touched. One packed sort dedups them all.
     live = np.flatnonzero(ukc)
     live = live[np.argsort(-ukc[live], kind='stable')]
-    ubits = max(1, int(seg.cols[u].get('bits') or 25))
-    uu_all = np.asarray(seg._raw_codes(u))[typed]
     board = []                               # (distinct, pairkey)
     kth = 0
     idx = 0
@@ -125,14 +150,12 @@ def execute(seg, spec):
                 break                            # the u16 jar holds 16 bits
         if not take:
             break
-        tk = np.asarray(take, np.int64)
-        m9 = np.isin(key, tk)
-        kk9 = key[m9]
-        pidx = np.searchsorted(np.sort(tk), kk9)   # pair -> batch index
-        tks = np.sort(tk)
+        tks = np.sort(np.asarray(take, np.int64))
+        lut = np.full(int(seg.cols[a]['V']) * Vb, -1, np.int16)
+        lut[tks] = np.arange(tks.size, dtype=np.int16)
         import wdb_kernels as _WK
-        dc = _WK.pd_stamp(pidx, uu_all[m9],
-                          int(seg.cols[u]['V']), tks.size)
+        dc = _WK.pd_hunt(key, ut9, lut,
+                         int(seg.cols[u]['V']), tks.size)
         for j9 in range(tks.size):           # the stamp jar: one pass,
             board.append((int(dc[j9]), int(tks[j9])))   # no sort at all
         board.sort(reverse=True)
