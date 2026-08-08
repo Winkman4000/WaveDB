@@ -4,6 +4,7 @@ Generic: knows nothing about any specific dataset. Handles plain (mode 0) and
 front-coded (mode 1) string dictionaries transparently."""
 import struct
 import threading, numpy as np, zstandard as zstd
+from concurrent.futures import ThreadPoolExecutor
 _DT_UNITS = ['us','ns','ms','s','D','h','m','M','Y','W']
 
 _POOL = None
@@ -246,6 +247,11 @@ class Segment:
             suf = raw[o:o+sl]; o += sl; s = prev[:cp]+suf; vals.append(s); prev = s; i += 1
         return vals
     def dict_charlens(self, nm):
+        _m9 = getattr(self, '_dlens', None)
+        if _m9 is None:
+            _m9 = self._dlens = {}
+        if ('c', nm) in _m9:
+            return _m9[('c', nm)]
         """V-sized CHARACTER lengths read straight off the front-coded dict bytes:
         UTF-8 chars = bytes minus continuation bytes, tracked through the prefix
         chain arithmetically. No string is ever decoded. None -> caller falls back."""
@@ -267,15 +273,13 @@ class Segment:
                     fb = c['chunk_base'] + int(c['chunk_foff'][j])
                     fe = c['chunk_base'] + int(c['chunk_foff'][j + 1])
                     bufs.append(bytes(self.buf[fb:fe]))
-                from concurrent.futures import ThreadPoolExecutor
                 def _one(fb2):
                     raw = __import__('zstandard').ZstdDecompressor().decompress(fb2)
                     a = np.frombuffer(raw, dtype=np.uint8)
                     out = np.empty(a.size // 4 + 1, np.int64)
                     n = _WK.fc_charlens(a, np.int64(R), out)
                     return out[:n]
-                with ThreadPoolExecutor(max_workers=min(8, len(bufs))) as ex:
-                    outs = list(ex.map(_one, bufs))
+                outs = list(_pool().map(_one, bufs))
             else:
                 raw = self._dz.decompress(c['z'])
                 a = np.frombuffer(raw, dtype=np.uint8)
@@ -290,9 +294,16 @@ class Segment:
         if c['has_null'] and res.size == int(c['V']) - 1:
             res = np.concatenate([res, np.zeros(1, np.int64)])
         c['charlens'] = res
-        return res
+        _r9 = res
+        _m9[('c', nm)] = _r9
+        return _r9
 
     def dict_bytelens(self, nm):
+        _m9 = getattr(self, '_dlens', None)
+        if _m9 is None:
+            _m9 = self._dlens = {}
+        if ('b', nm) in _m9:
+            return _m9[('b', nm)]
         """V-sized BYTE lengths off the front-coded dict (STRLEN semantics).
         No decode; pure header arithmetic. None -> caller falls back."""
         c = self.cols.get(nm)
@@ -313,15 +324,13 @@ class Segment:
                     fb = c['chunk_base'] + int(c['chunk_foff'][j])
                     fe = c['chunk_base'] + int(c['chunk_foff'][j + 1])
                     bufs.append(bytes(self.buf[fb:fe]))
-                from concurrent.futures import ThreadPoolExecutor
                 def _one(fb2):
                     raw = __import__('zstandard').ZstdDecompressor().decompress(fb2)
                     a = np.frombuffer(raw, dtype=np.uint8)
                     out = np.empty(a.size // 4 + 1, np.int64)
                     n = _WK.fc_bytelens(a, np.int64(R), out)
                     return out[:n]
-                with ThreadPoolExecutor(max_workers=min(8, len(bufs))) as ex:
-                    outs = list(ex.map(_one, bufs))
+                outs = list(_pool().map(_one, bufs))
             else:
                 raw = self._dz.decompress(c['z'])
                 a = np.frombuffer(raw, dtype=np.uint8)
@@ -336,7 +345,9 @@ class Segment:
         if c['has_null'] and res.size == int(c['V']) - 1:
             res = np.concatenate([res, np.zeros(1, np.int64)])
         c['bytelens'] = res
-        return res
+        _r9 = res
+        _m9[('b', nm)] = _r9
+        return _r9
 
     def _dict_ints(self, c):
         # mode 2: the .nline sidecar memmaps directly when present -- the fixed number
@@ -363,7 +374,6 @@ class Segment:
                     return ch, np.cumsum(np.frombuffer(
                         _z.ZstdDecompressor().decompress(bytes(self.buf[a:b])),
                         dtype=np.int64))
-                from concurrent.futures import ThreadPoolExecutor
                 with ThreadPoolExecutor(max_workers=8) as ex:
                     for ch, arr in ex.map(_popi, range(nch)):
                         parts[ch] = arr
@@ -393,7 +403,6 @@ class Segment:
                     _z.ZstdDecompressor().decompress(bytes(self.buf[a:b])),
                     dtype=np.int64))
             if len(missing) > 1:
-                from concurrent.futures import ThreadPoolExecutor
                 with ThreadPoolExecutor(max_workers=min(8, len(missing))) as ex:
                     for ch, arr in ex.map(_popi, missing):
                         cache[ch] = arr

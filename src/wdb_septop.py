@@ -93,11 +93,20 @@ def execute(seg, spec):
     lits8 = np.asarray(pl[1], np.int64)
     Vp = int(seg.cols[sp]['V'])
     spc = np.bincount(lits8, minlength=Vp)
-    M = max(64, 8 * k)
+    # Jackson's descent, window-batched: hunt the biggest phrases first in
+    # ONE batch per window; stop when the k-th pair beats the best phrase
+    # still outside. kth lands high fast, so the first window usually ends it.
+    W = max(16, 2 * k)
     while True:
-        M = min(M, Vp)
-        topp = np.argpartition(-spc, M - 1)[:M]
-        Mth = int(spc[topp].min()) if topp.size else 0
+        W = min(W, Vp)
+        if W < Vp:
+            part = np.argpartition(-spc, W)[:W + 1]     # top-W+1, unordered
+            part = part[np.argsort(-spc[part], kind='stable')]
+            topp = part[:W]
+            outside = int(spc[part[W]])      # the best phrase left outside
+        else:
+            topp = np.arange(Vp)
+            outside = 0
         sel = np.flatnonzero(np.isin(lits8, topp))
         rows9 = pos8[sel]
         pc9 = lits8[sel]
@@ -112,9 +121,9 @@ def execute(seg, spec):
         cnt = np.diff(np.append(st, key.size))
         order = np.argsort(-cnt, kind='stable')[:k]
         kth = int(cnt[order[-1]]) if order.size >= k else 0
-        if kth >= Mth or M >= Vp:
-            break
-        M *= 4                                    # a bigger pair may hide: widen
+        if kth >= outside or W >= Vp:
+            break                            # nothing outside can board
+        W *= 4
     out = []
     proj = spec['proj']
     for gi in order.tolist():
