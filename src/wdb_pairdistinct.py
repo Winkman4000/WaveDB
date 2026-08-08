@@ -100,30 +100,51 @@ def detect(seg, tree, col_map):
 def execute(seg, spec):
     global _HITS
     a, b, u, k = spec['a'], spec['b'], spec['u'], spec['lim']
-    ac = np.asarray(seg._raw_codes(a))
-    bc = np.asarray(seg._raw_codes(b))
+    ac = np.asarray(seg._raw_codes(a)).astype(np.int64)
+    bc = np.asarray(seg._raw_codes(b)).astype(np.int64)
     e0 = int(WS._code_of(seg, b, ''))
+    Vb = int(seg.cols[b]['V'])
     typed = np.flatnonzero(bc != e0)
-    key = (ac[typed].astype(np.int64) << 16) | bc[typed]
-    uk, inv, ukc = np.unique(key, return_inverse=True, return_counts=True)
-    order = np.argsort(-ukc, kind='stable')
-    uu_all = np.asarray(seg._raw_codes(u))[typed]   # ONE read; slices after
-    gsort = np.argsort(inv, kind='stable')       # pair-grouped order, ONCE --
-    gends = np.cumsum(ukc)                       # no 5.6M scan per pair
-    board = []                                   # (distinct, acode, bcode)
+    key = ac[typed] * Vb + bc[typed]         # <= Va*Vb cells: bincount land
+    ukc = np.bincount(key, minlength=int(seg.cols[a]['V']) * Vb)
+    # Jackson's guillotine, sort-free: candidates are pairs whose ROW count
+    # could still beat the k-th DISTINCT count; distinct <= rows prunes the
+    # rest before UserID is ever touched. One packed sort dedups them all.
+    live = np.flatnonzero(ukc)
+    live = live[np.argsort(-ukc[live], kind='stable')]
+    ubits = max(1, int(seg.cols[u].get('bits') or 25))
+    uu_all = np.asarray(seg._raw_codes(u))[typed]
+    board = []                               # (distinct, pairkey)
     kth = 0
-    for oi in order.tolist():
-        if len(board) >= k and kth >= int(ukc[oi]):
-            break                                # the guillotine: distinct<=rows
-        lo9 = int(gends[oi - 1]) if oi else 0
-        uu = uu_all[gsort[lo9:int(gends[oi])]]
-        d9 = int(np.unique(uu).size)
-        board.append((d9, int(uk[oi] >> 16), int(uk[oi] & 0xFFFF)))
+    idx = 0
+    while idx < live.size:
+        take = [];
+        while idx < live.size and (len(board) < k or int(ukc[live[idx]]) > kth):
+            take.append(int(live[idx])); idx += 1
+            if len(take) >= max(k, 12) and len(board) >= k:
+                break
+        if not take:
+            break
+        tk = np.asarray(take, np.int64)
+        m9 = np.isin(key, tk)
+        pk = (key[m9] << ubits) | uu_all[m9]
+        pk.sort()                            # ONE flat sort dedups every
+        brk = np.empty(pk.size, bool)        # candidate pair at once
+        if pk.size:
+            brk[0] = True
+            np.not_equal(pk[1:], pk[:-1], out=brk[1:])
+        dk = pk[brk] >> ubits
+        du, dc = np.unique(dk, return_counts=True)
+        for j9 in range(du.size):
+            board.append((int(dc[j9]), int(du[j9])))
         board.sort(reverse=True)
         board = board[:max(k, 12)]
         kth = board[k - 1][0] if len(board) >= k else 0
+        if idx < live.size and kth >= int(ukc[live[idx]]):
+            break                            # nothing left can climb
+    board = [(d9, pk9 // Vb, pk9 % Vb) for d9, pk9 in board[:k]]
     out = []
-    for d9, acode, bcode in board[:k]:
+    for d9, acode, bcode in board:
         av = seg.fetch(a, acode)
         bv = seg.fetch(b, bcode)
         if isinstance(av, (bytes, bytearray)):
