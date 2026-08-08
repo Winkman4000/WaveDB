@@ -939,10 +939,10 @@ class Segment:
         c = self.cols.get(nm)
         if c is None or c.get('code_enc', 0) != 8:
             return None
-        key = '_e8p_' + nm
-        hit = self._codes.get(key)
-        if hit is not None:
-            return hit
+        pm = self.__dict__.setdefault('_e8pm', {})
+        hit = pm.get(nm)                     # planes get an unbounded home:
+        if hit is not None:                  # the codes LRU evicted them and
+            return hit                       # every query rebuilt 13.2M planes
         import wdb_kernels as _WK
         pb = np.ascontiguousarray(self.buf[c['e8pres']:c['e8pres'] + (self.N + 7) // 8])
         ck = np.frombuffer(self.buf[c['e8ck']:c['e8ck'] + ((self.N + 65535) // 65536) * 8],
@@ -953,7 +953,7 @@ class Segment:
             self.buf[c['cstart']:c['cstart'] + (c['e8n'] * c['e8bits'] + 7) // 8 + 8])
         lits = _WK.unpack_any(lb, c['e8n'], c['e8bits'])
         res = (pos, lits, int(c['e8d']))
-        self._codes[key] = res
+        pm[nm] = res
         return res
 
     def _raw_codes_range(self, nm, lo, hi):
