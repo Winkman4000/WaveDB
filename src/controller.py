@@ -50,6 +50,7 @@ _READ_ORDER = (
     R.groupself,            # counting board: GROUP BY K + WHERE on K, bins not rows
     R.coscan,               # fused conjunctive COUNT: zone-map veto, one walk
     R.grid2,               # plain 2-key COUNT grid: one fused pass, narrow detect
+    R.firstk,               # staircase early-exit: LIKE + ORDER BY stair LIMIT k, pops only the answer window
     R.wherescan,            # conjunctive WHERE: stair spans + blocked-frame predicate scan, disk-only
     R.septop,
     R.tripletop,
@@ -126,6 +127,12 @@ def route_single_segment(ctx):
             rows = R.value_topk.execute(ctx, spec)
             if rows is not None:
                 if _PATH_SINK is not None: _PATH_SINK(ctx, R.value_topk.name)
+                return rows
+        spec = R.firstk.detect(ctx)         # staircase early-exit: first k matches ARE the answer
+        if spec is not None:
+            rows = R.firstk.execute(ctx, spec)
+            if rows is not None:
+                if _PATH_SINK is not None: _PATH_SINK(ctx, R.firstk.name)
                 return rows
         spec = R.wherescan.detect(ctx)       # rows mode: WHERE + ORDER BY cluster col LIMIT k
         if spec is not None:
