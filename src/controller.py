@@ -51,6 +51,7 @@ _READ_ORDER = (
     R.coscan,               # fused conjunctive COUNT: zone-map veto, one walk
     R.grid2,               # plain 2-key COUNT grid: one fused pass, narrow detect
     R.wherescan,            # conjunctive WHERE: stair spans + blocked-frame predicate scan, disk-only
+    R.septop,
     R.tripletop,
     R.pairtop,
     R.gridwalk,

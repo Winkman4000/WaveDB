@@ -136,6 +136,11 @@ heavypair = Read('heavypair',
                  lambda c, spec: wdb_heavypair.execute(c.seg, spec),
                  'two-key COUNT(*) top-N from a count-sorted pair sidecar')
 
+import wdb_septop
+septop = Read('septop',
+              lambda c: wdb_septop.detect(c.seg, c.tree, c.cmap),
+              lambda c, spec: wdb_septop.execute(c.seg, spec))
+
 import wdb_tripletop
 tripletop = Read('tripletop',
                  lambda c: wdb_tripletop.detect(c.seg, c.tree, c.cmap),
