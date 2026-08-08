@@ -247,10 +247,46 @@ def _code_section(codes, bits, enc5_ok=False):
         litp = _pack_codes(lits, bits) if lits.size else b''
         sparse = (bytes([8, bits]) + struct.pack('<IQQ', dflt, lits.size, codes.size)
                   + pb.tobytes() + ck.tobytes() + litp)
+    # tag 9 = TIERED dress (rule eleven, Jackson's design): the dominant value
+    # is NOTHING (absence bitmap), then within the typed remainder the most
+    # common code is ONE BIT, tiering down; the small tail rides u8. Elected
+    # for low-V columns with concentrated histograms; zero-pop serving.
+    tiered = None
+    if codes.size and cn8.size and cn8[dflt] * 2 > codes.size and bits <= 8 \
+            and cn8.size <= 256:
+        arr9 = np.asarray(codes, dtype=np.int64)
+        pres9 = arr9 != dflt
+        pb9 = np.packbits(pres9)
+        CK = 65536
+        nck9 = (codes.size + CK - 1) // CK
+        per9 = np.add.reduceat(pres9.astype(np.int64), np.arange(0, codes.size, CK))
+        ck9 = np.zeros(nck9, dtype=np.uint64)
+        if nck9 > 1:
+            ck9[1:] = np.cumsum(per9[:-1]).astype(np.uint64)
+        rem = arr9[pres9]                    # typed codes, row order
+        planes = b''
+        tcodes = []
+        for _ in range(3):                   # up to three one-bit tiers
+            if rem.size < 65536:
+                break
+            cnr = np.bincount(rem)
+            dom = int(cnr.argmax())
+            if int(cnr[dom]) * 4 < rem.size:
+                break                        # no concentration left: tail it
+            bit9 = rem == dom
+            planes += struct.pack('<IQ', dom, rem.size) + np.packbits(bit9).tobytes()
+            tcodes.append(dom)
+            rem = rem[~bit9]
+        tiered = (bytes([9, bits]) + struct.pack('<IQQ', dflt, int(pres9.sum()), codes.size)
+                  + pb9.tobytes() + ck9.tobytes()
+                  + bytes([len(tcodes)]) + planes
+                  + struct.pack('<Q', rem.size) + rem.astype(np.uint8).tobytes())
     cands8 = [s for s in (stair, zsec, packed, sparse) if s is not None]
     best = min(cands8, key=len)
     if sparse is not None and os.environ.get('WDB_E8_FORCE'):
         best = sparse                            # rehearsal-only: exercise the readers
+    if tiered is not None and os.environ.get('WDB_TIER_FORCE'):
+        best = tiered                            # rehearsal-only: rule eleven's readers
 
     if best is zsec:
         # tag 3 = BLOCKED frames: independent zstd frame per BLOCK_ROWS rows + a frame offset

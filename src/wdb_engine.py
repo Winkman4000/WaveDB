@@ -137,6 +137,19 @@ class Segment:
                 meta['BR'], nfr = struct.unpack_from('<II', buf, off); off += 8
                 meta['boffs'] = np.frombuffer(buf, dtype=np.uint32, count=nfr+1, offset=off); off += 4*(nfr+1)
                 meta['cstart'] = off; meta['czlen'] = int(meta['boffs'][-1]); off += meta['czlen']
+            elif code_enc == 9:                # tiered dress (rule eleven)
+                meta['e9bits'] = int(buf[off]); off += 1
+                meta['e9d'], meta['e9n'], e9rows = struct.unpack_from('<IQQ', buf, off); off += 20
+                meta['e9pres'] = off; off += (e9rows + 7) // 8
+                meta['e9ck'] = off; off += ((e9rows + 65535) // 65536) * 8
+                nt9 = int(buf[off]); off += 1
+                meta['e9tiers'] = []
+                for _ in range(nt9):
+                    tc9, tn9 = struct.unpack_from('<IQ', buf, off); off += 12
+                    meta['e9tiers'].append((int(tc9), int(tn9), off))
+                    off += (tn9 + 7) // 8
+                meta['e9tail_n'], = struct.unpack_from('<Q', buf, off); off += 8
+                meta['e9tail'] = off; off += meta['e9tail_n']
             elif code_enc == 8:                # sparse-default: presence + checkpoints + literals
                 meta['e8bits'] = int(buf[off]); off += 1
                 meta['e8d'], meta['e8n'], e8rows = struct.unpack_from('<IQQ', buf, off); off += 20
@@ -554,6 +567,21 @@ class Segment:
             lits8 = _WK.unpack_any(lb, c['e8n'], c['e8bits'])
             out8 = _WK.e8_scatter(pos, lits8, self.N, c['e8d'])
             self._codes[nm] = out8; return out8
+        if c.get('code_enc', 0) == 9:                # tiered dress: absence + tier planes + tail
+            import wdb_kernels as _WK
+            pb = np.ascontiguousarray(self.buf[c['e9pres']:c['e9pres'] + (self.N + 7) // 8])
+            pres = np.unpackbits(pb, count=self.N).astype(bool)
+            cc = np.full(self.N, c['e9d'], dtype=np.uint8 if c['e9bits'] <= 8 else np.uint16)
+            rem_idx = np.flatnonzero(pres)
+            for tc9, tn9, toff in c['e9tiers']:
+                tb = np.unpackbits(np.ascontiguousarray(
+                    self.buf[toff:toff + (tn9 + 7) // 8]), count=tn9).astype(bool)
+                cc[rem_idx[tb]] = tc9
+                rem_idx = rem_idx[~tb]
+            if c['e9tail_n']:
+                tail = np.frombuffer(self.buf, np.uint8, c['e9tail_n'], c['e9tail'])
+                cc[rem_idx] = tail
+            self._codes[nm] = cc; return cc
         if c.get('code_enc', 0) == 1:                # zstd of byte-aligned codes (clustered/skewed)
             raw = self._dz.decompress(self.buf[c['cstart']:c['cstart']+c['czlen']].tobytes())
             wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
