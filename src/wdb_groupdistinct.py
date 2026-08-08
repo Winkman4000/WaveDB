@@ -274,7 +274,7 @@ def execute(seg, det, tree):
             return rows, [wdb_sql._alias(p) for p in proj]
 
     kc9 = seg.cols.get(kcol)
-    if (kc9 is not None and kc9.get('code_enc') == 8 and hasattr(seg, 'e8_planes')
+    if (kc9 is not None and kc9.get('code_enc') in (8, 9) and hasattr(seg, 'e8_planes')
             and P.no_deleted_rows(seg) and excl_empty):
         # the planes hold only NON-default rows: this branch serves solely the
         # filtered shape (the default group is exactly what the filter removes)

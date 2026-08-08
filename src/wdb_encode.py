@@ -287,6 +287,15 @@ def _code_section(codes, bits, enc5_ok=False):
         best = sparse                            # rehearsal-only: exercise the readers
     if tiered is not None and os.environ.get('WDB_TIER_FORCE'):
         best = tiered                            # rehearsal-only: rule eleven's readers
+    elif tiered is not None and cn8[dflt] * 10 >= codes.size * 9 \
+            and (codes.size - int(cn8[dflt])) >= 65536 \
+            and len(tiered) <= 4 * len(best):
+        # RULE ELEVEN'S ELECTION (Jackson): low V + a histogram concentrated
+        # to a >=90% default elects the tiered dress on SERVING dominance --
+        # zero-pop reads, the census IS the planes -- accepting bounded disk
+        # (<=4x, in practice pennies against the whole segment). The same
+        # within-tolerance precedent that seated enc-3's frames.
+        best = tiered
 
     if best is zsec:
         # tag 3 = BLOCKED frames: independent zstd frame per BLOCK_ROWS rows + a frame offset

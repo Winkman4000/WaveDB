@@ -965,13 +965,31 @@ class Segment:
         positions of the literals + the literal codes + the default. Consumers that
         count or mask never densify -- 13.2M elements instead of a 400MB write."""
         c = self.cols.get(nm)
-        if c is None or c.get('code_enc', 0) != 8:
+        if c is None or c.get('code_enc', 0) not in (8, 9):
             return None
         pm = self.__dict__.setdefault('_e8pm', {})
         hit = pm.get(nm)                     # planes get an unbounded home:
         if hit is not None:                  # the codes LRU evicted them and
             return hit                       # every query rebuilt 13.2M planes
         import wdb_kernels as _WK
+        if c.get('code_enc', 0) == 9:        # the tiered dress speaks planes too
+            pb = np.ascontiguousarray(self.buf[c['e9pres']:c['e9pres'] + (self.N + 7) // 8])
+            ck = np.frombuffer(self.buf[c['e9ck']:c['e9ck'] + ((self.N + 65535) // 65536) * 8],
+                               dtype=np.uint64)
+            pos = np.empty(c['e9n'], dtype=np.int64)
+            _WK.e8_pos(pb, ck, self.N, pos)
+            lits = np.empty(c['e9n'], dtype=np.int64)
+            rem9 = np.arange(c['e9n'], dtype=np.int64)
+            for tc9, tn9, toff in c['e9tiers']:
+                tb = np.unpackbits(np.ascontiguousarray(
+                    self.buf[toff:toff + (tn9 + 7) // 8]), count=tn9).astype(bool)
+                lits[rem9[tb]] = tc9
+                rem9 = rem9[~tb]
+            if c['e9tail_n']:
+                lits[rem9] = np.frombuffer(self.buf, np.uint8, c['e9tail_n'], c['e9tail'])
+            res = (pos, lits, int(c['e9d']))
+            pm[nm] = res
+            return res
         pb = np.ascontiguousarray(self.buf[c['e8pres']:c['e8pres'] + (self.N + 7) // 8])
         ck = np.frombuffer(self.buf[c['e8ck']:c['e8ck'] + ((self.N + 65535) // 65536) * 8],
                            dtype=np.uint64)

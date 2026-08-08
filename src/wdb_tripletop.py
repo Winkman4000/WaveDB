@@ -77,7 +77,7 @@ def detect(seg, tree, col_map):
         c = seg.cols.get(cn)
         if c is None:
             return None
-        if c.get('code_enc') == 8:
+        if c.get('code_enc') in (8, 9):
             sp = cn
         else:
             uid = cn

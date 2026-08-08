@@ -57,7 +57,7 @@ def detect(seg, tree, col_map):
     uc = seg.cols.get(ucol)
     if kc is None or uc is None:
         return None
-    if kc.get('code_enc') != 8:
+    if kc.get('code_enc') not in (8, 9):
         return None                              # v1: the sparse dress only --
     ox = tree.args.get('order')                  # its planes ARE the row list
     lim = None

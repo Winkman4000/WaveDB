@@ -222,7 +222,7 @@ def _try_fused_union(db, node):
     if not P.no_deleted_rows(seg):
         return None
     kcodes = [WS._code_of(seg, kcol, v) for v in lits]
-    gc = None if seg.cols[gcol].get('code_enc') == 8 else \
+    gc = None if seg.cols[gcol].get('code_enc') in (8, 9) else \
         np.asarray(seg._raw_codes(gcol))     # e8 counts in literal space: no dense gc
     kc = np.asarray(seg._raw_codes(kcol))    # native widths (the int64 casts were 153ms)
     resid_mask = None

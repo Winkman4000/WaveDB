@@ -99,7 +99,7 @@ def detect(seg, tree, col_map):
             return None
     if fcol is not None:
         fc9 = seg.cols.get(fcol)
-        if fc9 is None or fc9.get('code_enc') != 8 or fcol in (a, b):
+        if fc9 is None or fc9.get('code_enc') not in (8, 9) or fcol in (a, b):
             return None                      # the prune rides the sparse dress
     return {'a': a, 'b': b, 'aggs': aggs, 'lim': lim, 'fcol': fcol,
             'proj': tree.expressions}

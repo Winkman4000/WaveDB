@@ -1284,7 +1284,7 @@ def _dict_eq_mask(seg, name, neg, lit):
     # 12.5MB of bits instead of reconstructing the dense column. sp <> '' becomes
     # the bitmap verbatim; sp = '' its complement. Non-default literals fall through
     # to the code scan as ever.
-    if c.get('code_enc') == 8 and not c.get('has_null'):
+    if c.get('code_enc') in (8, 9) and not c.get('has_null'):
         import wdb_wherescan as _WS
         dcode = _WS._code_of(seg, name, lit)
         if dcode is None:                       # literal absent from the dictionary

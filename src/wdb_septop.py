@@ -47,7 +47,7 @@ def detect(seg, tree, col_map):
     cp = seg.cols.get(sp)
     if cs is None or cp is None:
         return None
-    if cp.get('code_enc') != 8:
+    if cp.get('code_enc') not in (8, 9):
         return None                              # the filter must BE the plane
     if int(cs.get('V') or 1 << 30) > 4096:
         return None                              # engine-first needs low V
