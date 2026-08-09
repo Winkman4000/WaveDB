@@ -287,7 +287,8 @@ def _code_section(codes, bits, enc5_ok=False):
         best = sparse                            # rehearsal-only: exercise the readers
     if tiered is not None and os.environ.get('WDB_TIER_FORCE'):
         best = tiered                            # rehearsal-only: rule eleven's readers
-    elif tiered is not None and cn8[dflt] * 10 >= codes.size * 9 \
+    elif tiered is not None and cn8.size >= 10 \
+            and cn8[dflt] * 10 >= codes.size * 9 \
             and (codes.size - int(cn8[dflt])) >= 65536 \
             and len(tiered) <= 4 * len(best):
         # RULE ELEVEN'S ELECTION (Jackson): low V + a histogram concentrated

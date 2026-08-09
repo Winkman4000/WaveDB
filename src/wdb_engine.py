@@ -1070,6 +1070,17 @@ class Segment:
         if rows.size == 0:
             return np.empty(0, dtype=np.int64)
         c = self.cols[nm]
+        if c.get('code_enc', 0) == 9:
+            rows9 = np.asarray(rows, np.int64)
+            pl9 = self.e8_planes(nm)         # planes speak tag-9, memoized
+            pos9 = pl9[0]; lit9 = pl9[1]
+            j9 = np.searchsorted(pos9, rows9)
+            j9c = np.minimum(j9, max(0, pos9.size - 1))
+            hit9 = (pos9[j9c] == rows9) if pos9.size else np.zeros(rows9.size, bool)
+            out9 = np.full(rows9.size, pl9[2], np.int64)
+            if pos9.size:
+                out9[hit9] = lit9[j9c[hit9]]
+            return out9
         if c.get('code_enc', 0) == 8 and nm not in self._codes:
             pos8, lits8, d8 = self.e8_planes(nm)   # point reads: binary search the
             out = np.full(rows.size, d8, dtype=np.int64)   # positions, never densify
