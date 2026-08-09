@@ -141,6 +141,11 @@ firstk = Read('firstk',
               lambda c: wdb_firstk.detect(c.seg, c.tree, c.cmap),
               lambda c, spec: wdb_firstk.execute(c.seg, spec))
 
+import wdb_mixtop
+mixtop = Read('mixtop',
+              lambda c: wdb_mixtop.detect(c.seg, c.tree, c.cmap),
+              lambda c, spec: wdb_mixtop.execute(c.seg, spec))
+
 import wdb_pairdistinct
 pairdistinct = Read('pairdistinct',
                     lambda c: wdb_pairdistinct.detect(c.seg, c.tree, c.cmap),

@@ -602,6 +602,57 @@ def pd_hunt(key, ut, lut, V, npairs):
     return cnt
 
 
+@njit(nogil=True, cache=True)
+def _mx_fold_nb(kc, ac, dv, acc):
+    """One-pass weighted fold: acc[key] += dv[a-code]. Native dtypes in, no
+    100M casts, no chunk ceremony -- the mixed board's sums in one walk."""
+    for i in range(kc.size):
+        acc[kc[i]] += dv[ac[i]]
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _mx_fold2_nb(kc, ac1, dv1, ac2, dv2, cnt2, s1, s2):
+    """Jackson's parallel fold: ONE pass over the column, prange-split with
+    thread-local accumulators (race-free), producing count + both weighted
+    sums together. The gather parallelizes because nothing is sequential."""
+    T = s1.shape[0]
+    n = kc.size
+    step = (n + T - 1) // T
+    for t in prange(T):
+        lo = t * step
+        hi = min(n, lo + step)
+        for i in range(lo, hi):
+            k = kc[i]
+            cnt2[t, k] += 1
+            s1[t, k] += dv1[ac1[i]]
+            s2[t, k] += dv2[ac2[i]]
+
+
+def mx_fold2(kc, ac1, dv1, ac2, dv2, KV):
+    if HAVE_NUMBA:
+        import numba
+        T = max(1, numba.get_num_threads())
+        cnt2 = np.zeros((T, KV), np.int64)
+        s1 = np.zeros((T, KV), np.float64)
+        s2 = np.zeros((T, KV), np.float64)
+        _mx_fold2_nb(kc, ac1, dv1, ac2, dv2, cnt2, s1, s2)
+        return cnt2.sum(0), s1.sum(0), s2.sum(0)
+    cnt = np.bincount(kc, minlength=KV)
+    return cnt, mx_fold(kc, ac1, dv1, KV), mx_fold(kc, ac2, dv2, KV)
+
+
+def mx_fold(kc, ac, dv, KV):
+    acc = np.zeros(KV, np.float64)
+    if HAVE_NUMBA:
+        _mx_fold_nb(kc, ac, dv, acc)
+        return acc
+    CH = 1 << 23
+    for lo in range(0, kc.size, CH):
+        sl = slice(lo, min(kc.size, lo + CH))
+        acc += np.bincount(kc[sl], weights=dv[ac[sl]], minlength=KV)
+    return acc
+
+
 def pd_stamp(pidx, uid, V, npairs):
     jar = np.zeros(V, np.uint16)
     cnt = np.zeros(npairs, np.int64)
@@ -625,6 +676,8 @@ def warm():
         _grid3_nb(np.array([0, 1], np.uint8), np.array([1, 0], np.uint8), np.array([0, 1], np.uint8), 2, 2, np.zeros(8, np.int64))
         pd_stamp(np.array([0, 1, 0], np.int64), np.array([3, 3, 3], np.int64), 8, 2)
         pd_hunt(np.array([0, 1, 0], np.int64), np.array([3, 3, 3], np.int64), np.array([0, 1], np.int16), 8, 2)
+        mx_fold(np.array([0, 1, 0], np.int64), np.array([0, 1, 1], np.int64), np.array([2.0, 5.0]), 2)
+        mx_fold2(np.array([0, 1, 0], np.int64), np.array([0, 1, 1], np.int64), np.array([2.0, 5.0]), np.array([1, 0, 1], np.int64), np.array([3.0, 4.0]), 2)
 
 
 @njit(nogil=True, parallel=True, cache=True)
