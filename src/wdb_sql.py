@@ -1289,11 +1289,13 @@ def _dict_eq_mask(seg, name, neg, lit):
         dcode = _WS._code_of(seg, name, lit)
         if dcode is None:                       # literal absent from the dictionary
             return np.ones(int(seg.N), bool) if neg else np.zeros(int(seg.N), bool)
-        if int(dcode) == int(c['e8d']):
+        d8 = c.get('e8d') if c.get('code_enc') == 8 else c.get('e9d')
+        p8 = c.get('e8pres') if c.get('code_enc') == 8 else c.get('e9pres')
+        if int(dcode) == int(d8):
             ck9 = '_e8up_' + name
             up = seg._codes.get(ck9)
             if up is None:
-                pb = np.asarray(seg.buf[c['e8pres']:c['e8pres'] + (int(seg.N) + 7) // 8],
+                pb = np.asarray(seg.buf[p8:p8 + (int(seg.N) + 7) // 8],
                                 dtype=np.uint8)
                 up = np.unpackbits(pb, count=int(seg.N)).astype(bool)
                 seg._codes[ck9] = up
