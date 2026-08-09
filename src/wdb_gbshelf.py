@@ -52,6 +52,8 @@ def birth(seg, col):
             f.write(bm4[:nb].tobytes())
             f.write(ck4.tobytes())
             f.write(tail.tobytes())
+        import wdb_shelves
+        wdb_shelves.record(seg, 'gbc2', col=col)
         return True
     except Exception:
         return False

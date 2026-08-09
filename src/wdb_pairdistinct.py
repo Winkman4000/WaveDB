@@ -118,6 +118,8 @@ def _tier_shelf(seg, a, b, u):
             f.write(bc0[typed0].astype(np.uint8).tobytes())
             f.write(uc0[typed0].astype(np.uint32).tobytes())
         os.replace(p9 + '.tmp', p9)
+        import wdb_shelves
+        wdb_shelves.record(seg, 'tier2', a=a, b=b, u=u)
     mm = np.memmap(p9, dtype=np.uint8, mode='r')
     n9 = int(np.frombuffer(mm[:8], np.int64)[0])
     typed = np.frombuffer(mm[8:8 + 4 * n9], np.uint32)

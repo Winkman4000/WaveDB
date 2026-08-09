@@ -127,6 +127,28 @@ def _gdc_load(seg, kcol, tcol):
     return None
 
 
+def birth2(seg, kcol, tcol):
+    """Standalone big-key gdc birth (the ledger's midwife): planes -> scatter
+    -> per-group distinct -> codes-only sidecar. Mirrors the lane's compute."""
+    import numpy as np
+    import wdb_kernels as _WK
+    kc9 = seg.cols.get(kcol)
+    if kc9 is None or kc9.get('code_enc') not in (8, 9):
+        return False
+    pl = seg.e8_planes(kcol)
+    pos8, lits8 = np.asarray(pl[0]), np.asarray(pl[1], dtype=np.int64)
+    KV9 = int(kc9['V'])
+    cnts9 = np.bincount(lits8, minlength=KV9)
+    uc9 = np.asarray(seg._raw_codes(tcol))[pos8].astype(np.int64)
+    offs9 = np.zeros(KV9 + 1, np.int64)
+    np.cumsum(cnts9, out=offs9[1:])
+    bucketed9 = np.empty(lits8.size, np.int64)
+    _WK.cd_scatter(lits8, uc9, offs9, offs9[:-1].copy(), bucketed9)
+    dcounts = _WK.cd_alldistinct(bucketed9, offs9)
+    _gdc_save2(seg, kcol, tcol, dcounts)
+    return True
+
+
 def _gdc_save2(seg, kcol, tcol, counts):
     """Codes-only sidecar for giant key spaces: counts indexed by dict code,
     winners decoded at emission. noempty: built from the sparse planes, so the
@@ -294,6 +316,8 @@ def execute(seg, det, tree):
             _WK.cd_scatter(lits8, uc9, offs9, offs9[:-1].copy(), bucketed9)
             dcounts = _WK.cd_alldistinct(bucketed9, offs9)
             _gdc_save2(seg, kcol, tcol, dcounts)
+            import wdb_shelves
+            wdb_shelves.record(seg, 'gdc2', k=kcol, t=tcol)
             counts = dcounts
             if excl_empty and _ecode is not None and _ecode < counts.size:
                 counts = counts.copy(); counts[_ecode] = 0
@@ -342,6 +366,8 @@ def execute(seg, det, tree):
             keys = [k.decode('utf-8', 'replace') if isinstance(k, (bytes, bytearray)) else k
                     for k in keys]
             _gdc_save(seg, kcol, tcol, counts, keys)     # birth-on-first-touch, gbc-style
+            import wdb_shelves
+            wdb_shelves.record(seg, 'gdc', k=kcol, t=tcol)
         lim = wdb_sql._limit(tree)
         present = np.nonzero(counts)[0]
         sel = present[np.argsort(-counts[present], kind='stable')]

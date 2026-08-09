@@ -72,7 +72,14 @@ class Database:
     @classmethod
     def create(cls, dbdir): return cls(Catalog.create(dbdir))
     @classmethod
-    def open(cls, dbdir): return cls(Catalog.open(dbdir))
+    def open(cls, dbdir):
+        db = cls(Catalog.open(dbdir))
+        try:
+            import wdb_shelves
+            wdb_shelves.replay(db)           # Jackson's eager-shelf law:
+        except Exception:                    # every recorded shelf is born
+            pass                             # at launch, never on luck
+        return db
 
     def open_segment(self, path, table=None):
         """Cached Segment for an immutable .wdb. Construction reads+parses the whole file (~200ms for a
