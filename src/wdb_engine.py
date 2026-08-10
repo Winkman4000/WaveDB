@@ -137,6 +137,22 @@ class Segment:
                 meta['BR'], nfr = struct.unpack_from('<II', buf, off); off += 8
                 meta['boffs'] = np.frombuffer(buf, dtype=np.uint32, count=nfr+1, offset=off); off += 4*(nfr+1)
                 meta['cstart'] = off; meta['czlen'] = int(meta['boffs'][-1]); off += meta['czlen']
+            elif code_enc == 10:               # segmented bitpack-plus
+                meta['pXbits'] = int(buf[off]); off += 1
+                pXn, pXnb = struct.unpack_from('<QI', buf, off); off += 12
+                meta['pXn'] = int(pXn); meta['pXnblk'] = int(pXnb)
+                meta['pXdir'] = off; off += 8 * int(pXnb)
+                meta['pXpay'] = off
+                dirX = np.frombuffer(buf, np.int64, int(pXnb), meta['pXdir'])
+                lastoff = int(dirX[-1]) >> 1
+                B10 = 4096
+                last_rows = int(pXn) - (int(pXnb) - 1) * B10
+                if int(dirX[-1]) & 1:
+                    nrX, = struct.unpack_from('<H', buf, meta['pXpay'] + lastoff)
+                    off = meta['pXpay'] + lastoff + 2 + 4 * int(nrX)
+                else:
+                    off = meta['pXpay'] + lastoff + (last_rows * meta['pXbits'] + 7) // 8
+                meta['bits'] = meta['pXbits']
             elif code_enc == 9:                # tiered dress (rule eleven)
                 meta['e9bits'] = int(buf[off]); off += 1
                 meta['e9d'], meta['e9n'], e9rows = struct.unpack_from('<IQQ', buf, off); off += 20
@@ -567,6 +583,29 @@ class Segment:
             lits8 = _WK.unpack_any(lb, c['e8n'], c['e8bits'])
             out8 = _WK.e8_scatter(pos, lits8, self.N, c['e8d'])
             self._codes[nm] = out8; return out8
+        if c.get('code_enc', 0) == 10:               # segmented bitpack-plus
+            bitsX = int(c['pXbits'])
+            B10 = 4096
+            nblkX = int(c['pXnblk'])
+            dirX = np.frombuffer(self.buf, np.int64, nblkX, c['pXdir'])
+            cc = np.empty(int(c['pXn']), dtype=np.uint16 if bitsX > 8 else np.uint8)
+            payX = c['pXpay']
+            for bX in range(nblkX):
+                loX = bX * B10
+                rowsX = min(B10, int(c['pXn']) - loX)
+                oX = payX + (int(dirX[bX]) >> 1)
+                if int(dirX[bX]) & 1:                # run block: repeat tokens
+                    nrX, = struct.unpack_from('<H', self.buf, oX)
+                    pairsX = np.frombuffer(self.buf, np.uint16, 2 * int(nrX), oX + 2)
+                    cc[loX:loX + rowsX] = np.repeat(pairsX[1::2], pairsX[0::2])[:rowsX]
+                else:                                # bitpack block: bit math
+                    nbyX = (rowsX * bitsX + 7) // 8
+                    bitarr = np.unpackbits(np.frombuffer(self.buf, np.uint8, nbyX, oX))
+                    valsX = np.zeros(rowsX, np.int64)
+                    for bitI in range(bitsX):
+                        valsX = (valsX << 1) | bitarr[bitI::bitsX][:rowsX]
+                    cc[loX:loX + rowsX] = valsX
+            self._codes[nm] = cc; return cc
         if c.get('code_enc', 0) == 9:                # tiered dress: absence + tier planes + tail
             import wdb_kernels as _WK
             pb = np.ascontiguousarray(self.buf[c['e9pres']:c['e9pres'] + (self.N + 7) // 8])
@@ -1057,7 +1096,7 @@ class Segment:
                 a = max(lo, j*BR); b = min(hi, j*BR + raw.size)
                 out[a-lo:b-lo] = raw[a-j*BR:b-j*BR]
             return out
-        if c['mode'] in (3, 5) or c.get('code_enc', 0) in (1, 8, 9):
+        if c['mode'] in (3, 5) or c.get('code_enc', 0) in (1, 8, 9, 10):
             return self._raw_codes(nm)[lo:hi]      # dresses without frames
         return self._bitunpack(c['cstart'], lo, hi, c['bits'])
 
@@ -1070,6 +1109,8 @@ class Segment:
         if rows.size == 0:
             return np.empty(0, dtype=np.int64)
         c = self.cols[nm]
+        if c.get('code_enc', 0) == 10:
+            return np.asarray(self._raw_codes(nm))[np.asarray(rows, np.int64)]
         if c.get('code_enc', 0) == 9:
             rows9 = np.asarray(rows, np.int64)
             pl9 = self.e8_planes(nm)         # planes speak tag-9, memoized

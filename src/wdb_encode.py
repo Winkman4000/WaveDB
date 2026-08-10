@@ -281,11 +281,57 @@ def _code_section(codes, bits, enc5_ok=False):
                   + pb9.tobytes() + ck9.tobytes()
                   + bytes([len(tcodes)]) + planes
                   + struct.pack('<Q', rem.size) + rem.astype(np.uint8).tobytes())
+    # tag 10 = SEGMENTED BITPACK-PLUS (Jackson's dress): 4096-row blocks,
+    # each electing bitpack or run-tokens by the profit formula -- runs
+    # compress only where run_len*bits beats the token, so the whole
+    # column is structurally never worse than bitpack (+1B/block).
+    bplus = None
+    if codes.size and bits <= 16:
+        arrA = np.asarray(codes, dtype=np.int64)
+        B10 = 4096
+        nblkA = (arrA.size + B10 - 1) // B10
+        bndA = np.flatnonzero(np.diff(arrA) != 0)
+        stA = np.concatenate([[0], bndA + 1]).astype(np.int64)
+        blk_firstA = np.searchsorted(stA, np.arange(0, arrA.size, B10), side='right') - 1
+        blk_lastA = np.searchsorted(stA, np.minimum(
+            np.arange(B10, arrA.size + B10, B10), arrA.size), side='left')
+        nruns_bA = np.maximum(1, blk_lastA - blk_firstA)
+        rows_bA = np.minimum(np.arange(B10, arrA.size + B10, B10), arrA.size) \
+            - np.arange(0, arrA.size, B10)
+        run_modeA = nruns_bA * 32 < rows_bA * bits    # u16 count + u16 value
+        if run_modeA.any():                           # only dress when runs pay
+            payloadA = bytearray()
+            dirA = np.zeros(nblkA, np.int64)
+            for bA in range(nblkA):
+                loA = bA * B10
+                hiA = min(arrA.size, loA + B10)
+                dirA[bA] = len(payloadA) << 1
+                blkA = arrA[loA:hiA]
+                if run_modeA[bA]:
+                    dirA[bA] |= 1
+                    bnd_b = np.flatnonzero(np.diff(blkA) != 0)
+                    st_b = np.concatenate([[0], bnd_b + 1])
+                    en_b = np.concatenate([bnd_b + 1, [blkA.size]])
+                    payloadA += struct.pack('<H', st_b.size)
+                    pairs = np.empty(st_b.size * 2, np.uint16)
+                    pairs[0::2] = (en_b - st_b).astype(np.uint16)
+                    pairs[1::2] = blkA[st_b].astype(np.uint16)
+                    payloadA += pairs.tobytes()
+                else:
+                    nbyA = (blkA.size * bits + 7) // 8
+                    accA = np.zeros(nbyA * 8, np.uint8)
+                    for bitA in range(bits):
+                        accA[bitA::bits][:blkA.size] = (blkA >> (bits - 1 - bitA)) & 1
+                    payloadA += np.packbits(accA[:nbyA * 8]).tobytes()
+            bplus = (bytes([10, bits]) + struct.pack('<QI', codes.size, nblkA)
+                     + dirA.tobytes() + bytes(payloadA))
     cands8 = [s for s in (stair, zsec, packed, sparse) if s is not None]
     best = min(cands8, key=len)
     if sparse is not None and os.environ.get('WDB_E8_FORCE'):
         best = sparse                            # rehearsal-only: exercise the readers
-    if tiered is not None and os.environ.get('WDB_TIER_FORCE'):
+    if bplus is not None and os.environ.get('WDB_PLUS_FORCE'):
+        best = bplus                             # rehearsal-only: enc-10's readers
+    elif tiered is not None and os.environ.get('WDB_TIER_FORCE'):
         best = tiered                            # rehearsal-only: rule eleven's readers
     elif tiered is not None and cn8.size >= 10 \
             and cn8[dflt] * 10 >= codes.size * 9 \
