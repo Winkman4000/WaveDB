@@ -72,6 +72,9 @@ def replay(db):
                         import wdb_groupdistinct as GD
                         if GD._gdc_load(seg, a['k'], a['t']) is None:
                             GD.birth2(seg, a['k'], a['t'])
+                    elif kind == 'plist':
+                        import wdb_funnel
+                        wdb_funnel._plist(seg, a['col'])
                     elif kind == 'tier2':
                         import wdb_pairdistinct as PD
                         PD._tier_shelf(seg, a['a'], a['b'], a['u'])

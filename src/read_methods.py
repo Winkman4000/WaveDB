@@ -146,6 +146,11 @@ firstsorted = Read('firstsorted',
                    lambda c: wdb_firstsorted.detect(c.seg, c.tree, c.cmap),
                    lambda c, spec: wdb_firstsorted.execute(c.seg, spec))
 
+import wdb_funnel
+funnel = Read('funnel',
+              lambda c: wdb_funnel.detect(c.seg, c.tree, c.cmap),
+              lambda c, spec: wdb_funnel.execute(c.seg, spec))
+
 import wdb_pairfold
 pairfold = Read('pairfold',
                 lambda c: wdb_pairfold.detect(c.seg, c.tree, c.cmap),

@@ -51,6 +51,7 @@ _READ_ORDER = (
     R.coscan,               # fused conjunctive COUNT: zone-map veto, one walk
     R.grid2,               # plain 2-key COUNT grid: one fused pass, narrow detect
     R.firstk,               # staircase early-exit: LIKE + ORDER BY stair LIMIT k, pops only the answer window
+    R.funnel,               # selective funnel: plist start, crumb hygiene, code-space group
     R.wherescan,            # conjunctive WHERE: stair spans + blocked-frame predicate scan, disk-only
     R.pairfold,
     R.affinegroup,
@@ -94,7 +95,7 @@ def route_single_segment(ctx):
     if wdb_sql._offset(ctx.tree):
         # wherescan is the one structure read that applies OFFSET itself (it materializes the
         # full ordered group set and slices [off:off+lim]) -- let it try before the scan.
-        for rd in (R.dict_count, R.wherescan, R.diskpair):   # the reads that apply OFFSET themselves
+        for rd in (R.funnel, R.dict_count, R.wherescan, R.diskpair):   # the reads that apply OFFSET themselves
             spec = rd.detect(ctx)
             if spec is not None:
                 rows = rd.execute(ctx, spec)
