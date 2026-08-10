@@ -133,6 +133,12 @@ def route_single_segment(ctx):
             if rows is not None:
                 if _PATH_SINK is not None: _PATH_SINK(ctx, R.value_topk.name)
                 return rows
+        spec = R.firstsorted.detect(ctx)     # staircase ORDER BY unprojected time
+        if spec is not None:
+            rows = R.firstsorted.execute(ctx, spec)
+            if rows is not None:
+                if _PATH_SINK is not None: _PATH_SINK(ctx, R.firstsorted.name)
+                return rows
         spec = R.firstk.detect(ctx)         # staircase early-exit: first k matches ARE the answer
         if spec is not None:
             rows = R.firstk.execute(ctx, spec)
