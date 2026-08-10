@@ -28,7 +28,7 @@ def test_clustered_int_compresses_and_is_lossless():
         col = np.minimum(np.random.default_rng(1).zipf(1.2, 1_000_000), 200000).astype(np.int64); col.sort()
         seg, w, _ = _enc(pd.DataFrame({'x': col}))
         raw = (seg.N * seg.cols['x']['bits'] + 7) // 8
-        assert seg.cols['x']['code_enc'] in (1, 3), "clustered codes should compress (sealed or blocked)"
+        assert seg.cols['x']['code_enc'] in (1, 3, 10), "clustered codes should compress (sealed, blocked, or bitpack-plus)"
         assert os.path.getsize(w) * 5 < raw, "should be far smaller than raw bit-packed codes"
         assert np.array_equal(seg.values('x'), col)
 

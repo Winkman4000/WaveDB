@@ -331,6 +331,16 @@ def _code_section(codes, bits, enc5_ok=False):
         best = sparse                            # rehearsal-only: exercise the readers
     if bplus is not None and os.environ.get('WDB_PLUS_FORCE'):
         best = bplus                             # rehearsal-only: enc-10's readers
+    elif bplus is not None and len(bplus) <= 4 * len(best):
+        # JACKSON'S ELECTION: real locality (the run census already proved
+        # profitable blocks exist) within the 4x serving seal -- random
+        # access and R-sized censuses outvote bounded disk, the tag-9
+        # precedent. Columns without locality never built a bplus with
+        # run-blocks cheaper than bitpack, so this only fires where the
+        # formula found profit.
+        _lensA = np.diff(np.concatenate([stA, [arrA.size]]))
+        if float(_lensA.mean()) >= 5.0:          # mean run >= 5: locality is real
+            best = bplus
     elif tiered is not None and os.environ.get('WDB_TIER_FORCE'):
         best = tiered                            # rehearsal-only: rule eleven's readers
     elif tiered is not None and cn8.size >= 10 \
