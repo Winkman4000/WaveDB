@@ -611,6 +611,42 @@ def _mx_fold_nb(kc, ac, dv, acc):
 
 
 @njit(nogil=True, parallel=True, cache=True)
+def pr_scatter(pos, acol, bcol, xcol, ycol, SH, T):
+    """Q30's fused gather+radix: walk the planes' typed positions ONCE, read all
+    four columns at the row, pack key=(b<<8|a) and pay=(x<<16|y), bucket by b's
+    top bits. No intermediate gathers ever materialize."""
+    n = pos.size
+    NB = 1 << 12
+    pc = np.zeros((T, NB), np.int64)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        for i in range(lo, hi):
+            pc[t, np.int64(bcol[pos[i]]) >> SH] += 1
+    offs = np.zeros(NB + 1, np.int64)
+    for b in range(NB):
+        s0 = 0
+        for t in range(T):
+            v = pc[t, b]
+            pc[t, b] = s0
+            s0 += v
+        offs[b + 1] = offs[b] + s0
+    key = np.empty(n, np.int64)
+    pay = np.empty(n, np.int64)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        for i in range(lo, hi):
+            p = pos[i]
+            bb = np.int64(bcol[p])
+            j = offs[bb >> SH] + pc[t, bb >> SH]
+            pc[t, bb >> SH] += 1
+            key[j] = (bb << 8) | np.int64(acol[p])
+            pay[j] = (np.int64(xcol[p]) << 16) | np.int64(ycol[p])
+    return key, pay, offs
+
+
+@njit(nogil=True, parallel=True, cache=True)
 def _mx_fold2_nb(kc, ac1, dv1, ac2, dv2, cnt2, s1, s2):
     """Jackson's parallel fold: ONE pass over the column, prange-split with
     thread-local accumulators (race-free), producing count + both weighted
@@ -678,6 +714,12 @@ def warm():
         pd_hunt(np.array([0, 1, 0], np.int64), np.array([3, 3, 3], np.int64), np.array([0, 1], np.int16), 8, 2)
         mx_fold(np.array([0, 1, 0], np.int64), np.array([0, 1, 1], np.int64), np.array([2.0, 5.0]), 2)
         mx_fold2(np.array([0, 1, 0], np.int64), np.array([0, 1, 1], np.int64), np.array([2.0, 5.0]), np.array([1, 0, 1], np.int64), np.array([3.0, 4.0]), 2)
+        _k9, _p9, _o9 = pr_scatter(np.array([0, 1, 2], np.int64), np.array([0, 1, 0], np.int64),
+                                   np.array([1, 1, 2], np.int64), np.array([0, 1, 0], np.int64),
+                                   np.array([0, 0, 1], np.int64), 0, 2)
+        _c9 = np.zeros(3, np.int64); _s19 = np.zeros(3, np.float64); _s29 = np.zeros(3, np.float64)
+        _u9 = np.zeros(3, np.int64); _n9 = np.zeros(1 << 12, np.int64)
+        pr_fold(_k9, _p9, _o9, np.array([0.0, 1.0]), np.array([2.0, 3.0]), _c9, _s19, _s29, _u9, _n9)
 
 
 @njit(nogil=True, parallel=True, cache=True)
@@ -823,6 +865,42 @@ def enc5_at2(packed, hot, patches, esc_off, rows_sorted, N, BR):
             if v == 15:
                 pi += 1
     return out
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def pr_fold(key, pay, offs, dv1, dv2, ucnt, us1, us2, ukey, nruns):
+    """Per-bucket argsort + run walk: fold count and both dictionary-valued sums
+    per (b, a) pair. Each bucket writes runs into ITS OWN slice region -- no
+    cursors, no contention."""
+    NB = offs.size - 1
+    for b in prange(NB):
+        lo = offs[b]
+        hi = offs[b + 1]
+        if hi <= lo:
+            nruns[b] = 0
+            continue
+        sl = np.argsort(key[lo:hi], kind='mergesort')
+        w = lo
+        r = 0
+        i = 0
+        m = hi - lo
+        while i < m:
+            kv = key[lo + sl[i]]
+            c = 0
+            s1 = 0.0
+            s2 = 0.0
+            while i < m and key[lo + sl[i]] == kv:
+                pv = pay[lo + sl[i]]
+                s1 += dv1[(pv >> 16) & 0xFFFF]
+                s2 += dv2[pv & 0xFFFF]
+                c += 1
+                i += 1
+            ukey[w + r] = kv
+            ucnt[w + r] = c
+            us1[w + r] = s1
+            us2[w + r] = s2
+            r += 1
+        nruns[b] = r
 
 
 @njit(nogil=True, parallel=True, cache=True)

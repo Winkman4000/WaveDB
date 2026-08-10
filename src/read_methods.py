@@ -141,6 +141,11 @@ firstk = Read('firstk',
               lambda c: wdb_firstk.detect(c.seg, c.tree, c.cmap),
               lambda c, spec: wdb_firstk.execute(c.seg, spec))
 
+import wdb_pairfold
+pairfold = Read('pairfold',
+                lambda c: wdb_pairfold.detect(c.seg, c.tree, c.cmap),
+                lambda c, spec: wdb_pairfold.execute(c.seg, spec))
+
 import wdb_affinegroup
 affinegroup = Read('affinegroup',
                    lambda c: wdb_affinegroup.detect(c.seg, c.tree, c.cmap),
