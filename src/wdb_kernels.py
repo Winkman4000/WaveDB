@@ -611,6 +611,38 @@ def _mx_fold_nb(kc, ac, dv, acc):
 
 
 @njit(nogil=True, parallel=True, cache=True)
+def pf_prune(pos, bcol, heavy):
+    """Q30's early stop: keep only typed positions whose b-code is HEAVY
+    (cnt_ip bound: a pair can never outscore its IP's total). Two prange
+    passes -- count, then stable scatter -- return the surviving crumb."""
+    n = pos.size
+    T = heavy.size and 16 or 16
+    T = 16
+    pc = np.zeros(T + 1, np.int64)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        c = 0
+        for i in range(lo, hi):
+            if heavy[bcol[pos[i]]]:
+                c += 1
+        pc[t + 1] = c
+    for t in range(T):
+        pc[t + 1] += pc[t]
+    out = np.empty(pc[T], np.int64)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        w = pc[t]
+        for i in range(lo, hi):
+            p = pos[i]
+            if heavy[bcol[p]]:
+                out[w] = p
+                w += 1
+    return out
+
+
+@njit(nogil=True, parallel=True, cache=True)
 def pr_scatter(pos, acol, bcol, xcol, ycol, SH, T):
     """Q30's fused gather+radix: walk the planes' typed positions ONCE, read all
     four columns at the row, pack key=(b<<8|a) and pay=(x<<16|y), bucket by b's
@@ -717,6 +749,7 @@ def warm():
         _k9, _p9, _o9 = pr_scatter(np.array([0, 1, 2], np.int64), np.array([0, 1, 0], np.int64),
                                    np.array([1, 1, 2], np.int64), np.array([0, 1, 0], np.int64),
                                    np.array([0, 0, 1], np.int64), 0, 2)
+        pf_prune(np.array([0, 1, 2], np.int64), np.array([1, 0, 1], np.int64), np.array([True, False]))
         _c9 = np.zeros(3, np.int64); _s19 = np.zeros(3, np.float64); _s29 = np.zeros(3, np.float64)
         _u9 = np.zeros(3, np.int64); _n9 = np.zeros(1 << 12, np.int64)
         pr_fold(_k9, _p9, _o9, np.array([0.0, 1.0]), np.array([2.0, 3.0]), _c9, _s19, _s29, _u9, _n9)

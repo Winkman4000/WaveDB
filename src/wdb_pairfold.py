@@ -117,21 +117,69 @@ def execute(seg, spec):
     import wdb_kernels as _WK
     pl = seg.e8_planes(spec['f'])
     pos = np.ascontiguousarray(np.asarray(pl[0], dtype=np.int64))
-    ac9 = np.asarray(seg._raw_codes(spec['a']))
     bc9 = np.asarray(seg._raw_codes(spec['b']))
+    BV = int(seg.cols[spec['b']]['V'])
+    memo = seg.__dict__.setdefault('_censusmemo', {})
+    ckey = ('pf', spec['f'], spec['b'])
+    cnt_b = memo.get(ckey)
+    if cnt_b is None:                        # the bound: a pair can never
+        cnt_b = np.bincount(bc9[pos], minlength=BV)   # outscore its b's total
+        memo[ckey] = cnt_b
+    k = spec['lim']
+    ac9 = np.asarray(seg._raw_codes(spec['a']))
     scols = spec['scols']
     x1 = scols[0] if scols else spec['a']
     x2 = scols[1] if len(scols) > 1 else x1
     xc9 = np.asarray(seg._raw_codes(x1))
     yc9 = np.asarray(seg._raw_codes(x2))
-    BV = int(seg.cols[spec['b']]['V'])
     SH = max(0, BV.bit_length() - 12)
     try:
         import numba
         T9 = max(1, numba.get_num_threads())
     except Exception:
         T9 = 1
-    key, pay, offs = _WK.pr_scatter(pos, ac9, bc9, xc9, yc9, SH, T9)
+    M = 4096
+    nz = int((cnt_b > 0).sum())
+    while True:
+        M9 = min(M, nz)
+        if M9 >= nz:                         # no prune possible: whole board
+            spos = pos
+            max_excl = 0
+        else:
+            hkey = ('pfh', spec['f'], spec['b'], M9)
+            hit = memo.get(hkey)                   # the heavy set is static
+            if hit is None:                        # per (filter, column, M):
+                thr_idx = np.argpartition(-cnt_b, M9 - 1)[:M9]   # select once,
+                heavy = np.zeros(BV, np.bool_)                   # remember
+                heavy[thr_idx] = True
+                max_excl = int(cnt_b[~heavy].max()) if M9 < BV else 0
+                spos9 = _WK.pf_prune(pos, bc9, heavy)
+                memo[hkey] = (max_excl, spos9)
+                hit = memo[hkey]
+            max_excl, spos = hit
+        key, pay, offs = _WK.pr_scatter(spos, ac9, bc9, xc9, yc9, SH, T9)
+        n = key.size
+        ucnt = np.zeros(n, np.int64)
+        us1 = np.zeros(n, np.float64)
+        us2 = np.zeros(n, np.float64)
+        ukey = np.zeros(n, np.int64)
+        nruns = np.zeros(1 << 12, np.int64)
+        _WK.pr_fold(key, pay, offs, _dv(seg, x1), _dv(seg, x2),
+                    ucnt, us1, us2, ukey, nruns)
+        live = np.zeros(n, bool)
+        for b in range(nruns.size):
+            if nruns[b]:
+                live[offs[b]:offs[b] + nruns[b]] = True
+        ucnt = ucnt[live]; us1 = us1[live]; us2 = us2[live]; ukey = ukey[live]
+        k9 = min(k, ucnt.size)
+        if k9 == 0 and max_excl > 0:
+            M *= 4; continue
+        order = np.argpartition(-ucnt, max(0, k9 - 1))[:k9]
+        order = order[np.argsort(-ucnt[order], kind='stable')]
+        p10 = int(ucnt[order[-1]]) if k9 else 0
+        if max_excl <= p10 or M9 >= nz:      # THE CERTIFICATE: every excluded
+            break                            # b PROVABLY hosts no better pair
+        M *= 4                               # widen once, re-check
     n = key.size
     ucnt = np.zeros(n, np.int64)
     us1 = np.zeros(n, np.float64)
@@ -145,10 +193,6 @@ def execute(seg, spec):
         if nruns[b]:
             live[offs[b]:offs[b] + nruns[b]] = True
     ucnt = ucnt[live]; us1 = us1[live]; us2 = us2[live]; ukey = ukey[live]
-    k = spec['lim']
-    k9 = min(k, ucnt.size)
-    order = np.argpartition(-ucnt, k9 - 1)[:k9]
-    order = order[np.argsort(-ucnt[order], kind='stable')]
     sums = {x1: us1, x2: us2}
     out = []
     for j in order.tolist():
