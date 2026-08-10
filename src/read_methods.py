@@ -141,6 +141,11 @@ firstk = Read('firstk',
               lambda c: wdb_firstk.detect(c.seg, c.tree, c.cmap),
               lambda c, spec: wdb_firstk.execute(c.seg, spec))
 
+import wdb_affinegroup
+affinegroup = Read('affinegroup',
+                   lambda c: wdb_affinegroup.detect(c.seg, c.tree, c.cmap),
+                   lambda c, spec: wdb_affinegroup.execute(c.seg, spec))
+
 import wdb_affinesum
 affinesum = Read('affinesum',
                  lambda c: wdb_affinesum.detect(c.seg, c.tree, c.cmap),
