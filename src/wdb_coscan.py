@@ -95,6 +95,11 @@ def detect(seg, tree, col_map):
             return None
         if c.get('mode') == 4 and kd not in ('eq', 'neq', 'range'):
             return None                                 # raw-int columns: value predicates only
+        if 'cstart' not in c or 'boffs' not in c:
+            return None                                 # dresses without block frames
+                                                        # (tag-9) speak planes, not
+                                                        # cstart -- not this lane's
+                                                        # dialect; decline, stay exact
         if kd == 'range' and c.get('mode') not in (2, 4):
             return None                                 # code order == value order only there
     if not P.no_deleted_rows(seg):

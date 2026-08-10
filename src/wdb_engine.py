@@ -1057,8 +1057,8 @@ class Segment:
                 a = max(lo, j*BR); b = min(hi, j*BR + raw.size)
                 out[a-lo:b-lo] = raw[a-j*BR:b-j*BR]
             return out
-        if c['mode'] in (3, 5) or c.get('code_enc', 0) == 1:
-            return self._raw_codes(nm)[lo:hi]
+        if c['mode'] in (3, 5) or c.get('code_enc', 0) in (1, 8, 9):
+            return self._raw_codes(nm)[lo:hi]      # dresses without frames
         return self._bitunpack(c['cstart'], lo, hi, c['bits'])
 
     def codes_at(self, nm, rows):
