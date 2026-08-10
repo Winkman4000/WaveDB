@@ -43,23 +43,50 @@ def detect(seg, tree, col_map):
         return None
     cm = col_map or {}
     col = None
+    ncols = 0
     for ge in g.expressions:
+        if isinstance(ge, E.Literal):
+            if not ge.is_string and str(ge.this).lstrip('-').isdigit():
+                # DuckDB law: a bare integer in GROUP BY is POSITIONAL --
+                # resolve it to the select item before judging it
+                idx = int(str(ge.this)) - 1
+                if idx < 0 or idx >= len(tree.expressions):
+                    return None
+                item = tree.expressions[idx]
+                ge = item.this if isinstance(item, E.Alias) else item
+                if isinstance(ge, E.Literal):
+                    continue                     # a true constant: no-op
+            else:
+                continue                         # string/float literal: no-op
         af = _affine(ge)
         if af is None:
             return None
         cn = cm.get(af[0], af[0])
+        ncols += 1
+        if af[1] != 0 and (seg.cols.get(cm.get(af[0], af[0])) or {}).get('dt') != 0:
+            return None                      # arithmetic faces need ints
         if col is None:
             col = cn
         elif cn != col:
             return None                          # one column, many faces
+    if ncols == 0:
+        return None                              # all-constant group: not ours
     c = seg.cols.get(col)
-    if c is None or c.get('dt') != 0 or c.get('has_null'):
+    if c is None or c.get('has_null'):
         return None
     proj = []                                    # ('F', shift) | ('C',)
     calias = None
     for p in tree.expressions:
         inner = p.this if isinstance(p, E.Alias) else p
+        if isinstance(inner, E.Literal):
+            v9 = str(inner.this)
+            proj.append(('L', v9 if inner.is_string else
+                         (float(v9) if '.' in v9 else int(v9))))
+            continue                             # the party hat, glued back on
         af = _affine(inner)
+        if af is not None and af[1] != 0 \
+                and (seg.cols.get(cm.get(af[0], af[0])) or {}).get('dt') != 0:
+            return None                      # arithmetic faces need ints
         if af is not None:
             if cm.get(af[0], af[0]) != col:
                 return None
@@ -106,11 +133,14 @@ def execute(seg, spec):
     out = []
     for code in order.tolist():
         v9 = seg.fetch(col, int(code))           # THE pluck: n values only
-        base = int(v9)
+        if isinstance(v9, (bytes, bytearray)):
+            v9 = v9.decode('utf-8', 'replace')
         row = []
         for kind in spec['projkinds']:
-            if kind[0] == 'F':
-                row.append(base + kind[1])
+            if kind[0] == 'L':
+                row.append(kind[1])
+            elif kind[0] == 'F':
+                row.append(v9 if kind[1] == 0 else int(v9) + kind[1])
             else:
                 row.append(int(cnt[code]))
         out.append(tuple(row))
