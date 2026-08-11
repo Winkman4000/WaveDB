@@ -150,6 +150,58 @@ def detect(seg, tree, col_map):
         return None
     if int(seg.cols[sel[0]].get('V') or 1 << 40) > 1 << 22:
         return None                              # plist stays a bounded species
+    trunc = None
+    if len(g.expressions) == 1:
+        ge0 = g.expressions[0]
+        tn = ge0.this if isinstance(ge0, E.Alias) else ge0
+        if isinstance(tn, (E.DateTrunc, E.TimestampTrunc)) or (
+                isinstance(tn, E.Anonymous)
+                and str(tn.this).upper() == 'DATE_TRUNC'):
+            argsT = list(tn.args.get('expressions') or [])
+            unitT = tn.args.get('unit')
+            colT = tn.this if isinstance(tn.this, E.Column) else None
+            for aT in argsT:
+                if isinstance(aT, E.Literal):
+                    unitT = aT
+                if isinstance(aT, E.Column):
+                    colT = aT
+            if unitT is not None and str(getattr(unitT, 'this', unitT)).lower() == 'minute' \
+                    and colT is not None:
+                cnT = cm.get(colT.name, colT.name)
+                if seg.stairs(cnT) is not None:
+                    trunc = (cnT, 60)
+    if trunc is not None:
+        ox = tree.args.get('order'); lx = tree.args.get('limit')
+        if ox is None or lx is None or len(ox.expressions) != 1 \
+                or ox.expressions[0].args.get('desc'):
+            return None                      # the file order IS minute order
+        proj9 = []
+        for p9 in tree.expressions:
+            inner = p9.this if isinstance(p9, E.Alias) else p9
+            if isinstance(inner, (E.DateTrunc, E.TimestampTrunc, E.Anonymous)):
+                proj9.append(('M',))
+            else:
+                ak = wdb_sql._agg_kind(inner)
+                if ak is None or ak[0] != 'COUNT_STAR':
+                    return None
+                proj9.append(('C',))
+        try:
+            lim = int(lx.expression.this)
+        except Exception:
+            return None
+        off = 0
+        offx = tree.args.get('offset')
+        if offx is not None:
+            try:
+                off = int(offx.expression.this)
+            except Exception:
+                return None
+        import wdb_policies as P
+        if not P.no_deleted_rows(seg):
+            return None
+        return {'sel': sel, 'rng': rng, 'flags': flags, 'strneq': strneq,
+                'g': [], 'trunc': trunc, 'k': lim, 'off': off,
+                'projkinds': proj9, 'proj': tree.expressions}
     gcols = []
     for ge in g.expressions:
         src = ge
@@ -238,6 +290,8 @@ def _code_of(seg, col, value):
 
 def execute(seg, spec):
     global _HITS
+    if spec.get('trunc'):
+        return _execute_trunc(seg, spec)
     scol, sval = spec['sel']
     code = _code_of(seg, scol, sval)
     if code is None:
@@ -354,6 +408,105 @@ def execute(seg, spec):
                 row.append(vals[kind[1]])
             else:
                 row.append(int(ucnt[j]))
+        out.append(tuple(row))
+    _HITS += 1
+    return out, [wdb_sql._alias(p) for p in spec['proj']]
+
+
+def _execute_trunc(seg, spec):
+    """Q42's shape (Jackson's cut): the window is a staircase span, so we
+    walk CHUNKS from its LEFT EDGE -- popping only the selector frames the
+    answer needs -- filter to the counter at each chunk, read minute values
+    for survivors only, and run-walk minutes in file order (which IS minute
+    order). The walk STOPS the moment run off+k closes. OFFSET deep pops
+    almost nothing past its own answer."""
+    global _HITS
+    import datetime as _dtm
+    scol, sval = spec['sel']
+    code = _code_of(seg, scol, sval)
+    ecol = spec['trunc'][0]
+    rlo, rhi = 0, seg.N
+    for rcol, (lo9, hi9) in spec['rng'].items():
+        steps = np.asarray(seg.stairs(rcol), dtype=np.int64)
+        full = np.concatenate([[0], steps, [seg.N]])
+        def _tov(sv):
+            try:
+                return int(sv)
+            except ValueError:
+                y, m, d = [int(x) for x in sv.split('-')]
+                return (_dtm.date(y, m, d) - _dtm.date(1970, 1, 1)).days
+        V9 = int(seg.cols[rcol]['V'])
+        vals = [_days_of(seg.fetch(rcol, c9)) for c9 in range(V9)]
+        import bisect
+        if lo9 is not None:
+            c9 = bisect.bisect_left(vals, _tov(lo9[0]) + (1 if lo9[1] else 0))
+            rlo = max(rlo, int(full[c9]))
+        if hi9 is not None:
+            c9 = bisect.bisect_right(vals, _tov(hi9[0]) - (1 if hi9[1] else 0))
+            rhi = min(rhi, int(full[c9]))
+    need = spec['off'] + spec['k']
+    runs_m = []
+    runs_c = []
+    cur_m = -1
+    cur_c = 0
+    if code is not None:
+        # THE PLIST START (the counter's own law finishing the job): the
+        # crumb's positions are already on the shelf -- no selector frames
+        # pop at all. Window = two searchsorteds on the row-ordered list.
+        offs, plist = _plist(seg, scol)
+        crumb = plist[int(offs[code]):int(offs[code + 1])]
+        a9 = np.searchsorted(crumb, rlo, side='left')
+        b9 = np.searchsorted(crumb, rhi, side='left')
+        crumb = crumb[a9:b9].astype(np.int64)
+    else:
+        crumb = np.empty(0, np.int64)
+    CH = 1 << 17                                 # crumb-prefix chunks: early stop
+    a = 0
+    while a < crumb.size:
+        hit = crumb[a:a + CH]
+        for fcol, fval, kind in spec['flags']:
+            if hit.size == 0:
+                break
+            fc = np.asarray(seg.codes_at(fcol, hit))
+            c9 = _code_of(seg, fcol, fval) if kind != 'in' else None
+            if kind == 'in':
+                want = [w9 for w9 in (_code_of(seg, fcol, v9) for v9 in fval)
+                        if w9 is not None]
+                hit = hit[np.isin(fc, want)] if want else hit[:0]
+            elif c9 is None:
+                hit = hit[:0] if kind else hit
+            else:
+                hit = hit[fc == c9] if kind else hit[fc != c9]
+        if hit.size:
+            sec = np.asarray(seg.values_range(ecol, int(hit[0]), int(hit[-1]) + 1))
+            if sec.dtype.kind == 'M':
+                sec = sec.astype('datetime64[s]').astype(np.int64)
+            mins = (sec[hit - int(hit[0])].astype(np.int64) // 60)
+            bnd = np.flatnonzero(np.diff(mins) != 0)
+            st9 = np.concatenate([[0], bnd + 1])
+            en9 = np.concatenate([bnd + 1, [mins.size]])
+            for i9 in range(st9.size):
+                m9 = int(mins[st9[i9]])
+                c99 = int(en9[i9] - st9[i9])
+                if m9 == cur_m:
+                    cur_c += c99
+                else:
+                    if cur_m >= 0:
+                        runs_m.append(cur_m)
+                        runs_c.append(cur_c)
+                    cur_m = m9
+                    cur_c = c99
+        if len(runs_m) > need:                   # the needed runs are all CLOSED
+            break
+        a += CH
+    if cur_m >= 0 and len(runs_m) <= need:
+        runs_m.append(cur_m); runs_c.append(cur_c)
+    out = []
+    for i9 in range(spec['off'], min(spec['off'] + spec['k'], len(runs_m))):
+        mv = _dtm.datetime(1970, 1, 1) + _dtm.timedelta(seconds=runs_m[i9] * 60)
+        row = []
+        for kind in spec['projkinds']:
+            row.append(mv if kind[0] == 'M' else runs_c[i9])
         out.append(tuple(row))
     _HITS += 1
     return out, [wdb_sql._alias(p) for p in spec['proj']]
