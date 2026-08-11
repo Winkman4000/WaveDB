@@ -611,6 +611,52 @@ def _mx_fold_nb(kc, ac, dv, acc):
 
 
 @njit(nogil=True, parallel=True, cache=True)
+def bp10_gather(buf, dirX, pay, bits, rows, out):
+    """enc-10's random access honored: decode ONLY the requested rows.
+    rows must be sorted. Bitpack blocks are O(1) bit arithmetic per row;
+    run blocks walk their few tokens once per touched block (merged with
+    the block's requested rows, two-pointer)."""
+    n = rows.size
+    if n == 0:
+        return
+    # partition requested rows by block via prange over blocks touched
+    nblk = dirX.size
+    B = 4096
+    for b in prange(nblk):
+        lo_i = np.searchsorted(rows, b * B)
+        hi_i = np.searchsorted(rows, (b + 1) * B)
+        if hi_i <= lo_i:
+            continue
+        o = pay + (dirX[b] >> 1)
+        if dirX[b] & 1:
+            nr = np.int64(buf[o]) | (np.int64(buf[o + 1]) << 8)
+            p = o + 2
+            acc = b * B                          # running row cursor
+            j = lo_i
+            for r in range(nr):
+                cnt = np.int64(buf[p]) | (np.int64(buf[p + 1]) << 8)
+                val = np.int64(buf[p + 2]) | (np.int64(buf[p + 3]) << 8)
+                p += 4
+                nxt = acc + cnt
+                while j < hi_i and rows[j] < nxt:
+                    out[j] = val
+                    j += 1
+                acc = nxt
+                if j >= hi_i:
+                    break
+        else:
+            for j in range(lo_i, hi_i):
+                r = rows[j] - b * B
+                v = np.int64(0)
+                base = r * bits
+                for bi in range(bits):
+                    idx = base + bi
+                    byte = buf[o + (idx >> 3)]
+                    v = (v << 1) | ((np.int64(byte) >> (7 - (idx & 7))) & 1)
+                out[j] = v
+
+
+@njit(nogil=True, parallel=True, cache=True)
 def bp10_decode(buf, dirX, pay, bits, N, out):
     """enc-10's walker: prange over 4096-row blocks; run blocks repeat-fill
     from u16 (count,value) pairs, bitpack blocks extract MSB-first bit runs.
@@ -786,6 +832,8 @@ def warm():
         _bw = np.zeros(8, np.uint8); _bw[0] = 2; _bw[1] = 0; _bw[2] = 3; _bw[3] = 0; _bw[4] = 1; _bw[5] = 0
         _bo = np.zeros(3, np.uint16)
         bp10_decode(_bw, np.array([1], np.int64), 0, 1, 3, _bo)
+        _bg = np.zeros(2, np.uint16)
+        bp10_gather(_bw, np.array([1], np.int64), 0, 1, np.array([0, 2], np.int64), _bg)
         _c9 = np.zeros(3, np.int64); _s19 = np.zeros(3, np.float64); _s29 = np.zeros(3, np.float64)
         _u9 = np.zeros(3, np.int64); _n9 = np.zeros(1 << 12, np.int64)
         pr_fold(_k9, _p9, _o9, np.array([0.0, 1.0]), np.array([2.0, 3.0]), _c9, _s19, _s29, _u9, _n9)

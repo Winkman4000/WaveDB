@@ -1083,6 +1083,14 @@ class Segment:
                 a = max(lo, j*BR); b = min(hi, j*BR + raw.size)
                 out[a-lo:b-lo] = raw[a-j*BR:b-j*BR]
             return out
+        if c.get('code_enc', 0) == 10 and nm not in self._codes:
+            import wdb_kernels as _WK             # window: gather the span only
+            rowsW = np.arange(lo, hi, dtype=np.int64)
+            outW = np.zeros(rowsW.size, dtype=np.uint16 if int(c['pXbits']) > 8 else np.uint8)
+            dirW = np.frombuffer(self.buf, np.int64, int(c['pXnblk']), c['pXdir'])
+            _WK.bp10_gather(np.frombuffer(self.buf, np.uint8), np.ascontiguousarray(dirW),
+                            int(c['pXpay']), int(c['pXbits']), rowsW, outW)
+            return outW
         if c['mode'] in (3, 5) or c.get('code_enc', 0) in (1, 8, 9, 10):
             return self._raw_codes(nm)[lo:hi]      # dresses without frames
         return self._bitunpack(c['cstart'], lo, hi, c['bits'])
@@ -1097,7 +1105,17 @@ class Segment:
             return np.empty(0, dtype=np.int64)
         c = self.cols[nm]
         if c.get('code_enc', 0) == 10:
-            return np.asarray(self._raw_codes(nm))[np.asarray(rows, np.int64)]
+            if nm in self._codes:                    # already decoded: gather free
+                return self._codes[nm][np.asarray(rows, np.int64)]
+            import wdb_kernels as _WK
+            rowsX = np.asarray(rows, np.int64)
+            srt = np.argsort(rowsX, kind='stable')   # kernel wants sorted rows
+            outX = np.zeros(rowsX.size, dtype=np.uint16 if int(c['pXbits']) > 8 else np.uint8)
+            dirX = np.frombuffer(self.buf, np.int64, int(c['pXnblk']), c['pXdir'])
+            _WK.bp10_gather(np.frombuffer(self.buf, np.uint8), np.ascontiguousarray(dirX),
+                            int(c['pXpay']), int(c['pXbits']), rowsX[srt], outX)
+            inv9 = np.empty_like(srt); inv9[srt] = np.arange(srt.size)
+            return outX[inv9]
         if c.get('code_enc', 0) == 9:
             rows9 = np.asarray(rows, np.int64)
             pl9 = self.e8_planes(nm)         # planes speak tag-9, memoized
