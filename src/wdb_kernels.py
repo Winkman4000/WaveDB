@@ -611,6 +611,39 @@ def _mx_fold_nb(kc, ac, dv, acc):
 
 
 @njit(nogil=True, parallel=True, cache=True)
+def bp10_decode(buf, dirX, pay, bits, N, out):
+    """enc-10's walker: prange over 4096-row blocks; run blocks repeat-fill
+    from u16 (count,value) pairs, bitpack blocks extract MSB-first bit runs.
+    The 24K-block python loop dies here."""
+    B = 4096
+    nblk = dirX.size
+    for b in prange(nblk):
+        lo = b * B
+        rows = min(B, N - lo)
+        o = pay + (dirX[b] >> 1)
+        if dirX[b] & 1:
+            nr = np.int64(buf[o]) | (np.int64(buf[o + 1]) << 8)
+            p = o + 2
+            w = lo
+            for r in range(nr):
+                cnt = np.int64(buf[p]) | (np.int64(buf[p + 1]) << 8)
+                val = np.int64(buf[p + 2]) | (np.int64(buf[p + 3]) << 8)
+                p += 4
+                for i in range(cnt):
+                    out[w] = val
+                    w += 1
+        else:
+            for r in range(rows):
+                v = np.int64(0)
+                base = r * bits
+                for bi in range(bits):
+                    idx = base + bi
+                    byte = buf[o + (idx >> 3)]
+                    v = (v << 1) | ((np.int64(byte) >> (7 - (idx & 7))) & 1)
+                out[lo + r] = v
+
+
+@njit(nogil=True, parallel=True, cache=True)
 def pf_prune(pos, bcol, heavy):
     """Q30's early stop: keep only typed positions whose b-code is HEAVY
     (cnt_ip bound: a pair can never outscore its IP's total). Two prange
@@ -750,6 +783,9 @@ def warm():
                                    np.array([1, 1, 2], np.int64), np.array([0, 1, 0], np.int64),
                                    np.array([0, 0, 1], np.int64), 0, 2)
         pf_prune(np.array([0, 1, 2], np.int64), np.array([1, 0, 1], np.int64), np.array([True, False]))
+        _bw = np.zeros(8, np.uint8); _bw[0] = 2; _bw[1] = 0; _bw[2] = 3; _bw[3] = 0; _bw[4] = 1; _bw[5] = 0
+        _bo = np.zeros(3, np.uint16)
+        bp10_decode(_bw, np.array([1], np.int64), 0, 1, 3, _bo)
         _c9 = np.zeros(3, np.int64); _s19 = np.zeros(3, np.float64); _s29 = np.zeros(3, np.float64)
         _u9 = np.zeros(3, np.int64); _n9 = np.zeros(1 << 12, np.int64)
         pr_fold(_k9, _p9, _o9, np.array([0.0, 1.0]), np.array([2.0, 3.0]), _c9, _s19, _s29, _u9, _n9)

@@ -585,26 +585,13 @@ class Segment:
             self._codes[nm] = out8; return out8
         if c.get('code_enc', 0) == 10:               # segmented bitpack-plus
             bitsX = int(c['pXbits'])
-            B10 = 4096
             nblkX = int(c['pXnblk'])
             dirX = np.frombuffer(self.buf, np.int64, nblkX, c['pXdir'])
-            cc = np.empty(int(c['pXn']), dtype=np.uint16 if bitsX > 8 else np.uint8)
-            payX = c['pXpay']
-            for bX in range(nblkX):
-                loX = bX * B10
-                rowsX = min(B10, int(c['pXn']) - loX)
-                oX = payX + (int(dirX[bX]) >> 1)
-                if int(dirX[bX]) & 1:                # run block: repeat tokens
-                    nrX, = struct.unpack_from('<H', self.buf, oX)
-                    pairsX = np.frombuffer(self.buf, np.uint16, 2 * int(nrX), oX + 2)
-                    cc[loX:loX + rowsX] = np.repeat(pairsX[1::2], pairsX[0::2])[:rowsX]
-                else:                                # bitpack block: bit math
-                    nbyX = (rowsX * bitsX + 7) // 8
-                    bitarr = np.unpackbits(np.frombuffer(self.buf, np.uint8, nbyX, oX))
-                    valsX = np.zeros(rowsX, np.int64)
-                    for bitI in range(bitsX):
-                        valsX = (valsX << 1) | bitarr[bitI::bitsX][:rowsX]
-                    cc[loX:loX + rowsX] = valsX
+            cc = np.zeros(int(c['pXn']), dtype=np.uint16 if bitsX > 8 else np.uint8)
+            import wdb_kernels as _WK
+            bufX = np.frombuffer(self.buf, np.uint8)
+            _WK.bp10_decode(bufX, np.ascontiguousarray(dirX), int(c['pXpay']),
+                            bitsX, int(c['pXn']), cc)
             self._codes[nm] = cc; return cc
         if c.get('code_enc', 0) == 9:                # tiered dress: absence + tier planes + tail
             import wdb_kernels as _WK
