@@ -186,6 +186,39 @@ def _gdc_save(seg, kcol, tcol, counts, keys):
         pass
 
 
+def birth_gdc(seg, kcol, tcol):
+    """The dense-gdc midwife: replay's birther for recorded recipes -- the
+    same scatter pass the lane runs on first touch, minus the query. A
+    fresh successor file opens with its inherited shelves already born."""
+    if _gdc_load(seg, kcol, tcol) is not None:
+        return True                              # already on the shelf
+    kinfo = _ids(seg, kcol)
+    tinfo = _ids(seg, tcol)
+    if kinfo is None or tinfo is None:
+        return False
+    grp, _knull, kdecode = kinfo
+    tgt, tnull, _t = tinfo
+    if grp.shape[0] != tgt.shape[0]:
+        return False
+    N = grp.shape[0]
+    VRk = int(grp.max()) + 1 if N else 0
+    VTt = int(tgt.max()) + 1 if N else 0
+    if not (tnull < 0 and N > 4_000_000 and 0 < VRk <= 262_144 and VTt > 65_536):
+        return False                             # the lane's own gates, honored
+    import wdb_kernels as _WK
+    SH = max(1, VTt.bit_length() - 12)
+    ku, kr, offs = _WK.gd_pass1(np.ascontiguousarray(tgt),
+                                np.ascontiguousarray(grp),
+                                np.int64(SH), np.int64(8))
+    counts = _WK.gd_pass2_count(ku, kr, offs, np.int64(SH), np.int64(VRk))
+    keys = [wdb_sql._pyval(kdecode[g] if kdecode is not None else np.int64(g))
+            for g in range(VRk)]
+    keys = [k.decode('utf-8', 'replace') if isinstance(k, (bytes, bytearray)) else k
+            for k in keys]
+    _gdc_save(seg, kcol, tcol, counts, keys)
+    return True
+
+
 def detect(seg, tree, col_map, _allow_group_filter=False):
     """Shape gate shared by the live walk and the materialized sidecar. Returns
     (kcol, tcol, ci, ki, proj) for a `GROUP BY key, COUNT(DISTINCT target)` query inside v1 scope,

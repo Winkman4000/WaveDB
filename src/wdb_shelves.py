@@ -78,7 +78,8 @@ def replay(db):
                     elif kind == 'tier2':
                         import wdb_pairdistinct as PD
                         PD._tier_shelf(seg, a['a'], a['b'], a['u'])
-                    # 'gdc' (dense small-key form) still births on first touch;
-                    # recorded so a future birther can adopt it.
+                    elif kind == 'gdc':
+                        import wdb_groupdistinct as GD
+                        GD.birth_gdc(seg, a['k'], a['t'])
                 except Exception:
                     pass
