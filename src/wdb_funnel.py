@@ -413,6 +413,31 @@ def execute(seg, spec):
     return out, [wdb_sql._alias(p) for p in spec['proj']]
 
 
+def _sec_at(seg, ecol, rows):
+    """Epoch seconds at ROWS for a staircase datetime column, all in code
+    space: codes via one searchsorted on the steps (free), values via a
+    memoized int64 view of the dictionary (V-sized, census-memo law).
+    No row-range value decode anywhere."""
+    memo = seg.__dict__.setdefault('_dv64memo', {})
+    hit9 = memo.get(ecol)
+    if hit9 is None:
+        c9 = seg.cols[ecol]
+        dv = np.asarray(seg._typed_dict(ecol), dtype=np.int64)
+        unit = {0: 1, 1: 1, 2: 1}.get(0)         # placeholder; refined below
+        u9 = c9.get('aux')
+        # normalize to SECONDS whatever the stored unit
+        div = {'s': 1, 'ms': 1000, 'us': 1000000, 'ns': 1000000000}
+        import wdb_engine as _E
+        un = _E._DT_UNITS[u9] if c9.get('dt') == 3 else 's'
+        dv = dv // div.get(un, 1)
+        steps9 = np.asarray(seg.stairs(ecol), dtype=np.int64)
+        memo[ecol] = (steps9, dv)
+        hit9 = memo[ecol]
+    steps9, dv = hit9
+    etc = np.searchsorted(steps9, np.asarray(rows, np.int64), side='right')
+    return dv[etc]
+
+
 def _execute_trunc(seg, spec):
     """Q42's shape (Jackson's cut): the window is a staircase span, so we
     walk CHUNKS from its LEFT EDGE -- popping only the selector frames the
@@ -478,10 +503,7 @@ def _execute_trunc(seg, spec):
             else:
                 hit = hit[fc == c9] if kind else hit[fc != c9]
         if hit.size:
-            sec = np.asarray(seg.values_range(ecol, int(hit[0]), int(hit[-1]) + 1))
-            if sec.dtype.kind == 'M':
-                sec = sec.astype('datetime64[s]').astype(np.int64)
-            mins = (sec[hit - int(hit[0])].astype(np.int64) // 60)
+            mins = _sec_at(seg, ecol, hit) // 60
             bnd = np.flatnonzero(np.diff(mins) != 0)
             st9 = np.concatenate([[0], bnd + 1])
             en9 = np.concatenate([bnd + 1, [mins.size]])
