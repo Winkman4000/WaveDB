@@ -1160,6 +1160,15 @@ class Segment:
             out = np.empty_like(got)
             out[order] = got
             return out
+        if c.get('code_enc', 0) == 0 and c.get('bits') and 'cstart' in c \
+                and 'boffs' not in c and nm not in self._codes \
+                and rows.size < (self.N >> 2):
+            import wdb_kernels as _WK                # plain bitpack: pure bit math
+            rows0 = np.ascontiguousarray(np.asarray(rows, np.int64))
+            out0 = np.zeros(rows0.size, np.uint32)
+            _WK.bp0_gather(np.frombuffer(self.buf, np.uint8), int(c['cstart']),
+                           int(c['bits']), rows0, out0)
+            return out0
         if c.get('code_enc', 0) != 3 or nm in self._codes or rows.size >= (self.N >> 2):
             # huge row sets: ONE full decode + one vectorized gather beats touching every
             # frame through a positional walk (sq-nested passed ~90M positions here)

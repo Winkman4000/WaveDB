@@ -611,6 +611,21 @@ def _mx_fold_nb(kc, ac, dv, acc):
 
 
 @njit(nogil=True, parallel=True, cache=True)
+def bp0_gather(buf, base, bits, rows, out):
+    """Plain bitpack's random access, honored: value at any row is pure bit
+    arithmetic -- no frame, no block, no decode. O(rows), any order."""
+    n = rows.size
+    for i in prange(n):
+        idx = rows[i] * bits
+        v = np.int64(0)
+        for bi in range(bits):
+            j = idx + bi
+            byte = buf[base + (j >> 3)]
+            v = (v << 1) | ((np.int64(byte) >> (7 - (j & 7))) & 1)
+        out[i] = v
+
+
+@njit(nogil=True, parallel=True, cache=True)
 def bp10_gather(buf, dirX, pay, bits, rows, out):
     """enc-10's random access honored: decode ONLY the requested rows.
     rows must be sorted. Bitpack blocks are O(1) bit arithmetic per row;
@@ -833,6 +848,8 @@ def warm():
         _bo = np.zeros(3, np.uint16)
         bp10_decode(_bw, np.array([1], np.int64), 0, 1, 3, _bo)
         _bg = np.zeros(2, np.uint16)
+        _b0 = np.zeros(2, np.uint32)
+        bp0_gather(_bw, 0, 1, np.array([0, 2], np.int64), _b0)
         bp10_gather(_bw, np.array([1], np.int64), 0, 1, np.array([0, 2], np.int64), _bg)
         _c9 = np.zeros(3, np.int64); _s19 = np.zeros(3, np.float64); _s29 = np.zeros(3, np.float64)
         _u9 = np.zeros(3, np.int64); _n9 = np.zeros(1 << 12, np.int64)
