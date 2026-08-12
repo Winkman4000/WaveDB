@@ -204,7 +204,7 @@ def _dict_bytes(p, zc):
             out += struct.pack('<I', len(fc)) + struct.pack('<I', len(z)) + z
     return out
 
-def _code_section(codes, bits, enc5_ok=False):
+def _code_section(codes, bits, enc5_ok=False, nm=None):
     """Per-row code array (mode 0/1/2): 1 tag byte + payload. tag 0 = raw bit-packed; tag 1 = zstd
     of byte-aligned codes; tag 2 = STAIRCASE (codes non-decreasing in row order, e.g. time-ordered
     ingest): store only the gap-packed rows where the code ticks +1 -- the norm is 'same as the row
@@ -331,6 +331,16 @@ def _code_section(codes, bits, enc5_ok=False):
         best = sparse                            # rehearsal-only: exercise the readers
     if bplus is not None and os.environ.get('WDB_PLUS_FORCE'):
         best = bplus                             # rehearsal-only: enc-10's readers
+    _serve = os.environ.get('WDB_SERVE_COLS', '')
+    if nm is not None and _serve and nm in _serve.split(','):
+        # THE SERVING-DRESS ELECTION (the clustering era's first law):
+        # crumb-read columns trade zstd's entropy edge for RANDOM ACCESS --
+        # bit arithmetic at any row, no frame ever decompresses to serve a
+        # point read. Candidates: plain bitpack or bitpack-plus (whichever
+        # is smaller); staircase columns already serve randomly and stay.
+        _ra = [c for c in (packed, bplus) if c is not None]
+        if _ra and best is not stair:
+            best = min(_ra, key=len)
     elif bplus is not None and len(bplus) <= 4 * len(best):
         # JACKSON'S ELECTION: real locality (the run census already proved
         # profitable blocks exist) within the 4x serving seal -- random
@@ -442,7 +452,8 @@ def _serialize_column(p, zc):
     out += _header(p['nm'], p['V'], p['bits'], p['dtype'], p['mode'], p['has_null'], p['aux'])
     out += _dict_bytes(p, zc)
     out += _code_section(p['codes'], p['bits'],
-                         enc5_ok=(p.get('dtype') == 0 and p['mode'] in (0, 1, 2)))
+                         enc5_ok=(p.get('dtype') == 0 and p['mode'] in (0, 1, 2)),
+                         nm=p['nm'])
     normal = bytes(out), (len(out), p['V'], p['bits'], p['dtype'], p['mode'], p['has_null'], p['aux'])
     # mode-5 inline candidate: high-cardinality non-null string -> storing rows inline often beats
     # dict+codes (pointers are dead weight when values rarely repeat). Compute both, keep smaller.
