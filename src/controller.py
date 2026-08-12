@@ -82,7 +82,8 @@ _READ_ORDER = (
 )
 
 
-_PATH_SINK = None   # None on speed-runs (one None-check per query, zero cost). The path-run
+_PATH_SINK = None
+_SERVED = [None]                     # the routing ledger's marker   # None on speed-runs (one None-check per query, zero cost). The path-run
                    # sets this to a callable(ctx, read_name) to record the winning read.
 
 
@@ -100,9 +101,9 @@ def route_single_segment(ctx):
             if spec is not None:
                 rows = rd.execute(ctx, spec)
                 if rows is not None:
-                    if _PATH_SINK is not None: _PATH_SINK(ctx, rd.name)
+                    _SERVED[0] = rd.name;  _PATH_SINK(ctx, rd.name) if _PATH_SINK is not None else None
                     return rows
-        if _PATH_SINK is not None: _PATH_SINK(ctx, 'general_scan')
+        _SERVED[0] = 'general_scan';  _PATH_SINK(ctx, 'general_scan') if _PATH_SINK is not None else None
         return R.general_scan(ctx)
     if _agg_or_group(ctx.tree) or _has_window(ctx.tree):
         for read in _READ_ORDER:
@@ -111,7 +112,7 @@ def route_single_segment(ctx):
                 continue
             rows = read.execute(ctx, spec)
             if rows is not None:
-                if _PATH_SINK is not None: _PATH_SINK(ctx, read.name)
+                _SERVED[0] = read.name;  _PATH_SINK(ctx, read.name) if _PATH_SINK is not None else None
                 return rows
     else:
         # non-agg projection: the value-sorted dict read, then the cluster-ordered
@@ -120,37 +121,37 @@ def route_single_segment(ctx):
         if spec is not None:
             rows = R.sorted_proj.execute(ctx, spec)
             if rows is not None:
-                if _PATH_SINK is not None: _PATH_SINK(ctx, R.sorted_proj.name)
+                _SERVED[0] = R.sorted_proj.name;  _PATH_SINK(ctx, R.sorted_proj.name) if _PATH_SINK is not None else None
                 return rows
         spec = R.cluster_topk.detect(ctx)
         if spec is not None:
             rows = R.cluster_topk.execute(ctx, spec)
             if rows is not None:
-                if _PATH_SINK is not None: _PATH_SINK(ctx, R.cluster_topk.name)
+                _SERVED[0] = R.cluster_topk.name;  _PATH_SINK(ctx, R.cluster_topk.name) if _PATH_SINK is not None else None
                 return rows
         spec = R.value_topk.detect(ctx)      # ordered dump: partition the key, decode k rows
         if spec is not None:
             rows = R.value_topk.execute(ctx, spec)
             if rows is not None:
-                if _PATH_SINK is not None: _PATH_SINK(ctx, R.value_topk.name)
+                _SERVED[0] = R.value_topk.name;  _PATH_SINK(ctx, R.value_topk.name) if _PATH_SINK is not None else None
                 return rows
         spec = R.firstsorted.detect(ctx)     # staircase ORDER BY unprojected time
         if spec is not None:
             rows = R.firstsorted.execute(ctx, spec)
             if rows is not None:
-                if _PATH_SINK is not None: _PATH_SINK(ctx, R.firstsorted.name)
+                _SERVED[0] = R.firstsorted.name;  _PATH_SINK(ctx, R.firstsorted.name) if _PATH_SINK is not None else None
                 return rows
         spec = R.firstk.detect(ctx)         # staircase early-exit: first k matches ARE the answer
         if spec is not None:
             rows = R.firstk.execute(ctx, spec)
             if rows is not None:
-                if _PATH_SINK is not None: _PATH_SINK(ctx, R.firstk.name)
+                _SERVED[0] = R.firstk.name;  _PATH_SINK(ctx, R.firstk.name) if _PATH_SINK is not None else None
                 return rows
         spec = R.wherescan.detect(ctx)       # rows mode: WHERE + ORDER BY cluster col LIMIT k
         if spec is not None:
             rows = R.wherescan.execute(ctx, spec)
             if rows is not None:
-                if _PATH_SINK is not None: _PATH_SINK(ctx, R.wherescan.name)
+                _SERVED[0] = R.wherescan.name;  _PATH_SINK(ctx, R.wherescan.name) if _PATH_SINK is not None else None
                 return rows
-    if _PATH_SINK is not None: _PATH_SINK(ctx, 'general_scan')
+    _SERVED[0] = 'general_scan';  _PATH_SINK(ctx, 'general_scan') if _PATH_SINK is not None else None
     return R.general_scan(ctx)

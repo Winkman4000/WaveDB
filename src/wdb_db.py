@@ -323,7 +323,16 @@ class Database:
             hot = hp if os.path.exists(hp) else None
             if hot is None and len(segs) == 1:
                 ctx = read_methods.ReadContext(self, name, segs[0], paths[0], tree, cmap, sql, esc)
-                return controller.route_single_segment(ctx)
+                import time as _time
+                import wdb_ledger
+                controller._SERVED[0] = None
+                _t0 = _time.perf_counter()
+                _res = controller.route_single_segment(ctx)
+                _ms = (_time.perf_counter() - _t0) * 1000
+                _rows = _res[0] if isinstance(_res, tuple) else _res
+                wdb_ledger.log(ctx.seg, sql, controller._SERVED[0] or '?', _ms,
+                               n_rows=len(_rows) if hasattr(_rows, '__len__') else None)
+                return _res
             if hot is None and not segs:
                 raise ValueError(f"table {name!r} has no data yet")
             if len(segs) == 1 and hot is not None:
