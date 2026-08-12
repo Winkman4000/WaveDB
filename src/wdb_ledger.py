@@ -12,6 +12,21 @@ import time
 
 _ENV_OFF = 'WDB_LEDGER_OFF'
 
+_STAGES = [{}]                                   # the current query's itemized bill
+
+
+def reset_stages():
+    _STAGES[0] = {}
+
+
+def stage(name, ms):
+    """A lane volunteers where its milliseconds went. Never raises."""
+    try:
+        _STAGES[0][name] = _STAGES[0].get(name, 0.0) + float(ms)
+    except Exception:
+        pass
+
+
 
 def _path_for(seg):
     try:
@@ -37,6 +52,7 @@ def log(seg, sql, path_name, ms, stages=None, n_rows=None):
         }
         if n_rows is not None:
             rec['rows'] = int(n_rows)
+        stages = stages or (_STAGES[0] or None)
         if stages:
             rec['stages'] = {k: round(float(v), 3) for k, v in stages.items()}
         with open(p, 'a') as f:

@@ -400,6 +400,9 @@ def execute(seg, spec):
     global _HITS
     if spec.get('trunc'):
         return _execute_trunc(seg, spec)
+    import time as _tm
+    import wdb_ledger as _LG
+    _t9 = _tm.perf_counter()
     scol, sval = spec['sel']
     code = _code_of(seg, scol, sval)
     if code is None:
@@ -433,6 +436,7 @@ def execute(seg, spec):
         a = np.searchsorted(crumb, rlo, side='left')
         b = np.searchsorted(crumb, rhi, side='left')
         crumb = crumb[a:b]
+    _LG.stage('crumb', (_tm.perf_counter() - _t9) * 1000); _t9 = _tm.perf_counter()
     # hygiene at the crumb: point reads, never the column
     for fcol, fval, kind in spec['flags']:
         if crumb.size == 0:
@@ -470,6 +474,7 @@ def execute(seg, spec):
         j = np.minimum(j, max(0, pos8.size - 1))
         m9 = (pos8[j] == crumb) if pos8.size else np.zeros(crumb.size, bool)
         crumb = crumb[m9]
+    _LG.stage('hygiene', (_tm.perf_counter() - _t9) * 1000); _t9 = _tm.perf_counter()
     # group in code space via the KEY COMPILER: each plan evaluates to
     # codes on the crumb (pure numpy), the composite packs into one int64
     plans = spec['plans']
@@ -518,6 +523,7 @@ def execute(seg, spec):
             else np.arange(ucnt.size)
         order = order[np.argsort(-ucnt[order], kind='stable')]
         picks = order[off:off + k]
+    _LG.stage('group', (_tm.perf_counter() - _t9) * 1000); _t9 = _tm.perf_counter()
     out = []
     for j in picks.tolist():
         vals = []
@@ -530,6 +536,7 @@ def execute(seg, spec):
             else:
                 row.append(int(ucnt[j]))
         out.append(tuple(row))
+    _LG.stage('emit', (_tm.perf_counter() - _t9) * 1000)
     _HITS += 1
     return out, [wdb_sql._alias(p) for p in spec['proj']]
 

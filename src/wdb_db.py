@@ -326,6 +326,7 @@ class Database:
                 import time as _time
                 import wdb_ledger
                 controller._SERVED[0] = None
+                wdb_ledger.reset_stages()
                 _t0 = _time.perf_counter()
                 _res = controller.route_single_segment(ctx)
                 _ms = (_time.perf_counter() - _t0) * 1000
