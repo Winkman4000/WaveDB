@@ -85,6 +85,105 @@ def _flatten_and(node, out):
         out.append(node)
 
 
+def _compile_key(seg, expr, cm):
+    """THE KEY COMPILER: an expression over dict-coded columns is itself a
+    code-space citizen. Compiles a group-key expression to a plan that
+    evaluates to codes on the crumb and decodes only emitted winners.
+    v1 atoms: Column | CASE WHEN <conj of col (=|<>) intlit> THEN
+    <Column|strlit> ELSE <Column|strlit> END."""
+    if isinstance(expr, E.Column):
+        cn = cm.get(expr.name, expr.name)
+        c9 = seg.cols.get(cn)
+        if c9 is None or c9.get('has_null'):
+            return None
+        return {'kind': 'col', 'col': cn, 'W': int(c9['V'])}
+    if isinstance(expr, E.Case):
+        ifs = expr.args.get('ifs') or []
+        els = expr.args.get('default')
+        if len(ifs) != 1:
+            return None
+        cond = ifs[0].this
+        then = ifs[0].args.get('true')
+        conds = []
+        stack = [cond]
+        while stack:
+            nd = stack.pop()
+            if isinstance(nd, E.Paren):
+                stack.append(nd.this); continue
+            if isinstance(nd, E.And):
+                stack.append(nd.this); stack.append(nd.expression); continue
+            if not isinstance(nd, (E.EQ, E.NEQ)):
+                return None
+            l9, r9 = nd.this, nd.expression
+            if not isinstance(l9, E.Column):
+                return None
+            v9 = _lit(r9)
+            if not isinstance(v9, int):
+                return None
+            cn9 = cm.get(l9.name, l9.name)
+            if seg.cols.get(cn9) is None or seg.cols[cn9].get('has_null'):
+                return None
+            conds.append((cn9, v9, isinstance(nd, E.EQ)))
+        def _branch(b9):
+            if isinstance(b9, E.Column):
+                cn9 = cm.get(b9.name, b9.name)
+                c99 = seg.cols.get(cn9)
+                if c99 is None or c99.get('has_null'):
+                    return None
+                return ('col', cn9)
+            if isinstance(b9, E.Literal) and b9.is_string:
+                return ('lit', str(b9.this))
+            return None
+        tb = _branch(then)
+        eb = _branch(els) if els is not None else ('lit', None)
+        if tb is None or eb is None or not conds:
+            return None
+        wcol = tb[1] if tb[0] == 'col' else (eb[1] if eb[0] == 'col' else None)
+        if wcol is None:
+            return None
+        return {'kind': 'case', 'conds': conds, 'then': tb, 'els': eb,
+                'col': wcol, 'W': int(seg.cols[wcol]['V']) + 2}
+    return None
+
+
+def _key_eval(seg, plan, crumb):
+    """Codes for a compiled key at the crumb -- pure numpy, no values."""
+    if plan['kind'] == 'col':
+        return np.asarray(seg.codes_at(plan['col'], crumb)).astype(np.int64)
+    mask = np.ones(crumb.size, bool)
+    for cn9, v9, eq9 in plan['conds']:
+        c9 = _code_of(seg, cn9, v9)
+        fc = np.asarray(seg.codes_at(cn9, crumb))
+        if c9 is None:
+            m9 = np.zeros(crumb.size, bool) if eq9 else np.ones(crumb.size, bool)
+        else:
+            m9 = (fc == c9) if eq9 else (fc != c9)
+        mask &= m9
+    V9 = int(seg.cols[plan['col']]['V'])
+    def _side(b9, tok):
+        if b9[0] == 'col':
+            return np.asarray(seg.codes_at(b9[1], crumb)).astype(np.int64)
+        return np.full(crumb.size, V9 + tok, np.int64)
+    return np.where(mask, _side(plan['then'], 0), _side(plan['els'], 1))
+
+
+def _key_decode(seg, plan, code):
+    """Value for one emitted key code -- the only place values exist."""
+    if plan['kind'] == 'col':
+        v9 = seg.fetch(plan['col'], int(code))
+    else:
+        V9 = int(seg.cols[plan['col']]['V'])
+        if code == V9:
+            v9 = plan['then'][1] if plan['then'][0] == 'lit' else None
+        elif code == V9 + 1:
+            v9 = plan['els'][1] if plan['els'][0] == 'lit' else None
+        else:
+            v9 = seg.fetch(plan['col'], int(code))
+    if isinstance(v9, (bytes, bytearray)):
+        v9 = v9.decode('utf-8', 'replace')
+    return v9
+
+
 def detect(seg, tree, col_map):
     if tree.args.get('joins') or tree.args.get('with') \
             or tree.args.get('having') or tree.args.get('distinct'):
@@ -202,7 +301,12 @@ def detect(seg, tree, col_map):
         return {'sel': sel, 'rng': rng, 'flags': flags, 'strneq': strneq,
                 'g': [], 'trunc': trunc, 'k': lim, 'off': off,
                 'projkinds': proj9, 'proj': tree.expressions}
-    gcols = []
+    aliasmap = {}
+    for p9 in tree.expressions:
+        if isinstance(p9, E.Alias):
+            aliasmap[p9.alias] = p9.this
+    plans = []
+    plankeys = []
     for ge in g.expressions:
         src = ge
         if isinstance(ge, E.Literal) and not ge.is_string:
@@ -211,24 +315,28 @@ def detect(seg, tree, col_map):
                 return None
             item = tree.expressions[idx]
             src = item.this if isinstance(item, E.Alias) else item
-        if not isinstance(src, E.Column):
+        if isinstance(src, E.Column) and src.name in aliasmap:
+            src = aliasmap[src.name]             # GROUP BY alias -> its expr
+        if isinstance(src, E.Literal):
+            continue                             # constant: grouping no-op
+        k9 = src.sql()
+        if k9 in plankeys:
+            continue
+        pl9 = _compile_key(seg, src, cm)
+        if pl9 is None:
             return None
-        gcols.append(cm.get(src.name, src.name))
-    gcols = list(dict.fromkeys(gcols))
-    if len(gcols) > 2:
+        plankeys.append(k9)
+        plans.append(pl9)
+    if not plans or len(plans) > 6:
         return None
-    for gc in gcols:
-        if seg.cols.get(gc) is None or seg.cols[gc].get('has_null'):
-            return None
+    gcols = [pl['col'] for pl in plans]
     proj = []
     calias = None
     for p9 in tree.expressions:
         inner = p9.this if isinstance(p9, E.Alias) else p9
-        if isinstance(inner, E.Column):
-            cn = cm.get(inner.name, inner.name)
-            if cn not in gcols:
-                return None
-            proj.append(('G', gcols.index(cn))); continue
+        k9 = inner.sql()
+        if k9 in plankeys:
+            proj.append(('G', plankeys.index(k9))); continue
         ak = wdb_sql._agg_kind(inner)
         if ak is None or ak[0] != 'COUNT_STAR':
             return None
@@ -264,7 +372,7 @@ def detect(seg, tree, col_map):
     if not P.no_deleted_rows(seg):
         return None
     return {'sel': sel, 'rng': rng, 'flags': flags, 'strneq': strneq,
-            'g': gcols, 'k': lim, 'off': off, 'projkinds': proj,
+            'g': gcols, 'plans': plans, 'k': lim, 'off': off, 'projkinds': proj,
             'proj': tree.expressions}
 
 
@@ -362,25 +470,44 @@ def execute(seg, spec):
         j = np.minimum(j, max(0, pos8.size - 1))
         m9 = (pos8[j] == crumb) if pos8.size else np.zeros(crumb.size, bool)
         crumb = crumb[m9]
-    # group in code space: only the differentiating bytes, no more
-    gcols = spec['g']
-    if crumb.size == 0:
-        ukey = np.empty(0, np.int64); ucnt = np.empty(0, np.int64)
-    else:
-        if len(gcols) == 1:
-            key = np.asarray(seg.codes_at(gcols[0], crumb)).astype(np.int64)
-            SH = 0
-        else:
-            k1 = np.asarray(seg.codes_at(gcols[0], crumb)).astype(np.int64)
-            k2 = np.asarray(seg.codes_at(gcols[1], crumb)).astype(np.int64)
-            SH = max(1, int(seg.cols[gcols[1]]['V']).bit_length())
-            key = (k1 << SH) | k2
+    # group in code space via the KEY COMPILER: each plan evaluates to
+    # codes on the crumb (pure numpy), the composite packs into one int64
+    plans = spec['plans']
+    widths = [max(1, int(pl['W']).bit_length()) for pl in plans]
+    packed = sum(widths) <= 62                   # one int64 when it fits,
+    if crumb.size == 0:                          # lexsort when it doesn't
+        ucodes = np.empty((len(plans), 0), np.int64); ucnt = np.empty(0, np.int64)
+    elif packed:
+        shifts = np.cumsum([0] + widths[::-1])[:-1][::-1]
+        key = np.zeros(crumb.size, np.int64)
+        karrs = []
+        for pl, sh in zip(plans, shifts):
+            ka = _key_eval(seg, pl, crumb)
+            karrs.append(ka)
+            key |= ka << int(sh)
         ks = np.sort(key, kind='stable')
         bnd = np.flatnonzero(np.diff(ks) != 0)
         starts = np.concatenate([[0], bnd + 1])
         ends = np.concatenate([bnd + 1, [ks.size]])
-        ukey = ks[starts]
+        ukv = ks[starts]
         ucnt = (ends - starts).astype(np.int64)
+        ucodes = np.empty((len(plans), ukv.size), np.int64)
+        for i9, (pl, sh) in enumerate(zip(plans, shifts)):
+            ucodes[i9] = (ukv >> int(sh)) & ((1 << widths[i9]) - 1)
+    else:
+        karrs = [_key_eval(seg, pl, crumb) for pl in plans]
+        order = np.lexsort(tuple(reversed(karrs)))
+        srt = [ka[order] for ka in karrs]
+        difs = np.zeros(crumb.size - 1, bool)
+        for sa in srt:
+            difs |= np.diff(sa) != 0
+        bnd = np.flatnonzero(difs)
+        starts = np.concatenate([[0], bnd + 1])
+        ends = np.concatenate([bnd + 1, [crumb.size]])
+        ucnt = (ends - starts).astype(np.int64)
+        ucodes = np.empty((len(plans), starts.size), np.int64)
+        for i9, sa in enumerate(srt):
+            ucodes[i9] = sa[starts]
     k, off = spec['k'], spec['off']
     need = off + k
     n9 = min(need, ucnt.size)
@@ -392,16 +519,10 @@ def execute(seg, spec):
         order = order[np.argsort(-ucnt[order], kind='stable')]
         picks = order[off:off + k]
     out = []
-    SH = 0 if len(gcols) == 1 else max(1, int(seg.cols[gcols[1]]['V']).bit_length())
     for j in picks.tolist():
-        kv = int(ukey[j])
-        codes = [kv] if len(gcols) == 1 else [kv >> SH, kv & ((1 << SH) - 1)]
         vals = []
-        for gi, gc in enumerate(gcols):
-            v9 = seg.fetch(gc, int(codes[gi]))   # THE pluck
-            if isinstance(v9, (bytes, bytearray)):
-                v9 = v9.decode('utf-8', 'replace')
-            vals.append(v9)
+        for i9, pl in enumerate(plans):
+            vals.append(_key_decode(seg, pl, int(ucodes[i9, j])))   # THE pluck
         row = []
         for kind in spec['projkinds']:
             if kind[0] == 'G':
