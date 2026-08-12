@@ -634,7 +634,15 @@ class Segment:
                 _span(0, 1)
             self._codes[nm] = cc; return cc
         bits = c['bits']; base = c['cstart']
-        cc = self._bitunpack(base, 0, self.N, bits)  # now returns native width
+        if c.get('code_enc', 0) == 0 and 'boffs' not in c and 0 < bits <= 32 \
+                and self.N >= (1 << 22):             # kernel full decode: the scan
+            import wdb_kernels as _WK                # family rides bit math too;
+            wdt0 = np.uint8 if bits <= 8 else (np.uint16 if bits <= 16 else np.uint32)
+            cc = np.zeros(self.N, wdt0)              # native width, kernel at scale
+            _WK.bp0_decode(np.frombuffer(self.buf, np.uint8), int(base),
+                           int(bits), self.N, cc)
+        else:
+            cc = self._bitunpack(base, 0, self.N, bits)  # native width
         self._codes[nm] = cc; return cc
     def stairs(self, nm):
         """Step rows of a STAIRCASE column (codes non-decreasing in row order, e.g. time-ordered
@@ -1093,6 +1101,15 @@ class Segment:
             return outW
         if c['mode'] in (3, 5) or c.get('code_enc', 0) in (1, 8, 9, 10):
             return self._raw_codes(nm)[lo:hi]      # dresses without frames
+        if c.get('code_enc', 0) == 0 and 'boffs' not in c and c.get('bits') \
+                and 0 < int(c['bits']) <= 32 and (hi - lo) >= (1 << 16):
+            import wdb_kernels as _WK            # window decode at kernel speed
+            bitsW = int(c['bits'])
+            wdtW = np.uint8 if bitsW <= 8 else (np.uint16 if bitsW <= 16 else np.uint32)
+            outW = np.zeros(hi - lo, wdtW)
+            _WK.bp0_gather(np.frombuffer(self.buf, np.uint8), int(c['cstart']),
+                           bitsW, np.arange(lo, hi, dtype=np.int64), outW)
+            return outW
         return self._bitunpack(c['cstart'], lo, hi, c['bits'])
 
     def codes_at(self, nm, rows):
@@ -1165,7 +1182,9 @@ class Segment:
                 and rows.size < (self.N >> 2):
             import wdb_kernels as _WK                # plain bitpack: pure bit math
             rows0 = np.ascontiguousarray(np.asarray(rows, np.int64))
-            out0 = np.zeros(rows0.size, np.uint32)
+            bits0 = int(c['bits'])
+            wdt0 = np.uint8 if bits0 <= 8 else (np.uint16 if bits0 <= 16 else np.uint32)
+            out0 = np.zeros(rows0.size, wdt0)
             _WK.bp0_gather(np.frombuffer(self.buf, np.uint8), int(c['cstart']),
                            int(c['bits']), rows0, out0)
             return out0

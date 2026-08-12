@@ -611,18 +611,53 @@ def _mx_fold_nb(kc, ac, dv, acc):
 
 
 @njit(nogil=True, parallel=True, cache=True)
-def bp0_gather(buf, base, bits, rows, out):
-    """Plain bitpack's random access, honored: value at any row is pure bit
-    arithmetic -- no frame, no block, no decode. O(rows), any order."""
-    n = rows.size
-    for i in prange(n):
-        idx = rows[i] * bits
+def bp0_decode(buf, base, bits, N, out):
+    """Plain bitpack's FULL decode, WORD-WISE (the block game): one
+    big-endian u64 assembly per value, shift+mask -- independent loads the
+    CPU pipelines, no per-bit dependency chain. Safe per-bit tail."""
+    mask = (np.int64(1) << bits) - 1
+    safe = N - (72 // bits + 2)                  # last values may read past buf
+    if safe < 0:
+        safe = 0
+    for i in prange(safe):
+        o = i * bits
+        j = base + (o >> 3)
+        w = np.uint64(0)
+        for t in range(8):
+            w = (w << np.uint64(8)) | np.uint64(buf[j + t])
+        out[i] = np.int64(w >> np.uint64(64 - (o & 7) - bits)) & mask
+    for i in range(safe, N):                     # tail: the per-bit path
+        idx = i * bits
         v = np.int64(0)
         for bi in range(bits):
             j = idx + bi
             byte = buf[base + (j >> 3)]
             v = (v << 1) | ((np.int64(byte) >> (7 - (j & 7))) & 1)
         out[i] = v
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def bp0_gather(buf, base, bits, rows, out):
+    """Plain bitpack's random access, WORD-WISE: one u64 assembly per row,
+    shift+mask. Rows near the buffer's end take the per-bit path."""
+    n = rows.size
+    mask = (np.int64(1) << bits) - 1
+    limit = buf.size - 8
+    for i in prange(n):
+        o = rows[i] * bits
+        j = base + (o >> 3)
+        if j <= limit:
+            w = np.uint64(0)
+            for t in range(8):
+                w = (w << np.uint64(8)) | np.uint64(buf[j + t])
+            out[i] = np.int64(w >> np.uint64(64 - (o & 7) - bits)) & mask
+        else:
+            v = np.int64(0)
+            for bi in range(bits):
+                jb = o + bi
+                byte = buf[base + (jb >> 3)]
+                v = (v << 1) | ((np.int64(byte) >> (7 - (jb & 7))) & 1)
+            out[i] = v
 
 
 @njit(nogil=True, parallel=True, cache=True)
@@ -850,6 +885,8 @@ def warm():
         _bg = np.zeros(2, np.uint16)
         _b0 = np.zeros(2, np.uint32)
         bp0_gather(_bw, 0, 1, np.array([0, 2], np.int64), _b0)
+        _b1 = np.zeros(3, np.uint32)
+        bp0_decode(_bw, 0, 1, 3, _b1)
         bp10_gather(_bw, np.array([1], np.int64), 0, 1, np.array([0, 2], np.int64), _bg)
         _c9 = np.zeros(3, np.int64); _s19 = np.zeros(3, np.float64); _s29 = np.zeros(3, np.float64)
         _u9 = np.zeros(3, np.int64); _n9 = np.zeros(1 << 12, np.int64)
