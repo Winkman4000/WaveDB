@@ -611,6 +611,62 @@ def _mx_fold_nb(kc, ac, dv, acc):
 
 
 @njit(nogil=True, parallel=True, cache=True)
+def bp0_scan_count(buf, base, bits, lo, hi, flag, counts, CH):
+    """Rule 3, pass 1: fused unpack+flag-test, counting matches per chunk.
+    The decoded value lives only in a register; nothing materializes."""
+    mask = (np.int64(1) << bits) - 1
+    limit = buf.size - 8
+    for cix in prange(counts.size):
+        a = lo + cix * CH
+        b = min(hi, a + CH)
+        cnt = 0
+        for i in range(a, b):
+            o = i * bits
+            j = base + (o >> 3)
+            if j <= limit:
+                w = np.uint64(0)
+                for t in range(8):
+                    w = (w << np.uint64(8)) | np.uint64(buf[j + t])
+                v = np.int64(w >> np.uint64(64 - (o & 7) - bits)) & mask
+            else:
+                v = np.int64(0)
+                for bi in range(bits):
+                    jb = o + bi
+                    v = (v << 1) | ((np.int64(buf[base + (jb >> 3)]) >> (7 - (jb & 7))) & 1)
+            if flag[v]:
+                cnt += 1
+        counts[cix] = cnt
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def bp0_scan_fill(buf, base, bits, lo, hi, flag, offs, out, CH):
+    """Rule 3, pass 2: same fused walk, writing matching POSITIONS into
+    contention-free slices. Total traffic: packed bytes in, positions out."""
+    mask = (np.int64(1) << bits) - 1
+    limit = buf.size - 8
+    for cix in prange(offs.size - 1):
+        a = lo + cix * CH
+        b = min(hi, a + CH)
+        w9 = offs[cix]
+        for i in range(a, b):
+            o = i * bits
+            j = base + (o >> 3)
+            if j <= limit:
+                w = np.uint64(0)
+                for t in range(8):
+                    w = (w << np.uint64(8)) | np.uint64(buf[j + t])
+                v = np.int64(w >> np.uint64(64 - (o & 7) - bits)) & mask
+            else:
+                v = np.int64(0)
+                for bi in range(bits):
+                    jb = o + bi
+                    v = (v << 1) | ((np.int64(buf[base + (jb >> 3)]) >> (7 - (jb & 7))) & 1)
+            if flag[v]:
+                out[w9] = i
+                w9 += 1
+
+
+@njit(nogil=True, parallel=True, cache=True)
 def bp0_decode(buf, base, bits, N, out):
     """Plain bitpack's FULL decode, WORD-WISE (the block game): one
     big-endian u64 assembly per value, shift+mask -- independent loads the
@@ -887,6 +943,11 @@ def warm():
         bp0_gather(_bw, 0, 1, np.array([0, 2], np.int64), _b0)
         _b1 = np.zeros(3, np.uint32)
         bp0_decode(_bw, 0, 1, 3, _b1)
+        _fl = np.zeros(4, np.bool_); _fl[1] = True
+        _ct = np.zeros(1, np.int64)
+        bp0_scan_count(_bw, 0, 1, 0, 3, _fl, _ct, 4096)
+        _po = np.zeros(max(1, int(_ct[0])), np.int64)
+        bp0_scan_fill(_bw, 0, 1, 0, 3, _fl, np.array([0, int(_ct[0])], np.int64), _po, 4096)
         bp10_gather(_bw, np.array([1], np.int64), 0, 1, np.array([0, 2], np.int64), _bg)
         _c9 = np.zeros(3, np.int64); _s19 = np.zeros(3, np.float64); _s29 = np.zeros(3, np.float64)
         _u9 = np.zeros(3, np.int64); _n9 = np.zeros(1 << 12, np.int64)

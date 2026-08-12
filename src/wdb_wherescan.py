@@ -909,6 +909,20 @@ def _scan_flag(seg, col, flag, lo, hi):
             parts = list(ex.map(scan, np.array_split(np.arange(j0, j1), W)))
         parts = [p for p in parts if p.size]
         return np.concatenate(parts) if parts else np.empty(0, np.int64)
+    if c.get('code_enc', 0) == 0 and 'boffs' not in c and c.get('bits') \
+            and 0 < int(c['bits']) <= 32 and (hi - lo) >= (1 << 16):
+        import wdb_kernels as _WK                # RULE 3: the fused scan --
+        bufS = np.frombuffer(seg.buf, np.uint8)  # values live in registers,
+        CH = 1 << 18                             # only positions ever write
+        nch = (hi - lo + CH - 1) // CH
+        cnts = np.zeros(nch, np.int64)
+        flagS = np.ascontiguousarray(flag, dtype=np.bool_)
+        _WK.bp0_scan_count(bufS, int(c['cstart']), int(c['bits']), lo, hi, flagS, cnts, CH)
+        offs = np.zeros(nch + 1, np.int64)
+        np.cumsum(cnts, out=offs[1:])
+        outS = np.zeros(max(1, int(offs[-1])), np.int64)
+        _WK.bp0_scan_fill(bufS, int(c['cstart']), int(c['bits']), lo, hi, flagS, offs, outS, CH)
+        return outS[:int(offs[-1])]
     cc = np.asarray(seg._raw_codes_range(col, lo, hi))
     return np.nonzero(flag[cc])[0] + lo
 
