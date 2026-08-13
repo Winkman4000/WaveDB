@@ -612,84 +612,80 @@ def _mx_fold_nb(kc, ac, dv, acc):
 
 @njit(nogil=True, parallel=True, cache=True)
 def bp0_scan_count(buf, base, bits, lo, hi, flag, counts, CH):
-    """Rule 3, pass 1: fused unpack+flag-test, counting matches per chunk.
-    The decoded value lives only in a register; nothing materializes."""
+    """Rule 3 pass 1, TILE-READER: fused unpack+flag-test; the value lives
+    in a register, every packed byte loads once, matches count per chunk."""
     mask = (np.int64(1) << bits) - 1
-    limit = buf.size - 8
     for cix in prange(counts.size):
         a = lo + cix * CH
         b = min(hi, a + CH)
+        bo = a * bits
+        p = base + (bo >> 3)
+        acc = np.uint64(buf[p]) & np.uint64(0xFF >> (bo & 7))
+        nb = 8 - (bo & 7)
+        p += 1
         cnt = 0
         for i in range(a, b):
-            o = i * bits
-            j = base + (o >> 3)
-            if j <= limit:
-                w = np.uint64(0)
-                for t in range(8):
-                    w = (w << np.uint64(8)) | np.uint64(buf[j + t])
-                v = np.int64(w >> np.uint64(64 - (o & 7) - bits)) & mask
-            else:
-                v = np.int64(0)
-                for bi in range(bits):
-                    jb = o + bi
-                    v = (v << 1) | ((np.int64(buf[base + (jb >> 3)]) >> (7 - (jb & 7))) & 1)
-            if flag[v]:
+            while nb < bits:
+                acc = (acc << np.uint64(8)) | np.uint64(buf[p])
+                p += 1
+                nb += 8
+            nb -= bits
+            if flag[np.int64(acc >> np.uint64(nb)) & mask]:
                 cnt += 1
+            acc &= (np.uint64(1) << np.uint64(nb)) - np.uint64(1)
         counts[cix] = cnt
 
 
 @njit(nogil=True, parallel=True, cache=True)
 def bp0_scan_fill(buf, base, bits, lo, hi, flag, offs, out, CH):
-    """Rule 3, pass 2: same fused walk, writing matching POSITIONS into
-    contention-free slices. Total traffic: packed bytes in, positions out."""
+    """Rule 3 pass 2, TILE-READER: the same fused walk writing matching
+    POSITIONS into contention-free slices."""
     mask = (np.int64(1) << bits) - 1
-    limit = buf.size - 8
     for cix in prange(offs.size - 1):
         a = lo + cix * CH
         b = min(hi, a + CH)
+        bo = a * bits
+        p = base + (bo >> 3)
+        acc = np.uint64(buf[p]) & np.uint64(0xFF >> (bo & 7))
+        nb = 8 - (bo & 7)
+        p += 1
         w9 = offs[cix]
         for i in range(a, b):
-            o = i * bits
-            j = base + (o >> 3)
-            if j <= limit:
-                w = np.uint64(0)
-                for t in range(8):
-                    w = (w << np.uint64(8)) | np.uint64(buf[j + t])
-                v = np.int64(w >> np.uint64(64 - (o & 7) - bits)) & mask
-            else:
-                v = np.int64(0)
-                for bi in range(bits):
-                    jb = o + bi
-                    v = (v << 1) | ((np.int64(buf[base + (jb >> 3)]) >> (7 - (jb & 7))) & 1)
-            if flag[v]:
+            while nb < bits:
+                acc = (acc << np.uint64(8)) | np.uint64(buf[p])
+                p += 1
+                nb += 8
+            nb -= bits
+            if flag[np.int64(acc >> np.uint64(nb)) & mask]:
                 out[w9] = i
                 w9 += 1
+            acc &= (np.uint64(1) << np.uint64(nb)) - np.uint64(1)
 
 
 @njit(nogil=True, parallel=True, cache=True)
 def bp0_decode(buf, base, bits, N, out):
-    """Plain bitpack's FULL decode, WORD-WISE (the block game): one
-    big-endian u64 assembly per value, shift+mask -- independent loads the
-    CPU pipelines, no per-bit dependency chain. Safe per-bit tail."""
+    """Plain bitpack FULL decode, TILE-READER: every packed byte loads
+    exactly once into a rolling accumulator; one shift+mask per value.
+    Total loads = the packed bytes themselves -- the bandwidth floor."""
     mask = (np.int64(1) << bits) - 1
-    safe = N - (72 // bits + 2)                  # last values may read past buf
-    if safe < 0:
-        safe = 0
-    for i in prange(safe):
-        o = i * bits
-        j = base + (o >> 3)
-        w = np.uint64(0)
-        for t in range(8):
-            w = (w << np.uint64(8)) | np.uint64(buf[j + t])
-        out[i] = np.int64(w >> np.uint64(64 - (o & 7) - bits)) & mask
-    for i in range(safe, N):                     # tail: the per-bit path
-        idx = i * bits
-        v = np.int64(0)
-        for bi in range(bits):
-            j = idx + bi
-            byte = buf[base + (j >> 3)]
-            v = (v << 1) | ((np.int64(byte) >> (7 - (j & 7))) & 1)
-        out[i] = v
+    CH = 1 << 18
+    nch = (N + CH - 1) // CH
+    for cix in prange(nch):
+        a = cix * CH
+        b = min(N, a + CH)
+        bo = a * bits
+        p = base + (bo >> 3)
+        acc = np.uint64(buf[p]) & np.uint64(0xFF >> (bo & 7))
+        nb = 8 - (bo & 7)
+        p += 1
+        for i in range(a, b):
+            while nb < bits:
+                acc = (acc << np.uint64(8)) | np.uint64(buf[p])
+                p += 1
+                nb += 8
+            nb -= bits
+            out[i] = np.int64(acc >> np.uint64(nb)) & mask
+            acc &= (np.uint64(1) << np.uint64(nb)) - np.uint64(1)
 
 
 @njit(nogil=True, parallel=True, cache=True)
