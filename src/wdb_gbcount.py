@@ -216,7 +216,18 @@ def _scalar_count_detect(seg, tree, col_map):
             colnode.set('this', E.to_identifier(rcol))
             rng = (lo, lo_inc, hi, hi_inc)
             lits = []
-    if (lits is None and rng is None) or not isinstance(colnode, E.Column):
+    lk = None
+    if lits is None and rng is None:
+        import wdb_wherescan as _WS
+        got_lk = _WS._like(node)
+        if got_lk is not None:
+            lcol, needle, kind, lneg = got_lk
+            if kind != 'general':                # dict-testable patterns only
+                colnode = E.column(lcol)
+                lk = (needle, kind)
+                neg = neg ^ lneg
+                lits = []
+    if (lits is None and rng is None and lk is None) or not isinstance(colnode, E.Column):
         return None
     col = (col_map or {}).get(colnode.name, colnode.name) if col_map else colnode.name
     c = seg.cols.get(col)
@@ -229,7 +240,7 @@ def _scalar_count_detect(seg, tree, col_map):
     if rng is not None and seg.cols[col].get('dt') != 0:
         return None                                     # value order is integer business
     return {'scalar': True, 'col': col, 'lits': lits, 'neg': neg,
-            'rng': rng, 'proj': proj}
+            'rng': rng, 'like': lk, 'proj': proj}
 
 
 def _scalar_count_execute(seg, spec):
@@ -238,6 +249,23 @@ def _scalar_count_execute(seg, spec):
     if got is None:
         return None
     hc, hn = got
+    import wdb_wherescan
+    if spec.get('like') is not None:
+        # Jackson's cut: COUNT + LIKE never needs a row byte. The dict
+        # answers WHICH codes match (once, memoized); the gbc shelf answers
+        # HOW MANY rows each has (absent code = exactly one, the singleton
+        # rule). flag . census -- zero scans, any encoding.
+        needle, kind = spec['like']
+        flag = wdb_wherescan._like_flags(seg, spec['col'], needle, kind)
+        if flag is None:
+            return None
+        flag = np.asarray(flag, dtype=bool)
+        hca = np.asarray(hc)
+        m = flag[hca]                            # heavy codes that match
+        total = int(np.asarray(hn)[m].sum()) + int(flag.sum()) - int(m.sum())
+        ans = (int(seg.N) - total) if spec['neg'] else total
+        _HITS += 1
+        return [(ans,)], [wdb_sql._alias(spec['proj'][0])]
     import wdb_wherescan
     if spec.get('rng') is not None:
         import wdb_window as _WN
