@@ -712,6 +712,47 @@ def bp0_gather(buf, base, bits, rows, out):
             out[i] = v
 
 
+@njit(nogil=True, cache=True)
+def _bp10_at(buf, dirX, pay, bits, row):
+    """One enc-10 value at one row -- block-local, used by the fused walk."""
+    B = 4096
+    b = row // B
+    o = pay + (dirX[b] >> 1)
+    if dirX[b] & 1:
+        nr = np.int64(buf[o]) | (np.int64(buf[o + 1]) << 8)
+        p = o + 2
+        acc = b * B
+        for r in range(nr):
+            cnt = np.int64(buf[p]) | (np.int64(buf[p + 1]) << 8)
+            if row < acc + cnt:
+                return np.int64(buf[p + 2]) | (np.int64(buf[p + 3]) << 8)
+            acc += cnt
+            p += 4
+        return np.int64(0)
+    r = row - b * B
+    v = np.int64(0)
+    base = r * bits
+    for bi in range(bits):
+        idx = base + bi
+        v = (v << 1) | ((np.int64(buf[o + (idx >> 3)]) >> (7 - (idx & 7))) & 1)
+    return v
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def bp10_hygiene2(buf, d1, p1, b1, c1, eq1, d2, p2, b2, c2, eq2, rows, keep):
+    """Jackson's fused hygiene: TWO enc-10 flag tests in ONE walk with
+    per-row short-circuit -- the moment a row fails the first test, the
+    second never runs (the crossing scheme at row granularity)."""
+    n = rows.size
+    for i in prange(n):
+        v1 = _bp10_at(buf, d1, p1, b1, rows[i])
+        ok = (v1 == c1) if eq1 else (v1 != c1)
+        if ok:
+            v2 = _bp10_at(buf, d2, p2, b2, rows[i])
+            ok = (v2 == c2) if eq2 else (v2 != c2)
+        keep[i] = ok
+
+
 @njit(nogil=True, parallel=True, cache=True)
 def bp10_gather(buf, dirX, pay, bits, rows, out):
     """enc-10's random access honored: decode ONLY the requested rows.
@@ -939,6 +980,10 @@ def warm():
         bp0_gather(_bw, 0, 1, np.array([0, 2], np.int64), _b0)
         _b1 = np.zeros(3, np.uint32)
         bp0_decode(_bw, 0, 1, 3, _b1)
+        _kp = np.zeros(2, np.bool_)
+        bp10_hygiene2(_bw, np.array([1], np.int64), 0, 1, 0, True,
+                      np.array([1], np.int64), 0, 1, 0, True,
+                      np.array([0, 2], np.int64), _kp)
         _fl = np.zeros(4, np.bool_); _fl[1] = True
         _ct = np.zeros(1, np.int64)
         bp0_scan_count(_bw, 0, 1, 0, 3, _fl, _ct, 4096)

@@ -437,8 +437,33 @@ def execute(seg, spec):
         b = np.searchsorted(crumb, rhi, side='left')
         crumb = crumb[a:b]
     _LG.stage('crumb', (_tm.perf_counter() - _t9) * 1000); _t9 = _tm.perf_counter()
-    # hygiene at the crumb: point reads, never the column
-    for fcol, fval, kind in spec['flags']:
+    # hygiene at the crumb: point reads, never the column. When the first
+    # two flags are enc-10 scalar tests, ONE fused walk serves both with
+    # per-row short-circuit (Jackson's crossing scheme, row granularity).
+    flags9 = list(spec['flags'])
+    if crumb.size and len(flags9) >= 2:
+        f1, f2 = flags9[0], flags9[1]
+        c1a = seg.cols.get(f1[0], {})
+        c2a = seg.cols.get(f2[0], {})
+        if f1[2] != 'in' and f2[2] != 'in' \
+                and c1a.get('code_enc') == 10 and c2a.get('code_enc') == 10:
+            k1 = _code_of(seg, f1[0], f1[1])
+            k2 = _code_of(seg, f2[0], f2[1])
+            if k1 is not None and k2 is not None:
+                import wdb_kernels as _WK
+                bufH = np.frombuffer(seg.buf, np.uint8)
+                d1 = np.ascontiguousarray(np.frombuffer(seg.buf, np.int64,
+                     int(c1a['pXnblk']), c1a['pXdir']))
+                d2 = np.ascontiguousarray(np.frombuffer(seg.buf, np.int64,
+                     int(c2a['pXnblk']), c2a['pXdir']))
+                keep = np.zeros(crumb.size, np.bool_)
+                _WK.bp10_hygiene2(bufH, d1, int(c1a['pXpay']), int(c1a['pXbits']),
+                                  int(k1), bool(f1[2]), d2, int(c2a['pXpay']),
+                                  int(c2a['pXbits']), int(k2), bool(f2[2]),
+                                  np.ascontiguousarray(crumb), keep)
+                crumb = crumb[keep]
+                flags9 = flags9[2:]
+    for fcol, fval, kind in flags9:
         if crumb.size == 0:
             break
         fc = np.asarray(seg.codes_at(fcol, crumb))
@@ -490,12 +515,20 @@ def execute(seg, spec):
             ka = _key_eval(seg, pl, crumb)
             karrs.append(ka)
             key |= ka << int(sh)
-        ks = np.sort(key, kind='stable')
-        bnd = np.flatnonzero(np.diff(ks) != 0)
-        starts = np.concatenate([[0], bnd + 1])
-        ends = np.concatenate([bnd + 1, [ks.size]])
-        ukv = ks[starts]
-        ucnt = (ends - starts).astype(np.int64)
+        KVtot = 1 << int(sum(widths))
+        if KVtot <= (1 << 24):
+            # Jackson's reduction, restored: lengths ARE the counts --
+            # one bincount over the packed space, no sort at all
+            cnts9 = np.bincount(key, minlength=KVtot)
+            ukv = np.flatnonzero(cnts9)
+            ucnt = cnts9[ukv].astype(np.int64)
+        else:
+            ks = np.sort(key, kind='stable')
+            bnd = np.flatnonzero(np.diff(ks) != 0)
+            starts = np.concatenate([[0], bnd + 1])
+            ends = np.concatenate([bnd + 1, [ks.size]])
+            ukv = ks[starts]
+            ucnt = (ends - starts).astype(np.int64)
         ucodes = np.empty((len(plans), ukv.size), np.int64)
         for i9, (pl, sh) in enumerate(zip(plans, shifts)):
             ucodes[i9] = (ukv >> int(sh)) & ((1 << widths[i9]) - 1)
@@ -524,11 +557,30 @@ def execute(seg, spec):
         order = order[np.argsort(-ucnt[order], kind='stable')]
         picks = order[off:off + k]
     _LG.stage('group', (_tm.perf_counter() - _t9) * 1000); _t9 = _tm.perf_counter()
+    # batch the pluck: one values_at per column-plan for ALL picks
+    batch9 = {}
+    for i9, pl in enumerate(plans):
+        if pl['kind'] == 'col' and picks.size and hasattr(seg, 'values_at'):
+            cds = np.unique(ucodes[i9, picks])
+            try:
+                vs = seg.values_at(pl['col'], cds.astype(np.int64))
+                mp9 = {}
+                for cx, vx in zip(cds.tolist(), list(vs)):
+                    if isinstance(vx, (bytes, bytearray)):
+                        vx = vx.decode('utf-8', 'replace')
+                    mp9[cx] = vx
+                batch9[i9] = mp9
+            except Exception:
+                pass
     out = []
     for j in picks.tolist():
         vals = []
         for i9, pl in enumerate(plans):
-            vals.append(_key_decode(seg, pl, int(ucodes[i9, j])))   # THE pluck
+            cx = int(ucodes[i9, j])
+            if i9 in batch9 and cx in batch9[i9]:
+                vals.append(batch9[i9][cx])
+            else:
+                vals.append(_key_decode(seg, pl, cx))   # THE pluck
         row = []
         for kind in spec['projkinds']:
             if kind[0] == 'G':
