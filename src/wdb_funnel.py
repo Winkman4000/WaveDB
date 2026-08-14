@@ -17,7 +17,6 @@ from sqlglot import expressions as E
 import wdb_sql
 
 _HITS = 0
-_VHITS = 0                                       # fused consumption fires
 
 
 def _days_of(v):
@@ -441,72 +440,7 @@ def execute(seg, spec):
     # hygiene at the crumb: point reads, never the column. When the first
     # two flags are enc-10 scalar tests, ONE fused walk serves both with
     # per-row short-circuit (Jackson's crossing scheme, row granularity).
-    # THE MASKED VERTICAL CONSUMPTION PATH: single enc-12 key, <=2 enc-10
-    # scalar flags, optional key<>'' -- hygiene, extraction, and bincount
-    # fuse into ONE kernel launch guided by the crumb bitmap. No stage
-    # boundary ever materializes.
-    fusedV = None
-    plans0 = spec['plans']
-    if crumb.size >= (1 << 15) and len(plans0) == 1 and plans0[0]['kind'] == 'col':
-        kcol = plans0[0]['col']
-        kc0 = seg.cols.get(kcol, {})
-        VK = int(kc0.get('V', 0))
-        fl0 = list(spec['flags'])
-        okf = (len(fl0) <= 2 and all(f[2] != 'in' for f in fl0)
-               and all(seg.cols.get(f[0], {}).get('code_enc') == 10 for f in fl0))
-        oks = all(pc == kcol for pc in spec['strneq'])
-        if kc0.get('code_enc') == 12 and okf and oks and 0 < VK <= (1 << 25):
-            codesF = [_code_of(seg, f[0], f[1]) for f in fl0]
-            if all(c9 is not None for c9 in codesF) or not fl0:
-                import wdb_kernels as _WK
-                bufF = np.frombuffer(seg.buf, np.uint8)
-                nwK = int(kc0['nwords'])
-                maskF = np.zeros(nwK, np.uint64)
-                _WK.vbits_set(np.ascontiguousarray(crumb), maskF)
-                skip9 = np.int64(-1)
-                if spec['strneq']:
-                    z9 = seg.fetch(kcol, 0)
-                    if isinstance(z9, (bytes, bytearray)):
-                        z9 = z9.decode('utf-8', 'replace')
-                    if z9 == '':
-                        skip9 = np.int64(0)
-                def _fd(f9):
-                    ca = seg.cols[f9[0]]
-                    return (np.ascontiguousarray(np.frombuffer(seg.buf, np.int64,
-                            int(ca['pXnblk']), ca['pXdir'])),
-                            int(ca['pXpay']), int(ca['pXbits']))
-                if fl0:
-                    da, pa, ba = _fd(fl0[0])
-                else:
-                    da, pa, ba = np.zeros(1, np.int64), 0, 1
-                if len(fl0) >= 2:
-                    db, pb, bb = _fd(fl0[1])
-                else:
-                    db, pb, bb = np.zeros(1, np.int64), 0, 1
-                CHW = 1 << 14
-                nchw = (nwK + CHW - 1) // CHW
-                cw9 = np.zeros(nchw, np.int64)
-                _WK.vfused_count(maskF, seg.vplanes(kcol), nwK, int(kc0['bits']), bufF,
-                                 da, pa, ba, int(codesF[0]) if len(fl0) >= 1 else 0,
-                                 bool(fl0[0][2]) if len(fl0) >= 1 else True,
-                                 db, pb, bb, int(codesF[1]) if len(fl0) >= 2 else 0,
-                                 bool(fl0[1][2]) if len(fl0) >= 2 else True,
-                                 len(fl0), skip9, cw9, CHW)
-                offs9 = np.zeros(nchw + 1, np.int64)
-                np.cumsum(cw9, out=offs9[1:])
-                codes9 = np.zeros(max(1, int(offs9[-1])), np.int32)
-                _WK.vfused_fill(maskF, seg.vplanes(kcol), nwK, int(kc0['bits']), bufF,
-                                da, pa, ba, int(codesF[0]) if len(fl0) >= 1 else 0,
-                                bool(fl0[0][2]) if len(fl0) >= 1 else True,
-                                db, pb, bb, int(codesF[1]) if len(fl0) >= 2 else 0,
-                                bool(fl0[1][2]) if len(fl0) >= 2 else True,
-                                len(fl0), skip9, offs9, codes9, CHW)
-                cntF = np.bincount(codes9[:int(offs9[-1])], minlength=VK)
-                uk9 = np.flatnonzero(cntF)
-                global _VHITS
-                _VHITS += 1
-                fusedV = (uk9.astype(np.int64), cntF[uk9].astype(np.int64))
-    flags9 = list(spec['flags']) if fusedV is None else []
+    flags9 = list(spec['flags'])
     if crumb.size and len(flags9) >= 2:
         f1, f2 = flags9[0], flags9[1]
         c1a = seg.cols.get(f1[0], {})
@@ -547,7 +481,7 @@ def execute(seg, spec):
             else:
                 m9 = (fc == c9) if kind else (fc != c9)
         crumb = crumb[m9]
-    for pcol in (spec['strneq'] if fusedV is None else []):
+    for pcol in spec['strneq']:
         if crumb.size == 0:
             break
         if seg.cols[pcol].get('code_enc') not in (8, 9):
@@ -569,14 +503,9 @@ def execute(seg, spec):
     # group in code space via the KEY COMPILER: each plan evaluates to
     # codes on the crumb (pure numpy), the composite packs into one int64
     plans = spec['plans']
-    if fusedV is not None:
-        ucodes = fusedV[0].reshape(1, -1)
-        ucnt = fusedV[1]
     widths = [max(1, int(pl['W']).bit_length()) for pl in plans]
     packed = sum(widths) <= 62                   # one int64 when it fits,
-    if fusedV is not None:
-        pass                                     # counts came from the kernel
-    elif crumb.size == 0:                        # lexsort when it doesn't
+    if crumb.size == 0:                          # lexsort when it doesn't
         ucodes = np.empty((len(plans), 0), np.int64); ucnt = np.empty(0, np.int64)
     elif packed:
         shifts = np.cumsum([0] + widths[::-1])[:-1][::-1]

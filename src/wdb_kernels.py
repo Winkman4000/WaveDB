@@ -611,85 +611,6 @@ def _mx_fold_nb(kc, ac, dv, acc):
 
 
 @njit(nogil=True, cache=True)
-def vbits_set(rows, mask):
-    """Positions -> bitmap: the crumb in mask currency."""
-    for i in range(rows.size):
-        r = rows[i]
-        mask[r >> 6] |= np.uint64(1) << np.uint64(r & 63)
-
-
-@njit(nogil=True, cache=True)
-def _vfused_chunk(mask, w0, w1, plK, nwordsK, bitsK, buf,
-                  d1, p1, b1, c1, eq1, d2, p2, b2, c2, eq2, nflags,
-                  skip_code, out, wbase, count_only):
-    """One chunk of the masked vertical consumption walk: transpose per
-    surviving word, hygiene in-register, emit surviving key codes."""
-    sh = np.uint64(64 - bitsK)
-    a = np.zeros(64, np.uint64)
-    k = wbase
-    for w in range(w0, w1):
-        mw = mask[w]
-        if mw == np.uint64(0):
-            continue
-        for p in range(bitsK):
-            a[p] = plK[p * nwordsK + w]
-        for p in range(bitsK, 64):
-            a[p] = np.uint64(0)
-        _t64(a)
-        r0 = w * 64
-        while mw != np.uint64(0):
-            t = mw & ((~mw) + np.uint64(1))
-            x = t - np.uint64(1)
-            x = x - ((x >> np.uint64(1)) & np.uint64(0x5555555555555555))
-            x = (x & np.uint64(0x3333333333333333)) + ((x >> np.uint64(2)) & np.uint64(0x3333333333333333))
-            x = (x + (x >> np.uint64(4))) & np.uint64(0x0F0F0F0F0F0F0F0F)
-            j = int((x * np.uint64(0x0101010101010101)) >> np.uint64(56))
-            mw ^= t
-            r = r0 + j
-            ok = True
-            if nflags >= 1:
-                v1 = _bp10_at(buf, d1, p1, b1, r)
-                ok = (v1 == c1) if eq1 else (v1 != c1)
-            if ok and nflags >= 2:
-                v2 = _bp10_at(buf, d2, p2, b2, r)
-                ok = (v2 == c2) if eq2 else (v2 != c2)
-            if ok:
-                code = np.int64(a[63 - j] >> sh)
-                if code != skip_code:
-                    if not count_only:
-                        out[k] = np.int32(code)
-                    k += 1
-    return k - wbase
-
-
-@njit(nogil=True, parallel=True, cache=True)
-def vfused_count(mask, plK, nwordsK, bitsK, buf,
-                 d1, p1, b1, c1, eq1, d2, p2, b2, c2, eq2, nflags,
-                 skip_code, counts, CHW):
-    """Pass 1: survivors per word-chunk, all cores."""
-    dummy = np.zeros(1, np.int32)
-    for cix in prange(counts.size):
-        w0 = cix * CHW
-        w1 = min(mask.size, w0 + CHW)
-        counts[cix] = _vfused_chunk(mask, w0, w1, plK, nwordsK, bitsK, buf,
-                                    d1, p1, b1, c1, eq1, d2, p2, b2, c2, eq2,
-                                    nflags, skip_code, dummy, 0, True)
-
-
-@njit(nogil=True, parallel=True, cache=True)
-def vfused_fill(mask, plK, nwordsK, bitsK, buf,
-                d1, p1, b1, c1, eq1, d2, p2, b2, c2, eq2, nflags,
-                skip_code, offs, out, CHW):
-    """Pass 2: surviving key codes into contention-free slices."""
-    for cix in prange(offs.size - 1):
-        w0 = cix * CHW
-        w1 = min(mask.size, w0 + CHW)
-        _vfused_chunk(mask, w0, w1, plK, nwordsK, bitsK, buf,
-                      d1, p1, b1, c1, eq1, d2, p2, b2, c2, eq2,
-                      nflags, skip_code, out, offs[cix], False)
-
-
-@njit(nogil=True, cache=True)
 def _t64(a):
     """Hacker's Delight 64x64 bit-matrix transpose, in place -- the tapes'
     un-rotation: 64 rows' values from bits-many plane words."""
@@ -1220,18 +1141,16 @@ def warm():
         _b1 = np.zeros(3, np.uint32)
         bp0_decode(_bw, 0, 1, 3, _b1)
         _vp = np.zeros(2 * 1, np.uint64); _vp[0] = np.uint64(3)
-        _mk = np.zeros(1, np.uint64)
-        vbits_set(np.array([0, 2], np.int64), _mk)
-        _cw = np.zeros(1, np.int64)
-        vfused_count(_mk, _vp, 1, 2, _bw,
-                     np.array([1], np.int64), 0, 1, 0, True,
-                     np.array([1], np.int64), 0, 1, 0, True, 0,
-                     np.int64(-1), _cw, 4096)
-        _ov = np.zeros(max(1, int(_cw[0])), np.int32)
-        vfused_fill(_mk, _vp, 1, 2, _bw,
-                    np.array([1], np.int64), 0, 1, 0, True,
-                    np.array([1], np.int64), 0, 1, 0, True, 0,
-                    np.int64(-1), np.array([0, int(_cw[0])], np.int64), _ov, 4096)
+        _vo = np.zeros(4, np.uint64)
+        vp_window(_vp, 1, 2, 0, 4, _vo)
+        _vg = np.zeros(2, np.int64)
+        vp_gather(_vp, 1, 2, np.array([0, 1], np.int64), _vg)
+        _vc = np.zeros(1, np.int64)
+        vp_scan_eq(_vp, 1, 2, 1, _vc, 4096)
+        _fl2 = np.zeros(4, np.bool_); _fl2[3] = True
+        vp_scan_flag_count(_vp, 1, 2, 0, 4, _fl2, _vc, 64)
+        _po2 = np.zeros(max(1, int(_vc[0])), np.int64)
+        vp_scan_flag_fill(_vp, 1, 2, 0, 4, _fl2, np.array([0, int(_vc[0])], np.int64), _po2, 64)
         _kp = np.zeros(2, np.bool_)
         bp10_hygiene2(_bw, np.array([1], np.int64), 0, 1, 0, True,
                       np.array([1], np.int64), 0, 1, 0, True,
