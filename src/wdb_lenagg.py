@@ -113,7 +113,7 @@ def detect(seg, tree, col_map):
             return None
         hmin = int(str(h.expression.this))
     for c in (key, lcol):
-        if c not in seg.cols or seg.cols[c].get('code_enc') not in (0, 3, 5, 8):
+        if c not in seg.cols or seg.cols[c].get('code_enc') not in (0, 3, 5, 8, 10, 12):
             return None
     lens = _fn_table(seg, lcol, lkind)
     if lens is None:
