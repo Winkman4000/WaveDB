@@ -127,6 +127,9 @@ class Segment:
             code_enc = int(buf[off]); off += 1; meta['code_enc'] = code_enc   # 0=bitpack, 1=zstd, 2=staircase, 3=blocked
             if code_enc == 0:
                 nb = (self.N*bits+7)//8; meta['cstart'] = off; off += nb
+            elif code_enc == 12:               # vertical planes (the tapes)
+                meta['nwords'] = int(struct.unpack_from('<I', buf, off)[0]); off += 4
+                meta['cstart'] = off; off += bits * meta['nwords'] * 8
             elif code_enc == 2:                # staircase: gap-packed step rows (see Segment.stairs)
                 meta['gbits'] = int(buf[off]); off += 1
                 meta['nsteps'] = struct.unpack_from('<I', buf, off)[0]; off += 4
@@ -529,6 +532,24 @@ class Segment:
             d = self._dzl.dz = zstd.ZstdDecompressor()
         return d
 
+    def vplanes(self, nm):
+        """Aligned u64 view of an enc-12 column's planes, memoized. Zero-
+        copy when the file offset lands 8-aligned; one copy otherwise."""
+        pv = getattr(self, '_vpl', None)
+        if pv is None:
+            pv = self._vpl = {}
+        if nm in pv:
+            return pv[nm]
+        c = self.cols[nm]
+        nb = int(c['bits']) * int(c['nwords']) * 8
+        cs = int(c['cstart'])
+        if cs % 8 == 0:
+            arr = np.frombuffer(self.buf, np.uint64, nb // 8, cs)
+        else:
+            arr = np.frombuffer(bytes(memoryview(self.buf)[cs:cs + nb]), np.uint64)
+        pv[nm] = arr
+        return arr
+
     def _raw_codes(self, nm):
         if nm in self._codes: return self._codes[nm]
         c = self.cols[nm]
@@ -634,7 +655,13 @@ class Segment:
                 _span(0, 1)
             self._codes[nm] = cc; return cc
         bits = c['bits']; base = c['cstart']
-        if c.get('code_enc', 0) == 0 and 'boffs' not in c and 0 < bits <= 32 \
+        if c.get('code_enc', 0) == 12:
+            import wdb_kernels as _WK
+            outF = np.zeros(self.N, np.uint64)
+            _WK.vp_window(self.vplanes(nm), int(c['nwords']), int(bits), 0, self.N, outF)
+            wdtF = np.uint8 if bits <= 8 else (np.uint16 if bits <= 16 else np.uint32)
+            cc = outF.astype(wdtF)
+        elif c.get('code_enc', 0) == 0 and 'boffs' not in c and 0 < bits <= 32 \
                 and self.N >= (1 << 22):             # kernel full decode: the scan
             import wdb_kernels as _WK                # family rides bit math too;
             wdt0 = np.uint8 if bits <= 8 else (np.uint16 if bits <= 16 else np.uint32)
@@ -1101,6 +1128,13 @@ class Segment:
             return outW
         if c['mode'] in (3, 5) or c.get('code_enc', 0) in (1, 8, 9, 10):
             return self._raw_codes(nm)[lo:hi]      # dresses without frames
+        if c.get('code_enc', 0) == 12:
+            import wdb_kernels as _WK
+            bitsR = int(c['bits'])
+            outR = np.zeros(hi - lo, np.uint64)
+            _WK.vp_window(self.vplanes(nm), int(c['nwords']), bitsR, lo, hi, outR)
+            wdtR = np.uint8 if bitsR <= 8 else (np.uint16 if bitsR <= 16 else np.uint32)
+            return outR.astype(wdtR)
         if c.get('code_enc', 0) == 0 and 'boffs' not in c and c.get('bits') \
                 and 0 < int(c['bits']) <= 32 and (hi - lo) >= (1 << 16):
             import wdb_kernels as _WK            # window decode at kernel speed
@@ -1177,6 +1211,14 @@ class Segment:
             out = np.empty_like(got)
             out[order] = got
             return out
+        if c.get('code_enc', 0) == 12 and rows.size < (self.N >> 1):
+            import wdb_kernels as _WK
+            rows0 = np.ascontiguousarray(np.asarray(rows, np.int64))
+            outV = np.zeros(rows0.size, np.int64)
+            _WK.vp_gather(self.vplanes(nm), int(c['nwords']), int(c['bits']), rows0, outV)
+            bitsV = int(c['bits'])
+            wdtV = np.uint8 if bitsV <= 8 else (np.uint16 if bitsV <= 16 else np.uint32)
+            return outV.astype(wdtV)
         if c.get('code_enc', 0) == 0 and c.get('bits') and 'cstart' in c \
                 and 'boffs' not in c and nm not in self._codes \
                 and rows.size < (self.N >> 2):

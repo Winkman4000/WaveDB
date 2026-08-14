@@ -610,6 +610,166 @@ def _mx_fold_nb(kc, ac, dv, acc):
         acc[kc[i]] += dv[ac[i]]
 
 
+@njit(nogil=True, cache=True)
+def _t64(a):
+    """Hacker's Delight 64x64 bit-matrix transpose, in place -- the tapes'
+    un-rotation: 64 rows' values from bits-many plane words."""
+    j = np.uint64(32)
+    m = np.uint64(0x00000000FFFFFFFF)
+    while j != np.uint64(0):
+        k = 0
+        while k < 64:
+            for i in range(k, k + int(j)):
+                t = (a[i] ^ (a[i + int(j)] >> j)) & m
+                a[i] ^= t
+                a[i + int(j)] ^= (t << j)
+            k = k + int(j) * 2
+        j >>= np.uint64(1)
+        m ^= (m << j)
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def vp_window(pl, nwords, bits, lo, hi, out):
+    """Jackson's tapes: decode rows [lo,hi) from flat planes via the
+    64x64 transpose -- the realm's fastest windowed reader."""
+    w_lo = lo // 64
+    w_hi = (hi + 63) // 64
+    sh = np.uint64(64 - bits)
+    for wb in prange(w_hi - w_lo):
+        w = w_lo + wb
+        a = np.zeros(64, np.uint64)
+        for p in range(bits):
+            a[p] = pl[p * nwords + w]
+        _t64(a)
+        r0 = w * 64
+        for j in range(64):
+            r = r0 + j
+            if r >= lo and r < hi:
+                out[r - lo] = a[63 - j] >> sh
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def vp_gather(pl, nwords, bits, rows, out):
+    """Scattered gather from planes -- measured FASTER than horizontal at
+    DRAM scale (independent plane streams pipeline)."""
+    n = rows.size
+    for i in prange(n):
+        r = rows[i]
+        w = r // 64
+        j = np.uint64(r % 64)
+        v = np.int64(0)
+        for p in range(bits):
+            v = (v << 1) | np.int64((pl[p * nwords + w] >> j) & np.uint64(1))
+        out[i] = v
+
+
+@njit(nogil=True, cache=True)
+def _vp_eq_block(pl, nwords, w0, w1, bits, target):
+    """One block of the snowball: word-granularity active list."""
+    sz = w1 - w0
+    m = np.full(sz, ~np.uint64(0), np.uint64)
+    alive = np.empty(sz, np.int64)
+    for w in range(sz):
+        alive[w] = w
+    na = sz
+    for p in range(bits):
+        tbit = (target >> (bits - 1 - p)) & 1
+        k = 0
+        if tbit:
+            for ai in range(na):
+                w = alive[ai]
+                m[w] &= pl[p * nwords + w0 + w]
+                if m[w] != np.uint64(0):
+                    alive[k] = w
+                    k += 1
+        else:
+            for ai in range(na):
+                w = alive[ai]
+                m[w] &= ~pl[p * nwords + w0 + w]
+                if m[w] != np.uint64(0):
+                    alive[k] = w
+                    k += 1
+        na = k
+        if na == 0:
+            return 0
+    c = 0
+    for ai in range(na):
+        x = m[alive[ai]]
+        x = x - ((x >> np.uint64(1)) & np.uint64(0x5555555555555555))
+        x = (x & np.uint64(0x3333333333333333)) + ((x >> np.uint64(2)) & np.uint64(0x3333333333333333))
+        x = (x + (x >> np.uint64(4))) & np.uint64(0x0F0F0F0F0F0F0F0F)
+        c += np.int64((x * np.uint64(0x0101010101010101)) >> np.uint64(56))
+    return c
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def vp_scan_eq(pl, nwords, bits, target, counts, BLK):
+    """COUNT rows == target: Jackson's progressive pruning at word
+    granularity -- runs data touches ~25-30% of bytes."""
+    nblk = counts.size
+    for b in prange(nblk):
+        w0 = b * BLK
+        w1 = min(nwords, w0 + BLK)
+        counts[b] = _vp_eq_block(pl, nwords, w0, w1, bits, target)
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def vp_scan_flag_count(pl, nwords, bits, lo, hi, flag, counts, CH):
+    """Membership scan pass 1 over planes: transpose 64 rows, test flag,
+    count per chunk (CH multiple of 64)."""
+    nch = counts.size
+    sh = np.uint64(64 - bits)
+    for cix in prange(nch):
+        a0 = lo + cix * CH
+        b0 = min(hi, a0 + CH)
+        a = np.zeros(64, np.uint64)
+        cnt = 0
+        w = a0 // 64
+        wend = (b0 + 63) // 64
+        while w < wend:
+            for p in range(bits):
+                a[p] = pl[p * nwords + w]
+            for p in range(bits, 64):
+                a[p] = np.uint64(0)
+            _t64(a)
+            r0 = w * 64
+            for j in range(64):
+                r = r0 + j
+                if r >= a0 and r < b0:
+                    if flag[np.int64(a[63 - j] >> sh)]:
+                        cnt += 1
+            w += 1
+        counts[cix] = cnt
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def vp_scan_flag_fill(pl, nwords, bits, lo, hi, flag, offs, out, CH):
+    """Membership scan pass 2: same walk, positions into slices."""
+    nch = offs.size - 1
+    sh = np.uint64(64 - bits)
+    for cix in prange(nch):
+        a0 = lo + cix * CH
+        b0 = min(hi, a0 + CH)
+        a = np.zeros(64, np.uint64)
+        w9 = offs[cix]
+        w = a0 // 64
+        wend = (b0 + 63) // 64
+        while w < wend:
+            for p in range(bits):
+                a[p] = pl[p * nwords + w]
+            for p in range(bits, 64):
+                a[p] = np.uint64(0)
+            _t64(a)
+            r0 = w * 64
+            for j in range(64):
+                r = r0 + j
+                if r >= a0 and r < b0:
+                    if flag[np.int64(a[63 - j] >> sh)]:
+                        out[w9] = r
+                        w9 += 1
+            w += 1
+
+
 @njit(nogil=True, parallel=True, cache=True)
 def bp0_scan_count(buf, base, bits, lo, hi, flag, counts, CH):
     """Rule 3 pass 1, TILE-READER: fused unpack+flag-test; the value lives
@@ -980,6 +1140,17 @@ def warm():
         bp0_gather(_bw, 0, 1, np.array([0, 2], np.int64), _b0)
         _b1 = np.zeros(3, np.uint32)
         bp0_decode(_bw, 0, 1, 3, _b1)
+        _vp = np.zeros(2 * 1, np.uint64); _vp[0] = np.uint64(3)
+        _vo = np.zeros(4, np.uint64)
+        vp_window(_vp, 1, 2, 0, 4, _vo)
+        _vg = np.zeros(2, np.int64)
+        vp_gather(_vp, 1, 2, np.array([0, 1], np.int64), _vg)
+        _vc = np.zeros(1, np.int64)
+        vp_scan_eq(_vp, 1, 2, 1, _vc, 4096)
+        _fl2 = np.zeros(4, np.bool_); _fl2[3] = True
+        vp_scan_flag_count(_vp, 1, 2, 0, 4, _fl2, _vc, 64)
+        _po2 = np.zeros(max(1, int(_vc[0])), np.int64)
+        vp_scan_flag_fill(_vp, 1, 2, 0, 4, _fl2, np.array([0, int(_vc[0])], np.int64), _po2, 64)
         _kp = np.zeros(2, np.bool_)
         bp10_hygiene2(_bw, np.array([1], np.int64), 0, 1, 0, True,
                       np.array([1], np.int64), 0, 1, 0, True,

@@ -909,6 +909,19 @@ def _scan_flag(seg, col, flag, lo, hi):
             parts = list(ex.map(scan, np.array_split(np.arange(j0, j1), W)))
         parts = [p for p in parts if p.size]
         return np.concatenate(parts) if parts else np.empty(0, np.int64)
+    if c.get('code_enc', 0) == 12 and (hi - lo) >= (1 << 16):
+        import wdb_kernels as _WK                # vertical membership scan
+        plV = seg.vplanes(col)
+        CH = 1 << 18
+        nch = (hi - lo + CH - 1) // CH
+        cnts = np.zeros(nch, np.int64)
+        flagV = np.ascontiguousarray(flag, dtype=np.bool_)
+        _WK.vp_scan_flag_count(plV, int(c['nwords']), int(c['bits']), lo, hi, flagV, cnts, CH)
+        offs = np.zeros(nch + 1, np.int64)
+        np.cumsum(cnts, out=offs[1:])
+        outV = np.zeros(max(1, int(offs[-1])), np.int64)
+        _WK.vp_scan_flag_fill(plV, int(c['nwords']), int(c['bits']), lo, hi, flagV, offs, outV, CH)
+        return outV[:int(offs[-1])]
     if c.get('code_enc', 0) == 0 and 'boffs' not in c and c.get('bits') \
             and 0 < int(c['bits']) <= 32 and (hi - lo) >= (1 << 16):
         import wdb_kernels as _WK                # RULE 3: the fused scan --

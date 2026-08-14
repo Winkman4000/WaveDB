@@ -338,9 +338,24 @@ def _code_section(codes, bits, enc5_ok=False, nm=None):
         # bit arithmetic at any row, no frame ever decompresses to serve a
         # point read. Candidates: plain bitpack or bitpack-plus (whichever
         # is smaller); staircase columns already serve randomly and stay.
-        _ra = [c for c in (packed, bplus) if c is not None]
-        if _ra and best is not stair:
-            best = min(_ra, key=len)
+        if best is not stair:
+            # THE VERTICAL DRESS (enc-12): planes instead of rows. Same
+            # bytes as bitpack, resliced -- one u64 = one bit of 64 rows.
+            # Scans word-parallel + Jackson's snowball; windows via the
+            # 64x64 transpose tapes; scattered gathers measured FASTER
+            # than horizontal at DRAM scale. Storage stays flat.
+            n9 = len(codes)
+            nw9 = (n9 + 63) // 64
+            pad9 = (-n9) % 64
+            pl9 = np.zeros(bits * nw9, np.uint64)
+            arr9 = np.asarray(codes, np.int64)
+            for p9 in range(bits):
+                bc9 = ((arr9 >> (bits - 1 - p9)) & 1).astype(np.uint8)
+                if pad9:
+                    bc9 = np.concatenate([bc9, np.zeros(pad9, np.uint8)])
+                pl9[p9 * nw9:(p9 + 1) * nw9] = np.frombuffer(
+                    np.packbits(bc9, bitorder='little').tobytes(), np.uint64)
+            best = bytes([12]) + struct.pack('<I', nw9) + pl9.tobytes()
     elif bplus is not None and len(bplus) <= 4 * len(best):
         # JACKSON'S ELECTION: real locality (the run census already proved
         # profitable blocks exist) within the 4x serving seal -- random
