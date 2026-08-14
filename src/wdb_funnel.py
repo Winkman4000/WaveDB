@@ -516,7 +516,9 @@ def execute(seg, spec):
             karrs.append(ka)
             key |= ka << int(sh)
         KVtot = 1 << int(sum(widths))
-        if KVtot <= (1 << 24):
+        if KVtot <= (1 << 24) and KVtot <= 4 * key.size:
+            # the bowl must not dwarf the rows: zeroing a V-sized
+            # bincount for V >> rows costs more than sorting the rows
             # Jackson's reduction, restored: lengths ARE the counts --
             # one bincount over the packed space, no sort at all
             cnts9 = np.bincount(key, minlength=KVtot)

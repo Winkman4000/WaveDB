@@ -898,19 +898,88 @@ def _bp10_at(buf, dirX, pay, bits, row):
     return v
 
 
-@njit(nogil=True, parallel=True, cache=True)
-def bp10_hygiene2(buf, d1, p1, b1, c1, eq1, d2, p2, b2, c2, eq2, rows, keep):
-    """Jackson's fused hygiene: TWO enc-10 flag tests in ONE walk with
-    per-row short-circuit -- the moment a row fails the first test, the
-    second never runs (the crossing scheme at row granularity)."""
-    n = rows.size
-    for i in prange(n):
-        v1 = _bp10_at(buf, d1, p1, b1, rows[i])
+@njit(nogil=True, cache=True)
+def _h2_chunk(buf, d1, p1, b1, c1, eq1, d2, p2, b2, c2, eq2, rows, keep, a0, a1):
+    """Jackson's monotone cursor: rows ascend, so each flag column's run
+    walk only ever moves FORWARD -- O(rows + runs), no per-row restart."""
+    B = 4096
+    blkA = np.int64(-1); nrA = 0; ptrA = np.int64(0); endA = np.int64(-1)
+    valA = np.int64(0); bpoA = np.int64(0); bitA = False
+    blkB = np.int64(-1); nrB = 0; ptrB = np.int64(0); endB = np.int64(-1)
+    valB = np.int64(0); bpoB = np.int64(0); bitB = False
+    for i in range(a0, a1):
+        r = rows[i]
+        # --- column A ---
+        bb = r // B
+        if bb != blkA:
+            blkA = bb
+            o = p1 + (d1[bb] >> 1)
+            if d1[bb] & 1:
+                bitA = False
+                nrA = np.int64(buf[o]) | (np.int64(buf[o + 1]) << 8)
+                ptrA = o + 2
+                endA = bb * B
+                valA = -1
+            else:
+                bitA = True
+                bpoA = o
+        if bitA:
+            rr = (r - blkA * B) * b1
+            v1 = np.int64(0)
+            for bi in range(b1):
+                idx = rr + bi
+                v1 = (v1 << 1) | ((np.int64(buf[bpoA + (idx >> 3)]) >> (7 - (idx & 7))) & 1)
+        else:
+            while r >= endA:
+                cntr = np.int64(buf[ptrA]) | (np.int64(buf[ptrA + 1]) << 8)
+                valA = np.int64(buf[ptrA + 2]) | (np.int64(buf[ptrA + 3]) << 8)
+                ptrA += 4
+                endA += cntr
+            v1 = valA
         ok = (v1 == c1) if eq1 else (v1 != c1)
         if ok:
-            v2 = _bp10_at(buf, d2, p2, b2, rows[i])
+            # --- column B ---
+            if bb != blkB:
+                blkB = bb
+                o = p2 + (d2[bb] >> 1)
+                if d2[bb] & 1:
+                    bitB = False
+                    nrB = np.int64(buf[o]) | (np.int64(buf[o + 1]) << 8)
+                    ptrB = o + 2
+                    endB = bb * B
+                    valB = -1
+                else:
+                    bitB = True
+                    bpoB = o
+            if bitB:
+                rr = (r - blkB * B) * b2
+                v2 = np.int64(0)
+                for bi in range(b2):
+                    idx = rr + bi
+                    v2 = (v2 << 1) | ((np.int64(buf[bpoB + (idx >> 3)]) >> (7 - (idx & 7))) & 1)
+            else:
+                while r >= endB:
+                    cntr = np.int64(buf[ptrB]) | (np.int64(buf[ptrB + 1]) << 8)
+                    valB = np.int64(buf[ptrB + 2]) | (np.int64(buf[ptrB + 3]) << 8)
+                    ptrB += 4
+                    endB += cntr
+                v2 = valB
             ok = (v2 == c2) if eq2 else (v2 != c2)
         keep[i] = ok
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def bp10_hygiene2(buf, d1, p1, b1, c1, eq1, d2, p2, b2, c2, eq2, rows, keep):
+    """Two enc-10 flag tests, one walk, short-circuit, MONOTONE CURSORS --
+    prange over row chunks, each chunk's cursors seek once then only
+    advance. A skipped col-B block never even loads its directory."""
+    n = rows.size
+    CH = 1 << 15
+    nch = (n + CH - 1) // CH
+    for cix in prange(nch):
+        a0 = cix * CH
+        a1 = min(n, a0 + CH)
+        _h2_chunk(buf, d1, p1, b1, c1, eq1, d2, p2, b2, c2, eq2, rows, keep, a0, a1)
 
 
 @njit(nogil=True, parallel=True, cache=True)
