@@ -649,6 +649,22 @@ def vp_window(pl, nwords, bits, lo, hi, out):
 
 
 @njit(nogil=True, parallel=True, cache=True)
+def vp_gather_span(pl, nwords, p0, p1, rows, out):
+    """Gather only planes [p0,p1) at the rows -- HALF A KEY IS FREE
+    vertically. Jackson's prefix-group law: read bits in the order
+    that prunes."""
+    n = rows.size
+    for i in prange(n):
+        r = rows[i]
+        w = r // 64
+        j = np.uint64(r % 64)
+        v = np.int64(0)
+        for p in range(p0, p1):
+            v = (v << 1) | np.int64((pl[p * nwords + w] >> j) & np.uint64(1))
+        out[i] = np.uint16(v)
+
+
+@njit(nogil=True, parallel=True, cache=True)
 def vp_gather(pl, nwords, bits, rows, out):
     """Scattered gather from planes -- measured FASTER than horizontal at
     DRAM scale (independent plane streams pipeline)."""
@@ -1214,6 +1230,8 @@ def warm():
         vp_window(_vp, 1, 2, 0, 4, _vo)
         _vg = np.zeros(2, np.int64)
         vp_gather(_vp, 1, 2, np.array([0, 1], np.int64), _vg)
+        _vs = np.zeros(2, np.uint16)
+        vp_gather_span(_vp, 1, 0, 1, np.array([0, 1], np.int64), _vs)
         _vc = np.zeros(1, np.int64)
         vp_scan_eq(_vp, 1, 2, 1, _vc, 4096)
         _fl2 = np.zeros(4, np.bool_); _fl2[3] = True
