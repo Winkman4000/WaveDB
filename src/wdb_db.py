@@ -427,6 +427,8 @@ class Database:
     def gd_trim(self, table, group_col, target_col, exclude_values):
         """Trim the materialized view: leave the given GROUP values to the live walk (pass [] to un-trim
         for a full sidecar serve). Values are mapped to group codes via the segment dictionary."""
+        import controller
+        controller.plan_epoch_bump()
         paths = self.cat.segment_paths(table)
         phys = self.cat.phys_map(table)
         gcol = phys.get(group_col, group_col); tcol = phys.get(target_col, target_col)

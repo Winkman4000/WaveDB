@@ -47,11 +47,15 @@ _VCACHE = wdb_qmem.register({})              # (seg.path,col) -> by-code value d
 def enable():
     global _ENABLED
     _ENABLED = True
+    import controller
+    controller.plan_epoch_bump()
 
 
 def disable():
     global _ENABLED
     _ENABLED = False
+    import controller
+    controller.plan_epoch_bump()   # standing a lane down changes routes
 
 
 def is_enabled():

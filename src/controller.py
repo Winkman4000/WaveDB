@@ -83,13 +83,72 @@ _READ_ORDER = (
 
 
 _PATH_SINK = None
-_SERVED = [None]                     # the routing ledger's marker   # None on speed-runs (one None-check per query, zero cost). The path-run
+_SERVED = [None]                     # the routing ledger's marker
+
+# THE PLAN CACHE: the routing decision (lane + spec) replays for repeated
+# query text -- parse survives, but the detect cascade dies. Keyed to the
+# exact sql, segment path, and row count; execution always runs fresh, so
+# results are never cached, only the route. LRU-capped; ~KB per entry.
+import os as _os
+from collections import OrderedDict as _OD
+_PLANS = _OD()
+_PLANS_CAP = 256
+_BYNAME = {}
+_PLAN_EPOCH = [0]
+
+
+def plan_epoch_bump():
+    """Any shelf birth or trim changes what routes are best or valid --
+    the cache re-keys and re-detects."""
+    _PLAN_EPOCH[0] += 1
+
+
+
+def _plan_store(ctx, name, spec):
+    if _os.environ.get('WDB_PLANCACHE_OFF') or spec is None:
+        return
+    key = (ctx.sql, ctx.seg.path, ctx.seg.N, _PLAN_EPOCH[0])
+    _PLANS[key] = (name, spec)
+    _PLANS.move_to_end(key)
+    while len(_PLANS) > _PLANS_CAP:
+        _PLANS.popitem(last=False)
+
+
+def _plan_replay(ctx):
+    if _os.environ.get('WDB_PLANCACHE_OFF'):
+        return None
+    key = (ctx.sql, ctx.seg.path, ctx.seg.N, _PLAN_EPOCH[0])
+    hit = _PLANS.get(key)
+    if hit is None:
+        return None
+    _PLANS.move_to_end(key)
+    name, spec = hit
+    rd = _BYNAME.get(name)
+    if rd is None:
+        for a in dir(R):
+            o = getattr(R, a)
+            if hasattr(o, 'name') and hasattr(o, 'execute'):
+                _BYNAME[o.name] = o
+        rd = _BYNAME.get(name)
+    if rd is None:
+        return None
+    rows = rd.execute(ctx, spec)
+    if rows is None:
+        _PLANS.pop(key, None)                    # the ground shifted: re-detect
+        return None
+    _SERVED[0] = name
+    if _PATH_SINK is not None:
+        _PATH_SINK(ctx, name)
+    return rows   # None on speed-runs (one None-check per query, zero cost). The path-run
                    # sets this to a callable(ctx, read_name) to record the winning read.
 
 
 def route_single_segment(ctx):
     """Route a request over a single clean segment to its read, else the general scan.
     Byte-identical to the previous wdb_db try-chain."""
+    _rp = _plan_replay(ctx)
+    if _rp is not None:
+        return _rp
     # OFFSET: the fast structure reads pre-truncate to LIMIT (so they drop the offset
     # window). Any query with OFFSET goes straight to the general scan, which
     # materializes the full ordered result and applies LIMIT/OFFSET together.
@@ -101,7 +160,7 @@ def route_single_segment(ctx):
             if spec is not None:
                 rows = rd.execute(ctx, spec)
                 if rows is not None:
-                    _SERVED[0] = rd.name;  _PATH_SINK(ctx, rd.name) if _PATH_SINK is not None else None
+                    _plan_store(ctx, rd.name, spec); _SERVED[0] = rd.name;  _PATH_SINK(ctx, rd.name) if _PATH_SINK is not None else None
                     return rows
         _SERVED[0] = 'general_scan';  _PATH_SINK(ctx, 'general_scan') if _PATH_SINK is not None else None
         return R.general_scan(ctx)
@@ -112,7 +171,7 @@ def route_single_segment(ctx):
                 continue
             rows = read.execute(ctx, spec)
             if rows is not None:
-                _SERVED[0] = read.name;  _PATH_SINK(ctx, read.name) if _PATH_SINK is not None else None
+                _plan_store(ctx, read.name, spec); _SERVED[0] = read.name;  _PATH_SINK(ctx, read.name) if _PATH_SINK is not None else None
                 return rows
     else:
         # non-agg projection: the value-sorted dict read, then the cluster-ordered
@@ -121,37 +180,37 @@ def route_single_segment(ctx):
         if spec is not None:
             rows = R.sorted_proj.execute(ctx, spec)
             if rows is not None:
-                _SERVED[0] = R.sorted_proj.name;  _PATH_SINK(ctx, R.sorted_proj.name) if _PATH_SINK is not None else None
+                _plan_store(ctx, R.sorted_proj.name, spec); _SERVED[0] = R.sorted_proj.name;  _PATH_SINK(ctx, R.sorted_proj.name) if _PATH_SINK is not None else None
                 return rows
         spec = R.cluster_topk.detect(ctx)
         if spec is not None:
             rows = R.cluster_topk.execute(ctx, spec)
             if rows is not None:
-                _SERVED[0] = R.cluster_topk.name;  _PATH_SINK(ctx, R.cluster_topk.name) if _PATH_SINK is not None else None
+                _plan_store(ctx, R.cluster_topk.name, spec); _SERVED[0] = R.cluster_topk.name;  _PATH_SINK(ctx, R.cluster_topk.name) if _PATH_SINK is not None else None
                 return rows
         spec = R.value_topk.detect(ctx)      # ordered dump: partition the key, decode k rows
         if spec is not None:
             rows = R.value_topk.execute(ctx, spec)
             if rows is not None:
-                _SERVED[0] = R.value_topk.name;  _PATH_SINK(ctx, R.value_topk.name) if _PATH_SINK is not None else None
+                _plan_store(ctx, R.value_topk.name, spec); _SERVED[0] = R.value_topk.name;  _PATH_SINK(ctx, R.value_topk.name) if _PATH_SINK is not None else None
                 return rows
         spec = R.firstsorted.detect(ctx)     # staircase ORDER BY unprojected time
         if spec is not None:
             rows = R.firstsorted.execute(ctx, spec)
             if rows is not None:
-                _SERVED[0] = R.firstsorted.name;  _PATH_SINK(ctx, R.firstsorted.name) if _PATH_SINK is not None else None
+                _plan_store(ctx, R.firstsorted.name, spec); _SERVED[0] = R.firstsorted.name;  _PATH_SINK(ctx, R.firstsorted.name) if _PATH_SINK is not None else None
                 return rows
         spec = R.firstk.detect(ctx)         # staircase early-exit: first k matches ARE the answer
         if spec is not None:
             rows = R.firstk.execute(ctx, spec)
             if rows is not None:
-                _SERVED[0] = R.firstk.name;  _PATH_SINK(ctx, R.firstk.name) if _PATH_SINK is not None else None
+                _plan_store(ctx, R.firstk.name, spec); _SERVED[0] = R.firstk.name;  _PATH_SINK(ctx, R.firstk.name) if _PATH_SINK is not None else None
                 return rows
         spec = R.wherescan.detect(ctx)       # rows mode: WHERE + ORDER BY cluster col LIMIT k
         if spec is not None:
             rows = R.wherescan.execute(ctx, spec)
             if rows is not None:
-                _SERVED[0] = R.wherescan.name;  _PATH_SINK(ctx, R.wherescan.name) if _PATH_SINK is not None else None
+                _plan_store(ctx, R.wherescan.name, spec); _SERVED[0] = R.wherescan.name;  _PATH_SINK(ctx, R.wherescan.name) if _PATH_SINK is not None else None
                 return rows
     _SERVED[0] = 'general_scan';  _PATH_SINK(ctx, 'general_scan') if _PATH_SINK is not None else None
     return R.general_scan(ctx)

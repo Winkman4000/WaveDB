@@ -19,6 +19,8 @@ def _ledger_path(seg):
 
 def record(seg, kind, **args):
     """Append a birth recipe (deduped, atomic, quiet on failure)."""
+    import controller
+    controller.plan_epoch_bump()
     try:
         p = _ledger_path(seg)
         rows = []
