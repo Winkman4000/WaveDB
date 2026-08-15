@@ -86,16 +86,6 @@ def _flatten_and(node, out):
         out.append(node)
 
 
-def needs_expensive9(order9, done9, plans9):
-    """Prune only when something expensive remains: a wide column
-    (>16 bits, real gather weight) or a compiled CASE key."""
-    for oix in order9[done9:]:
-        p9, b9 = plans9[oix][0], plans9[oix][1]
-        if p9['kind'] != 'col' or b9 > 16:
-            return True
-    return False
-
-
 def _compile_key(seg, expr, cm):
     """THE KEY COMPILER: an expression over dict-coded columns is itself a
     code-space citizen. Compiles a group-key expression to a plan that
@@ -495,27 +485,12 @@ def execute(seg, spec):
     _pg_plans = None
     if crumb.size >= (1 << 15):
         _cand = spec['plans']
-        def _pgb(p9):
-            if p9['kind'] == 'col':
-                c9 = seg.cols.get(p9['col'], {})
-                if not c9 or c9.get('has_null'):
-                    return None
-                return max(1, int(c9['V']).bit_length())
-            return max(1, int(p9['W']).bit_length())   # compiled keys pack too
-        if _cand:
-            _bl = [_pgb(p9) for p9 in _cand]
-            if all(b9 is not None and b9 >= 1 for b9 in _bl) \
-                    and any(p9['kind'] == 'col' for p9 in _cand):
-                _rank9 = [False] * len(_bl)
-                _eff = list(_bl)
-                while sum(_eff) > 63 and max(_eff) > 21:
-                    wix = _eff.index(max(_eff))
-                    _rank9[wix] = True           # dense-rank the widest: crumb-
-                    _eff[wix] = 21               # local ids fit 21 bits (<=2^21 rows)
-                if sum(_eff) <= 63:
-                    _pg_plans = list(zip(_cand, _bl, _rank9))
-    _pg_cols = set(p9['col'] for p9, _, _ in (_pg_plans or [])
-                   if p9['kind'] == 'col')
+        if (_cand and all(p9['kind'] == 'col' for p9 in _cand)
+                and all(seg.cols.get(p9['col'], {}).get('code_enc') == 12 for p9 in _cand)):
+            _bl = [int(seg.cols[p9['col']]['bits']) for p9 in _cand]
+            if all(b9 >= 1 for b9 in _bl) and sum(_bl) <= 36:
+                _pg_plans = list(zip([p9['col'] for p9 in _cand], _bl))
+    _pg_cols = set(c9 for c9, _ in (_pg_plans or []))
     for pcol in spec['strneq']:
         if pcol in _pg_cols:
             continue                             # folded into the radix walk
@@ -541,122 +516,63 @@ def execute(seg, spec):
     # codes on the crumb (pure numpy), the composite packs into one int64
     plans = spec['plans']
     widths = [max(1, int(pl['W']).bit_length()) for pl in plans]
-    # JACKSON'S RADIX GROUP with PROGRESSIVE ASSEMBLY: fields join the
-    # composite CHEAPEST FIRST; once the partial key carries >=26 bits, a
-    # radix count certifies singleton buckets (coarse count bounds fine
-    # count) and the doomed rows are DISCARDED before the expensive
-    # fields -- wide gathers, CASE evaluation -- are ever paid. If the
-    # final window's k-th count is 1, singletons mattered: full fallback.
+    # JACKSON'S RADIX GROUP: any set of enc-12 key columns whose widths
+    # pack under 36 bits -- span-gathers per key (half a key is free
+    # vertically), one composite, the RADIX ATOM instead of comparison
+    # sort, empty-string hygiene folded into dropped field-0 groups.
     prefixed = False
     if _pg_plans is not None:
         import wdb_kernels as _WK
-
-        def _cost9(pb):
-            p9, b9, _ = pb
-            return (0, b9) if p9['kind'] == 'col' else (1, b9)
-        order9 = sorted(range(len(_pg_plans)), key=lambda ix: _cost9(_pg_plans[ix]))
         cr9 = np.ascontiguousarray(crumb)
-        live9 = cr9
         comp9 = np.zeros(cr9.size, np.int64)
-        accb9 = 0
-        pruned9 = False
-        need9 = spec['off'] + spec['k']
-
-        def _field(p9, b9, rows9, split9):
-            if p9['kind'] != 'col':
-                return _key_eval(seg, p9, rows9)
-            kc9 = seg.cols[p9['col']]
-            if kc9.get('code_enc') != 12:
-                return np.asarray(seg.codes_at(p9['col'], rows9)).astype(np.int64)
+        shifts9 = []
+        acc9 = 0
+        for _, b9 in reversed(_pg_plans):
+            shifts9.append(acc9)
+            acc9 += b9
+        shifts9 = list(reversed(shifts9))
+        totbits9 = acc9
+        for (kcol9, b9), sh9 in zip(_pg_plans, shifts9):
+            kc9 = seg.cols[kcol9]
             nw9 = int(kc9['nwords'])
-            pl9 = seg.vplanes(p9['col'])
-            if split9 and b9 > 16:
+            pl9 = seg.vplanes(kcol9)
+            if b9 > 16:
                 P9 = b9 - 12
-                a9 = np.zeros(rows9.size, np.uint16)
-                _WK.vp_gather_span(pl9, nw9, 0, P9, rows9, a9)
-                z9 = np.zeros(rows9.size, np.uint16)
-                _WK.vp_gather_span(pl9, nw9, P9, b9, rows9, z9)
-                return (a9.astype(np.int64) << (b9 - P9)) | z9.astype(np.int64)
-            w9 = np.zeros(rows9.size, np.uint16) if b9 <= 16 else None
-            if w9 is not None:
-                _WK.vp_gather_span(pl9, nw9, 0, b9, rows9, w9)
-                return w9.astype(np.int64)
-            return _field(p9, b9, rows9, True)
-
-        done9 = 0
-        maps9 = {}
-        packb9 = {}
-        for oix in order9:
-            p9, b9, rk9 = _pg_plans[oix]
-            f9 = _field(p9, b9, live9, False)
-            if rk9:
-                sr9 = _WK.radix_sortN(f9, b9)
-                du9 = sr9[np.concatenate([[0], np.flatnonzero(np.diff(sr9) != 0) + 1])] \
-                    if sr9.size else sr9
-                maps9[oix] = du9
-                f9 = np.searchsorted(du9, f9)
-                b9 = max(1, int(du9.size).bit_length())
-            packb9[oix] = b9
-            comp9 = (comp9 << b9) | f9
-            accb9 += b9
-            done9 += 1
-            done9 += 0
-            if (not pruned9 and done9 < len(order9) and accb9 >= 26
-                    and needs_expensive9(order9, done9, _pg_plans)):
-                ks0 = _WK.radix_sortN(comp9, accb9)
-                b0 = np.flatnonzero(np.diff(ks0) != 0)
-                s0 = np.concatenate([[0], b0 + 1])
-                c0 = np.diff(np.concatenate([s0, [ks0.size]]))
-                srch9 = ks0[s0]
-                cnts9 = c0[np.searchsorted(srch9, comp9)]
-                keepP = cnts9 >= 2
-                if int(keepP.sum()) < live9.size:
-                    live9 = live9[keepP]
-                    comp9 = comp9[keepP]
-                pruned9 = True
-        ks9 = _WK.radix_sortN(comp9, accb9)
+                hi9 = np.zeros(cr9.size, np.uint16)
+                _WK.vp_gather_span(pl9, nw9, 0, P9, cr9, hi9)
+                lo9 = np.zeros(cr9.size, np.uint16)
+                _WK.vp_gather_span(pl9, nw9, P9, b9, cr9, lo9)
+                k9 = (hi9.astype(np.int64) << (b9 - P9)) | lo9.astype(np.int64)
+            else:
+                w9 = np.zeros(cr9.size, np.uint16)
+                _WK.vp_gather_span(pl9, nw9, 0, b9, cr9, w9)
+                k9 = w9.astype(np.int64)
+            comp9 |= k9 << sh9
+        ks9 = _WK.radix_sortN(comp9, totbits9)
         bnd9 = np.flatnonzero(np.diff(ks9) != 0)
         st9 = np.concatenate([[0], bnd9 + 1])
         uk9 = ks9[st9]
         uc9 = np.diff(np.concatenate([st9, [ks9.size]])).astype(np.int64)
-        shifts9 = []
-        acc0 = accb9
-        for oix in order9:
-            acc0 -= packb9[oix]
-            shifts9.append(acc0)
         fields9 = np.empty((len(_pg_plans), uk9.size), np.int64)
-        for pos9, oix in enumerate(order9):
-            fv9 = (uk9 >> shifts9[pos9]) & ((1 << packb9[oix]) - 1)
-            if oix in maps9:
-                fv9 = maps9[oix][fv9]            # rank -> true code
-            fields9[oix] = fv9
+        for i9, ((kcol9, b9), sh9) in enumerate(zip(_pg_plans, shifts9)):
+            fields9[i9] = (uk9 >> sh9) & ((1 << b9) - 1)
         drop9 = np.zeros(uk9.size, bool)
-        for oix, (p9, b9, _) in enumerate(_pg_plans):
-            if p9['kind'] == 'col' and any(pc == p9['col'] for pc in spec['strneq']):
-                z9 = seg.fetch(p9['col'], 0)
+        for i9, (kcol9, b9) in enumerate(_pg_plans):
+            if any(pc == kcol9 for pc in spec['strneq']):
+                z9 = seg.fetch(kcol9, 0)
                 if isinstance(z9, (bytes, bytearray)):
                     z9 = z9.decode('utf-8', 'replace')
                 if z9 == '':
-                    drop9 |= fields9[oix] == 0
+                    drop9 |= fields9[i9] == 0
         if drop9.any():
             keep9 = ~drop9
             fields9 = fields9[:, keep9]
             uc9 = uc9[keep9]
-        okwin9 = True
-        if pruned9:
-            n2 = min(need9, uc9.size)
-            if uc9.size < need9:
-                okwin9 = False
-            elif uc9.size:
-                topc = int(np.partition(uc9, uc9.size - n2)[uc9.size - n2]) \
-                    if uc9.size > n2 else int(uc9.min())
-                okwin9 = topc >= 2
-        if okwin9:
-            global _PHITS
-            _PHITS += 1
-            ucodes = fields9
-            ucnt = uc9
-            prefixed = True
+        global _PHITS
+        _PHITS += 1
+        ucodes = fields9
+        ucnt = uc9
+        prefixed = True
     packed = sum(widths) <= 62                   # one int64 when it fits,
     if prefixed:
         pass                                     # counts already stand
