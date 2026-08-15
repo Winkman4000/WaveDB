@@ -43,6 +43,7 @@ def _has_window(tree):
 _READ_ORDER = (
     R.cube,                 # pre-materialized cube
     R.blockstats,           # whole-table aggregates from per-block stats: no row data touched
+    R.gbcount,              # full-table group census from the gbc shelf
     R.stair,                # staircase column: single-key GROUP BY from step positions (no decode)
     R.regexgroup,           # GROUP BY regex over the dict: per-code counts, V-level strings
     R.window,               # window fns: stable scatter by partition, lanes inherit cluster order
@@ -155,7 +156,7 @@ def route_single_segment(ctx):
     if wdb_sql._offset(ctx.tree):
         # wherescan is the one structure read that applies OFFSET itself (it materializes the
         # full ordered group set and slices [off:off+lim]) -- let it try before the scan.
-        for rd in (R.funnel, R.dict_count, R.wherescan, R.diskpair):   # the reads that apply OFFSET themselves
+        for rd in (R.gbcount, R.funnel, R.dict_count, R.wherescan, R.diskpair):   # the reads that apply OFFSET themselves
             spec = rd.detect(ctx)
             if spec is not None:
                 rows = rd.execute(ctx, spec)

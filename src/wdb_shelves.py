@@ -70,6 +70,10 @@ def replay(db):
                         import wdb_gbshelf
                         if wdb_gbshelf.open_shelf(seg, a['col']) is None:
                             wdb_gbshelf.birth(seg, a['col'])
+                    elif kind == 'gbc3':
+                        import wdb_gbshelf
+                        if wdb_gbshelf.open_dense(seg, a['col']) is None:
+                            wdb_gbshelf.birth_dense(seg, a['col'])
                     elif kind == 'gdc2':
                         import wdb_groupdistinct as GD
                         if GD._gdc_load(seg, a['k'], a['t']) is None:

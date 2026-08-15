@@ -336,6 +336,19 @@ def _fused_execute(c, spec):
     except wdb_join._FastUnsupported:
         return None                          # not the fused shape -> fall through
 
+def _gbc_detect(c):
+    import wdb_gbshelf
+    return wdb_gbshelf.detect_group(c)
+
+
+def _gbc_execute(c, spec):
+    import wdb_gbshelf
+    return wdb_gbshelf.execute_group(c, spec)
+
+
+gbcount = Read('gbcount', _gbc_detect, _gbc_execute, 'full-table group census from the gbc shelf')
+
+
 fused_agg = Read('fused_agg', _fused_detect, _fused_execute, 'single-table fused fast path')
 
 
