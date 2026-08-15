@@ -675,6 +675,50 @@ def radix_scatter12(keys, lo_shift, offs, okeys, CH):
             okeys[j] = keys[i]
 
 
+@njit(nogil=True, parallel=True, cache=True)
+def radix_scatter12p(keys, pay, lo_shift, offs, okeys, opay, CH):
+    """Stable scatter carrying a payload word -- Jackson's partition pass:
+    the top digit routes rows into buckets, the 62-bit remainder rides
+    along, and each bucket then fits the single-word engine."""
+    nch = offs.shape[0]
+    n = keys.size
+    for cix in prange(nch):
+        a = cix * CH
+        b = min(n, a + CH)
+        for i in range(a, b):
+            d = (keys[i] >> lo_shift) & 0xFFF
+            j = offs[cix, d]
+            offs[cix, d] = j + 1
+            okeys[j] = keys[i]
+            opay[j] = pay[i]
+
+
+def radix_partition(top, pay):
+    """Partition rows by a <=12-bit top digit (stable), payload alongside.
+    Returns (sorted_top, sorted_pay, bucket_bounds)."""
+    n = top.size
+    CH = 1 << 16
+    nch = (n + CH - 1) // CH
+    k0 = np.ascontiguousarray(top, dtype=np.int64)
+    p0 = np.ascontiguousarray(pay, dtype=np.int64)
+    hists = np.zeros((nch, 4096), np.int64)
+    radix_hist12(k0, 0, hists, CH)
+    tot = hists.sum(axis=0)
+    base = np.zeros(4096, np.int64)
+    np.cumsum(tot[:-1], out=base[1:])
+    offs = np.empty((nch, 4096), np.int64)
+    run = base
+    for cix in range(nch):
+        offs[cix] = run
+        run = run + hists[cix]
+    ok = np.empty(n, np.int64)
+    op = np.empty(n, np.int64)
+    radix_scatter12p(k0, p0, 0, offs, ok, op, CH)
+    nz = np.flatnonzero(tot)
+    bounds = [(int(d), int(base[d]), int(base[d] + tot[d])) for d in nz]
+    return ok, op, bounds
+
+
 def radix_sortN(keys, bits):
     """THE RADIX ATOM, general form: sort integer keys of known width in
     ceil(bits/12) LSD passes -- O(n), L1 histogram bowls, never mutates."""
@@ -1298,6 +1342,10 @@ def warm():
         np.cumsum(_rh[0][:-1], out=_ro[0][1:])
         _tk = np.empty(4, np.int64)
         radix_scatter12(_rk, 0, _ro, _tk, 65536)
+        _ro2 = np.zeros((1, 4096), np.int64)
+        np.cumsum(_rh[0][:-1], out=_ro2[0][1:])
+        _tp = np.zeros(4, np.int64)
+        radix_scatter12p(_rk, np.array([9, 8, 7, 6], np.int64), 0, _ro2, _tk, _tp, 65536)
         _vc = np.zeros(1, np.int64)
         vp_scan_eq(_vp, 1, 2, 1, _vc, 4096)
         _fl2 = np.zeros(4, np.bool_); _fl2[3] = True

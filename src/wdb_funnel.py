@@ -483,14 +483,26 @@ def execute(seg, spec):
                 m9 = (fc == c9) if kind else (fc != c9)
         crumb = crumb[m9]
     _pg_plans = None
+    _pg_part = False
     if crumb.size >= (1 << 15):
         _cand = spec['plans']
-        if (_cand and all(p9['kind'] == 'col' for p9 in _cand)
-                and all(seg.cols.get(p9['col'], {}).get('code_enc') == 12 for p9 in _cand)):
-            _bl = [int(seg.cols[p9['col']]['bits']) for p9 in _cand]
-            if all(b9 >= 1 for b9 in _bl) and sum(_bl) <= 36:
-                _pg_plans = list(zip([p9['col'] for p9 in _cand], _bl))
-    _pg_cols = set(c9 for c9, _ in (_pg_plans or []))
+        def _pgb(p9):
+            if p9['kind'] == 'col':
+                c9 = seg.cols.get(p9['col'], {})
+                if not c9 or c9.get('has_null'):
+                    return None
+                return max(1, int(c9['V']).bit_length())
+            return max(1, int(p9['W']).bit_length())
+        if _cand and any(p9['kind'] == 'col' for p9 in _cand):
+            _bl = [_pgb(p9) for p9 in _cand]
+            if all(b9 is not None and b9 >= 1 for b9 in _bl):
+                if sum(_bl) <= 63:
+                    _pg_plans = list(zip(_cand, _bl))
+                elif len(_bl) >= 2 and _bl[0] <= 12 and sum(_bl[1:]) <= 62:
+                    _pg_plans = list(zip(_cand, _bl))
+                    _pg_part = True              # Jackson's partition-first
+    _pg_cols = set(p9['col'] for p9, _ in (_pg_plans or [])
+                   if p9['kind'] == 'col')
     for pcol in spec['strneq']:
         if pcol in _pg_cols:
             continue                             # folded into the radix walk
@@ -516,54 +528,95 @@ def execute(seg, spec):
     # codes on the crumb (pure numpy), the composite packs into one int64
     plans = spec['plans']
     widths = [max(1, int(pl['W']).bit_length()) for pl in plans]
-    # JACKSON'S RADIX GROUP: any set of enc-12 key columns whose widths
-    # pack under 36 bits -- span-gathers per key (half a key is free
-    # vertically), one composite, the RADIX ATOM instead of comparison
-    # sort, empty-string hygiene folded into dropped field-0 groups.
+    # JACKSON'S RADIX GROUP: enc-12 keys span-gather, other encodings ride
+    # codes_at, compiled CASE keys evaluate in code space. <=63 bits pack
+    # one word for the radix atom; wider composites run PARTITION-FIRST --
+    # the top field (<=12 bits) routes rows into buckets in one stable
+    # pass, the <=62-bit remainder rides as payload, and each bucket runs
+    # the single-word engine. Empty-string hygiene folds into dropped
+    # field-0 groups.
     prefixed = False
     if _pg_plans is not None:
         import wdb_kernels as _WK
         cr9 = np.ascontiguousarray(crumb)
-        comp9 = np.zeros(cr9.size, np.int64)
-        shifts9 = []
-        acc9 = 0
-        for _, b9 in reversed(_pg_plans):
-            shifts9.append(acc9)
-            acc9 += b9
-        shifts9 = list(reversed(shifts9))
-        totbits9 = acc9
-        for (kcol9, b9), sh9 in zip(_pg_plans, shifts9):
-            kc9 = seg.cols[kcol9]
+
+        def _field(p9, b9):
+            if p9['kind'] != 'col':
+                return _key_eval(seg, p9, cr9)
+            kc9 = seg.cols[p9['col']]
+            if kc9.get('code_enc') != 12:
+                return np.asarray(seg.codes_at(p9['col'], cr9)).astype(np.int64)
             nw9 = int(kc9['nwords'])
-            pl9 = seg.vplanes(kcol9)
+            pl9 = seg.vplanes(p9['col'])
             if b9 > 16:
                 P9 = b9 - 12
-                hi9 = np.zeros(cr9.size, np.uint16)
-                _WK.vp_gather_span(pl9, nw9, 0, P9, cr9, hi9)
-                lo9 = np.zeros(cr9.size, np.uint16)
-                _WK.vp_gather_span(pl9, nw9, P9, b9, cr9, lo9)
-                k9 = (hi9.astype(np.int64) << (b9 - P9)) | lo9.astype(np.int64)
-            else:
-                w9 = np.zeros(cr9.size, np.uint16)
-                _WK.vp_gather_span(pl9, nw9, 0, b9, cr9, w9)
-                k9 = w9.astype(np.int64)
-            comp9 |= k9 << sh9
-        ks9 = _WK.radix_sortN(comp9, totbits9)
-        bnd9 = np.flatnonzero(np.diff(ks9) != 0)
-        st9 = np.concatenate([[0], bnd9 + 1])
-        uk9 = ks9[st9]
-        uc9 = np.diff(np.concatenate([st9, [ks9.size]])).astype(np.int64)
+                a9 = np.zeros(cr9.size, np.uint16)
+                _WK.vp_gather_span(pl9, nw9, 0, P9, cr9, a9)
+                z9 = np.zeros(cr9.size, np.uint16)
+                _WK.vp_gather_span(pl9, nw9, P9, b9, cr9, z9)
+                return (a9.astype(np.int64) << (b9 - P9)) | z9.astype(np.int64)
+            w9 = np.zeros(cr9.size, np.uint16)
+            _WK.vp_gather_span(pl9, nw9, 0, b9, cr9, w9)
+            return w9.astype(np.int64)
+
+        comp9 = np.zeros(cr9.size, np.int64)
+        top9 = None
+        lowb9 = 0
+        for oix, (p9, b9) in enumerate(_pg_plans):
+            f9 = _field(p9, b9)
+            if _pg_part and oix == 0:
+                top9 = f9
+                continue
+            comp9 = (comp9 << b9) | f9
+            lowb9 += b9
+        if _pg_part:
+            # the top digit NEVER re-enters the key (top << 61 would
+            # overflow int64) -- it rides as its own per-bucket field
+            _, sp9, bounds9 = _WK.radix_partition(top9, comp9)
+            uks = []
+            ucs = []
+            tvs = []
+            for dval9, a9x, b9x in bounds9:
+                kb9 = _WK.radix_sortN(sp9[a9x:b9x], lowb9)
+                bb9 = np.flatnonzero(np.diff(kb9) != 0)
+                sb9 = np.concatenate([[0], bb9 + 1])
+                uks.append(kb9[sb9])
+                ucs.append(np.diff(np.concatenate([sb9, [kb9.size]])))
+                tvs.append(np.full(sb9.size, dval9, np.int64))
+            uk9 = np.concatenate(uks) if uks else np.empty(0, np.int64)
+            uc9 = np.concatenate(ucs).astype(np.int64) if ucs else np.empty(0, np.int64)
+            topv9 = np.concatenate(tvs) if tvs else np.empty(0, np.int64)
+            fullb9 = lowb9
+        else:
+            topv9 = None
+            ks9 = _WK.radix_sortN(comp9, lowb9)
+            bnd9 = np.flatnonzero(np.diff(ks9) != 0)
+            st9 = np.concatenate([[0], bnd9 + 1])
+            uk9 = ks9[st9]
+            uc9 = np.diff(np.concatenate([st9, [ks9.size]])).astype(np.int64)
+            fullb9 = lowb9
+        shifts9 = []
+        acc0 = fullb9
+        for oix, (p9, b9) in enumerate(_pg_plans):
+            if _pg_part and oix == 0:
+                shifts9.append(0)                # top rides apart
+                continue
+            acc0 -= b9
+            shifts9.append(acc0)
         fields9 = np.empty((len(_pg_plans), uk9.size), np.int64)
-        for i9, ((kcol9, b9), sh9) in enumerate(zip(_pg_plans, shifts9)):
-            fields9[i9] = (uk9 >> sh9) & ((1 << b9) - 1)
+        for oix, (p9, b9) in enumerate(_pg_plans):
+            if _pg_part and oix == 0:
+                fields9[0] = topv9
+            else:
+                fields9[oix] = (uk9 >> shifts9[oix]) & ((1 << b9) - 1)
         drop9 = np.zeros(uk9.size, bool)
-        for i9, (kcol9, b9) in enumerate(_pg_plans):
-            if any(pc == kcol9 for pc in spec['strneq']):
-                z9 = seg.fetch(kcol9, 0)
+        for oix, (p9, b9) in enumerate(_pg_plans):
+            if p9['kind'] == 'col' and any(pc == p9['col'] for pc in spec['strneq']):
+                z9 = seg.fetch(p9['col'], 0)
                 if isinstance(z9, (bytes, bytearray)):
                     z9 = z9.decode('utf-8', 'replace')
                 if z9 == '':
-                    drop9 |= fields9[i9] == 0
+                    drop9 |= fields9[oix] == 0
         if drop9.any():
             keep9 = ~drop9
             fields9 = fields9[:, keep9]
