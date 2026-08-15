@@ -482,7 +482,16 @@ def execute(seg, spec):
             else:
                 m9 = (fc == c9) if kind else (fc != c9)
         crumb = crumb[m9]
+    _pg_col = None
+    if crumb.size >= (1 << 15) and len(spec['plans']) == 1 \
+            and spec['plans'][0]['kind'] == 'col':
+        _pgc = spec['plans'][0]['col']
+        _pgk = seg.cols.get(_pgc, {})
+        if _pgk.get('code_enc') == 12 and 13 <= int(_pgk.get('bits', 0) or 0) <= 24:
+            _pg_col = _pgc                       # the radix group will handle it
     for pcol in spec['strneq']:
+        if pcol == _pg_col:
+            continue                             # folded into the radix walk
         if crumb.size == 0:
             break
         if seg.cols[pcol].get('code_enc') not in (8, 9):
@@ -505,46 +514,46 @@ def execute(seg, spec):
     # codes on the crumb (pure numpy), the composite packs into one int64
     plans = spec['plans']
     widths = [max(1, int(pl['W']).bit_length()) for pl in plans]
-    # JACKSON'S PREFIX-GROUP: for a lone wide enc-12 key in the near-unique
-    # regime, gather only the TOP planes, bincount 2^P prefixes in an L1
-    # bowl, DISCARD rows whose prefix count is 1 (a count-1 group can never
-    # enter a count-desc top-k whose k-th count is >= 2), and stitch full
-    # keys for survivors only. Falls back whenever the guard can't certify.
+    # JACKSON'S RADIX GROUP: for a lone wide enc-12 key, two span-gathers
+    # (half a key is free vertically), the RADIX ATOM instead of comparison
+    # sort (19x), and the empty-string hygiene folds into a dropped group.
     prefixed = False
-    if (crumb.size >= (1 << 15) and len(plans) == 1 and plans[0]['kind'] == 'col'
-            and spec['off'] + spec['k'] <= 1000):
-        kcol9 = plans[0]['col']
-        kc9 = seg.cols.get(kcol9, {})
-        bits9 = int(kc9.get('bits', 0) or 0)
-        if kc9.get('code_enc') == 12 and 18 <= bits9 <= 28:
-            import wdb_kernels as _WK
+    if _pg_col is not None:
+        kcol9 = _pg_col
+        kc9 = seg.cols[kcol9]
+        bits9 = int(kc9['bits'])
+        import wdb_kernels as _WK
+        nw9 = int(kc9['nwords'])
+        pl9 = seg.vplanes(kcol9)
+        cr9 = np.ascontiguousarray(crumb)
+        if bits9 > 12:
             P9 = bits9 - 12
-            nw9 = int(kc9['nwords'])
-            pl9 = seg.vplanes(kcol9)
-            cr9 = np.ascontiguousarray(crumb)
             hi9 = np.zeros(cr9.size, np.uint16)
             _WK.vp_gather_span(pl9, nw9, 0, P9, cr9, hi9)
-            bowl9 = np.bincount(hi9, minlength=1 << P9)
-            keep9 = bowl9[hi9] >= 2
-            sur9 = cr9[keep9]
-            if sur9.size:
-                lo9 = np.zeros(sur9.size, np.uint16)
-                _WK.vp_gather_span(pl9, nw9, P9, bits9, sur9, lo9)
-                full9 = (hi9[keep9].astype(np.int64) << (bits9 - P9)) | lo9.astype(np.int64)
-                ks9 = np.sort(full9, kind='stable')
-                bnd9 = np.flatnonzero(np.diff(ks9) != 0)
-                st9 = np.concatenate([[0], bnd9 + 1])
-                en9 = np.concatenate([bnd9 + 1, [ks9.size]])
-                uk9 = ks9[st9]
-                uc9 = (en9 - st9).astype(np.int64)
-                multi9 = uc9 >= 2
-                need9 = spec['off'] + spec['k']
-                if int(multi9.sum()) >= need9:
-                    ucodes = uk9[multi9].reshape(1, -1)
-                    ucnt = uc9[multi9]
-                    global _PHITS
-                    _PHITS += 1
-                    prefixed = True
+            lo9 = np.zeros(cr9.size, np.uint16)
+            _WK.vp_gather_span(pl9, nw9, P9, bits9, cr9, lo9)
+            full9 = (hi9.astype(np.int64) << (bits9 - P9)) | lo9.astype(np.int64)
+        else:
+            w9 = np.zeros(cr9.size, np.uint16)
+            _WK.vp_gather_span(pl9, nw9, 0, bits9, cr9, w9)
+            full9 = w9.astype(np.int64)
+        ks9 = _WK.radix_sort24(full9)
+        bnd9 = np.flatnonzero(np.diff(ks9) != 0)
+        st9 = np.concatenate([[0], bnd9 + 1])
+        uk9 = ks9[st9]
+        uc9 = np.diff(np.concatenate([st9, [ks9.size]])).astype(np.int64)
+        if any(pc == kcol9 for pc in spec['strneq']):
+            z9 = seg.fetch(kcol9, 0)
+            if isinstance(z9, (bytes, bytearray)):
+                z9 = z9.decode('utf-8', 'replace')
+            if z9 == '' and uk9.size and uk9[0] == 0:
+                uk9 = uk9[1:]
+                uc9 = uc9[1:]
+        global _PHITS
+        _PHITS += 1
+        ucodes = uk9.reshape(1, -1)
+        ucnt = uc9
+        prefixed = True
     packed = sum(widths) <= 62                   # one int64 when it fits,
     if prefixed:
         pass                                     # counts already stand

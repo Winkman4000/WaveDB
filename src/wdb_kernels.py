@@ -649,6 +649,59 @@ def vp_window(pl, nwords, bits, lo, hi, out):
 
 
 @njit(nogil=True, parallel=True, cache=True)
+def radix_hist12(keys, lo_shift, hists, CH):
+    """Pass histogram: 12-bit digit counts per chunk (4096 counters, L1)."""
+    nch = hists.shape[0]
+    n = keys.size
+    for cix in prange(nch):
+        a = cix * CH
+        b = min(n, a + CH)
+        for i in range(a, b):
+            hists[cix, (keys[i] >> lo_shift) & 0xFFF] += 1
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def radix_scatter12(keys, lo_shift, offs, okeys, CH):
+    """Stable scatter by 12-bit digit using per-chunk running offsets."""
+    nch = offs.shape[0]
+    n = keys.size
+    for cix in prange(nch):
+        a = cix * CH
+        b = min(n, a + CH)
+        for i in range(a, b):
+            d = (keys[i] >> lo_shift) & 0xFFF
+            j = offs[cix, d]
+            offs[cix, d] = j + 1
+            okeys[j] = keys[i]
+
+
+def radix_sort24(keys):
+    """THE RADIX ATOM: sort <=24-bit integer keys in two 12-bit LSD
+    passes -- O(n), L1 histogram bowls. Never mutates the input."""
+    n = keys.size
+    if n == 0:
+        return np.asarray(keys, np.int64)
+    CH = 1 << 16
+    nch = (n + CH - 1) // CH
+    k0 = np.array(keys, dtype=np.int64, copy=True)
+    t_k = np.empty(n, np.int64)
+    for lo_shift in (0, 12):
+        hists = np.zeros((nch, 4096), np.int64)
+        radix_hist12(k0, lo_shift, hists, CH)
+        tot = hists.sum(axis=0)
+        base = np.zeros(4096, np.int64)
+        np.cumsum(tot[:-1], out=base[1:])
+        offs = np.empty((nch, 4096), np.int64)
+        run = base
+        for cix in range(nch):
+            offs[cix] = run
+            run = run + hists[cix]
+        radix_scatter12(k0, lo_shift, offs, t_k, CH)
+        k0, t_k = t_k, k0
+    return k0
+
+
+@njit(nogil=True, parallel=True, cache=True)
 def vp_gather_span(pl, nwords, p0, p1, rows, out):
     """Gather only planes [p0,p1) at the rows -- HALF A KEY IS FREE
     vertically. Jackson's prefix-group law: read bits in the order
@@ -1232,6 +1285,13 @@ def warm():
         vp_gather(_vp, 1, 2, np.array([0, 1], np.int64), _vg)
         _vs = np.zeros(2, np.uint16)
         vp_gather_span(_vp, 1, 0, 1, np.array([0, 1], np.int64), _vs)
+        _rk = np.array([5, 1, 3, 1], np.int64)
+        _rh = np.zeros((1, 4096), np.int64)
+        radix_hist12(_rk, 0, _rh, 65536)
+        _ro = np.zeros((1, 4096), np.int64)
+        np.cumsum(_rh[0][:-1], out=_ro[0][1:])
+        _tk = np.empty(4, np.int64)
+        radix_scatter12(_rk, 0, _ro, _tk, 65536)
         _vc = np.zeros(1, np.int64)
         vp_scan_eq(_vp, 1, 2, 1, _vc, 4096)
         _fl2 = np.zeros(4, np.bool_); _fl2[3] = True
