@@ -442,6 +442,36 @@ def execute(seg, spec):
     # two flags are enc-10 scalar tests, ONE fused walk serves both with
     # per-row short-circuit (Jackson's crossing scheme, row granularity).
     flags9 = list(spec['flags'])
+    # THE BAND-DECODE LAW (hygiene half): dense crumbs stream their band's
+    # flag columns once instead of probing per row.
+    if crumb.size >= (1 << 15) and 1 <= len(flags9) <= 2 \
+            and not spec['strneq'] \
+            and all(f[2] != 'in' for f in flags9) \
+            and all(seg.cols.get(f[0], {}).get('code_enc') == 10 for f in flags9):
+        blo9 = int(crumb[0]); bhi9 = int(crumb[-1]) + 1
+        band9 = bhi9 - blo9
+        if band9 > 0 and crumb.size / band9 >= 0.02 and band9 <= (1 << 26):
+            import wdb_kernels as _WK
+            bufB = np.frombuffer(seg.buf, np.uint8)
+            keepB = np.ones(crumb.size, bool)
+            rel9 = crumb - blo9
+            okB = True
+            for f9 in flags9:
+                c9 = _code_of(seg, f9[0], f9[1])
+                if c9 is None:
+                    okB = False
+                    break
+                ca = seg.cols[f9[0]]
+                d9 = np.ascontiguousarray(np.frombuffer(seg.buf, np.int64,
+                        int(ca['pXnblk']), ca['pXdir']))
+                v9 = np.empty(band9, np.int16)
+                _WK.bp10_range(bufB, d9, int(ca['pXpay']), int(ca['pXbits']),
+                               blo9, bhi9, v9)
+                fv9 = v9[rel9]
+                keepB &= (fv9 == c9) if f9[2] else (fv9 != c9)
+            if okB:
+                crumb = crumb[keepB]
+                flags9 = []
     if crumb.size and len(flags9) >= 2:
         f1, f2 = flags9[0], flags9[1]
         c1a = seg.cols.get(f1[0], {})
@@ -548,6 +578,13 @@ def execute(seg, spec):
                 return np.asarray(seg.codes_at(p9['col'], cr9)).astype(np.int64)
             nw9 = int(kc9['nwords'])
             pl9 = seg.vplanes(p9['col'])
+            blo9 = int(cr9[0]); bhi9 = int(cr9[-1]) + 1
+            band9 = bhi9 - blo9
+            if b9 <= 16 and band9 > 0 and cr9.size / band9 >= 0.02 \
+                    and band9 * 8 <= (1 << 30):
+                outW = np.zeros(band9, np.uint64)
+                _WK.vp_window(pl9, nw9, b9, blo9, bhi9, outW)
+                return outW[cr9 - blo9].astype(np.int64)
             if b9 > 16:
                 P9 = b9 - 12
                 a9 = np.zeros(cr9.size, np.uint16)

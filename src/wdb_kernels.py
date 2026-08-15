@@ -1017,6 +1017,46 @@ def _bp10_at(buf, dirX, pay, bits, row):
     return v
 
 
+@njit(nogil=True, parallel=True, cache=True)
+def bp10_range(buf, d, p, b, blo, bhi, out):
+    """THE BAND-DECODE LAW's enc-10 half: expand run-lists / bitpack for
+    every row in [blo,bhi) -- streaming beats per-row probes when the
+    crumb is dense inside its band."""
+    B = 4096
+    k0 = blo // B
+    k1 = (bhi + B - 1) // B
+    for kb in prange(k1 - k0):
+        blk = k0 + kb
+        o = p + (d[blk] >> 1)
+        base = blk * B
+        if d[blk] & 1:
+            nr = np.int64(buf[o]) | (np.int64(buf[o + 1]) << 8)
+            ptr = o + 2
+            r = base
+            for _ in range(nr):
+                cnt = np.int64(buf[ptr]) | (np.int64(buf[ptr + 1]) << 8)
+                val = np.int64(buf[ptr + 2]) | (np.int64(buf[ptr + 3]) << 8)
+                ptr += 4
+                e = r + cnt
+                a0 = r if r > blo else blo
+                a1 = e if e < bhi else bhi
+                for rr in range(a0, a1):
+                    out[rr - blo] = np.int16(val)
+                r = e
+                if r >= bhi:
+                    break
+        else:
+            a0 = base if base > blo else blo
+            a1 = base + B if base + B < bhi else bhi
+            for rr in range(a0, a1):
+                idx = (rr - base) * b
+                v = np.int64(0)
+                for bi in range(b):
+                    ix = idx + bi
+                    v = (v << 1) | ((np.int64(buf[o + (ix >> 3)]) >> (7 - (ix & 7))) & 1)
+                out[rr - blo] = np.int16(v)
+
+
 @njit(nogil=True, cache=True)
 def _h2_chunk(buf, d1, p1, b1, c1, eq1, d2, p2, b2, c2, eq2, rows, keep, a0, a1):
     """Jackson's monotone cursor: rows ascend, so each flag column's run
@@ -1352,6 +1392,8 @@ def warm():
         vp_scan_flag_count(_vp, 1, 2, 0, 4, _fl2, _vc, 64)
         _po2 = np.zeros(max(1, int(_vc[0])), np.int64)
         vp_scan_flag_fill(_vp, 1, 2, 0, 4, _fl2, np.array([0, int(_vc[0])], np.int64), _po2, 64)
+        _br = np.zeros(3, np.int16)
+        bp10_range(_bw, np.array([1], np.int64), 0, 1, 0, 3, _br)
         _kp = np.zeros(2, np.bool_)
         bp10_hygiene2(_bw, np.array([1], np.int64), 0, 1, 0, True,
                       np.array([1], np.int64), 0, 1, 0, True,
