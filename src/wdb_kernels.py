@@ -675,9 +675,9 @@ def radix_scatter12(keys, lo_shift, offs, okeys, CH):
             okeys[j] = keys[i]
 
 
-def radix_sort24(keys):
-    """THE RADIX ATOM: sort <=24-bit integer keys in two 12-bit LSD
-    passes -- O(n), L1 histogram bowls. Never mutates the input."""
+def radix_sortN(keys, bits):
+    """THE RADIX ATOM, general form: sort integer keys of known width in
+    ceil(bits/12) LSD passes -- O(n), L1 histogram bowls, never mutates."""
     n = keys.size
     if n == 0:
         return np.asarray(keys, np.int64)
@@ -685,9 +685,10 @@ def radix_sort24(keys):
     nch = (n + CH - 1) // CH
     k0 = np.array(keys, dtype=np.int64, copy=True)
     t_k = np.empty(n, np.int64)
-    for lo_shift in (0, 12):
+    sh = 0
+    while sh < bits:
         hists = np.zeros((nch, 4096), np.int64)
-        radix_hist12(k0, lo_shift, hists, CH)
+        radix_hist12(k0, sh, hists, CH)
         tot = hists.sum(axis=0)
         base = np.zeros(4096, np.int64)
         np.cumsum(tot[:-1], out=base[1:])
@@ -696,9 +697,14 @@ def radix_sort24(keys):
         for cix in range(nch):
             offs[cix] = run
             run = run + hists[cix]
-        radix_scatter12(k0, lo_shift, offs, t_k, CH)
+        radix_scatter12(k0, sh, offs, t_k, CH)
         k0, t_k = t_k, k0
+        sh += 12
     return k0
+
+
+def radix_sort24(keys):
+    return radix_sortN(keys, 24)
 
 
 @njit(nogil=True, parallel=True, cache=True)

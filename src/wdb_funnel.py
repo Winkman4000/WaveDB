@@ -482,15 +482,17 @@ def execute(seg, spec):
             else:
                 m9 = (fc == c9) if kind else (fc != c9)
         crumb = crumb[m9]
-    _pg_col = None
-    if crumb.size >= (1 << 15) and len(spec['plans']) == 1 \
-            and spec['plans'][0]['kind'] == 'col':
-        _pgc = spec['plans'][0]['col']
-        _pgk = seg.cols.get(_pgc, {})
-        if _pgk.get('code_enc') == 12 and 13 <= int(_pgk.get('bits', 0) or 0) <= 24:
-            _pg_col = _pgc                       # the radix group will handle it
+    _pg_plans = None
+    if crumb.size >= (1 << 15):
+        _cand = spec['plans']
+        if (_cand and all(p9['kind'] == 'col' for p9 in _cand)
+                and all(seg.cols.get(p9['col'], {}).get('code_enc') == 12 for p9 in _cand)):
+            _bl = [int(seg.cols[p9['col']]['bits']) for p9 in _cand]
+            if all(b9 >= 1 for b9 in _bl) and sum(_bl) <= 36:
+                _pg_plans = list(zip([p9['col'] for p9 in _cand], _bl))
+    _pg_cols = set(c9 for c9, _ in (_pg_plans or []))
     for pcol in spec['strneq']:
-        if pcol == _pg_col:
+        if pcol in _pg_cols:
             continue                             # folded into the radix walk
         if crumb.size == 0:
             break
@@ -514,44 +516,61 @@ def execute(seg, spec):
     # codes on the crumb (pure numpy), the composite packs into one int64
     plans = spec['plans']
     widths = [max(1, int(pl['W']).bit_length()) for pl in plans]
-    # JACKSON'S RADIX GROUP: for a lone wide enc-12 key, two span-gathers
-    # (half a key is free vertically), the RADIX ATOM instead of comparison
-    # sort (19x), and the empty-string hygiene folds into a dropped group.
+    # JACKSON'S RADIX GROUP: any set of enc-12 key columns whose widths
+    # pack under 36 bits -- span-gathers per key (half a key is free
+    # vertically), one composite, the RADIX ATOM instead of comparison
+    # sort, empty-string hygiene folded into dropped field-0 groups.
     prefixed = False
-    if _pg_col is not None:
-        kcol9 = _pg_col
-        kc9 = seg.cols[kcol9]
-        bits9 = int(kc9['bits'])
+    if _pg_plans is not None:
         import wdb_kernels as _WK
-        nw9 = int(kc9['nwords'])
-        pl9 = seg.vplanes(kcol9)
         cr9 = np.ascontiguousarray(crumb)
-        if bits9 > 12:
-            P9 = bits9 - 12
-            hi9 = np.zeros(cr9.size, np.uint16)
-            _WK.vp_gather_span(pl9, nw9, 0, P9, cr9, hi9)
-            lo9 = np.zeros(cr9.size, np.uint16)
-            _WK.vp_gather_span(pl9, nw9, P9, bits9, cr9, lo9)
-            full9 = (hi9.astype(np.int64) << (bits9 - P9)) | lo9.astype(np.int64)
-        else:
-            w9 = np.zeros(cr9.size, np.uint16)
-            _WK.vp_gather_span(pl9, nw9, 0, bits9, cr9, w9)
-            full9 = w9.astype(np.int64)
-        ks9 = _WK.radix_sort24(full9)
+        comp9 = np.zeros(cr9.size, np.int64)
+        shifts9 = []
+        acc9 = 0
+        for _, b9 in reversed(_pg_plans):
+            shifts9.append(acc9)
+            acc9 += b9
+        shifts9 = list(reversed(shifts9))
+        totbits9 = acc9
+        for (kcol9, b9), sh9 in zip(_pg_plans, shifts9):
+            kc9 = seg.cols[kcol9]
+            nw9 = int(kc9['nwords'])
+            pl9 = seg.vplanes(kcol9)
+            if b9 > 16:
+                P9 = b9 - 12
+                hi9 = np.zeros(cr9.size, np.uint16)
+                _WK.vp_gather_span(pl9, nw9, 0, P9, cr9, hi9)
+                lo9 = np.zeros(cr9.size, np.uint16)
+                _WK.vp_gather_span(pl9, nw9, P9, b9, cr9, lo9)
+                k9 = (hi9.astype(np.int64) << (b9 - P9)) | lo9.astype(np.int64)
+            else:
+                w9 = np.zeros(cr9.size, np.uint16)
+                _WK.vp_gather_span(pl9, nw9, 0, b9, cr9, w9)
+                k9 = w9.astype(np.int64)
+            comp9 |= k9 << sh9
+        ks9 = _WK.radix_sortN(comp9, totbits9)
         bnd9 = np.flatnonzero(np.diff(ks9) != 0)
         st9 = np.concatenate([[0], bnd9 + 1])
         uk9 = ks9[st9]
         uc9 = np.diff(np.concatenate([st9, [ks9.size]])).astype(np.int64)
-        if any(pc == kcol9 for pc in spec['strneq']):
-            z9 = seg.fetch(kcol9, 0)
-            if isinstance(z9, (bytes, bytearray)):
-                z9 = z9.decode('utf-8', 'replace')
-            if z9 == '' and uk9.size and uk9[0] == 0:
-                uk9 = uk9[1:]
-                uc9 = uc9[1:]
+        fields9 = np.empty((len(_pg_plans), uk9.size), np.int64)
+        for i9, ((kcol9, b9), sh9) in enumerate(zip(_pg_plans, shifts9)):
+            fields9[i9] = (uk9 >> sh9) & ((1 << b9) - 1)
+        drop9 = np.zeros(uk9.size, bool)
+        for i9, (kcol9, b9) in enumerate(_pg_plans):
+            if any(pc == kcol9 for pc in spec['strneq']):
+                z9 = seg.fetch(kcol9, 0)
+                if isinstance(z9, (bytes, bytearray)):
+                    z9 = z9.decode('utf-8', 'replace')
+                if z9 == '':
+                    drop9 |= fields9[i9] == 0
+        if drop9.any():
+            keep9 = ~drop9
+            fields9 = fields9[:, keep9]
+            uc9 = uc9[keep9]
         global _PHITS
         _PHITS += 1
-        ucodes = uk9.reshape(1, -1)
+        ucodes = fields9
         ucnt = uc9
         prefixed = True
     packed = sum(widths) <= 62                   # one int64 when it fits,
