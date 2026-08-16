@@ -442,42 +442,6 @@ def execute(seg, spec):
     # hygiene at the crumb: point reads, never the column. When the first
     # two flags are enc-10 scalar tests, ONE fused walk serves both with
     # per-row short-circuit (Jackson's crossing scheme, row granularity).
-    # THE SELECTIVE-FIRST CUT: an enc-12 scalar flag is an equality the
-    # SNOWBALL tests word-parallel over the band -- maximally selective
-    # predicates run first, and everything downstream touches only their
-    # survivors. (Q41's URLHash = const was buried in per-row hygiene.)
-    _sf = [f for f in spec['flags']
-           if f[2] != 'in' and seg.cols.get(f[0], {}).get('code_enc') == 12]
-    if _sf and crumb.size >= (1 << 15):
-        import wdb_kernels as _WK
-        blo8 = int(crumb[0]); bhi8 = int(crumb[-1]) + 1
-        w08 = blo8 // 64; w18 = (bhi8 + 63) // 64
-        keepF = None
-        rel8 = crumb - np.int64(w08 * 64)
-        done8 = []
-        for f8 in _sf:
-            c8 = _code_of(seg, f8[0], f8[1])
-            kc8 = seg.cols[f8[0]]
-            if f8[2] and c8 is None:
-                crumb = crumb[:0]
-                done8.append(f8)
-                continue
-            if c8 is None:
-                done8.append(f8)                 # neq missing value: all pass
-                continue
-            m8 = np.zeros(w18 - w08, np.uint64)
-            _WK.vp_scan_eq_mask(seg.vplanes(f8[0]), int(kc8['nwords']),
-                                int(kc8['bits']), int(c8), w08, w18, m8)
-            hit8 = (m8[rel8 >> 6] >> (rel8 & 63).astype(np.uint64)) \
-                & np.uint64(1)
-            k8 = hit8.astype(bool) if f8[2] else ~hit8.astype(bool)
-            keepF = k8 if keepF is None else (keepF & k8)
-            done8.append(f8)
-        if keepF is not None:
-            crumb = crumb[keepF]
-        if done8:
-            spec = dict(spec)
-            spec['flags'] = [f for f in spec['flags'] if f not in done8]
     # JACKSON'S MORSEL DOCTRINE: partition the crumb once, sixteen full
     # pipelines, one combine. Covers <=3 enc-12 keys, <=2 scalar enc-10
     # flags, plus one enc-12 equality flag via a pre-built snowball mask.
@@ -491,7 +455,8 @@ def execute(seg, spec):
             and len(_mof) + len(_moe) == len(spec['flags'])
             and len(_mof) <= 2 and len(_moe) <= 1
             and 1 <= len(_mop) <= 3 and all(p['kind'] == 'col' for p in _mop)
-            and all(seg.cols.get(p['col'], {}) and not seg.cols[p['col']].get('has_null') for p in _mop)
+            and all(seg.cols.get(p['col'], {}).get('code_enc') == 12
+                    and not seg.cols[p['col']].get('has_null') for p in _mop)
             and sum(max(1, int(seg.cols[p['col']].get('V', 2)).bit_length()) for p in _mop) <= 62
             and spec['off'] + spec['k'] <= 100000):
         import wdb_kernels as _WK
@@ -620,46 +585,129 @@ def execute(seg, spec):
     # every stage runs numba-to-numba in one entry -- hygiene as mask
     # surgery, lockstep decode, radix, walk -- zero interpreter between.
     _fb_done = False
-    _fbf = list(spec['flags'])
+    _fbf = [f for f in spec['flags'] if f[2] != 'in'
+            and seg.cols.get(f[0], {}).get('code_enc') == 10]
+    _fbe = [f for f in spec['flags'] if f[2] != 'in' and f[2]
+            and seg.cols.get(f[0], {}).get('code_enc') == 12]
     _fbp = spec['plans']
-    if (not _mo_done and crumb.size >= (1 << 15) and not spec['strneq'] and len(_fbf) <= 2
-            and all(f[2] != 'in' for f in _fbf)
-            and all(seg.cols.get(f[0], {}).get('code_enc') == 10 for f in _fbf)
+    if (not _mo_done and crumb.size >= (1 << 15) and not spec['strneq']
+            and len(_fbf) + len(_fbe) == len(spec['flags'])
+            and len(_fbf) <= 2 and len(_fbe) <= 1
             and 1 <= len(_fbp) <= 3 and all(p['kind'] == 'col' for p in _fbp)
-            and all(seg.cols.get(p['col'], {}).get('code_enc') == 12 for p in _fbp)
+            and all(seg.cols.get(p['col'], {}).get('code_enc') in (5, 6, 12)
+                    and not seg.cols[p['col']].get('has_null') for p in _fbp)
+            and sum(max(1, int(seg.cols[p['col']].get('V', 2)).bit_length())
+                    for p in _fbp) <= 62
             and spec['off'] + spec['k'] <= 100000):
         blo9 = int(crumb[0]); bhi9 = int(crumb[-1]) + 1
         band9 = bhi9 - blo9
-        if band9 > 0 and crumb.size / band9 >= 0.02:
-            codesF = [_code_of(seg, f[0], f[1]) for f in _fbf]
-            if all(c9 is not None for c9 in codesF):
-                import wdb_kernels as _WK
-                bufF = np.frombuffer(seg.buf, np.uint8)
-                fl9 = []
-                for f9, c9 in zip(_fbf, codesF):
-                    ca = seg.cols[f9[0]]
-                    fl9.append((np.ascontiguousarray(np.frombuffer(seg.buf, np.int64,
-                                int(ca['pXnblk']), ca['pXdir'])),
-                                int(ca['pXpay']), int(ca['pXbits']),
-                                int(c9), bool(f9[2])))
-                ks9 = []
-                for p9 in _fbp:
-                    kc9 = seg.cols[p9['col']]
-                    ks9.append((seg.vplanes(p9['col']), int(kc9['nwords']),
-                                int(kc9['bits'])))
-                uk9, uc9, wl9 = _WK.fused_band_group(bufF, fl9, ks9, crumb, blo9, bhi9)
-                fields9 = np.empty((len(_fbp), uk9.size), np.int64)
-                acc9 = sum(wl9)
-                for i9, b9 in enumerate(wl9):
-                    acc9 -= b9
-                    fields9[i9] = (uk9 >> acc9) & ((1 << b9) - 1)
-                _PHITS += 1
-                ucodes = fields9
-                ucnt = uc9
-                _fb_done = True
+        codesF = [_code_of(seg, f[0], f[1]) for f in _fbf]
+        emc9 = _code_of(seg, _fbe[0][0], _fbe[0][1]) if _fbe else None
+        if band9 > 0 and crumb.size / band9 >= 0.02 \
+                and all(c9 is not None for c9 in codesF):
+            import wdb_kernels as _WK
+            bufF = np.frombuffer(seg.buf, np.uint8)
+            cr9 = np.ascontiguousarray(crumb)
+            if _fbe and emc9 is None:
+                cr9 = cr9[:0]
+            fl9 = []
+            for f9, c9 in zip(_fbf, codesF):
+                ca = seg.cols[f9[0]]
+                fl9.append((np.ascontiguousarray(np.frombuffer(seg.buf, np.int64,
+                            int(ca['pXnblk']), ca['pXdir'])),
+                            int(ca['pXpay']), int(ca['pXbits']),
+                            int(c9), bool(f9[2])))
+            em9 = None
+            if _fbe and emc9 is not None and cr9.size:
+                ec9 = seg.cols[_fbe[0][0]]
+                w08 = (int(cr9[0]) // 64)
+                w18 = ((int(cr9[-1]) + 1 + 63) // 64)
+                em9 = np.zeros(w18 - w08, np.uint64)
+                _WK.vp_scan_eq_mask(seg.vplanes(_fbe[0][0]), int(ec9['nwords']),
+                                    int(ec9['bits']), int(emc9), w08, w18, em9)
+            ks9 = []
+            wl9 = []
+            for p9 in _fbp:
+                kc9 = seg.cols[p9['col']]
+                if kc9.get('code_enc') == 12:
+                    b9 = int(kc9['bits'])
+                    ks9.append(('p', seg.vplanes(p9['col']),
+                                int(kc9['nwords']), b9))
+                elif kc9.get('code_enc') == 6:
+                    b9 = max(1, int(kc9['V']).bit_length())
+                    pk9 = np.frombuffer(seg.buf, np.uint8,
+                                        int(kc9['czlen']), int(kc9['cstart']))
+                    ks9.append(('e6', pk9, np.asarray(kc9['e5hot']),
+                                np.asarray(kc9['e6warm']),
+                                np.asarray(kc9['e6wb']),
+                                np.asarray(kc9['e5patch']),
+                                np.asarray(kc9['e6o1']).astype(np.int64),
+                                np.asarray(kc9['e6o2']).astype(np.int64),
+                                np.int64(kc9['BR']), b9))
+                else:
+                    b9 = max(1, int(kc9['V']).bit_length())
+                    pk9 = np.frombuffer(seg.buf, np.uint8,
+                                        int(kc9['czlen']), int(kc9['cstart']))
+                    ks9.append(('e5', pk9, np.asarray(kc9['e5hot']),
+                                np.asarray(kc9['e5patch']),
+                                np.asarray(kc9['e5off']).astype(np.int64),
+                                np.int64(kc9['BR']), b9))
+                wl9.append(b9)
+            if cr9.size:
+                uk9, uc9, _ = _WK.fused_band_group(bufF, fl9, ks9, cr9,
+                                                   int(cr9[0]),
+                                                   int(cr9[-1]) + 1, em9)
+            else:
+                uk9 = np.empty(0, np.int64)
+                uc9 = np.empty(0, np.int64)
+            fields9 = np.empty((len(_fbp), uk9.size), np.int64)
+            acc9 = sum(wl9)
+            for i9, b9 in enumerate(wl9):
+                acc9 -= b9
+                fields9[i9] = (uk9 >> acc9) & ((1 << b9) - 1)
+            _PHITS += 1
+            ucodes = fields9
+            ucnt = uc9
+            _fb_done = True
+            crumb = crumb[:0]
+            spec = dict(spec)
+            spec['flags'] = []
+    # THE SELECTIVE-FIRST CUT: an enc-12 scalar flag is an equality the
+    # SNOWBALL tests word-parallel over the band -- maximally selective
+    # predicates run first, and everything downstream touches only their
+    # survivors. (Q41's URLHash = const was buried in per-row hygiene.)
+    _sf = [] if (_mo_done or _fb_done) else [f for f in spec['flags']
+           if f[2] != 'in' and seg.cols.get(f[0], {}).get('code_enc') == 12]
+    if _sf and crumb.size >= (1 << 15):
+        import wdb_kernels as _WK
+        blo8 = int(crumb[0]); bhi8 = int(crumb[-1]) + 1
+        w08 = blo8 // 64; w18 = (bhi8 + 63) // 64
+        keepF = None
+        rel8 = crumb - np.int64(w08 * 64)
+        done8 = []
+        for f8 in _sf:
+            c8 = _code_of(seg, f8[0], f8[1])
+            kc8 = seg.cols[f8[0]]
+            if f8[2] and c8 is None:
                 crumb = crumb[:0]
-                spec = dict(spec)
-                spec['flags'] = []
+                done8.append(f8)
+                continue
+            if c8 is None:
+                done8.append(f8)                 # neq missing value: all pass
+                continue
+            m8 = np.zeros(w18 - w08, np.uint64)
+            _WK.vp_scan_eq_mask(seg.vplanes(f8[0]), int(kc8['nwords']),
+                                int(kc8['bits']), int(c8), w08, w18, m8)
+            hit8 = (m8[rel8 >> 6] >> (rel8 & 63).astype(np.uint64)) \
+                & np.uint64(1)
+            k8 = hit8.astype(bool) if f8[2] else ~hit8.astype(bool)
+            keepF = k8 if keepF is None else (keepF & k8)
+            done8.append(f8)
+        if keepF is not None:
+            crumb = crumb[keepF]
+        if done8:
+            spec = dict(spec)
+            spec['flags'] = [f for f in spec['flags'] if f not in done8]
     flags9 = list(spec['flags'])
     # THE BAND-DECODE LAW (hygiene half): dense crumbs stream their band's
     # flag columns once instead of probing per row.

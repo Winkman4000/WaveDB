@@ -770,6 +770,103 @@ def vbits_pop(mask, out):
         out[i] = np.int64((x * np.uint64(0x0101010101010101)) >> np.uint64(56))
 
 
+_REV8 = np.array([int('{:08b}'.format(i)[::-1], 2) for i in range(256)],
+                 dtype=np.uint8)
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def flag1_pass(buf, d, p, blo, bhi, want_one, rev, fmb):
+    """ONE-BIT flags ARE bitmasks: the bitpack payload, byte-reversed to
+    the mask's bit order, IS the pass mask. Per block: 512 byte lookups.
+    Run-list blocks (rare for 1-bit) expand the slow way."""
+    B = 4096
+    k0 = blo // B
+    k1 = (bhi + B - 1) // B
+    for kb in prange(k1 - k0):
+        blk = k0 + kb
+        o = p + (d[blk] >> 1)
+        base = blk * B
+        start = base if base > blo else blo
+        if d[blk] & 1:
+            nr = np.int64(buf[o]) | (np.int64(buf[o + 1]) << 8)
+            ptr = o + 2
+            r = base
+            for _ in range(nr):
+                cnt = np.int64(buf[ptr]) | (np.int64(buf[ptr + 1]) << 8)
+                val = np.int64(buf[ptr + 2]) | (np.int64(buf[ptr + 3]) << 8)
+                ptr += 4
+                e = min(r + cnt, bhi)
+                ok = (val == 1) if want_one else (val == 0)
+                if ok and e > start:
+                    for rr in range(max(r, start), e):
+                        fmb[(rr - blo) >> 3] |= np.uint8(1 << (rr & 7))
+                r = r + cnt
+                if r >= bhi:
+                    break
+        else:
+            hi = min(base + B, bhi)
+            kk0 = (start - base) >> 3
+            nby = (hi - base) >> 3
+            ob = (base - blo) >> 3
+            if want_one:
+                for k in range(kk0, nby):
+                    fmb[ob + k] = rev[buf[o + k]]
+            else:
+                for k in range(kk0, nby):
+                    fmb[ob + k] = rev[buf[o + k]] ^ np.uint8(0xFF)
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _flag_pass(buf, d, p, b, c, eq, blo, bhi, fm):
+    """Surgery with the polarity RIGHT: SET bits where the test PASSES --
+    the passing majority arrives as long runs, so whole-word fills do
+    almost all the work; the AND into the crumb mask follows."""
+    B = 4096
+    k0 = blo // B
+    k1 = (bhi + B - 1) // B
+    for kb in prange(k1 - k0):
+        blk = k0 + kb
+        o = p + (d[blk] >> 1)
+        base = blk * B
+        a0 = base if base > blo else blo
+        a1 = base + B if base + B < bhi else bhi
+        if d[blk] & 1:
+            nr = np.int64(buf[o]) | (np.int64(buf[o + 1]) << 8)
+            ptr = o + 2
+            r = base
+            for _ in range(nr):
+                cnt = np.int64(buf[ptr]) | (np.int64(buf[ptr + 1]) << 8)
+                val = np.int64(buf[ptr + 2]) | (np.int64(buf[ptr + 3]) << 8)
+                ptr += 4
+                e = r + cnt
+                ok = (val == c) if eq else (val != c)
+                if ok:
+                    x0 = r if r > a0 else a0
+                    x1 = e if e < a1 else a1
+                    rr = x0
+                    while rr < x1:
+                        w = (rr - blo) >> 6
+                        if (rr & 63) == 0 and rr + 64 <= x1:
+                            fm[w] = ~np.uint64(0)
+                            rr += 64
+                        else:
+                            fm[w] |= np.uint64(1) << np.uint64(rr & 63)
+                            rr += 1
+                r = e
+                if r >= bhi:
+                    break
+        else:
+            for rr in range(a0, a1):
+                idx = (rr - base) * b
+                v = np.int64(0)
+                for bi in range(b):
+                    ix = idx + bi
+                    v = (v << 1) | ((np.int64(buf[o + (ix >> 3)]) >> (7 - (ix & 7))) & 1)
+                ok = (v == c) if eq else (v != c)
+                if ok:
+                    fm[(rr - blo) >> 6] |= np.uint64(1) << np.uint64(rr & 63)
+
+
 @njit(nogil=True, parallel=True, cache=True)
 def _flag_mask(buf, d, p, b, c, eq, blo, bhi, mask):
     """Hygiene as MASK SURGERY: decode the flag's band block by block and
@@ -1055,61 +1152,156 @@ def morsel_group(crumb, buf,
             gcounts[t] = m                       # rows mode: survivors only
 
 
-def fused_band_group(buf, fl, keys, crumb, blo, bhi):
-    """THE FUSED BAND GROUP: Jackson's integration decree -- every stage
-    numba-to-numba, one Python entry, zero interpreter between mask
-    surgery, lockstep decode, radix, and the walk.
-    fl: list of (dirs, pay, bits, code, eq) enc-10 flags (<=2)
-    keys: list of (planes, nwords, bits) enc-12 keys (<=3)
-    Returns (packed sorted-unique keys, counts, widths)."""
+@njit(nogil=True, parallel=True, cache=True)
+def enc6_range(packed, hot, warm, wbytes, patches, e1off, e2off,
+               blo, bhi, BR, out):
+    """THE STREAMING MORSEL's missing machine: decode enc-6 rows [blo,bhi)
+    sequentially, bucket by bucket -- escape cursors walk from each
+    bucket's start, writes land band-relative."""
+    b0 = blo // BR
+    b1 = (bhi + BR - 1) // BR
+    for bb in prange(b1 - b0):
+        b = b0 + bb
+        lo = b * BR
+        hi = lo + BR
+        if hi > bhi:
+            hi = bhi
+        p1 = e1off[b]
+        p2 = e2off[b]
+        for i in range(lo, hi):
+            byte = packed[i >> 1]
+            if (i & 1) == 0:
+                v = np.int64(byte & 0x0F)
+            else:
+                v = np.int64(byte >> 4)
+            if v < 15:
+                x = hot[v]
+            else:
+                w = np.int64(wbytes[p1])
+                p1 += 1
+                if w < 255:
+                    x = warm[w]
+                else:
+                    x = patches[p2]
+                    p2 += 1
+            if i >= blo:
+                out[i - blo] = x
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def enc5_range(packed, hot, patches, eoff, blo, bhi, BR, out):
+    """enc-5's band decode: hot nibble -> u16 patch, one escape tier."""
+    b0 = blo // BR
+    b1 = (bhi + BR - 1) // BR
+    for bb in prange(b1 - b0):
+        b = b0 + bb
+        lo = b * BR
+        hi = lo + BR
+        if hi > bhi:
+            hi = bhi
+        p2 = eoff[b]
+        for i in range(lo, hi):
+            byte = packed[i >> 1]
+            if (i & 1) == 0:
+                v = np.int64(byte & 0x0F)
+            else:
+                v = np.int64(byte >> 4)
+            if v < 15:
+                x = hot[v]
+            else:
+                x = patches[p2]
+                p2 += 1
+            if i >= blo:
+                out[i - blo] = x
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def band_pick(band, mask, ob, out, CHW):
+    """Compact a band-relative value array by the surviving mask --
+    sequential reads of freshly written cache-warm bytes."""
+    nch = ob.size
+    for cix in prange(nch):
+        a0 = cix * CHW
+        a1 = min(mask.size, a0 + CHW)
+        k = ob[cix]
+        for w in range(a0, a1):
+            mw = mask[w]
+            base = w * 64
+            while mw != np.uint64(0):
+                t = mw & ((~mw) + np.uint64(1))
+                x = t - np.uint64(1)
+                x = x - ((x >> np.uint64(1)) & np.uint64(0x5555555555555555))
+                x = (x & np.uint64(0x3333333333333333)) + ((x >> np.uint64(2)) & np.uint64(0x3333333333333333))
+                x = (x + (x >> np.uint64(4))) & np.uint64(0x0F0F0F0F0F0F0F0F)
+                j = int((x * np.uint64(0x0101010101010101)) >> np.uint64(56))
+                mw ^= t
+                out[k] = np.int64(band[base + j])
+                k += 1
+
+
+def fused_band_group(buf, fl, keys, crumb, blo, bhi, emask=None):
+    """THE STREAMING MORSEL: every stage a sequential band pass, zero
+    per-row random touches. fl: enc-10 flags (mask surgery). emask: an
+    optional pre-built snowball match mask (enc-12 equality), ANDed in.
+    keys: ('p', planes, nwords, bits) or ('e6', packed, hot, warm,
+    wbytes, patches, o1, o2, BR, bits). Returns (packed keys, counts,
+    widths)."""
     w0 = blo // 64
     w1 = (bhi + 63) // 64
     mask = np.zeros(w1 - w0, np.uint64)
     vbits_set(np.ascontiguousarray(crumb) - np.int64(w0 * 64), mask)
     for (d, p, b, c, eq) in fl:
-        _flag_mask(buf, d, p, b, c, eq, w0 * 64, bhi, mask)
+        fm = np.zeros(w1 - w0, np.uint64)
+        if b == 1 and c in (0, 1):
+            want_one = (c == 1) if eq else (c == 0)
+            flag1_pass(buf, d, p, w0 * 64, bhi, want_one, _REV8,
+                       fm.view(np.uint8))
+        else:
+            _flag_pass(buf, d, p, b, c, eq, w0 * 64, bhi, fm)
+        np.bitwise_and(mask, fm, out=mask)
+    if emask is not None:
+        np.bitwise_and(mask, emask, out=mask)
     CHW = 1024
     nch = (mask.size + CHW - 1) // CHW
     ob = np.zeros(nch, np.int64)
     tot = _offsets_from_mask(mask, CHW, ob)
+    widths = [k[-1] for k in keys]
     if tot == 0:
-        return np.empty(0, np.int64), np.empty(0, np.int64), [b for (_, _, b) in keys]
+        return np.empty(0, np.int64), np.empty(0, np.int64), widths
     comp = np.zeros(tot, np.int64)
+    tmp = np.empty(tot, np.int64)
+    band6 = None
+    rows2 = None
     accb = 0
-    if tot / max(1, (bhi - w0 * 64)) < 0.02:
-        # THE RE-ELECTION: hygiene changed the density regime -- read key
-        # bits ONLY for the survivors, never for rows surgery killed.
-        rows2 = np.empty(tot, np.int64)
-        mask_to_rows(mask, w0, ob, rows2, 1024)
-        tmpw = np.zeros(tot, np.uint16)
-        for (pl, nw, b) in keys:
-            if b > 16:
-                P = b - 12
-                vp_gather_span(pl, nw, 0, P, rows2, tmpw)
-                np.left_shift(comp, P, out=comp)
-                np.bitwise_or(comp, tmpw.astype(np.int64), out=comp)
-                vp_gather_span(pl, nw, P, b, rows2, tmpw)
-                np.left_shift(comp, b - P, out=comp)
-                np.bitwise_or(comp, tmpw.astype(np.int64), out=comp)
-            else:
-                vp_gather_span(pl, nw, 0, b, rows2, tmpw)
-                np.left_shift(comp, b, out=comp)
-                np.bitwise_or(comp, tmpw.astype(np.int64), out=comp)
-            accb += b
-    else:
-        tmp = np.empty(tot, np.int64)
-        for (pl, nw, b) in keys:
+    for k in keys:
+        if k[0] == 'p':
+            _, pl, nw, b = k
             vp_gather_band(pl, nw, b, mask, w0, w1, ob, tmp)
-            np.left_shift(comp, b, out=comp)
-            np.bitwise_or(comp, tmp, out=comp)
-            accb += b
+        elif k[0] == 'e6':
+            _, pk, hot, warm, wb, pt, o1, o2, BR, b = k
+            if rows2 is None:
+                rows2 = np.empty(tot, np.int64)
+                mask_to_rows(mask, w0, ob, rows2, CHW)
+            v6 = enc6_at2(pk, hot, warm, wb, pt, o1, o2, rows2,
+                          np.int64(bhi), np.int64(BR))
+            tmp[:] = v6.astype(np.int64)
+        else:
+            _, pk, hot, pt, o1, BR, b = k
+            if rows2 is None:
+                rows2 = np.empty(tot, np.int64)
+                mask_to_rows(mask, w0, ob, rows2, CHW)
+            v5 = enc5_at2(pk, hot, pt, o1, rows2, np.int64(bhi), np.int64(BR))
+            tmp[:] = v5.astype(np.int64)
+        np.left_shift(comp, b, out=comp)
+        np.bitwise_or(comp, tmp, out=comp)
+        accb += b
     t_k = np.empty(tot, np.int64)
     ks = _radix_inplace(comp, t_k, accb, 1 << 16)
     bnd = np.flatnonzero(np.diff(ks) != 0)
     st = np.concatenate([[0], bnd + 1])
     uk = ks[st]
     uc = np.diff(np.concatenate([st, [ks.size]])).astype(np.int64)
-    return uk, uc, [b for (_, _, b) in keys]
+    return uk, uc, widths
 
 
 @njit(nogil=True, parallel=True, cache=True)
