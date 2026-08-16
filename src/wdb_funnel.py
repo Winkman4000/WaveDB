@@ -584,6 +584,131 @@ def execute(seg, spec):
     # is (<=3 enc-12 keys, <=2 scalar enc-10 flags, no strneq, dense band),
     # every stage runs numba-to-numba in one entry -- hygiene as mask
     # surgery, lockstep decode, radix, walk -- zero interpreter between.
+    # THE COMPOSED LANE (Q40's shape): stair keys and enc-3 flags join the
+    # stream -- every op a measured kernel, the glue microseconds. Fires
+    # only when a staircase key or an enc-3 flag is present; pure shapes
+    # keep the fused kernel below.
+    _fs_done = False
+    _fsp = spec['plans']
+    _fs10 = [f for f in spec['flags'] if f[2] != 'in'
+             and seg.cols.get(f[0], {}).get('code_enc') == 10]
+    _fs12 = [f for f in spec['flags'] if f[2] != 'in' and f[2]
+             and seg.cols.get(f[0], {}).get('code_enc') == 12]
+    _fs3 = [f for f in spec['flags']
+            if seg.cols.get(f[0], {}).get('code_enc') == 3]
+    _hasst = any(p['kind'] == 'col'
+                 and seg.cols.get(p['col'], {}).get('code_enc') == 2
+                 and seg.cols.get(p['col'], {}).get('mode') == 0
+                 for p in _fsp)
+    if (not _mo_done and crumb.size >= (1 << 15) and not spec['strneq']
+            and (_hasst or _fs3)
+            and (not _fs3 or (int(crumb[-1]) + 1 - int(crumb[0])) <= (1 << 22))
+            and len(_fs10) + len(_fs12) + len(_fs3) == len(spec['flags'])
+            and len(_fs10) <= 2 and len(_fs12) <= 1 and len(_fs3) <= 1
+            and 1 <= len(_fsp) <= 3 and all(p['kind'] == 'col' for p in _fsp)
+            and all((seg.cols.get(p['col'], {}).get('code_enc') == 12
+                     or (seg.cols.get(p['col'], {}).get('code_enc') == 2
+                         and seg.cols.get(p['col'], {}).get('mode') == 0))
+                    and not seg.cols[p['col']].get('has_null') for p in _fsp)
+            and sum(max(1, int(seg.cols[p['col']].get('V', 2)).bit_length())
+                    for p in _fsp) <= 62
+            and spec['off'] + spec['k'] <= 100000):
+        blo9 = int(crumb[0]); bhi9 = int(crumb[-1]) + 1
+        band9 = bhi9 - blo9
+        codesA = [_code_of(seg, f[0], f[1]) for f in _fs10]
+        emcA = _code_of(seg, _fs12[0][0], _fs12[0][1]) if _fs12 else None
+        if band9 > 0 and crumb.size / band9 >= 0.02 \
+                and all(c9 is not None for c9 in codesA):
+            import wdb_kernels as _WK
+            bufF = np.frombuffer(seg.buf, np.uint8)
+            cr9 = np.ascontiguousarray(crumb)
+            if _fs12 and emcA is None:
+                cr9 = cr9[:0]
+            uk9 = np.empty(0, np.int64)
+            uc9 = np.empty(0, np.int64)
+            wl9 = [max(1, int(seg.cols[p['col']].get('V', 2)).bit_length())
+                   for p in _fsp]
+            if cr9.size:
+                w08 = blo9 // 64
+                w18 = (bhi9 + 63) // 64
+                mask9 = np.zeros(w18 - w08, np.uint64)
+                _WK.vbits_set(cr9 - np.int64(w08 * 64), mask9)
+                for f9, c9 in zip(_fs10, codesA):
+                    ca = seg.cols[f9[0]]
+                    d9 = np.ascontiguousarray(np.frombuffer(seg.buf, np.int64,
+                            int(ca['pXnblk']), ca['pXdir']))
+                    fm9 = np.zeros(w18 - w08, np.uint64)
+                    if int(ca['pXbits']) == 1 and c9 in (0, 1):
+                        wone9 = (c9 == 1) if f9[2] else (c9 == 0)
+                        _WK.flag1_pass(bufF, d9, int(ca['pXpay']), w08 * 64,
+                                       bhi9, wone9, _WK._REV8, fm9.view(np.uint8))
+                    else:
+                        _WK._flag_pass(bufF, d9, int(ca['pXpay']),
+                                       int(ca['pXbits']), int(c9),
+                                       bool(f9[2]), w08 * 64, bhi9, fm9)
+                    np.bitwise_and(mask9, fm9, out=mask9)
+                if _fs12 and emcA is not None:
+                    ec9 = seg.cols[_fs12[0][0]]
+                    em9 = np.zeros(w18 - w08, np.uint64)
+                    _WK.vp_scan_eq_mask(seg.vplanes(_fs12[0][0]),
+                                        int(ec9['nwords']), int(ec9['bits']),
+                                        int(emcA), w08, w18, em9)
+                    np.bitwise_and(mask9, em9, out=mask9)
+                for f9 in _fs3:
+                    v9 = np.asarray(seg.values_range(f9[0], w08 * 64, bhi9))
+                    if f9[2] == 'in':
+                        p9m = np.zeros(v9.size, bool)
+                        for lit9 in f9[1]:
+                            p9m |= (v9 == lit9)
+                    elif f9[2]:
+                        p9m = (v9 == f9[1])
+                    else:
+                        p9m = (v9 != f9[1])
+                    pb9 = np.packbits(p9m, bitorder='little')
+                    fm9 = np.zeros(w18 - w08, np.uint64)
+                    fm9.view(np.uint8)[:pb9.size] = pb9
+                    np.bitwise_and(mask9, fm9, out=mask9)
+                CHW9 = 1024
+                nch9 = (mask9.size + CHW9 - 1) // CHW9
+                ob9 = np.zeros(nch9, np.int64)
+                tot9 = _WK._offsets_from_mask(mask9, CHW9, ob9)
+                if tot9:
+                    rows9 = np.empty(tot9, np.int64)
+                    _WK.mask_to_rows(mask9, w08, ob9, rows9, CHW9)
+                    comp9 = np.zeros(tot9, np.int64)
+                    tmp9 = np.empty(tot9, np.int64)
+                    accb9 = 0
+                    for p9, b9 in zip(_fsp, wl9):
+                        kc9 = seg.cols[p9['col']]
+                        if kc9.get('code_enc') == 12:
+                            _WK.vp_gather_band(seg.vplanes(p9['col']),
+                                               int(kc9['nwords']),
+                                               int(kc9['bits']), mask9,
+                                               w08, w18, ob9, tmp9)
+                        else:
+                            st9 = seg.stairs(p9['col'])
+                            tmp9[:] = np.searchsorted(st9, rows9,
+                                                      side='right')
+                        np.left_shift(comp9, b9, out=comp9)
+                        np.bitwise_or(comp9, tmp9, out=comp9)
+                        accb9 += b9
+                    ks9s = _WK.radix_sortN(comp9, accb9)
+                    bd9 = np.flatnonzero(np.diff(ks9s) != 0)
+                    st9x = np.concatenate([[0], bd9 + 1])
+                    uk9 = ks9s[st9x]
+                    uc9 = np.diff(np.concatenate([st9x, [ks9s.size]])).astype(np.int64)
+            fields9 = np.empty((len(_fsp), uk9.size), np.int64)
+            acc9 = sum(wl9)
+            for i9, b9 in enumerate(wl9):
+                acc9 -= b9
+                fields9[i9] = (uk9 >> acc9) & ((1 << b9) - 1)
+            _PHITS += 1
+            ucodes = fields9
+            ucnt = uc9
+            _fs_done = True
+            crumb = crumb[:0]
+            spec = dict(spec)
+            spec['flags'] = []
     _fb_done = False
     _fbf = [f for f in spec['flags'] if f[2] != 'in'
             and seg.cols.get(f[0], {}).get('code_enc') == 10]
@@ -676,7 +801,7 @@ def execute(seg, spec):
     # SNOWBALL tests word-parallel over the band -- maximally selective
     # predicates run first, and everything downstream touches only their
     # survivors. (Q41's URLHash = const was buried in per-row hygiene.)
-    _sf = [] if (_mo_done or _fb_done) else [f for f in spec['flags']
+    _sf = [] if (_fs_done or _mo_done or _fb_done) else [f for f in spec['flags']
            if f[2] != 'in' and seg.cols.get(f[0], {}).get('code_enc') == 12]
     if _sf and crumb.size >= (1 << 15):
         import wdb_kernels as _WK
@@ -833,7 +958,7 @@ def execute(seg, spec):
     # the single-word engine. Empty-string hygiene folds into dropped
     # field-0 groups.
     prefixed = False
-    if _mo_done or _fb_done:
+    if _fs_done or _mo_done or _fb_done:
         _pg_plans = None
     if _pg_plans is not None:
         import wdb_kernels as _WK
@@ -944,7 +1069,7 @@ def execute(seg, spec):
         ucnt = uc9
         prefixed = True
     packed = sum(widths) <= 62                   # one int64 when it fits,
-    if _mo_done or _fb_done or prefixed:
+    if _fs_done or _mo_done or _fb_done or prefixed:
         pass                                     # counts already stand
     elif crumb.size == 0:                        # lexsort when it doesn't
         ucodes = np.empty((len(plans), 0), np.int64); ucnt = np.empty(0, np.int64)
