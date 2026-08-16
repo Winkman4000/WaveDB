@@ -889,6 +889,172 @@ def mask_to_rows(mask, w0, ob, out, CHW):
                 k += 1
 
 
+@njit(nogil=True, cache=True)
+def _morsel_body(crumb, lo, hi, buf,
+                 d1, p1, b1, c1, eq1, d2, p2, b2, c2, eq2, nflags,
+                 emask, ebase, has_em,
+                 pl1, nw1, kb1, pl2, nw2, kb2, pl3, nw3, kb3, nkeys,
+                 okeys, obase):
+    """One cook's COMPLETE pipeline over its crumb slice: kill-ordered
+    tests (snowball mask bit, then monotone flag cursors), key bits read
+    only for survivors, packed keys appended locally. No barriers inside."""
+    B = 4096
+    blkA = np.int64(-1); ptrA = np.int64(0); endA = np.int64(-1)
+    valA = np.int64(0); bpoA = np.int64(0); bitA = False
+    blkB = np.int64(-1); ptrB = np.int64(0); endB = np.int64(-1)
+    valB = np.int64(0); bpoB = np.int64(0); bitB = False
+    k = obase
+    for i in range(lo, hi):
+        r = crumb[i]
+        if has_em:
+            rr = r - ebase
+            if ((emask[rr >> 6] >> np.uint64(rr & 63)) & np.uint64(1)) == np.uint64(0):
+                continue
+        ok = True
+        if nflags >= 1:
+            bb = r // B
+            if bb != blkA:
+                blkA = bb
+                o = p1 + (d1[bb] >> 1)
+                if d1[bb] & 1:
+                    bitA = False
+                    ptrA = o + 2
+                    endA = bb * B
+                    valA = -1
+                else:
+                    bitA = True
+                    bpoA = o
+            if bitA:
+                rr2 = (r - blkA * B) * b1
+                v1 = np.int64(0)
+                for bi in range(b1):
+                    ix = rr2 + bi
+                    v1 = (v1 << 1) | ((np.int64(buf[bpoA + (ix >> 3)]) >> (7 - (ix & 7))) & 1)
+            else:
+                while r >= endA:
+                    cnt = np.int64(buf[ptrA]) | (np.int64(buf[ptrA + 1]) << 8)
+                    valA = np.int64(buf[ptrA + 2]) | (np.int64(buf[ptrA + 3]) << 8)
+                    ptrA += 4
+                    endA += cnt
+                v1 = valA
+            ok = (v1 == c1) if eq1 else (v1 != c1)
+        if ok and nflags >= 2:
+            bb = r // B
+            if bb != blkB:
+                blkB = bb
+                o = p2 + (d2[bb] >> 1)
+                if d2[bb] & 1:
+                    bitB = False
+                    ptrB = o + 2
+                    endB = bb * B
+                    valB = -1
+                else:
+                    bitB = True
+                    bpoB = o
+            if bitB:
+                rr2 = (r - blkB * B) * b2
+                v2 = np.int64(0)
+                for bi in range(b2):
+                    ix = rr2 + bi
+                    v2 = (v2 << 1) | ((np.int64(buf[bpoB + (ix >> 3)]) >> (7 - (ix & 7))) & 1)
+            else:
+                while r >= endB:
+                    cnt = np.int64(buf[ptrB]) | (np.int64(buf[ptrB + 1]) << 8)
+                    valB = np.int64(buf[ptrB + 2]) | (np.int64(buf[ptrB + 3]) << 8)
+                    ptrB += 4
+                    endB += cnt
+                v2 = valB
+            ok = (v2 == c2) if eq2 else (v2 != c2)
+        if not ok:
+            continue
+        if nkeys == 0:
+            okeys[k] = r                         # rows mode: emit the row
+            k += 1
+            continue
+        w = r // 64
+        j = np.uint64(r % 64)
+        key = np.int64(0)
+        for p in range(kb1):
+            key = (key << 1) | np.int64((pl1[p * nw1 + w] >> j) & np.uint64(1))
+        if nkeys >= 2:
+            for p in range(kb2):
+                key = (key << 1) | np.int64((pl2[p * nw2 + w] >> j) & np.uint64(1))
+        if nkeys >= 3:
+            for p in range(kb3):
+                key = (key << 1) | np.int64((pl3[p * nw3 + w] >> j) & np.uint64(1))
+        okeys[k] = key
+        k += 1
+    return k - obase
+
+
+@njit(nogil=True, cache=True)
+def _local_sort_walk(keys, n, bits, tmp, uk, uc):
+    """One cook's private count: serial LSD radix on its survivors, then
+    the run walk -- L1 bowls, no contention with any other cook."""
+    src = keys
+    dst = tmp
+    sh = 0
+    while sh < bits:
+        hist = np.zeros(4096, np.int64)
+        for i in range(n):
+            hist[(src[i] >> sh) & 0xFFF] += 1
+        tot = 0
+        for d in range(4096):
+            h = hist[d]
+            hist[d] = tot
+            tot += h
+        for i in range(n):
+            dg = (src[i] >> sh) & 0xFFF
+            dst[hist[dg]] = src[i]
+            hist[dg] += 1
+        src, dst = dst, src
+        sh += 12
+    g = 0
+    i = 0
+    while i < n:
+        v = src[i]
+        c = 1
+        i += 1
+        while i < n and src[i] == v:
+            c += 1
+            i += 1
+        uk[g] = v
+        uc[g] = c
+        g += 1
+    return g
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def morsel_group(crumb, buf,
+                 d1, p1, b1, c1, eq1, d2, p2, b2, c2, eq2, nflags,
+                 emask, ebase, has_em,
+                 pl1, nw1, kb1, pl2, nw2, kb2, pl3, nw3, kb3, nkeys,
+                 kbits, NT, okeys, tmp, uks, ucs, gcounts):
+    """JACKSON'S MORSEL DOCTRINE: partition the crumb ONCE, then every
+    thread runs the WHOLE pipeline -- kill-ordered filters, survivor-only
+    key reads, private radix count -- with a single barrier at the end.
+    The reading-aloud collapses to the combine."""
+    n = crumb.size
+    per = (n + NT - 1) // NT
+    for t in prange(NT):
+        lo = t * per
+        hi = min(n, lo + per)
+        if lo >= hi:
+            gcounts[t] = 0
+            continue
+        m = _morsel_body(crumb, lo, hi, buf,
+                         d1, p1, b1, c1, eq1, d2, p2, b2, c2, eq2, nflags,
+                         emask, ebase, has_em,
+                         pl1, nw1, kb1, pl2, nw2, kb2, pl3, nw3, kb3, nkeys,
+                         okeys, lo)
+        if nkeys >= 1:
+            gcounts[t] = _local_sort_walk(okeys[lo:lo + m], m, kbits,
+                                          tmp[lo:lo + m], uks[lo:lo + m],
+                                          ucs[lo:lo + m])
+        else:
+            gcounts[t] = m                       # rows mode: survivors only
+
+
 def fused_band_group(buf, fl, keys, crumb, blo, bhi):
     """THE FUSED BAND GROUP: Jackson's integration decree -- every stage
     numba-to-numba, one Python entry, zero interpreter between mask
@@ -1652,6 +1818,16 @@ def warm():
         vp_scan_flag_count(_vp, 1, 2, 0, 4, _fl2, _vc, 64)
         _po2 = np.zeros(max(1, int(_vc[0])), np.int64)
         vp_scan_flag_fill(_vp, 1, 2, 0, 4, _fl2, np.array([0, int(_vc[0])], np.int64), _po2, 64)
+        _mc = np.array([0, 1, 2, 3], np.int64)
+        _mo = np.empty(4, np.int64); _mt = np.empty(4, np.int64)
+        _mu = np.empty(4, np.int64); _mv = np.empty(4, np.int64)
+        _mg = np.zeros(2, np.int64)
+        morsel_group(_mc, _bw,
+                     np.array([1], np.int64), 0, 1, 0, True,
+                     np.array([1], np.int64), 0, 1, 0, True, 0,
+                     np.zeros(1, np.uint64), 0, False,
+                     _vp, 1, 2, _vp, 1, 2, _vp, 1, 2, 1,
+                     2, 2, _mo, _mt, _mu, _mv, _mg)
         _sm = np.zeros(1, np.uint64)
         vp_scan_eq_mask(_vp, 1, 2, 1, 0, 1, _sm)
         _br = np.zeros(3, np.int16)

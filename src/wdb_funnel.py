@@ -478,6 +478,143 @@ def execute(seg, spec):
         if done8:
             spec = dict(spec)
             spec['flags'] = [f for f in spec['flags'] if f not in done8]
+    # JACKSON'S MORSEL DOCTRINE: partition the crumb once, sixteen full
+    # pipelines, one combine. Covers <=3 enc-12 keys, <=2 scalar enc-10
+    # flags, plus one enc-12 equality flag via a pre-built snowball mask.
+    _mo_done = False
+    _mof = [f for f in spec['flags'] if f[2] != 'in'
+            and seg.cols.get(f[0], {}).get('code_enc') == 10]
+    _moe = [f for f in spec['flags'] if f[2] != 'in'
+            and seg.cols.get(f[0], {}).get('code_enc') == 12 and f[2]]
+    _mop = spec['plans']
+    if (crumb.size >= (1 << 15) and not spec['strneq']
+            and len(_mof) + len(_moe) == len(spec['flags'])
+            and len(_mof) <= 2 and len(_moe) <= 1
+            and 1 <= len(_mop) <= 3 and all(p['kind'] == 'col' for p in _mop)
+            and all(seg.cols.get(p['col'], {}) and not seg.cols[p['col']].get('has_null') for p in _mop)
+            and sum(max(1, int(seg.cols[p['col']].get('V', 2)).bit_length()) for p in _mop) <= 62
+            and spec['off'] + spec['k'] <= 100000):
+        import wdb_kernels as _WK
+        codesF = [_code_of(seg, f[0], f[1]) for f in _mof]
+        emc = _code_of(seg, _moe[0][0], _moe[0][1]) if _moe else None
+        if all(c9 is not None for c9 in codesF):
+            bufF = np.frombuffer(seg.buf, np.uint8)
+            cr9 = np.ascontiguousarray(crumb)
+            if _moe and emc is None:
+                cr9 = cr9[:0]                    # eq on absent value: empty
+            has_em = bool(_moe) and emc is not None
+            if has_em:
+                ec9 = seg.cols[_moe[0][0]]
+                blo9 = int(cr9[0]); bhi9 = int(cr9[-1]) + 1
+                w08 = blo9 // 64; w18 = (bhi9 + 63) // 64
+                em9 = np.zeros(w18 - w08, np.uint64)
+                _WK.vp_scan_eq_mask(seg.vplanes(_moe[0][0]), int(ec9['nwords']),
+                                    int(ec9['bits']), int(emc), w08, w18, em9)
+                ebase9 = w08 * 64
+            else:
+                em9 = np.zeros(1, np.uint64)
+                ebase9 = 0
+            def _fd9(f9):
+                ca = seg.cols[f9[0]]
+                return (np.ascontiguousarray(np.frombuffer(seg.buf, np.int64,
+                        int(ca['pXnblk']), ca['pXdir'])),
+                        int(ca['pXpay']), int(ca['pXbits']))
+            if len(_mof) >= 1:
+                da9, pa9, ba9 = _fd9(_mof[0])
+            else:
+                da9, pa9, ba9 = np.zeros(1, np.int64), 0, 1
+            if len(_mof) >= 2:
+                db9, pb9, bb9 = _fd9(_mof[1])
+            else:
+                db9, pb9, bb9 = np.zeros(1, np.int64), 0, 1
+            all12 = all(seg.cols[p9['col']].get('code_enc') == 12 for p9 in _mop)
+            kp9 = []
+            wl9 = []
+            for p9 in _mop:
+                kc9 = seg.cols[p9['col']]
+                wl9.append(max(1, int(kc9.get('V', 2)).bit_length()))
+                if all12:
+                    kp9.append((seg.vplanes(p9['col']), int(kc9['nwords']),
+                                int(kc9['bits'])))
+            if all12:
+                wl9 = [int(seg.cols[p9['col']]['bits']) for p9 in _mop]
+            dummy9 = np.zeros(2, np.uint64)
+            while len(kp9) < 3:
+                kp9.append(kp9[0] if kp9 else (dummy9, 1, 1))
+            kbits9 = sum(wl9)
+            nkeys9 = len(_mop) if all12 else 0
+            NT9 = 16
+            n9 = cr9.size
+            ok9 = np.empty(n9, np.int64)
+            tm9 = np.empty(n9, np.int64)
+            uk9a = np.empty(n9, np.int64)
+            uc9a = np.empty(n9, np.int64)
+            gc9 = np.zeros(NT9, np.int64)
+            if n9:
+                _WK.morsel_group(cr9, bufF,
+                                 da9, pa9, ba9,
+                                 int(codesF[0]) if len(_mof) >= 1 else 0,
+                                 bool(_mof[0][2]) if len(_mof) >= 1 else True,
+                                 db9, pb9, bb9,
+                                 int(codesF[1]) if len(_mof) >= 2 else 0,
+                                 bool(_mof[1][2]) if len(_mof) >= 2 else True,
+                                 len(_mof), em9, ebase9, has_em,
+                                 kp9[0][0], kp9[0][1], kp9[0][2],
+                                 kp9[1][0], kp9[1][1], kp9[1][2],
+                                 kp9[2][0], kp9[2][1], kp9[2][2], nkeys9,
+                                 kbits9, NT9, ok9, tm9, uk9a, uc9a, gc9)
+            per9 = (n9 + NT9 - 1) // NT9 if n9 else 0
+            if nkeys9 == 0 and n9:
+                # rows mode: the morsel filtered in parallel; key + count the
+                # small survivor set through the engine's any-encoding reads
+                parts_r = [ok9[t * per9:t * per9 + int(gc9[t])] for t in range(NT9)]
+                rows9 = np.concatenate(parts_r) if parts_r else np.empty(0, np.int64)
+                allk9 = np.zeros(rows9.size, np.int64)
+                for p9, b9 in zip(_mop, wl9):
+                    f9 = np.asarray(seg.codes_at(p9['col'], rows9)).astype(np.int64)
+                    np.left_shift(allk9, b9, out=allk9)
+                    np.bitwise_or(allk9, f9, out=allk9)
+                if allk9.size:
+                    allk9 = _WK.radix_sortN(allk9, kbits9)
+                    bd9 = np.flatnonzero(np.diff(allk9) != 0)
+                    st9 = np.concatenate([[0], bd9 + 1])
+                    uk9 = allk9[st9]
+                    uc9 = np.diff(np.concatenate([st9, [allk9.size]])).astype(np.int64)
+                else:
+                    uk9 = np.empty(0, np.int64)
+                    uc9 = np.empty(0, np.int64)
+                allk9 = np.empty(0, np.int64)
+                allc9 = np.empty(0, np.int64)
+            else:
+                parts_k = [uk9a[t * per9:t * per9 + int(gc9[t])] for t in range(NT9)] if n9 else []
+                parts_c = [uc9a[t * per9:t * per9 + int(gc9[t])] for t in range(NT9)] if n9 else []
+                allk9 = np.concatenate(parts_k) if parts_k else np.empty(0, np.int64)
+                allc9 = np.concatenate(parts_c) if parts_c else np.empty(0, np.int64)
+            if nkeys9 == 0 and n9:
+                pass                             # uk9/uc9 already stand
+            elif allk9.size:
+                o9 = np.argsort(allk9, kind='stable')
+                sk9 = allk9[o9]
+                sc9 = allc9[o9]
+                bd9 = np.flatnonzero(np.diff(sk9) != 0)
+                st9 = np.concatenate([[0], bd9 + 1])
+                uk9 = sk9[st9]
+                uc9 = np.add.reduceat(sc9, st9)
+            else:
+                uk9 = np.empty(0, np.int64)
+                uc9 = np.empty(0, np.int64)
+            fields9 = np.empty((len(_mop), uk9.size), np.int64)
+            acc9 = kbits9
+            for i9, b9 in enumerate(wl9):
+                acc9 -= b9
+                fields9[i9] = (uk9 >> acc9) & ((1 << b9) - 1)
+            _PHITS += 1
+            ucodes = fields9
+            ucnt = uc9.astype(np.int64)
+            _mo_done = True
+            crumb = crumb[:0]
+            spec = dict(spec)
+            spec['flags'] = []
     # THE FUSED BAND GROUP: Jackson's integration decree. When the shape
     # is (<=3 enc-12 keys, <=2 scalar enc-10 flags, no strneq, dense band),
     # every stage runs numba-to-numba in one entry -- hygiene as mask
@@ -485,7 +622,7 @@ def execute(seg, spec):
     _fb_done = False
     _fbf = list(spec['flags'])
     _fbp = spec['plans']
-    if (crumb.size >= (1 << 15) and not spec['strneq'] and len(_fbf) <= 2
+    if (not _mo_done and crumb.size >= (1 << 15) and not spec['strneq'] and len(_fbf) <= 2
             and all(f[2] != 'in' for f in _fbf)
             and all(seg.cols.get(f[0], {}).get('code_enc') == 10 for f in _fbf)
             and 1 <= len(_fbp) <= 3 and all(p['kind'] == 'col' for p in _fbp)
@@ -648,7 +785,7 @@ def execute(seg, spec):
     # the single-word engine. Empty-string hygiene folds into dropped
     # field-0 groups.
     prefixed = False
-    if _fb_done:
+    if _mo_done or _fb_done:
         _pg_plans = None
     if _pg_plans is not None:
         import wdb_kernels as _WK
@@ -759,7 +896,7 @@ def execute(seg, spec):
         ucnt = uc9
         prefixed = True
     packed = sum(widths) <= 62                   # one int64 when it fits,
-    if _fb_done or prefixed:
+    if _mo_done or _fb_done or prefixed:
         pass                                     # counts already stand
     elif crumb.size == 0:                        # lexsort when it doesn't
         ucodes = np.empty((len(plans), 0), np.int64); ucnt = np.empty(0, np.int64)
