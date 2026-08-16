@@ -580,11 +580,23 @@ def execute(seg, spec):
             pl9 = seg.vplanes(p9['col'])
             blo9 = int(cr9[0]); bhi9 = int(cr9[-1]) + 1
             band9 = bhi9 - blo9
-            if b9 <= 16 and band9 > 0 and cr9.size / band9 >= 0.02 \
-                    and band9 * 8 <= (1 << 30):
-                outW = np.zeros(band9, np.uint64)
-                _WK.vp_window(pl9, nw9, b9, blo9, bhi9, outW)
-                return outW[cr9 - blo9].astype(np.int64)
+            if band9 > 0 and cr9.size / band9 >= 0.02:
+                # JACKSON'S LOCKSTEP GATHER: planes stream shoulder-to-
+                # shoulder across the band, output compacts by the mask
+                w0 = blo9 // 64
+                w1 = (bhi9 + 63) // 64
+                maskB = np.zeros(w1 - w0, np.uint64)
+                _WK.vbits_set(cr9 - np.int64(w0 * 64), maskB)
+                pcs = np.zeros(maskB.size, np.int64)
+                _WK.vbits_pop(maskB, pcs)
+                CHW = 1024
+                nch = (w1 - w0 + CHW - 1) // CHW
+                ob = np.zeros(nch, np.int64)
+                cs = np.add.reduceat(pcs, np.arange(0, pcs.size, CHW))
+                np.cumsum(cs[:-1], out=ob[1:])
+                outC = np.empty(cr9.size, np.int64)
+                _WK.vp_gather_band(pl9, nw9, b9, maskB, w0, w1, ob, outC)
+                return outC
             if b9 > 16:
                 P9 = b9 - 12
                 a9 = np.zeros(cr9.size, np.uint16)

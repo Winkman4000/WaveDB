@@ -751,6 +751,61 @@ def radix_sort24(keys):
     return radix_sortN(keys, 24)
 
 
+@njit(nogil=True, cache=True)
+def vbits_set(rows, mask):
+    """Positions -> bitmap: the crumb in mask currency."""
+    for i in range(rows.size):
+        r = rows[i]
+        mask[r >> 6] |= np.uint64(1) << np.uint64(r & 63)
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def vbits_pop(mask, out):
+    """Per-word popcounts: the lockstep gather's free output offsets."""
+    for i in prange(mask.size):
+        x = mask[i]
+        x = x - ((x >> np.uint64(1)) & np.uint64(0x5555555555555555))
+        x = (x & np.uint64(0x3333333333333333)) + ((x >> np.uint64(2)) & np.uint64(0x3333333333333333))
+        x = (x + (x >> np.uint64(4))) & np.uint64(0x0F0F0F0F0F0F0F0F)
+        out[i] = np.int64((x * np.uint64(0x0101010101010101)) >> np.uint64(56))
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def vp_gather_band(pl, nwords, bits, mask, w0, w1, obase, out):
+    """JACKSON'S LOCKSTEP GATHER: walk the band's word positions once,
+    all planes advancing shoulder-to-shoulder, transpose per word, emit
+    ONLY the masked rows' codes compacted -- offsets pre-paid by mask
+    popcounts, so every chunk writes its own slice with no contention.
+    Every plane word is read exactly once, sequentially."""
+    sh = np.uint64(64 - bits)
+    CHW = 1024
+    nch = (w1 - w0 + CHW - 1) // CHW
+    for cix in prange(nch):
+        a0 = w0 + cix * CHW
+        a1 = min(w1, a0 + CHW)
+        a = np.zeros(64, np.uint64)
+        k = obase[cix]
+        for w in range(a0, a1):
+            mw = mask[w - w0]
+            if mw == np.uint64(0):
+                continue
+            for p in range(bits):
+                a[p] = pl[p * nwords + w]
+            for p in range(bits, 64):
+                a[p] = np.uint64(0)
+            _t64(a)
+            while mw != np.uint64(0):
+                t = mw & ((~mw) + np.uint64(1))
+                x = t - np.uint64(1)
+                x = x - ((x >> np.uint64(1)) & np.uint64(0x5555555555555555))
+                x = (x & np.uint64(0x3333333333333333)) + ((x >> np.uint64(2)) & np.uint64(0x3333333333333333))
+                x = (x + (x >> np.uint64(4))) & np.uint64(0x0F0F0F0F0F0F0F0F)
+                j = int((x * np.uint64(0x0101010101010101)) >> np.uint64(56))
+                mw ^= t
+                out[k] = np.int64(a[63 - j] >> sh)
+                k += 1
+
+
 @njit(nogil=True, parallel=True, cache=True)
 def vp_gather_span(pl, nwords, p0, p1, rows, out):
     """Gather only planes [p0,p1) at the rows -- HALF A KEY IS FREE
@@ -1375,6 +1430,11 @@ def warm():
         vp_gather(_vp, 1, 2, np.array([0, 1], np.int64), _vg)
         _vs = np.zeros(2, np.uint16)
         vp_gather_span(_vp, 1, 0, 1, np.array([0, 1], np.int64), _vs)
+        _mb = np.zeros(1, np.uint64)
+        vbits_set(np.array([0, 2], np.int64), _mb)
+        _ob = np.zeros(1, np.int64)
+        _og = np.zeros(2, np.int64)
+        vp_gather_band(_vp, 1, 2, _mb, 0, 1, _ob, _og)
         _rk = np.array([5, 1, 3, 1], np.int64)
         _rh = np.zeros((1, 4096), np.int64)
         radix_hist12(_rk, 0, _rh, 65536)
