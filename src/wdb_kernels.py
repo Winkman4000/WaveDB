@@ -1053,27 +1053,6 @@ def _vp_eq_block(pl, nwords, w0, w1, bits, target):
 
 
 @njit(nogil=True, parallel=True, cache=True)
-def vp_scan_eq_mask(pl, nwords, bits, target, w0, w1, mask):
-    """The snowball EMITTING: per-word match bitmasks for rows == target
-    over word window [w0,w1) -- Jackson's progressive pruning, but the
-    survivors land as a bitmap ready to AND into any crumb."""
-    BLK = 4096
-    nblk = (w1 - w0 + BLK - 1) // BLK
-    for b in prange(nblk):
-        a0 = w0 + b * BLK
-        a1 = min(w1, a0 + BLK)
-        for w in range(a0, a1):
-            m = ~np.uint64(0)
-            for p in range(bits):
-                tbit = (target >> (bits - 1 - p)) & 1
-                pw = pl[p * nwords + w]
-                m &= pw if tbit else ~pw
-                if m == np.uint64(0):
-                    break
-            mask[w - w0] = m
-
-
-@njit(nogil=True, parallel=True, cache=True)
 def vp_scan_eq(pl, nwords, bits, target, counts, BLK):
     """COUNT rows == target: Jackson's progressive pruning at word
     granularity -- runs data touches ~25-30% of bytes."""
@@ -1652,8 +1631,6 @@ def warm():
         vp_scan_flag_count(_vp, 1, 2, 0, 4, _fl2, _vc, 64)
         _po2 = np.zeros(max(1, int(_vc[0])), np.int64)
         vp_scan_flag_fill(_vp, 1, 2, 0, 4, _fl2, np.array([0, int(_vc[0])], np.int64), _po2, 64)
-        _sm = np.zeros(1, np.uint64)
-        vp_scan_eq_mask(_vp, 1, 2, 1, 0, 1, _sm)
         _br = np.zeros(3, np.int16)
         bp10_range(_bw, np.array([1], np.int64), 0, 1, 0, 3, _br)
         _kp = np.zeros(2, np.bool_)
