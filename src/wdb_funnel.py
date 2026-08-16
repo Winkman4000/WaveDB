@@ -442,6 +442,42 @@ def execute(seg, spec):
     # hygiene at the crumb: point reads, never the column. When the first
     # two flags are enc-10 scalar tests, ONE fused walk serves both with
     # per-row short-circuit (Jackson's crossing scheme, row granularity).
+    # THE SELECTIVE-FIRST CUT: an enc-12 scalar flag is an equality the
+    # SNOWBALL tests word-parallel over the band -- maximally selective
+    # predicates run first, and everything downstream touches only their
+    # survivors. (Q41's URLHash = const was buried in per-row hygiene.)
+    _sf = [f for f in spec['flags']
+           if f[2] != 'in' and seg.cols.get(f[0], {}).get('code_enc') == 12]
+    if _sf and crumb.size >= (1 << 15):
+        import wdb_kernels as _WK
+        blo8 = int(crumb[0]); bhi8 = int(crumb[-1]) + 1
+        w08 = blo8 // 64; w18 = (bhi8 + 63) // 64
+        keepF = None
+        rel8 = crumb - np.int64(w08 * 64)
+        done8 = []
+        for f8 in _sf:
+            c8 = _code_of(seg, f8[0], f8[1])
+            kc8 = seg.cols[f8[0]]
+            if f8[2] and c8 is None:
+                crumb = crumb[:0]
+                done8.append(f8)
+                continue
+            if c8 is None:
+                done8.append(f8)                 # neq missing value: all pass
+                continue
+            m8 = np.zeros(w18 - w08, np.uint64)
+            _WK.vp_scan_eq_mask(seg.vplanes(f8[0]), int(kc8['nwords']),
+                                int(kc8['bits']), int(c8), w08, w18, m8)
+            hit8 = (m8[rel8 >> 6] >> (rel8 & 63).astype(np.uint64)) \
+                & np.uint64(1)
+            k8 = hit8.astype(bool) if f8[2] else ~hit8.astype(bool)
+            keepF = k8 if keepF is None else (keepF & k8)
+            done8.append(f8)
+        if keepF is not None:
+            crumb = crumb[keepF]
+        if done8:
+            spec = dict(spec)
+            spec['flags'] = [f for f in spec['flags'] if f not in done8]
     # THE FUSED BAND GROUP: Jackson's integration decree. When the shape
     # is (<=3 enc-12 keys, <=2 scalar enc-10 flags, no strneq, dense band),
     # every stage runs numba-to-numba in one entry -- hygiene as mask
