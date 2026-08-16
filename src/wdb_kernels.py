@@ -866,6 +866,29 @@ def _radix_inplace(k0, t_k, bits, CH):
     return src
 
 
+@njit(nogil=True, parallel=True, cache=True)
+def mask_to_rows(mask, w0, ob, out, CHW):
+    """Surviving mask bits -> absolute row positions, compacted per chunk."""
+    nch = ob.size
+    for cix in prange(nch):
+        a0 = cix * CHW
+        a1 = min(mask.size, a0 + CHW)
+        k = ob[cix]
+        for w in range(a0, a1):
+            mw = mask[w]
+            base = (w0 + w) * 64
+            while mw != np.uint64(0):
+                t = mw & ((~mw) + np.uint64(1))
+                x = t - np.uint64(1)
+                x = x - ((x >> np.uint64(1)) & np.uint64(0x5555555555555555))
+                x = (x & np.uint64(0x3333333333333333)) + ((x >> np.uint64(2)) & np.uint64(0x3333333333333333))
+                x = (x + (x >> np.uint64(4))) & np.uint64(0x0F0F0F0F0F0F0F0F)
+                j = int((x * np.uint64(0x0101010101010101)) >> np.uint64(56))
+                mw ^= t
+                out[k] = base + j
+                k += 1
+
+
 def fused_band_group(buf, fl, keys, crumb, blo, bhi):
     """THE FUSED BAND GROUP: Jackson's integration decree -- every stage
     numba-to-numba, one Python entry, zero interpreter between mask
@@ -886,13 +909,34 @@ def fused_band_group(buf, fl, keys, crumb, blo, bhi):
     if tot == 0:
         return np.empty(0, np.int64), np.empty(0, np.int64), [b for (_, _, b) in keys]
     comp = np.zeros(tot, np.int64)
-    tmp = np.empty(tot, np.int64)
     accb = 0
-    for (pl, nw, b) in keys:
-        vp_gather_band(pl, nw, b, mask, w0, w1, ob, tmp)
-        np.left_shift(comp, b, out=comp)
-        np.bitwise_or(comp, tmp, out=comp)
-        accb += b
+    if tot / max(1, (bhi - w0 * 64)) < 0.02:
+        # THE RE-ELECTION: hygiene changed the density regime -- read key
+        # bits ONLY for the survivors, never for rows surgery killed.
+        rows2 = np.empty(tot, np.int64)
+        mask_to_rows(mask, w0, ob, rows2, 1024)
+        tmpw = np.zeros(tot, np.uint16)
+        for (pl, nw, b) in keys:
+            if b > 16:
+                P = b - 12
+                vp_gather_span(pl, nw, 0, P, rows2, tmpw)
+                np.left_shift(comp, P, out=comp)
+                np.bitwise_or(comp, tmpw.astype(np.int64), out=comp)
+                vp_gather_span(pl, nw, P, b, rows2, tmpw)
+                np.left_shift(comp, b - P, out=comp)
+                np.bitwise_or(comp, tmpw.astype(np.int64), out=comp)
+            else:
+                vp_gather_span(pl, nw, 0, b, rows2, tmpw)
+                np.left_shift(comp, b, out=comp)
+                np.bitwise_or(comp, tmpw.astype(np.int64), out=comp)
+            accb += b
+    else:
+        tmp = np.empty(tot, np.int64)
+        for (pl, nw, b) in keys:
+            vp_gather_band(pl, nw, b, mask, w0, w1, ob, tmp)
+            np.left_shift(comp, b, out=comp)
+            np.bitwise_or(comp, tmp, out=comp)
+            accb += b
     t_k = np.empty(tot, np.int64)
     ks = _radix_inplace(comp, t_k, accb, 1 << 16)
     bnd = np.flatnonzero(np.diff(ks) != 0)
