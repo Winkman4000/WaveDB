@@ -398,6 +398,7 @@ def _code_of(seg, col, value):
 
 
 def execute(seg, spec):
+    global _PHITS
     global _HITS
     if spec.get('trunc'):
         return _execute_trunc(seg, spec)
@@ -441,6 +442,51 @@ def execute(seg, spec):
     # hygiene at the crumb: point reads, never the column. When the first
     # two flags are enc-10 scalar tests, ONE fused walk serves both with
     # per-row short-circuit (Jackson's crossing scheme, row granularity).
+    # THE FUSED BAND GROUP: Jackson's integration decree. When the shape
+    # is (<=3 enc-12 keys, <=2 scalar enc-10 flags, no strneq, dense band),
+    # every stage runs numba-to-numba in one entry -- hygiene as mask
+    # surgery, lockstep decode, radix, walk -- zero interpreter between.
+    _fb_done = False
+    _fbf = list(spec['flags'])
+    _fbp = spec['plans']
+    if (crumb.size >= (1 << 15) and not spec['strneq'] and len(_fbf) <= 2
+            and all(f[2] != 'in' for f in _fbf)
+            and all(seg.cols.get(f[0], {}).get('code_enc') == 10 for f in _fbf)
+            and 1 <= len(_fbp) <= 3 and all(p['kind'] == 'col' for p in _fbp)
+            and all(seg.cols.get(p['col'], {}).get('code_enc') == 12 for p in _fbp)
+            and spec['off'] + spec['k'] <= 100000):
+        blo9 = int(crumb[0]); bhi9 = int(crumb[-1]) + 1
+        band9 = bhi9 - blo9
+        if band9 > 0 and crumb.size / band9 >= 0.02:
+            codesF = [_code_of(seg, f[0], f[1]) for f in _fbf]
+            if all(c9 is not None for c9 in codesF):
+                import wdb_kernels as _WK
+                bufF = np.frombuffer(seg.buf, np.uint8)
+                fl9 = []
+                for f9, c9 in zip(_fbf, codesF):
+                    ca = seg.cols[f9[0]]
+                    fl9.append((np.ascontiguousarray(np.frombuffer(seg.buf, np.int64,
+                                int(ca['pXnblk']), ca['pXdir'])),
+                                int(ca['pXpay']), int(ca['pXbits']),
+                                int(c9), bool(f9[2])))
+                ks9 = []
+                for p9 in _fbp:
+                    kc9 = seg.cols[p9['col']]
+                    ks9.append((seg.vplanes(p9['col']), int(kc9['nwords']),
+                                int(kc9['bits'])))
+                uk9, uc9, wl9 = _WK.fused_band_group(bufF, fl9, ks9, crumb, blo9, bhi9)
+                fields9 = np.empty((len(_fbp), uk9.size), np.int64)
+                acc9 = sum(wl9)
+                for i9, b9 in enumerate(wl9):
+                    acc9 -= b9
+                    fields9[i9] = (uk9 >> acc9) & ((1 << b9) - 1)
+                _PHITS += 1
+                ucodes = fields9
+                ucnt = uc9
+                _fb_done = True
+                crumb = crumb[:0]
+                spec = dict(spec)
+                spec['flags'] = []
     flags9 = list(spec['flags'])
     # THE BAND-DECODE LAW (hygiene half): dense crumbs stream their band's
     # flag columns once instead of probing per row.
@@ -566,6 +612,8 @@ def execute(seg, spec):
     # the single-word engine. Empty-string hygiene folds into dropped
     # field-0 groups.
     prefixed = False
+    if _fb_done:
+        _pg_plans = None
     if _pg_plans is not None:
         import wdb_kernels as _WK
         cr9 = np.ascontiguousarray(crumb)
@@ -670,13 +718,12 @@ def execute(seg, spec):
             keep9 = ~drop9
             fields9 = fields9[:, keep9]
             uc9 = uc9[keep9]
-        global _PHITS
         _PHITS += 1
         ucodes = fields9
         ucnt = uc9
         prefixed = True
     packed = sum(widths) <= 62                   # one int64 when it fits,
-    if prefixed:
+    if _fb_done or prefixed:
         pass                                     # counts already stand
     elif crumb.size == 0:                        # lexsort when it doesn't
         ucodes = np.empty((len(plans), 0), np.int64); ucnt = np.empty(0, np.int64)

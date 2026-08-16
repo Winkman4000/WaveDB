@@ -771,6 +771,138 @@ def vbits_pop(mask, out):
 
 
 @njit(nogil=True, parallel=True, cache=True)
+def _flag_mask(buf, d, p, b, c, eq, blo, bhi, mask):
+    """Hygiene as MASK SURGERY: decode the flag's band block by block and
+    clear mask bits where the test fails. No keep array, no handoff."""
+    B = 4096
+    k0 = blo // B
+    k1 = (bhi + B - 1) // B
+    for kb in prange(k1 - k0):
+        blk = k0 + kb
+        o = p + (d[blk] >> 1)
+        base = blk * B
+        a0 = base if base > blo else blo
+        a1 = base + B if base + B < bhi else bhi
+        if d[blk] & 1:
+            nr = np.int64(buf[o]) | (np.int64(buf[o + 1]) << 8)
+            ptr = o + 2
+            r = base
+            for _ in range(nr):
+                cnt = np.int64(buf[ptr]) | (np.int64(buf[ptr + 1]) << 8)
+                val = np.int64(buf[ptr + 2]) | (np.int64(buf[ptr + 3]) << 8)
+                ptr += 4
+                e = r + cnt
+                ok = (val == c) if eq else (val != c)
+                if not ok:
+                    x0 = r if r > a0 else a0
+                    x1 = e if e < a1 else a1
+                    rr = x0
+                    while rr < x1:
+                        w = (rr - blo) >> 6
+                        j = np.uint64((rr - blo) & 63)
+                        if (rr & 63) == 0 and rr + 64 <= x1:
+                            mask[w] = np.uint64(0)
+                            rr += 64
+                        else:
+                            mask[w] &= ~(np.uint64(1) << j)
+                            rr += 1
+                r = e
+                if r >= bhi:
+                    break
+        else:
+            for rr in range(a0, a1):
+                idx = (rr - base) * b
+                v = np.int64(0)
+                for bi in range(b):
+                    ix = idx + bi
+                    v = (v << 1) | ((np.int64(buf[o + (ix >> 3)]) >> (7 - (ix & 7))) & 1)
+                ok = (v == c) if eq else (v != c)
+                if not ok:
+                    w = (rr - blo) >> 6
+                    mask[w] &= ~(np.uint64(1) << np.uint64((rr - blo) & 63))
+
+
+@njit(nogil=True, cache=True)
+def _offsets_from_mask(mask, CHW, ob):
+    tot = 0
+    nch = ob.size
+    for cix in range(nch):
+        ob[cix] = tot
+        a0 = cix * CHW
+        a1 = min(mask.size, a0 + CHW)
+        for i in range(a0, a1):
+            x = mask[i]
+            x = x - ((x >> np.uint64(1)) & np.uint64(0x5555555555555555))
+            x = (x & np.uint64(0x3333333333333333)) + ((x >> np.uint64(2)) & np.uint64(0x3333333333333333))
+            x = (x + (x >> np.uint64(4))) & np.uint64(0x0F0F0F0F0F0F0F0F)
+            tot += np.int64((x * np.uint64(0x0101010101010101)) >> np.uint64(56))
+    return tot
+
+
+@njit(nogil=True, cache=True)
+def _radix_inplace(k0, t_k, bits, CH):
+    n = k0.size
+    nch = (n + CH - 1) // CH
+    src = k0
+    dst = t_k
+    sh = 0
+    while sh < bits:
+        hists = np.zeros((nch, 4096), np.int64)
+        radix_hist12(src, sh, hists, CH)
+        run = np.zeros(4096, np.int64)
+        tot = 0
+        for d in range(4096):
+            run[d] = tot
+            for cix in range(nch):
+                tot += hists[cix, d]
+        offs = np.empty((nch, 4096), np.int64)
+        for cix in range(nch):
+            for d in range(4096):
+                offs[cix, d] = run[d]
+                run[d] += hists[cix, d]
+        radix_scatter12(src, sh, offs, dst, CH)
+        src, dst = dst, src
+        sh += 12
+    return src
+
+
+def fused_band_group(buf, fl, keys, crumb, blo, bhi):
+    """THE FUSED BAND GROUP: Jackson's integration decree -- every stage
+    numba-to-numba, one Python entry, zero interpreter between mask
+    surgery, lockstep decode, radix, and the walk.
+    fl: list of (dirs, pay, bits, code, eq) enc-10 flags (<=2)
+    keys: list of (planes, nwords, bits) enc-12 keys (<=3)
+    Returns (packed sorted-unique keys, counts, widths)."""
+    w0 = blo // 64
+    w1 = (bhi + 63) // 64
+    mask = np.zeros(w1 - w0, np.uint64)
+    vbits_set(np.ascontiguousarray(crumb) - np.int64(w0 * 64), mask)
+    for (d, p, b, c, eq) in fl:
+        _flag_mask(buf, d, p, b, c, eq, w0 * 64, bhi, mask)
+    CHW = 1024
+    nch = (mask.size + CHW - 1) // CHW
+    ob = np.zeros(nch, np.int64)
+    tot = _offsets_from_mask(mask, CHW, ob)
+    if tot == 0:
+        return np.empty(0, np.int64), np.empty(0, np.int64), [b for (_, _, b) in keys]
+    comp = np.zeros(tot, np.int64)
+    tmp = np.empty(tot, np.int64)
+    accb = 0
+    for (pl, nw, b) in keys:
+        vp_gather_band(pl, nw, b, mask, w0, w1, ob, tmp)
+        np.left_shift(comp, b, out=comp)
+        np.bitwise_or(comp, tmp, out=comp)
+        accb += b
+    t_k = np.empty(tot, np.int64)
+    ks = _radix_inplace(comp, t_k, accb, 1 << 16)
+    bnd = np.flatnonzero(np.diff(ks) != 0)
+    st = np.concatenate([[0], bnd + 1])
+    uk = ks[st]
+    uc = np.diff(np.concatenate([st, [ks.size]])).astype(np.int64)
+    return uk, uc, [b for (_, _, b) in keys]
+
+
+@njit(nogil=True, parallel=True, cache=True)
 def vp_gather_band(pl, nwords, bits, mask, w0, w1, obase, out):
     """JACKSON'S LOCKSTEP GATHER: walk the band's word positions once,
     all planes advancing shoulder-to-shoulder, transpose per word, emit
@@ -1435,6 +1567,9 @@ def warm():
         _ob = np.zeros(1, np.int64)
         _og = np.zeros(2, np.int64)
         vp_gather_band(_vp, 1, 2, _mb, 0, 1, _ob, _og)
+        _flag_mask(_bw, np.array([1], np.int64), 0, 1, 0, True, 0, 3, _mb)
+        _offsets_from_mask(_mb, 1024, np.zeros(1, np.int64))
+        _radix_inplace(np.array([3, 1, 2], np.int64), np.empty(3, np.int64), 12, 65536)
         _rk = np.array([5, 1, 3, 1], np.int64)
         _rh = np.zeros((1, 4096), np.int64)
         radix_hist12(_rk, 0, _rh, 65536)
