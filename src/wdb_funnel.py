@@ -600,7 +600,9 @@ def execute(seg, spec):
                  and seg.cols.get(p['col'], {}).get('code_enc') == 2
                  and seg.cols.get(p['col'], {}).get('mode') == 0
                  for p in _fsp)
-    if (not _mo_done and crumb.size >= (1 << 15) and not spec['strneq']
+    import os as _os
+    if (not _mo_done and not _os.environ.get('WDB_FS_OFF') 
+            and crumb.size >= (1 << 15) and not spec['strneq']
             and (_hasst or _fs3)
             and (not _fs3 or (int(crumb[-1]) + 1 - int(crumb[0])) <= (1 << 22))
             and len(_fs10) + len(_fs12) + len(_fs3) == len(spec['flags'])
@@ -655,15 +657,21 @@ def execute(seg, spec):
                                         int(emcA), w08, w18, em9)
                     np.bitwise_and(mask9, em9, out=mask9)
                 for f9 in _fs3:
-                    v9 = np.asarray(seg.values_range(f9[0], w08 * 64, bhi9))
+                    v9 = np.asarray(seg.codes_band(f9[0], w08 * 64, bhi9))
                     if f9[2] == 'in':
                         p9m = np.zeros(v9.size, bool)
                         for lit9 in f9[1]:
-                            p9m |= (v9 == lit9)
+                            c3 = _code_of(seg, f9[0], lit9)
+                            if c3 is not None:
+                                p9m |= (v9 == c3)
                     elif f9[2]:
-                        p9m = (v9 == f9[1])
+                        c3 = _code_of(seg, f9[0], f9[1])
+                        p9m = (v9 == c3) if c3 is not None \
+                            else np.zeros(v9.size, bool)
                     else:
-                        p9m = (v9 != f9[1])
+                        c3 = _code_of(seg, f9[0], f9[1])
+                        p9m = (v9 != c3) if c3 is not None \
+                            else np.ones(v9.size, bool)
                     pb9 = np.packbits(p9m, bitorder='little')
                     fm9 = np.zeros(w18 - w08, np.uint64)
                     fm9.view(np.uint8)[:pb9.size] = pb9

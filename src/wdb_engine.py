@@ -671,6 +671,36 @@ class Segment:
         else:
             cc = self._bitunpack(base, 0, self.N, bits)  # native width
         self._codes[nm] = cc; return cc
+    def codes_band(self, nm, lo, hi):
+        """enc-3 band read: decompress ONLY the frames covering [lo,hi),
+        8 zstd lanes, band-relative result, nothing cached -- the range
+        path the blocked dress never had."""
+        c = self.cols[nm]
+        if nm in self._codes:
+            return self._codes[nm][lo:hi]
+        wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
+        BR = int(c['BR']); base = c['cstart']; bo = c['boffs']
+        isz = wdt().itemsize
+        j0 = lo // BR
+        j1 = (hi + BR - 1) // BR
+        out = np.empty(j1 * BR - j0 * BR, dtype=wdt)
+        nb = j1 - j0
+        def _span(t, T=8):
+            import zstandard as _zs
+            dec = _zs.ZstdDecompressor()
+            a = t * nb // T
+            b = (t + 1) * nb // T
+            for jj in range(a, b):
+                j = j0 + jj
+                raw = dec.decompress(
+                    self.buf[base + int(bo[j]):base + int(bo[j + 1])].tobytes())
+                out[jj * BR:jj * BR + len(raw) // isz] = np.frombuffer(raw, dtype=wdt)
+        if nb > 2:
+            list(_pool().map(_span, range(8)))
+        else:
+            _span(0, 1)
+        return out[lo - j0 * BR:hi - j0 * BR]
+
     def stairs(self, nm):
         """Step rows of a STAIRCASE column (codes non-decreasing in row order, e.g. time-ordered
         ingest): the row indices where the code ticks +1. Per-value counts and row spans derive
