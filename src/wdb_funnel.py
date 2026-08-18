@@ -657,24 +657,37 @@ def execute(seg, spec):
                                         int(emcA), w08, w18, em9)
                     np.bitwise_and(mask9, em9, out=mask9)
                 for f9 in _fs3:
-                    v9 = np.asarray(seg.codes_band(f9[0], w08 * 64, bhi9))
+                    v9 = np.ascontiguousarray(
+                        seg.codes_band(f9[0], w08 * 64, bhi9).astype(np.int64))
+                    fm9 = np.zeros(w18 - w08, np.uint64)
                     if f9[2] == 'in':
-                        p9m = np.zeros(v9.size, bool)
-                        for lit9 in f9[1]:
-                            c3 = _code_of(seg, f9[0], lit9)
-                            if c3 is not None:
+                        cs3 = [_code_of(seg, f9[0], lit9) for lit9 in f9[1]]
+                        cs3 = [c for c in cs3 if c is not None]
+                        if len(cs3) == 0:
+                            mask9[:] = np.uint64(0)
+                            continue
+                        while len(cs3) < 2:
+                            cs3.append(cs3[0])
+                        if len(cs3) <= 2:
+                            _WK.codes_test_mask(v9, int(cs3[0]), int(cs3[1]),
+                                                0, fm9)
+                        else:
+                            p9m = np.zeros(v9.size, bool)
+                            for c3 in cs3:
                                 p9m |= (v9 == c3)
+                            pb9 = np.packbits(p9m, bitorder='little')
+                            fm9.view(np.uint8)[:pb9.size] = pb9
                     elif f9[2]:
                         c3 = _code_of(seg, f9[0], f9[1])
-                        p9m = (v9 == c3) if c3 is not None \
-                            else np.zeros(v9.size, bool)
+                        if c3 is None:
+                            mask9[:] = np.uint64(0)
+                            continue
+                        _WK.codes_test_mask(v9, int(c3), int(c3), 0, fm9)
                     else:
                         c3 = _code_of(seg, f9[0], f9[1])
-                        p9m = (v9 != c3) if c3 is not None \
-                            else np.ones(v9.size, bool)
-                    pb9 = np.packbits(p9m, bitorder='little')
-                    fm9 = np.zeros(w18 - w08, np.uint64)
-                    fm9.view(np.uint8)[:pb9.size] = pb9
+                        if c3 is None:
+                            continue
+                        _WK.codes_test_mask(v9, int(c3), int(c3), 1, fm9)
                     np.bitwise_and(mask9, fm9, out=mask9)
                 CHW9 = 1024
                 nch9 = (mask9.size + CHW9 - 1) // CHW9

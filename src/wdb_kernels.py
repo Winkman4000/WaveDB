@@ -1307,6 +1307,31 @@ def enc6_swar_pick(pk8, hot, warm, wb, pt, o1, o2, rows, BR, out):
 
 
 @njit(nogil=True, parallel=True, cache=True)
+def codes_test_mask(v, c1, c2, mode, fm):
+    """Band codes -> pass-mask words, sixteen-wide: each thread reads 64
+    codes and emits one word. mode 0: ==c1 | ==c2 (IN pair / eq when
+    c2==c1); mode 1: != c1. Replaces the serial isin+packbits tail."""
+    nw = fm.size
+    n = v.size
+    for w in prange(nw):
+        base = w * 64
+        hi = base + 64
+        if hi > n:
+            hi = n
+        m = np.uint64(0)
+        if mode == 0:
+            for j in range(base, hi):
+                x = v[j]
+                if x == c1 or x == c2:
+                    m |= np.uint64(1) << np.uint64(j - base)
+        else:
+            for j in range(base, hi):
+                if v[j] != c1:
+                    m |= np.uint64(1) << np.uint64(j - base)
+        fm[w] = m
+
+
+@njit(nogil=True, parallel=True, cache=True)
 def band_pick(band, mask, ob, out, CHW):
     """Compact a band-relative value array by the surviving mask --
     sequential reads of freshly written cache-warm bytes."""
@@ -2105,6 +2130,8 @@ def warm():
         _mu = np.empty(4, np.int64); _mv = np.empty(4, np.int64)
         _mg = np.zeros(2, np.int64)
         _sp = np.zeros(1, np.int64)
+        _cm = np.zeros(1, np.uint64)
+        codes_test_mask(np.array([1, 2, 3], np.int64), 2, 2, 0, _cm)
         enc6_swar_pick(np.zeros(16, np.uint8), np.zeros(15, np.int64),
                        np.zeros(255, np.int64), np.zeros(1, np.uint8),
                        np.zeros(1, np.int64), np.zeros(2, np.int64),
