@@ -115,6 +115,71 @@ def _dv(seg, col):
 def execute(seg, spec):
     global _HITS
     import wdb_kernels as _WK
+    # THE LAWFUL FAST PATH (Jackson's marginal-bound, N-RAM-free reads):
+    # census from the dense literals, pruning in RANK space, the partner
+    # via codes_band, pair counts by radix -- nothing N-scale built or
+    # cached, so nothing is ever purged and re-paid. COUNT-only shapes.
+    if not spec.get('scols') and seg.cols.get(spec['a'], {}).get('code_enc') == 3 \
+            and seg.cols.get(spec['b'], {}).get('code_enc') == 8 \
+            and int(seg.cols[spec['a']].get('V') or 999) <= 256:
+        pl = seg.e8_planes(spec['f'])
+        pos = np.ascontiguousarray(np.asarray(pl[0], dtype=np.int64))
+        lits = np.ascontiguousarray(np.asarray(pl[1], dtype=np.int64))
+        BV = int(seg.cols[spec['b']]['V'])
+        memo = seg.__dict__.setdefault('_censusmemo', {})
+        ckey = ('pfL', spec['f'], spec['b'])
+        cnt_b = memo.get(ckey)
+        if cnt_b is None:
+            cnt_b = np.bincount(lits, minlength=BV)
+            memo[ckey] = cnt_b
+        k = spec['lim']
+        aC = np.ascontiguousarray(
+            seg.codes_band(spec['a'], 0, seg.N).astype(np.uint8))
+        nz = int((cnt_b > 0).sum())
+        order_b = np.argsort(cnt_b, kind='stable')[::-1]
+        M = 4096
+        while True:
+            M9 = min(M, nz)
+            cid = np.full(BV, -1, np.int32)
+            cid[order_b[:M9]] = np.arange(M9)
+            max_excl = int(cnt_b[order_b[M9]]) if M9 < nz else 0
+            rr = cid[lits]
+            rsel = np.flatnonzero(rr >= 0)
+            pk = (rr[rsel].astype(np.int64) << 8) \
+                | aC[pos[rsel]].astype(np.int64)
+            pcnt = np.bincount(pk, minlength=M9 << 8)
+            k9 = min(k, int((pcnt > 0).sum()))
+            if k9 == 0 and max_excl > 0:
+                M *= 4
+                continue
+            topi = np.argpartition(-pcnt, max(0, k9 - 1))[:k9]
+            topi = topi[np.argsort(-pcnt[topi], kind='stable')]
+            p10 = int(pcnt[topi[-1]]) if k9 else 0
+            if max_excl <= p10 or M9 >= nz:
+                break
+            M *= 4
+        out = []
+        for j in topi.tolist():
+            ci9, acode = j >> 8, j & 0xFF
+            bcode = int(order_b[ci9])
+            va = seg.fetch(spec['a'], acode)
+            vb = seg.fetch(spec['b'], bcode)
+            if isinstance(va, (bytes, bytearray)):
+                va = va.decode('utf-8', 'replace')
+            if isinstance(vb, (bytes, bytearray)):
+                vb = vb.decode('utf-8', 'replace')
+            row = []
+            for p in spec['projkinds']:
+                if p[0] == 'A':
+                    row.append(va)
+                elif p[0] == 'B':
+                    row.append(vb)
+                else:
+                    row.append(int(pcnt[j]))
+            out.append(tuple(row))
+        _HITS += 1
+        import wdb_sql
+        return out, [wdb_sql._alias(p) for p in spec['proj']]
     pl = seg.e8_planes(spec['f'])
     pos = np.ascontiguousarray(np.asarray(pl[0], dtype=np.int64))
     bc9 = np.asarray(seg._raw_codes(spec['b']))

@@ -584,6 +584,79 @@ def execute(seg, spec):
     # is (<=3 enc-12 keys, <=2 scalar enc-10 flags, no strneq, dense band),
     # every stage runs numba-to-numba in one entry -- hygiene as mask
     # surgery, lockstep decode, radix, walk -- zero interpreter between.
+    # THE MARGINAL-BOUND LANE (Q14's family): GROUP BY (sparse-default
+    # BigKey, small partner) ORDER BY COUNT DESC -- the marginal total of
+    # BigKey ceilings every pair it contains, so candidates resolve in
+    # descending-marginal order and the k-th resolved pair's count
+    # guillotines the tail. Exact by the bound; zipf only sets how early.
+    _mb_done = False
+    _mbp = spec['plans']
+    _q14_ok = False
+    if (crumb.size == 0 and not spec['flags'] and len(_mbp) == 2
+            and all(p['kind'] == 'col' for p in _mbp)
+            and spec['off'] + spec['k'] <= 1000):
+        e8i = [i for i, p in enumerate(_mbp)
+               if seg.cols.get(p['col'], {}).get('code_enc') == 8]
+        smi = [i for i, p in enumerate(_mbp)
+               if seg.cols.get(p['col'], {}).get('code_enc') == 3
+               and int(seg.cols[p['col']].get('V', 1 << 30)) <= 4096]
+        if len(e8i) == 1 and len(smi) == 1 \
+                and len(spec['strneq']) == 1 \
+                and spec['strneq'][0][0] == _mbp[e8i[0]]['col'] \
+                and spec['strneq'][0][1] == '':
+            _q14_ok = True
+    if _q14_ok:
+        import wdb_kernels as _WK
+        spB = seg.cols[_mbp[e8i[0]]['col']]
+        spS = seg.cols[_mbp[smi[0]]['col']]
+        bufQ = np.frombuffer(seg.buf, np.uint8)
+        e8n = int(spB['e8n']); b8 = int(spB['e8bits']); V8 = int(spB['V'])
+        lb9 = np.ascontiguousarray(
+            bufQ[spB['cstart']:spB['cstart'] + (e8n * b8 + 7) // 8 + 8])
+        codes9 = np.ascontiguousarray(_WK.unpack_any(lb9, e8n, b8).astype(np.int64))
+        tot9 = np.bincount(codes9, minlength=V8)
+        eng9 = np.ascontiguousarray(
+            seg.codes_band(_mbp[smi[0]]['col'], 0, seg.N).astype(np.uint8))
+        pres9 = np.ascontiguousarray(
+            bufQ[spB['e8pres']:spB['e8pres'] + (seg.N + 7) // 8])
+        ck9 = np.frombuffer(seg.buf, np.uint64,
+                            (seg.N + 65535) // 65536, spB['e8ck']).astype(np.int64)
+        ne9 = int(spS['V'])
+        need9 = spec['off'] + spec['k']
+        order9 = np.argsort(tot9, kind='stable')[::-1]
+        K9 = max(64, 2 * need9)
+        while True:
+            K9 = min(K9, V8)
+            candc9 = order9[:K9]
+            cmap9 = np.full(V8, 255, np.uint8)
+            cmap9[candc9] = np.minimum(np.arange(K9), 254)
+            if K9 > 254:
+                cmap9[candc9[:254]] = np.arange(254)
+                cmap9[candc9[254:]] = 255
+                K9 = 254
+                candc9 = candc9[:254]
+            bowls9 = np.zeros((16, K9 * ne9), np.int64)
+            _WK.pres_pair_count(pres9, ck9, codes9, eng9, cmap9, K9, ne9,
+                                bowls9)
+            pc9 = bowls9.sum(0)
+            srt9 = np.sort(pc9)[::-1]
+            bar9 = int(srt9[need9 - 1]) if pc9.size >= need9 else 0
+            maxun9 = int(tot9[order9[K9]]) if K9 < V8 else -1
+            if maxun9 < bar9 or K9 >= min(V8, 254):
+                break
+            K9 = K9 * 4
+        nz9 = np.flatnonzero(pc9)
+        ci9 = nz9 // ne9
+        ei9 = nz9 % ne9
+        fields9 = np.empty((2, nz9.size), np.int64)
+        fields9[e8i[0]] = candc9[ci9]
+        fields9[smi[0]] = ei9
+        _PHITS += 1
+        ucodes = fields9
+        ucnt = pc9[nz9].astype(np.int64)
+        _mb_done = True
+        spec = dict(spec)
+        spec['strneq'] = []
     # THE COMPOSED LANE (Q40's shape): stair keys and enc-3 flags join the
     # stream -- every op a measured kernel, the glue microseconds. Fires
     # only when a staircase key or an enc-3 flag is present; pure shapes
@@ -979,7 +1052,7 @@ def execute(seg, spec):
     # the single-word engine. Empty-string hygiene folds into dropped
     # field-0 groups.
     prefixed = False
-    if _fs_done or _mo_done or _fb_done:
+    if _mb_done or _fs_done or _mo_done or _fb_done:
         _pg_plans = None
     if _pg_plans is not None:
         import wdb_kernels as _WK
@@ -1090,7 +1163,7 @@ def execute(seg, spec):
         ucnt = uc9
         prefixed = True
     packed = sum(widths) <= 62                   # one int64 when it fits,
-    if _fs_done or _mo_done or _fb_done or prefixed:
+    if _mb_done or _fs_done or _mo_done or _fb_done or prefixed:
         pass                                     # counts already stand
     elif crumb.size == 0:                        # lexsort when it doesn't
         ucodes = np.empty((len(plans), 0), np.int64); ucnt = np.empty(0, np.int64)

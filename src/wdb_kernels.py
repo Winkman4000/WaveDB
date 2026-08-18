@@ -1307,6 +1307,47 @@ def enc6_swar_pick(pk8, hot, warm, wb, pt, o1, o2, rows, BR, out):
 
 
 @njit(nogil=True, parallel=True, cache=True)
+def e8_unpack(buf, base, n, bits, out):
+    """Sparse-default literal stream -> codes, MSB-packed, 16-wide."""
+    for i in prange(n):
+        bo = i * bits
+        by = base + (bo >> 3)
+        sh = bo & 7
+        acc = np.int64(0)
+        for k in range(4):
+            acc = (acc << np.int64(8)) | np.int64(buf[by + k])
+        out[i] = (acc >> np.int64(32 - bits - sh)) \
+            & ((np.int64(1) << np.int64(bits)) - 1)
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def pres_pair_count(pres, ck, codes, eng, cand, ncand, ne, bowls):
+    """THE MARGINAL-BOUND LAW's walk: stride the presence bitmap by its
+    64K checkpoints (each chunk knows its starting rank), and for every
+    present row whose code is a candidate, count (candidate, partner)
+    into a cache-resident table. One pass, sixteen-wide, no expansion
+    of anything that cannot win."""
+    nch = ck.size
+    for c in prange(nch):
+        r0 = c << 16
+        rank = ck[c]
+        b0 = r0 >> 3
+        b1 = min(pres.size, b0 + 8192)
+        for bi in range(b0, b1):
+            pv = pres[bi]
+            if pv == 0:
+                continue
+            row = bi << 3
+            for j in range(8):
+                if (pv >> (7 - j)) & 1:
+                    code = codes[rank]
+                    ci = cand[code]
+                    if ci < ncand:
+                        bowls[c % 16, ci * ne + eng[row + j]] += 1
+                    rank += 1
+
+
+@njit(nogil=True, parallel=True, cache=True)
 def codes_test_mask(v, c1, c2, mode, fm):
     """Band codes -> pass-mask words, sixteen-wide: each thread reads 64
     codes and emits one word. mode 0: ==c1 | ==c2 (IN pair / eq when
@@ -2132,6 +2173,12 @@ def warm():
         _sp = np.zeros(1, np.int64)
         _cm = np.zeros(1, np.uint64)
         codes_test_mask(np.array([1, 2, 3], np.int64), 2, 2, 0, _cm)
+        _e8 = np.zeros(2, np.int64)
+        e8_unpack(_bw, 0, 2, 3, _e8)
+        _bl = np.zeros((16, 4), np.int64)
+        pres_pair_count(np.array([255], np.uint8), np.array([0], np.int64),
+                        np.zeros(8, np.int64), np.zeros(8, np.uint8),
+                        np.zeros(8, np.uint8), 2, 2, _bl)
         enc6_swar_pick(np.zeros(16, np.uint8), np.zeros(15, np.int64),
                        np.zeros(255, np.int64), np.zeros(1, np.uint8),
                        np.zeros(1, np.int64), np.zeros(2, np.int64),
