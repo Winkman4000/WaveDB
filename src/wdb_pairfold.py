@@ -179,7 +179,6 @@ def execute(seg, spec):
                     row.append(int(pcnt[j]))
             out.append(tuple(row))
         _HITS += 1
-        import wdb_sql
         return out, [wdb_sql._alias(p) for p in spec['proj']]
     pl = seg.e8_planes(spec['f'])
     pos = np.ascontiguousarray(np.asarray(pl[0], dtype=np.int64))
