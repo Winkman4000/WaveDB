@@ -115,38 +115,39 @@ def _dv(seg, col):
 def execute(seg, spec):
     global _HITS
     import wdb_kernels as _WK
-    # THE LAWFUL FAST PATH (Jackson's marginal-bound, N-RAM-free reads):
-    # census from the dense literals, pruning in RANK space, the partner
-    # via codes_band, pair counts by radix -- nothing N-scale built or
-    # cached, so nothing is ever purged and re-paid. COUNT-only shapes.
+    # THE PLIST PATH (Jackson's audit: the counts were in the data all
+    # along). The big key's plist offsets ARE the census (diff), its
+    # positions ARE each candidate's rows -- so the marginal-bound law
+    # runs on slices: candidates descending, partner gathered at their
+    # rows, one tiny bincount, the certificate verbatim. Zero storage,
+    # zero N-arrays, nothing to purge.
     if not spec.get('scols') and seg.cols.get(spec['a'], {}).get('code_enc') == 3 \
             and seg.cols.get(spec['b'], {}).get('code_enc') == 8 \
             and int(seg.cols[spec['a']].get('V') or 999) <= 256:
-        pl = seg.e8_planes(spec['f'])
-        pos = np.ascontiguousarray(np.asarray(pl[0], dtype=np.int64))
-        lits = np.ascontiguousarray(np.asarray(pl[1], dtype=np.int64))
-        BV = int(seg.cols[spec['b']]['V'])
-        memo = seg.__dict__.setdefault('_censusmemo', {})
-        ckey = ('pfL', spec['f'], spec['b'])
-        cnt_b = memo.get(ckey)
-        if cnt_b is None:
-            cnt_b = np.bincount(lits, minlength=BV)
-            memo[ckey] = cnt_b
+        import wdb_funnel as _F
+        offsB, plB = _F._plist(seg, spec['b'])
+        offsB = np.asarray(offsB, dtype=np.int64)
+        cnt_b = np.diff(offsB)
+        dflt9 = int(seg.cols[spec['b']].get('e8d', -1))
+        if 0 <= dflt9 < cnt_b.size:
+            cnt_b = cnt_b.copy()
+            cnt_b[dflt9] = 0                     # the WHERE excludes ''
+        BV = cnt_b.size
         k = spec['lim']
         aC = np.ascontiguousarray(
             seg.codes_band(spec['a'], 0, seg.N).astype(np.uint8))
         nz = int((cnt_b > 0).sum())
         order_b = np.argsort(cnt_b, kind='stable')[::-1]
-        M = 4096
+        M = max(64, 4 * k)
         while True:
             M9 = min(M, nz)
-            cid = np.full(BV, -1, np.int32)
-            cid[order_b[:M9]] = np.arange(M9)
+            cands = order_b[:M9]
             max_excl = int(cnt_b[order_b[M9]]) if M9 < nz else 0
-            rr = cid[lits]
-            rsel = np.flatnonzero(rr >= 0)
-            pk = (rr[rsel].astype(np.int64) << 8) \
-                | aC[pos[rsel]].astype(np.int64)
+            rows9 = np.concatenate([np.asarray(plB[offsB[c]:offsB[c + 1]])
+                                    for c in cands.tolist()]).astype(np.int64)
+            cidr = np.repeat(np.arange(M9, dtype=np.int64),
+                             cnt_b[cands])
+            pk = (cidr << 8) | aC[rows9].astype(np.int64)
             pcnt = np.bincount(pk, minlength=M9 << 8)
             k9 = min(k, int((pcnt > 0).sum()))
             if k9 == 0 and max_excl > 0:
@@ -161,7 +162,7 @@ def execute(seg, spec):
         out = []
         for j in topi.tolist():
             ci9, acode = j >> 8, j & 0xFF
-            bcode = int(order_b[ci9])
+            bcode = int(cands[ci9])
             va = seg.fetch(spec['a'], acode)
             vb = seg.fetch(spec['b'], bcode)
             if isinstance(va, (bytes, bytearray)):
