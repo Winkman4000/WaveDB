@@ -60,6 +60,7 @@ _READ_ORDER = (
     R.mixtop,
     R.pairdistinct,
     R.septop,
+    R.sampletop,
     R.tripletop,
     R.pairtop,
     R.gridwalk,

@@ -181,6 +181,10 @@ septop = Read('septop',
               lambda c: wdb_septop.detect(c.seg, c.tree, c.cmap),
               lambda c, spec: wdb_septop.execute(c.seg, spec))
 
+import wdb_sampletop
+sampletop = Read('sampletop',
+                 lambda c: wdb_sampletop.detect(c.seg, c.tree, c.cmap),
+                 lambda c, spec: wdb_sampletop.execute(c.seg, spec))
 import wdb_tripletop
 tripletop = Read('tripletop',
                  lambda c: wdb_tripletop.detect(c.seg, c.tree, c.cmap),
