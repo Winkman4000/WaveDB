@@ -140,6 +140,11 @@ class Segment:
                 meta['BR'], nfr = struct.unpack_from('<II', buf, off); off += 8
                 meta['boffs'] = np.frombuffer(buf, dtype=np.uint32, count=nfr+1, offset=off); off += 4*(nfr+1)
                 meta['cstart'] = off; meta['czlen'] = int(meta['boffs'][-1]); off += meta['czlen']
+            elif code_enc == 13:               # vertical zstd: bit-planes per frame, prefix-readable
+                meta['vbits'] = int(buf[off]); off += 1
+                meta['BR'], nfr = struct.unpack_from('<II', buf, off); off += 8
+                meta['boffs'] = np.frombuffer(buf, dtype=np.uint64, count=nfr+1, offset=off); off += 8*(nfr+1)
+                meta['cstart'] = off; meta['czlen'] = int(meta['boffs'][-1]); off += meta['czlen']
             elif code_enc == 10:               # segmented bitpack-plus
                 meta['pXbits'] = int(buf[off]); off += 1
                 pXn, pXnb = struct.unpack_from('<QI', buf, off); off += 12
@@ -553,6 +558,10 @@ class Segment:
     def _raw_codes(self, nm):
         if nm in self._codes: return self._codes[nm]
         c = self.cols[nm]
+        if c.get('code_enc') == 13:
+            cc = self._e13_band(nm, 0, self.N)
+            self._codes[nm] = cc
+            return cc
         if c['mode'] == 6:
             cc = np.zeros(self.N, dtype=np.uint8)    # constant column: a single group
             self._codes[nm] = cc; return cc
@@ -678,6 +687,8 @@ class Segment:
         c = self.cols[nm]
         if nm in self._codes:
             return self._codes[nm][lo:hi]
+        if c.get('code_enc') == 13:
+            return self._e13_band(nm, lo, hi)
         wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
         BR = int(c['BR']); base = c['cstart']; bo = c['boffs']
         isz = wdt().itemsize
@@ -695,6 +706,36 @@ class Segment:
                 raw = dec.decompress(
                     self.buf[base + int(bo[j]):base + int(bo[j + 1])].tobytes())
                 out[jj * BR:jj * BR + len(raw) // isz] = np.frombuffer(raw, dtype=wdt)
+        if nb > 2:
+            list(_pool().map(_span, range(8)))
+        else:
+            _span(0, 1)
+        return out[lo - j0 * BR:hi - j0 * BR]
+
+    def _e13_band(self, nm, lo, hi, planes=None):
+        """The plane dress's range read: decompress touched frames (a
+        PREFIX of each when planes= is given), rebuild codes from planes.
+        Eight zstd lanes, nothing cached."""
+        c = self.cols[nm]
+        b13 = int(c['vbits']); BR = int(c['BR'])
+        base = c['cstart']; bo = c['boffs']
+        pb = b13 if planes is None else min(planes, b13)
+        j0 = lo // BR; j1 = (hi + BR - 1) // BR
+        nb = j1 - j0
+        out = np.zeros((j1 - j0) * BR, dtype=np.int64)
+        pbytes = BR // 8
+        def _span(t, T=8):
+            import zstandard as _zs
+            dec = _zs.ZstdDecompressor()
+            for jj in range(t * nb // T, (t + 1) * nb // T):
+                j = j0 + jj
+                comp = self.buf[base + int(bo[j]):base + int(bo[j + 1])].tobytes()
+                raw = dec.decompress(comp, max_output_size=pb * pbytes)
+                arr = np.frombuffer(raw, np.uint8, pb * pbytes)
+                seg9 = out[jj * BR:(jj + 1) * BR]
+                for p in range(pb):
+                    bits9 = np.unpackbits(arr[p * pbytes:(p + 1) * pbytes])
+                    seg9 |= bits9.astype(np.int64) << np.int64(b13 - 1 - p)
         if nb > 2:
             list(_pool().map(_span, range(8)))
         else:
@@ -1185,6 +1226,10 @@ class Segment:
         if rows.size == 0:
             return np.empty(0, dtype=np.int64)
         c = self.cols[nm]
+        if c.get('code_enc') == 13:
+            lo13 = int(rows.min()); hi13 = int(rows.max()) + 1
+            band13 = self._e13_band(nm, lo13, hi13)
+            return band13[rows - lo13]
         if c.get('code_enc', 0) == 10:
             if nm in self._codes:                    # already decoded: gather free
                 return self._codes[nm][np.asarray(rows, np.int64)]

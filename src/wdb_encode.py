@@ -379,7 +379,32 @@ def _code_section(codes, bits, enc5_ok=False, nm=None):
         # within-tolerance precedent that seated enc-3's frames.
         best = tiered
 
+    # tag 13 = VERTICAL ZSTD (the plane dress, rehearsal-only until its
+    # snowball reader lands): per frame, codes transpose to bit-planes
+    # (top bit first), planes concatenate, one zstd frame. Plane sizes
+    # are implicit (BR/8 bytes each), so PREFIX decompression yields the
+    # top planes of every row -- distinction reads on compressed bytes.
+    if os.environ.get('WDB_E13_FORCE') and codes.size and int(np.max(codes)) >= 1:
+        a13 = np.asarray(codes, dtype=np.int64)
+        b13 = max(1, int(np.max(a13)).bit_length())
+        if b13 > 1:
+            cxb13 = zstd.ZstdCompressor(level=3)
+            fr13 = []
+            for i in range(0, a13.size, BLOCK_ROWS):
+                ch = a13[i:i + BLOCK_ROWS]
+                if ch.size < BLOCK_ROWS:
+                    ch = np.concatenate([ch, np.zeros(BLOCK_ROWS - ch.size,
+                                                      np.int64)])
+                pls = [np.packbits(((ch >> (b13 - 1 - p)) & 1).astype(np.uint8))
+                       for p in range(b13)]
+                fr13.append(cxb13.compress(np.concatenate(pls).tobytes()))
+            v13 = (bytes([13, b13]) + struct.pack('<II', BLOCK_ROWS, len(fr13))
+                   + b''.join(struct.pack('<Q', x) for x in
+                              np.cumsum([0] + [len(f) for f in fr13]).tolist())
+                   + b''.join(fr13))
+            best = v13
     if best is zsec:
+
         # tag 3 = BLOCKED frames: independent zstd frame per BLOCK_ROWS rows + a frame offset
         # index. Buys pop/scan/prune access (touched frames only, ~0.6 ms/frame) for a measured
         # +1-9% per column at 512K rows (knee sweep) -- adopted when within 10% of the seal.
