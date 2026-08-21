@@ -163,19 +163,20 @@ def execute(seg, spec):
     BR = 524288
     nfr = (N + BR - 1) // BR
     from concurrent.futures import ThreadPoolExecutor
-    def _pour(f):
-        lo, hi = f * BR, min((f + 1) * BR, N)
-        kcf = np.asarray(seg._raw_codes_range(key, lo, hi))
-        ucf = np.asarray(seg._raw_codes_range(lcol, lo, hi))
+    def _work(t, T=8):
         j = np.zeros(KV, np.int64)
         c = np.zeros(KV, np.int64)
-        WK.lenagg_pour(kcf, ucf, lens16, j, c, np.int64(ec))
-        return j, c
+        for f in range(t, nfr, T):               # striped frames, ONE dispatch:
+            lo, hi = f * BR, min((f + 1) * BR, N)
+            kcf = np.asarray(seg._raw_codes_range(key, lo, hi))
+            ucf = np.asarray(seg._raw_codes_range(lcol, lo, hi))
+            WK.lenagg_pour(kcf, ucf, lens16, j, c, np.int64(ec))
+        return j, c                              # one partial pair per worker
     sums = np.zeros(KV, np.float64)
     cnt = np.zeros(KV, np.float64)
     with ThreadPoolExecutor(max_workers=8) as ex:
-        for j, c in ex.map(_pour, range(nfr)):   # frame-fused: pop the aligned pair,
-            sums += j                            # pour while cache-hot, discard
+        for j, c in ex.map(_work, range(8)):     # eight workers, no future churn
+            sums += j
             cnt += c
     keep = cnt > (spec['hmin'] if spec['hmin'] is not None else 0)
     gs = np.flatnonzero(keep)
