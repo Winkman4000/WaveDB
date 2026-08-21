@@ -205,6 +205,9 @@ def _dict_bytes(p, zc):
     return out
 
 def _code_section(codes, bits, enc5_ok=False, nm=None):
+    _fovr = dict((kv.split(':')[0], int(kv.split(':')[1]))
+                 for kv in os.environ.get('WDB_FRAME_OVERRIDES', '').split(',') if ':' in kv)
+    BLOCK_ROWS = _fovr[nm] if (nm is not None and nm in _fovr)         else globals()['BLOCK_ROWS']             # the passport elects the frame
     """Per-row code array (mode 0/1/2): 1 tag byte + payload. tag 0 = raw bit-packed; tag 1 = zstd
     of byte-aligned codes; tag 2 = STAIRCASE (codes non-decreasing in row order, e.g. time-ordered
     ingest): store only the gap-packed rows where the code ticks +1 -- the norm is 'same as the row
