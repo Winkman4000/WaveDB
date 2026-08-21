@@ -420,12 +420,21 @@ def _code_section(codes, bits, enc5_ok=False, nm=None):
         # Bitpack (already point-readable) and staircase still win outright when smaller.
         a = np.asarray(codes, dtype=wdt)
         cxb = zstd.ZstdCompressor(level=CODE_ZSTD_LEVEL)
-        frames = [cxb.compress(a[i:i + BLOCK_ROWS].tobytes()) for i in range(0, a.size, BLOCK_ROWS)]
-        offs = np.zeros(len(frames) + 1, dtype=np.uint32)
-        np.cumsum([len(f) for f in frames], out=offs[1:])
-        blocked = (bytes([3, width]) + struct.pack('<II', BLOCK_ROWS, len(frames))
-                   + offs.tobytes() + b''.join(frames))
-        if len(blocked) <= len(zsec) * 1.10:
+        blocked = None
+        for BR9 in ((65536, BLOCK_ROWS) if (BLOCK_ROWS > 65536
+                    and codes.size and int(np.max(codes)) > 1)
+                    else (BLOCK_ROWS,)):
+            frames = [cxb.compress(a[i:i + BR9].tobytes())
+                      for i in range(0, a.size, BR9)]
+            offs = np.zeros(len(frames) + 1, dtype=np.uint32)
+            np.cumsum([len(f) for f in frames], out=offs[1:])
+            cand9 = (bytes([3, width]) + struct.pack('<II', BR9, len(frames))
+                     + offs.tobytes() + b''.join(frames))
+            if len(cand9) <= len(zsec) * 1.10 \
+                    and (blocked is None or len(cand9) <= 1.10 * len(blocked)):
+                blocked = cand9                  # Jackson's rule: fine frames
+                break                            # up to +10%; else the coarse
+        if blocked is not None:
             best = blocked
     # tag 5 = PATCHED BUCKETS (Jackson's format): 4-bit pointers into a 15-entry hot
     # table + escape patches (u16) + per-32K escape offsets. Skewed low-V numeric
