@@ -74,11 +74,14 @@ def execute(seg, spec):
     k = spec['k']
     pairs = {}
     tries = 0
-    while len(pairs) < k and tries < 64:
+    cap9 = max(64, 4 * k)          # tiny slices first: draws touch few frames
+    while len(pairs) < k and tries < 96:
         tries += 1
+        if tries == 65:
+            cap9 = 200000          # fallback phase: admit anything countable
         c = int(rng.integers(0, V))
         n9 = int(cnt_b[c])
-        if n9 == 0 or n9 > 200000:
+        if n9 == 0 or n9 > cap9:
             continue
         rows9 = np.asarray(plB[offsB[c]:offsB[c + 1]]).astype(np.int64)
         ac9 = np.asarray(seg.codes_at(spec['a'], rows9)).astype(np.int64)
