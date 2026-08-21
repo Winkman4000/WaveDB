@@ -140,8 +140,8 @@ class Segment:
                 meta['BR'], nfr = struct.unpack_from('<II', buf, off); off += 8
                 meta['boffs'] = np.frombuffer(buf, dtype=np.uint32, count=nfr+1, offset=off); off += 4*(nfr+1)
                 meta['cstart'] = off; meta['czlen'] = int(meta['boffs'][-1]); off += meta['czlen']
-            elif code_enc == 13:               # vertical zstd: bit-planes per frame, prefix-readable
-                meta['vbits'] = int(buf[off]); off += 1
+            elif code_enc == 13:               # byte-planes: each plane its own zstd frame
+                meta['vnby'] = int(buf[off]); off += 1
                 meta['BR'], nfr = struct.unpack_from('<II', buf, off); off += 8
                 meta['boffs'] = np.frombuffer(buf, dtype=np.uint64, count=nfr+1, offset=off); off += 8*(nfr+1)
                 meta['cstart'] = off; meta['czlen'] = int(meta['boffs'][-1]); off += meta['czlen']
@@ -713,34 +713,73 @@ class Segment:
         return out[lo - j0 * BR:hi - j0 * BR]
 
     def _e13_band(self, nm, lo, hi, planes=None):
-        """The plane dress's range read: decompress touched frames (a
-        PREFIX of each when planes= is given), rebuild codes from planes.
-        Eight zstd lanes, nothing cached."""
+        """Byte-plane range read: per touched frame, inflate only the
+        planes asked for (all, for exact codes; fewer for coarse reads)
+        and weave bytes back into codes. Eight lanes, nothing cached."""
         c = self.cols[nm]
-        b13 = int(c['vbits']); BR = int(c['BR'])
+        nby = int(c['vnby']); BR = int(c['BR'])
         base = c['cstart']; bo = c['boffs']
-        pb = b13 if planes is None else min(planes, b13)
+        pb = nby if planes is None else min(planes, nby)
         j0 = lo // BR; j1 = (hi + BR - 1) // BR
         nb = j1 - j0
         out = np.zeros((j1 - j0) * BR, dtype=np.int64)
-        pbytes = BR // 8
         def _span(t, T=8):
             import zstandard as _zs
             dec = _zs.ZstdDecompressor()
             for jj in range(t * nb // T, (t + 1) * nb // T):
                 j = j0 + jj
-                comp = self.buf[base + int(bo[j]):base + int(bo[j + 1])].tobytes()
-                raw = dec.decompress(comp, max_output_size=pb * pbytes)
-                arr = np.frombuffer(raw, np.uint8, pb * pbytes)
                 seg9 = out[jj * BR:(jj + 1) * BR]
-                for p in range(pb):
-                    bits9 = np.unpackbits(arr[p * pbytes:(p + 1) * pbytes])
-                    seg9 |= bits9.astype(np.int64) << np.int64(b13 - 1 - p)
+                for b in range(pb):
+                    fi = j * nby + b
+                    raw = dec.decompress(
+                        self.buf[base + int(bo[fi]):base + int(bo[fi + 1])]
+                        .tobytes(), max_output_size=BR)
+                    seg9 |= np.frombuffer(raw, np.uint8, BR).astype(np.int64) \
+                        << np.int64(8 * (nby - 1 - b))
         if nb > 2:
             list(_pool().map(_span, range(8)))
         else:
             _span(0, 1)
         return out[lo - j0 * BR:hi - j0 * BR]
+
+    def e13_scan_eq(self, nm, code, neq=False):
+        """THE BYTE-DESCENT (Jackson's 10-vs-42 economics): per frame,
+        inflate plane 0 and compare one byte -- 255/256 of rows die per
+        level -- descending only while candidates live. A dead frame
+        never inflates its remaining planes. Returns a bool row mask and
+        bytes actually inflated, for the referee."""
+        import zstandard as _zs
+        c = self.cols[nm]
+        nby = int(c['vnby']); BR = int(c['BR'])
+        base = c['cstart']; bo = c['boffs']
+        nfr = (len(bo) - 1) // nby
+        out = np.zeros(nfr * BR, bool)
+        spent = np.zeros(8, np.int64)
+        def _span(t, T=8):
+            dec = _zs.ZstdDecompressor()
+            for j in range(t * nfr // T, (t + 1) * nfr // T):
+                cand = None
+                for b in range(nby):
+                    fi = j * nby + b
+                    comp = self.buf[base + int(bo[fi]):base + int(bo[fi + 1])]
+                    raw = dec.decompress(comp.tobytes(), max_output_size=BR)
+                    spent[t] += len(comp)
+                    pl = np.frombuffer(raw, np.uint8, BR)
+                    tb = (code >> (8 * (nby - 1 - b))) & 0xFF
+                    m9 = (pl == tb)
+                    cand = m9 if cand is None else (cand & m9)
+                    if not cand.any():
+                        cand = None
+                        break
+                if cand is not None:
+                    out[j * BR:(j + 1) * BR] = cand
+        if nfr > 2:
+            list(_pool().map(_span, range(8)))
+        else:
+            _span(0, 1)
+        if neq:
+            np.invert(out, out=out)
+        return out, int(spent.sum())
 
     def stairs(self, nm):
         """Step rows of a STAIRCASE column (codes non-decreasing in row order, e.g. time-ordered

@@ -379,15 +379,18 @@ def _code_section(codes, bits, enc5_ok=False, nm=None):
         # within-tolerance precedent that seated enc-3's frames.
         best = tiered
 
-    # tag 13 = VERTICAL ZSTD (the plane dress, rehearsal-only until its
-    # snowball reader lands): per frame, codes transpose to bit-planes
-    # (top bit first), planes concatenate, one zstd frame. Plane sizes
-    # are implicit (BR/8 bytes each), so PREFIX decompression yields the
-    # top planes of every row -- distinction reads on compressed bytes.
-    if os.environ.get('WDB_E13_FORCE') and codes.size and int(np.max(codes)) >= 1:
+    # tag 13 = BYTE-PLANES (Jackson's dress, v2): per frame, codes split
+    # into byte lanes (top byte first), EACH plane its own zstd frame --
+    # a plane you don't need is a plane never inflated. Descent prunes
+    # 255/256 per level and the top plane's census fits a cache line
+    # neighborhood. Operator-tagged columns only (semantic knowledge is
+    # the operator's), passing the data gates (multi-byte, growth <=25%).
+    _e13_tags = set(x for x in os.environ.get('WDB_E13_TAGS', '').split(',') if x)
+    _e13_want = os.environ.get('WDB_E13_FORCE') or (nm is not None and nm in _e13_tags)
+    if _e13_want and codes.size and int(np.max(codes)) >= 256:
         a13 = np.asarray(codes, dtype=np.int64)
-        b13 = max(1, int(np.max(a13)).bit_length())
-        if b13 > 1:
+        nby = (max(1, int(np.max(a13)).bit_length()) + 7) // 8
+        if nby > 1:
             cxb13 = zstd.ZstdCompressor(level=3)
             fr13 = []
             for i in range(0, a13.size, BLOCK_ROWS):
@@ -395,14 +398,17 @@ def _code_section(codes, bits, enc5_ok=False, nm=None):
                 if ch.size < BLOCK_ROWS:
                     ch = np.concatenate([ch, np.zeros(BLOCK_ROWS - ch.size,
                                                       np.int64)])
-                pls = [np.packbits(((ch >> (b13 - 1 - p)) & 1).astype(np.uint8))
-                       for p in range(b13)]
-                fr13.append(cxb13.compress(np.concatenate(pls).tobytes()))
-            v13 = (bytes([13, b13]) + struct.pack('<II', BLOCK_ROWS, len(fr13))
+                for b in range(nby):
+                    pl = ((ch >> (8 * (nby - 1 - b))) & 0xFF).astype(np.uint8)
+                    fr13.append(cxb13.compress(pl.tobytes()))
+            v13 = (bytes([13, nby]) + struct.pack('<II', BLOCK_ROWS, len(fr13))
                    + b''.join(struct.pack('<Q', x) for x in
                               np.cumsum([0] + [len(f) for f in fr13]).tolist())
                    + b''.join(fr13))
-            best = v13
+            if os.environ.get('WDB_E13_FORCE'):
+                best = v13                        # rehearsal: wear it regardless
+            elif len(v13) <= 1.25 * len(best):
+                best = v13                        # the tagged column's gate
     if best is zsec:
 
         # tag 3 = BLOCKED frames: independent zstd frame per BLOCK_ROWS rows + a frame offset
