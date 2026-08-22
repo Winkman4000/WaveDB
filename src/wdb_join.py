@@ -1684,20 +1684,75 @@ def _build_chain(db, tree, allow_hash=True):
     frm = tree.find(E.From).this
     tables = [(frm.name, frm.alias or frm.name)]
     for jn in (tree.args.get('joins') or []):
-        if jn.args.get('side') or jn.args.get('kind'): raise _FastUnsupported   # INNER only
+        if jn.args.get('side'): raise _FastUnsupported                           # INNER only
+        if jn.args.get('kind') and jn.args.get('kind') != 'CROSS':
+            raise _FastUnsupported                                               # comma-dialect rides as CROSS
+        if jn.args.get('kind') == 'CROSS' and jn.args.get('on') is not None:
+            raise _FastUnsupported
         if not isinstance(jn.this, E.Table): raise _FastUnsupported              # no subqueries
         tables.append((jn.this.name, jn.this.alias or jn.this.name))
     alias2t = {a: t for t, a in tables}
     if len(alias2t) != len(tables): raise _FastUnsupported                       # duplicate/self alias
 
-    edges = {}            # child_alias -> (parent_alias, fk_col)
-    parents = set()
+    # THE DIALECT MINER: equalities come from ON clauses (residual conjuncts
+    # shifted into WHERE -- lawful for INNER) and, for comma-dialect joins,
+    # from WHERE's own col=col conjuncts. The edge court below is unchanged.
+    def _conjuncts(x):
+        if isinstance(x, E.And):
+            return _conjuncts(x.this) + _conjuncts(x.expression)
+        return [x]
+    col_owner = {}                                  # bare name -> alias (None if ambiguous)
+    for t9, a9 in tables:
+        try:
+            for cn9 in db.cat.column_names(t9):
+                col_owner[cn9] = None if cn9 in col_owner else a9
+        except Exception:
+            pass
+    def _own(c9):
+        return c9.table or col_owner.get(c9.name)   # TPC-H speaks bare names
+    eq_pool = []
+    residuals = []
     for jn in (tree.args.get('joins') or []):
         on = jn.args.get('on')
-        if not isinstance(on, E.EQ): raise _FastUnsupported
+        if on is None:
+            continue
+        got = False
+        for cj in _conjuncts(on):
+            if (not got and isinstance(cj, E.EQ)
+                    and isinstance(cj.this, E.Column)
+                    and isinstance(cj.expression, E.Column)):
+                eq_pool.append(cj)
+                got = True
+            else:
+                residuals.append(cj)
+        if not got: raise _FastUnsupported
+    w9 = tree.args.get('where')
+    w_eqs = []
+    if w9 is not None:
+        for cj in _conjuncts(w9.this):
+            if (isinstance(cj, E.EQ) and isinstance(cj.this, E.Column)
+                    and isinstance(cj.expression, E.Column)
+                    and _own(cj.this) and _own(cj.expression)
+                    and _own(cj.this) != _own(cj.expression)):
+                eq_pool.append(cj)
+                w_eqs.append(cj)
+    if residuals and not tree.args.get('_wdb_onshift'):
+        import sqlglot as _sg
+        merged = residuals[0]
+        for r9 in residuals[1:]:
+            merged = E.And(this=merged, expression=r9)
+        if w9 is not None:
+            w9.set('this', E.And(this=w9.this, expression=merged))
+        else:
+            tree.set('where', E.Where(this=merged))
+        tree.set('_wdb_onshift', True)
+
+    edges = {}            # child_alias -> (parent_alias, fk_col)
+    parents = set()
+    _edge_w = []
+    for on in eq_pool:
         le, re = on.this, on.expression
-        if not (isinstance(le, E.Column) and isinstance(re, E.Column)): raise _FastUnsupported
-        aA, kA, aB, kB = le.table, le.name, re.table, re.name
+        aA, kA, aB, kB = _own(le), le.name, _own(re), re.name
         tA, tB = alias2t.get(aA), alias2t.get(aB)
         if tA is None or tB is None: raise _FastUnsupported
         fkA, fkB = db.cat.fk_pointers(tA), db.cat.fk_pointers(tB)
@@ -1710,10 +1765,29 @@ def _build_chain(db, tree, allow_hash=True):
         elif allow_hash and _key_is_unique(db, tA, kA):
             child_a, parent_a, fk_col = aB, aA, ('hash', kB, kA)
         else:
-            raise _FastUnsupported                                               # neither key unique -> not a pointer
-        if child_a in edges: raise _FastUnsupported                              # one parent per child (tree)
+            continue                                             # neither key unique: rides WHERE as a filter
+        if child_a in edges:
+            continue                                             # child already parented: extra eq stays a filter
         edges[child_a] = (parent_a, fk_col); parents.add(parent_a)
+        if id(on) in {id(x) for x in w_eqs}:
+            _edge_w.append(on)
 
+    if w9 is not None and _edge_w:
+        consumed = {id(x) for x in _edge_w}
+        kept = [cj for cj in _conjuncts(w9.this) if id(cj) not in consumed]
+        for cj in kept:                                          # col=col survivors: decline, don't crash
+            if (isinstance(cj, E.EQ) and isinstance(cj.this, E.Column)
+                    and isinstance(cj.expression, E.Column)
+                    and _own(cj.this) and _own(cj.expression)
+                    and _own(cj.this) != _own(cj.expression)):
+                raise _FastUnsupported
+        if kept:
+            merged = kept[0]
+            for cj in kept[1:]:
+                merged = E.And(this=merged, expression=cj)
+            w9.set('this', merged)
+        else:
+            tree.set('where', None)
     if not edges:                                                                # 0 joins: single-table query
         if len(tables) != 1: raise _FastUnsupported                              # multiple tables, no FK edge
         fact = tables[0][1]
