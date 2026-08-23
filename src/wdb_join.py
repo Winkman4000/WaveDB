@@ -925,6 +925,22 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                         res = codes != tc
                         if nullcode is not None: res &= (codes != nullcode)   # SQL: NULL != x is not TRUE
                         return res
+                c9 = seg.cols[pcol]
+                if c9.get('mode') in (0, 1, 2) and c9.get('mode') != 4:
+                    # THE JOIN FUNNEL, tier 1: predicate -> V-sized bool over
+                    # the dictionary (_dict_keep), gathered through codes. No
+                    # value decode, no astype -- the mask costs one u-int
+                    # gather. Null codes read False (SQL: NULL op x not TRUE).
+                    try:
+                        td9 = np.asarray(seg._typed_dict(pcol))
+                    except Exception:
+                        td9 = None
+                    if td9 is not None and td9.dtype.kind in 'iuf' and len(td9):
+                        keep9 = _dict_keep(node, seg, pcol, td9)
+                        if keep9 is not None:
+                            kx9 = np.zeros(int(c9['V']), bool)
+                            kx9[:len(keep9)] = keep9
+                            return kx9[np.asarray(seg.codes(pcol))]
                 arr, _ = _col_cached(seg, pcol)
                 v = wdb_sql._lit_for_col(seg, pcol, node.expression, arr.dtype.kind)
                 if arr.dtype.kind == 'M': arr = arr.view('int64')   # datetime: compare as epoch ints
