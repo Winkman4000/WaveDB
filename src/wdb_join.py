@@ -1178,7 +1178,18 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             for k in gkeys:
                 codes = k['full'][k['cptr']] if k['cptr'] is not None else k['full']
                 comp = comp * k['K'] + codes.astype(np.int64, copy=False)
-            gids, gid_to_comp = pd.factorize(comp, sort=False)   # hash-factorise -> only groups present
+            d9 = np.diff(comp)
+            if n and (d9 >= 0).all():
+                # THE SORTED-RUN COURT: a monotone composite (sorted fact key,
+                # pointer-dependent co-keys) factorises by boundary -- no hash,
+                # one diff. TPC-H's fact tables arrive this way by birth.
+                starts = np.concatenate([[0], np.flatnonzero(d9 > 0) + 1])
+                gids = np.zeros(n, np.int64)
+                gids[starts[1:]] = 1
+                gids = np.cumsum(gids)
+                gid_to_comp = comp[starts]
+            else:
+                gids, gid_to_comp = pd.factorize(comp, sort=False)   # hash-factorise -> only groups present
             gids = np.ascontiguousarray(gids.astype(np.int64))
             K = len(gid_to_comp); group_op = ('d', gids); group_keys = [(gids, K, None)]
 
