@@ -1507,11 +1507,20 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 col_results[i] = ('key', body)           # body field carries the group-key index
             else:
                 s, mn, mx = results[ex_index[body]]
-                o = np.full(K, None, dtype=object)
-                if   fn == 'SUM': o = s.astype(object); o[~nz] = None
-                elif fn == 'AVG': o[nz] = s[nz] / counts[nz]
-                elif fn == 'MIN': o[nz] = mn[nz]
-                else:             o[nz] = mx[nz]
+                if nz.all():
+                    # groups born from rows are never empty: no NULLs to
+                    # plant, so the object-dtype ceremony (17.5% of Q3's
+                    # warm wall) is skipped and numerics stay numeric.
+                    if   fn == 'SUM': o = s
+                    elif fn == 'AVG': o = s / counts
+                    elif fn == 'MIN': o = mn
+                    else:             o = mx
+                else:
+                    o = np.full(K, None, dtype=object)
+                    if   fn == 'SUM': o = s.astype(object); o[~nz] = None
+                    elif fn == 'AVG': o[nz] = s[nz] / counts[nz]
+                    elif fn == 'MIN': o[nz] = mn[nz]
+                    else:             o[nz] = mx[nz]
                 col_results[i] = ('arr', o, is_dt, unit)
     else:
         specs = []          # (i, fn, value_op, nullmask_op) for COUNT/SUM/AVG
