@@ -323,6 +323,8 @@ def denorm_rewrite(db, tree):
 
 
 def join_query(db, sql, columnar=False):
+    import time as _t8
+    _jq_t0 = _t8.perf_counter()
     tree = sqlglot.parse_one(sql, read='duckdb')
     joins = tree.args.get('joins')
     import wdb_sql as _ws
@@ -354,6 +356,9 @@ def join_query(db, sql, columnar=False):
             chain = None
     if chain is not None:
         try:
+            if __import__('os').environ.get('WDB_JOIN_BILL'):
+                print('JOIN BILL: pre-work(parse+chain)=%.0fms'
+                      % ((_t8.perf_counter() - _jq_t0) * 1000), flush=True)
             return _fast_pointer_agg(db, tree, chain, columnar)  # hashed chain, fused agg
         except _FastUnsupported:
             return _chain_pandas(db, tree, chain)    # same chain, pandas agg/predicate tail
@@ -1393,6 +1398,10 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             return f"(({lo} <= {v}) and ({v} <= {hi}))"
         raise _FastUnsupported
 
+    import time as _t9
+    _bill9 = [] if __import__('os').environ.get('WDB_JOIN_BILL') else None
+    _tk9 = _t9.perf_counter
+    _b0 = _tk9()
     pred_body = None
     if where is not None:
         try:
@@ -1532,9 +1541,13 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             counts, _rsum = wdb_radix.radix_grouped(_rk, _rK, _rmeas, NT=wdb_exprjit._NT)
             results = [] if _rmeas is None else [(_rsum[0], None, None)]
         else:
+            if _bill9 is not None:
+                _bill9.append(('assemble(pred+slots+keys+comp)', _tk9() - _b0)); _b1 = _tk9()
             counts, results = wdb_exprjit.grouped_multi(group_keys, slot_list, exprs,
                                                         _mask, n, pred_body,
                                                         mono=bool(locals().get('_mono_gids')))
+            if _bill9 is not None:
+                _bill9.append(('grouped_multi kernel', _tk9() - _b1)); _b1 = _tk9()
         nz = counts > 0
         for (i, fn, body, is_dt, unit) in plan:
             if fn == 'count':
@@ -1690,6 +1703,44 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         _bump_fast()
         return out, names
 
+    # THE TOP-K EMIT (the realm's oldest move, arriving at the join court):
+    # with ORDER BY + LIMIT and no HAVING, select the k winners in ARRAY
+    # space -- agg results are arrays already, and numeric-dict key codes are
+    # order-isomorphic to their values (dict-locked ordered encode) -- then
+    # materialise only k python rows instead of every group.
+    _sel9 = None
+    _ord9 = tree.args.get('order')
+    _lim9 = wdb_sql._limit(tree)
+    if _ord9 is not None and _lim9 is not None and tree.args.get('having') is None:
+        try:
+            keys9 = []
+            aliases9 = [wdb_sql._alias(p) for p in proj]
+            for oe in _ord9.expressions:
+                tgt = oe.this
+                nm9 = tgt.name if hasattr(tgt, 'name') else str(tgt)
+                if nm9 not in aliases9:
+                    raise ValueError
+                i9 = aliases9.index(nm9)
+                r9 = col_results[i9]
+                if r9[0] == 'count':
+                    a9 = counts[present].astype(np.float64)
+                elif r9[0] == 'key':
+                    gk9 = gkeys[r9[1]]
+                    if 'labels' in gk9 or gk9['seg'].cols[gk9['pcol']].get('dt') == 1:
+                        raise ValueError            # only numeric-dict keys are order-safe
+                    a9 = kc_arr[r9[1]].astype(np.float64)
+                else:
+                    if r9[1].dtype == object:
+                        raise ValueError
+                    a9 = r9[1][present].astype(np.float64)
+                keys9.append(-a9 if oe.args.get('desc') else a9)
+            _sel9 = np.lexsort(tuple(reversed(keys9)))[:int(_lim9)]
+        except Exception:
+            _sel9 = None
+    if _sel9 is not None:
+        present = np.flatnonzero(present)[_sel9] if present.dtype == bool else present[_sel9]
+        counts_present = counts[present]
+        kc_arr = [k9[_sel9] for k9 in kc_arr]
     col_lists = []
     for i, p in enumerate(proj):
         r = col_results[i]
@@ -1702,7 +1753,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         elif r[0] == 'count':
             col_lists.append(counts[present].tolist())
         else:
-            picked = r[1][present]
+            picked = r[1][present] if _sel9 is None else r[1][present]
             if r[2]:                                      # datetime epoch -> datetime64 -> _pyval string
                 unit = r[3]
                 col_lists.append([(wdb_sql._pyval(np.int64(v).view(f'datetime64[{unit}]')) if v is not None
@@ -1715,9 +1766,13 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     having = tree.args.get('having')
     if having is not None:
         rows = wdb_sql._apply_having(rows, proj, having.this, None)   # fused path must filter too
-    rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))
-    lim = wdb_sql._limit(tree)
-    if lim is not None: rows = rows[:lim]
+    if _sel9 is None:
+        rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))
+        lim = wdb_sql._limit(tree)
+        if lim is not None: rows = rows[:lim]
+    if _bill9 is not None:
+        _bill9.append(('emit+having+order', _tk9() - _b1))
+        print('JOIN BILL: ' + ' | '.join('%s=%.0fms' % (k9, v9 * 1000) for k9, v9 in _bill9), flush=True)
     return rows, [wdb_sql._alias(p) for p in proj]
 
 
