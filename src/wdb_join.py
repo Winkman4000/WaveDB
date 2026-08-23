@@ -1427,7 +1427,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             if len(conj9) > 1:
                 scored9 = [(_potency9(cn), build_pred(cn)) for cn in conj9]
                 scored9.sort(key=lambda x: -x[0])
-                pred_body = '(' + ' and '.join(p for _, p in scored9) + ')'
+                pred_body = tuple(p for _, p in scored9)   # ordered conjuncts: the law rides to the codegen
             else:
                 pred_body = build_pred(where.this)
         except _FastUnsupported:

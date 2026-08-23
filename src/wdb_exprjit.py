@@ -167,12 +167,19 @@ def _build_multi(bodies, mm_flags, slot_gathered, slot_code, gk_gathered, nkeys,
     def _decode(k):
         idx = f'c{k}[p{k}[i]]' if slot_gathered[k] else f'c{k}[i]'
         return f"            v{k} = {idx}" if slot_code[k] else f"            v{k} = b{k}[{idx}]"
-    pred_slots = sorted(set(int(x) for x in re.findall(r'v(\d+)', pred))) if pred else []
     done = set()
-    if pred:                                    # decode only what the predicate needs, then skip early
-        for k in pred_slots:
-            L += [_decode(k)]; done.add(k)
-        L += [f"            if not ({pred}): continue"]
+    if pred:
+        # THE POTENCY LAW's enforcement arm: pred may arrive as an ORDERED
+        # tuple of conjuncts (highest prune/cost first). Each conjunct
+        # decodes only its own slots, tests, and skips -- a failed cheap
+        # test means the expensive gathers behind it are never paid. A
+        # plain string keeps the old single-block behavior.
+        conjs = pred if isinstance(pred, tuple) else (pred,)
+        for cj in conjs:
+            for k in sorted(set(int(x) for x in re.findall(r'v(\d+)', cj))):
+                if k not in done:
+                    L += [_decode(k)]; done.add(k)
+            L += [f"            if not ({cj}): continue"]
     elif has_mask:
         L += ["            if not mask[i]: continue"]
     for k in range(G):
@@ -276,11 +283,12 @@ def _build_scalar(bodies, slot_gathered, slot_code, has_mask, pred):
     L = [f"def _k({', '.join(params)}):", "    cnt = 0"]
     for e in range(E): L.append(f"    s{e} = 0.0")
     L.append("    for i in _prange(n):")
-    pred_slots = sorted(set(int(x) for x in re.findall(r'v(\d+)', pred))) if pred else []
+    _ps = (' and '.join(pred) if isinstance(pred, tuple) else pred) or ''
+    pred_slots = sorted(set(int(x) for x in re.findall(r'v(\d+)', _ps))) if _ps else []
     cond = None
     if pred:
         for k in pred_slots: L.append(_decode(k, "        "))
-        cond = f"({pred})"
+        cond = f"({_ps})"
     elif has_mask:
         cond = "mask[i]"
     ind = "        "
