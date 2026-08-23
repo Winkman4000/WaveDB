@@ -1712,16 +1712,29 @@ def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
     # and mmap'd forever after -- the N-RAM law satisfied on disk. A stale
     # or foreign sidecar can only misroute rows, so it carries a birthmark
     # (parent segment path + N) checked before trust.
-    import os as _os
+    import os as _os, json as _js
     sc9 = getattr(cseg, 'path', None)
+    pp9 = getattr(pseg, 'path', None)
     side = None
-    if sc9:
+    mark = None
+    if sc9 and pp9:
         side = '%s.%s__%s.%s.jptr.npy' % (sc9, cp, ptbl, pp)
-        if _os.path.exists(side):
+        try:
+            st_c = _os.stat(sc9); st_p = _os.stat(pp9)
+            mark = {'c': [_os.path.realpath(sc9), st_c.st_size, st_c.st_mtime_ns],
+                    'p': [_os.path.realpath(pp9), st_p.st_size, st_p.st_mtime_ns],
+                    'ck': cp, 'pk': pp}
+        except Exception:
+            side = None
+        if side and _os.path.exists(side) and _os.path.exists(side + '.mark'):
             try:
-                ptr9 = np.load(side, mmap_mode='r')
-                if ptr9.shape[0] == cseg.N and int(ptr9[-1]) < pseg.N:
-                    return ptr9
+                # THE BIRTHMARK (plist regime): the sidecar names BOTH parents'
+                # identity (path+size+mtime) and the key pair; any mismatch is a
+                # hard refusal, never a guess -- a stale pointer misroutes rows.
+                if _js.load(open(side + '.mark')) == mark:
+                    ptr9 = np.load(side, mmap_mode='r')
+                    if ptr9.shape[0] == cseg.N:
+                        return ptr9
             except Exception:
                 pass
     ck = np.asarray(wdb_sql._col(cseg, cp)[0]); pk = np.asarray(wdb_sql._col(pseg, pp)[0])
@@ -1730,12 +1743,23 @@ def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
     ptr = pidx.get_indexer(ck)
     if (ptr < 0).any(): raise _FastUnsupported                    # unmatched child rows -> would drop -> fall back
     ptr = ptr.astype(np.int64)
-    if side:
-        try:
-            np.save(side + '.tmp.npy', ptr)
-            _os.replace(side + '.tmp.npy', side)
-        except Exception:
-            pass
+    # THE BIRTH GATE (plist spirit: born where reads justify): the first
+    # qualifying join per (child,key,parent,key) pays its hash in RAM only;
+    # the sidecar is born on the SECOND ask, so one-off exploratory joins
+    # never cost the realm disk. Operators may force births with
+    # WDB_JPTR_EAGER=1 or forbid them with WDB_JPTR_OFF=1.
+    if side and mark and not _os.environ.get('WDB_JPTR_OFF'):
+        asked = db.__dict__.setdefault('_jptr_asked', set())
+        key9 = (side,)
+        if key9 in asked or _os.environ.get('WDB_JPTR_EAGER'):
+            try:
+                np.save(side + '.tmp.npy', ptr)
+                _os.replace(side + '.tmp.npy', side)
+                _js.dump(mark, open(side + '.mark', 'w'))
+            except Exception:
+                pass
+        else:
+            asked.add(key9)
     return ptr
 
 
