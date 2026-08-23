@@ -1195,7 +1195,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 codes = k['full'][k['cptr']] if k['cptr'] is not None else k['full']
                 comp = comp * k['K'] + codes.astype(np.int64, copy=False)
             d9 = np.diff(comp)
-            if n and (d9 >= 0).all():
+            _mono_gids = bool(n and (d9 >= 0).all())
+            if _mono_gids:
                 # THE SORTED-RUN COURT: a monotone composite (sorted fact key,
                 # pointer-dependent co-keys) factorises by boundary -- no hash,
                 # one diff. TPC-H's fact tables arrive this way by birth.
@@ -1532,7 +1533,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             results = [] if _rmeas is None else [(_rsum[0], None, None)]
         else:
             counts, results = wdb_exprjit.grouped_multi(group_keys, slot_list, exprs,
-                                                        _mask, n, pred_body)
+                                                        _mask, n, pred_body,
+                                                        mono=bool(locals().get('_mono_gids')))
         nz = counts > 0
         for (i, fn, body, is_dt, unit) in plan:
             if fn == 'count':

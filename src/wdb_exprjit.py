@@ -126,13 +126,14 @@ def grouped_expr(group_keys, body, inputs, mask, n, need_minmax):
     return cnt[:, :K].sum(0), s[:, :K].sum(0), None, None
 
 
-def _build_multi(bodies, mm_flags, slot_gathered, slot_code, gk_gathered, nkeys, has_mask, pred):
+def _build_multi(bodies, mm_flags, slot_gathered, slot_code, gk_gathered, nkeys, has_mask, pred,
+                 mono=False):
     """Compile a kernel that, in ONE pass, composes the group code inline, decodes the shared value slots
     once, and accumulates EVERY value expression (count + per-expr sum, and min/max where flagged).
     bodies: tuple of numba-source expressions over global slots v0..v{G-1}; mm_flags: per-expr need_minmax.
     pred: a boolean expression over the same slots (WHERE fused inline); '' for none. When present, the
     predicate's slots are decoded first and a failing row is skipped before any other slot is decoded."""
-    key = (bodies, mm_flags, slot_gathered, slot_code, gk_gathered, nkeys, has_mask, pred)
+    key = (bodies, mm_flags, slot_gathered, slot_code, gk_gathered, nkeys, has_mask, pred, mono)
     fn = _CACHE.get(key)
     if fn is not None:
         return fn
@@ -154,16 +155,36 @@ def _build_multi(bodies, mm_flags, slot_gathered, slot_code, gk_gathered, nkeys,
 
     def gkexpr(j): return f'gk{j}[gp{j}[i]]' if gk_gathered[j] else f'gk{j}[i]'
 
-    L = [f"def _k({', '.join(params)}):",
-         "    cnt = np.zeros((NT, Kp), np.int64)"]
-    for e in range(E):
-        L += [f"    s{e} = np.zeros((NT, Kp))"]
-        if mm_flags[e]:
-            L += [f"    mn{e} = np.full((NT, Kp), np.inf)", f"    mx{e} = np.full((NT, Kp), -np.inf)"]
-    L += ["    chunk = (n + NT - 1) // NT",
-          "    for t in _prange(NT):",
-          "        lo = t * chunk; hi = min(lo + chunk, n)",
-          "        for i in range(lo, hi):"]
+    mono = bool(mono and nkeys == 1 and not gk_gathered[0])
+    if mono:
+        # THE MONOTONE ACCUMULATOR REGIME: gids arrive sorted (the sorted-run
+        # court), so threads snap their chunk edges forward to group
+        # boundaries and own DISJOINT group ranges of ONE shared accumulator.
+        # No NT-privatization (146MB/array at K=1.1M), no giant memset, no
+        # merge pass -- the three walls the potency strikes exposed.
+        L = [f"def _k({', '.join(params)}):",
+             "    cnt = np.zeros(Kp, np.int64)"]
+        for e in range(E):
+            L += [f"    s{e} = np.zeros(Kp)"]
+            if mm_flags[e]:
+                L += [f"    mn{e} = np.full(Kp, np.inf)", f"    mx{e} = np.full(Kp, -np.inf)"]
+        L += ["    chunk = (n + NT - 1) // NT",
+              "    for t in _prange(NT):",
+              "        lo = t * chunk; hi = min(lo + chunk, n)",
+              "        while 0 < lo < n and gk0[lo] == gk0[lo - 1]: lo += 1",
+              "        while 0 < hi < n and gk0[hi] == gk0[hi - 1]: hi += 1",
+              "        for i in range(lo, hi):"]
+    else:
+        L = [f"def _k({', '.join(params)}):",
+             "    cnt = np.zeros((NT, Kp), np.int64)"]
+        for e in range(E):
+            L += [f"    s{e} = np.zeros((NT, Kp))"]
+            if mm_flags[e]:
+                L += [f"    mn{e} = np.full((NT, Kp), np.inf)", f"    mx{e} = np.full((NT, Kp), -np.inf)"]
+        L += ["    chunk = (n + NT - 1) // NT",
+              "    for t in _prange(NT):",
+              "        lo = t * chunk; hi = min(lo + chunk, n)",
+              "        for i in range(lo, hi):"]
     def _decode(k):
         idx = f'c{k}[p{k}[i]]' if slot_gathered[k] else f'c{k}[i]'
         return f"            v{k} = {idx}" if slot_code[k] else f"            v{k} = b{k}[{idx}]"
@@ -190,12 +211,13 @@ def _build_multi(bodies, mm_flags, slot_gathered, slot_code, gk_gathered, nkeys,
         L += [f"            g = {gkexpr(0)}"]
         for j in range(1, nkeys):
             L += [f"            g = g * r{j} + {gkexpr(j)}"]
-    L += ["            cnt[t, g] += 1"]
+    ix = "g" if mono else "t, g"
+    L += [f"            cnt[{ix}] += 1"]
     for e in range(E):
-        L += [f"            x{e} = {bodies[e]}", f"            s{e}[t, g] += x{e}"]
+        L += [f"            x{e} = {bodies[e]}", f"            s{e}[{ix}] += x{e}"]
         if mm_flags[e]:
-            L += [f"            if x{e} < mn{e}[t, g]: mn{e}[t, g] = x{e}",
-                  f"            if x{e} > mx{e}[t, g]: mx{e}[t, g] = x{e}"]
+            L += [f"            if x{e} < mn{e}[{ix}]: mn{e}[{ix}] = x{e}",
+                  f"            if x{e} > mx{e}[{ix}]: mx{e}[{ix}] = x{e}"]
     ret = ["cnt"]
     for e in range(E):
         ret.append(f"s{e}")
@@ -210,7 +232,7 @@ def _build_multi(bodies, mm_flags, slot_gathered, slot_code, gk_gathered, nkeys,
     return fn
 
 
-def grouped_multi(group_keys, inputs, exprs, mask, n, pred=None):
+def grouped_multi(group_keys, inputs, exprs, mask, n, pred=None, mono=False):
     """Single-pass fused aggregation of MANY value expressions sharing one composite group + decoded slots.
       group_keys : list of (codes, K_i, ptr_or_None)  -- composed inline into the group code.
       inputs     : global list of (base, codes, ptr_or_None) distinct value slots.
@@ -226,7 +248,9 @@ def grouped_multi(group_keys, inputs, exprs, mask, n, pred=None):
     bodies   = tuple(e[0] for e in exprs)
     mm_flags = tuple(bool(e[1]) for e in exprs)
     has_mask = mask is not None and not pred          # fused predicate supersedes a materialised mask
-    fn = _build_multi(bodies, mm_flags, slot_gathered, slot_code, gk_gathered, nkeys, has_mask, pred or '')
+    mono = bool(mono and nkeys == 1 and group_keys[0][2] is None)
+    fn = _build_multi(bodies, mm_flags, slot_gathered, slot_code, gk_gathered, nkeys, has_mask, pred or '',
+                      mono=mono)
 
     args = [n]
     for (codes, _ki, ptr) in group_keys:
@@ -242,6 +266,17 @@ def grouped_multi(group_keys, inputs, exprs, mask, n, pred=None):
     if has_mask: args.append(mask)
 
     res = fn(*args)
+    if mono:
+        counts = res[0][:K]
+        out = []; idx = 1
+        for e in range(len(exprs)):
+            s = res[idx][:K]; idx += 1
+            if mm_flags[e]:
+                mn = res[idx][:K]; mx = res[idx + 1][:K]; idx += 2
+            else:
+                mn = mx = None
+            out.append((s, mn, mx))
+        return counts, out
     counts = res[0][:, :K].sum(0)
     out = []; idx = 1
     for e in range(len(exprs)):
