@@ -1395,7 +1395,41 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     pred_body = None
     if where is not None:
         try:
-            pred_body = build_pred(where.this)
+            # THE POTENCY LAW (Jackson's ratio): conjuncts fire in descending
+            # prune_fraction / access_cost -- the cheapest, deadliest test
+            # first, so failed rows never pay a gather. Prune is EXACT from
+            # the dictionary censuses where readable; cost by access class.
+            def _flat9(n):
+                if isinstance(n, E.Paren): return _flat9(n.this)
+                if isinstance(n, E.And):
+                    return _flat9(n.this) + _flat9(n.expression)
+                return [n]
+            def _potency9(n):
+                cost = 1.0; prune = 0.5
+                try:
+                    cols9 = list(n.find_all(E.Column))
+                    if any(resolve(c)[2] is not None for c in cols9):
+                        cost = 6.0
+                    if len(cols9) == 1:
+                        cs9, cp9, _ = resolve(cols9[0])
+                        td9 = np.asarray(cs9._typed_dict(cp9))
+                        if td9.dtype.kind in 'iuf' and len(td9):
+                            keep9 = _dict_keep(n, cs9, cp9, td9)
+                            if keep9 is not None:
+                                cc9 = np.asarray(cs9.code_counts(cp9))[:len(keep9)]
+                                t9 = cc9.sum()
+                                if t9:
+                                    prune = 1.0 - float(cc9[keep9].sum()) / t9
+                except Exception:
+                    pass
+                return prune / cost
+            conj9 = _flat9(where.this)
+            if len(conj9) > 1:
+                scored9 = [(_potency9(cn), build_pred(cn)) for cn in conj9]
+                scored9.sort(key=lambda x: -x[0])
+                pred_body = '(' + ' and '.join(p for _, p in scored9) + ')'
+            else:
+                pred_body = build_pred(where.this)
         except _FastUnsupported:
             pred_body = None; slots.clear(); slot_list.clear()   # discard any partial predicate slots
 
