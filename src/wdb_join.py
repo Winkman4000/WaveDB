@@ -1696,12 +1696,36 @@ def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
     drop child rows, so that raises _FastUnsupported and the query falls back. A hash join becomes a pointer,
     and every downstream gather/predicate/aggregate stays on the same fused chain."""
     cp = db.cat.phys_map(ctbl).get(ckey, ckey); pp = db.cat.phys_map(ptbl).get(pkey, pkey)
+    # THE POINTER SIDECAR (the plists' cousin): a resolved child->parent
+    # pointer is derived data, so it is born once beside the child segment
+    # and mmap'd forever after -- the N-RAM law satisfied on disk. A stale
+    # or foreign sidecar can only misroute rows, so it carries a birthmark
+    # (parent segment path + N) checked before trust.
+    import os as _os
+    sc9 = getattr(cseg, 'path', None)
+    side = None
+    if sc9:
+        side = '%s.%s__%s.%s.jptr.npy' % (sc9, cp, ptbl, pp)
+        if _os.path.exists(side):
+            try:
+                ptr9 = np.load(side, mmap_mode='r')
+                if ptr9.shape[0] == cseg.N and int(ptr9[-1]) < pseg.N:
+                    return ptr9
+            except Exception:
+                pass
     ck = np.asarray(wdb_sql._col(cseg, cp)[0]); pk = np.asarray(wdb_sql._col(pseg, pp)[0])
     pidx = pd.Index(pk)
     if not pidx.is_unique: raise _FastUnsupported                 # many-to-many -> not a pointer
     ptr = pidx.get_indexer(ck)
     if (ptr < 0).any(): raise _FastUnsupported                    # unmatched child rows -> would drop -> fall back
-    return ptr.astype(np.int64)
+    ptr = ptr.astype(np.int64)
+    if side:
+        try:
+            np.save(side + '.tmp.npy', ptr)
+            _os.replace(side + '.tmp.npy', side)
+        except Exception:
+            pass
+    return ptr
 
 
 def _build_chain(db, tree, allow_hash=True):
