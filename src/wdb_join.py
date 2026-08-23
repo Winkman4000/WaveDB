@@ -1657,13 +1657,37 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
 # that table's row (None for the fact itself). Raises _FastUnsupported if the join graph is not an
 # FK-pointer-rooted tree, so the caller can fall back.
 def _key_is_unique(db, table, col):
-    """True if `col` in `table` is a single clean segment with all-distinct values (a candidate join parent)."""
+    """True if `col` in `table` is a single clean segment with all-distinct
+    values (a candidate join parent). The dictionary already knows: V == N is
+    uniqueness, read from metadata in O(1); mode-4 identity codes are unique by
+    construction. Memoized; the old materialize-and-count survives only as the
+    fallback for dressless columns."""
+    memo = db.__dict__.setdefault('_uniq_memo', {})
+    mk = (table, col)
+    if mk in memo:
+        return memo[mk]
     try: seg, _ = _solo_segment(db, table)
     except _FastUnsupported: return False
     pc = db.cat.phys_map(table).get(col, col)
-    if pc not in seg.cols: return False
-    v = wdb_sql._col(seg, pc)[0]
-    return v is not None and len(v) == len(np.unique(np.asarray(v)))
+    if pc not in seg.cols:
+        memo[mk] = False
+        return False
+    c9 = seg.cols[pc]
+    r = None
+    if c9.get('mode') == 4:
+        r = True                                   # identity: unique by law
+    elif c9.get('mode') == 6:
+        r = seg.N <= 1                             # constant column
+    else:
+        V9 = c9.get('V')
+        hn9 = c9.get('has_null')
+        if V9 is not None and not hn9 and c9.get('mode') in (0, 1, 2):
+            r = int(V9) == int(seg.N)              # dict distincts vs rows: O(1)
+    if r is None:
+        v = wdb_sql._col(seg, pc)[0]
+        r = v is not None and len(v) == len(np.unique(np.asarray(v)))
+    memo[mk] = bool(r)
+    return memo[mk]
 
 
 def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
