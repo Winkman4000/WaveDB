@@ -741,6 +741,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     _bill9 = [] if __import__('os').environ.get('WDB_JOIN_BILL') else None
     rows9 = None
     _where_spent = False
+    _stage0 = _fpa_t0
     proj = tree.expressions
     group = tree.args.get('group')
     has_agg = any(wdb_sql._agg_kind(p) for p in proj)
@@ -1245,6 +1246,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             if _bill9 is not None:
                 _bill9.append(('cascade %d->%d' % (n, rows9.size), _tk9() - _fpa_t0))
             n = int(rows9.size)
+            _stage0 = _tk9()
             if n == 0:
                 _bump_fast()
                 return [], [wdb_sql._alias(p) for p in proj]
@@ -1526,7 +1528,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
 
     _b0 = _tk9()
     if _bill9 is not None:
-        _bill9.append(('setup(proj+gkeys+resolve)', _b0 - _fpa_t0))
+        _bill9.append(('setup(proj+gkeys+resolve)', _b0 - _stage0))
     pred_body = None
     if where is not None and not _where_spent:
         try:
