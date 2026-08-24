@@ -34,3 +34,16 @@ the architectural fact is which layer's stage got compiled.
 - SCOPE LAW: a principle names WHICH LAYER it restructures before code is touched ("changes which rows exist" vs "which test runs first").
 - CENSUS LAW: scope existing organs (this codex + census) before building anything.
 - VERDICT LAW: the only progress number is warm wall before vs after, written here.
+
+
+## NEXT SESSION — THE SURVIVOR CASCADE (single task, Jackson-ratified)
+SCOPE: restructures the join court pipeline — changes WHICH ROWS EXIST
+after the filter stage. Not a trim.
+1. FILTER FIRST, code space, potency-descending: shipdate keep-LUT over
+   sequential codes -> gather pointers ONLY for survivors -> orderdate
+   LUT -> 2-hop mktsegment -> ~3M survivor indices. No values decoded.
+2. THEN setup at survivor scale: group-key codes sliced at survivors,
+   gids on survivors, slots as V-LUTs (decode spec).
+3. Kernel on survivors, pred spent. Emit decodes k.
+Gates: suite + megaboard + TPCH board, exactness vs duck, warm-wall
+verdict vs 1.34s written to the table. Projected band: 300-500ms.
