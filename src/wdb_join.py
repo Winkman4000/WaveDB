@@ -470,6 +470,8 @@ def _mask(df, node, R):
         s = df[R(node.this)]; lo = _coerce_lit(s, node.args['low']); hi = _coerce_lit(s, node.args['high'])
         return (s >= lo) & (s <= hi)
     if isinstance(node, E.In):
+        if node.args.get('query') is not None or not (node.args.get('expressions') or []):
+            raise NotImplementedError('join WHERE: IN (subquery) -- fail loud, never empty')
         s = df[R(node.this)]; vals = [_coerce_lit(s, L) for L in (node.args.get('expressions') or [])]
         return s.isin(vals)
     if isinstance(node, E.Is):                         # IS NULL (IS NOT NULL arrives as Not(Is))
