@@ -27,6 +27,7 @@ the architectural fact is which layer's stage got compiled.
 | query | before | after | commit | note |
 |---|---|---|---|---|
 | TPCH Q3 | 23.0s | 2.00s | 202c59b | arc: uniq-meta, jptr sidecars, sorted-run, mono-acc; kernel=62ms; REMAINING: emit 475 (topk gate), assemble 360, prework 133, ~950ms UNMEASURED in db.run dispatch |
+| TPCH Q3 | 2.00s | 1.34s | 63441ba | BALANCED BILL era: setup bracket found 885ms never measured; leading-run court killed the 60M co-key gathers (2003->1820); numeric-emit + top-k gate fired, emit 473->32 (1820->1340). Bill now: setup 733, assemble 350, kernel 60, emit 32, prework 131. Next: sub-bracket setup; assemble LUTs. |
 
 ## STANDING RULES (the anti-slip laws)
 - BALANCE LAW: no strike while the bill's stages don't sum to ~the wall.
