@@ -1726,16 +1726,21 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     a9 = counts[present].astype(np.float64)
                 elif r9[0] == 'key':
                     gk9 = gkeys[r9[1]]
-                    if 'labels' in gk9 or gk9['seg'].cols[gk9['pcol']].get('dt') == 1:
-                        raise ValueError            # only numeric-dict keys are order-safe
-                    a9 = kc_arr[r9[1]].astype(np.float64)
+                    if 'labels' in gk9:
+                        a9 = np.asarray(gk9['labels'])[kc_arr[r9[1]]].astype(np.float64)
+                    else:
+                        if gk9['seg'].cols[gk9['pcol']].get('dt') == 1:
+                            raise ValueError        # string keys: not order-safe in code space
+                        a9 = kc_arr[r9[1]].astype(np.float64)
                 else:
                     if r9[1].dtype == object:
                         raise ValueError
                     a9 = r9[1][present].astype(np.float64)
                 keys9.append(-a9 if oe.args.get('desc') else a9)
             _sel9 = np.lexsort(tuple(reversed(keys9)))[:int(_lim9)]
-        except Exception:
+        except Exception as _e9:
+            if _bill9 is not None:
+                print('JOIN BILL: topk-declined %s: %s' % (type(_e9).__name__, str(_e9)[:80]), flush=True)
             _sel9 = None
     if _sel9 is not None:
         present = np.flatnonzero(present)[_sel9] if present.dtype == bool else present[_sel9]
