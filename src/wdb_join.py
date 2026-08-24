@@ -1205,6 +1205,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 return [x]
             plan9 = []
             for cn in _cflat(_w9c.this):
+                if cn.find(E.Select) is not None:
+                    raise _FastUnsupported          # subqueries: never the cascade's to judge
                 cols9 = list(cn.find_all(E.Column))
                 if len(cols9) != 1: raise _FastUnsupported
                 cs9, cp9, cc9p = resolve(cols9[0])
@@ -1221,7 +1223,11 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     code9 = _code_of_literal(cs9, cp9, _lit_bytes(cs9, cp9, cn.expression))
                     if code9 is not None: kx9[code9] = True
                 elif isinstance(cn, E.In):
+                    if not cn.expressions:
+                        raise _FastUnsupported      # IN with no literal list (subquery form)
                     for e9 in cn.expressions:
+                        if not isinstance(e9, E.Literal):
+                            raise _FastUnsupported
                         code9 = _code_of_literal(cs9, cp9, _lit_bytes(cs9, cp9, e9))
                         if code9 is not None: kx9[code9] = True
                 else:
