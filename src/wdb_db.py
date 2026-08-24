@@ -271,14 +271,25 @@ class Database:
         """Depth-guarded: recursive runs (subquery rewrites, join sub-queries) share
         memory within one outer query; at depth 0 wdb_qmem.flush forgets everything
         data-derived. A query leaves the engine as if it was never there."""
-        import wdb_qmem
+        import wdb_qmem, os as _os9
+        _bill9 = _os9.environ.get('WDB_JOIN_BILL')
+        if _bill9:
+            import time as _t9
+            _r0 = _t9.perf_counter()
         self._qdepth = getattr(self, '_qdepth', 0) + 1
         try:
-            return self._run_impl(sql, escalate)
+            r9 = self._run_impl(sql, escalate)
+            if _bill9 and self._qdepth == 1:
+                print('RUN BILL: impl=%.0fms' % ((_t9.perf_counter() - _r0) * 1000), flush=True)
+            return r9
         finally:
             self._qdepth -= 1
             if self._qdepth == 0:
+                if _bill9:
+                    _f0 = _t9.perf_counter()
                 wdb_qmem.flush(self)
+                if _bill9:
+                    print('RUN BILL: qmem-flush=%.0fms' % ((_t9.perf_counter() - _f0) * 1000), flush=True)
 
     def _run_impl(self, sql, escalate=None):
         esc = self.escalate if escalate is None else escalate
@@ -292,7 +303,14 @@ class Database:
                 tree = wdb_cte.rewrite(tree)      # flatten views before anything resolves
                 sql = tree.sql()
             if tree.args.get('joins'):
-                _rw = wdb_join.denorm_rewrite(self, tree)        # join that groups by a denormalised parent
+                import os as _os9
+                if _os9.environ.get('WDB_JOIN_BILL'):
+                    import time as _t9
+                    _d0 = _t9.perf_counter()
+                    _rw = wdb_join.denorm_rewrite(self, tree)
+                    print('RUN BILL: denorm-rewrite=%.0fms' % ((_t9.perf_counter() - _d0) * 1000), flush=True)
+                else:
+                    _rw = wdb_join.denorm_rewrite(self, tree)    # join that groups by a denormalised parent
                 if _rw is None:                                  # column -> single-table cube read; else gather
                     return wdb_join.join_query(self, sql)
                 sql = _rw; tree = _parse_sql_cached(_rw)         # fall through to the single-table path

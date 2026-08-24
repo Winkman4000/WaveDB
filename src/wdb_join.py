@@ -735,6 +735,8 @@ def _slice_scalar_agg(group_keys, inputs, exprs, mask, n, pred, offsets):
 
 def _fast_pointer_agg(db, tree, ctx, columnar=False):
     import operator
+    import time as _t9f
+    _fpa_t0 = _t9f.perf_counter()
     proj = tree.expressions
     group = tree.args.get('group')
     has_agg = any(wdb_sql._agg_kind(p) for p in proj)
@@ -1195,23 +1197,56 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             prod = 1
             for k in gkeys: prod *= k['K']
             if prod > (1 << 62): raise _FastUnsupported    # mixed-radix code would overflow int64
-            comp = np.zeros(n, dtype=np.int64)
-            for k in gkeys:
-                codes = k['full'][k['cptr']] if k['cptr'] is not None else k['full']
-                comp = comp * k['K'] + codes.astype(np.int64, copy=False)
-            d9 = np.diff(comp)
-            _mono_gids = bool(n and (d9 >= 0).all())
-            if _mono_gids:
-                # THE SORTED-RUN COURT: a monotone composite (sorted fact key,
-                # pointer-dependent co-keys) factorises by boundary -- no hash,
-                # one diff. TPC-H's fact tables arrive this way by birth.
-                starts = np.concatenate([[0], np.flatnonzero(d9 > 0) + 1])
+            # THE LEADING-RUN COURT (decode-spec law: group keys are IDENTITY
+            # class -- never gather 60M co-key codes to label 1.1M groups).
+            # Gate, proven exactly and gather-free: leading key fact-direct and
+            # monotone; every co-key's POINTER constant within leading runs
+            # (a sequential O(N) compare -- if a pointer never changes inside
+            # a run, its gathered codes can't either). Then boundaries come
+            # from the leading key alone and the composite is computed AT THE
+            # STARTS ONLY, mirroring the full radix exactly.
+            _lead_ok = (gkeys[0]['cptr'] is None
+                        and all(k['cptr'] is not None for k in gkeys[1:]))
+            if _lead_ok:
+                f0 = gkeys[0]['full'].astype(np.int64, copy=False)
+                d0 = np.diff(f0)
+                _lead_ok = bool(n and (d0 >= 0).all())
+                if _lead_ok:
+                    nb9 = d0 > 0
+                    for k in gkeys[1:]:
+                        cp9 = np.asarray(k['cptr'])
+                        if not bool(((cp9[1:] == cp9[:-1]) | nb9).all()):
+                            _lead_ok = False
+                            break
+            if _lead_ok:
+                _mono_gids = True
+                starts = np.concatenate([[0], np.flatnonzero(nb9) + 1])
                 gids = np.zeros(n, np.int64)
                 gids[starts[1:]] = 1
                 gids = np.cumsum(gids)
-                gid_to_comp = comp[starts]
+                comp_s = np.zeros(starts.size, dtype=np.int64)
+                for k in gkeys:                        # same radix order as the full build
+                    ck9 = (k['full'][np.asarray(k['cptr'])[starts]]
+                           if k['cptr'] is not None else k['full'][starts])
+                    comp_s = comp_s * k['K'] + ck9.astype(np.int64, copy=False)
+                gid_to_comp = comp_s
             else:
-                gids, gid_to_comp = pd.factorize(comp, sort=False)   # hash-factorise -> only groups present
+                comp = np.zeros(n, dtype=np.int64)
+                for k in gkeys:
+                    codes = k['full'][k['cptr']] if k['cptr'] is not None else k['full']
+                    comp = comp * k['K'] + codes.astype(np.int64, copy=False)
+                d9 = np.diff(comp)
+                _mono_gids = bool(n and (d9 >= 0).all())
+                if _mono_gids:
+                    # THE SORTED-RUN COURT: a monotone composite factorises by
+                    # boundary -- no hash, one diff.
+                    starts = np.concatenate([[0], np.flatnonzero(d9 > 0) + 1])
+                    gids = np.zeros(n, np.int64)
+                    gids[starts[1:]] = 1
+                    gids = np.cumsum(gids)
+                    gid_to_comp = comp[starts]
+                else:
+                    gids, gid_to_comp = pd.factorize(comp, sort=False)   # hash-factorise -> only groups present
             gids = np.ascontiguousarray(gids.astype(np.int64))
             K = len(gid_to_comp); group_op = ('d', gids); group_keys = [(gids, K, None)]
 
@@ -1402,6 +1437,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     _bill9 = [] if __import__('os').environ.get('WDB_JOIN_BILL') else None
     _tk9 = _t9.perf_counter
     _b0 = _tk9()
+    if _bill9 is not None:
+        _bill9.append(('setup(proj+gkeys+resolve)', _b0 - _fpa_t0))
     pred_body = None
     if where is not None:
         try:
