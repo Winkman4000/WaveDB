@@ -9,9 +9,19 @@ reflect consequences of that layer.
 3. READS LAYER — read_methods.py (named!), engine reads: codes/codes_band/codes_at/_raw_codes/_e13_band, blockstats
 4. QUERY IDENTIFICATION / ROUTING — controller.py (the consult chain), commands.py
 5. PLANNING / COURTS — per-shape lanes: funnel, join (chains/hash/sidecars/potency), lenagg, sampletop, compound (SURVIVOR-SET — already exists!), coscan, countpos, clustertopk, bsi, affine*, cdgroup, cte...
-6. EXECUTION KERNELS — wdb_kernels (numba), wdb_exprjit (codegen), wdb_radix, bsi_kernels
-7. EMIT/RESULTS — colresult, sql tail (_apply_order/having), top-k emits
-8. REFEREE/GATES — tests/ (1692), megaboard, board_clickbench, board_tpch, duck referees
+6. EMIT/RESULTS — colresult, sql tail (_apply_order/having), top-k emits
+7. REFEREE/GATES — tests/ (1692), megaboard, board_clickbench, board_tpch, duck referees
+
+## KERNELS ARE NOT A LAYER (Jackson's correction)
+Kernels are a SPEED CLASS, not a place: a kernel can be a read, a fold,
+a sort -- it belongs to whatever layer's stage it compiles. wdb_kernels,
+wdb_exprjit, wdb_radix, bsi_kernels are SHARED ARMORIES (cross-cutting
+infrastructure, accounted for in the census but not pipeline rungs).
+Every organ's codex entry must state WHICH of its stages run at kernel
+speed and which run in interpreted glue -- that attribute is the era's
+recurring diagnosis (lenagg: 4ms fold in 320ms glue; Q3: 62ms kernel in
+2000ms glue). A new kernel is never an architectural change by itself;
+the architectural fact is which layer's stage got compiled.
 
 ## MEASURED-VERDICTS TABLE (append-only; warm wall, commit, date)
 | query | before | after | commit | note |
