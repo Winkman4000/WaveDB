@@ -1593,15 +1593,21 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 col_results[i] = ('key', body)           # body field carries the group-key index
             else:
                 s, mn, mx = results[ex_index[body]]
-                if nz.all():
-                    # groups born from rows are never empty: no NULLs to
-                    # plant, so the object-dtype ceremony (17.5% of Q3's
-                    # warm wall) is skipped and numerics stay numeric.
+                if gkeys:
+                    # GROUP BY: numeric always -- every consumer slices
+                    # [present], and present IS the nonzero set (pred-killed
+                    # groups never reach a row). The object-dtype NULL
+                    # ceremony served nothing here and blocked the top-k
+                    # gate with an object 'revenue' array.
                     if   fn == 'SUM': o = s
-                    elif fn == 'AVG': o = s / counts
+                    elif fn == 'AVG':
+                        o = np.divide(s, counts, out=np.zeros_like(s, dtype=np.float64),
+                                      where=counts > 0)
                     elif fn == 'MIN': o = mn
                     else:             o = mx
                 else:
+                    # no GROUP BY: SQL demands ONE row even over zero rows,
+                    # with NULL aggregates -- the ceremony earns its keep.
                     o = np.full(K, None, dtype=object)
                     if   fn == 'SUM': o = s.astype(object); o[~nz] = None
                     elif fn == 'AVG': o[nz] = s[nz] / counts[nz]
@@ -1756,7 +1762,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 tgt = oe.this
                 nm9 = tgt.name if hasattr(tgt, 'name') else str(tgt)
                 if nm9 not in aliases9:
-                    raise ValueError
+                    raise ValueError('order term %r not in %r' % (nm9, aliases9))
                 i9 = aliases9.index(nm9)
                 r9 = col_results[i9]
                 if r9[0] == 'count':
@@ -1767,11 +1773,11 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                         a9 = np.asarray(gk9['labels'])[kc_arr[r9[1]]].astype(np.float64)
                     else:
                         if gk9['seg'].cols[gk9['pcol']].get('dt') == 1:
-                            raise ValueError        # string keys: not order-safe in code space
+                            raise ValueError('string key %s' % gk9['pcol'])
                         a9 = kc_arr[r9[1]].astype(np.float64)
                 else:
                     if r9[1].dtype == object:
-                        raise ValueError
+                        raise ValueError('object-dtype agg %r' % nm9)
                     a9 = r9[1][present].astype(np.float64)
                 keys9.append(-a9 if oe.args.get('desc') else a9)
             _sel9 = np.lexsort(tuple(reversed(keys9)))[:int(_lim9)]
