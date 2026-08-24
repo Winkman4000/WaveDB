@@ -1240,16 +1240,58 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 cost9 = 1.0 if cc9p is None else 6.0
                 plan9.append((prune9 / cost9, kx9, cs9, cp9, cc9p))
             plan9.sort(key=lambda x: -x[0])
+            # THE HOME-TABLE LAW (Jackson): a predicate is judged AT ITS HOME
+            # table, once per home row; verdicts flow DOWN the foreign-key
+            # roads as keep-flags; the fact pays one gather per road. Homes
+            # are causally independent, so their native keeps build IN
+            # PARALLEL; only the (cheap, parent-scale) downhill is serial.
+            seg2alias9 = {id(ctx['seg_of'][a9]): a9 for a9 in ctx['seg_of']}
+            fact9 = ctx['fact']
+            homes9 = {}                                   # alias -> [(kx, seg, pcol)]
             for _, kx9, cs9, cp9, cc9p in plan9:
-                if cc9p is None:
-                    codes9 = np.asarray(cs9.codes(cp9))
-                    rows9 = (np.flatnonzero(kx9[codes9]) if rows9 is None
-                             else rows9[kx9[codes9[rows9]]])
-                else:
-                    pc9 = np.asarray(cs9.codes(cp9))
-                    pt9 = np.asarray(cc9p)
-                    rows9 = (np.flatnonzero(kx9[pc9[pt9]]) if rows9 is None
-                             else rows9[kx9[pc9[pt9[rows9]]]])
+                a9 = seg2alias9.get(id(cs9))
+                if a9 is None: raise _FastUnsupported
+                homes9.setdefault(a9, []).append((kx9, cs9, cp9))
+            def _native9(items9):
+                m9 = None
+                for kx9, cs9, cp9 in items9:
+                    v9 = kx9[np.asarray(cs9.codes(cp9))]
+                    m9 = v9 if m9 is None else (m9 & v9)
+                return m9
+            from concurrent.futures import ThreadPoolExecutor as _TPE9
+            with _TPE9(max_workers=max(1, len(homes9))) as _ex9:
+                futs9 = {a9: _ex9.submit(_native9, its9) for a9, its9 in homes9.items()}
+                keeps9 = {a9: f9.result() for a9, f9 in futs9.items()}
+            eps9 = ctx.get('edge_ptrs') or {}
+            depth9 = {fact9: 0}
+            _ch9 = True
+            while _ch9:
+                _ch9 = False
+                for pa9, (ca9, _p9) in eps9.items():
+                    if ca9 in depth9 and pa9 not in depth9:
+                        depth9[pa9] = depth9[ca9] + 1; _ch9 = True
+            for pa9 in sorted((a for a in keeps9 if a != fact9),
+                              key=lambda a: -depth9.get(a, 0)):
+                if pa9 not in eps9: raise _FastUnsupported
+                ca9, p9 = eps9[pa9]
+                flow9 = keeps9[pa9][np.asarray(p9)]       # verdict rides the road down
+                keeps9[ca9] = flow9 if keeps9.get(ca9) is None else (keeps9.get(ca9) & flow9)                     if ca9 in keeps9 else flow9
+                if ca9 not in homes9 and ca9 != fact9:
+                    homes9[ca9] = []                      # transit alias now carries a keep
+            fm9 = keeps9.get(fact9)
+            rows9 = np.flatnonzero(fm9) if fm9 is not None else None
+            for a9, (ca9, p9) in eps9.items():
+                pass
+            # any keep left on a fact-adjacent alias applies through its road
+            for pa9, (ca9, p9) in eps9.items():
+                if ca9 == fact9 and pa9 in keeps9 and keeps9[pa9] is not None                         and depth9.get(pa9) == 1:
+                    k9 = keeps9[pa9]
+                    pt9 = np.asarray(p9)
+                    if rows9 is None:
+                        rows9 = np.flatnonzero(k9[pt9])
+                    else:
+                        rows9 = rows9[k9[pt9[rows9]]]
+            if rows9 is None: raise _FastUnsupported
             _where_spent = True
             if _bill9 is not None:
                 _bill9.append(('cascade %d->%d' % (n, rows9.size), _tk9() - _fpa_t0))
@@ -2173,6 +2215,7 @@ def _build_chain(db, tree, allow_hash=True):
         seg_of[a], sp_of[a] = _solo_segment(db, alias2t[a])
 
     composed = {fact: None}                                                      # None = identity (fact rows)
+    edge_ptrs = {}
     progress = True
     while progress:
         progress = False
@@ -2189,7 +2232,9 @@ def _build_chain(db, tree, allow_hash=True):
                     p = db.fk_pointer(sp_of[child_a], fk_col)
                 if p is None: raise _FastUnsupported
                 cc = composed[child_a]
+                edge_ptrs[parent_a] = (child_a, p)       # child-scale road, kept for the downhill flow
                 composed[parent_a] = p if cc is None else p[cc]                  # compose by gather
                 progress = True
     if any(a not in composed for a in keep): raise _FastUnsupported              # kept tables must connect
-    return dict(fact=fact, alias2t=alias2t, seg_of=seg_of, composed=composed, n=seg_of[fact].N)
+    return dict(fact=fact, alias2t=alias2t, seg_of=seg_of, composed=composed, n=seg_of[fact].N,
+                edge_ptrs=edge_ptrs)
