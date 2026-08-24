@@ -1,0 +1,867 @@
+== src/commands.py (38 lines)
+"""
+commands.py -- THE MUTATION/INIT ROUTER.
+
+  defs: def route 
+
+== src/controller.py (218 lines)
+"""
+controller.py -- THE CONTROLLER (routing layer).
+
+  defs: def _agg_or_group def _has_window def plan_epoch_bump def _plan_store def _plan_replay def route_single_segment 
+
+== src/read_methods.py (398 lines)
+"""
+read_methods.py -- THE READS LAYER.
+
+  defs: class ReadContext: class Read: def _bsi_detect def _bsi_execute def _fused_detect def _fused_execute def _gbc_detect def _gbc_execute def general_scan 
+
+== src/wdb_affinegroup.py (148 lines)
+"""wdb_affinegroup -- Q35's identity (grouping by x wearing four hats).
+
+SELECT f1(col), f2(col), ..., COUNT(*) c FROM hits
+  defs: def _affine def detect def execute 
+
+== src/wdb_affinesum.py (90 lines)
+"""wdb_affinesum -- Q29's algebra (the ninety-sums comedy).
+
+SELECT SUM(col + k0), SUM(col + k1), ... FROM hits   (no WHERE, no GROUP)
+  defs: def _affine def detect def execute 
+
+== src/wdb_agg.py (571 lines)
+"""Code-based group-by aggregation kernel.
+
+Operates on DENSE integer group codes (0..K-1) -- exactly what WaveDB already stores for dictionary
+  defs: def group_counts def group_agg def _group_minmax def _pool def _slice def fused_counts_and_aggs def parallel_counts_and_aggs def numba_grouped def numba_grouped_g def _reduce1 def numba_grouped_d def numba_grouped_gd def _opkey def fused_numba 
+
+== src/wdb_blockstats.py (193 lines)
+"""blockstats: whole-table aggregates answered from per-block statistics -- the disk-only read.
+At build (eagerly in prewarm workers, or lazily once), every stats-eligible column gets per-32K-row-
+block (count, nonnull count, value sum, min code, max code): ~28 bytes a block, ~84 KB a column,
+  defs: def enable def disable def eligible def build def install def detect def execute 
+
+== src/wdb_bsi_exec.py (270 lines)
+"""Phase 3: BSI filter-aggregate executor.
+
+Fires for single-table scalar/grouped SUM/COUNT aggregates with a WHERE over
+  defs: class _BSIUnsupported def _bump def _col_index def _is_lit def _cmp def _pred def _agg_spec def _scalar def _grouped_arr def _grp_val def execute def footprint 
+
+== src/wdb_bsi_kernels.py (94 lines)
+"""Numba bitmap-walk kernels: accumulate aggregates directly over the set bits
+of a packed bitmap (np.packbits layout, MSB-first) -- no unpackbits, no position
+array. Replaces unpackbits+nonzero (the ~7.4ms gather bottleneck) for the
+  defs: def bw_count def bw_sum1 def bw_sum2 def bw_group_sum1 def bw_group_count def warmup 
+
+== src/wdb_bsi.py (114 lines)
+"""Bit-sliced index (BSI) + per-value bitmaps for predicate evaluation.
+
+A column's integer dictionary codes are indexed in one of two forms, chosen by
+  defs: def _ones class BSI: def build_bsi def build_value_bitmaps def vbm_in def to_positions def popcount 
+
+== src/wdb_calib.py (69 lines)
+"""wdb_calib -- the machine card: measured primitive speeds for this box.
+
+A ~2s ceremony at first open per machine, cached as .calib.json beside the
+  defs: def _bench def machine_card 
+
+== src/wdb_catalog.py (183 lines)
+"""WaveDB catalog: a database is a directory; catalog.json registers tables.
+
+Minimal first slice: persistent registry of table name -> schema + segment files.
+  defs: class Catalog: 
+
+== src/wdb_cdgroup.py (112 lines)
+"""wdb_cdgroup -- Jackson's bounded hunt for COUNT(DISTINCT u) GROUP BY sparse col.
+
+Q13's lane: visits bound uniques (distinct(u) per group <= group's row count),
+  defs: def detect def execute 
+
+== src/wdb_clustertopk.py (185 lines)
+"""
+wdb_clustertopk -- cluster-ordered projection top-K.
+
+  defs: def _order_keys def _where_neq_empty_col def detect def _gather def execute 
+
+== src/wdb_colresult.py (51 lines)
+"""
+wdb_colresult -- the columnar treaty's carrier.
+
+  defs: class ColRows: 
+
+== src/wdb_compact.py (112 lines)
+"""Compaction: merge several cold segments into one, paying down the append debt that
+buffered flushes run up. This is also where FD labels get VERIFIED.
+
+  defs: def _choose_fd_specs def _segment_to_df def compact 
+
+== src/wdb_compound.py (321 lines)
+"""
+wdb_compound -- compound-AND filtered GROUP BY COUNT(*) via survivor-set resolution.
+
+  defs: def _intersect def _m4_range def _m4_in_ranges def _codes_in_ranges def _APPLY def _coerce def _code_of def _conjuncts def _resolve def _offset def detect def execute def try_compound 
+
+== src/wdb_coscan.py (298 lines)
+"""
+wdb_coscan -- the fused conjunctive count: duck's homework, our dialect.
+
+  defs: def _lit def detect def _block_codes def _comp_minmax def execute 
+
+== src/wdb_countpos.py (278 lines)
+"""
+wdb_countpos — per-row count-class column + presence-scan for 2-key GROUP BY COUNT(*) top-K.
+
+  defs: def enable def disable def is_enabled def _vals def _build def _load def build def _count_index def _order_is_count_desc def detect def execute def try_countpos def promote 
+
+== src/wdb_cte.py (173 lines)
+"""wdb_cte: WITH-clause support by flattening -- views merge, they don't materialize.
+
+A CTE that only filters and projects is a lens over its base table: outer references
+  defs: def has_cte def _with_arg def _from_arg def _table_name def _alias_map def _subst def _and_where def _and_having def _conjuncts def _flatten_once def _is_agg def rewrite 
+
+== src/wdb_cube.py (465 lines)
+"""
+wdb_cube -- materialised low-cardinality GROUP BY cube (a precomputed aggregate).
+
+  defs: def _radix def build_cube def _derive_cube def _get_cube def write_cubes def load_cubes def _build_specs_worker def build_and_write def low_card_stamp_cols def enumerate_cube_specs def maximal_cube_specs def _grouped_cdist_from_cube def _const def _make_pred def _range_filter_from_cube def detect def execute def try_cube 
+
+== src/wdb_db.py (463 lines)
+"""WaveDB Database: a directory-backed database you build with SQL.
+
+    db = Database.create('/path/mydb')
+  defs: def _parse_sql_cached def _prewarm_worker class Database: 
+
+== src/wdb_ddl.py (138 lines)
+"""WaveDB DDL: parse CREATE TABLE (borrowed SQL syntax via sqlglot) into the catalog.
+
+We borrow SQL's language and sqlglot's parser; execution/storage is all WaveDB's.
+  defs: def _wdb_type def parse_create_table def create_table def alter_table def _materialize_added_column def _fresh_physical def _drop_column_from_buffer 
+
+== src/wdb_diskpair.py (345 lines)
+"""diskpair: disk-only N-key GROUP BY COUNT top-K -- the scan-merge read.
+
+The proof that pair structures are optional, generalized to any key count. The bare shape
+  defs: def enable def disable def _minute_key def detect def _modal_share def _block_geometry def execute 
+
+== src/wdb_distinctlim.py (90 lines)
+"""
+wdb_distinctlim -- DISTINCT (extract(hour FROM t), key) LIMIT n: the early exit.
+
+  defs: def detect def execute 
+
+== src/wdb_dml.py (293 lines)
+"""WaveDB DML: INSERT. Step 3a - single segment per table.
+
+Each table keeps a buffer parquet (canonical rows); the segment is derived from it.
+  defs: def _synth_value def register_synth def _litval def _coerce def parse_insert def _buffer_path def hot_path def _segment_name def _rows_to_df def _append_parquet def _encode_segment def _next_segment_index def flush def insert def _filter_parquet_keep_complement def delete def _literal_rhs def _update_parquet def update 
+
+== src/wdb_encode.py (802 lines)
+"""
+WaveDB encoder — schema-driven, works on ANY columnar file.
+
+  defs: def _unit_code def _encode_column def _pack_codes def _try_seq def _prep_column def _header def _dict_bytes_plain def _dict_bytes def _code_section def _serialize_column def _serialize_inline def _serialize_fd def _cluster_order def _encode_streaming def encode def _birth_differentiator_shelves def _expand_pair_shelves 
+
+== src/wdb_engine.py (1415 lines)
+"""WaveDB engine — loads a WVDB3 segment, resolves columns by name from the header.
+Generic: knows nothing about any specific dataset. Handles plain (mode 0) and
+front-coded (mode 1) string dictionaries transparently."""
+  defs: def _pool class Segment: 
+
+== src/wdb_exactint.py (37 lines)
+"""wdb_exactint: exact integer aggregation at any magnitude.
+
+SUM over an int64 column can exceed int64 (SUM(UserID) at 100M reaches ~2.5e26):
+  defs: def fold_counts def fold_values def exact_avg 
+
+== src/wdb_exprjit.py (367 lines)
+"""
+wdb_exprjit -- runtime code generation of fused decode+arithmetic aggregation kernels.
+
+  defs: def _build def grouped_expr def _build_multi def grouped_multi def _build_scalar def scalar_multi 
+
+== src/wdb_fastjoin.py (602 lines)
+"""wdb_fastjoin: dimension joins through the dictionary -- the introductions happen in
+dict space, never in row space.
+
+  defs: def _tables def _split_where def _strip_qual def try_execute def _try_orientation def _stream_dump def _introduce def _giant_m2o 
+
+== src/wdb_fdcodec.py (49 lines)
+"""FD-reference codec (FD pipeline stage 3, standalone — NOT wired into the .wdb format yet).
+
+When X->Y is a verified exact FD, the dependent column Y need not store its own per-row
+  defs: def fd_encode def fd_decode def _equal def is_lossless 
+
+== src/wdb_firstk.py (117 lines)
+"""wdb_firstk -- Q23's staircase early-exit (Jackson's design).
+
+SELECT * FROM hits WHERE strcol LIKE '%needle%' ORDER BY staircol LIMIT k
+  defs: def _staircase_ok def detect def execute 
+
+== src/wdb_firstsorted.py (102 lines)
+"""wdb_firstsorted -- Q24/Q26: the staircase answers ORDER BY unprojected time.
+
+SELECT p FROM hits WHERE p <> '' ORDER BY et [, p] LIMIT k
+  defs: def detect def execute 
+
+== src/wdb_fkptr.py (40 lines)
+"""Foreign-key pointer sidecar.
+
+A pre-resolved join: for each row of a child table, the row position of its matching parent row
+  defs: def path_for def save def load 
+
+== src/wdb_fpm.py (92 lines)
+"""
+wdb_fpm — frame-presence map: which dictionary codes appear in which zstd frame.
+
+  defs: def _path def _eligible def _load_or_birth def eq_positions 
+
+== src/wdb_funnel.py (1376 lines)
+"""wdb_funnel -- the selective funnel (Jackson's law: own the best "no").
+
+SELECT g..., COUNT(*) c FROM hits
+  defs: def _days_of def _plist_path def _plist def _lit def _flatten_and def _compile_key def _key_eval def _key_decode def detect def _code_of def execute def _sec_at def _execute_trunc 
+
+== src/wdb_gbcount.py (551 lines)
+"""
+wdb_gbcount — pre-aggregated count projection for high-cardinality single-key GROUP BY COUNT(*).
+
+  defs: def _path def _fetchable class _FetchDecoder: def _code_values def _build def _load def _count_index def _order_is_count_desc def _scalar_count_detect def _scalar_count_execute def _echo_detect def detect def _emit_key def execute def try_gbcount 
+
+== src/wdb_gbshelf.py (328 lines)
+"""wdb_gbshelf -- Jackson's tiered-absence count shelf (.gbc2).
+
+The census of per-code row counts, dressed by its own histogram:
+  defs: def _path def birth def open_shelf def _bit def point def bulk def _path3 def birth_dense def open_dense def detect_group def execute_group 
+
+== src/wdb_gdsidecar.py (305 lines)
+"""
+wdb_gdsidecar -- materialized group-wise COUNT(DISTINCT) answer (the "sidecar").
+
+  defs: def sidecar_path def build def save def load def rows_from_sidecar def _literal_value def _binary_literal def _excluded_from_group_filter def detect def execute def try_serve def codes_for_values def inspect 
+
+== src/wdb_grid2.py (183 lines)
+"""
+wdb_grid2 -- plain 2-key grouped COUNT(*) as one composite bincount.
+
+  defs: def detect def execute 
+
+== src/wdb_gridwalk_live.py (150 lines)
+"""wdb_gridwalk_live -- buffered-mode 2-key COUNT(*) top-K via the gridwalk base + GwMaint.
+
+When a table has ONE cold segment plus a growing hot buffer (buffered-mode inserts), the generic
+  defs: def enable def disable def is_enabled def _base def _hot_gids def try_live 
+
+== src/wdb_gridwalk_maint.py (140 lines)
+"""wdb_gridwalk_maint -- append-tail maintenance for the gridwalk structure.
+
+gridwalk (#1) builds the heavy filled-cell bulk once from a full group-by and reads it. This makes
+  defs: class GwMaint: 
+
+== src/wdb_gridwalk.py (459 lines)
+"""
+wdb_gridwalk — grid filled-cell + count-ordered head for 2-key GROUP BY COUNT(*) top-K.
+
+  defs: def enable def disable def is_enabled def _vals def _bulk_encode def _bulk_decode_all def _bulk_nbytes def _build def _load def build def structure_nbytes def cache_pop def _count_index def _order_is_count_desc def detect def execute def try_gridwalk 
+
+== src/wdb_groupdistinct.py (467 lines)
+"""
+wdb_groupdistinct — group-wise exact COUNT(DISTINCT) via single-pass code hashing.
+
+  defs: def _ids def _distinct_index def _order_is_distinct_desc def _gdc_path def _gdc_load def birth2 def _gdc_save2 def _gdc_save def birth_gdc def detect def execute def try_groupdistinct 
+
+== src/wdb_groupmix.py (182 lines)
+"""
+wdb_groupmix -- single-pass GROUP BY with foldable co-aggregates + one COUNT(DISTINCT).
+
+  defs: def _sidecar_counts def detect def execute def try_groupmix 
+
+== src/wdb_groupself.py (229 lines)
+"""wdb_groupself -- the counting board: GROUP BY K where the WHERE lives on K itself.
+
+The whole query is dictionary arithmetic: one walk drops beans on the board
+  defs: def _term def _having def detect def execute 
+
+== src/wdb_groupsets.py (397 lines)
+"""wdb_groupsets: GROUPING SETS / ROLLUP / CUBE as controller-level composition.
+
+Each grouping set is a plain GROUP BY the engine is already fast at: the sets run through
+  defs: def has_grouping def _colname def _sets_of def _fused_2key def execute def _roll_from_finest 
+
+== src/wdb_heavypair.py (390 lines)
+"""
+wdb_heavypair — pre-aggregated count projection for high-cardinality TWO-key GROUP BY COUNT(*).
+
+  defs: def _vals def disable_pair def enable_pair def is_disabled def _path def _landmarks def _build def _load def threshold_floor def _count_index def _order_is_count_desc def _axis_filter def detect_distinct def execute_distinct def detect def execute def try_heavypair 
+
+== src/wdb_join.py (2053 lines)
+"""WaveDB JOIN executor — step 1: two-table INNER equi-join.
+
+Decode the needed columns from each side via WaveDB's own read path, join them, then run the SELECT
+  defs: def _materialize def _all_columns def _chain_pandas def _exact_scalar def _sum_overflow_gate def table_agg def denorm_rewrite def join_query def _render def _coerce_lit def _mask def _aggregate class _FastUnsupported def _bump_fast def _fast_detect def _solo_segment def _code_val def _bulk_keyvals def _mode4_group def _topk_prefilter def _radix_plan def _slice_scalar_agg def _fast_pointer_agg def 
+
+== src/wdb_kernel.py (153 lines)
+"""
+wdb_kernel -- lazily-compiled AVX-512 helper for the scanpair high-match path.
+
+  defs: def _has_avx512 def _load def _capbits def scanpair_topk 
+
+== src/wdb_kernels.py (2989 lines)
+"""Compiled aggregation kernels (numba soft-dependency).
+
+kway_topk: single-pass loser-tree merge of K sorted (key, count) runs with on-the-fly equal-key
+  defs: def _kway_topk_nb def top10_i32 def kway_topk def _part_scatter_nb def part_scatter def _group_min_nb def group_min def _group_max_nb def group_max def _frame_sum_keyed_nb def frame_sum_keyed def _frame_ext_keyed_nb def frame_ext_keyed def _rnk_mark_nb def rnk_mark def _seg_cumminmax_nb def seg_cummin def seg_cummax def _seg_slidext_nb def seg_slidmin def seg_slidmax def _running_nb def running_ag
+
+== src/wdb_labels.py (49 lines)
+"""FD labeling: discover single-column functional dependencies in a segment at flush time.
+
+Labels are HINTS for the compactor, not facts. Each carries det_uniqueness =
+  defs: def discover_fds def discover_from_parquet def holds 
+
+== src/wdb_ledger.py (61 lines)
+"""wdb_ledger -- the routing ledger (the future router's memory).
+
+Every routed query appends one JSON line: when, what shape (sql hash +
+  defs: def reset_stages def stage def _path_for def log 
+
+== src/wdb_lenagg.py (205 lines)
+"""wdb_lenagg -- grouped string-measure aggregates from the charlens table.
+
+Q27's lane: AVG/SUM(LENGTH(c)) [+ COUNT(*)] GROUP BY key [WHERE c <> ''] [HAVING
+  defs: def _fn_table def _price def detect def execute 
+
+== src/wdb_lmap.py (83 lines)
+"""wdb_lmap: the lower-collation map -- old_code -> lower_gid, as a file.
+
+LOWER(col) GROUP BY doesn't want the column's values; it wants to know which
+  defs: def _path def _lower def load def build def load_or_build 
+
+== src/wdb_measure_runtime.py (169 lines)
+"""
+wdb_measure_runtime -- runtime / query-derived measurements and the cost thresholds that read them.
+
+  defs: def survivor_gate def structural_pushdown_worth_it def bsi_too_unselective def bsi_index_fits def compound_range_worth_it def cube_worth_materializing def parallel_worth_it def dense_multigroup_fits def grouped_cdist_fits def tally_worth_it def code_lut_fits def column_fits_resident 
+
+== src/wdb_merge.py (232 lines)
+"""WaveDB two-tier merge-read: combine a cold segment + a hot buffer into one answer.
+
+The hard part is aggregates: you cannot average two averages. So we push MERGEABLE
+  defs: def _inner def _is_cdistinct def _classify def _partial_sql def _num def _mm def _merge_partials def _slot_op def merge_query def _duck_from 
+
+== src/wdb_mixtop.py (152 lines)
+"""wdb_mixtop -- Q9's shelf-fed mixed board (Jackson's design).
+
+SELECT k, SUM(a), COUNT(*) c, AVG(b), COUNT(DISTINCT t) FROM hits
+  defs: def detect def execute 
+
+== src/wdb_nline.py (51 lines)
+"""wdb_nline: the fixed number line as a file.
+
+A .nline.<col> sidecar is the column's value-ordered int table written as a flat
+  defs: def line_path def eligible def build 
+
+== src/wdb_override.py (55 lines)
+"""Override sidecar: per-segment mutable map of row -> new value, for UPDATE without
+rewriting the immutable .wdb. Sits next to the segment as '<segment>.overrides'.
+
+  defs: def path_for def load def save def set_override def override_count 
+
+== src/wdb_pairagg.py (392 lines)
+"""wdb_pairagg -- filtered 2-key GROUP BY, top-K by COUNT(*), with COUNT/SUM/AVG payload, served by a
+parallel SPARSE hash aggregate (numba).
+
+  defs: def enable def disable def is_enabled def _mask_to_idx def _gather_partition def _agg_shards def _dict_col def _single_col_eq_predicate def _order_targets_count def detect def _build_mask def _survivor_payload def _sort_counts def _winner_payload def execute 
+
+== src/wdb_pairdistinct.py (185 lines)
+"""wdb_pairdistinct -- Q11's guillotine hunt (Jackson's order of operations).
+
+SELECT a, b, COUNT(DISTINCT u) FROM t WHERE b <> '' GROUP BY a, b
+  defs: def detect def _tier_shelf def execute 
+
+== src/wdb_pairfold.py (286 lines)
+"""wdb_pairfold -- Q30's one-walk pair board (the eight taxes become one).
+
+SELECT a, b, COUNT(*) c, SUM(x), AVG(y) FROM hits
+  defs: def detect def _dv def execute 
+
+== src/wdb_pairtop.py (408 lines)
+"""wdb_pairtop -- Jackson's singleton-discard for Q32's near-unique pair giant.
+
+SELECT a, b, COUNT(*) c, <aggs...> GROUP BY a, b ORDER BY c DESC LIMIT k.
+  defs: def detect def execute def _pt2_path def _pt2_load def _pt2_save def _prune def _fpool def _pt_codes def _finish def _col_ints def _finish_v2 
+
+== src/wdb_passport.py (47 lines)
+"""wdb_passport -- every column publishes a card of self-measured facts.
+
+The router's vocabulary. v1 derives everything from headers already on disk
+  defs: def card def coverage 
+
+== src/wdb_policies.py (79 lines)
+"""
+wdb_policies -- named, reusable decision guards ("policies") that gate which operator answers a query.
+
+  defs: def no_joins def no_select_distinct def no_having def no_where def has_where def single_group_key def has_limit def has_group_key def columns_exist def no_deleted_rows def key_not_nullable def not_positional 
+
+== src/wdb_presence.py (56 lines)
+"""Presence sidecar: per-segment mutable bitset marking which rows are live.
+
+A cold .wdb segment is immutable. To DELETE without rewriting it, we keep a tiny sidecar
+  defs: def path_for def load def save def mark_deleted def live_count 
+
+== src/wdb_profile.py (28 lines)
+"""
+wdb_profile -- DATA measurement: true per-column cardinality.
+
+  defs: def cardinality def segment_cardinalities 
+
+== src/wdb_qmem.py (35 lines)
+"""wdb_qmem: query-scoped memory -- Jackson's law.
+
+A query may use any RAM it needs WHILE it runs. When the outermost run() returns,
+  defs: def register def flush 
+
+== src/wdb_radix.py (148 lines)
+"""
+wdb_radix — key-partitioned (radix) aggregation for high-cardinality single-key GROUP BY.
+
+  defs: def _radix0 def _radix1 def _fanout def radix_grouped def _detect_l3 def should_use 
+
+== src/wdb_read.py (96 lines)
+"""Column reader for the encoder. Produces, per column, numpy matching what the encoder
+expects: numpy.ma.MaskedArray (original dtype) for nullable columns, plain ndarray else.
+
+  defs: def _arrow_default def _arrow_col_to_numpy def _read_arrow def _read_duckdb def read_columns def column_schema def read_one_column 
+
+== src/wdb_recluster.py (79 lines)
+"""
+wdb_recluster -- reorder an existing segment by a key WITHOUT re-encoding from source.
+
+  defs: def _col_values_masked def recluster 
+
+== src/wdb_regexgroup.py (353 lines)
+"""regexgroup: GROUP BY REGEXP_REPLACE(dict column) computed entirely at the dictionary level.
+
+The Q28 shape: SELECT REGEXP_REPLACE(col, pat, repl) AS k, AVG(LENGTH(col)), COUNT(*),
+  defs: def _fork_chunk def enable def disable def _regex_key def _avg_length def detect def _code_counts def execute def _derive_runs def _derive def _emit 
+
+== src/wdb_retype.py (146 lines)
+"""wdb_retype.py -- re-type integer columns as temporal (Date/DateTime) in place.
+
+A retype is a metadata + dict-format change, NOT a row reorder and NOT a value
+  defs: def _column_spans def retype 
+
+== src/wdb_sampletop.py (111 lines)
+"""THE SAMPLE LANE: a LIMIT with no ORDER BY asks for a sample, not a
+ranking -- so serve a fresh lawful sample each run. Random group keys
+are drawn from the big key's plist; each candidate's COMPLETE row slice
+  defs: def detect def execute 
+
+== src/wdb_scalar.py (145 lines)
+"""wdb_scalar: scalar functions computed at the DICTIONARY level -- never per row.
+
+The regexgroup law generalized into engine infrastructure: a supported scalar expression over
+  defs: def parse def _key def table def surrogate 
+
+== src/wdb_scanpair.py (202 lines)
+"""
+wdb_scanpair -- NON-KEY filter regime for a 2-key COUNT(*) top-K with a WHERE on a separate column.
+
+  defs: def _eq_on_nonkey def detect def _order_is_count_desc def execute def try_scanpair 
+
+== src/wdb_septop.py (147 lines)
+"""wdb_septop -- Q14's engine-first hunt (Jackson's design).
+
+SELECT se, sp, COUNT(*) WHERE sp <> '' GROUP BY se, sp ORDER BY c DESC LIMIT k
+  defs: def detect def execute 
+
+== src/wdb_seqcodec.py (132 lines)
+"""WaveDB sequence (affine) codec -- mode 4 building blocks, standalone and engine-free.
+
+A sequential key column (auto-increment PK, monotonic timestamp) looks like maximum entropy
+  defs: def params def build def decode def header def exceptions def encode def is_lossless 
+
+== src/wdb_seqpred.py (95 lines)
+"""
+wdb_seqpred — predicate pushdown on mode-4 (WSQ1 affine) columns.
+
+  defs: def n_exceptions def _struct def _seg_mask def survivor_ranges def survivor_count def ranges_to_ids 
+
+== src/wdb_setops.py (423 lines)
+"""wdb_setops: UNION / UNION ALL / INTERSECT / EXCEPT as controller-level composition.
+
+Each side runs through the full existing pipeline (any read, any table -- sides recurse, so
+  defs: def is_setop def _norm_row def _codes_side def _union_codes def _try_fused_union def _eval def execute 
+
+== src/wdb_shelves.py (91 lines)
+"""wdb_shelves -- the birth ledger (Jackson's eager-shelf law).
+
+Shelves are few and small, but birth-on-touch made them lucky accidents of
+  defs: def _ledger_path def record def replay 
+
+== src/wdb_smallk.py (136 lines)
+"""
+wdb_smallk -- the small-K weapon: GROUP BY 2-3 narrow keys + COUNT(*), answered by
+one fused pass over raw code streams onto a composite bean board. The router's twin
+  defs: def detect def execute 
+
+== src/wdb_sql.py (1570 lines)
+"""WaveDB SQL executor — STEP 1: single-table SELECT with WHERE, GROUP BY, HAVING,
+ORDER BY, LIMIT, returning the FULL correct result set. Parses real SQL via sqlglot;
+executes against a WVDB3 Segment. Correctness first; optimization second.
+  defs: def _kind def _flatten_and def _slice_vals def _cluster_will_slice def _has_count_star_only def _has_count_distinct def _cluster_will_group_slice def _grouped_slice def _colname def _fn_strlen def _fn_length def _fn_regexp_replace def _factorize_obj def _fn_lower def _fn_upper def _scalar_fn def _fval_by_code def _ck def _factorize_nonneg def _sfn_array def _date_unit def _code_counts def _trunc_t
+
+== src/wdb_stair.py (206 lines)
+"""stair: single-key GROUP BY reads served from a STAIRCASE column's step positions -- no code
+decode, no dict materialization, no scan. A staircase column (codes non-decreasing in row order,
+i.e. data ingested sorted by it: EventTime, EventDate) is fully described by the rows where its
+  defs: def enable def disable def _count_index def _order_kind def detect def execute def _unit_execute 
+
+== src/wdb_subquery.py (337 lines)
+"""wdb_subquery: uncorrelated subqueries in WHERE, by tree rewrite.
+
+The composition pattern from set operations pointed inward: evaluate the inner SELECT through
+  defs: def _samecol_codes def has_subquery def _run_inner def _lit def _inner_tables def _corr_eq def _try_window_decorrelate def rewrite 
+
+== src/wdb_sumtopk.py (108 lines)
+"""
+wdb_sumtopk -- single high-card key, SUM top-K: the counting board's SUM sibling.
+
+  defs: def detect def execute 
+
+== src/wdb_survgroup.py (177 lines)
+"""
+wdb_survgroup — survivor-set group-by for SELECTIVE filtered high-card single-key COUNT(*).
+
+  defs: def _int_lit def _simple_cmp def detect def execute def try_survgroup 
+
+== src/wdb_tripletop.py (335 lines)
+"""wdb_tripletop -- Jackson's double-bound hunt for Q18's triple-key giant.
+
+SELECT uid, extract(minute FROM dt) AS m, sp, COUNT(*) ... GROUP BY the three
+  defs: def _extract_minute def detect def _minute_table def execute def _free_serve 
+
+== src/wdb_valsort.py (122 lines)
+"""
+wdb_valsort -- value-sorted projection top-K.
+
+  defs: def _dupcounts def _where_is_neq_empty def _order_is_col_asc def detect def execute def try_valsort 
+
+== src/wdb_valtopk.py (345 lines)
+"""wdb_valtopk: ordered row dumps without sorting the world.
+
+SELECT <cols> FROM t ORDER BY <numeric/temporal col(s)> LIMIT k was falling to the general
+  defs: def _order_keys def detect def _counts_lane def execute 
+
+== src/wdb_verify.py (79 lines)
+"""Verify a WVDB3 segment is byte-exact lossless vs its source file. Null- and float-aware."""
+import duckdb, numpy as np, numpy.ma as ma, sys
+sys.path.insert(0, '/home/jack/WaveDB/src')
+  defs: def _expected def _recon_obj def verify 
+
+== src/wdb_wherescan.py (1402 lines)
+"""wherescan: the disk-first WHERE read -- predicate scan over blocked (enc=3) code frames.
+
+The shape this serves is the ClickBench trench: a conjunction of selective predicates feeding a
+  defs: def enable def disable def _lit_bytes def _litval def _code_of def _conjuncts def _col_lit def _in_list def _case_key def _count_distinct def _scalar_cmp def _scalar_flag def _like def _like_flags def _disjuncts def _atom def detect def _bound_code def _span_rows def _scan_eq def _num_table def _in_codes def _scan_flag def _or_union_flag def _atom_mask def _fact_small def execute 
+
+== src/wdb_window.py (1190 lines)
+"""wdb_window: window functions on the FUSED MOTION -- one placement, two coordinates.
+
+The architecture is the child-language design: walking the file once, each row is placed into
+  defs: def enable def disable def _parse_window def detect def _int_table def _numvals def _order_codes_file def _try_stream_pairs def _rn1_emit_col def _try_partcount def _try_running def _try_rank def _try_frame_keyed def _try_rnk def _gdp_path def _gdp_load def _gdp_save def _try_rn1 def execute def _try_partagg_sortless 
+
+== src/workers.py (48 lines)
+"""
+workers.py -- THE WORKERS LAYER.
+
+  defs: def finalize def take_sorted 
+
+== bench/anomaly_hunt.py (53 lines)
+"""
+anomaly_hunt -- Jackson's fingerprint method, made permanent.
+
+  defs: 
+
+== bench/audit_nonexact.py (70 lines)
+"""Megaboard non-exact audit: different-correct-answers or actual bug?
+
+Case 1/2 (t-bool, g-lower): classify the errors.
+  defs: def rows_of def experiment 
+
+== bench/bench_scanpair_kernel.py (73 lines)
+"""bench/bench_scanpair_kernel.py -- verify the scanpair AVX-512 kernel vs DuckDB on 100M.
+
+Run on the pod (has the 100M segment + parquet oracle). Confirms the kernel path fires, is
+  defs: def hsh def main 
+
+== bench/bitpack_plus_bench.py (114 lines)
+"""bitpack vs bitpack-plus (Jackson's per-run-gated hybrid) on synthetic columns.
+
+Format under test (bitpack-plus): a token stream, 1 flag bit per token.
+  defs: def make_regimes def runs_of def bench 
+
+== bench/bitplane_bench2.py (213 lines)
+"""bit-plane faces 2: RUNS (the snowball) and RANGE (native prefix prune)."""
+import time
+import numpy as np
+  defs: def _range_block def _vrange_drive def vplane_count_range def horiz_count_range def face_eq def face_range def _eq_alist_block def _valist_drive def vplane_count_eq_alist def face_eq3 
+
+== bench/bitplane_bench3.py (199 lines)
+"""planes-only verdict bench: the four verbs on vertical-only storage.
+1. eq-scan       (snowball)          -- the known 11x
+2. window decode (13-tape transpose) -- Jackson's horizontal insert
+  defs: def _pop def v_transpose_range def v_gather def h_gather def v_topk_walk def h_topk_walk def build_planes def build_horiz def race 
+
+== bench/bitplane_bench4.py (280 lines)
+"""POD-SCALE planes-only verdict: N=100M, DRAM regime, proper 64x64
+bit-matrix transpose for the tapes. Faces: 13-bit runs (CounterID-class)
+and 25-bit zipf (URL-class)."""
+  defs: def _pop def _t64 def v_eq_alist def h_scan_eq def v_window_t64 def v_gather def h_gather def v_topk_t64 def h_topk def build_planes def build_horiz def race def suite 
+
+== bench/bitplane_bench.py (139 lines)
+"""bit-plane (vertical) scan vs horizontal word-wise scan -- Jackson's
+progressive pruning, benched before any encoder ink.
+
+  defs: def _popcnt def vplane_count_eq def horiz_count_eq def build def bench 
+
+== bench/board_clickbench.py (89 lines)
+"""ClickBench board runner (hits dataset). Robust: each query runs in its own process
+(bench/_cbq_worker.py) under a hard kill-timeout, so slow queries get TIMEOUT instead
+of stalling the board. Reports cold (fresh process) + warm (re-run) WaveDB times vs
+  defs: def duck def run_wdb def validated_ok 
+
+== bench/board_tpch.py (97 lines)
+"""THE TPC-H BOARD: the realm's first foreign-data trial. 22 official
+queries (dates as int-days, decimals as doubles -- both engines read
+the identical parquet-born bytes), duck-refereed, float-tolerant
+  defs: def rows_of def main 
+
+== bench/canon_table.py (123 lines)
+"""Canonical-corpus scoreboard: join the TPC-H matrix (examples/report.md) and a ClickBench
+board JSON (examples/boards/*.json) onto the 37 canonical shapes (docs/crosswalk.md) and emit
+one row per shape. Matrix = lineitem 6M warm best-of-5 speedup; clickbench = hits 100M warm
+  defs: def parse_matrix def parse_board def parse_crosswalk def _fmt_m def _fmt_q def _verdict def build def main 
+
+== bench/catalog.py (65 lines)
+"""Canonical catalog of the query shapes WaveDB supports. SINGLE SOURCE OF TRUTH:
+- bench/query_matrix.py imports QUERIES from here (no second copy)
+- docs/queries.md is generated from here (the running list)
+  defs: def workload 
+
+== bench/_cbcorrect_worker.py (20 lines)
+"""Single-run correctness worker: run one query once, emit its order-insensitive normalized result hash.
+Own process so the parent can enforce a hard kill-timeout. argv: src_dir db_dir query"""
+import sys, json, os
+  defs: def rows_of 
+
+== bench/_cbnorm.py (75 lines)
+"""Shared value normalization + hashing for the ClickBench board and the correctness verifier.
+
+The board's old check md5-hashed repr(round(v,3)) per cell, which false-failed on benign differences:
+  defs: def _cn def norm_cell def norm_row def _cn_exact def norm_cell_exact def limit_hash def full_fp 
+
+== bench/_cbq_rows.py (24 lines)
+"""Correctness worker: run ONE query in its own process (so a slow query can't stall the harness) and
+emit the ACTUAL result rows, normalized, as JSON. Distinct from _cbq_worker.py, which emits only a hash
+for the speed board. argv: src_dir db_dir query"""
+  defs: def rows_of 
+
+== bench/_cbq_worker.py (25 lines)
+"""Single-query worker for the ClickBench board runner. Runs one query in its own
+process so the parent can enforce a hard kill-timeout (a slow query can't stall the
+board). Measures cold (this fresh process's first run) + warm (immediate re-run), and
+  defs: def nh 
+
+== bench/_cbvalidate.py (47 lines)
+"""Turn a query into a total-order variant so a non-deterministic LIMIT answer becomes deterministic.
+
+Ties/unordered LIMITs are the reason DuckDB's exact hash false-fails correct WaveDB answers. Appending
+  defs: def total_order_sql 
+
+== bench/corpus.py (174 lines)
+"""Canonical query corpus generator. SINGLE SOURCE OF TRUTH for the unified benchmark
+corpus across both datasets (TPC-H lineitem via our matrix; ClickBench hits).
+
+  defs: def _clickbench def feats def medium def bucket def label def shape_str def build def write_corpus def write_crosswalk 
+
+== bench/correctness.py (282 lines)
+"""Parquet-grounded correctness harness for the ClickBench suite.
+
+PRINCIPLE: DuckDB is a stopwatch (the board's job); the PARQUET is the answer key. Here Duck is used
+  defs: def duck def _agg_of def extract def _proj_sql def run_wdb def _to_num def cell_eq def denorm def nrow def _close def msort def check_exact def _key_agg_idx def membership def band def check_scalar def check_exact_scalar def check_ordered_limit def check_unordered_limit def check_canonical def verdict 
+
+== bench/demo.py (32 lines)
+"""WaveDB demo -- run the canonical query catalog once on the bench DB, vs DuckDB.
+  python3 bench/demo.py            (expects /tmp/jbprof_sf1.0/wdb; build: python3 bench/join_prof.py 1.0)
+Shows every supported query shape, result size, WaveDB vs DuckDB time, and a correctness check.
+  defs: def best 
+
+== bench/gen_verify.py (57 lines)
+"""Generalize-and-verify: many join/agg shapes through the fast path vs DuckDB at sf=1.
+Checks correctness (sorted compare) AND speed, and asserts the fast path was actually taken."""
+import sys, os, time, math, datetime, re
+  defs: def _cell def _norm def _eq def best 
+
+== bench/join_bench.py (123 lines)
+"""Honest head-to-head: WaveDB vs DuckDB on TPC-H joins.
+Axes: correctness, end-to-end query time, storage, and the pointer-walk gather kernel (FK pre-resolved
+to a parent row pointer at load -> query-time join is a pure gather, no hash build)."""
+  defs: def load def best def norm def gather_A def gather_B def fsize def zsz def delta_z 
+
+== bench/join_prof_A.py (61 lines)
+"""Apply the code-based aggregation to query [A] (orders x customer, SCATTERED FK).
+Reuses the persistent sf=1 build; pre-resolves o_custkey -> customer row pointer once (untimed, as it
+would be stored), then times the gather + aggregate, pandas-on-strings vs numpy-on-codes."""
+  defs: def numpy_codes def tm def full_pandas 
+
+== bench/join_prof.py (94 lines)
+"""Profile the gather-join hotspot: where does the time actually go?
+Breaks the lineitem x orders aggregate into decode / gather(walk) / group-by, and contrasts pandas
+object-key group-by against a numpy group-by on WaveDB's integer codes."""
+  defs: def tm def numpy_groupby def full_pandas def full_numpy 
+
+== bench/lattice_proto.py (97 lines)
+"""lattice_proto.py -- proof-of-concept for a unified sidecar lattice over a shared code basis.
+
+Thesis (Jackson's): every sidecar is a node (axes, measures) in one coordinate system -- the
+  defs: class Node: def heavy_cells def main 
+
+== bench/loser_census.py (43 lines)
+  defs: 
+
+== bench/megaboard.py (174 lines)
+"""megaboard runner: 103 queries x (wave, duck) with per-kind validation.
+
+Usage (pod): python3 bench/megaboard.py /workspace/data/fjdb /workspace/data/hits.parquet
+  defs: def duck_cols def rows_of def duck_sql def wtie_duck_sql def order_col_index def norm def validate 
+
+== bench/megaboard_queries.py (136 lines)
+"""megaboard: the full-surface benchmark -- every family, every distinct shape, one board.
+
+Compare kinds:
+  defs: 
+
+== bench/overall_size_bench_clustered.py (83 lines)
+"""Big-picture storage on a REALISTIC CLUSTERED table (rows sorted by user; each user's region/
+device cluster into runs; sequential id/ts; skewed amount; high-entropy high-card session). Clean
+ablation of all THREE storage features, each toggled independently so its standalone contribution
+  defs: def say def _cs_raw def measure 
+
+== bench/overall_size_bench.py (96 lines)
+"""overall_size_bench -- big-picture storage: WaveDB (mode-4 ON vs OFF) vs DuckDB vs parquet
+on a REPRESENTATIVE wide analytical table (sequential PK + monotonic ts + the usual mix of
+categoricals / measures / high-card strings). Isolates what the mode-4 addition bought at the
+  defs: def say def encode_measure 
+
+== bench/path_run.py (37 lines)
+"""Path run (separate from the timed board): execute each query ONCE with the controller's
+_PATH_SINK live, record the winning read per query. Overhead is irrelevant here -- we never
+time anything; we only capture which read fired. Speed stays in board_clickbench.py with the
+  defs: 
+
+== bench/pod_cgk2.py (34 lines)
+  defs: def T def truth 
+
+== bench/pod_computed_groupkey.py (47 lines)
+  defs: def T def wave 
+
+== bench/pod_diag.py (18 lines)
+  defs: def T 
+
+== bench/pod_exec_diag.py (23 lines)
+  defs: def T 
+
+== bench/pod_heavypair_main.py (40 lines)
+  defs: def T 
+
+== bench/pod_router_diag2.py (33 lines)
+  defs: def T 
+
+== bench/pod_router_diag3.py (31 lines)
+  defs: def T 
+
+== bench/pod_router_diag.py (30 lines)
+  defs: def T 
+
+== bench/pod_table_numbers.py (34 lines)
+  defs: def T 
+
+== bench/pod_wrapper_diag.py (22 lines)
+  defs: def T 
+
+== bench/pool_dedup_bench.py (83 lines)
+"""Dedup-lookup throughput as the pool grows. The pool answers 'have I seen this value?'
+once per incoming write; we want a structure whose lookup stays FLAT as it fills.
+Candidates: python dict (hash, O(1)), sorted-array+bisect (O(log n), sorted-free),
+  defs: def gen_random def gen_prefix class HashPool: class SortedPool: class TriePool: def bench_fill def bench_hits 
+
+== bench/pool_read_bench2.py (54 lines)
+"""v2: corrected int case (pool holds int64, dtype-preserving scatter) + dtype-preserving
+string case (no object promotion when not needed). Isolates the TRUE cost of override
+resolution from the dtype-promotion artifact found in v1."""
+  defs: def build def best def pool def base def branchless_preserve 
+
+== bench/pool_read_bench.py (72 lines)
+"""Measure how read latency degrades as a fraction of rows are overridden into a pool,
+under different resolution strategies. Answers: (1) where does the pool grow 'too big',
+(2) how much does branchless vectorized resolution beat naive per-row branching.
+  defs: def build_segment def best def make_pool def baseline def branchless def branchy 
+
+== bench/prof_fastpath_A.py (32 lines)
+"""Steady-state (cached-segment) sub-step breakdown for query [A]."""
+import sys, os, time
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+  defs: def t 
+
+== bench/prof_fastpath.py (46 lines)
+"""Where does db.run's fast path spend its time? Break down query [B] step by step."""
+import sys, os, time
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+  defs: def t def whole 
+
+== bench/query_matrix.py (123 lines)
+"""Query-type matrix: for every query shape WaveDB supports, measure BITS READ
+(sum of code-stream bits of the columns it touches: N x code_width) and SPEED
+(best-of-5 ms) vs DuckDB on identical TPC-H sf=1 data. Correctness vs DuckDB.
+  defs: def _cell def _norm def _eq def best def build_cols def bits_read def open_db def open_segs def open_duck def run_matrix 
+
+== bench/report.py (309 lines)
+"""bench/report.py -- the living scoreboard (one regenerated artifact).
+
+  (1) STORAGE   WaveDB on-disk (per table + FK pointers) vs DuckDB native -> compression total
+  defs: def _need_db def wdb_sizes def _baseline_has_tables def duck_baseline def _write_memrun def _peak_kb def _write_duckmem def _duck_peak_kb def write_caps def write_md def main 
+
+== bench/seqkey_bench.py (81 lines)
+"""seqkey_bench -- measure the position-derivable (formula) codec hypothesis on sequential
+key columns vs (A) the real WaveDB encoder and (B) zstd-19 on raw int64. Honest exceptions:
+real byte arrays, zstd-compressed. Reports bits/row (scale-free) and the detector verdict.
+  defs: def scenarios def wavedb_bytes def zstd_raw def formula_codec def reconstruct_time def bpr 
+
+== bench/speed_check.py (32 lines)
+"""Does the gather fast path reach db.run()? Reuse the persistent sf=1 build, add FK pointers, and
+time the actual SQL join queries vs DuckDB."""
+import sys, os, time
+  defs: def best 
+
+== bench/throughput.py (190 lines)
+"""bench/throughput.py -- the throughput scoreboard (WaveDB vs DuckDB).
+
+Throughput is WaveDB's optimization target: a shared analytical DB serving many
+  defs: def _smaps_private_dirty def _worker def _dworker def _spawn def run def _write_md 
+
+== bench/traffic.py (94 lines)
+"""bench/traffic.py -- sustained-traffic RAM test (one command, both engines).
+
+Opens each engine ONCE, runs `passes` full sweeps of the catalog
+  defs: def _hwm def _wdb_worker def _duck_worker def _spawn def run 
+
+== bench/verify_correctness.py (101 lines)
+"""Correctness gate for EVERY ClickBench query -- verified against the PARQUET, not against DuckDB's
+arbitrary output. DuckDB is only a SQL executor over the parquet here (any correct engine would give the
+same canonical answer), so its tie/order choices never enter the verdict.
+  defs: def duck_hash def wdb def classify def verify 
+
+== bench/verify_nondeterministic.py (155 lines)
+"""Airtight verification of the board's ❌ queries that are (hypothesized) non-deterministic, not wrong.
+
+The board checker is order-insensitive + float-tolerant, so a ❌ is NOT ordering. It is tie MEMBERSHIP
+  defs: def rows_of def wrun def drun def _counts def check_query def check_q03 
+
