@@ -833,8 +833,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 key = (id(seg), pcol, id(cptr) if cptr is not None else None)
                 if key not in slot:
                     slot[key] = len(inputs)
-                    inputs.append((np.ascontiguousarray(raw[0]), np.ascontiguousarray(raw[1]),
-                                   None if cptr is None else np.ascontiguousarray(cptr)))
+                    inputs.append((np.ascontiguousarray(raw[0]), np.ascontiguousarray(_rw9(raw[1])),
+                                   None if cptr is None else np.ascontiguousarray(_rw9(cptr))))
                 return f"v{slot[key]}"
             if isinstance(node, E.Literal):
                 if node.is_string: raise _FastUnsupported
@@ -1167,6 +1167,69 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             _bump_fast()
             return [tuple(row)], [wdb_sql._alias(p) for p in proj]
 
+    # ============ THE SURVIVOR CASCADE (Jackson's PEMDAS at pipeline scope):
+    # filter FIRST, in code space, potency-descending -- everything downstream
+    # (group keys, gids, slots, kernel, emit) exists only at survivor scale.
+    # Atomic: every WHERE conjunct must be a single-column dict predicate the
+    # cascade can serve (numeric LUT via _dict_keep; string EQ/IN via
+    # literal->code), else the whole cascade declines and the old path runs.
+    rows9 = None
+    _where_spent = False
+    _w9c = tree.args.get('where')
+    if _w9c is not None and gnodes:
+        try:
+            def _cflat(x):
+                if isinstance(x, E.Paren): return _cflat(x.this)
+                if isinstance(x, E.And):
+                    return _cflat(x.this) + _cflat(x.expression)
+                return [x]
+            plan9 = []
+            for cn in _cflat(_w9c.this):
+                cols9 = list(cn.find_all(E.Column))
+                if len(cols9) != 1: raise _FastUnsupported
+                cs9, cp9, cc9p = resolve(cols9[0])
+                c9 = cs9.cols.get(cp9) or {}
+                if c9.get('mode') not in (0, 1, 2): raise _FastUnsupported
+                V9 = int(c9['V'])
+                td9 = np.asarray(cs9._typed_dict(cp9))
+                kx9 = np.zeros(V9, bool)
+                if td9.dtype.kind in 'iuf' and len(td9):
+                    keep9 = _dict_keep(cn, cs9, cp9, td9)
+                    if keep9 is None: raise _FastUnsupported
+                    kx9[:len(keep9)] = keep9
+                elif isinstance(cn, E.EQ) and isinstance(cn.expression, E.Literal):
+                    code9 = _code_of_literal(cs9, cp9, _lit_bytes(cs9, cp9, cn.expression))
+                    if code9 is not None: kx9[code9] = True
+                elif isinstance(cn, E.In):
+                    for e9 in cn.expressions:
+                        code9 = _code_of_literal(cs9, cp9, _lit_bytes(cs9, cp9, e9))
+                        if code9 is not None: kx9[code9] = True
+                else:
+                    raise _FastUnsupported
+                cnt9 = np.asarray(cs9.code_counts(cp9))[:V9]
+                t9s = cnt9.sum()
+                prune9 = 1.0 - float(cnt9[kx9[:cnt9.size]].sum()) / t9s if t9s else 0.5
+                cost9 = 1.0 if cc9p is None else 6.0
+                plan9.append((prune9 / cost9, kx9, cs9, cp9, cc9p))
+            plan9.sort(key=lambda x: -x[0])
+            for _, kx9, cs9, cp9, cc9p in plan9:
+                if cc9p is None:
+                    codes9 = np.asarray(cs9.codes(cp9))
+                    rows9 = (np.flatnonzero(kx9[codes9]) if rows9 is None
+                             else rows9[kx9[codes9[rows9]]])
+                else:
+                    pc9 = np.asarray(cs9.codes(cp9))
+                    pt9 = np.asarray(cc9p)
+                    rows9 = (np.flatnonzero(kx9[pc9[pt9]]) if rows9 is None
+                             else rows9[kx9[pc9[pt9[rows9]]]])
+            _where_spent = True
+            if _bill9 is not None:
+                _bill9.append(('cascade %d->%d' % (n, rows9.size), _tk9() - _fpa_t0))
+            n = int(rows9.size)
+        except Exception:
+            rows9 = None; _where_spent = False
+    def _rw9(a):
+        return a if (rows9 is None or a is None) else np.asarray(a)[rows9]
     gkeys = []                                           # one per GROUP BY column
     for g in gnodes:
         gseg, gpcol, gcptr = resolve(g)
@@ -1174,12 +1237,17 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             # Affine-coded (mode 4): dense gids + labels, memoised on the immutable segment.
             full, _K, _labels = _mode4_group(gseg, gpcol)
             if full.size == 0: return [], [wdb_sql._alias(p) for p in proj]
+            if gcptr is None: full = _rw9(full)
+            else: gcptr = _rw9(gcptr)
             gkeys.append({'seg': gseg, 'pcol': gpcol, 'cptr': gcptr, 'full': full,
                           'K': _K, 'labels': _labels})
             continue
         full = gseg.codes(gpcol)
         if full.size == 0: return [], [wdb_sql._alias(p) for p in proj]
-        gkeys.append({'seg': gseg, 'pcol': gpcol, 'cptr': gcptr, 'full': full, 'K': int(full.max()) + 1})
+        K9full = int(full.max()) + 1
+        if gcptr is None: full = _rw9(full)
+        else: gcptr = _rw9(gcptr)
+        gkeys.append({'seg': gseg, 'pcol': gpcol, 'cptr': gcptr, 'full': full, 'K': K9full})
     gid_to_comp = None                                    # set when a high-card composite is hash-factorised
     if len(gkeys) == 0:
         K = 1; group_op = None; group_keys = []
@@ -1286,8 +1354,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             bkey = (id(bseg), bpcol, id(bcptr) if bcptr is not None else None)
             if bkey not in slots:
                 slots[bkey] = len(slot_list)
-                slot_list.append((np.ascontiguousarray(raw[0]), np.ascontiguousarray(raw[1]),
-                                  None if bcptr is None else np.ascontiguousarray(bcptr)))
+                slot_list.append((np.ascontiguousarray(raw[0]), np.ascontiguousarray(_rw9(raw[1])),
+                                  None if bcptr is None else np.ascontiguousarray(_rw9(bcptr))))
             return f"v{slots[bkey]}"
         if isinstance(node, E.Literal):
             if node.is_string: raise _FastUnsupported
@@ -1311,8 +1379,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         ckey = (id(cseg), cpcol, id(cptr) if cptr is not None else None)
         if ckey not in slots:
             slots[ckey] = len(slot_list)
-            slot_list.append((None, np.ascontiguousarray(codes),
-                              None if cptr is None else np.ascontiguousarray(cptr)))
+            slot_list.append((None, np.ascontiguousarray(_rw9(codes)),
+                              None if cptr is None else np.ascontiguousarray(_rw9(cptr))))
         return f"v{slots[ckey]}", nullcode      # NO code_of -- literals resolved via _code_of_literal
     def _code_lut(cseg, cpcol, cptr, fn, mark_null=False):
         # ARBITRARY single-column string predicate -> code-LUT: precompute keep[code]=fn(dict_value) over
@@ -1330,8 +1398,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         else:
             for vb, cd in code_of.items():
                 if fn(vb): keep[cd] = 1
-        slot_list.append((keep, np.ascontiguousarray(codes),
-                          None if cptr is None else np.ascontiguousarray(cptr)))
+        slot_list.append((keep, np.ascontiguousarray(_rw9(codes)),
+                          None if cptr is None else np.ascontiguousarray(_rw9(cptr))))
         return f"v{len(slot_list) - 1}"
     def _like_fn(cseg, cpcol, pat_node, ci):
         pb = _lit_bytes(cseg, cpcol, pat_node)
@@ -1440,7 +1508,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     if _bill9 is not None:
         _bill9.append(('setup(proj+gkeys+resolve)', _b0 - _fpa_t0))
     pred_body = None
-    if where is not None:
+    if where is not None and not _where_spent:
         try:
             # THE POTENCY LAW (Jackson's ratio): conjuncts fire in descending
             # prune_fraction / access_cost -- the cheapest, deadliest test
@@ -1563,7 +1631,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             if fn in ('SUM', 'AVG', 'MIN', 'MAX'):
                 if body not in ex_index: ex_index[body] = len(exprs); exprs.append([body, False])
                 if fn in ('MIN', 'MAX'): exprs[ex_index[body]][1] = True
-        _mask = None if pred_body else get_mask()
+        _mask = None if (pred_body or _where_spent) else get_mask()
         _cm = gkeys[0]['seg'].cluster_meta() if len(gkeys) == 1 else None
         _no_mm = not any(e[1] for e in exprs)
         _rdx = _radix_plan(group_keys, slot_list, exprs, _no_mm, pred_body, _mask)
