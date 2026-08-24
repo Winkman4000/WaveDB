@@ -735,8 +735,12 @@ def _slice_scalar_agg(group_keys, inputs, exprs, mask, n, pred, offsets):
 
 def _fast_pointer_agg(db, tree, ctx, columnar=False):
     import operator
-    import time as _t9f
-    _fpa_t0 = _t9f.perf_counter()
+    import time as _t9
+    _tk9 = _t9.perf_counter
+    _fpa_t0 = _tk9()
+    _bill9 = [] if __import__('os').environ.get('WDB_JOIN_BILL') else None
+    rows9 = None
+    _where_spent = False
     proj = tree.expressions
     group = tree.args.get('group')
     has_agg = any(wdb_sql._agg_kind(p) for p in proj)
@@ -766,7 +770,10 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     def _col_cached(seg, pcol):                 # decode each column once per query (multi-agg reuse)
         k = (id(seg), pcol)
         if k not in _colmemo: _colmemo[k] = wdb_sql._col(seg, pcol)
-        return _colmemo[k]
+        v9m = _colmemo[k]
+        if rows9 is None:
+            return v9m
+        return (_rw9(v9m[0]), _rw9(v9m[1]))     # materialised operands ride survivor space
 
     def resolve(node):
         if not isinstance(node, E.Column):
@@ -833,7 +840,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 key = (id(seg), pcol, id(cptr) if cptr is not None else None)
                 if key not in slot:
                     slot[key] = len(inputs)
-                    inputs.append((np.ascontiguousarray(raw[0]), np.ascontiguousarray(_rw9(raw[1])),
+                    inputs.append((np.ascontiguousarray(raw[0]),
+                                   np.ascontiguousarray(_rw9(raw[1]) if cptr is None else raw[1]),
                                    None if cptr is None else np.ascontiguousarray(_rw9(cptr))))
                 return f"v{slot[key]}"
             if isinstance(node, E.Literal):
@@ -1030,6 +1038,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     where = tree.args.get('where')
     _maskc = {}
     def get_mask():                # materialise the WHERE bool mask lazily -- only non-fused paths need it
+        if _where_spent:
+            return None                # the cascade already applied WHERE in row space
         if 'm' not in _maskc:
             _maskc['m'] = mask_eval(where.this) if where is not None else None
         return _maskc['m']
@@ -1176,7 +1186,16 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     rows9 = None
     _where_spent = False
     _w9c = tree.args.get('where')
-    if _w9c is not None and gnodes:
+    if _w9c is not None and len(gnodes) == 1:
+        try:
+            _g0s, _g0p, _g0c = resolve(gnodes[0])
+            if (_g0c is None and _g0s.cluster_meta() is not None
+                    and _g0s.cluster_meta().get('key') == _g0p
+                    and _g0s.presence_mask() is None):
+                _w9c = None            # cluster slice-scalar lane is faster: cascade stands down
+        except Exception:
+            pass
+    if _w9c is not None and gnodes and cd_col is None:
         try:
             def _cflat(x):
                 if isinstance(x, E.Paren): return _cflat(x.this)
@@ -1192,7 +1211,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 if c9.get('mode') not in (0, 1, 2): raise _FastUnsupported
                 V9 = int(c9['V'])
                 td9 = np.asarray(cs9._typed_dict(cp9))
-                kx9 = np.zeros(V9, bool)
+                kx9 = np.zeros(V9 + 1, bool)   # +1: null sentinel bin, False by law
                 if td9.dtype.kind in 'iuf' and len(td9):
                     keep9 = _dict_keep(cn, cs9, cp9, td9)
                     if keep9 is None: raise _FastUnsupported
@@ -1226,6 +1245,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             if _bill9 is not None:
                 _bill9.append(('cascade %d->%d' % (n, rows9.size), _tk9() - _fpa_t0))
             n = int(rows9.size)
+            if n == 0:
+                _bump_fast()
+                return [], [wdb_sql._alias(p) for p in proj]
         except Exception:
             rows9 = None; _where_spent = False
     def _rw9(a):
@@ -1354,7 +1376,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             bkey = (id(bseg), bpcol, id(bcptr) if bcptr is not None else None)
             if bkey not in slots:
                 slots[bkey] = len(slot_list)
-                slot_list.append((np.ascontiguousarray(raw[0]), np.ascontiguousarray(_rw9(raw[1])),
+                slot_list.append((np.ascontiguousarray(raw[0]),
+                                  np.ascontiguousarray(_rw9(raw[1]) if bcptr is None else raw[1]),
                                   None if bcptr is None else np.ascontiguousarray(_rw9(bcptr))))
             return f"v{slots[bkey]}"
         if isinstance(node, E.Literal):
@@ -1379,7 +1402,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         ckey = (id(cseg), cpcol, id(cptr) if cptr is not None else None)
         if ckey not in slots:
             slots[ckey] = len(slot_list)
-            slot_list.append((None, np.ascontiguousarray(_rw9(codes)),
+            slot_list.append((None, np.ascontiguousarray(_rw9(codes) if cptr is None else codes),
                               None if cptr is None else np.ascontiguousarray(_rw9(cptr))))
         return f"v{slots[ckey]}", nullcode      # NO code_of -- literals resolved via _code_of_literal
     def _code_lut(cseg, cpcol, cptr, fn, mark_null=False):
@@ -1398,7 +1421,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         else:
             for vb, cd in code_of.items():
                 if fn(vb): keep[cd] = 1
-        slot_list.append((keep, np.ascontiguousarray(_rw9(codes)),
+        slot_list.append((keep, np.ascontiguousarray(_rw9(codes) if cptr is None else codes),
                           None if cptr is None else np.ascontiguousarray(_rw9(cptr))))
         return f"v{len(slot_list) - 1}"
     def _like_fn(cseg, cpcol, pat_node, ci):
@@ -1501,9 +1524,6 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             return f"(({lo} <= {v}) and ({v} <= {hi}))"
         raise _FastUnsupported
 
-    import time as _t9
-    _bill9 = [] if __import__('os').environ.get('WDB_JOIN_BILL') else None
-    _tk9 = _t9.perf_counter
     _b0 = _tk9()
     if _bill9 is not None:
         _bill9.append(('setup(proj+gkeys+resolve)', _b0 - _fpa_t0))
@@ -1602,7 +1622,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         op = _group_op()
         if op is None or op[0] != 'd': return None
         gid = np.asarray(op[1], dtype=np.int64)
-        vcodes = vseg.codes(vpcol)
+        vcodes = _rw9(vseg.codes(vpcol))   # fact-space by this lane's own gate
         m = get_mask()
         if m is not None: gid = gid[m]; vcodes = vcodes[m]
         # ONE pass: a (groups x value) cell count. Row totals give presence; nonzero non-null
@@ -1638,6 +1658,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         if not group_keys and _no_mm:     # no GROUP BY, no MIN/MAX -> lean scalar kernel
             counts, results = wdb_exprjit.scalar_multi(slot_list, exprs, _mask, n, pred_body)
         elif (len(gkeys) == 1 and _cm is not None and gkeys[0]['cptr'] is None and _no_mm
+              and rows9 is None
               and _cm.get('key') == gkeys[0]['pcol'] and gkeys[0]['seg'].presence_mask() is None):
             counts, results = _slice_scalar_agg(group_keys, slot_list, exprs,   # cluster-key GROUP BY +
                                                 _mask, n, pred_body, _cm['offsets'])  # predicate -> per-slice scalar
