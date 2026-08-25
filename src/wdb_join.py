@@ -1238,8 +1238,18 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 t9s = cnt9.sum()
                 prune9 = 1.0 - float(cnt9[kx9[:cnt9.size]].sum()) / t9s if t9s else 0.5
                 cost9 = 1.0 if cc9p is None else 6.0
-                plan9.append((prune9 / cost9, kx9, cs9, cp9, cc9p))
+                plan9.append((prune9 / cost9, prune9, kx9, cs9, cp9, cc9p))
             plan9.sort(key=lambda x: -x[0])
+            # THE MARGINAL-BOUND GATE: expected survivors, EXACT from the
+            # censuses (product of keep fractions), known BEFORE any pass
+            # runs. A high-survivor cascade turns cheap sequential reads
+            # into N-scale gathers (Q1: 98.6% survive -> +430ms regression),
+            # so the cascade fires only when the prune pays.
+            _exp9 = 1.0
+            for _, pr9, *_r9 in plan9:
+                _exp9 *= (1.0 - pr9)
+            if _exp9 > 0.5:
+                raise _FastUnsupported
             # THE HOME-TABLE LAW (Jackson): a predicate is judged AT ITS HOME
             # table, once per home row; verdicts flow DOWN the foreign-key
             # roads as keep-flags; the fact pays one gather per road. Homes
@@ -1248,7 +1258,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             seg2alias9 = {id(ctx['seg_of'][a9]): a9 for a9 in ctx['seg_of']}
             fact9 = ctx['fact']
             homes9 = {}                                   # alias -> [(kx, seg, pcol)]
-            for _, kx9, cs9, cp9, cc9p in plan9:
+            for _, _pr9, kx9, cs9, cp9, cc9p in plan9:
                 a9 = seg2alias9.get(id(cs9))
                 if a9 is None: raise _FastUnsupported
                 homes9.setdefault(a9, []).append((kx9, cs9, cp9))
