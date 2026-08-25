@@ -268,45 +268,56 @@ def _sumslice_meta(db, tbl):
 
 
 def _descent_exec(db, tree, meta, s9, k, fseg):
-    """Jackson's pipeline, literally: (1) stream the one-byte stamp column,
-    >= slice s9, 99% of rows dead, STOP FILTERING; (2) confirm the survivors
-    against the query's own conditions, read only at their scale; (3) sum,
-    top-k. No cascade, no chain rebuild, no dictionary marshalling -- the
-    reads layer called directly. None on any shape doubt (caller falls back
-    to the general court)."""
+    """Jackson's pipeline, the probe's shape, no ceremony: (1) stream the
+    one-byte stamp >= s9; (2) confirm survivors -- fact conjuncts at
+    survivor scale, parent verdicts at PARENT scale flowing the mmap'd
+    edge roads down, fact pays one road gather at survivor scale; (3) sum
+    and top-k at the final survivors. The join context (segments + edge
+    roads) is memoised like the plan cache: paths and mmaps, no row data.
+    None on any doubt -> the general court serves."""
     import sqlglot.expressions as E9
     try:
-        ctx = _build_chain(db, tree.copy())
-        seg_of = ctx['seg_of']; composed = ctx['composed']; alias2t = ctx['alias2t']
-        fact_a = ctx['fact']
+        import os as _os
+        memo = db.__dict__.setdefault('_dc_ctx', {})
+        tbls = tuple(sorted(t.name for t in tree.find_all(E9.Table)))
+        ent = memo.get(tbls)
+        if ent is not None:
+            for p9, mt9 in ent['stamps']:
+                if _os.path.getmtime(p9) != mt9:
+                    ent = None; break
+        if ent is None:
+            ctx = _build_chain(db, tree.copy())
+            ent = dict(fact=ctx['fact'], alias2t=ctx['alias2t'],
+                       seg_of=ctx['seg_of'], edges=ctx.get('edge_ptrs') or {},
+                       stamps=[(db.cat.segment_paths(t)[0], _os.path.getmtime(db.cat.segment_paths(t)[0]))
+                               for t in ctx['alias2t'].values()])
+            memo[tbls] = ent
+        import time as _tt
+        _bl = [] if __import__('os').environ.get('WDB_JOIN_BILL') else None
+        _t0 = _tt.perf_counter()
+        fact_a = ent['fact']; seg_of = ent['seg_of']; edges = ent['edges']
         own = {}
-        for a9, t9 in alias2t.items():
+        for a9, t9 in ent['alias2t'].items():
             for c9 in db.cat.column_names(t9):
                 own.setdefault(c9, a9)
-        # ---- step 1: stream the byte
+        road = {pa: (ca, p9) for pa, (ca, p9) in edges.items()}
+        # ---- 1. stream the byte
         std = np.asarray(fseg._typed_dict(meta['stamp']))
         clo = int(np.searchsorted(std, s9, side='left'))
         r = np.flatnonzero(np.asarray(fseg.codes(meta['stamp'])) >= clo)
-        # ---- step 2: confirm
+        if _bl is not None: _bl.append(('ctx+stamp', _tt.perf_counter() - _t0)); _t0 = _tt.perf_counter()
+        # ---- 2. confirm
         w9 = tree.args.get('where')
         def flat(x):
             if isinstance(x, E9.Paren): return flat(x.this)
             if isinstance(x, E9.And): return flat(x.this) + flat(x.expression)
             return [x]
-        for cn in (flat(w9.this) if w9 is not None else []):
-            cols = list(cn.find_all(E9.Column))
-            if len(cols) != 1: return None
-            nm = cols[0].name
-            a9 = own.get(nm)
-            if a9 is None: return None
-            sg = seg_of[a9]
+        def keep_of(cn, sg, nm):
             td = np.asarray(sg._typed_dict(nm))
             V = int(sg.cols[nm]['V'])
             kx = np.zeros(V + 1, bool)
             lit = cn.args.get('expression') if not isinstance(cn, E9.Between) else None
-            def num(e):
-                v = e.name if hasattr(e, 'name') else e
-                return float(str(v))
+            def num(e): return float(str(e.name if hasattr(e, 'name') else e))
             if td.dtype.kind in 'iuf':
                 if   isinstance(cn, E9.GT):  kx[:td.size] = td > num(lit)
                 elif isinstance(cn, E9.GTE): kx[:td.size] = td >= num(lit)
@@ -316,32 +327,64 @@ def _descent_exec(db, tree, meta, s9, k, fseg):
                 elif isinstance(cn, E9.Between):
                     kx[:td.size] = (td >= num(cn.args['low'])) & (td <= num(cn.args['high']))
                 else: return None
+            elif isinstance(cn, E9.EQ) and lit is not None and getattr(lit, 'is_string', False):
+                want = str(lit.name)
+                kx[:td.size] = np.array([(x.decode() if isinstance(x, (bytes, bytearray)) else str(x)) == want
+                                         for x in td])
             else:
-                if isinstance(cn, E9.EQ) and lit is not None and getattr(lit, 'is_string', False):
-                    want = str(lit.name)
-                    kx[:td.size] = np.array([(x.decode() if isinstance(x, (bytes, bytearray)) else str(x)) == want for x in td])
-                else: return None
-            if r.size == 0: break
+                return None
+            return kx
+        fact_cns = []; par_keep = {}
+        for cn in (flat(w9.this) if w9 is not None else []):
+            cols = list(cn.find_all(E9.Column))
+            if len(cols) != 1: return None
+            nm = cols[0].name; a9 = own.get(nm)
+            if a9 is None: return None
+            kx = keep_of(cn, seg_of[a9], nm)
+            if kx is None: return None
             if a9 == fact_a:
-                r = r[kx[np.asarray(fseg.codes_at(nm, r))]]
+                fact_cns.append((nm, kx))
             else:
-                pc = np.asarray(sg.codes(nm))
-                pk = kx[pc]
-                r = r[pk[np.asarray(composed[a9])[r]]]
-        # ---- step 3: sum + top-k + emit
+                m9 = kx[np.asarray(seg_of[a9].codes(nm))]
+                par_keep[a9] = m9 if a9 not in par_keep else (par_keep[a9] & m9)
+        if _bl is not None: _bl.append(('parse-where+parent-keeps', _tt.perf_counter() - _t0)); _t0 = _tt.perf_counter()
+        for nm, kx in fact_cns:                       # fact confirms at survivor scale
+            if r.size == 0: break
+            r = r[kx[np.asarray(fseg.codes_at(nm, r))]]
+        if _bl is not None: _bl.append(('fact-confirm', _tt.perf_counter() - _t0)); _t0 = _tt.perf_counter()
+        # flow parent verdicts DOWN the roads (parent scale), then one fact gather each
+        depth = {fact_a: 0}; ch = True
+        while ch:
+            ch = False
+            for pa, (ca, _p) in road.items():
+                if ca in depth and pa not in depth:
+                    depth[pa] = depth[ca] + 1; ch = True
+        for pa in sorted([a for a in par_keep if a != fact_a], key=lambda a: -depth.get(a, 0)):
+            ca, p9 = road.get(pa, (None, None))
+            if ca is None: return None
+            if ca == fact_a:
+                if r.size:
+                    r = r[par_keep[pa][np.asarray(p9)[r]]]
+            else:
+                m9 = par_keep[pa][np.asarray(p9)]
+                par_keep[ca] = m9 if ca not in par_keep else (par_keep[ca] & m9)
+        # ---- 3. sum + top-k
+        if _bl is not None: _bl.append(('road-flow', _tt.perf_counter() - _t0)); _t0 = _tt.perf_counter()
         group = tree.args.get('group')
+        f2a = {}                                       # fact -> depth-1 alias road, at survivors
         gk = []
         for g9 in group.expressions:
             c9 = g9.find(E9.Column)
             nm = c9.name; a9 = own.get(nm)
             if a9 is None: return None
-            sg = seg_of[a9]
             if a9 == fact_a:
                 cd = np.asarray(fseg.codes_at(nm, r))
             else:
-                cd = np.asarray(sg.codes(nm))[np.asarray(composed[a9])[r]]
-            gk.append((nm, sg, cd))
-        # revenue at survivors
+                ca, p9 = road.get(a9, (None, None))
+                if ca != fact_a: return None
+                if a9 not in f2a: f2a[a9] = np.asarray(p9)[r]
+                cd = np.asarray(seg_of[a9].codes(nm))[f2a[a9]]
+            gk.append((nm, seg_of[a9], cd))
         sexpr = None
         for p in tree.expressions:
             ag = p.find(E9.Sum)
@@ -349,15 +392,20 @@ def _descent_exec(db, tree, meta, s9, k, fseg):
         def ev(e):
             if isinstance(e, E9.Paren): return ev(e.this)
             if isinstance(e, E9.Column):
-                sg = seg_of[own[e.name]]
-                td = np.asarray(sg._typed_dict(e.name), dtype=np.float64)
-                if own[e.name] == fact_a:
-                    return td[np.asarray(fseg.codes_at(e.name, r))]
-                return td[np.asarray(sg.codes(e.name))[np.asarray(composed[own[e.name]])[r]]]
+                a9 = own.get(e.name)
+                if a9 != fact_a: return None
+                td = np.asarray(seg_of[a9]._typed_dict(e.name), dtype=np.float64)
+                return td[np.asarray(fseg.codes_at(e.name, r))]
             if isinstance(e, E9.Literal): return float(str(e.name))
-            if isinstance(e, E9.Mul): return ev(e.this) * ev(e.expression)
-            if isinstance(e, E9.Sub): return ev(e.this) - ev(e.expression)
-            if isinstance(e, E9.Add): return ev(e.this) + ev(e.expression)
+            if isinstance(e, E9.Mul):
+                a, b = ev(e.this), ev(e.expression)
+                return None if a is None or b is None else a * b
+            if isinstance(e, E9.Sub):
+                a, b = ev(e.this), ev(e.expression)
+                return None if a is None or b is None else a - b
+            if isinstance(e, E9.Add):
+                a, b = ev(e.this), ev(e.expression)
+                return None if a is None or b is None else a + b
             return None
         rev = ev(sexpr)
         if rev is None or not gk: return None
@@ -368,49 +416,46 @@ def _descent_exec(db, tree, meta, s9, k, fseg):
         gid, uniq = pd.factorize(comp, sort=False)
         sums = np.zeros(len(uniq)); np.add.at(sums, gid, rev)
         firsts = np.full(len(uniq), -1, np.int64)
-        seen = np.flatnonzero(firsts[gid] == -1)
         for i9 in range(r.size):
             if firsts[gid[i9]] < 0: firsts[gid[i9]] = i9
-        # order: sum desc, then remaining ORDER BY terms among group cols asc
-        ordn = tree.args.get('order')
         keys2 = []
-        for oe in ordn.expressions[1:]:
+        for oe in tree.args.get('order').expressions[1:]:
             nm2 = oe.this.name
-            for j9, (nm, sg, cd) in enumerate(gk):
-                if nm == nm2:
-                    keys2.append(cd[firsts])
-        import numpy.lib.recfunctions as _rf
-        order = np.lexsort(tuple(reversed([-sums] + [k2 for k2 in keys2])))
+            for (nm, sg, cd) in gk:
+                if nm == nm2: keys2.append(cd[firsts])
+        order = np.lexsort(tuple(reversed([-sums] + keys2)))
         top = order[:k]
-        # emit: decode per projection
         rows = []
         for t9i in top:
-            row = []
-            i0 = firsts[t9i]
+            row = []; i0 = firsts[t9i]
             for p in tree.expressions:
                 if p.find(E9.Sum) is not None:
                     row.append(float(sums[t9i])); continue
-                c9 = p.find(E9.Column)
-                nm = c9.name
+                nm = p.find(E9.Column).name
                 for (nmg, sg, cd) in gk:
                     if nmg == nm:
-                        td = sg._typed_dict(nm)
-                        v9 = td[int(cd[i0])]
+                        v9 = sg._typed_dict(nm)[int(cd[i0])]
                         c9m = sg.cols[nm]
                         if c9m.get('dt') == 3:
                             import datetime as _dt
-                            v9 = _dt.date(1970,1,1) + _dt.timedelta(days=int(v9))
+                            v9 = _dt.date(1970, 1, 1) + _dt.timedelta(days=int(v9))
                         elif isinstance(v9, (bytes, bytearray)):
                             v9 = v9.decode()
                         elif c9m.get('dt') == 0 and float(v9) == int(v9):
                             v9 = int(v9)
-                        row.append(v9)
-                        break
+                        row.append(v9); break
                 else:
                     return None
             rows.append(tuple(row))
+        if _bl is not None:
+            _bl.append(('sum+topk+emit', _tt.perf_counter() - _t0))
+            print('JOIN BILL: EXEC ' + ' | '.join('%s=%.0fms' % (n9, v9 * 1000) for n9, v9 in _bl), flush=True)
         return rows, [wdb_sql._alias(p) for p in tree.expressions]
     except Exception:
+        if __import__('os').environ.get('WDB_JOIN_BILL'):
+            import traceback
+            print('JOIN BILL: EXEC declined:', flush=True)
+            traceback.print_exc()
         return None
 
 
