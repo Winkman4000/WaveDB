@@ -1938,11 +1938,42 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     opf = _OPS[{E.GT: E.LT, E.LT: E.GT, E.GTE: E.LTE, E.LTE: E.GTE}[type(node)]]
                 vk = _code_lut(cseg, cpcol, cptr, lambda vb, opf=opf, litb=litb: bool(opf(vb, litb)))
                 return f"({vk} != 0)"
-            v = build_fused(col)
             kind = 'f' if cseg.cols[cpcol]['dt'] == 2 else 'i'
             lv = wdb_sql._lit_for_col(cseg, cpcol, lit, kind)
             if not isinstance(lv, (int, float, np.integer, np.floating)): raise _FastUnsupported
             lv = float(lv) if kind == 'f' else int(lv)
+            # THE BAND COMPARE (Jackson's year law): on an order-isomorphic
+            # dict the comparison runs on CODES against a bound computed
+            # once -- the kernel never loads the dictionary per row.
+            if cseg.cols[cpcol].get('mode') in (1, 2, 4):
+                td9 = np.asarray(cseg._typed_dict(cpcol))
+                if td9.dtype.kind in 'if' and td9.size:
+                    build_fused(col)                      # ensure the slot exists
+                    bkey9 = (id(cseg), cpcol, id(cptr) if cptr is not None else None)
+                    k9 = slots[bkey9]
+                    cv9 = f"c{k9}[p{k9}[i]]" if cptr is not None else f"c{k9}[i]"
+                    V9 = int(cseg.cols[cpcol]['V'])
+                    ty9 = type(node) if left else {E.GT: E.LT, E.LT: E.GT,
+                                                   E.GTE: E.LTE, E.LTE: E.GTE,
+                                                   E.EQ: E.EQ, E.NEQ: E.NEQ}[type(node)]
+                    if ty9 is E.GTE:
+                        b9 = int(np.searchsorted(td9, lv, side='left'))
+                        return f"(({cv9} >= {b9}) and ({cv9} < {V9}))"
+                    if ty9 is E.GT:
+                        b9 = int(np.searchsorted(td9, lv, side='right'))
+                        return f"(({cv9} >= {b9}) and ({cv9} < {V9}))"
+                    if ty9 is E.LT:
+                        b9 = int(np.searchsorted(td9, lv, side='left'))
+                        return f"({cv9} < {b9})"
+                    if ty9 is E.LTE:
+                        b9 = int(np.searchsorted(td9, lv, side='right'))
+                        return f"({cv9} < {b9})"
+                    if ty9 is E.EQ:
+                        b9 = int(np.searchsorted(td9, lv, side='left'))
+                        if b9 < td9.size and td9[b9] == lv:
+                            return f"({cv9} == {b9})"
+                        return "(False)"
+            v = build_fused(col)
             return f"({v} {op} {lv})" if left else f"({lv} {op} {v})"
         if isinstance(node, E.In):
             col = node.this; exprs = node.args.get('expressions') or []
@@ -1969,10 +2000,22 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             if not isinstance(col, E.Column): raise _FastUnsupported
             cseg, cpcol, _c = resolve(col)
             if cseg.cols[cpcol]['dt'] == 1: raise _FastUnsupported
-            v = build_fused(col); kind = 'f' if cseg.cols[cpcol]['dt'] == 2 else 'i'
+            kind = 'f' if cseg.cols[cpcol]['dt'] == 2 else 'i'
             lo = wdb_sql._lit_for_col(cseg, cpcol, node.args['low'], kind)
             hi = wdb_sql._lit_for_col(cseg, cpcol, node.args['high'], kind)
             lo = float(lo) if kind == 'f' else int(lo); hi = float(hi) if kind == 'f' else int(hi)
+            if cseg.cols[cpcol].get('mode') in (1, 2, 4):
+                td9 = np.asarray(cseg._typed_dict(cpcol))
+                if td9.dtype.kind in 'if' and td9.size:
+                    build_fused(col)
+                    _c9b = resolve(col)[2]
+                    bkey9 = (id(cseg), cpcol, id(_c9b) if _c9b is not None else None)
+                    k9 = slots[bkey9]
+                    cv9 = f"c{k9}[p{k9}[i]]" if _c9b is not None else f"c{k9}[i]"
+                    b_lo = int(np.searchsorted(td9, lo, side='left'))
+                    b_hi = int(np.searchsorted(td9, hi, side='right'))
+                    return f"(({cv9} >= {b_lo}) and ({cv9} < {b_hi}))"
+            v = build_fused(col)
             return f"(({lo} <= {v}) and ({v} <= {hi}))"
         raise _FastUnsupported
 
