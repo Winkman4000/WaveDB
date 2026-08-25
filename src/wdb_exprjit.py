@@ -66,12 +66,9 @@ def _build(body, slot_gathered, gk_gathered, nkeys, has_mask, need_minmax):
           "        for i in range(lo, hi):"]
     if has_mask:
         L += ["            if not mask[i]: continue"]
-    _used9 = body + (pred or '')
-    import re as _re9
     for k in range(V):
         idx = f'c{k}[p{k}[i]]' if slot_gathered[k] else f'c{k}[i]'
-        if _re9.search(r'v%d(?!\d)' % k, _used9):
-            L += [f"            v{k} = b{k}[{idx}]"]
+        L += [f"            v{k} = b{k}[{idx}]"]
     if nkeys == 0:
         L += ["            g = 0"]
     else:
