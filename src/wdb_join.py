@@ -2055,11 +2055,10 @@ def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
                 if _js.load(open(side + '.mark')) == mark:
                     ptr9 = np.load(side, mmap_mode='r')
                     if ptr9.shape[0] == cseg.N:
-                        if _os.path.exists(side + '.runs.npz'):
+                        if _os.path.exists(side + '.rseq.npy'):
                             try:
-                                z9 = np.load(side + '.runs.npz')
-                                ptr9._wdb_runs = (np.asarray(z9['seq']),
-                                                  np.asarray(z9['lens']))
+                                ptr9._wdb_runs = (np.load(side + '.rseq.npy', mmap_mode='r'),
+                                                  np.load(side + '.rlen.npy', mmap_mode='r'))
                             except Exception:
                                 pass
                         return ptr9
@@ -2095,8 +2094,10 @@ def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
                     st9 = np.concatenate([[0], b9 + 1])
                     seq9 = ptr[st9].astype(w9, copy=False)
                     ln9 = np.diff(np.concatenate([st9, [ptr.size]])).astype(np.uint32)
-                    np.savez(side + '.runs.tmp.npz', seq=seq9, lens=ln9)
-                    _os.replace(side + '.runs.tmp.npz', side + '.runs.npz')
+                    np.save(side + '.rseq.tmp.npy', seq9)
+                    _os.replace(side + '.rseq.tmp.npy', side + '.rseq.npy')
+                    np.save(side + '.rlen.tmp.npy', ln9)
+                    _os.replace(side + '.rlen.tmp.npy', side + '.rlen.npy')
                 _js.dump(mark, open(side + '.mark', 'w'))
             except Exception:
                 pass
