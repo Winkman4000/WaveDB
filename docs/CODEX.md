@@ -147,3 +147,14 @@ verified only by db.run before/after. FIRST ACT NEXT SESSION: the
 descent executor body becomes the probe code LITERALLY (it exists,
 it measured 230-class); db.run must then print ~230-280 or the
 diff gets billed line by line until it sums. No other work first.
+
+
+## 2026-08-26 LATE: THE NEEDLE MOVED — ENGINE UNDER DUCK
+| step | number |
+|---|---|
+| morning state | 769ms (fallback band, executor silently gated) |
+| THE CENSUS SIDECAR (06b6ac1) | 769 -> 547. code_counts persisted as file facts; PEMDAS scoring 313 -> 15ms. Jackson diagnosed it (metadata evaluation) and split it (facts cached, decisions computed). |
+| EXECUTOR UNBLOCKED | 547 -> 256 EXACT, UNDER DUCK 271. Gate G3: join equalities are ROADS not filters; skipped, edges honor them. All 16 exec gates now confess under the bill flag. |
+EXEC bill: ctx+stamp 47, confirm ~100, roads 20, sum+topk+emit 97.
+Iso floor 230; engine 256; remainder ~26ms = court wrapper + run dispatch.
+STANDING DEBT: boards NOT re-gated today (cancelled by order) — megaboard + tpch MUST gate next session before anything rides further. Running-rule + census + executor all touch every agg join.
