@@ -268,6 +268,8 @@ def _sumslice_meta(db, tbl):
 
 
 def _descent_court(db, tree):
+    def _no9(tag):
+        return None
     """THE DESCENT COURT (Jackson's stamp, given teeth): top-k-by-SUM served
     from the heaviest sum-slices down. Gate: GROUP BY includes the stamp's
     key; ORDER BY <sum alias> DESC with LIMIT k; the summed expression is
@@ -282,30 +284,30 @@ def _descent_court(db, tree):
         group = tree.args.get('group'); lim = tree.args.get('limit')
         ordn = tree.args.get('order')
         if group is None or lim is None or ordn is None or tree.args.get('having') is not None:
-            return None
+            return _no9('shape')
         k = int(lim.expression.name)
         o0 = ordn.expressions[0]
-        if not o0.args.get('desc'): return None
+        if not o0.args.get('desc'): return _no9('not-desc')
         onm = o0.this.name if isinstance(o0.this, E9.Column) else None
-        if onm is None: return None
+        if onm is None: return _no9('order-not-col')
         sum_idx = None; sum_expr = None; aliases = []
         for i, p in enumerate(tree.expressions):
             aliases.append(wdb_sql._alias(p))
             if aliases[-1] == onm:
                 ag = p.find(E9.Sum)
-                if ag is None: return None
+                if ag is None: return _no9('no-sum')
                 sum_idx = i; sum_expr = ag.this
-        if sum_idx is None: return None
+        if sum_idx is None: return _no9('alias-miss')
         cols = list(sum_expr.find_all(E9.Column))
-        if not cols: return None
+        if not cols: return _no9('no-cols')
         tbl = None
         for t9 in (tree.find_all(E9.Table)):
             m9 = _sumslice_meta(db, t9.name)
             if m9 is not None and m9['val'] in {c.name for c in cols}:
                 tbl = t9.name; meta = m9; break
-        if tbl is None: return None
+        if tbl is None: return _no9('no-meta-table')
         seg9 = db.open_segment(db.cat.segment_paths(tbl)[0], tbl)
-        if meta['stamp'] not in db.cat.column_names(tbl): return None
+        if meta['stamp'] not in db.cat.column_names(tbl): return _no9('stamp-not-registered')
         # bound proof: expr is val, or val*(1-c) with c's dict in [0,1]
         val = meta['val']; okb = False
         if isinstance(sum_expr, E9.Column) and sum_expr.name == val:
@@ -324,12 +326,12 @@ def _descent_court(db, tree):
                         if td9.dtype.kind in 'if' and td9.size and 0.0 <= float(td9.min()) and float(td9.max()) <= 1.0:
                             okb = True
                     break
-        if not okb: return None
+        if not okb: return _no9('bound-unproven')
         gnames = set()
         for g9 in group.expressions:
             for c9 in g9.find_all(E9.Column):
                 gnames.add(c9.name)
-        if meta['key'] not in gnames: return None
+        if meta['key'] not in gnames: return _no9('key-not-grouped')
         ceil9 = meta['ceilings']
         _bill9 = __import__('os').environ.get('WDB_JOIN_BILL')
         s9 = 255
@@ -357,6 +359,10 @@ def _descent_court(db, tree):
                 s9 = max(1, max((i for i in range(1, s9) if ceil9[i] >= kth), default=s9 - 1))
         return None
     except _FastUnsupported:
+        if __import__('os').environ.get('WDB_JOIN_BILL'):
+            import traceback
+            print('JOIN BILL: DESCENT declined _FastUnsupported:', flush=True)
+            traceback.print_exc()
         return None
     except Exception:
         if __import__('os').environ.get('WDB_JOIN_BILL'):
@@ -450,6 +456,10 @@ def join_query(db, sql, columnar=False):
     joins = tree.args.get('joins')
     import wdb_sql as _ws
     has_aggs = any(_ws._agg_kind(p) is not None for p in tree.expressions)
+    if has_aggs and not columnar:
+        _dc9j = _descent_court(db, tree.copy())   # pristine: doors below MUTATE the
+        if _dc9j is not None:                     # tree (chain build pops join eqs)
+            return _dc9j
     chain = None
     # FK-pointer fast path: handles 1..N joins as a chain/star of pre-resolved pointers.
     # Building a chain can RESOLVE POINTERS ON THE FLY (an O(N) hash over the fact) -- so
@@ -463,10 +473,6 @@ def join_query(db, sql, columnar=False):
             chain = None
         if chain is not None:
             try:
-                if not columnar:
-                    _dc9j = _descent_court(db, tree)
-                    if _dc9j is not None:
-                        return _dc9j
                 return _fast_pointer_agg(db, tree, chain, columnar)  # fully fused
             except _FastUnsupported:
                 pass
@@ -484,10 +490,6 @@ def join_query(db, sql, columnar=False):
             if __import__('os').environ.get('WDB_JOIN_BILL'):
                 print('JOIN BILL: pre-work(parse+chain)=%.0fms'
                       % ((_t8.perf_counter() - _jq_t0) * 1000), flush=True)
-            if not columnar:
-                _dc9j = _descent_court(db, tree)
-                if _dc9j is not None:
-                    return _dc9j
             return _fast_pointer_agg(db, tree, chain, columnar)  # hashed chain, fused agg
         except _FastUnsupported:
             return _chain_pandas(db, tree, chain)    # same chain, pandas agg/predicate tail
