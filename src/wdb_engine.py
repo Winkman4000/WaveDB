@@ -859,8 +859,27 @@ class Segment:
         cc = getattr(self, '_ccounts', None)
         if cc is None: cc = self._ccounts = {}
         if nm not in cc:
+            # THE CENSUS SIDECAR (Jackson's split: facts cached, decisions
+            # computed). Counts are immutable per-file facts -- persisted
+            # once, mmap'd forever; the PEMDAS consults them in microseconds
+            # instead of re-scanning 60M rows per query to score potency.
+            import os as _os
+            fn = self.path + '.' + nm + '.cnt.npy'
+            try:
+                if _os.path.exists(fn) and _os.path.getmtime(fn) >= _os.path.getmtime(self.path):
+                    v9 = np.load(fn, mmap_mode='r')
+                    if v9.shape[0] == int(self.cols[nm]['V']):
+                        cc[nm] = v9
+                        return cc[nm]
+            except Exception:
+                pass
             codes = self.codes(nm)
             cc[nm] = np.bincount(codes, minlength=self.cols[nm]['V'])
+            try:
+                np.save(fn + '.tmp.npy', np.asarray(cc[nm]))
+                _os.replace(fn + '.tmp.npy', fn)
+            except Exception:
+                pass
         return cc[nm]
     def _override_vals_typed(self, nm):
         eff = self._effective(nm)
