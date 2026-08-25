@@ -135,3 +135,15 @@ sum/topk 20) | duck 271. THE GAP IS THREE DELETIONS, named:
    (59MB mmap, scan 6ms measured at 10.6GB/s)
 Boards cancelled by order this session; next session MUST gate
 (megaboard + tpch) before any further push rides on the court.
+
+
+## THE ISO-FLOOR LAW (Jackson, 2026-08-26 -- binding)
+The isolated cost of a pipeline IS its engine budget. If the steps
+cost 230ms measured alone, the engine serving them above ~230ms is
+DEFECTIVE CODE, not overhead -- there is no legitimate category of
+engine time that performs none of the pipeline steps. Deviation
+from the iso floor is a defect to be deleted, and the deletion is
+verified only by db.run before/after. FIRST ACT NEXT SESSION: the
+descent executor body becomes the probe code LITERALLY (it exists,
+it measured 230-class); db.run must then print ~230-280 or the
+diff gets billed line by line until it sums. No other work first.
