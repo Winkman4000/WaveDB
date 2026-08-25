@@ -158,3 +158,13 @@ diff gets billed line by line until it sums. No other work first.
 EXEC bill: ctx+stamp 47, confirm ~100, roads 20, sum+topk+emit 97.
 Iso floor 230; engine 256; remainder ~26ms = court wrapper + run dispatch.
 STANDING DEBT: boards NOT re-gated today (cancelled by order) — megaboard + tpch MUST gate next session before anything rides further. Running-rule + census + executor all touch every agg join.
+
+
+## BOARDS 2026-08-26 (post census+running-rule+executor) — GATES CLEAN, HISTORY MADE
+MEGABOARD: 103/103, zero wrong, 89 wins, median 3.73x NEW RECORD.
+TPCH: zero wrong, FIRST WINS EVER: Q1 0.36 vs duck 0.39 (1.06x),
+Q3 0.28 vs duck 0.29 (1.03x). Q6 0.24 vs 0.15 next target.
+Baselines: Q3 0.256-0.28 exact | Q1 0.36 | boards clean.
+NEXT DOCKET: Q6 face; the 26ms wrapper; ClickBench fronts (Q30
+enc-13 tenant, Q39 group-stage); TPCH holes (FROM-subquery forge
+first: Q7/Q13/Q22); stamp forges for other fact tables.
