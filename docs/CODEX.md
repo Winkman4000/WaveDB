@@ -187,3 +187,24 @@ had been re-scanning 60M-row censuses per query. Claude attributed
 the win to pod weather without testing; the untested attribution
 was false. LAW REINFORCED: cross-pod deltas get an A/B before any
 ambient claim.
+
+
+## THE FIELD-PLANE DRESS (Jackson's design, 2026-08-27) — MEASURED CONTRACT
+Dates decompose to y/m/d u8 planes (widths MEASURED from range, not
+assumed: 210y fits u8, else u16). Real numbers, l_shipdate 60M:
+planes 16.4+29.0+37.3 = 82.7MB vs enc-3 94.1 (SMALLER — the calendar
+correlation beats the naive 85MB entropy bound); year-plane predicate
+~14ms laned vs 54 today (4x); full-decode CORRECTION found mid-build:
+reconstruction to DICT CODES adds an inverse-LUT gather ~+35 laned
+=> ~75 vs 44 (WORSE) — the probe priced days, not codes.
+THE CORRECT SHAPE: primary consumer = the PLANE-TEST READ METHOD
+(year/month bands served maskless from planes, zero reconstruction);
+codes() reconstruction is the fallback. ELECTION RULE (ratified):
+types NOMINATE candidates (dt==3), measurements SIZE the planes,
+the size election alone ELECTS; structural recognition later as
+cheaper candidate pruning (lossless reconstruction is the only bar).
+BUILD ORDER (one session, gated): enc-14 encoder candidate + reader
+fallback; plane_test read method wired to pred/cascade for
+year-aligned bands; suite+boards; lineitem re-encode last; verdicts
+vs: Q6 278 baseline, year-test 14-vs-54 contract, full-decode
+regression must stay confined to plane-elected columns.
