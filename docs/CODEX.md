@@ -110,3 +110,13 @@ STOP-RULE legality check (descend a slice on failure). Engine
 target 180-250 vs duck 265. Floor probe + numbers above. Gates:
 boards zero-wrong first (logs /tmp/megaboard_v4_6.log,
 /tmp/tpchboard8.log from launched runs).
+
+
+## VERDICTS 2026-08-26 (the descent court session)
+| item | verdict |
+|---|---|
+| THE DESCENT COURT (e3cb45f) | LIVE AND EXACT in db.run: DESCENT slice>=255, kth 415367 > ceil 391935, STOP every run; cascade 60M->1,960; falls to plain path on any mismatch. Root-caused two silent declines on the way: (a) court must consult BEFORE join_query doors (chain build MUTATES the tree, popping join eqs); (b) _FastUnsupported confessions now print under the bill flag. |
+| Q3 stamped | 758ms exact vs plain 699, duck 271, floor 129. The court wins nothing YET because cascade=490 is unexplained at the stamped shape -- the floor proves ~130 is physical. |
+| band scan | TRIED (f2cf454), 758->792, REVERTED. First-pass decode is NOT the 490. |
+| NEXT (single task) | SUB-BILL THE STAMPED CASCADE 490 line by line (balance law) -- stamp pass / codes_at fallthrough at 405K / roads / flatnonzero / qmem re-reads -- THEN strike the named line. Also: court avoids double chain build; assemble 150 dict copies. |
+Boards: megaboard_v4_7 + tpchboard9 grinding as the court gate.
