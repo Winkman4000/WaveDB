@@ -843,8 +843,10 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 key = (id(seg), pcol, id(cptr) if cptr is not None else None)
                 if key not in slot:
                     slot[key] = len(inputs)
-                    inputs.append((np.ascontiguousarray(raw[0]),
-                                   np.ascontiguousarray(_rw9(raw[1]) if cptr is None else raw[1]),
+                    _c9f = (np.asarray(seg.codes_at(pcol, rows9))
+                            if (cptr is None and rows9 is not None) else
+                            (_rw9(raw[1]) if cptr is None else raw[1]))
+                    inputs.append((np.ascontiguousarray(raw[0]), np.ascontiguousarray(_c9f),
                                    None if cptr is None else np.ascontiguousarray(_rw9(cptr))))
                 return f"v{slot[key]}"
             if isinstance(node, E.Literal):
@@ -1263,10 +1265,18 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 if a9 is None: raise _FastUnsupported
                 homes9.setdefault(a9, []).append((kx9, cs9, cp9))
             def _native9(items9):
+                # Within a home, conjuncts CASCADE by potency: the first pays
+                # one sequential pass; every later one reads codes ONLY at
+                # the survivors (codes_at: touched frames decompress, the
+                # rest never open). One byte straight down, then small.
                 m9 = None
                 for kx9, cs9, cp9 in items9:
-                    v9 = kx9[np.asarray(cs9.codes(cp9))]
-                    m9 = v9 if m9 is None else (m9 & v9)
+                    if m9 is None:
+                        m9 = kx9[np.asarray(cs9.codes(cp9))]
+                    else:
+                        r9i = np.flatnonzero(m9)
+                        if r9i.size == 0: return m9
+                        m9[r9i] = kx9[np.asarray(cs9.codes_at(cp9, r9i))]
                 return m9
             from concurrent.futures import ThreadPoolExecutor as _TPE9
             with _TPE9(max_workers=max(1, len(homes9))) as _ex9:
@@ -1326,11 +1336,15 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             gkeys.append({'seg': gseg, 'pcol': gpcol, 'cptr': gcptr, 'full': full,
                           'K': _K, 'labels': _labels})
             continue
-        full = gseg.codes(gpcol)
-        if full.size == 0: return [], [wdb_sql._alias(p) for p in proj]
-        K9full = int(full.max()) + 1
-        if gcptr is None: full = _rw9(full)
-        else: gcptr = _rw9(gcptr)
+        K9full = int(gseg.cols[gpcol]['V'])              # dict-wide, no full read needed
+        if gcptr is None and rows9 is not None:
+            full = np.asarray(gseg.codes_at(gpcol, rows9))   # survivor-scale fetch
+        else:
+            full = gseg.codes(gpcol)
+            if full.size == 0: return [], [wdb_sql._alias(p) for p in proj]
+            if gcptr is None: full = _rw9(full)
+            else: gcptr = _rw9(gcptr)
+        if full.size == 0 and n > 0: return [], [wdb_sql._alias(p) for p in proj]
         gkeys.append({'seg': gseg, 'pcol': gpcol, 'cptr': gcptr, 'full': full, 'K': K9full})
     gid_to_comp = None                                    # set when a high-card composite is hash-factorised
     if len(gkeys) == 0:
@@ -1438,8 +1452,10 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             bkey = (id(bseg), bpcol, id(bcptr) if bcptr is not None else None)
             if bkey not in slots:
                 slots[bkey] = len(slot_list)
-                slot_list.append((np.ascontiguousarray(raw[0]),
-                                  np.ascontiguousarray(_rw9(raw[1]) if bcptr is None else raw[1]),
+                _c9s = (np.asarray(bseg.codes_at(bpcol, rows9))
+                        if (bcptr is None and rows9 is not None) else
+                        (_rw9(raw[1]) if bcptr is None else raw[1]))
+                slot_list.append((np.ascontiguousarray(raw[0]), np.ascontiguousarray(_c9s),
                                   None if bcptr is None else np.ascontiguousarray(_rw9(bcptr))))
             return f"v{slots[bkey]}"
         if isinstance(node, E.Literal):
@@ -1464,7 +1480,10 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         ckey = (id(cseg), cpcol, id(cptr) if cptr is not None else None)
         if ckey not in slots:
             slots[ckey] = len(slot_list)
-            slot_list.append((None, np.ascontiguousarray(_rw9(codes) if cptr is None else codes),
+            _c9t = (np.asarray(cseg.codes_at(cpcol, rows9))
+                    if (cptr is None and rows9 is not None) else
+                    (_rw9(codes) if cptr is None else codes))
+            slot_list.append((None, np.ascontiguousarray(_c9t),
                               None if cptr is None else np.ascontiguousarray(_rw9(cptr))))
         return f"v{slots[ckey]}", nullcode      # NO code_of -- literals resolved via _code_of_literal
     def _code_lut(cseg, cpcol, cptr, fn, mark_null=False):
@@ -1483,7 +1502,10 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         else:
             for vb, cd in code_of.items():
                 if fn(vb): keep[cd] = 1
-        slot_list.append((keep, np.ascontiguousarray(_rw9(codes) if cptr is None else codes),
+        _c9k = (np.asarray(cseg.codes_at(cpcol, rows9))
+                if (cptr is None and rows9 is not None) else
+                (_rw9(codes) if cptr is None else codes))
+        slot_list.append((keep, np.ascontiguousarray(_c9k),
                           None if cptr is None else np.ascontiguousarray(_rw9(cptr))))
         return f"v{len(slot_list) - 1}"
     def _like_fn(cseg, cpcol, pat_node, ci):
@@ -1684,7 +1706,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         op = _group_op()
         if op is None or op[0] != 'd': return None
         gid = np.asarray(op[1], dtype=np.int64)
-        vcodes = _rw9(vseg.codes(vpcol))   # fact-space by this lane's own gate
+        vcodes = (np.asarray(vseg.codes_at(vpcol, rows9)) if rows9 is not None
+                  else vseg.codes(vpcol))   # fact-space by this lane's own gate
         m = get_mask()
         if m is not None: gid = gid[m]; vcodes = vcodes[m]
         # ONE pass: a (groups x value) cell count. Row totals give presence; nonzero non-null
