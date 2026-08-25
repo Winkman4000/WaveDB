@@ -168,3 +168,12 @@ Baselines: Q3 0.256-0.28 exact | Q1 0.36 | boards clean.
 NEXT DOCKET: Q6 face; the 26ms wrapper; ClickBench fronts (Q30
 enc-13 tenant, Q39 group-stage); TPCH holes (FROM-subquery forge
 first: Q7/Q13/Q22); stamp forges for other fact tables.
+
+
+## 2026-08-27: Q6 CAMPAIGN — measured verdicts
+| lever | verdict |
+|---|---|
+| byte/bit planes | LOSES in sim (230/362ms vs 154/80): low planes are noise, unpackbits costly. |
+| cross-column parallel decode | FLAT (+17ms real; -70 projection wrong: each column already runs 8 internal zstd lanes). Reverted. |
+| BAND COMPARES in the jit kernel | 229 -> 245-263, REVERTED. Kernel dicts are L1-resident; b[c[i]] already compare-cheap. THE YEAR LAW LIVES WHERE MASKS MATERIALIZE FULL-WIDTH: the cascade kx[codes] passes (18 vs 70 measured there) — future strike site, not the kernel. |
+Q6 stands 229 vs duck 207 this pod (0.89x). Honest gap ~22ms = decode 151 (dress-bound) + kernel 55 + dispatch.
