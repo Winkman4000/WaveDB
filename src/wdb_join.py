@@ -359,6 +359,10 @@ def _descent_court(db, tree):
     except _FastUnsupported:
         return None
     except Exception:
+        if __import__('os').environ.get('WDB_JOIN_BILL'):
+            import traceback
+            print('JOIN BILL: DESCENT declined:', flush=True)
+            traceback.print_exc()
         return None
 
 
@@ -459,6 +463,10 @@ def join_query(db, sql, columnar=False):
             chain = None
         if chain is not None:
             try:
+                if not columnar:
+                    _dc9j = _descent_court(db, tree)
+                    if _dc9j is not None:
+                        return _dc9j
                 return _fast_pointer_agg(db, tree, chain, columnar)  # fully fused
             except _FastUnsupported:
                 pass
@@ -476,6 +484,10 @@ def join_query(db, sql, columnar=False):
             if __import__('os').environ.get('WDB_JOIN_BILL'):
                 print('JOIN BILL: pre-work(parse+chain)=%.0fms'
                       % ((_t8.perf_counter() - _jq_t0) * 1000), flush=True)
+            if not columnar:
+                _dc9j = _descent_court(db, tree)
+                if _dc9j is not None:
+                    return _dc9j
             return _fast_pointer_agg(db, tree, chain, columnar)  # hashed chain, fused agg
         except _FastUnsupported:
             return _chain_pandas(db, tree, chain)    # same chain, pandas agg/predicate tail
