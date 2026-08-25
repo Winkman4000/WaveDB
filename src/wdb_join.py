@@ -2068,11 +2068,11 @@ def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
         key9 = (side,)
         if key9 in asked or _os.environ.get('WDB_JPTR_EAGER'):
             try:
-                # WIDTH ELECTION (Jackson): a pointer's width is the parent's
-                # size, not int64 by habit -- u16/u32 by law.
-                w9 = (np.uint16 if pseg.N <= 0xFFFF else
-                      np.uint32 if pseg.N <= 0xFFFFFFFF else np.int64)
-                np.save(side + '.tmp.npy', ptr.astype(w9, copy=False))
+                # Width stays intp/int64 BY MEASUREMENT: numpy indexes with
+                # intp, so narrow pointer arrays pay a cast-copy at every
+                # gather (u32 cost Q3 +50ms/query for 240MB disk saved --
+                # the verdict law ruled disk loses).
+                np.save(side + '.tmp.npy', ptr)
                 _os.replace(side + '.tmp.npy', side)
                 _js.dump(mark, open(side + '.mark', 'w'))
             except Exception:
