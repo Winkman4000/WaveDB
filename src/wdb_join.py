@@ -1395,26 +1395,6 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 a9 = seg2alias9.get(id(cs9))
                 if a9 is None: raise _FastUnsupported
                 homes9.setdefault(a9, []).append((kx9, cs9, cp9))
-            def _band_scan9(cs9b, cp9b, kxb):
-                # THE FUSED FIRST PASS (duck's read shape in our dress):
-                # decompress a band -> LUT-test it -> write its mask slice,
-                # THREADED across bands (zstd and the gather both release
-                # the GIL). The 60M column is never materialised.
-                c9b = cs9b.cols[cp9b]
-                N9b = int(cs9b.N)
-                B9 = 1 << 21
-                if c9b.get('code_enc') not in (3, 13) or N9b < (B9 << 1) \
-                        or cp9b in cs9b._codes:
-                    return kxb[np.asarray(cs9b.codes(cp9b))]
-                out9 = np.empty(N9b, bool)
-                nb9 = (N9b + B9 - 1) // B9
-                def _w9(bi9):
-                    lo9 = bi9 * B9; hi9 = min(N9b, lo9 + B9)
-                    out9[lo9:hi9] = kxb[np.asarray(cs9b.codes_band(cp9b, lo9, hi9))]
-                from concurrent.futures import ThreadPoolExecutor as _TP9
-                with _TP9(max_workers=min(nb9, 8)) as _ex9b:
-                    list(_ex9b.map(_w9, range(nb9)))
-                return out9
             def _native9(items9):
                 # Within a home, conjuncts CASCADE by potency: the first pays
                 # one sequential pass; every later one reads codes ONLY at
@@ -1423,7 +1403,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 m9 = None
                 for kx9, cs9, cp9 in items9:
                     if m9 is None:
-                        m9 = _band_scan9(cs9, cp9, kx9)
+                        m9 = kx9[np.asarray(cs9.codes(cp9))]
                     else:
                         r9i = np.flatnonzero(m9)
                         if r9i.size == 0: return m9
