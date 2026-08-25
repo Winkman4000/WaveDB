@@ -92,3 +92,21 @@ Baselines now: Q3 0.832s | Q1 0.503s | both exact.
 | stamp speed, honest | 808 vs plain 699: the stamp own 60M pass (~150-200ms u8 decode) outweighs savings while downstream is already cheap. PAYS WHEN: (a) u8 scan kernelized (~40ms), (b) the DESCENT COURT wired (auto stamp injection + stop rule + slice descent), (c) month-prune shrinks the fine pass. All docketed. |
 Baselines: Q3 0.699 EXACT (record) | Q1 0.503 | stamp aboard lineitem, ceilings in lineitem.sumslice.json, backup lineitem_0.wdb.bak intact.
 NEXT: descent court + stamp-scan kernel + month-prune; boards re-gate first (launched at session end -- read /tmp/megaboard_v4_6.log + /tmp/tpchboard8.log).
+
+
+## THE POTENCY LAW, COMPLETED (Jackson, 2026-08-25)
+The aggregation is always the filter target. A filter has potency
+only while (downstream work saved) > (its own cost) -- prune rate
+alone is meaningless. When the protected work is already cheap,
+NO filter earns a place. Cascade MEMBERSHIP and ORDER both follow.
+Today proofs: 13ms stamp = potent vs an 18ms sum; 150ms stamp
+pass = cargo; run-road repeat = negative potency; marginal-bound
+gate = this law at the cascade gate.
+
+## NEXT SESSION (single task): THE DESCENT COURT
+Wire the measured 129ms floor as the join court lane: stamp scan
+(13) -> confirm at survivors (98) -> survivor sum + top-k (18) ->
+STOP-RULE legality check (descend a slice on failure). Engine
+target 180-250 vs duck 265. Floor probe + numbers above. Gates:
+boards zero-wrong first (logs /tmp/megaboard_v4_6.log,
+/tmp/tpchboard8.log from launched runs).
