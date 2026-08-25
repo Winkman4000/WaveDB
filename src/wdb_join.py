@@ -1296,6 +1296,12 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             for pa9, (ca9, p9) in eps9.items():
                 if ca9 == fact9 and pa9 in keeps9 and keeps9[pa9] is not None                         and depth9.get(pa9) == 1:
                     k9 = keeps9[pa9]
+                    rn9 = getattr(p9, '_wdb_runs', None)
+                    if rn9 is not None and rows9 is None:
+                        # RUN-ROAD: expand parent verdicts across runs --
+                        # one sequential repeat, the pointer never read.
+                        rows9 = np.flatnonzero(np.repeat(k9[rn9[0]], rn9[1]))
+                        continue
                     pt9 = np.asarray(p9)
                     if rows9 is None:
                         rows9 = np.flatnonzero(k9[pt9])
@@ -2049,6 +2055,13 @@ def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
                 if _js.load(open(side + '.mark')) == mark:
                     ptr9 = np.load(side, mmap_mode='r')
                     if ptr9.shape[0] == cseg.N:
+                        if _os.path.exists(side + '.runs.npz'):
+                            try:
+                                z9 = np.load(side + '.runs.npz')
+                                ptr9._wdb_runs = (np.asarray(z9['seq']),
+                                                  np.asarray(z9['lens']))
+                            except Exception:
+                                pass
                         return ptr9
             except Exception:
                 pass
@@ -2068,8 +2081,22 @@ def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
         key9 = (side,)
         if key9 in asked or _os.environ.get('WDB_JPTR_EAGER'):
             try:
-                np.save(side + '.tmp.npy', ptr)
+                # WIDTH ELECTION (Jackson): a pointer's width is the parent's
+                # size, not int64 by habit -- u16/u32 by law.
+                w9 = (np.uint16 if pseg.N <= 0xFFFF else
+                      np.uint32 if pseg.N <= 0xFFFFFFFF else np.int64)
+                np.save(side + '.tmp.npy', ptr.astype(w9, copy=False))
                 _os.replace(side + '.tmp.npy', side)
+                # THE RUN-ROAD FORM: a monotone road is differentiation, not
+                # addresses -- store (parent_seq, run_lengths); readers expand
+                # verdicts with one sequential repeat, zero pointer bytes.
+                if ptr.size and bool((ptr[1:] >= ptr[:-1]).all()):
+                    b9 = np.flatnonzero(ptr[1:] != ptr[:-1])
+                    st9 = np.concatenate([[0], b9 + 1])
+                    seq9 = ptr[st9].astype(w9, copy=False)
+                    ln9 = np.diff(np.concatenate([st9, [ptr.size]])).astype(np.uint32)
+                    np.savez(side + '.runs.tmp.npz', seq=seq9, lens=ln9)
+                    _os.replace(side + '.runs.tmp.npz', side + '.runs.npz')
                 _js.dump(mark, open(side + '.mark', 'w'))
             except Exception:
                 pass
