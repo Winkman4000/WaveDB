@@ -120,3 +120,18 @@ boards zero-wrong first (logs /tmp/megaboard_v4_6.log,
 | band scan | TRIED (f2cf454), 758->792, REVERTED. First-pass decode is NOT the 490. |
 | NEXT (single task) | SUB-BILL THE STAMPED CASCADE 490 line by line (balance law) -- stamp pass / codes_at fallthrough at 405K / roads / flatnonzero / qmem re-reads -- THEN strike the named line. Also: court avoids double chain build; assemble 150 dict copies. |
 Boards: megaboard_v4_7 + tpchboard9 grinding as the court gate.
+
+
+## SESSION CLOSE 2026-08-26
+Jackson pipeline IS the descent executor (exact, gated, fallback
+safe). Numbers: executor 930 | general court 758 | plain 699 |
+LAWFUL FLOOR measured piecewise ~230 (stamp 110 + confirm ~100 +
+sum/topk 20) | duck 271. THE GAP IS THREE DELETIONS, named:
+1. chain rebuild per query (~130) -> cache per (sql-shape, epoch)
+2. shipdate confirm reads FULL column when 405K survivors scatter
+   (~110+) -> confirm cheapest-per-survivor first (parent verdicts
+   via pointer ~free) so shipdate confirms at ~20K not 405K
+3. stamp decode 95 -> scan-class columns elect the RAW dress
+   (59MB mmap, scan 6ms measured at 10.6GB/s)
+Boards cancelled by order this session; next session MUST gate
+(megaboard + tpch) before any further push rides on the court.
