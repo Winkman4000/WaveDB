@@ -56,3 +56,17 @@ after the filter stage. Not a trim.
 3. Kernel on survivors, pred spent. Emit decodes k.
 Gates: suite + megaboard + TPCH board, exactness vs duck, warm-wall
 verdict vs 1.34s written to the table. Projected band: 300-500ms.
+
+
+## NEXT SESSION DOCKET (post home-table-law, Jackson-ratified)
+1. THE RUN-ROAD LAW: monotone pointer roads read as RUNS, not
+   addresses -- the cascade fact pass becomes repeat(verdicts,
+   run_lengths): zero gathers, zero pointer bytes. (~90ms of Q3)
+2. POINTER WIDTH ELECTION: u16/u32 by parent size at sidecar birth
+   (naked int64 = 2-3x bytes); elegant end-state: .jptr as a
+   dressed wdb column under the encoder own elections.
+3. setup 178 + assemble 143 sub-bills; prework 130.
+4. REGRESSION FLAG (standing): Q1 0.44->0.83, Q6 0.31->0.50 vs
+   board v1 -- bill single-table fused_agg BEFORE new blades.
+Baselines: Q3 0.819s (33db9e3) | megaboard 90 wins zero-wrong |
+TPCH zero-wrong, 3 ok, 11 honest holes.
