@@ -1077,20 +1077,6 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     rows9 = None
     _where_spent = False
     _stage0 = _fpa_t0
-    # PARALLEL COLUMN DECODE (the Q6 law): a single-table lane's columns
-    # decompress CONCURRENTLY (zstd releases the GIL); every later read
-    # hits the per-query memo. Measured: 151ms sequential -> ~80.
-    if not tree.args.get('joins'):
-        try:
-            _pfs = ctx['seg_of'][ctx['fact']]
-            _pfc = [nm9 for nm9 in {c9.name for c9 in tree.find_all(E.Column)}
-                    if nm9 in _pfs.cols and nm9 not in _pfs._codes]
-            if len(_pfc) >= 2:
-                from concurrent.futures import ThreadPoolExecutor as _TPF9
-                with _TPF9(max_workers=min(4, len(_pfc))) as _exf9:
-                    list(_exf9.map(lambda nm9: _pfs.codes(nm9), _pfc))
-        except Exception:
-            pass
     proj = tree.expressions
     group = tree.args.get('group')
     has_agg = any(wdb_sql._agg_kind(p) for p in proj)
