@@ -68,5 +68,8 @@ verdict vs 1.34s written to the table. Projected band: 300-500ms.
 3. setup 178 + assemble 143 sub-bills; prework 130.
 4. REGRESSION FLAG (standing): Q1 0.44->0.83, Q6 0.31->0.50 vs
    board v1 -- bill single-table fused_agg BEFORE new blades.
+VERDICT 2026-08-25: Q1 regression CURED 869->503 exact (643f0e3, the
+marginal-bound gate: exact census product decides cascade firing);
+Q3 788 unharmed.
 Baselines: Q3 0.819s (33db9e3) | megaboard 90 wins zero-wrong |
 TPCH zero-wrong, 3 ok, 11 honest holes.
