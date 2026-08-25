@@ -1567,6 +1567,12 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 cost9 = 1.0 if cc9p is None else 6.0
                 plan9.append((prune9 / cost9, prune9, kx9, cs9, cp9, cc9p))
             plan9.sort(key=lambda x: -x[0])
+            # JACKSON'S RUNNING RULE: potency picks WHICH filter is next;
+            # (next filter's cost) < (aggregating the current survivors)
+            # decides WHETHER to filter at all. Leftover conjuncts apply
+            # later AT SURVIVOR SCALE. Constants from measured passes:
+            # seq scan ~2ns/row of N, road gather ~3ns/survivor,
+            # aggregate ~7ns/survivor + 2ms fixed.
             # THE MARGINAL-BOUND GATE: expected survivors, EXACT from the
             # censuses (product of keep fractions), known BEFORE any pass
             # runs. A high-survivor cascade turns cheap sequential reads
@@ -1585,10 +1591,21 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             seg2alias9 = {id(ctx['seg_of'][a9]): a9 for a9 in ctx['seg_of']}
             fact9 = ctx['fact']
             homes9 = {}                                   # alias -> [(kx, seg, pcol)]
-            for _, _pr9, kx9, cs9, cp9, cc9p in plan9:
+            _resid9 = []
+            _n_est9 = float(n)
+            _spent9 = 0
+            for pot9, _pr9, kx9, cs9, cp9, cc9p in plan9:
                 a9 = seg2alias9.get(id(cs9))
                 if a9 is None: raise _FastUnsupported
+                if _spent9 >= 1:
+                    _c_filt = (2e-9 * n) if cc9p is None else (3e-9 * _n_est9)
+                    _c_agg = 7e-9 * _n_est9 + 0.002
+                    if _c_filt >= _c_agg:
+                        _resid9.append((kx9, cs9, cp9, cc9p))
+                        continue
                 homes9.setdefault(a9, []).append((kx9, cs9, cp9))
+                _n_est9 *= (1.0 - _pr9)
+                _spent9 += 1
             def _native9(items9):
                 # Within a home, conjuncts CASCADE by potency: the first pays
                 # one sequential pass; every later one reads codes ONLY at
@@ -1637,6 +1654,13 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     else:
                         rows9 = rows9[k9[pt9[rows9]]]
             if rows9 is None: raise _FastUnsupported
+            for kx9, cs9, cp9, cc9p in _resid9:      # leftovers at survivor scale
+                if rows9.size == 0: break
+                if cc9p is None:
+                    rows9 = rows9[kx9[np.asarray(cs9.codes_at(cp9, rows9))]]
+                else:
+                    pc9r = np.asarray(cs9.codes(cp9))
+                    rows9 = rows9[kx9[pc9r[np.asarray(cc9p)[rows9]]]]
             _where_spent = True
             if _bill9 is not None:
                 _bill9.append(('cascade %d->%d' % (n, rows9.size), _tk9() - _fpa_t0))
