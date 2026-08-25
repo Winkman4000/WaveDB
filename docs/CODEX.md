@@ -73,3 +73,12 @@ marginal-bound gate: exact census product decides cascade firing);
 Q3 788 unharmed.
 Baselines: Q3 0.819s (33db9e3) | megaboard 90 wins zero-wrong |
 TPCH zero-wrong, 3 ok, 11 honest holes.
+
+
+## VERDICTS 2026-08-25 (morning)
+| item | verdict |
+|---|---|
+| Q1 regression | CURED 869->503 exact (643f0e3): THE MARGINAL-BOUND GATE -- expected survivors from exact census product decides cascade firing (fires iff <=50% survive). Q3 unharmed. |
+| run-road law | TRIED 3 FORMS, MEASURED 819 -> 1002/883/1042, REVERTED (e35240a). At Q3 shape the 60M-wide verdict-repeat loses to the 32M survivor-scale gather. Shelved with numbers; revisit only for multi-road low-survivor shapes. |
+| width election | REVERTED (8f0112b): numpy indexes with intp -- narrow pointer arrays pay a cast-copy per gather (+50ms/query for 240MB disk). Index arrays are intp by law. |
+Baselines now: Q3 0.832s | Q1 0.503s | both exact.
