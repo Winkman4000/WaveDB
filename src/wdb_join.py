@@ -276,6 +276,10 @@ def _descent_exec(db, tree, meta, s9, k, fseg):
     roads) is memoised like the plan cache: paths and mmaps, no row data.
     None on any doubt -> the general court serves."""
     import sqlglot.expressions as E9
+    def _gate9(tag):
+        if __import__('os').environ.get('WDB_JOIN_BILL'):
+            print('JOIN BILL: EXEC gate-out %s' % tag, flush=True)
+        return None
     try:
         import os as _os
         memo = db.__dict__.setdefault('_dc_ctx', {})
@@ -326,22 +330,26 @@ def _descent_exec(db, tree, meta, s9, k, fseg):
                 elif isinstance(cn, E9.EQ):  kx[:td.size] = td == num(lit)
                 elif isinstance(cn, E9.Between):
                     kx[:td.size] = (td >= num(cn.args['low'])) & (td <= num(cn.args['high']))
-                else: return None
+                else: return _gate9('G1')
             elif isinstance(cn, E9.EQ) and lit is not None and getattr(lit, 'is_string', False):
                 want = str(lit.name)
                 kx[:td.size] = np.array([(x.decode() if isinstance(x, (bytes, bytearray)) else str(x)) == want
                                          for x in td])
             else:
-                return None
+                return _gate9('G2')
             return kx
         fact_cns = []; par_keep = {}
         for cn in (flat(w9.this) if w9 is not None else []):
             cols = list(cn.find_all(E9.Column))
-            if len(cols) != 1: return None
+            if (isinstance(cn, E9.EQ) and len(cols) == 2
+                    and isinstance(cn.this, E9.Column)
+                    and isinstance(cn.expression, E9.Column)):
+                continue                    # a join road, already honored by the edges
+            if len(cols) != 1: return _gate9('G3')
             nm = cols[0].name; a9 = own.get(nm)
-            if a9 is None: return None
+            if a9 is None: return _gate9('G4')
             kx = keep_of(cn, seg_of[a9], nm)
-            if kx is None: return None
+            if kx is None: return _gate9('G5')
             if a9 == fact_a:
                 fact_cns.append((nm, kx))
             else:
@@ -361,7 +369,7 @@ def _descent_exec(db, tree, meta, s9, k, fseg):
                     depth[pa] = depth[ca] + 1; ch = True
         for pa in sorted([a for a in par_keep if a != fact_a], key=lambda a: -depth.get(a, 0)):
             ca, p9 = road.get(pa, (None, None))
-            if ca is None: return None
+            if ca is None: return _gate9('G6')
             if ca == fact_a:
                 if r.size:
                     r = r[par_keep[pa][np.asarray(p9)[r]]]
@@ -376,12 +384,12 @@ def _descent_exec(db, tree, meta, s9, k, fseg):
         for g9 in group.expressions:
             c9 = g9.find(E9.Column)
             nm = c9.name; a9 = own.get(nm)
-            if a9 is None: return None
+            if a9 is None: return _gate9('G7')
             if a9 == fact_a:
                 cd = np.asarray(fseg.codes_at(nm, r))
             else:
                 ca, p9 = road.get(a9, (None, None))
-                if ca != fact_a: return None
+                if ca != fact_a: return _gate9('G8')
                 if a9 not in f2a: f2a[a9] = np.asarray(p9)[r]
                 cd = np.asarray(seg_of[a9].codes(nm))[f2a[a9]]
             gk.append((nm, seg_of[a9], cd))
@@ -393,22 +401,22 @@ def _descent_exec(db, tree, meta, s9, k, fseg):
             if isinstance(e, E9.Paren): return ev(e.this)
             if isinstance(e, E9.Column):
                 a9 = own.get(e.name)
-                if a9 != fact_a: return None
+                if a9 != fact_a: return _gate9('G9')
                 td = np.asarray(seg_of[a9]._typed_dict(e.name), dtype=np.float64)
                 return td[np.asarray(fseg.codes_at(e.name, r))]
             if isinstance(e, E9.Literal): return float(str(e.name))
             if isinstance(e, E9.Mul):
                 a, b = ev(e.this), ev(e.expression)
-                return None if a is None or b is None else a * b
+                return _gate9('G10') if a is None or b is None else a * b
             if isinstance(e, E9.Sub):
                 a, b = ev(e.this), ev(e.expression)
-                return None if a is None or b is None else a - b
+                return _gate9('G11') if a is None or b is None else a - b
             if isinstance(e, E9.Add):
                 a, b = ev(e.this), ev(e.expression)
-                return None if a is None or b is None else a + b
-            return None
+                return _gate9('G12') if a is None or b is None else a + b
+            return _gate9('G13')
         rev = ev(sexpr)
-        if rev is None or not gk: return None
+        if rev is None or not gk: return _gate9('G14')
         import pandas as pd
         comp = np.zeros(r.size, dtype=np.int64)
         for _, sg, cd in gk:
@@ -445,7 +453,7 @@ def _descent_exec(db, tree, meta, s9, k, fseg):
                             v9 = int(v9)
                         row.append(v9); break
                 else:
-                    return None
+                    return _gate9('G15')
             rows.append(tuple(row))
         if _bl is not None:
             _bl.append(('sum+topk+emit', _tt.perf_counter() - _t0))
@@ -456,7 +464,7 @@ def _descent_exec(db, tree, meta, s9, k, fseg):
             import traceback
             print('JOIN BILL: EXEC declined:', flush=True)
             traceback.print_exc()
-        return None
+        return _gate9('G16')
 
 
 def _descent_court(db, tree):
@@ -1532,6 +1540,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 if isinstance(x, E.And):
                     return _cflat(x.this) + _cflat(x.expression)
                 return [x]
+            _cb9 = [] if _bill9 is not None else None
+            _ct9 = _tk9()
             plan9 = []
             for cn in _cflat(_w9c.this):
                 if cn.find(E.Select) is not None:
@@ -1566,6 +1576,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 prune9 = 1.0 - float(cnt9[kx9[:cnt9.size]].sum()) / t9s if t9s else 0.5
                 cost9 = 1.0 if cc9p is None else 6.0
                 plan9.append((prune9 / cost9, prune9, kx9, cs9, cp9, cc9p))
+            if _cb9 is not None:
+                _cb9.append(('plan-build(metadata+censuses)', _tk9() - _ct9)); _ct9 = _tk9()
             plan9.sort(key=lambda x: -x[0])
             # JACKSON'S RUNNING RULE: potency picks WHICH filter is next;
             # (next filter's cost) < (aggregating the current survivors)
@@ -1624,6 +1636,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             with _TPE9(max_workers=max(1, len(homes9))) as _ex9:
                 futs9 = {a9: _ex9.submit(_native9, its9) for a9, its9 in homes9.items()}
                 keeps9 = {a9: f9.result() for a9, f9 in futs9.items()}
+            if _cb9 is not None:
+                _cb9.append(('parallel-homes(native keeps)', _tk9() - _ct9)); _ct9 = _tk9()
             eps9 = ctx.get('edge_ptrs') or {}
             depth9 = {fact9: 0}
             _ch9 = True
@@ -1654,6 +1668,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     else:
                         rows9 = rows9[k9[pt9[rows9]]]
             if rows9 is None: raise _FastUnsupported
+            if _cb9 is not None:
+                _cb9.append(('roads+fnz', _tk9() - _ct9)); _ct9 = _tk9()
             for kx9, cs9, cp9, cc9p in _resid9:      # leftovers at survivor scale
                 if rows9.size == 0: break
                 if cc9p is None:
@@ -1662,6 +1678,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     pc9r = np.asarray(cs9.codes(cp9))
                     rows9 = rows9[kx9[pc9r[np.asarray(cc9p)[rows9]]]]
             _where_spent = True
+            if _cb9 is not None:
+                _cb9.append(('residual@survivors', _tk9() - _ct9))
+                print('JOIN BILL: CASCADE-SUB ' + ' | '.join('%s=%.0fms' % (n9, v9 * 1000) for n9, v9 in _cb9), flush=True)
             if _bill9 is not None:
                 _bill9.append(('cascade %d->%d' % (n, rows9.size), _tk9() - _fpa_t0))
             n = int(rows9.size)
