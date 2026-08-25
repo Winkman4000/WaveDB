@@ -1077,6 +1077,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     rows9 = None
     _where_spent = False
     _stage0 = _fpa_t0
+    _b1 = _fpa_t0
     proj = tree.expressions
     group = tree.args.get('group')
     has_agg = any(wdb_sql._agg_kind(p) for p in proj)
@@ -2109,7 +2110,12 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         _no_mm = not any(e[1] for e in exprs)
         _rdx = _radix_plan(group_keys, slot_list, exprs, _no_mm, pred_body, _mask)
         if not group_keys and _no_mm:     # no GROUP BY, no MIN/MAX -> lean scalar kernel
+            if _bill9 is not None:
+                print('JOIN BILL: SCALAR pre-kernel=%.0fms' % ((_tk9() - _fpa_t0) * 1000), flush=True)
+                _sk9 = _tk9()
             counts, results = wdb_exprjit.scalar_multi(slot_list, exprs, _mask, n, pred_body)
+            if _bill9 is not None:
+                print('JOIN BILL: SCALAR kernel=%.0fms' % ((_tk9() - _sk9) * 1000), flush=True)
         elif (len(gkeys) == 1 and _cm is not None and gkeys[0]['cptr'] is None and _no_mm
               and rows9 is None
               and _cm.get('key') == gkeys[0]['pcol'] and gkeys[0]['seg'].presence_mask() is None):
