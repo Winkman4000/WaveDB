@@ -242,7 +242,124 @@ def table_agg(db, tree):
             if len(innode.args.get('expressions') or []) > 256:
                 raise _FastUnsupported       # giant literal lists: the pandas tail decodes the
                                              # world; the fallback's code-space isin is the path
+    _dc9 = _descent_court(db, tree)
+    if _dc9 is not None:
+        return _dc9
     return _fast_pointer_agg(db, tree, _build_chain(db, tree))
+
+
+def _sumslice_meta(db, tbl):
+    """Memoised per-table sum-stamp metadata ({key, val, stamp, ceilings}) or None."""
+    memo = getattr(db, '_sumslice_memo', None)
+    if memo is None:
+        memo = db._sumslice_memo = {}
+    if tbl not in memo:
+        import os as _os, json as _js
+        p = _os.path.join(db.cat.dbdir, tbl + '.sumslice.json')
+        m = None
+        if _os.path.exists(p):
+            try:
+                m = _js.load(open(p))
+                m.setdefault('stamp', 'l_sumslice')
+            except Exception:
+                m = None
+        memo[tbl] = m
+    return memo[tbl]
+
+
+def _descent_court(db, tree):
+    """THE DESCENT COURT (Jackson's stamp, given teeth): top-k-by-SUM served
+    from the heaviest sum-slices down. Gate: GROUP BY includes the stamp's
+    key; ORDER BY <sum alias> DESC with LIMIT k; the summed expression is
+    provably bounded by the stamped value column (val itself, or
+    val*(1-c)/(1-c)*val with c's dictionary within [0,1]). Then: run the
+    ordinary court with 'stamp >= s' injected, and STOP when the kth sum
+    STRICTLY exceeds the next slice's stored ceiling -- orders below cannot
+    reach it (filtered sum <= total <= ceiling). Descend a slice otherwise.
+    Any mismatch or doubt returns None: the plain path is always the law."""
+    import sqlglot.expressions as E9
+    try:
+        group = tree.args.get('group'); lim = tree.args.get('limit')
+        ordn = tree.args.get('order')
+        if group is None or lim is None or ordn is None or tree.args.get('having') is not None:
+            return None
+        k = int(lim.expression.name)
+        o0 = ordn.expressions[0]
+        if not o0.args.get('desc'): return None
+        onm = o0.this.name if isinstance(o0.this, E9.Column) else None
+        if onm is None: return None
+        sum_idx = None; sum_expr = None; aliases = []
+        for i, p in enumerate(tree.expressions):
+            aliases.append(wdb_sql._alias(p))
+            if aliases[-1] == onm:
+                ag = p.find(E9.Sum)
+                if ag is None: return None
+                sum_idx = i; sum_expr = ag.this
+        if sum_idx is None: return None
+        cols = list(sum_expr.find_all(E9.Column))
+        if not cols: return None
+        tbl = None
+        for t9 in (tree.find_all(E9.Table)):
+            m9 = _sumslice_meta(db, t9.name)
+            if m9 is not None and m9['val'] in {c.name for c in cols}:
+                tbl = t9.name; meta = m9; break
+        if tbl is None: return None
+        seg9 = db.open_segment(db.cat.segment_paths(tbl)[0], tbl)
+        if meta['stamp'] not in db.cat.column_names(tbl): return None
+        # bound proof: expr is val, or val*(1-c) with c's dict in [0,1]
+        val = meta['val']; okb = False
+        if isinstance(sum_expr, E9.Column) and sum_expr.name == val:
+            okb = True
+        elif isinstance(sum_expr, E9.Mul):
+            a9, b9 = sum_expr.this, sum_expr.expression
+            def unparen(x):
+                return unparen(x.this) if isinstance(x, E9.Paren) else x
+            a9, b9 = unparen(a9), unparen(b9)
+            for u9, v9 in ((a9, b9), (b9, a9)):
+                if isinstance(u9, E9.Column) and u9.name == val and isinstance(v9, E9.Sub):
+                    l9, r9 = v9.this, v9.expression
+                    if (isinstance(l9, E9.Literal) and str(l9.name) == '1'
+                            and isinstance(r9, E9.Column)):
+                        td9 = np.asarray(seg9._typed_dict(r9.name))
+                        if td9.dtype.kind in 'if' and td9.size and 0.0 <= float(td9.min()) and float(td9.max()) <= 1.0:
+                            okb = True
+                    break
+        if not okb: return None
+        gnames = set()
+        for g9 in group.expressions:
+            for c9 in g9.find_all(E9.Column):
+                gnames.add(c9.name)
+        if meta['key'] not in gnames: return None
+        ceil9 = meta['ceilings']
+        _bill9 = __import__('os').environ.get('WDB_JOIN_BILL')
+        s9 = 255
+        for _it in range(6):
+            t2 = tree.copy()
+            w2 = t2.args.get('where')
+            cond9 = E9.GTE(this=E9.column(meta['stamp']),
+                           expression=E9.Literal.number(s9))
+            t2.set('where', E9.Where(this=cond9 if w2 is None
+                                     else E9.And(this=w2.this, expression=cond9)))
+            out = _fast_pointer_agg(db, t2, _build_chain(db, t2))
+            rows, als = out if isinstance(out, tuple) else (out, None)
+            kth = float(rows[k - 1][sum_idx]) if len(rows) >= k else None
+            nxt = max(ceil9[1:s9]) if s9 > 1 else None
+            done = s9 <= 1 or (kth is not None and nxt is not None and kth > nxt)
+            if _bill9:
+                print('JOIN BILL: DESCENT slice>=%d rows=%d kth=%s next-ceil=%s %s'
+                      % (s9, len(rows), kth, nxt, 'STOP' if done else 'DESCEND'),
+                      flush=True)
+            if done:
+                return out
+            if kth is None:
+                s9 -= 1
+            else:
+                s9 = max(1, max((i for i in range(1, s9) if ceil9[i] >= kth), default=s9 - 1))
+        return None
+    except _FastUnsupported:
+        return None
+    except Exception:
+        return None
 
 
 def denorm_rewrite(db, tree):
