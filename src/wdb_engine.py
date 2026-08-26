@@ -127,6 +127,11 @@ class Segment:
             code_enc = int(buf[off]); off += 1; meta['code_enc'] = code_enc   # 0=bitpack, 1=zstd, 2=staircase, 3=blocked
             if code_enc == 0:
                 nb = (self.N*bits+7)//8; meta['cstart'] = off; off += nb
+            elif code_enc == 14:               # FIELD PLANES (Jackson's dress): y/m/d
+                meta['ywidth'] = int(buf[off]); off += 1
+                meta['ybase'] = int(struct.unpack_from('<H', buf, off)[0]); off += 2
+                meta['e14_lens'] = struct.unpack_from('<III', buf, off); off += 12
+                meta['cstart'] = off; meta['czlen'] = int(sum(meta['e14_lens'])); off += meta['czlen']
             elif code_enc == 12:               # vertical planes (the tapes)
                 meta['nwords'] = int(struct.unpack_from('<I', buf, off)[0]); off += 4
                 meta['cstart'] = off; off += bits * meta['nwords'] * 8
@@ -643,6 +648,34 @@ class Segment:
             wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
             cc = np.frombuffer(raw, dtype=wdt)       # native width (was upcast to int64)
             self._codes[nm] = cc; return cc
+        if c.get('code_enc', 0) == 14:               # FIELD PLANES: y/m/d -> civil -> codes
+            base = c['cstart']; ly, lm, ld = c['e14_lens']
+            dz = self._dz
+            Yp = np.frombuffer(dz.decompress(self.buf[base:base + ly].tobytes()),
+                               np.uint8).astype(np.int64) + c['ybase']
+            Mp = np.frombuffer(dz.decompress(self.buf[base + ly:base + ly + lm].tobytes()),
+                               np.uint8).astype(np.int64)
+            Dp = np.frombuffer(dz.decompress(self.buf[base + ly + lm:base + ly + lm + ld].tobytes()),
+                               np.uint8).astype(np.int64)
+            y14 = Yp - (Mp <= 1)                       # Hinnant civil->days, vectorized
+            era = np.where(y14 >= 0, y14, y14 - 399) // 400
+            yoe = y14 - era * 400
+            mp14 = (Mp + 10) % 12
+            doe = yoe * 365 + yoe // 4 - yoe // 100 + (153 * mp14 + 2) // 5 + Dp
+            days14 = era * 146097 + doe - 719468
+            td14 = np.asarray(self._typed_dict(nm)).astype(np.int64)
+            inv_map = getattr(self, '_e14_inv', None)
+            if inv_map is None:
+                inv_map = self._e14_inv = {}
+            dmin14 = int(td14[0])
+            inv14 = inv_map.get(nm)
+            if inv14 is None:
+                inv14 = np.zeros(int(td14[-1]) - dmin14 + 1, dtype=np.uint32)
+                inv14[td14 - dmin14] = np.arange(td14.size, dtype=np.uint32)
+                inv_map[nm] = inv14
+            wdt14 = np.uint8 if c['bits'] <= 8 else (np.uint16 if c['bits'] <= 16 else np.uint32)
+            cc = inv14[days14 - dmin14].astype(wdt14)
+            self._codes[nm] = cc; return cc
         if c.get('code_enc', 0) == 3:                # blocked: decompress every frame, concat
             wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
             cc = np.empty(self.N, dtype=wdt)
@@ -689,6 +722,8 @@ class Segment:
             return self._codes[nm][lo:hi]
         if c.get('code_enc') == 13:
             return self._e13_band(nm, lo, hi)
+        if c.get('code_enc') == 14:
+            return np.asarray(self.codes(nm))[lo:hi]
         wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
         BR = int(c['BR']); base = c['cstart']; bo = c['boffs']
         isz = wdt().itemsize

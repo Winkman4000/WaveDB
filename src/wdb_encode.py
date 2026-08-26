@@ -204,7 +204,7 @@ def _dict_bytes(p, zc):
             out += struct.pack('<I', len(fc)) + struct.pack('<I', len(z)) + z
     return out
 
-def _code_section(codes, bits, enc5_ok=False, nm=None):
+def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
     _fovr = dict((kv.split(':')[0], int(kv.split(':')[1]))
                  for kv in os.environ.get('WDB_FRAME_OVERRIDES', '').split(',') if ':' in kv)
     BLOCK_ROWS = _fovr[nm] if (nm is not None and nm in _fovr)         else globals()['BLOCK_ROWS']             # the passport elects the frame
@@ -436,6 +436,31 @@ def _code_section(codes, bits, enc5_ok=False, nm=None):
                 break                            # up to +10%; else the coarse
         if blocked is not None:
             best = blocked
+    # tag 14 = FIELD PLANES (Jackson's dress): dates decompose to y/m/d u8
+    # planes, each its own zstd stream -- the calendar's internal correlation
+    # compresses BELOW naive entropy (82.7 vs 94.1MB measured on l_shipdate),
+    # and band predicates later read only the fields they constrain. Types
+    # NOMINATE (the caller passes date_vals only for dt==3), measurements
+    # SIZE (year width from the real range), the size election alone ELECTS.
+    if date_vals is not None and codes.size:
+        try:
+            dv = np.asarray(date_vals, dtype=np.int64)[np.asarray(codes, dtype=np.int64)]
+            dt64 = dv.astype('timedelta64[D]') + np.datetime64('1970-01-01')
+            Y14 = dt64.astype('datetime64[Y]').astype(np.int64) + 1970
+            ybase = int(Y14.min())
+            if int(Y14.max()) - ybase <= 255:
+                M14 = (dt64.astype('datetime64[M]').astype(np.int64) % 12).astype(np.uint8)
+                D14 = (dv - dt64.astype('datetime64[M]').astype('datetime64[D]').astype(np.int64)).astype(np.uint8)
+                zc14 = zstd.ZstdCompressor(level=CODE_ZSTD_LEVEL)
+                zy = zc14.compress((Y14 - ybase).astype(np.uint8).tobytes())
+                zm = zc14.compress(M14.tobytes())
+                zd = zc14.compress(D14.tobytes())
+                cand14 = (bytes([14, 1]) + struct.pack('<HIII', ybase, len(zy), len(zm), len(zd))
+                          + zy + zm + zd)
+                if len(cand14) < len(best):
+                    best = cand14
+        except Exception:
+            pass
     # tag 5 = PATCHED BUCKETS (Jackson's format): 4-bit pointers into a 15-entry hot
     # table + escape patches (u16) + per-32K escape offsets. Skewed low-V numeric
     # streams only; adopted when within 25% of the zstd seal. Buys O(1) point reads
@@ -511,7 +536,14 @@ def _serialize_column(p, zc):
     out += _dict_bytes(p, zc)
     out += _code_section(p['codes'], p['bits'],
                          enc5_ok=(p.get('dtype') == 0 and p['mode'] in (0, 1, 2)),
-                         nm=p['nm'])
+                         nm=p['nm'],
+                         date_vals=(p['uniq'] if ((p.get('dtype') == 3
+                                                   or (p.get('dtype') == 0 and p['mode'] in (0, 2)
+                                                       and np.asarray(p['uniq']).size
+                                                       and -25567 <= int(np.asarray(p['uniq'])[0])
+                                                       and int(np.asarray(p['uniq'])[-1]) <= 65700))
+                                                  and not p['has_null']
+                                                  and p['mode'] in (0, 2)) else None))
     normal = bytes(out), (len(out), p['V'], p['bits'], p['dtype'], p['mode'], p['has_null'], p['aux'])
     # mode-5 inline candidate: high-cardinality non-null string -> storing rows inline often beats
     # dict+codes (pointers are dead weight when values rarely repeat). Compute both, keep smaller.

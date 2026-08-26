@@ -87,6 +87,9 @@ def _column_spans(buf):
             nfr = struct.unpack_from('<II', buf, off)[1]; off += 8
             boffs = np.asarray(buf[off:off + (nfr + 1) * 4]).view(np.uint32); off += (nfr + 1) * 4
             off += int(boffs[-1])
+        elif code_enc == 14:                         # field planes: ywidth u8 + ybase u16 + 3x u32 lens + zy+zm+zd
+            off += 1 + 2
+            l14 = struct.unpack_from('<III', buf, off); off += 12 + sum(l14)
         else:
             off += 1  # cwidth
             czlen = struct.unpack_from('<I', buf, off)[0]; off += 4 + czlen
