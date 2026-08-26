@@ -147,7 +147,8 @@ def build_and_write(seg, specs, max_cells=CUBE_MAX_CELLS, workers=1):
         nw = min(workers, len(specs))
         chunks = [specs[i::nw] for i in range(nw)]          # round-robin: mix cube sizes per worker
         cubes = []
-        with cf.ProcessPoolExecutor(max_workers=nw) as ex:
+        import multiprocessing as _mp9
+        with cf.ProcessPoolExecutor(max_workers=nw, mp_context=_mp9.get_context('spawn')) as ex:
             for part in ex.map(_build_specs_worker, [(seg.path, ch, max_cells) for ch in chunks]):
                 cubes.extend(part)
     else:

@@ -452,11 +452,19 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
                 M14 = (dt64.astype('datetime64[M]').astype(np.int64) % 12).astype(np.uint8)
                 D14 = (dv - dt64.astype('datetime64[M]').astype('datetime64[D]').astype(np.int64)).astype(np.uint8)
                 zc14 = zstd.ZstdCompressor(level=CODE_ZSTD_LEVEL)
-                zy = zc14.compress((Y14 - ybase).astype(np.uint8).tobytes())
-                zm = zc14.compress(M14.tobytes())
-                zd = zc14.compress(D14.tobytes())
-                cand14 = (bytes([14, 1]) + struct.pack('<HIII', ybase, len(zy), len(zm), len(zd))
-                          + zy + zm + zd)
+                FR14 = 1 << 23                       # 8M rows/frame: the planes are LANEABLE
+                nfr14 = (codes.size + FR14 - 1) // FR14
+                secs14 = []
+                offs14 = []
+                for pl in ((Y14 - ybase).astype(np.uint8), M14, D14):
+                    frs = [zc14.compress(pl[i:i + FR14].tobytes())
+                           for i in range(0, pl.size, FR14)]
+                    o9 = np.zeros(nfr14 + 1, dtype=np.uint32)
+                    np.cumsum([len(f) for f in frs], out=o9[1:])
+                    offs14.append(o9); secs14.append(b''.join(frs))
+                cand14 = (bytes([14, 1]) + struct.pack('<HII', ybase, FR14, nfr14)
+                          + b''.join(o.tobytes() for o in offs14)
+                          + b''.join(secs14))
                 if len(cand14) < len(best):
                     best = cand14
         except Exception:
@@ -744,7 +752,9 @@ def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_s
                 specs = cubes
             wdb_cube.build_and_write(_seg, specs, workers=workers)
         except Exception:
-            pass
+            if os.environ.get('WDB_ENCODE_VERBOSE'):
+                import traceback, sys as _sy
+                print('CUBE BUILD DIED:', file=_sy.stderr); traceback.print_exc()
     try:
         _birth_differentiator_shelves(out_path)
     except Exception:

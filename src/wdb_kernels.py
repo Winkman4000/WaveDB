@@ -10,6 +10,7 @@ top10_i32: single-pass top-K over a dense int32 count table (the norm lane's per
 Without numba both fall back to numpy (pairwise sorted-merge tournament / argpartition) --
 correct, ~2-4x slower.
 """
+import os as _os_tl; _os_tl.environ.setdefault('NUMBA_THREADING_LAYER', 'workqueue')  # fork-safe: cube builds fork worker pools after kernels have run
 import numpy as np
 
 try:
@@ -2987,3 +2988,24 @@ def pt_census_bucketed(ku, kr, offs, SH, outs, lens):
                     outs[b, w] = kr[i]
                     w += 1
         lens[b] = w
+
+
+@njit(cache=True, parallel=True)
+def e14_reconstruct(Y, M, D, ybase, inv, dmin, out):
+    """FIELD-PLANE reconstruction: y/m/d u8 planes -> epoch days (Hinnant) ->
+    dict codes via the inverse LUT. One parallel pass, no temporaries."""
+    n = Y.shape[0]
+    for i in prange(n):
+        mm = np.int64(M[i])
+        y = np.int64(ybase) + np.int64(Y[i])
+        if mm <= 1:
+            y -= 1
+        if y >= 0:
+            era = y // 400
+        else:
+            era = (y - 399) // 400
+        yoe = y - era * 400
+        mp = (mm + 10) % 12
+        doe = yoe * 365 + yoe // 4 - yoe // 100 + (153 * mp + 2) // 5 + np.int64(D[i])
+        days = era * 146097 + doe - 719468
+        out[i] = inv[days - dmin]

@@ -127,11 +127,19 @@ class Segment:
             code_enc = int(buf[off]); off += 1; meta['code_enc'] = code_enc   # 0=bitpack, 1=zstd, 2=staircase, 3=blocked
             if code_enc == 0:
                 nb = (self.N*bits+7)//8; meta['cstart'] = off; off += nb
-            elif code_enc == 14:               # FIELD PLANES (Jackson's dress): y/m/d
+            elif code_enc == 14:               # FIELD PLANES (Jackson's dress): y/m/d, FRAMED
                 meta['ywidth'] = int(buf[off]); off += 1
                 meta['ybase'] = int(struct.unpack_from('<H', buf, off)[0]); off += 2
-                meta['e14_lens'] = struct.unpack_from('<III', buf, off); off += 12
-                meta['cstart'] = off; meta['czlen'] = int(sum(meta['e14_lens'])); off += meta['czlen']
+                fr14, nfr14 = struct.unpack_from('<II', buf, off); off += 8
+                meta['e14_FR'] = int(fr14); meta['e14_nfr'] = int(nfr14)
+                meta['e14_offs'] = []
+                for _p14 in range(3):
+                    meta['e14_offs'].append(np.frombuffer(buf, dtype=np.uint32,
+                                                          count=nfr14 + 1, offset=off))
+                    off += 4 * (nfr14 + 1)
+                meta['cstart'] = off
+                meta['czlen'] = int(sum(int(o[-1]) for o in meta['e14_offs']))
+                off += meta['czlen']
             elif code_enc == 12:               # vertical planes (the tapes)
                 meta['nwords'] = int(struct.unpack_from('<I', buf, off)[0]); off += 4
                 meta['cstart'] = off; off += bits * meta['nwords'] * 8
@@ -648,21 +656,8 @@ class Segment:
             wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
             cc = np.frombuffer(raw, dtype=wdt)       # native width (was upcast to int64)
             self._codes[nm] = cc; return cc
-        if c.get('code_enc', 0) == 14:               # FIELD PLANES: y/m/d -> civil -> codes
-            base = c['cstart']; ly, lm, ld = c['e14_lens']
-            dz = self._dz
-            Yp = np.frombuffer(dz.decompress(self.buf[base:base + ly].tobytes()),
-                               np.uint8).astype(np.int64) + c['ybase']
-            Mp = np.frombuffer(dz.decompress(self.buf[base + ly:base + ly + lm].tobytes()),
-                               np.uint8).astype(np.int64)
-            Dp = np.frombuffer(dz.decompress(self.buf[base + ly + lm:base + ly + lm + ld].tobytes()),
-                               np.uint8).astype(np.int64)
-            y14 = Yp - (Mp <= 1)                       # Hinnant civil->days, vectorized
-            era = np.where(y14 >= 0, y14, y14 - 399) // 400
-            yoe = y14 - era * 400
-            mp14 = (Mp + 10) % 12
-            doe = yoe * 365 + yoe // 4 - yoe // 100 + (153 * mp14 + 2) // 5 + Dp
-            days14 = era * 146097 + doe - 719468
+        if c.get('code_enc', 0) == 14:               # FIELD PLANES: framed y/m/d -> codes
+            pls = self._e14_planes(nm)
             td14 = np.asarray(self._typed_dict(nm)).astype(np.int64)
             inv_map = getattr(self, '_e14_inv', None)
             if inv_map is None:
@@ -674,7 +669,9 @@ class Segment:
                 inv14[td14 - dmin14] = np.arange(td14.size, dtype=np.uint32)
                 inv_map[nm] = inv14
             wdt14 = np.uint8 if c['bits'] <= 8 else (np.uint16 if c['bits'] <= 16 else np.uint32)
-            cc = inv14[days14 - dmin14].astype(wdt14)
+            cc = np.empty(self.N, dtype=wdt14)
+            import wdb_kernels as _WK14
+            _WK14.e14_reconstruct(pls[0], pls[1], pls[2], c['ybase'], inv14, dmin14, cc)
             self._codes[nm] = cc; return cc
         if c.get('code_enc', 0) == 3:                # blocked: decompress every frame, concat
             wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
@@ -713,6 +710,32 @@ class Segment:
         else:
             cc = self._bitunpack(base, 0, self.N, bits)  # native width
         self._codes[nm] = cc; return cc
+    def _e14_planes(self, nm):
+        """Decompress the three field planes, ALL FRAMES IN PARALLEL (zstd
+        releases the GIL). Returns (Y, M, D) u8 arrays of length N."""
+        c = self.cols[nm]
+        base = c['cstart']; FR = c['e14_FR']; nfr = c['e14_nfr']; offs = c['e14_offs']
+        starts = [base, base + int(offs[0][-1]), base + int(offs[0][-1]) + int(offs[1][-1])]
+        outs = [np.empty(self.N, np.uint8) for _ in range(3)]
+        jobs = []
+        for p9 in range(3):
+            for j9 in range(nfr):
+                jobs.append((p9, j9))
+        def _w14(job):
+            import zstandard as _zs14
+            p9, j9 = job
+            a9 = starts[p9] + int(offs[p9][j9]); b9 = starts[p9] + int(offs[p9][j9 + 1])
+            raw = _zs14.ZstdDecompressor().decompress(self.buf[a9:b9].tobytes())
+            lo9 = j9 * FR
+            outs[p9][lo9:lo9 + len(raw)] = np.frombuffer(raw, np.uint8)
+        if len(jobs) > 1:
+            from concurrent.futures import ThreadPoolExecutor as _TP14
+            with _TP14(max_workers=min(len(jobs), 8)) as ex14:
+                list(ex14.map(_w14, jobs))
+        else:
+            _w14(jobs[0])
+        return outs
+
     def codes_band(self, nm, lo, hi):
         """enc-3 band read: decompress ONLY the frames covering [lo,hi),
         8 zstd lanes, band-relative result, nothing cached -- the range
