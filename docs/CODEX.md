@@ -232,3 +232,15 @@ order ungoverned; codes_at at survivors pays full reconstruct),
 strike the named lines, re-verdict. The organs are general and
 stay; the ELECTION waits for the bill to balance.
 Boards megaboard_v4_8 + tpchboard10 grinding as the code gate.
+
+
+## BOARDS + A/B CLOSE 2026-08-28
+Boards ZERO-WRONG both (megaboard 103/103, 90 wins; tpch 3/14 ok).
+Same-pod same-minute A/B (record code eaea2e3 vs HEAD 005630c):
+Q1 0.39-WIN vs 0.45 = CODE REGRESSION ~+60ms from today's emitter/
+partition changes, line unidentified; Q3 0.32 vs 0.33 and Q6 0.33
+vs 0.35 = POD AMBIENT (proven by A/B, duck drifted equally).
+NEXT SESSION OPENS WITH: bill Q1 under both heads until the 60ms
+names itself (suspects: pred-partition pre-pass per query; emitter
+source changes; mask plumbing). Then the enc-14 remainder bill per
+the standing contract. Crowned data state intact on pod.
