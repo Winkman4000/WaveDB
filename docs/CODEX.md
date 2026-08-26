@@ -208,3 +208,27 @@ fallback; plane_test read method wired to pred/cascade for
 year-aligned bands; suite+boards; lineitem re-encode last; verdicts
 vs: Q6 278 baseline, year-test 14-vs-54 contract, full-decode
 regression must stay confined to plane-elected columns.
+
+
+## 2026-08-27/28: ENC-14 CAMPAIGN — full honest ledger
+BUILT AND BANKED (all suite-green, all pushed): enc-14 framed field
+planes (elections: 3 lineitem dates, -47MB, everything else held);
+reconstruction kernel; THE PLANE-TEST READ (lex calendar band, no
+reconstruction) at both consumers; the YEAR FAST PATH (y-plane
+alone decides year-aligned bands); fork-safe kernels+cube pools;
+retype tag; AND the mask-always fix -- the kernel wrappers DROPPED
+a materialised mask whenever a fused pred existed, a wrongness
+class the suite caught live.
+BUGS KILLED EN ROUTE: thread-shared dctx corruption; fork-after-
+OpenMP pool death; two inherited silent excepts now confess.
+VERDICTS (the law rules): pre-swap Q6 229 / Q3 256-CROWN; with
+enc-14 elected on lineitem: Q6 350 / Q3 314 -- the dress costs the
+flagships more than its 47MB pays AS CONSUMED TODAY. POD DATA
+RESTORED to the crowned state (lineitem_0.wdb.e14v2 kept for A/B).
+STANDING CONTRACT before lineitem re-elects: bill the enc-14
+remainder line by line (per-query plane decompress ~30-50; the
+mask fires full-width OUTSIDE the running rule -- mask-vs-pred
+order ungoverned; codes_at at survivors pays full reconstruct),
+strike the named lines, re-verdict. The organs are general and
+stay; the ELECTION waits for the bill to balance.
+Boards megaboard_v4_8 + tpchboard10 grinding as the code gate.
