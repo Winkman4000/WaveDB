@@ -3022,3 +3022,13 @@ def e14_band_test(Y, M, D, ybase, ylo, mlo, dlo, yhi, mhi, dhi, out):
         ge = (y > ylo) or (y == ylo and (m > mlo or (m == mlo and d >= dlo)))
         lt = (y < yhi) or (y == yhi and (m < mhi or (m == mhi and d < dhi)))
         out[i] = ge and lt
+
+
+@njit(cache=True, parallel=True)
+def e14_year_band(Y, ybase, ylo, yhi, out):
+    """Year-aligned calendar band: the y-plane alone decides."""
+    lo = ylo - ybase; hi = yhi - ybase
+    n = Y.shape[0]
+    for i in prange(n):
+        v = np.int64(Y[i])
+        out[i] = (v >= lo) and (v < hi)

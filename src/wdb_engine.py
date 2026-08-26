@@ -721,18 +721,46 @@ class Segment:
         cache = getattr(self, '_e14_pl', None)
         if cache is None:
             cache = self._e14_pl = {}
-        pls = cache.get(nm)
-        if pls is None:
-            pls = cache[nm] = self._e14_planes(nm)
         c = self.cols[nm]
         e0 = _dt14.date(1970, 1, 1)
         a9 = e0 + _dt14.timedelta(days=int(day_lo))
         b9 = e0 + _dt14.timedelta(days=int(day_hi))
         out = np.empty(self.N, dtype=np.bool_)
         import wdb_kernels as _WK14
+        if (a9.month, a9.day, b9.month, b9.day) == (1, 1, 1, 1):
+            # YEAR-ALIGNED band (Jackson's year law, landed): the y-plane
+            # ALONE decides -- one 16MB plane instead of three, one compare.
+            yp = cache.get((nm, 0))
+            if yp is None:
+                yp = cache[(nm, 0)] = self._e14_plane(nm, 0)
+            _WK14.e14_year_band(yp, c['ybase'], a9.year, b9.year, out)
+            return out
+        pls = cache.get(nm)
+        if pls is None:
+            pls = cache[nm] = self._e14_planes(nm)
         _WK14.e14_band_test(pls[0], pls[1], pls[2], c['ybase'],
                             a9.year, a9.month - 1, a9.day - 1,
                             b9.year, b9.month - 1, b9.day - 1, out)
+        return out
+
+    def _e14_plane(self, nm, p9):
+        """Decompress ONE field plane (0=y, 1=m, 2=d), frames in parallel."""
+        c = self.cols[nm]
+        base = c['cstart']; FR = c['e14_FR']; nfr = c['e14_nfr']; offs = c['e14_offs']
+        starts = [base, base + int(offs[0][-1]), base + int(offs[0][-1]) + int(offs[1][-1])]
+        out = np.empty(self.N, np.uint8)
+        def _w1(j9):
+            import zstandard as _zs14
+            a9 = starts[p9] + int(offs[p9][j9]); b9 = starts[p9] + int(offs[p9][j9 + 1])
+            raw = _zs14.ZstdDecompressor().decompress(self.buf[a9:b9].tobytes())
+            lo9 = j9 * FR
+            out[lo9:lo9 + len(raw)] = np.frombuffer(raw, np.uint8)
+        if nfr > 1:
+            from concurrent.futures import ThreadPoolExecutor as _TP14
+            with _TP14(max_workers=min(nfr, 8)) as ex14:
+                list(ex14.map(_w1, range(nfr)))
+        else:
+            _w1(0)
         return out
 
     def _e14_planes(self, nm):
