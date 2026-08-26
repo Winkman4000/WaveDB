@@ -195,6 +195,8 @@ def _build_multi(bodies, mm_flags, slot_gathered, slot_code, gk_gathered, nkeys,
         # decodes only its own slots, tests, and skips -- a failed cheap
         # test means the expensive gathers behind it are never paid. A
         # plain string keeps the old single-block behavior.
+        if has_mask:
+            L += ["            if not mask[i]: continue"]
         conjs = pred if isinstance(pred, tuple) else (pred,)
         for cj in conjs:
             for k in sorted(set(int(x) for x in re.findall(r'v(\d+)', cj))):
@@ -247,7 +249,7 @@ def grouped_multi(group_keys, inputs, exprs, mask, n, pred=None, mono=False):
     slot_code     = tuple(inp[0] is None for inp in inputs)   # base None -> raw code slot (string equality)
     bodies   = tuple(e[0] for e in exprs)
     mm_flags = tuple(bool(e[1]) for e in exprs)
-    has_mask = mask is not None and not pred          # fused predicate supersedes a materialised mask
+    has_mask = mask is not None                      # mask ALWAYS gates; pred conjuncts follow it
     mono = bool(mono and nkeys == 1 and group_keys[0][2] is None)
     fn = _build_multi(bodies, mm_flags, slot_gathered, slot_code, gk_gathered, nkeys, has_mask, pred or '',
                       mono=mono)
@@ -324,6 +326,8 @@ def _build_scalar(bodies, slot_gathered, slot_code, has_mask, pred):
     if pred:
         for k in pred_slots: L.append(_decode(k, "        "))
         cond = f"({_ps})"
+        if has_mask:
+            cond = f"mask[i] and {cond}"
     elif has_mask:
         cond = "mask[i]"
     ind = "        "
@@ -353,7 +357,7 @@ def scalar_multi(inputs, exprs, mask, n, pred=None):
     slot_gathered = tuple(inp[2] is not None for inp in inputs)
     slot_code     = tuple(inp[0] is None for inp in inputs)
     bodies        = tuple(e[0] for e in exprs)
-    has_mask = mask is not None and not pred
+    has_mask = mask is not None                      # mask ALWAYS gates; pred follows
     fn = _build_scalar(bodies, slot_gathered, slot_code, has_mask, pred or '')
     args = [n]
     for (base, codes, ptr) in inputs:

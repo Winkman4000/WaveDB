@@ -3009,3 +3009,16 @@ def e14_reconstruct(Y, M, D, ybase, inv, dmin, out):
         doe = yoe * 365 + yoe // 4 - yoe // 100 + (153 * mp + 2) // 5 + np.int64(D[i])
         days = era * 146097 + doe - 719468
         out[i] = inv[days - dmin]
+
+
+@njit(cache=True, parallel=True)
+def e14_band_test(Y, M, D, ybase, ylo, mlo, dlo, yhi, mhi, dhi, out):
+    """FIELD-PLANE band test (the plane-test read): keep rows whose calendar
+    tuple sits in [ (ylo,mlo,dlo), (yhi,mhi,dhi) ) -- three u8 compares per
+    row, NO reconstruction, no dictionary, no gather."""
+    n = Y.shape[0]
+    for i in prange(n):
+        y = np.int64(ybase) + np.int64(Y[i]); m = np.int64(M[i]); d = np.int64(D[i])
+        ge = (y > ylo) or (y == ylo and (m > mlo or (m == mlo and d >= dlo)))
+        lt = (y < yhi) or (y == yhi and (m < mhi or (m == mhi and d < dhi)))
+        out[i] = ge and lt

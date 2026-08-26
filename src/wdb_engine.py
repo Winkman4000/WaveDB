@@ -230,6 +230,8 @@ class Segment:
         sidecar loads (presence, override, cluster, cube: they lazy-reload on next touch).
         The memmap stays: it IS the file. cols/order/synth stay: file-shape metadata."""
         self._codes.clear(); self._tdict.clear(); self._resident.clear()
+        _pl9 = getattr(self, '_e14_pl', None)
+        if _pl9 is not None: _pl9.clear()   # planes obey the same forget-law as codes
         for a in ('_eff', '_ccounts'):
             d = getattr(self, a, None)
             if isinstance(d, dict):
@@ -710,6 +712,29 @@ class Segment:
         else:
             cc = self._bitunpack(base, 0, self.N, bits)  # native width
         self._codes[nm] = cc; return cc
+    def plane_test(self, nm, day_lo, day_hi):
+        """THE PLANE-TEST READ (the field-plane dress's primary consumer):
+        a [day_lo, day_hi) date-range mask served straight from the y/m/d
+        planes -- a lexicographic band over calendar tuples. No civil math,
+        no inverse LUT, no code reconstruction. Returns a bool mask of N."""
+        import datetime as _dt14
+        cache = getattr(self, '_e14_pl', None)
+        if cache is None:
+            cache = self._e14_pl = {}
+        pls = cache.get(nm)
+        if pls is None:
+            pls = cache[nm] = self._e14_planes(nm)
+        c = self.cols[nm]
+        e0 = _dt14.date(1970, 1, 1)
+        a9 = e0 + _dt14.timedelta(days=int(day_lo))
+        b9 = e0 + _dt14.timedelta(days=int(day_hi))
+        out = np.empty(self.N, dtype=np.bool_)
+        import wdb_kernels as _WK14
+        _WK14.e14_band_test(pls[0], pls[1], pls[2], c['ybase'],
+                            a9.year, a9.month - 1, a9.day - 1,
+                            b9.year, b9.month - 1, b9.day - 1, out)
+        return out
+
     def _e14_planes(self, nm):
         """Decompress the three field planes, ALL FRAMES IN PARALLEL (zstd
         releases the GIL). Returns (Y, M, D) u8 arrays of length N."""

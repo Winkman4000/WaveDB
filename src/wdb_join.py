@@ -1619,6 +1619,27 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 homes9.setdefault(a9, []).append((kx9, cs9, cp9))
                 _n_est9 *= (1.0 - _pr9)
                 _spent9 += 1
+            def _plane_serve9(cs9p, cp9p, kx9p):
+                # enc-14 columns serve contiguous keep-bands from the PLANES:
+                # kx over a sorted dict is a code band [lo, hi) -> day bounds
+                # from the dict ends -> the lexicographic plane test. Any
+                # non-contiguous keep (or non-14 dress) returns None and the
+                # ordinary reads serve.
+                c9p = cs9p.cols.get(cp9p)
+                if c9p is None or c9p.get('code_enc') != 14:
+                    return None
+                nz9 = np.flatnonzero(kx9p)
+                if nz9.size == 0:
+                    return np.zeros(int(cs9p.N), dtype=bool)
+                lo9, hi9 = int(nz9[0]), int(nz9[-1]) + 1
+                if hi9 - lo9 != nz9.size:
+                    return None                       # holes: not a band
+                td9p = np.asarray(cs9p._typed_dict(cp9p))
+                V9p = int(c9p['V'])
+                if hi9 > V9p: return None
+                dlo9 = int(td9p[lo9])
+                dhi9 = int(td9p[hi9]) if hi9 < V9p else int(td9p[V9p - 1]) + 1
+                return cs9p.plane_test(cp9p, dlo9, dhi9)
             def _native9(items9):
                 # Within a home, conjuncts CASCADE by potency: the first pays
                 # one sequential pass; every later one reads codes ONLY at
@@ -1626,12 +1647,16 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 # rest never open). One byte straight down, then small.
                 m9 = None
                 for kx9, cs9, cp9 in items9:
+                    pm9 = _plane_serve9(cs9, cp9, kx9)
                     if m9 is None:
-                        m9 = kx9[np.asarray(cs9.codes(cp9))]
+                        m9 = pm9 if pm9 is not None else kx9[np.asarray(cs9.codes(cp9))]
                     else:
                         r9i = np.flatnonzero(m9)
                         if r9i.size == 0: return m9
-                        m9[r9i] = kx9[np.asarray(cs9.codes_at(cp9, r9i))]
+                        if pm9 is not None:
+                            m9[r9i] = pm9[r9i]
+                        else:
+                            m9[r9i] = kx9[np.asarray(cs9.codes_at(cp9, r9i))]
                 return m9
             from concurrent.futures import ThreadPoolExecutor as _TPE9
             with _TPE9(max_workers=max(1, len(homes9))) as _ex9:
@@ -1981,6 +2006,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     if _bill9 is not None:
         _bill9.append(('setup(proj+gkeys+resolve)', _b0 - _stage0))
     pred_body = None
+    _plane_mask9 = None
     if where is not None and not _where_spent:
         try:
             # THE POTENCY LAW (Jackson's ratio): conjuncts fire in descending
@@ -2012,12 +2038,61 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     pass
                 return prune / cost
             conj9 = _flat9(where.this)
-            if len(conj9) > 1:
+            # THE PLANE-TEST SERVE (the field-plane dress's primary consumer):
+            # date-range conjuncts on enc-14 fact columns become plane masks
+            # -- three u8 compares per row, no reconstruction -- ANDed into
+            # the kernel's mask; only the residual conjuncts compile to pred.
+            _resid_c9 = []
+            for cn9 in conj9:
+                served9 = None
+                try:
+                    cols9 = list(cn9.find_all(E.Column))
+                    if len(cols9) == 1 and isinstance(cn9, (E.GT, E.GTE, E.LT, E.LTE, E.EQ, E.Between)):
+                        cseg9, cp9x, cptr9x = resolve(cols9[0])
+                        c9x = cseg9.cols.get(cp9x)
+                        if cptr9x is None and c9x is not None and c9x.get('code_enc') == 14:
+                            td9x = np.asarray(cseg9._typed_dict(cp9x))
+                            dmin9x = int(td9x[0]); dmax9x = int(td9x[-1])
+                            kind9x = 'f' if c9x['dt'] == 2 else 'i'
+                            if isinstance(cn9, E.Between):
+                                lo9x = int(wdb_sql._lit_for_col(cseg9, cp9x, cn9.args['low'], kind9x))
+                                hi9x = int(wdb_sql._lit_for_col(cseg9, cp9x, cn9.args['high'], kind9x)) + 1
+                            else:
+                                left9x = isinstance(cn9.this, E.Column)
+                                lit9x = cn9.args.get('expression') if left9x else cn9.this
+                                v9x = int(wdb_sql._lit_for_col(cseg9, cp9x, lit9x, kind9x))
+                                t9x = type(cn9) if left9x else {E.GT: E.LT, E.LT: E.GT,
+                                                                E.GTE: E.LTE, E.LTE: E.GTE,
+                                                                E.EQ: E.EQ}[type(cn9)]
+                                if t9x is E.GTE: lo9x, hi9x = v9x, dmax9x + 1
+                                elif t9x is E.GT: lo9x, hi9x = v9x + 1, dmax9x + 1
+                                elif t9x is E.LT: lo9x, hi9x = dmin9x, v9x
+                                elif t9x is E.LTE: lo9x, hi9x = dmin9x, v9x + 1
+                                else: lo9x, hi9x = v9x, v9x + 1
+                            if lo9x < dmin9x: lo9x = dmin9x
+                            if hi9x > dmax9x + 1: hi9x = dmax9x + 1
+                            if lo9x >= hi9x:
+                                served9 = np.zeros(int(cseg9.N), dtype=bool)
+                            else:
+                                served9 = cseg9.plane_test(cp9x, lo9x, hi9x)
+                except _FastUnsupported:
+                    served9 = None
+                except Exception:
+                    served9 = None
+                if served9 is None:
+                    _resid_c9.append(cn9)
+                else:
+                    _plane_mask9 = served9 if _plane_mask9 is None else (_plane_mask9 & served9)
+            if _plane_mask9 is not None:
+                conj9 = _resid_c9
+            if _plane_mask9 is not None and not conj9:
+                pred_body = None
+            elif len(conj9) > 1:
                 scored9 = [(_potency9(cn), build_pred(cn)) for cn in conj9]
                 scored9.sort(key=lambda x: -x[0])
                 pred_body = tuple(p for _, p in scored9)   # ordered conjuncts: the law rides to the codegen
             else:
-                pred_body = build_pred(where.this)
+                pred_body = build_pred(conj9[0])
         except _FastUnsupported:
             pred_body = None; slots.clear(); slot_list.clear()   # discard any partial predicate slots
 
@@ -2106,6 +2181,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 if body not in ex_index: ex_index[body] = len(exprs); exprs.append([body, False])
                 if fn in ('MIN', 'MAX'): exprs[ex_index[body]][1] = True
         _mask = None if (pred_body or _where_spent) else get_mask()
+        if _plane_mask9 is not None and not _where_spent:
+            _mask = _plane_mask9 if _mask is None else (_mask & _plane_mask9)
         _cm = gkeys[0]['seg'].cluster_meta() if len(gkeys) == 1 else None
         _no_mm = not any(e[1] for e in exprs)
         _rdx = _radix_plan(group_keys, slot_list, exprs, _no_mm, pred_body, _mask)
