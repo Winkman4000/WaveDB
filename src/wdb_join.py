@@ -2042,7 +2042,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             # date-range conjuncts on enc-14 fact columns become plane masks
             # -- three u8 compares per row, no reconstruction -- ANDed into
             # the kernel's mask; only the residual conjuncts compile to pred.
+            _pp_t9 = _tk9()
             _resid_c9 = []
+            _pl_iv9 = {}
             for cn9 in conj9:
                 served9 = None
                 try:
@@ -2071,18 +2073,27 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                                 else: lo9x, hi9x = v9x, v9x + 1
                             if lo9x < dmin9x: lo9x = dmin9x
                             if hi9x > dmax9x + 1: hi9x = dmax9x + 1
-                            if lo9x >= hi9x:
-                                served9 = np.zeros(int(cseg9.N), dtype=bool)
+                            k9iv = (id(cseg9), cp9x)
+                            if k9iv in _pl_iv9:
+                                s9o, l9o, h9o = _pl_iv9[k9iv]
+                                _pl_iv9[k9iv] = (s9o, max(l9o, lo9x), min(h9o, hi9x))
                             else:
-                                served9 = cseg9.plane_test(cp9x, lo9x, hi9x)
+                                _pl_iv9[k9iv] = (cseg9, lo9x, hi9x)
+                            served9 = True                 # interval banked; tested fused below
                 except _FastUnsupported:
                     served9 = None
                 except Exception:
                     served9 = None
                 if served9 is None:
                     _resid_c9.append(cn9)
+            for (_sg9, _cp9), (cseg9f, lo9f, hi9f) in list(_pl_iv9.items()):
+                if lo9f >= hi9f:
+                    m9f = np.zeros(int(cseg9f.N), dtype=bool)
                 else:
-                    _plane_mask9 = served9 if _plane_mask9 is None else (_plane_mask9 & served9)
+                    m9f = cseg9f.plane_test(_cp9, lo9f, hi9f)
+                _plane_mask9 = m9f if _plane_mask9 is None else (_plane_mask9 & m9f)
+            if _bill9 is not None:
+                print('JOIN BILL: PARTITION pre-pass=%.1fms' % ((_tk9() - _pp_t9) * 1000), flush=True)
             if _plane_mask9 is not None:
                 conj9 = _resid_c9
             if _plane_mask9 is not None and not conj9:
@@ -2180,7 +2191,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             if fn in ('SUM', 'AVG', 'MIN', 'MAX'):
                 if body not in ex_index: ex_index[body] = len(exprs); exprs.append([body, False])
                 if fn in ('MIN', 'MAX'): exprs[ex_index[body]][1] = True
-        _mask = None if (pred_body or _where_spent) else get_mask()
+        _mask = None if (pred_body or _where_spent
+                         or _plane_mask9 is not None) else get_mask()
         if _plane_mask9 is not None and not _where_spent:
             _mask = _plane_mask9 if _mask is None else (_mask & _plane_mask9)
         _cm = gkeys[0]['seg'].cluster_meta() if len(gkeys) == 1 else None

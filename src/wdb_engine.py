@@ -659,6 +659,8 @@ class Segment:
             cc = np.frombuffer(raw, dtype=wdt)       # native width (was upcast to int64)
             self._codes[nm] = cc; return cc
         if c.get('code_enc', 0) == 14:               # FIELD PLANES: framed y/m/d -> codes
+            if __import__('os').environ.get('WDB_JOIN_BILL'):
+                print('JOIN BILL: E14 FULL RECONSTRUCT fired: %s' % nm, flush=True)
             pls = self._e14_planes(nm)
             td14 = np.asarray(self._typed_dict(nm)).astype(np.int64)
             inv_map = getattr(self, '_e14_inv', None)
@@ -722,6 +724,8 @@ class Segment:
         if cache is None:
             cache = self._e14_pl = {}
         c = self.cols[nm]
+        if __import__('os').environ.get('WDB_JOIN_BILL'):
+            print('JOIN BILL: PLANE-TEST %s [%d,%d)' % (nm, day_lo, day_hi), flush=True)
         e0 = _dt14.date(1970, 1, 1)
         a9 = e0 + _dt14.timedelta(days=int(day_lo))
         b9 = e0 + _dt14.timedelta(days=int(day_hi))
