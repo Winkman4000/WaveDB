@@ -661,7 +661,6 @@ class Segment:
         if c.get('code_enc', 0) == 14:               # FIELD PLANES: framed y/m/d -> codes
             if __import__('os').environ.get('WDB_JOIN_BILL'):
                 print('JOIN BILL: E14 FULL RECONSTRUCT fired: %s' % nm, flush=True)
-            pls = self._e14_planes(nm)
             td14 = np.asarray(self._typed_dict(nm)).astype(np.int64)
             inv_map = getattr(self, '_e14_inv', None)
             if inv_map is None:
@@ -675,7 +674,26 @@ class Segment:
             wdt14 = np.uint8 if c['bits'] <= 8 else (np.uint16 if c['bits'] <= 16 else np.uint32)
             cc = np.empty(self.N, dtype=wdt14)
             import wdb_kernels as _WK14
-            _WK14.e14_reconstruct(pls[0], pls[1], pls[2], c['ybase'], inv14, dmin14, cc)
+            base14 = c['cstart']; FR14 = c['e14_FR']; nfr14 = c['e14_nfr']; offs14 = c['e14_offs']
+            st14 = [base14,
+                    base14 + int(offs14[0][-1]),
+                    base14 + int(offs14[0][-1]) + int(offs14[1][-1])]
+            def _wr14(j9):
+                import zstandard as _zs14
+                dz9 = _zs14.ZstdDecompressor()
+                pls9 = []
+                for p9 in range(3):
+                    a9 = st14[p9] + int(offs14[p9][j9]); b9 = st14[p9] + int(offs14[p9][j9 + 1])
+                    pls9.append(np.frombuffer(dz9.decompress(self.buf[a9:b9].tobytes()), np.uint8))
+                l9 = j9 * FR14
+                _WK14.e14_reconstruct_chunk(pls9[0], pls9[1], pls9[2], c['ybase'],
+                                            inv14, dmin14, cc[l9:l9 + pls9[0].size])
+            if nfr14 > 1:
+                from concurrent.futures import ThreadPoolExecutor as _TPr
+                with _TPr(max_workers=min(nfr14, 8)) as exr:
+                    list(exr.map(_wr14, range(nfr14)))
+            else:
+                _wr14(0)
             self._codes[nm] = cc; return cc
         if c.get('code_enc', 0) == 3:                # blocked: decompress every frame, concat
             wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]

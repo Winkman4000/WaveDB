@@ -3032,3 +3032,26 @@ def e14_year_band(Y, ybase, ylo, yhi, out):
     for i in prange(n):
         v = np.int64(Y[i])
         out[i] = (v >= lo) and (v < hi)
+
+
+@njit(cache=True, nogil=True)
+def e14_reconstruct_chunk(Y, M, D, ybase, inv, dmin, out):
+    """FIELD-PLANE reconstruction, ONE CHUNK, nogil: called from t frame
+    workers so the whole decode runs with t sets of eyes end-to-end --
+    decompress-then-reconstruct per chunk, cache-hot, no barrier, no
+    materialised planes (Jackson's shape)."""
+    n = Y.shape[0]
+    for i in range(n):
+        mm = np.int64(M[i])
+        y = np.int64(ybase) + np.int64(Y[i])
+        if mm <= 1:
+            y -= 1
+        if y >= 0:
+            era = y // 400
+        else:
+            era = (y - 399) // 400
+        yoe = y - era * 400
+        mp = (mm + 10) % 12
+        doe = yoe * 365 + yoe // 4 - yoe // 100 + (153 * mp + 2) // 5 + np.int64(D[i])
+        days = era * 146097 + doe - 719468
+        out[i] = inv[days - dmin]
