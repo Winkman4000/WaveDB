@@ -732,12 +732,31 @@ class Segment:
         out = np.empty(self.N, dtype=np.bool_)
         import wdb_kernels as _WK14
         if (a9.month, a9.day, b9.month, b9.day) == (1, 1, 1, 1):
-            # YEAR-ALIGNED band (Jackson's year law, landed): the y-plane
-            # ALONE decides -- one 16MB plane instead of three, one compare.
-            yp = cache.get((nm, 0))
-            if yp is None:
-                yp = cache[(nm, 0)] = self._e14_plane(nm, 0)
-            _WK14.e14_year_band(yp, c['ybase'], a9.year, b9.year, out)
+            # YEAR-ALIGNED band, FUSED (Jackson's shape): each frame worker
+            # tests its chunk THE MOMENT it decompresses it -- bytes hot in
+            # that core's cache, no full-plane round-trip through RAM, one
+            # pool doing both jobs. The plane never materialises.
+            lo14 = max(0, a9.year - c['ybase'])
+            hi14 = min(256, b9.year - c['ybase'])
+            if hi14 <= lo14:
+                out[:] = False; return out
+            if lo14 == 0 and hi14 == 256:
+                out[:] = True; return out
+            base = c['cstart']; FR = c['e14_FR']; nfr = c['e14_nfr']; offs = c['e14_offs']
+            def _wy(j9):
+                import zstandard as _zs14
+                a1 = base + int(offs[0][j9]); b1 = base + int(offs[0][j9 + 1])
+                raw = np.frombuffer(_zs14.ZstdDecompressor().decompress(
+                    self.buf[a1:b1].tobytes()), np.uint8)
+                l1 = j9 * FR
+                np.less(raw - np.uint8(lo14), np.uint8(hi14 - lo14),
+                        out=out[l1:l1 + raw.size])      # unsigned trick: lo<=v<hi
+            if nfr > 1:
+                from concurrent.futures import ThreadPoolExecutor as _TPy
+                with _TPy(max_workers=min(nfr, 8)) as exy:
+                    list(exy.map(_wy, range(nfr)))
+            else:
+                _wy(0)
             return out
         pls = cache.get(nm)
         if pls is None:
