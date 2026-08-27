@@ -264,3 +264,15 @@ protocol); (3) mask delivery fusion (60M bool round-trip, the
 architecture question); (4) ELECTION RE-VERDICT + boards before
 lineitem re-elects; (5) pod noise now exceeds strike sizes --
 repeat-median protocol required for further Q6 verdicts.
+
+
+## Q1 CROWN RECOVERED (2026-08-28, 4712f6d)
+The +60-100ms code regression = THE WORKQUEUE TAX: the fork-safe
+numba layer taxed EVERY prange kernel (kernel, comp, keys), which
+is why it smeared across stages. Repealed; fork safety kept at the
+source (cube + prewarm pools on spawn; regexgroup COW fork keeps
+its graceful fallback). Alternating drift-proof A/B: REC 431/458
+vs HEAD 358/425 -- Q1 1.04-1.16x, BEATS DUCK AND THE RECORD.
+Same-day scoreboard: Q6 0.87x in the field-plane dress (its best
+ever), Q1 crowned again. LAW LEARNED: environment-level knobs are
+engine-wide taxes -- price them on a flagship before adoption.
