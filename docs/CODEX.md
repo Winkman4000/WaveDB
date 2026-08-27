@@ -244,3 +244,23 @@ NEXT SESSION OPENS WITH: bill Q1 under both heads until the 60ms
 names itself (suspects: pred-partition pre-pass per query; emitter
 source changes; mask plumbing). Then the enc-14 remainder bill per
 the standing contract. Crowned data state intact on pod.
+
+
+## 2026-08-28 LATE: THE DOUBLE-SCAN DAY (Jackson's session)
+Jackson's shot in the dark, caught in the act by door instruments:
+a fully-plane-served WHERE re-evaluated itself via get_mask (full
+column reconstruction to re-answer an answered question) AND twin
+half-bands on one column each paid 3-plane tests instead of fusing
+into their year-aligned interval. Both killed (f637604): Q6 planes
+426->321, Q1 planes 789->555. SAME-MINUTE TRIANGLE: Q6 enc-3 331 /
+enc-14 273 / duck 231 -- THE DRESS NOW WINS ITS ORIGIN QUERY by
+58ms same-metal (~0.87x vs duck; ~185ms-equivalent on the 207-duck
+day). Fused year mask (test-at-decompress, Jackson's shape,
+4428c76): flat within today's +/-35ms pod noise, kept for shape.
+STANDING: (1) serve governance -- census-gate the plane serve
+(Q1's 98%-keep mask costs 58 for nothing; -15 residue); (2) Q1's
+code-only +100 (A/B-proven, stage-smeared, needs alternating-min
+protocol); (3) mask delivery fusion (60M bool round-trip, the
+architecture question); (4) ELECTION RE-VERDICT + boards before
+lineitem re-elects; (5) pod noise now exceeds strike sizes --
+repeat-median protocol required for further Q6 verdicts.
