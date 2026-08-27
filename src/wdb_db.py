@@ -212,10 +212,12 @@ class Database:
 
         if workers and int(workers) > 1:
             from concurrent.futures import ProcessPoolExecutor
+            import multiprocessing as _mp_pw
             cargs = [(self.cat.dbdir, tt, p, c, None) for (tt, p, c) in col_tasks]
             args = [(self.cat.dbdir, tt, p, a, b) for (tt, p, a, b) in tasks]
             sargs = [(self.cat.dbdir, tt, p, c, '') for (tt, p, c) in stat_tasks]
-            with ProcessPoolExecutor(max_workers=int(workers)) as ex:
+            with ProcessPoolExecutor(max_workers=int(workers),
+                                      mp_context=_mp_pw.get_context('spawn')) as ex:
                 for (tt, p, c), (v, _z, _dt) in zip(col_tasks, ex.map(_prewarm_worker, cargs, chunksize=1)):
                     colnd[(p, c)] = int(v)
                 import wdb_blockstats

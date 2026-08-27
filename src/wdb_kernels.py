@@ -10,7 +10,6 @@ top10_i32: single-pass top-K over a dense int32 count table (the norm lane's per
 Without numba both fall back to numpy (pairwise sorted-merge tournament / argpartition) --
 correct, ~2-4x slower.
 """
-import os as _os_tl; _os_tl.environ.setdefault('NUMBA_THREADING_LAYER', 'workqueue')  # fork-safe: cube builds fork worker pools after kernels have run
 import numpy as np
 
 try:
