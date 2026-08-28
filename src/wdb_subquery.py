@@ -139,20 +139,25 @@ def _road_codes(db, tree, node, rows):
             return None
         seg9 = db.open_segment(db.cat.segment_paths(ot)[0], ot)
         c9 = seg9.cols.get(oc.name)
-        if c9 is None or c9.get('mode') not in (0, 2) or c9.get('dt') not in (0, 2, 3) \
-                or c9.get('has_null'):
+        if c9 is None or c9.get('dt') not in (0, 2, 3) or c9.get('has_null'):
             return None
         td9 = np.asarray(seg9._typed_dict(oc.name))
         if td9.dtype.kind not in 'if' or not rows:
             return None
+        if td9.size > 1 and not bool(np.all(td9[1:] >= td9[:-1])):
+            return None                          # property, not mode: sorted dicts only
         vals9 = np.asarray(rows, dtype=td9.dtype).ravel()
         idx9 = np.searchsorted(td9, vals9)
         ok9 = (idx9 < td9.size)
         ok9 &= (td9[np.minimum(idx9, td9.size - 1)] == vals9)
         return np.unique(idx9[ok9]).astype(np.int64)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as e9:
+        if __import__('os').environ.get('WDB_JOIN_BILL'):
+            print('ROAD-CODES declined (val):', str(e9)[:60], flush=True)
         return None
-    except Exception:
+    except Exception as e9:
+        if __import__('os').environ.get('WDB_JOIN_BILL'):
+            import traceback; traceback.print_exc()
         return None
 
 
