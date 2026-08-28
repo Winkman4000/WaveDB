@@ -123,6 +123,82 @@ def has_subquery(tree):
             or any(True for _ in w.find_all(E.Exists)))
 
 
+def _exists_road(db, tree, inner, icol, ocol, rest):
+    """EXISTS over an FK road, executed as arrays: evaluate the residual
+    child predicate with numpy (Column-vs-Column and Column-vs-literal
+    conjuncts over typed dict values), scatter through the road sidecar,
+    return unique qualifying OUTER codes. None on any shape doubt."""
+    try:
+        tc, _al = _inner_tables(inner)
+        if tc is None:
+            return None
+        segp = db.cat.segment_paths(tc)[0]
+        segc = db.open_segment(segp, tc)
+        ptr = db.fk_pointer(segp, icol)
+        if ptr is None:
+            return None
+        ot = None
+        for t9 in tree.find_all(E.Table):
+            if t9.name != tc and ocol in db.cat.column_names(t9.name):
+                ot = t9.name
+                break
+        if ot is None:
+            return None
+        sego = db.open_segment(db.cat.segment_paths(ot)[0], ot)
+        def vals_of(colname):
+            c9 = segc.cols.get(colname)
+            if c9 is None or c9.get('has_null') or c9.get('dt') not in (0, 2, 3):
+                return None
+            td9 = np.asarray(segc._typed_dict(colname))
+            if td9.dtype.kind not in 'if':
+                return None
+            return td9[np.asarray(segc.codes(colname))]
+        m9 = None
+        import wdb_sql as _ws9
+        for cn in rest:
+            cols = list(cn.find_all(E.Column))
+            t9n = type(cn).__name__
+            if t9n not in ('EQ', 'NEQ', 'GT', 'GTE', 'LT', 'LTE'):
+                return None
+            if len(cols) == 2 and isinstance(cn.this, E.Column) and isinstance(cn.expression, E.Column):
+                a9, b9 = vals_of(cn.this.name), vals_of(cn.expression.name)
+                if a9 is None or b9 is None:
+                    return None
+            elif len(cols) == 1:
+                a9 = vals_of(cols[0].name)
+                if a9 is None:
+                    return None
+                lit9 = cn.expression if isinstance(cn.this, E.Column) else cn.this
+                kind9 = 'f' if segc.cols[cols[0].name]['dt'] == 2 else 'i'
+                b9 = _ws9._lit_for_col(segc, cols[0].name, lit9, kind9)
+                if not isinstance(b9, (int, float, np.integer, np.floating)):
+                    return None
+                if not isinstance(cn.this, E.Column):
+                    t9n = {'GT': 'LT', 'LT': 'GT', 'GTE': 'LTE', 'LTE': 'GTE',
+                           'EQ': 'EQ', 'NEQ': 'NEQ'}[t9n]
+            else:
+                return None
+            op9 = {'EQ': np.equal, 'NEQ': np.not_equal, 'GT': np.greater,
+                   'GTE': np.greater_equal, 'LT': np.less, 'LTE': np.less_equal}[t9n]
+            c9m = op9(a9, b9)
+            m9 = c9m if m9 is None else (m9 & c9m)
+        if m9 is None:
+            m9 = np.ones(int(segc.N), dtype=bool)
+        prow9 = np.unique(np.asarray(ptr)[np.flatnonzero(m9)])
+        co9 = sego.cols.get(ocol)
+        if co9 is None:
+            return None
+        if co9.get('mode') == 4:
+            return prow9.astype(np.int64)         # positional: rows ARE codes
+        oc9 = np.asarray(sego.codes(ocol))
+        return np.unique(oc9[prow9]).astype(np.int64)
+    except Exception:
+        if __import__('os').environ.get('WDB_JOIN_BILL'):
+            import traceback
+            traceback.print_exc()
+        return None
+
+
 def _road_codes(db, tree, node, rows):
     """Different-column IN in code space: inner VALUES -> outer dict codes.
     Numeric sorted outer dicts only; any None value falls back to the
@@ -317,6 +393,14 @@ def rewrite(db, tree):
         else:
             sub.set('where', None)
         in_node = E.In(this=E.column(ocol), query=E.Subquery(this=sub))
+        rd9 = _exists_road(db, tree, inner, icol, ocol, rest)
+        if rd9 is not None:
+            # THE SCATTER FORM (Jackson's Q4 walk): child residual mask in
+            # arrays -> road sidecar -> unique PARENT ROWS -> the _codes
+            # sentinel directly. No SQL execution of the inner, no values,
+            # no rows -- and a mode-4 outer key means parent rows ARE codes.
+            in_node.set('_codes', rd9)
+            in_node.set('expressions', [E.Subquery(this=sub)])
         in_node.set('_exists_rewrite', True)   # NOT EXISTS drops inner NULLs; it does NOT
                                                # inherit NOT IN's null-poisoning rule
         negated = isinstance(ex.parent, E.Not)
