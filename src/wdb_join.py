@@ -358,6 +358,18 @@ def _descent_exec(db, tree, meta, s9, k, fseg):
         if _bl is not None: _bl.append(('parse-where+parent-keeps', _tt.perf_counter() - _t0)); _t0 = _tt.perf_counter()
         for nm, kx in fact_cns:                       # fact confirms at survivor scale
             if r.size == 0: break
+            c14c = fseg.cols.get(nm)
+            if c14c is not None and c14c.get('code_enc') == 14:
+                nz14 = np.flatnonzero(kx)
+                if nz14.size and int(nz14[-1]) + 1 - int(nz14[0]) == nz14.size:
+                    lo14c, hi14c = int(nz14[0]), int(nz14[-1]) + 1
+                    td14c = np.asarray(fseg._typed_dict(nm))
+                    V14c = int(c14c['V'])
+                    if hi14c <= V14c:
+                        dl14 = int(td14c[lo14c])
+                        dh14 = int(td14c[hi14c]) if hi14c < V14c else int(td14c[V14c - 1]) + 1
+                        r = r[fseg.plane_test(nm, dl14, dh14)[r]]
+                        continue
             r = r[kx[np.asarray(fseg.codes_at(nm, r))]]
         if _bl is not None: _bl.append(('fact-confirm', _tt.perf_counter() - _t0)); _t0 = _tt.perf_counter()
         # flow parent verdicts DOWN the roads (parent scale), then one fact gather each
