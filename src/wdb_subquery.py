@@ -12,6 +12,7 @@ standard. IN ignores NULLs in the inner result; NOT IN with any inner NULL yield
 (three-valued logic's famous trap). Correlated subqueries decline loudly for now -- the inner
 run's unknown-column error is itself the detector.
 """
+import numpy as np
 import sqlglot.expressions as E
 
 _MAX_IN = 2_000_000
@@ -126,30 +127,26 @@ def _road_codes(db, tree, node, rows):
     """Different-column IN in code space: inner VALUES -> outer dict codes.
     Numeric sorted outer dicts only; any None value falls back to the
     legacy path. Returns unique code array or None."""
-    def _no_rc(t9):
-        if __import__('os').environ.get('WDB_JOIN_BILL'):
-            print('ROAD-CODES gate-out %s' % t9, flush=True)
-        return None
     try:
         oc = node.this
         if not isinstance(oc, E.Column):
-            return _no_rc('G1')
+            return None
         ot = None
         for t9 in tree.find_all(E.Table):
             if oc.name in db.cat.column_names(t9.name):
                 ot = t9.name
                 break
         if ot is None:
-            return _no_rc('G2')
+            return None
         seg9 = db.open_segment(db.cat.segment_paths(ot)[0], ot)
         c9 = seg9.cols.get(oc.name)
         if c9 is None or c9.get('dt') not in (0, 2, 3) or c9.get('has_null'):
-            return _no_rc('G3')
+            return None
         td9 = np.asarray(seg9._typed_dict(oc.name))
         if td9.dtype.kind not in 'if' or not rows:
-            return _no_rc('G4')
+            return None
         if td9.size > 1 and not bool(np.all(td9[1:] >= td9[:-1])):
-            return _no_rc('G5')                          # property, not mode: sorted dicts only
+            return None                          # property, not mode: sorted dicts only
         vals9 = np.asarray(rows, dtype=td9.dtype).ravel()
         idx9 = np.searchsorted(td9, vals9)
         ok9 = (idx9 < td9.size)
@@ -158,11 +155,11 @@ def _road_codes(db, tree, node, rows):
     except (TypeError, ValueError) as e9:
         if __import__('os').environ.get('WDB_JOIN_BILL'):
             print('ROAD-CODES declined (val):', str(e9)[:60], flush=True)
-        return _no_rc('G6')
+        return None
     except Exception as e9:
         if __import__('os').environ.get('WDB_JOIN_BILL'):
             import traceback; traceback.print_exc()
-        return _no_rc('G7')
+        return None
 
 
 def _run_inner(db, sub):
