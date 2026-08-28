@@ -158,7 +158,15 @@ def _inner_tables(sel):
     return f.this.name, (f.this.alias or f.this.name)
 
 
-def _corr_eq(sel, outer_names):
+def _inner_colset(db, sel):
+    try:
+        _tn, _al = _inner_tables(sel)
+        return set(db.cat.column_names(_tn)) if _tn else None
+    except Exception:
+        return None
+
+
+def _corr_eq(sel, outer_names, inner_cols=None):
     """Split the inner WHERE into (the single outer-eq correlation, remaining conjuncts).
     Returns (inner_col, outer_col, rest) or None."""
     import wdb_wherescan as WS
@@ -172,7 +180,12 @@ def _corr_eq(sel, outer_names):
     # a 'hits.'-qualified column refers to the OUTER query's hits
     inner_quals = {alias} if alias != _tn else {_tn}
     def is_outer(x):
-        return bool(x.table) and x.table not in inner_quals
+        # Qualified: outer iff the qualifier isn't the inner table/alias.
+        # Unqualified (the TPC-H idiom): SQL binds innermost-first, so a bare
+        # name is outer exactly when the INNER table doesn't own it.
+        if x.table:
+            return x.table not in inner_quals
+        return inner_cols is not None and x.name not in inner_cols
     corr, rest = None, []
     for c in WS._conjuncts(w.this):
         cols = list(c.find_all(E.Column))
@@ -219,7 +232,7 @@ def _try_window_decorrelate(db, tree):
     ak = wdb_sql._agg_kind(inner.expressions[0])
     if ak is None or ak[0] not in ('SUM', 'AVG', 'MIN', 'MAX', 'COUNT_STAR'):
         return None
-    ce = _corr_eq(inner, None)
+    ce = _corr_eq(inner, None, _inner_colset(db, inner))
     if ce is None or ce[2]:
         return None                              # v1: pure eq-correlation, no extra conds
     icol, ocol = ce[0], ce[1]
@@ -250,7 +263,7 @@ def rewrite(db, tree):
     # EXISTS with an equality correlation -> semi-join as IN; NOT EXISTS -> null-safe NOT IN
     for ex in list(w.find_all(E.Exists)):
         inner = ex.this
-        ce = _corr_eq(inner, None)
+        ce = _corr_eq(inner, None, _inner_colset(db, inner))
         if ce is None:
             raise NotImplementedError("EXISTS without a single eq-correlation")
         icol, ocol, rest = ce
