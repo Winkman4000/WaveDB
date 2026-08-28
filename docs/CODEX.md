@@ -276,3 +276,12 @@ vs HEAD 358/425 -- Q1 1.04-1.16x, BEATS DUCK AND THE RECORD.
 Same-day scoreboard: Q6 0.87x in the field-plane dress (its best
 ever), Q1 crowned again. LAW LEARNED: environment-level knobs are
 engine-wide taxes -- price them on a flagship before adoption.
+
+
+## THE ELECTION BANKED 2026-08-29
+Median protocol (5 boards per arm, zero wrong on all 10): PLANES
+0.98/1.00/0.77 vs ENC-3 0.95/0.94/0.69 on Q1/Q3/Q6 -- the dress
+wins or ties every face, -47MB disk. lineitem WEARS THE FIELD
+PLANES PERMANENTLY (enc-3 retired to .enc3 backup). Jackson's
+y/m/d design, elected by the rule he ratified: types nominate,
+measurements size, the election elects.
