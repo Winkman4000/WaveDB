@@ -122,6 +122,40 @@ def has_subquery(tree):
             or any(True for _ in w.find_all(E.Exists)))
 
 
+def _road_codes(db, tree, node, rows):
+    """Different-column IN in code space: inner VALUES -> outer dict codes.
+    Numeric sorted outer dicts only; any None value falls back to the
+    legacy path. Returns unique code array or None."""
+    try:
+        oc = node.this
+        if not isinstance(oc, E.Column):
+            return None
+        ot = None
+        for t9 in tree.find_all(E.Table):
+            if oc.name in db.cat.column_names(t9.name):
+                ot = t9.name
+                break
+        if ot is None:
+            return None
+        seg9 = db.open_segment(db.cat.segment_paths(ot)[0], ot)
+        c9 = seg9.cols.get(oc.name)
+        if c9 is None or c9.get('mode') not in (0, 2) or c9.get('dt') not in (0, 2, 3) \
+                or c9.get('has_null'):
+            return None
+        td9 = np.asarray(seg9._typed_dict(oc.name))
+        if td9.dtype.kind not in 'if' or not rows:
+            return None
+        vals9 = np.asarray(rows, dtype=td9.dtype).ravel()
+        idx9 = np.searchsorted(td9, vals9)
+        ok9 = (idx9 < td9.size)
+        ok9 &= (td9[np.minimum(idx9, td9.size - 1)] == vals9)
+        return np.unique(idx9[ok9]).astype(np.int64)
+    except (TypeError, ValueError):
+        return None
+    except Exception:
+        return None
+
+
 def _run_inner(db, sub):
     inner = sub.this
     tn, alias = _inner_tables(inner)
@@ -316,6 +350,22 @@ def rewrite(db, tree):
         rows = _run_inner(db, sub)
         if rows and len(rows[0]) != 1:
             raise ValueError("IN subquery must return one column")
+        # THE ROAD FORM (Jackson's Q4 walk, array space end to end): a
+        # different-column IN resolves to the OUTER column's dict CODES --
+        # searchsorted into the outer dict, unique, then the same _codes
+        # sentinel the same-column path uses. No value lists, no cap: the
+        # downstream LUT is V+1 bools however many million values matched.
+        rc9 = _road_codes(db, tree, node, rows)
+        if rc9 is not None:
+            codes9 = rc9
+            negated = isinstance(node.parent, E.Not)
+            if codes9.size == 0:
+                (node.parent if negated else node).replace(
+                    E.true() if negated else E.false())
+                continue
+            node.set('_codes', codes9)
+            node.set('expressions', [sub])
+            continue
         vals = [r[0] for r in rows]
         has_null = any(v is None for v in vals)
         vals = list(dict.fromkeys(v for v in vals if v is not None))
