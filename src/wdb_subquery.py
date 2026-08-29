@@ -414,6 +414,8 @@ def rewrite(db, tree):
         sub = node.args.get('query')
         if sub is None:
             continue
+        if node.args.get('_codes') is not None:
+            continue                              # the scatter form already answered
         inner = sub.this
         if (isinstance(inner, E.Select) and not inner.args.get('distinct')
                 and not inner.args.get('group') and not inner.args.get('limit')
