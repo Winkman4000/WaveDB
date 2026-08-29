@@ -303,3 +303,26 @@ reconstruct + 1GB of value gathers -> ~450 est); quarter-first
 pruning through the road (Jackson's original order) -> ~duck.
 STANDING: boards re-gate (subquery machinery touched); Q22 next
 on this matcher + the FROM-door; holes now 10.
+
+
+## ENC-15 THE CLOCK DRESS: FORGED, CORRECT, ELECTION DEFERRED (2026-08-29 late)
+Jackson designed the dial live: date pair = anchor(min planes) +
+arm separation(u8 delta) + one orientation bit. Probe: 3-way sizing
+beat enc-14 by 14pc on commit+receipt; sorted-pair LOST (pigeonhole
+honored). Forged whole: pair nomination by measured property, size
+election vs BOTH standalone sections, tag-15 anchor + tag-16 stub,
+either column reconstructs its own codes (nogil t-eyes), no-FD fast
+path two-phased so cross-column elections can see. THE ELECTION
+OUT-DESIGNED US: it paired ship+receipt (delta 1-30d, tightest) not
+commit+receipt -- the law measuring better than intuition. Result:
+file 1,075->1,034.6MB (-40.6), ALL EXACT (Q4 1,427 in-dress), suite
+1692/0 -- but crowns taxed (Q6 0.50x, Q3 0.88x) because plane_test/
+year-path/exec-confirm gate ==14 and shipdate now wears 15. BY THE
+VERDICT LAW: NOT BANKED; pod restored to crowned e14; .e15 file
+kept for re-verdict. NEXT-SESSION FORGE, shaped exactly: plane_test
+-15 (shipdate = anchor + delta*(1-bit): band test = one fused pass
+over 5 planes; year path rides the anchor) -> the clock keeps its
+-40MB AND the crowns. Same debt enc-14 paid in one session.
+ALSO THIS SESSION: Q4 hole->face (14,570 -> 1,413, Jackson walk),
+elections banked for enc-14 by medians, Q3 crown retaken dressed,
+serve governance + Q1 +100 hunt closed (workqueue tax repealed).
