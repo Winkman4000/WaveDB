@@ -128,28 +128,15 @@ def _exists_road(db, tree, inner, icol, ocol, rest, outer_where=None, ex_node=No
     child predicate with numpy (Column-vs-Column and Column-vs-literal
     conjuncts over typed dict values), scatter through the road sidecar,
     return unique qualifying OUTER codes. None on any shape doubt."""
+    import time as _tt9, os as _os9
+    _b9 = (lambda t0, tag: print('EXISTS-ROAD: %-18s %6.1fms' % (tag, (_tt9.perf_counter() - t0) * 1000), flush=True)) if _os9.environ.get('WDB_JOIN_BILL') else (lambda t0, tag: None)
     try:
+        _t9 = _tt9.perf_counter()
         tc, _al = _inner_tables(inner)
         if tc is None:
             return None
         segp = db.cat.segment_paths(tc)[0]
         segc = db.open_segment(segp, tc)
-        ptr = db.fk_pointer(segp, icol)
-        if ptr is None:
-            ot0 = None
-            for t9 in tree.find_all(E.Table):
-                if t9.name != tc and ocol in db.cat.column_names(t9.name):
-                    ot0 = t9.name
-                    break
-            if ot0 is None:
-                return None
-            try:
-                db.create_fk_pointer(tc, icol, ot0, ocol)   # the road births on first ask
-            except Exception:
-                return None
-            ptr = db.fk_pointer(segp, icol)
-            if ptr is None:
-                return None
         ot = None
         for t9 in tree.find_all(E.Table):
             if t9.name != tc and ocol in db.cat.column_names(t9.name):
@@ -158,6 +145,17 @@ def _exists_road(db, tree, inner, icol, ocol, rest, outer_where=None, ex_node=No
         if ot is None:
             return None
         sego = db.open_segment(db.cat.segment_paths(ot)[0], ot)
+        import wdb_join as _wj9                    # lazy: avoids import cycles
+        ptr = _wj9._hash_pointer(db, tc, icol, segc, ot, ocol, sego)
+        if ptr is None:
+            try:
+                db.create_fk_pointer(tc, icol, ot, ocol)
+                ptr = db.fk_pointer(segp, icol)
+            except Exception:
+                ptr = None
+            if ptr is None:
+                return None
+        _b9(_t9, 'setup+ptr'); _t9 = _tt9.perf_counter()
         def vals_of(colname):
             c9 = segc.cols.get(colname)
             if c9 is None or c9.get('has_null') or c9.get('dt') not in (0, 2, 3):
@@ -201,9 +199,15 @@ def _exists_road(db, tree, inner, icol, ocol, rest, outer_where=None, ex_node=No
                     t9o = {'GT': 'LT', 'LT': 'GT', 'GTE': 'LTE', 'LTE': 'GTE', 'EQ': 'EQ'}[t9o]
                 op9o = {'EQ': np.equal, 'GT': np.greater, 'GTE': np.greater_equal,
                         'LT': np.less, 'LTE': np.less_equal}[t9o]
-                vv9 = tdo9[np.asarray(sego.codes(ocols9[0].name))]
+                _vvc9 = locals().get('_vv_cache9')
+                if _vvc9 is None:
+                    _vv_cache9 = _vvc9 = {}
+                vv9 = _vvc9.get(ocols9[0].name)
+                if vv9 is None:
+                    vv9 = _vvc9[ocols9[0].name] = tdo9[np.asarray(sego.codes(ocols9[0].name))]
                 mo9 = op9o(vv9, v9o)
                 okeep9 = mo9 if okeep9 is None else (okeep9 & mo9)
+                _b9(_t9, 'okeep-conjunct'); _t9 = _tt9.perf_counter()
         for cn in rest:
             cols = list(cn.find_all(E.Column))
             t9n = type(cn).__name__
@@ -219,6 +223,7 @@ def _exists_road(db, tree, inner, icol, ocol, rest, outer_where=None, ex_node=No
                     # THE BIT ANSWERS (the declared pair's whole purpose):
                     # bit means anchor <= partner; delta==0 means equal.
                     bit9, dl9 = segc.pair_bits(nl9)
+                    _b9(_t9, 'pair_bits'); _t9 = _tt9.perf_counter()
                     lf9 = (cl9.get('code_enc') == 15)   # left is the anchor?
                     t9x = t9n if lf9 else {'GT': 'LT', 'LT': 'GT', 'GTE': 'LTE',
                                            'LTE': 'GTE', 'EQ': 'EQ', 'NEQ': 'NEQ'}[t9n]
@@ -255,15 +260,20 @@ def _exists_road(db, tree, inner, icol, ocol, rest, outer_where=None, ex_node=No
             m9 = np.ones(int(segc.N), dtype=bool)
         if m9 is None:
             m9 = np.ones(int(segc.N), dtype=bool)
+        _b9(_t9, 'child-mask-AND'); _t9 = _tt9.perf_counter()
         if okeep9 is not None:
             m9 &= okeep9[np.asarray(ptr)]         # quarter-first: only lines of
+            _b9(_t9, 'okeep[ptr]-gate'); _t9 = _tt9.perf_counter()
         yes9 = np.zeros(int(sego.N), dtype=bool)  # surviving parents scatter
         yes9[np.asarray(ptr)[m9]] = True          # idempotent scatter: no sort, no unique
+        _b9(_t9, 'scatter'); _t9 = _tt9.perf_counter()
         co9 = sego.cols.get(ocol)
         if co9 is None:
             return None
         if co9.get('mode') == 4:
-            return np.flatnonzero(yes9).astype(np.int64)   # positional: rows ARE codes
+            r9f = np.flatnonzero(yes9).astype(np.int64)
+            _b9(_t9, 'codes-out')
+            return r9f
         oc9 = np.asarray(sego.codes(ocol))
         kx9 = np.zeros(int(co9['V']) + 1, dtype=bool)
         kx9[oc9[yes9]] = True
