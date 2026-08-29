@@ -342,3 +342,18 @@ NEXT SESSION OPENS HERE: that kernel (e15_band_lex_chunk), then
 verdict trio, then the median election protocol for the clock.
 Pod .132:11381 holds lineitem_0.wdb(=e14, crowned), .e15, .enc3.
 Then: Q22 on the widened matcher; Q12/Q14/Q10 guard bugs; boards.
+
+
+## THE DECLARED CLOCK BANKS (2026-08-29 night)
+Jackson ruled: clock pairs are OPERATOR-DECLARED (semantics are
+workload knowledge; the engine never guesses) -- date_pairs on
+encode, physical property verified, fails loud. Declared commit+
+receipt on lineitem: ship KEEPS planes by construction, crowns
+verified IN the new file (Q6 199ms 0.96x BEST EVER, Q3 298ms 1.01x
+crown held), Q4 1,515 exact, file 1,054.4MB (-20.9 vs e14). Median
+protocol still gates the formal election; trio is unambiguous.
+NEXT OPENERS: (1) Q4/Q12 bit consumer -- the scatter evaluator
+answers commit<receipt by READING THE BIT (est. Q4 ~350-450);
+(2) median protocol to formalize; (3) Q22 on the widened matcher;
+(4) guard bugs Q12/Q14/Q10. Pod .132:11381: lineitem_0.wdb =
+DECLARED CLOCK (live), .e14, .e15 (auto-pair), .enc3 backups.
