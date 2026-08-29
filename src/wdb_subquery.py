@@ -136,7 +136,20 @@ def _exists_road(db, tree, inner, icol, ocol, rest):
         segc = db.open_segment(segp, tc)
         ptr = db.fk_pointer(segp, icol)
         if ptr is None:
-            return None
+            ot0 = None
+            for t9 in tree.find_all(E.Table):
+                if t9.name != tc and ocol in db.cat.column_names(t9.name):
+                    ot0 = t9.name
+                    break
+            if ot0 is None:
+                return None
+            try:
+                db.create_fk_pointer(tc, icol, ot0, ocol)   # the road births on first ask
+            except Exception:
+                return None
+            ptr = db.fk_pointer(segp, icol)
+            if ptr is None:
+                return None
         ot = None
         for t9 in tree.find_all(E.Table):
             if t9.name != tc and ocol in db.cat.column_names(t9.name):
