@@ -883,7 +883,8 @@ def _mask(df, node, R):
     if isinstance(node, (E.Like, E.ILike)):            # LIKE that didn't fuse (e.g. high-card column)
         s = df[R(node.this)].astype('string')
         rx = '^' + re.escape(str(node.expression.this)).replace('%', '.*').replace('_', '.') + '$'
-        m = s.str.match(rx, case=not isinstance(node, E.ILike), flags=re.DOTALL, na=False)
+        fl9 = re.DOTALL | (re.IGNORECASE if isinstance(node, E.ILike) else 0)
+        m = s.str.match(re.compile(rx, fl9), na=False)
         return (~m) if node.args.get('negate') else m
     raise NotImplementedError(f"join WHERE: {type(node).__name__}")
 
