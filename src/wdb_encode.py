@@ -545,7 +545,7 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
         pk17 = np.packbits(tb17, bitorder='little')
         cand17 = (bytes([17, bits]) + struct.pack('<I', arr17.size)
                   + pk17.tobytes() + b'\x00\x00')
-        S17 = (len(best) - len(cand17)) / max(1, len(best) + len(cand17))
+        S17 = (len(cand17) - len(best)) / max(1, len(best) + len(cand17))   # zstd SHRINK vs packed
         import time as _t17
         u817 = arr17.astype(np.uint8) if bits <= 8 else arr17.astype(np.uint16)
         zz17 = zstd.ZstdCompressor(level=CODE_ZSTD_LEVEL).compress(u817.tobytes())
