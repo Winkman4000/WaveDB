@@ -3117,3 +3117,17 @@ def exists_scatter(m, ptr, okeep, yes):
             p = np.int64(ptr[i])
             if okeep[p]:
                 yes[p] = True
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def pk_unpack(buf, bits, n, out):
+    """enc-17 RAW PACKED CODES (Jackson's deal law): LE bit-stream ->
+    codes, one parallel pass. The dress that charges no toll."""
+    mask = (np.int64(1) << bits) - 1
+    for i in prange(n):
+        bitpos = np.int64(i) * bits
+        b = bitpos >> 3
+        sh = bitpos & 7
+        w = (np.int64(buf[b]) | (np.int64(buf[b + 1]) << 8)
+             | (np.int64(buf[b + 2]) << 16))
+        out[i] = (w >> sh) & mask

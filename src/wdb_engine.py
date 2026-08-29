@@ -127,6 +127,12 @@ class Segment:
             code_enc = int(buf[off]); off += 1; meta['code_enc'] = code_enc   # 0=bitpack, 1=zstd, 2=staircase, 3=blocked
             if code_enc == 0:
                 nb = (self.N*bits+7)//8; meta['cstart'] = off; off += nb
+            elif code_enc == 17:               # RAW PACKED CODES: mmap-direct, no toll
+                meta['pk_bits'] = int(buf[off]); off += 1
+                meta['pk_n'] = int(struct.unpack_from('<I', buf, off)[0]); off += 4
+                meta['cstart'] = off
+                meta['czlen'] = (meta['pk_n'] * meta['pk_bits'] + 7) // 8 + 2
+                off += meta['czlen']
             elif code_enc == 15:               # CLOCK DRESS (Jackson's dial): anchor+delta+bit
                 meta['ywidth'] = int(buf[off]); off += 1
                 meta['ybase'] = int(struct.unpack_from('<H', buf, off)[0]); off += 2
@@ -676,6 +682,13 @@ class Segment:
             raw = self._dz.decompress(self.buf[c['cstart']:c['cstart']+c['czlen']].tobytes())
             wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
             cc = np.frombuffer(raw, dtype=wdt)       # native width (was upcast to int64)
+            self._codes[nm] = cc; return cc
+        if c.get('code_enc', 0) == 17:               # RAW PACKED: one parallel unpack
+            wdt17 = np.uint8 if c['bits'] <= 8 else np.uint16
+            cc = np.empty(self.N, dtype=wdt17)
+            import wdb_kernels as _WK17
+            _WK17.pk_unpack(np.asarray(self.buf[c['cstart']:c['cstart'] + c['czlen']]),
+                            c['pk_bits'], self.N, cc)
             self._codes[nm] = cc; return cc
         if c.get('code_enc', 0) in (15, 16):         # CLOCK DRESS: anchor+delta+bit -> codes
             if c['code_enc'] == 16:

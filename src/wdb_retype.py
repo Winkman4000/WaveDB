@@ -87,6 +87,10 @@ def _column_spans(buf):
             nfr = struct.unpack_from('<II', buf, off)[1]; off += 8
             boffs = np.asarray(buf[off:off + (nfr + 1) * 4]).view(np.uint32); off += (nfr + 1) * 4
             off += int(boffs[-1])
+        elif code_enc == 17:                         # raw packed codes
+            b17 = buf[off]; off += 1
+            n17 = struct.unpack_from('<I', buf, off)[0]; off += 4
+            off += (n17 * b17 + 7) // 8 + 2
         elif code_enc == 15:                         # clock dress: 5 offs tables + partner + payload
             off += 1 + 2
             nfr15 = struct.unpack_from('<II', buf, off)[1]; off += 8
