@@ -127,6 +127,25 @@ class Segment:
             code_enc = int(buf[off]); off += 1; meta['code_enc'] = code_enc   # 0=bitpack, 1=zstd, 2=staircase, 3=blocked
             if code_enc == 0:
                 nb = (self.N*bits+7)//8; meta['cstart'] = off; off += nb
+            elif code_enc == 15:               # CLOCK DRESS (Jackson's dial): anchor+delta+bit
+                meta['ywidth'] = int(buf[off]); off += 1
+                meta['ybase'] = int(struct.unpack_from('<H', buf, off)[0]); off += 2
+                fr15, nfr15 = struct.unpack_from('<II', buf, off); off += 8
+                meta['e15_FR'] = int(fr15); meta['e15_nfr'] = int(nfr15)
+                meta['e15_offs'] = []
+                for _p15 in range(5):
+                    meta['e15_offs'].append(np.frombuffer(buf, dtype=np.uint32,
+                                                          count=nfr15 + 1, offset=off))
+                    off += 4 * (nfr15 + 1)
+                pnl15 = int(struct.unpack_from('<H', buf, off)[0]); off += 2
+                meta['e15_partner'] = bytes(buf[off:off + pnl15]).decode(); off += pnl15
+                meta['cstart'] = off
+                meta['czlen'] = int(sum(int(o[-1]) for o in meta['e15_offs']))
+                off += meta['czlen']
+            elif code_enc == 16:               # clock stub: dressed by partner
+                pnl16 = int(struct.unpack_from('<H', buf, off)[0]); off += 2
+                meta['e16_partner'] = bytes(buf[off:off + pnl16]).decode(); off += pnl16
+                meta['cstart'] = off; meta['czlen'] = 0
             elif code_enc == 14:               # FIELD PLANES (Jackson's dress): y/m/d, FRAMED
                 meta['ywidth'] = int(buf[off]); off += 1
                 meta['ybase'] = int(struct.unpack_from('<H', buf, off)[0]); off += 2
@@ -657,6 +676,47 @@ class Segment:
             raw = self._dz.decompress(self.buf[c['cstart']:c['cstart']+c['czlen']].tobytes())
             wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
             cc = np.frombuffer(raw, dtype=wdt)       # native width (was upcast to int64)
+            self._codes[nm] = cc; return cc
+        if c.get('code_enc', 0) in (15, 16):         # CLOCK DRESS: anchor+delta+bit -> codes
+            if c['code_enc'] == 16:
+                anm = c['e16_partner']; role = 0
+            else:
+                anm = nm; role = 1
+            ca = self.cols[anm]
+            td15 = np.asarray(self._typed_dict(nm)).astype(np.int64)
+            dmin15 = int(td15[0])
+            inv_map = getattr(self, '_e14_inv', None)
+            if inv_map is None:
+                inv_map = self._e14_inv = {}
+            inv15 = inv_map.get(nm)
+            if inv15 is None:
+                inv15 = np.zeros(int(td15[-1]) - dmin15 + 1, dtype=np.uint32)
+                inv15[td15 - dmin15] = np.arange(td15.size, dtype=np.uint32)
+                inv_map[nm] = inv15
+            wdt15 = np.uint8 if c['bits'] <= 8 else (np.uint16 if c['bits'] <= 16 else np.uint32)
+            cc = np.empty(self.N, dtype=wdt15)
+            import wdb_kernels as _WK15
+            base15 = ca['cstart']; FR15 = ca['e15_FR']; nfr15 = ca['e15_nfr']; offs15 = ca['e15_offs']
+            st15 = [base15]
+            for _k in range(4):
+                st15.append(st15[-1] + int(offs15[_k][-1]))
+            def _wr15(j9):
+                import zstandard as _zs15
+                dz9 = _zs15.ZstdDecompressor()
+                pls9 = []
+                for p9 in range(5):
+                    a9 = st15[p9] + int(offs15[p9][j9]); b9 = st15[p9] + int(offs15[p9][j9 + 1])
+                    pls9.append(np.frombuffer(dz9.decompress(self.buf[a9:b9].tobytes()), np.uint8))
+                l9 = j9 * FR15
+                _WK15.e15_reconstruct_chunk(pls9[0], pls9[1], pls9[2], pls9[3], pls9[4],
+                                            role, ca['ybase'], inv15, dmin15,
+                                            cc[l9:l9 + pls9[0].size])
+            if nfr15 > 1:
+                from concurrent.futures import ThreadPoolExecutor as _TPc
+                with _TPc(max_workers=min(nfr15, 8)) as exc15:
+                    list(exc15.map(_wr15, range(nfr15)))
+            else:
+                _wr15(0)
             self._codes[nm] = cc; return cc
         if c.get('code_enc', 0) == 14:               # FIELD PLANES: framed y/m/d -> codes
             if __import__('os').environ.get('WDB_JOIN_BILL'):

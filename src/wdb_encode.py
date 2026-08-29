@@ -532,6 +532,84 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
                                                  # heir whose tolls it never repaid
     return best
 
+def _pair15_candidate(pa, pb):
+    """Size the CLOCK dress for a date pair: anchor planes + u8 delta +
+    orientation bit, framed. Returns (blob_bytes, size) or None."""
+    ua, ub = np.asarray(pa['uniq'], np.int64), np.asarray(pb['uniq'], np.int64)
+    da, db = ua[np.asarray(pa['codes'])], ub[np.asarray(pb['codes'])]
+    dl = np.abs(da - db)
+    if int(dl.max(initial=0)) > 255:
+        return None
+    bit = (da <= db)                              # 1: column A is the anchor(min)
+    mn = np.minimum(da, db)
+    dt64 = mn.astype('datetime64[D]')
+    Y = (dt64.astype('datetime64[Y]').astype(np.int64) + 1970)
+    ybase = int(Y.min())
+    if int(Y.max()) - ybase > 255:
+        return None
+    Yp = (Y - ybase).astype(np.uint8)
+    Mp = (dt64.astype('datetime64[M]').astype(np.int64) % 12).astype(np.uint8)
+    Dp = (mn - dt64.astype('datetime64[M]').astype('datetime64[D]').astype(np.int64)).astype(np.uint8)
+    DL = dl.astype(np.uint8)
+    BB = np.packbits(bit)
+    zc15 = zstd.ZstdCompressor(level=CODE_ZSTD_LEVEL)
+    FR = 1 << 23
+    nfr = (mn.size + FR - 1) // FR
+    offs, secs = [], []
+    for pl, ib in ((Yp, 1), (Mp, 1), (Dp, 1), (DL, 1), (BB, 0)):
+        if ib:
+            frs = [zc15.compress(pl[i:i + FR].tobytes()) for i in range(0, pl.size, FR)]
+        else:                                     # bit plane: FR/8 bytes per frame
+            F8 = FR >> 3
+            frs = [zc15.compress(pl[i:i + F8].tobytes()) for i in range(0, pl.size, F8)]
+            while len(frs) < nfr: frs.append(zc15.compress(b''))
+        o9 = np.zeros(nfr + 1, dtype=np.uint32)
+        np.cumsum([len(f) for f in frs], out=o9[1:])
+        offs.append(o9); secs.append(b''.join(frs))
+    pn = pb['nm'].encode()
+    blob = (bytes([15, 1]) + struct.pack('<HII', ybase, FR, nfr)
+            + b''.join(o.tobytes() for o in offs)
+            + struct.pack('<H', len(pn)) + pn
+            + b''.join(secs))
+    return blob, len(blob)
+
+
+def _elect_pair15(preps, cols):
+    """Nominate date pairs by PROPERTY (both plane-eligible, no nulls,
+    measured bounded delta); size the clock against the two standalone
+    code sections; elect at most one pair per table, best savings."""
+    def eligible(p):
+        if p.get('has_null') or p.get('mode') not in (0, 2):
+            return False
+        u = np.asarray(p['uniq'])
+        if u.size == 0:
+            return False
+        if p.get('dtype') == 3:
+            return True
+        return (p.get('dtype') == 0 and -25567 <= int(u[0]) and int(u[-1]) <= 65700)
+    dcols = [nm for nm in cols if eligible(preps[nm])]
+    if os.environ.get('WDB_ENCODE_VERBOSE'):
+        print('PAIR15: dcols=%r' % dcols, flush=True)
+    best = None
+    for i in range(len(dcols)):
+        for j in range(i + 1, len(dcols)):
+            pa, pb = preps[dcols[i]], preps[dcols[j]]
+            cand = _pair15_candidate(pa, pb)
+            if cand is None:
+                continue
+            sa = len(_code_section(pa['codes'], pa['bits'], nm=pa['nm'], date_vals=pa['uniq']))
+            sb = len(_code_section(pb['codes'], pb['bits'], nm=pb['nm'], date_vals=pb['uniq']))
+            save = (sa + sb) - cand[1]
+            if os.environ.get('WDB_ENCODE_VERBOSE'):
+                print('PAIR15: %s+%s sa=%d sb=%d cand=%d save=%d' % (dcols[i], dcols[j], sa, sb, cand[1], save), flush=True)
+            if save > 0 and (best is None or save > best[0]):
+                best = (save, dcols[i], dcols[j], cand[0])
+    if best is not None:
+        _sv, na, nb, blob = best
+        preps[na]['force15'] = blob
+        preps[nb]['force16'] = na.encode()
+
+
 def _serialize_column(p, zc):
     """Normal blob (mode 0/1/2), or mode-4 affine blob (header + WSQ1 seqcodec blob)."""
     if p['mode'] == 4:
@@ -542,6 +620,13 @@ def _serialize_column(p, zc):
     out = bytearray()
     out += _header(p['nm'], p['V'], p['bits'], p['dtype'], p['mode'], p['has_null'], p['aux'])
     out += _dict_bytes(p, zc)
+    if p.get('force15') is not None:
+        out += p['force15']
+        return bytes(out), (len(out), p['V'], p['bits'], p['dtype'], p['mode'], p['has_null'], p['aux'])
+    if p.get('force16') is not None:
+        pn16 = p['force16']
+        out += bytes([16]) + struct.pack('<H', len(pn16)) + pn16
+        return bytes(out), (len(out), p['V'], p['bits'], p['dtype'], p['mode'], p['has_null'], p['aux'])
     out += _code_section(p['codes'], p['bits'],
                          enc5_ok=(p.get('dtype') == 0 and p['mode'] in (0, 1, 2)),
                          nm=p['nm'],
@@ -696,8 +781,16 @@ def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_s
     if not fd_specs:
         # fast path (no FDs): fused prep+serialize in one parallel pass — byte-identical to
         # the original encoder, no two-phase overhead.
+        preps15 = {}
+        if workers > 1 and len(cols) > 1:
+            with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+                for nm, p9 in zip(cols, ex.map(lambda n: _prep_column(n, coldata[n]), cols)):
+                    preps15[nm] = p9
+        else:
+            for nm in cols: preps15[nm] = _prep_column(nm, coldata[nm])
+        _elect_pair15(preps15, cols)
         def _blob(nm):
-            return nm, _serialize_column(_prep_column(nm, coldata[nm]),
+            return nm, _serialize_column(preps15[nm],
                                          zstd.ZstdCompressor(level=ZSTD_LEVEL))
         if workers > 1 and len(cols) > 1:
             with cf.ThreadPoolExecutor(max_workers=workers) as ex:
@@ -718,6 +811,7 @@ def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_s
                     nm = futs[fut]; preps[nm] = fut.result()
         else:
             for nm in cols: preps[nm] = _prep_column(nm, coldata[nm], nm not in fd_involved)
+        _elect_pair15(preps, cols)
         col_idx = {nm: i for i, nm in enumerate(cols)}
         normal = [nm for nm in cols if nm not in fd_specs]
         def _ser_normal(nm):
