@@ -788,6 +788,40 @@ def _render(v):
     return wdb_sql._pyval(v)
 
 
+def _eval_expr(df, node, R):
+    """Pandas-path expression evaluator for aggregate ARGUMENTS: Columns,
+    literals, arithmetic, and CASE WHEN (via _mask + np.select)."""
+    if isinstance(node, E.Paren):
+        return _eval_expr(df, node.this, R)
+    if isinstance(node, E.Column):
+        return df[R(node)]
+    if isinstance(node, E.Literal):
+        v = node.this
+        if node.is_string:
+            return v.encode() if isinstance(v, str) else v
+        return float(v) if '.' in str(v) else int(v)
+    if isinstance(node, E.Neg):
+        return -_eval_expr(df, node.this, R)
+    if isinstance(node, E.Case):
+        conds, vals = [], []
+        for br in node.args.get('ifs', []):
+            c9 = _mask(df, br.this, R)
+            conds.append(c9.to_numpy() if hasattr(c9, 'to_numpy') else np.asarray(c9))
+            v9 = _eval_expr(df, br.args['true'], R)
+            vals.append(v9.to_numpy() if hasattr(v9, 'to_numpy') else v9)
+        d9 = node.args.get('default')
+        dv = _eval_expr(df, d9, R) if d9 is not None else 0
+        if hasattr(dv, 'to_numpy'):
+            dv = dv.to_numpy()
+        return pd.Series(np.select(conds, vals, default=dv), index=df.index)
+    import operator as _op9
+    for tp9, op9 in ((E.Mul, _op9.mul), (E.Add, _op9.add),
+                     (E.Sub, _op9.sub), (E.Div, _op9.truediv)):
+        if isinstance(node, tp9):
+            return op9(_eval_expr(df, node.this, R), _eval_expr(df, node.expression, R))
+    raise NotImplementedError('pandas expr: %s' % type(node).__name__)
+
+
 def _coerce_lit(series, lit):
     if isinstance(lit, E.Neg):
         return -_coerce_lit(series, lit.this)
@@ -842,7 +876,13 @@ def _aggregate(merged, proj, group, R):
         elif kind[0] == 'COUNT_STAR':
             specs.append(('size',))
         else:
-            specs.append(('agg', kind[0], R(inner.this)))
+            arg9 = inner.this
+            if isinstance(arg9, E.Column):
+                specs.append(('agg', kind[0], R(arg9)))
+            else:                                  # SUM(CASE...), SUM(a*b), ...
+                syn9 = '_xpr%d' % i
+                merged[syn9] = _eval_expr(merged, arg9, R)
+                specs.append(('agg', kind[0], syn9))
     if group is not None:
         key_cols = [R(g) for g in group.expressions]
         g = merged.groupby(key_cols, sort=False, dropna=False)
