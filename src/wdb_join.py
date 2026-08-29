@@ -80,7 +80,9 @@ def _chain_pandas(db, tree, ctx):
     where = tree.args.get('where')
     if where is not None: df = df[_mask(df, where.this, R)]
     group = tree.args.get('group')
-    has_agg = any(wdb_sql._agg_kind(p) for p in proj)
+    has_agg = any(wdb_sql._agg_kind(p) is not None
+                  or any(True for _ in p.find_all(E.Sum, E.Avg, E.Min, E.Max, E.Count))
+                  for p in proj)
     if group is not None or has_agg:
         rows = _aggregate(df, proj, group, R)
     else:
