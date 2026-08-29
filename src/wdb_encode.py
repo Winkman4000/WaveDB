@@ -574,7 +574,36 @@ def _pair15_candidate(pa, pb):
     return blob, len(blob)
 
 
-def _elect_pair15(preps, cols):
+def _apply_pairs15(preps, cols, date_pairs):
+    """OPERATOR-DECLARED clock pairs (Jackson's ruling): two dates that are
+    sides of one event pair ONLY when the operator says so -- the bit's
+    meaning (outstanding vs closed) is workload semantics the data cannot
+    reveal, so the engine never guesses. Declared pairs must satisfy the
+    physical property (both plane-eligible, measured delta <= 255) or the
+    encode FAILS LOUD."""
+    if not date_pairs:
+        return
+    for na, nb in date_pairs:
+        if na not in preps or nb not in preps:
+            raise ValueError("date_pairs: unknown column in (%s, %s)" % (na, nb))
+        pa, pb = preps[na], preps[nb]
+        for p9 in (pa, pb):
+            if p9.get('has_null') or p9.get('mode') not in (0, 2):
+                raise ValueError("date_pairs: %s not clock-eligible (nulls or mode)" % p9['nm'])
+        cand = _pair15_candidate(pa, pb)
+        if cand is None:
+            raise ValueError("date_pairs: (%s, %s) delta exceeds u8 or year span too wide"
+                             % (na, nb))
+        if os.environ.get('WDB_ENCODE_VERBOSE'):
+            sa = len(_code_section(pa['codes'], pa['bits'], nm=na, date_vals=pa['uniq']))
+            sb = len(_code_section(pb['codes'], pb['bits'], nm=nb, date_vals=pb['uniq']))
+            print('PAIR15 declared %s+%s: %d -> %d bytes (%+d)'
+                  % (na, nb, sa + sb, cand[1], cand[1] - (sa + sb)), flush=True)
+        pa['force15'] = cand[0]
+        pb['force16'] = na.encode()
+
+
+def _elect_pair15_retired(preps, cols):
     """Nominate date pairs by PROPERTY (both plane-eligible, no nulls,
     measured bounded delta); size the clock against the two standalone
     code sections; elect at most one pair per table, best savings."""
@@ -755,7 +784,7 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0)
                 sizes=sizes, cluster=None)
 
 
-def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_specs=None, cluster_by=None, cubes=None, stream=False):
+def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_specs=None, cluster_by=None, cubes=None, stream=False, date_pairs=None):
     """fd_specs: optional {dependent_col: determinant_col} — store the dependent column as
     a mode-3 FD-reference into the determinant (lossless iff the FD is exact; callers pass
     only verified FDs). Determinant must be a normal (non-FD) column in the same segment.
@@ -788,7 +817,7 @@ def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_s
                     preps15[nm] = p9
         else:
             for nm in cols: preps15[nm] = _prep_column(nm, coldata[nm])
-        _elect_pair15(preps15, cols)
+        _apply_pairs15(preps15, cols, date_pairs)
         def _blob(nm):
             return nm, _serialize_column(preps15[nm],
                                          zstd.ZstdCompressor(level=ZSTD_LEVEL))
@@ -811,7 +840,7 @@ def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_s
                     nm = futs[fut]; preps[nm] = fut.result()
         else:
             for nm in cols: preps[nm] = _prep_column(nm, coldata[nm], nm not in fd_involved)
-        _elect_pair15(preps, cols)
+        _apply_pairs15(preps, cols, date_pairs)
         col_idx = {nm: i for i, nm in enumerate(cols)}
         normal = [nm for nm in cols if nm not in fd_specs]
         def _ser_normal(nm):
