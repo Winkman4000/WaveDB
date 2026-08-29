@@ -261,12 +261,13 @@ def _exists_road(db, tree, inner, icol, ocol, rest, outer_where=None, ex_node=No
         if m9 is None:
             m9 = np.ones(int(segc.N), dtype=bool)
         _b9(_t9, 'child-mask-AND'); _t9 = _tt9.perf_counter()
+        yes9 = np.zeros(int(sego.N), dtype=bool)
         if okeep9 is not None:
-            m9 &= okeep9[np.asarray(ptr)]         # quarter-first: only lines of
-            _b9(_t9, 'okeep[ptr]-gate'); _t9 = _tt9.perf_counter()
-        yes9 = np.zeros(int(sego.N), dtype=bool)  # surviving parents scatter
-        yes9[np.asarray(ptr)[m9]] = True          # idempotent scatter: no sort, no unique
-        _b9(_t9, 'scatter'); _t9 = _tt9.perf_counter()
+            import wdb_kernels as _wk9
+            _wk9.exists_scatter(m9, np.asarray(ptr), okeep9, yes9)   # one fused pass
+        else:
+            yes9[np.asarray(ptr)[m9]] = True
+        _b9(_t9, 'fused-scatter'); _t9 = _tt9.perf_counter()
         co9 = sego.cols.get(ocol)
         if co9 is None:
             return None

@@ -3105,3 +3105,15 @@ def e15_band_chunk(Y, M, D, DL, BB, role, ybase, dlo, dhi, out):
         if b != role:
             days += np.int64(DL[i])
         out[i] = (days >= dlo) and (days < dhi)
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def exists_scatter(m, ptr, okeep, yes):
+    """Jackson's three-scans glue, fused: child verdict AND parent gate AND
+    scatter in ONE pass. The racing bool store is idempotent."""
+    n = m.shape[0]
+    for i in prange(n):
+        if m[i]:
+            p = np.int64(ptr[i])
+            if okeep[p]:
+                yes[p] = True
