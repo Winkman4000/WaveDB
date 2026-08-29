@@ -357,3 +357,11 @@ answers commit<receipt by READING THE BIT (est. Q4 ~350-450);
 (2) median protocol to formalize; (3) Q22 on the widened matcher;
 (4) guard bugs Q12/Q14/Q10. Pod .132:11381: lineitem_0.wdb =
 DECLARED CLOCK (live), .e14, .e15 (auto-pair), .enc3 backups.
+
+
+## THE BIT ANSWERS (session close): Q4 1,515 -> 952 EXACT (-563).
+pair_bits reads delta+orientation only (~28MB laned); the scatter
+serves declared-pair compares from the operator table. Remaining
+~700ms named: the 38M-parent road scatter fires BEFORE the outer
+quarter -- Jackson's quarter-first ordering is the next strike
+(est ~400ms), then Q12 consumes the same bit on its guard fix.
