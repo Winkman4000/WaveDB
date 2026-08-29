@@ -788,6 +788,27 @@ def _render(v):
     return wdb_sql._pyval(v)
 
 
+def _eval_compose(node, amap, r):
+    """Evaluate an arithmetic tree over already-aggregated values: agg nodes
+    resolve via amap into the result row; literals and arithmetic recurse."""
+    if id(node) in amap:
+        return r[amap[id(node)]]
+    if isinstance(node, E.Paren):
+        return _eval_compose(node.this, amap, r)
+    if isinstance(node, E.Literal):
+        v = node.this
+        return float(v) if '.' in str(v) else int(v)
+    if isinstance(node, E.Neg):
+        return -_eval_compose(node.this, amap, r)
+    import operator as _o9
+    for tp9, op9 in ((E.Mul, _o9.mul), (E.Add, _o9.add),
+                     (E.Sub, _o9.sub), (E.Div, _o9.truediv)):
+        if isinstance(node, tp9):
+            return op9(_eval_compose(node.this, amap, r),
+                       _eval_compose(node.expression, amap, r))
+    raise NotImplementedError('compose: %s' % type(node).__name__)
+
+
 def _eval_expr(df, node, R):
     """Pandas-path expression evaluator for aggregate ARGUMENTS: Columns,
     literals, arithmetic, and CASE WHEN (via _mask + np.select)."""
@@ -871,7 +892,26 @@ def _aggregate(merged, proj, group, R):
     for i, p in enumerate(proj):
         inner = p.this if isinstance(p, E.Alias) else p
         kind = wdb_sql._agg_kind(p)
-        if kind is None:
+        if kind is None and not isinstance(inner, E.Column) \
+                and any(True for _ in inner.find_all(E.Sum, E.Avg, E.Min, E.Max, E.Count)):
+            # arithmetic OVER aggregates (Q14's 100*SUM/SUM): each inner agg
+            # becomes its own synth spec; the tree composes on the RESULT row.
+            amap9 = {}
+            for an9 in inner.find_all(E.Sum, E.Avg, E.Min, E.Max, E.Count):
+                k9 = wdb_sql._agg_kind(an9)
+                if k9 is None:
+                    raise NotImplementedError('compose: agg kind')
+                syn9 = '_pc%d_%d' % (i, len(amap9))
+                arg9 = an9.this
+                if isinstance(arg9, E.Column):
+                    col9 = R(arg9)
+                else:
+                    col9 = syn9 + '_x'
+                    merged[col9] = _eval_expr(merged, arg9, R)
+                specs.append(('agg', k9[0], col9, syn9))
+                amap9[id(an9)] = syn9
+            specs.append(('compose', inner, amap9))
+        elif kind is None:
             specs.append(('key', R(inner)))
         elif kind[0] == 'COUNT_STAR':
             specs.append(('size',))
@@ -886,7 +926,8 @@ def _aggregate(merged, proj, group, R):
     if group is not None:
         key_cols = [R(g) for g in group.expressions]
         g = merged.groupby(key_cols, sort=False, dropna=False)
-        named = {f"_a{i}": pd.NamedAgg(column=s[2], aggfunc=_PF[s[1]]) for i, s in enumerate(specs) if s[0] == 'agg'}
+        named = {(s[3] if len(s) > 3 else f"_a{i}"): pd.NamedAgg(column=s[2], aggfunc=_PF[s[1]])
+                 for i, s in enumerate(specs) if s[0] == 'agg'}
         agg = g.agg(**named) if named else g.size().to_frame('_dummy')
         if any(s[0] == 'size' for s in specs):
             agg['_size'] = g.size()
@@ -897,17 +938,29 @@ def _aggregate(merged, proj, group, R):
             for i, s in enumerate(specs):
                 if s[0] == 'key': row.append(_render(r[s[1]]))
                 elif s[0] == 'size': row.append(int(r['_size']))
+                elif s[0] == 'compose':
+                    row.append(_render(_eval_compose(s[1], s[2], r)))
+                elif len(s) > 3:
+                    continue                       # consumed by a compose
                 else: row.append(_render(r[f"_a{i}"]))
             out.append(tuple(row))
         return out
     # whole-table aggregate -> single row
     row = []
+    sc9 = {}
+    for i, s in enumerate(specs):
+        if s[0] == 'agg':
+            col = merged[s[2]]
+            sc9[s[3] if len(s) > 3 else f"_a{i}"] = {'SUM': col.sum(), 'AVG': col.mean(),
+                'MIN': col.min(), 'MAX': col.max(), 'COUNT': col.count()}[s[1]]
     for i, s in enumerate(specs):
         if s[0] == 'size': row.append(int(len(merged)))
+        elif s[0] == 'compose':
+            row.append(_render(_eval_compose(s[1], s[2], sc9)))
         elif s[0] == 'agg':
-            col = merged[s[2]]
-            row.append(_render({'SUM': col.sum(), 'AVG': col.mean(), 'MIN': col.min(),
-                                'MAX': col.max(), 'COUNT': col.count()}[s[1]]))
+            if len(s) > 3:
+                continue                           # consumed by a compose
+            row.append(_render(sc9[f"_a{i}"]))
         else:
             raise NotImplementedError("bare column with aggregates but no GROUP BY")
     return [tuple(row)]
