@@ -285,3 +285,21 @@ wins or ties every face, -47MB disk. lineitem WEARS THE FIELD
 PLANES PERMANENTLY (enc-3 retired to .enc3 backup). Jackson's
 y/m/d design, elected by the rule he ratified: types nominate,
 measurements size, the election elects.
+
+
+## Q4: HOLE -> FACE (2026-08-29, Jackson's walk end to end)
+The walk: quarter the orders, ask each surviving order ONE BIT via
+its line items, stop at the first late line, count by priority.
+Landed as: matcher sees bare correlations (schema truth); THE
+SCATTER FORM -- child residual pred in arrays, idempotent bool
+scatter through the road sidecar (which now BIRTHS on first ask),
+parent rows ARE codes on mode-4 keys, straight into the _codes
+sentinel; the In-loop honors pre-answered sentinels. Numbers:
+HOLE -> 14,570ms (value-path v1) -> 1,413ms EXACT (duck 234).
+Five silent gates convicted en route incl. wdb_subquery lacking
+module-level numpy and my unique-sort of 38M rows (9 of the 10s).
+NEXT STRIKES, named: plane-lex col-vs-col compare (kills 2x
+reconstruct + 1GB of value gathers -> ~450 est); quarter-first
+pruning through the road (Jackson's original order) -> ~duck.
+STANDING: boards re-gate (subquery machinery touched); Q22 next
+on this matcher + the FROM-door; holes now 10.
