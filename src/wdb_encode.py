@@ -553,7 +553,7 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
         td17 = min(_t17.perf_counter() - t for t in [_t17.perf_counter()]
                    if dz17.decompress(zz17) is not None or True)
         t017 = _t17.perf_counter(); dz17.decompress(zz17); tdec17 = _t17.perf_counter() - t017
-        t017 = _t17.perf_counter(); int(u817.sum()); tpass17 = _t17.perf_counter() - t017
+        t017 = _t17.perf_counter(); np.bincount(u817); tpass17 = _t17.perf_counter() - t017   # op model: a real engine pass (LUT/bincount class), not a bare sum
         tz17 = tdec17 + tpass17
         tr17 = tpass17 * 1.15                     # unpack rides ~one extra pass
         T17 = (tz17 - tr17) / max(1e-9, tz17 + tr17)
