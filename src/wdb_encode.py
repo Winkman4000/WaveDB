@@ -546,17 +546,13 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
         cand17 = (bytes([17, bits]) + struct.pack('<I', arr17.size)
                   + pk17.tobytes() + b'\x00\x00')
         S17 = (len(cand17) - len(best)) / max(1, len(best) + len(cand17))   # zstd SHRINK vs packed
-        import time as _t17
-        u817 = arr17.astype(np.uint8) if bits <= 8 else arr17.astype(np.uint16)
-        zz17 = zstd.ZstdCompressor(level=CODE_ZSTD_LEVEL).compress(u817.tobytes())
-        dz17 = zstd.ZstdDecompressor()
-        td17 = min(_t17.perf_counter() - t for t in [_t17.perf_counter()]
-                   if dz17.decompress(zz17) is not None or True)
-        t017 = _t17.perf_counter(); dz17.decompress(zz17); tdec17 = _t17.perf_counter() - t017
-        t017 = _t17.perf_counter(); np.bincount(u817); tpass17 = _t17.perf_counter() - t017   # op model: a real engine pass (LUT/bincount class), not a bare sum
-        tz17 = tdec17 + tpass17
-        tr17 = tpass17 * 1.15                     # unpack rides ~one extra pass
-        T17 = (tz17 - tr17) / max(1e-9, tz17 + tr17)
+        T17 = 0.17
+        # T is the ENGINE's measured slowdown ratio for zstd on real ops
+        # (scan+group geo across the deals table: 0.15-0.20, near-constant
+        # per column) -- a calibrated constant, deterministic at encode.
+        # Per-column micro-timing tried twice and lied both ways: a bare
+        # sum overweighted decompression, a 1T bincount underweighted it.
+        # Recalibrate by re-running bench deals when the engine changes.
         if not (S17 > T17):
             best = cand17
     return best
