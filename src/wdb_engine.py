@@ -792,6 +792,40 @@ class Segment:
         else:
             cc = self._bitunpack(base, 0, self.N, bits)  # native width
         self._codes[nm] = cc; return cc
+    def pair_bits(self, nm):
+        """THE BIT READ (Jackson's declared clock, its purpose): for a pair
+        column, decompress ONLY the delta and orientation streams. Returns
+        (bit_bool[N] meaning anchor-column <= partner, delta_u8[N])."""
+        c = self.cols[nm]
+        anm = c['e16_partner'] if c['code_enc'] == 16 else nm
+        ca = self.cols[anm]
+        base = ca['cstart']; FR = ca['e15_FR']; nfr = ca['e15_nfr']; offs = ca['e15_offs']
+        st = [base]
+        for _k in range(4):
+            st.append(st[-1] + int(offs[_k][-1]))
+        DL = np.empty(self.N, np.uint8)
+        BB = np.empty((self.N + 7) >> 3, np.uint8)
+        def _ws(job):
+            import zstandard as _zs15
+            p9, j9 = job
+            a9 = st[p9] + int(offs[p9][j9]); b9 = st[p9] + int(offs[p9][j9 + 1])
+            raw = np.frombuffer(_zs15.ZstdDecompressor().decompress(
+                self.buf[a9:b9].tobytes()), np.uint8)
+            if p9 == 3:
+                DL[j9 * FR: j9 * FR + raw.size] = raw
+            else:
+                f8 = FR >> 3
+                BB[j9 * f8: j9 * f8 + raw.size] = raw
+        jobs = [(3, j) for j in range(nfr)] + [(4, j) for j in range(nfr)]
+        if len(jobs) > 1:
+            from concurrent.futures import ThreadPoolExecutor as _TPs
+            with _TPs(max_workers=min(len(jobs), 8)) as exs:
+                list(exs.map(_ws, jobs))
+        else:
+            _ws(jobs[0])
+        bit = np.unpackbits(BB)[:self.N].astype(bool)
+        return bit, DL
+
     def _e15_band(self, nm, day_lo, day_hi):
         """The clock dress's band test: fused per-frame decompress + civil
         anchor + delta swing + numeric band. Serves BOTH pair columns."""

@@ -174,7 +174,27 @@ def _exists_road(db, tree, inner, icol, ocol, rest):
             if t9n not in ('EQ', 'NEQ', 'GT', 'GTE', 'LT', 'LTE'):
                 return None
             if len(cols) == 2 and isinstance(cn.this, E.Column) and isinstance(cn.expression, E.Column):
-                a9, b9 = vals_of(cn.this.name), vals_of(cn.expression.name)
+                nl9, nr9 = cn.this.name, cn.expression.name
+                cl9, cr9 = segc.cols.get(nl9), segc.cols.get(nr9)
+                if (cl9 is not None and cr9 is not None
+                        and {cl9.get('code_enc'), cr9.get('code_enc')} == {15, 16}
+                        and (cl9.get('e16_partner') in (nr9, None))
+                        and (cr9.get('e16_partner') in (nl9, None))):
+                    # THE BIT ANSWERS (the declared pair's whole purpose):
+                    # bit means anchor <= partner; delta==0 means equal.
+                    bit9, dl9 = segc.pair_bits(nl9)
+                    lf9 = (cl9.get('code_enc') == 15)   # left is the anchor?
+                    t9x = t9n if lf9 else {'GT': 'LT', 'LT': 'GT', 'GTE': 'LTE',
+                                           'LTE': 'GTE', 'EQ': 'EQ', 'NEQ': 'NEQ'}[t9n]
+                    if t9x == 'LTE':   c9m = bit9
+                    elif t9x == 'GT':  c9m = ~bit9
+                    elif t9x == 'LT':  c9m = bit9 & (dl9 > 0)
+                    elif t9x == 'GTE': c9m = ~(bit9 & (dl9 > 0))
+                    elif t9x == 'EQ':  c9m = (dl9 == 0)
+                    else:              c9m = (dl9 > 0)
+                    m9 = c9m if m9 is None else (m9 & c9m)
+                    continue
+                a9, b9 = vals_of(nl9), vals_of(nr9)
                 if a9 is None or b9 is None:
                     return None
             elif len(cols) == 1:
