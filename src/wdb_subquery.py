@@ -197,14 +197,17 @@ def _exists_road(db, tree, inner, icol, ocol, rest):
             m9 = c9m if m9 is None else (m9 & c9m)
         if m9 is None:
             m9 = np.ones(int(segc.N), dtype=bool)
-        prow9 = np.unique(np.asarray(ptr)[np.flatnonzero(m9)])
+        yes9 = np.zeros(int(sego.N), dtype=bool)
+        yes9[np.asarray(ptr)[m9]] = True          # idempotent scatter: no sort, no unique
         co9 = sego.cols.get(ocol)
         if co9 is None:
             return None
         if co9.get('mode') == 4:
-            return prow9.astype(np.int64)         # positional: rows ARE codes
+            return np.flatnonzero(yes9).astype(np.int64)   # positional: rows ARE codes
         oc9 = np.asarray(sego.codes(ocol))
-        return np.unique(oc9[prow9]).astype(np.int64)
+        kx9 = np.zeros(int(co9['V']) + 1, dtype=bool)
+        kx9[oc9[yes9]] = True
+        return np.flatnonzero(kx9).astype(np.int64)
     except Exception:
         if __import__('os').environ.get('WDB_JOIN_BILL'):
             import traceback
