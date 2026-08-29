@@ -326,3 +326,19 @@ over 5 planes; year path rides the anchor) -> the clock keeps its
 ALSO THIS SESSION: Q4 hole->face (14,570 -> 1,413, Jackson walk),
 elections banked for enc-14 by medians, Q3 crown retaken dressed,
 serve governance + Q1 +100 hunt closed (workqueue tax repealed).
+
+
+## PLANE_TEST-15 BUILT; THE LAST KERNEL NAMED (session end)
+The clock now answers band tests (fused 5-stream kernel, both pair
+columns, all three consumer gates widened; suite 1692/0, pushed).
+Measured: the serve costs 152ms/query (full civil math) vs enc-14
+year path ~20 -> crowns still taxed (Q6 0.55, Q3 0.82 in-dress).
+THE FAST FORM, shaped by the data itself: bit(ship<=receipt) is
+~all-ones, so shipdate==anchor a.e. -> per-frame: if the bit chunk
+is solid ones, skip delta AND civil math, pure LEX tuple test on
+anchor y/m/d (the e14 trick verbatim); mixed frames take the civil
+path per mismatched row only. Est: e14 parity, clock keeps -40MB.
+NEXT SESSION OPENS HERE: that kernel (e15_band_lex_chunk), then
+verdict trio, then the median election protocol for the clock.
+Pod .132:11381 holds lineitem_0.wdb(=e14, crowned), .e15, .enc3.
+Then: Q22 on the widened matcher; Q12/Q14/Q10 guard bugs; boards.
