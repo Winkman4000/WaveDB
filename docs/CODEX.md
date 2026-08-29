@@ -380,3 +380,28 @@ td-gather, est -20) -- named, unstruck. NEXT OPENERS: Q12 guard
 fix (+ free bit consumer), Q22, median protocol, boards re-gate
 (subquery+kernels touched since last gate). fk_pointer/path_for
 stale API flagged for retirement.
+
+
+## THE DEAL LAW DAY (2026-08-30): ENC-17 BANKED, TWO CROWNS AT ONCE
+Jackson could not phrase the intuition at breakfast; by evening it
+was statute: every compression is a DEAL -- symmetric shrink S vs
+symmetric slowdown T, zstd keeps a column iff S > T. Measured
+genesis: the deals tables (per-op, engine-true strategies after
+his fairness objection killed my bogus lookup numbers) showed a
+cliff -- floor-entropy columns paying 12-39ms/MB tolls vs sumslice
+earning 58 percent. ENC-17 raw packed codes (LE bitstream, mmap
+1:1, one unpack kernel). THREE ELECTION BUGS caught by file-size
+confessions across four grinds: inverted S, a bare-sum op model,
+then 1T-bincount overshoot -- T is now a CALIBRATED CONSTANT
+(0.17 from the engine-true bench; per-column micro-timing lied
+both directions). Verdicts: ship/qty/disc/tax -> 17; retflag/
+sumslice keep earned zstd; binaries excluded (Jackson). File
+1,066MB (+12 buying the tolls out). FLAGSHIPS: Q6 182ms 0.95x
+best-ever; Q1 339ms 1.07x CROWN. FRESH GATES: megaboard 103/103
+zero-wrong 3.68x; tpch TWO SIMULTANEOUS WINS (Q1 1.03, Q3 1.09
+BEST EVER) -- campaign first. Also today: Q12+Q14 holes->faces
+(pandas catch-all taught col-vs-col, CASE-in-agg, post-agg
+compose, arrow-LIKE sidestep); holes 10->8.
+SPEED WAR NEXT: Q12 4.0s / Q14 2.2s on pandas -- fast-path homes
+(CASE in the fused kernel; Q12 consumes the clock bit free).
+Enc-14 nomination gate over-wide on small ints (wart, docketed).
