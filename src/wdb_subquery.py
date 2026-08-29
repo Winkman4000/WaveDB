@@ -123,7 +123,7 @@ def has_subquery(tree):
             or any(True for _ in w.find_all(E.Exists)))
 
 
-def _exists_road(db, tree, inner, icol, ocol, rest):
+def _exists_road(db, tree, inner, icol, ocol, rest, outer_where=None, ex_node=None):
     """EXISTS over an FK road, executed as arrays: evaluate the residual
     child predicate with numpy (Column-vs-Column and Column-vs-literal
     conjuncts over typed dict values), scatter through the road sidecar,
@@ -168,6 +168,42 @@ def _exists_road(db, tree, inner, icol, ocol, rest):
             return td9[np.asarray(segc.codes(colname))]
         m9 = None
         import wdb_sql as _ws9
+        # QUARTER-FIRST (Jackson's original order): evaluate the outer's own
+        # single-column literal conjuncts, gather through the road, and let
+        # only lines of surviving parents into the scatter.
+        okeep9 = None
+        if outer_where is not None:
+            import wdb_wherescan as _WS9
+            for oc9 in _WS9._conjuncts(outer_where.this):
+                if ex_node is not None and (oc9 is ex_node or any(True for _ in oc9.find_all(E.Exists)) or any(True for _ in oc9.find_all(E.In))):
+                    continue
+                t9o = type(oc9).__name__
+                if t9o not in ('GT', 'GTE', 'LT', 'LTE', 'EQ'):
+                    continue
+                ocols9 = list(oc9.find_all(E.Column))
+                if len(ocols9) != 1 or ocols9[0].name not in db.cat.column_names(ot):
+                    continue
+                co9v = sego.cols.get(ocols9[0].name)
+                if co9v is None or co9v.get('has_null') or co9v.get('dt') not in (0, 2, 3):
+                    continue
+                tdo9 = np.asarray(sego._typed_dict(ocols9[0].name))
+                if tdo9.dtype.kind not in 'if':
+                    continue
+                lito9 = oc9.expression if isinstance(oc9.this, E.Column) else oc9.this
+                k9o = 'f' if co9v['dt'] == 2 else 'i'
+                try:
+                    v9o = _ws9._lit_for_col(sego, ocols9[0].name, lito9, k9o)
+                except Exception:
+                    continue
+                if not isinstance(v9o, (int, float, np.integer, np.floating)):
+                    continue
+                if not isinstance(oc9.this, E.Column):
+                    t9o = {'GT': 'LT', 'LT': 'GT', 'GTE': 'LTE', 'LTE': 'GTE', 'EQ': 'EQ'}[t9o]
+                op9o = {'EQ': np.equal, 'GT': np.greater, 'GTE': np.greater_equal,
+                        'LT': np.less, 'LTE': np.less_equal}[t9o]
+                vv9 = tdo9[np.asarray(sego.codes(ocols9[0].name))]
+                mo9 = op9o(vv9, v9o)
+                okeep9 = mo9 if okeep9 is None else (okeep9 & mo9)
         for cn in rest:
             cols = list(cn.find_all(E.Column))
             t9n = type(cn).__name__
@@ -217,7 +253,11 @@ def _exists_road(db, tree, inner, icol, ocol, rest):
             m9 = c9m if m9 is None else (m9 & c9m)
         if m9 is None:
             m9 = np.ones(int(segc.N), dtype=bool)
-        yes9 = np.zeros(int(sego.N), dtype=bool)
+        if m9 is None:
+            m9 = np.ones(int(segc.N), dtype=bool)
+        if okeep9 is not None:
+            m9 &= okeep9[np.asarray(ptr)]         # quarter-first: only lines of
+        yes9 = np.zeros(int(sego.N), dtype=bool)  # surviving parents scatter
         yes9[np.asarray(ptr)[m9]] = True          # idempotent scatter: no sort, no unique
         co9 = sego.cols.get(ocol)
         if co9 is None:
@@ -429,7 +469,8 @@ def rewrite(db, tree):
         else:
             sub.set('where', None)
         in_node = E.In(this=E.column(ocol), query=E.Subquery(this=sub))
-        rd9 = _exists_road(db, tree, inner, icol, ocol, rest)
+        rd9 = _exists_road(db, tree, inner, icol, ocol, rest,
+                           outer_where=tree.args.get('where'), ex_node=ex)
         if rd9 is not None:
             # THE SCATTER FORM (Jackson's Q4 walk): child residual mask in
             # arrays -> road sidecar -> unique PARENT ROWS -> the _codes
