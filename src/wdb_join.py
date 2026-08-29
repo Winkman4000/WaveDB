@@ -807,7 +807,8 @@ def _mask(df, node, R):
     if isinstance(node, E.Or): return _mask(df, node.this, R) | _mask(df, node.expression, R)
     if isinstance(node, E.Not): return ~_mask(df, node.this, R)
     if type(node) in _CMP:
-        s = df[R(node.this)]; v = _coerce_lit(s, node.expression)
+        s = df[R(node.this)]
+        v = df[R(node.expression)] if isinstance(node.expression, E.Column) else _coerce_lit(s, node.expression)
         op = {E.EQ: operator.eq, E.NEQ: operator.ne, E.GT: operator.gt,
               E.LT: operator.lt, E.GTE: operator.ge, E.LTE: operator.le}[type(node)]
         return op(s, v)
