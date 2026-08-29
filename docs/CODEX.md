@@ -365,3 +365,18 @@ serves declared-pair compares from the operator table. Remaining
 ~700ms named: the 38M-parent road scatter fires BEFORE the outer
 quarter -- Jackson's quarter-first ordering is the next strike
 (est ~400ms), then Q12 consumes the same bit on its guard fix.
+
+
+## Q4 ENDGAME (session true close): 952 -> 778 -> 354 -> 270ms EXACT
+(duck 234, 0.87x). Line-item hunt, Jackson-driven: quarter-first
+(-174); THE REBIRTH BUG (-424): fk_pointer used a stale .fkptr
+naming that never matched the .jptr birthmark regime, so the road
+re-birthed EVERY query (470ms) -- exists-road now rides the
+canonical _hash_pointer; conjunct value gathers dedup; then his
+three-scans glue FUSED (-70): child verdict AND parent gate AND
+scatter in one prange pass. Remaining vs duck ~35: outer exec
+assemble ~66 on a 3-row answer + okeep gathers (kx-LUT instead of
+td-gather, est -20) -- named, unstruck. NEXT OPENERS: Q12 guard
+fix (+ free bit consumer), Q22, median protocol, boards re-gate
+(subquery+kernels touched since last gate). fk_pointer/path_for
+stale API flagged for retirement.
