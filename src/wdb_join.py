@@ -359,7 +359,7 @@ def _descent_exec(db, tree, meta, s9, k, fseg):
         for nm, kx in fact_cns:                       # fact confirms at survivor scale
             if r.size == 0: break
             c14c = fseg.cols.get(nm)
-            if c14c is not None and c14c.get('code_enc') == 14:
+            if c14c is not None and c14c.get('code_enc') in (14, 15, 16):
                 nz14 = np.flatnonzero(kx)
                 if nz14.size and int(nz14[-1]) + 1 - int(nz14[0]) == nz14.size:
                     lo14c, hi14c = int(nz14[0]), int(nz14[-1]) + 1
@@ -1638,7 +1638,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 # non-contiguous keep (or non-14 dress) returns None and the
                 # ordinary reads serve.
                 c9p = cs9p.cols.get(cp9p)
-                if c9p is None or c9p.get('code_enc') != 14:
+                if c9p is None or c9p.get('code_enc') not in (14, 15, 16):
                     return None
                 nz9 = np.flatnonzero(kx9p)
                 if nz9.size == 0:
@@ -2064,7 +2064,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     if len(cols9) == 1 and isinstance(cn9, (E.GT, E.GTE, E.LT, E.LTE, E.EQ, E.Between)):
                         cseg9, cp9x, cptr9x = resolve(cols9[0])
                         c9x = cseg9.cols.get(cp9x)
-                        if cptr9x is None and c9x is not None and c9x.get('code_enc') == 14:
+                        if cptr9x is None and c9x is not None and c9x.get('code_enc') in (14, 15, 16):
                             td9x = np.asarray(cseg9._typed_dict(cp9x))
                             dmin9x = int(td9x[0]); dmax9x = int(td9x[-1])
                             kind9x = 'f' if c9x['dt'] == 2 else 'i'

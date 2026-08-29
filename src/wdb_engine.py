@@ -792,11 +792,47 @@ class Segment:
         else:
             cc = self._bitunpack(base, 0, self.N, bits)  # native width
         self._codes[nm] = cc; return cc
+    def _e15_band(self, nm, day_lo, day_hi):
+        """The clock dress's band test: fused per-frame decompress + civil
+        anchor + delta swing + numeric band. Serves BOTH pair columns."""
+        c = self.cols[nm]
+        if c['code_enc'] == 16:
+            anm = c['e16_partner']; role = 0
+        else:
+            anm = nm; role = 1
+        ca = self.cols[anm]
+        base = ca['cstart']; FR = ca['e15_FR']; nfr = ca['e15_nfr']; offs = ca['e15_offs']
+        st = [base]
+        for _k in range(4):
+            st.append(st[-1] + int(offs[_k][-1]))
+        out = np.empty(self.N, dtype=np.bool_)
+        import wdb_kernels as _WK15
+        def _wb(j9):
+            import zstandard as _zs15
+            dz9 = _zs15.ZstdDecompressor()
+            pls9 = []
+            for p9 in range(5):
+                a9 = st[p9] + int(offs[p9][j9]); b9 = st[p9] + int(offs[p9][j9 + 1])
+                pls9.append(np.frombuffer(dz9.decompress(self.buf[a9:b9].tobytes()), np.uint8))
+            l9 = j9 * FR
+            _WK15.e15_band_chunk(pls9[0], pls9[1], pls9[2], pls9[3], pls9[4],
+                                 role, ca['ybase'], int(day_lo), int(day_hi),
+                                 out[l9:l9 + pls9[0].size])
+        if nfr > 1:
+            from concurrent.futures import ThreadPoolExecutor as _TPb
+            with _TPb(max_workers=min(nfr, 8)) as exb:
+                list(exb.map(_wb, range(nfr)))
+        else:
+            _wb(0)
+        return out
+
     def plane_test(self, nm, day_lo, day_hi):
         """THE PLANE-TEST READ (the field-plane dress's primary consumer):
         a [day_lo, day_hi) date-range mask served straight from the y/m/d
         planes -- a lexicographic band over calendar tuples. No civil math,
         no inverse LUT, no code reconstruction. Returns a bool mask of N."""
+        if self.cols[nm].get('code_enc') in (15, 16):
+            return self._e15_band(nm, day_lo, day_hi)
         import datetime as _dt14
         cache = getattr(self, '_e14_pl', None)
         if cache is None:
