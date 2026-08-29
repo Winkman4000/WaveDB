@@ -881,10 +881,12 @@ def _mask(df, node, R):
         if isinstance(node.expression, E.Null): return df[R(node.this)].isna()
         raise NotImplementedError(f"join WHERE: Is {type(node.expression).__name__}")
     if isinstance(node, (E.Like, E.ILike)):            # LIKE that didn't fuse (e.g. high-card column)
-        s = df[R(node.this)].astype('string')
+        s = df[R(node.this)]
         rx = '^' + re.escape(str(node.expression.this)).replace('%', '.*').replace('_', '.') + '$'
         fl9 = re.DOTALL | (re.IGNORECASE if isinstance(node, E.ILike) else 0)
-        m = s.str.match(re.compile(rx, fl9), na=False)
+        rxc9 = re.compile(rx.encode() if s.dtype == object else rx, fl9)
+        arr9 = s.to_numpy()
+        m = pd.Series([v is not None and bool(rxc9.match(v)) for v in arr9], index=s.index)
         return (~m) if node.args.get('negate') else m
     raise NotImplementedError(f"join WHERE: {type(node).__name__}")
 
