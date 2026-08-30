@@ -2293,7 +2293,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     m9f = _pl_req9[0]()
                     _plane_mask9 = m9f if _plane_mask9 is None else (_plane_mask9 & m9f)
             if (_plane_mask9 is not None and group is not None and rows9 is None
-                    and not _where_spent and len(ctx['alias2t']) == 1):
+                    and not _where_spent):
                 _sv9 = np.flatnonzero(_plane_mask9)
                 if _sv9.size * 4 < _plane_mask9.size:
                     # SURVIVOR HANDOFF: the mask is selective enough that the
@@ -2302,6 +2302,19 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     rows9 = _sv9
                     n = int(rows9.size)
                     _plane_mask9 = None
+                    # keys were EXTRACTED full-width before this block: regather
+                    # the structures the kernel actually reads.
+                    group_keys = [((f9h if c9h is not None else np.asarray(f9h)[rows9]),
+                                   K9h,
+                                   (None if c9h is None else np.asarray(c9h)[rows9]))
+                                  for (f9h, K9h, c9h) in group_keys]
+                    if group_op is not None and group_op[0] == 'd':
+                        group_op = ('d', np.asarray(group_op[1])[rows9])
+                    for gk9h in gkeys:
+                        if gk9h.get('cptr') is not None:
+                            gk9h['cptr'] = np.asarray(gk9h['cptr'])[rows9]
+                        elif gk9h.get('full') is not None:
+                            gk9h['full'] = np.asarray(gk9h['full'])[rows9]
             if _bill9 is not None:
                 print('JOIN BILL: PARTITION pre-pass=%.1fms' % ((_tk9() - _pp_t9) * 1000), flush=True)
             if _plane_mask9 is not None:
