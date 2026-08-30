@@ -2293,7 +2293,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     m9f = _pl_req9[0]()
                     _plane_mask9 = m9f if _plane_mask9 is None else (_plane_mask9 & m9f)
             if (_plane_mask9 is not None and group is not None and rows9 is None
-                    and not _where_spent):
+                    and not _where_spent
+                    and os.environ.get('WDB_SURVIVOR_HANDOFF')):
                 _sv9 = np.flatnonzero(_plane_mask9)
                 if _sv9.size * 4 < _plane_mask9.size:
                     # SURVIVOR HANDOFF: the mask is selective enough that the
