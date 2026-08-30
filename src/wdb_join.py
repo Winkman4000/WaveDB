@@ -2209,7 +2209,31 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 served9 = None
                 try:
                     cols9 = list(cn9.find_all(E.Column))
-                    if len(cols9) == 1 and isinstance(cn9, (E.GT, E.GTE, E.LT, E.LTE, E.EQ, E.Between)):
+                    if (len(cols9) == 2 and isinstance(cn9, (E.GT, E.GTE, E.LT, E.LTE, E.EQ, E.NEQ))
+                            and isinstance(cn9.this, E.Column) and isinstance(cn9.expression, E.Column)):
+                        sga9, cpa9, ptra9 = resolve(cn9.this)
+                        sgb9, cpb9, ptrb9 = resolve(cn9.expression)
+                        ca9x, cb9x = sga9.cols.get(cpa9), sgb9.cols.get(cpb9)
+                        if (sga9 is sgb9 and ptra9 is None and ptrb9 is None
+                                and ca9x is not None and cb9x is not None
+                                and {ca9x.get('code_enc'), cb9x.get('code_enc')} == {15, 16}
+                                and (ca9x.get('e16_partner') in (cpb9, None))
+                                and (cb9x.get('e16_partner') in (cpa9, None))):
+                            # THE PAIR BIT ANSWERS IN THE PRED PARTITION too
+                            # (the declared clock's operator table, same as
+                            # the scatter): no reconstruction, no code slots.
+                            bit9x, dl9x = sga9.pair_bits(cpa9)
+                            t9y = type(cn9).__name__
+                            if ca9x.get('code_enc') != 15:   # left is partner: flip
+                                t9y = {'GT': 'LT', 'LT': 'GT', 'GTE': 'LTE',
+                                       'LTE': 'GTE', 'EQ': 'EQ', 'NEQ': 'NEQ'}[t9y]
+                            if t9y == 'LTE':   served9 = bit9x
+                            elif t9y == 'GT':  served9 = ~bit9x
+                            elif t9y == 'LT':  served9 = bit9x & (dl9x > 0)
+                            elif t9y == 'GTE': served9 = ~(bit9x & (dl9x > 0))
+                            elif t9y == 'EQ':  served9 = (dl9x == 0)
+                            else:              served9 = (dl9x > 0)
+                    if served9 is None and len(cols9) == 1 and isinstance(cn9, (E.GT, E.GTE, E.LT, E.LTE, E.EQ, E.Between)):
                         cseg9, cp9x, cptr9x = resolve(cols9[0])
                         c9x = cseg9.cols.get(cp9x)
                         if cptr9x is None and c9x is not None and c9x.get('code_enc') in (14, 15, 16):
