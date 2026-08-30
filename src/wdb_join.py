@@ -2076,13 +2076,14 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         if isinstance(node, E.Neg): return f"(-{build_fused(node.this)})"
         if isinstance(node, E.Column):
             bseg, bpcol, bcptr = resolve(node)
-            raw = wdb_sql.raw_dict_col(bseg, bpcol)
+            _sv14 = (bcptr is None and rows9 is not None)   # survivor slot:
+            raw = wdb_sql.raw_dict_col(bseg, bpcol, want_codes=not _sv14)   # never decode full
             if raw is None: raise _FastUnsupported
             bkey = (id(bseg), bpcol, id(bcptr) if bcptr is not None else None)
             if bkey not in slots:
                 slots[bkey] = len(slot_list)
                 _c9s = (np.asarray(bseg.codes_at(bpcol, rows9))
-                        if (bcptr is None and rows9 is not None) else
+                        if _sv14 else
                         (_rw9(raw[1]) if bcptr is None else raw[1]))
                 slot_list.append((np.ascontiguousarray(raw[0]), np.ascontiguousarray(_c9s),
                                   None if bcptr is None else np.ascontiguousarray(_rw9(bcptr))))

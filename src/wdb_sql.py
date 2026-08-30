@@ -1039,7 +1039,7 @@ def _col(seg, name):
     for k,v in enumerate(ov): lut[len(dv)+k]=v
     return lut[codes], None
 
-def raw_dict_col(seg, name):
+def raw_dict_col(seg, name, want_codes=True):
     """For a plain dict-coded NUMERIC column (no nulls, no overrides), return (base, codes) so the caller
     can defer/fuse the base[codes] decode instead of materialising it. base is float64 (dt2) or int64
     (dt0 int / dt3 datetime-epoch); codes index it per row. Returns None for anything that is not this
@@ -1054,7 +1054,7 @@ def raw_dict_col(seg, name):
         base = np.asarray(seg._typed_dict(name), dtype=np.int64)
     else:
         return None
-    return base, seg.codes(name)
+    return base, (seg.codes(name) if want_codes else None)
 
 def _parse_temporal(litstr, unit):
     return int(np.datetime64(str(litstr).replace(' ','T')).astype(f'datetime64[{unit}]').view('int64'))
