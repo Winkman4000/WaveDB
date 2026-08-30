@@ -1827,6 +1827,128 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 return [], [wdb_sql._alias(p) for p in proj]
         except Exception:
             rows9 = None; _where_spent = False
+    _plane_mask9 = None
+    _resid_c9X = None
+    # THE HOISTED PARTITION (Jackson's structural ruling): serves and the
+    # survivor handoff run BEFORE anything row-aligned exists, so keys,
+    # slots and roads are BORN at survivor scale -- no retrofits.
+    if where is not None and not _where_spent and rows9 is None:
+        try:
+            def _flatH(nH):
+                if isinstance(nH, E.Paren): return _flatH(nH.this)
+                if isinstance(nH, E.And):
+                    return _flatH(nH.this) + _flatH(nH.expression)
+                return [nH]
+            conj9 = _flatH(where.this)
+            # THE PLANE-TEST SERVE (the field-plane dress's primary consumer):
+            # date-range conjuncts on enc-14 fact columns become plane masks
+            # -- three u8 compares per row, no reconstruction -- ANDed into
+            # the kernel's mask; only the residual conjuncts compile to pred.
+            _pp_t9 = _tk9()
+            _resid_c9 = []
+            _pl_iv9 = {}
+            _pl_req9 = []
+            for cn9 in conj9:
+                served9 = None
+                try:
+                    cols9 = list(cn9.find_all(E.Column))
+                    if (len(cols9) == 2 and isinstance(cn9, (E.GT, E.GTE, E.LT, E.LTE, E.EQ, E.NEQ))
+                            and isinstance(cn9.this, E.Column) and isinstance(cn9.expression, E.Column)):
+                        sga9, cpa9, ptra9 = resolve(cn9.this)
+                        sgb9, cpb9, ptrb9 = resolve(cn9.expression)
+                        ca9x, cb9x = sga9.cols.get(cpa9), sgb9.cols.get(cpb9)
+                        if (sga9 is sgb9 and ptra9 is None and ptrb9 is None
+                                and ca9x is not None and cb9x is not None
+                                and {ca9x.get('code_enc'), cb9x.get('code_enc')} == {15, 16}
+                                and (ca9x.get('e16_partner') in (cpb9, None))
+                                and (cb9x.get('e16_partner') in (cpa9, None))):
+                            # THE PAIR BIT ANSWERS IN THE PRED PARTITION too
+                            # (the clock's operator table); banked as a
+                            # request, executed concurrently below.
+                            t9y = type(cn9).__name__
+                            if ca9x.get('code_enc') != 15:   # left is partner: flip
+                                t9y = {'GT': 'LT', 'LT': 'GT', 'GTE': 'LTE',
+                                       'LTE': 'GTE', 'EQ': 'EQ', 'NEQ': 'NEQ'}[t9y]
+                            def _pb_run9(sg9=sga9, cp9r=cpa9, t9z=t9y):
+                                bit9x, dl9x = sg9.pair_bits(cp9r)
+                                if t9z == 'LTE':   return bit9x
+                                if t9z == 'GT':    return ~bit9x
+                                if t9z == 'LT':    return bit9x & (dl9x > 0)
+                                if t9z == 'GTE':   return ~(bit9x & (dl9x > 0))
+                                if t9z == 'EQ':    return (dl9x == 0)
+                                return (dl9x > 0)
+                            _pl_req9.append(_pb_run9)
+                            served9 = True
+                    if served9 is None and len(cols9) == 1 and isinstance(cn9, (E.GT, E.GTE, E.LT, E.LTE, E.EQ, E.Between)):
+                        cseg9, cp9x, cptr9x = resolve(cols9[0])
+                        c9x = cseg9.cols.get(cp9x)
+                        if cptr9x is None and c9x is not None and c9x.get('code_enc') in (14, 15, 16):
+                            td9x = np.asarray(cseg9._typed_dict(cp9x))
+                            dmin9x = int(td9x[0]); dmax9x = int(td9x[-1])
+                            kind9x = 'f' if c9x['dt'] == 2 else 'i'
+                            if isinstance(cn9, E.Between):
+                                lo9x = int(wdb_sql._lit_for_col(cseg9, cp9x, cn9.args['low'], kind9x))
+                                hi9x = int(wdb_sql._lit_for_col(cseg9, cp9x, cn9.args['high'], kind9x)) + 1
+                            else:
+                                left9x = isinstance(cn9.this, E.Column)
+                                lit9x = cn9.args.get('expression') if left9x else cn9.this
+                                v9x = int(wdb_sql._lit_for_col(cseg9, cp9x, lit9x, kind9x))
+                                t9x = type(cn9) if left9x else {E.GT: E.LT, E.LT: E.GT,
+                                                                E.GTE: E.LTE, E.LTE: E.GTE,
+                                                                E.EQ: E.EQ}[type(cn9)]
+                                if t9x is E.GTE: lo9x, hi9x = v9x, dmax9x + 1
+                                elif t9x is E.GT: lo9x, hi9x = v9x + 1, dmax9x + 1
+                                elif t9x is E.LT: lo9x, hi9x = dmin9x, v9x
+                                elif t9x is E.LTE: lo9x, hi9x = dmin9x, v9x + 1
+                                else: lo9x, hi9x = v9x, v9x + 1
+                            if lo9x < dmin9x: lo9x = dmin9x
+                            if hi9x > dmax9x + 1: hi9x = dmax9x + 1
+                            k9iv = (id(cseg9), cp9x)
+                            if k9iv in _pl_iv9:
+                                s9o, l9o, h9o = _pl_iv9[k9iv]
+                                _pl_iv9[k9iv] = (s9o, max(l9o, lo9x), min(h9o, hi9x))
+                            else:
+                                _pl_iv9[k9iv] = (cseg9, lo9x, hi9x)
+                            served9 = True                 # interval banked; tested fused below
+                except _FastUnsupported:
+                    served9 = None
+                except Exception:
+                    served9 = None
+                if served9 is None:
+                    _resid_c9.append(cn9)
+            for (_sg9, _cp9), (cseg9f, lo9f, hi9f) in list(_pl_iv9.items()):
+                if lo9f >= hi9f:
+                    _pl_req9.append(lambda n9=int(cseg9f.N): np.zeros(n9, dtype=bool))
+                else:
+                    _pl_req9.append(lambda c9z=cseg9f, p9z=_cp9, a9z=lo9f, b9z=hi9f:
+                                    c9z.plane_test(p9z, a9z, b9z))
+            if _pl_req9:
+                # SHADOW SCHEDULING (Jackson's law): fixed-cost serves cannot
+                # be reduced, so they run FIRST and TOGETHER -- the cheap
+                # serves finish inside the heaviest serve's shadow.
+                if len(_pl_req9) > 1:
+                    from concurrent.futures import ThreadPoolExecutor as _TPq
+                    with _TPq(max_workers=min(len(_pl_req9), 4)) as exq9:
+                        for m9f in exq9.map(lambda f9: f9(), _pl_req9):
+                            _plane_mask9 = m9f if _plane_mask9 is None else (_plane_mask9 & m9f)
+                else:
+                    m9f = _pl_req9[0]()
+                    _plane_mask9 = m9f if _plane_mask9 is None else (_plane_mask9 & m9f)
+            if (_plane_mask9 is not None and group is not None and rows9 is None
+                    and not _where_spent):
+                _sv9 = np.flatnonzero(_plane_mask9)
+                if _sv9.size * 4 < _plane_mask9.size:
+                    # SURVIVOR HANDOFF: the mask is selective enough that the
+                    # per-row leftovers (slots, keys, pred, kernel) all run at
+                    # survivor scale through the existing rows9 plumbing.
+                    rows9 = _sv9
+                    n = int(rows9.size)
+                    _plane_mask9 = None
+            if _bill9 is not None:
+                print('JOIN BILL: PARTITION pre-pass=%.1fms' % ((_tk9() - _pp_t9) * 1000), flush=True)
+            _resid_c9X = _resid_c9
+        except Exception:
+            _plane_mask9 = None; _resid_c9X = None; rows9 = None
     def _rw9(a):
         return a if (rows9 is None or a is None) else np.asarray(a)[rows9]
     gkeys = []                                           # one per GROUP BY column
@@ -2198,128 +2320,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     pass
                 return prune / cost
             conj9 = _flat9(where.this)
-            # THE PLANE-TEST SERVE (the field-plane dress's primary consumer):
-            # date-range conjuncts on enc-14 fact columns become plane masks
-            # -- three u8 compares per row, no reconstruction -- ANDed into
-            # the kernel's mask; only the residual conjuncts compile to pred.
-            _pp_t9 = _tk9()
-            _resid_c9 = []
-            _pl_iv9 = {}
-            _pl_req9 = []
-            for cn9 in conj9:
-                served9 = None
-                try:
-                    cols9 = list(cn9.find_all(E.Column))
-                    if (len(cols9) == 2 and isinstance(cn9, (E.GT, E.GTE, E.LT, E.LTE, E.EQ, E.NEQ))
-                            and isinstance(cn9.this, E.Column) and isinstance(cn9.expression, E.Column)):
-                        sga9, cpa9, ptra9 = resolve(cn9.this)
-                        sgb9, cpb9, ptrb9 = resolve(cn9.expression)
-                        ca9x, cb9x = sga9.cols.get(cpa9), sgb9.cols.get(cpb9)
-                        if (sga9 is sgb9 and ptra9 is None and ptrb9 is None
-                                and ca9x is not None and cb9x is not None
-                                and {ca9x.get('code_enc'), cb9x.get('code_enc')} == {15, 16}
-                                and (ca9x.get('e16_partner') in (cpb9, None))
-                                and (cb9x.get('e16_partner') in (cpa9, None))):
-                            # THE PAIR BIT ANSWERS IN THE PRED PARTITION too
-                            # (the clock's operator table); banked as a
-                            # request, executed concurrently below.
-                            t9y = type(cn9).__name__
-                            if ca9x.get('code_enc') != 15:   # left is partner: flip
-                                t9y = {'GT': 'LT', 'LT': 'GT', 'GTE': 'LTE',
-                                       'LTE': 'GTE', 'EQ': 'EQ', 'NEQ': 'NEQ'}[t9y]
-                            def _pb_run9(sg9=sga9, cp9r=cpa9, t9z=t9y):
-                                bit9x, dl9x = sg9.pair_bits(cp9r)
-                                if t9z == 'LTE':   return bit9x
-                                if t9z == 'GT':    return ~bit9x
-                                if t9z == 'LT':    return bit9x & (dl9x > 0)
-                                if t9z == 'GTE':   return ~(bit9x & (dl9x > 0))
-                                if t9z == 'EQ':    return (dl9x == 0)
-                                return (dl9x > 0)
-                            _pl_req9.append(_pb_run9)
-                            served9 = True
-                    if served9 is None and len(cols9) == 1 and isinstance(cn9, (E.GT, E.GTE, E.LT, E.LTE, E.EQ, E.Between)):
-                        cseg9, cp9x, cptr9x = resolve(cols9[0])
-                        c9x = cseg9.cols.get(cp9x)
-                        if cptr9x is None and c9x is not None and c9x.get('code_enc') in (14, 15, 16):
-                            td9x = np.asarray(cseg9._typed_dict(cp9x))
-                            dmin9x = int(td9x[0]); dmax9x = int(td9x[-1])
-                            kind9x = 'f' if c9x['dt'] == 2 else 'i'
-                            if isinstance(cn9, E.Between):
-                                lo9x = int(wdb_sql._lit_for_col(cseg9, cp9x, cn9.args['low'], kind9x))
-                                hi9x = int(wdb_sql._lit_for_col(cseg9, cp9x, cn9.args['high'], kind9x)) + 1
-                            else:
-                                left9x = isinstance(cn9.this, E.Column)
-                                lit9x = cn9.args.get('expression') if left9x else cn9.this
-                                v9x = int(wdb_sql._lit_for_col(cseg9, cp9x, lit9x, kind9x))
-                                t9x = type(cn9) if left9x else {E.GT: E.LT, E.LT: E.GT,
-                                                                E.GTE: E.LTE, E.LTE: E.GTE,
-                                                                E.EQ: E.EQ}[type(cn9)]
-                                if t9x is E.GTE: lo9x, hi9x = v9x, dmax9x + 1
-                                elif t9x is E.GT: lo9x, hi9x = v9x + 1, dmax9x + 1
-                                elif t9x is E.LT: lo9x, hi9x = dmin9x, v9x
-                                elif t9x is E.LTE: lo9x, hi9x = dmin9x, v9x + 1
-                                else: lo9x, hi9x = v9x, v9x + 1
-                            if lo9x < dmin9x: lo9x = dmin9x
-                            if hi9x > dmax9x + 1: hi9x = dmax9x + 1
-                            k9iv = (id(cseg9), cp9x)
-                            if k9iv in _pl_iv9:
-                                s9o, l9o, h9o = _pl_iv9[k9iv]
-                                _pl_iv9[k9iv] = (s9o, max(l9o, lo9x), min(h9o, hi9x))
-                            else:
-                                _pl_iv9[k9iv] = (cseg9, lo9x, hi9x)
-                            served9 = True                 # interval banked; tested fused below
-                except _FastUnsupported:
-                    served9 = None
-                except Exception:
-                    served9 = None
-                if served9 is None:
-                    _resid_c9.append(cn9)
-            for (_sg9, _cp9), (cseg9f, lo9f, hi9f) in list(_pl_iv9.items()):
-                if lo9f >= hi9f:
-                    _pl_req9.append(lambda n9=int(cseg9f.N): np.zeros(n9, dtype=bool))
-                else:
-                    _pl_req9.append(lambda c9z=cseg9f, p9z=_cp9, a9z=lo9f, b9z=hi9f:
-                                    c9z.plane_test(p9z, a9z, b9z))
-            if _pl_req9:
-                # SHADOW SCHEDULING (Jackson's law): fixed-cost serves cannot
-                # be reduced, so they run FIRST and TOGETHER -- the cheap
-                # serves finish inside the heaviest serve's shadow.
-                if len(_pl_req9) > 1:
-                    from concurrent.futures import ThreadPoolExecutor as _TPq
-                    with _TPq(max_workers=min(len(_pl_req9), 4)) as exq9:
-                        for m9f in exq9.map(lambda f9: f9(), _pl_req9):
-                            _plane_mask9 = m9f if _plane_mask9 is None else (_plane_mask9 & m9f)
-                else:
-                    m9f = _pl_req9[0]()
-                    _plane_mask9 = m9f if _plane_mask9 is None else (_plane_mask9 & m9f)
-            if (_plane_mask9 is not None and group is not None and rows9 is None
-                    and not _where_spent
-                    and os.environ.get('WDB_SURVIVOR_HANDOFF')):
-                _sv9 = np.flatnonzero(_plane_mask9)
-                if _sv9.size * 4 < _plane_mask9.size:
-                    # SURVIVOR HANDOFF: the mask is selective enough that the
-                    # per-row leftovers (slots, keys, pred, kernel) all run at
-                    # survivor scale through the existing rows9 plumbing.
-                    rows9 = _sv9
-                    n = int(rows9.size)
-                    _plane_mask9 = None
-                    # keys were EXTRACTED full-width before this block: regather
-                    # the structures the kernel actually reads.
-                    group_keys = [((f9h if c9h is not None else np.asarray(f9h)[rows9]),
-                                   K9h,
-                                   (None if c9h is None else np.asarray(c9h)[rows9]))
-                                  for (f9h, K9h, c9h) in group_keys]
-                    if group_op is not None and group_op[0] == 'd':
-                        group_op = ('d', np.asarray(group_op[1])[rows9])
-                    for gk9h in gkeys:
-                        if gk9h.get('cptr') is not None:
-                            gk9h['cptr'] = np.asarray(gk9h['cptr'])[rows9]
-                        elif gk9h.get('full') is not None:
-                            gk9h['full'] = np.asarray(gk9h['full'])[rows9]
-            if _bill9 is not None:
-                print('JOIN BILL: PARTITION pre-pass=%.1fms' % ((_tk9() - _pp_t9) * 1000), flush=True)
-            if _plane_mask9 is not None or rows9 is not None:
-                conj9 = _resid_c9
+            if _resid_c9X is not None:
+                conj9 = _resid_c9X
             if _plane_mask9 is not None and not conj9:
                 pred_body = None
             elif len(conj9) > 1:
