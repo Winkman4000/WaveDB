@@ -2975,7 +2975,20 @@ def _build_chain(db, tree, allow_hash=True):
                     p = _hash_pointer(db, alias2t[child_a], fk_col[1], seg_of[child_a],
                                       alias2t[parent_a], fk_col[2], seg_of[parent_a])
                 else:
-                    p = db.fk_pointer(sp_of[child_a], fk_col)
+                    # THE CANONICAL ROAD FIRST (fk_pointer/path_for retired as
+                    # the routing default): the legacy zstd .fkptr sidecar costs
+                    # 480ms of decompress+cumsum after every qmem flush; the
+                    # birthmarked .jptr road is mmap'd (and RAM-pinned) once.
+                    p = None
+                    try:
+                        fkm9 = (db.cat.fk_pointers(alias2t[child_a]) or {}).get(fk_col)
+                        if isinstance(fkm9, dict) and fkm9.get('parent_key'):
+                            p = _hash_pointer(db, alias2t[child_a], fk_col, seg_of[child_a],
+                                              alias2t[parent_a], fkm9['parent_key'], seg_of[parent_a])
+                    except Exception:
+                        p = None
+                    if p is None:
+                        p = db.fk_pointer(sp_of[child_a], fk_col)
                 if p is None: raise _FastUnsupported
                 cc = composed[child_a]
                 edge_ptrs[parent_a] = (child_a, p)       # child-scale road, kept for the downhill flow
