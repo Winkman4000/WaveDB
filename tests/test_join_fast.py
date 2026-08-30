@@ -18,6 +18,7 @@ def _fixture():
     _CON = duckdb.connect(); _CON.execute("INSTALL tpch; LOAD tpch; CALL dbgen(sf=0.01)")
     d = os.path.join(tempfile.gettempdir(), f'joinfast_{uuid.uuid4().hex[:8]}')
     _DB = Database.create(d)
+    import helpers as _H; _H.register_dir(d)
     order = {'region':'r_regionkey','nation':'n_nationkey','customer':'c_custkey','orders':'o_orderkey','lineitem':'l_orderkey'}
     for tbl in ('region','nation','customer','orders','lineitem'):
         desc = _CON.execute(f"DESCRIBE {tbl}").fetchall()

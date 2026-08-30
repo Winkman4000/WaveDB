@@ -9,19 +9,22 @@ TMP = tempfile.gettempdir()
 _files = []
 
 
+_dirs = []
+
+
+def register_dir(d):
+    """Fixture dirs register here; ONLY this process's temps are removed at
+    exit (a glob-based sweep once deleted a concurrent suite's live fixture)."""
+    _dirs.append(d)
+
+
 def _cleanup_temps():
-    """The suite leaked ~3GB/day of wt_* temps into /tmp (2026-08-30);
-    every temp registered here (and every wt_*/fixture dir) dies at exit."""
-    import glob as _g, shutil as _sh
+    import shutil as _sh
     for f in _files:
         try: os.remove(f)
         except Exception: pass
-    for pat in ('wt_*.parquet', 'wt_*.wdb', 'wt_*.wdb.*', 'joinfast_*', 'pairdb_*'):
-        for p in _g.glob(os.path.join(TMP, pat)):
-            try:
-                if os.path.isdir(p): _sh.rmtree(p, ignore_errors=True)
-                else: os.remove(p)
-            except Exception: pass
+    for d in _dirs:
+        _sh.rmtree(d, ignore_errors=True)
 
 
 import atexit as _atexit

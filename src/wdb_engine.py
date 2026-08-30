@@ -893,8 +893,9 @@ class Segment:
         # ONE decompression -- the band loads the cached streams (paying for
         # them exactly once per query) and later consumers ride free.
         Y5, M5, D5, DL5, BB5 = self._e15_streams(anm)
-        _WK15.e15_band_from_streams(Y5, M5, D5, DL5, BB5, role,
-                                    ca['ybase'], day_lo, day_hi, out)
+        ystart, mcum = self._civil_luts(ca['ybase'])
+        _WK15.e15_band_lut(Y5, M5, D5, DL5, BB5, role, ystart, mcum,
+                           day_lo, day_hi, out)
         return out
         def _wb(j9):
             import zstandard as _zs15
@@ -942,6 +943,24 @@ class Segment:
             a = (c.get('czlen') or 0) * MSPB
             b = 2e-6
         return a + b * float(n)
+
+    def _civil_luts(self, ybase):
+        """ystart[k] = epoch-day of Jan 1 of (ybase+k), k in 0..257;
+        mcum[m] = non-leap cumulative days before month m (1-based)."""
+        luts = getattr(self, '_civil_lut_cache', None)
+        if luts is None:
+            luts = self._civil_lut_cache = {}
+        got = luts.get(ybase)
+        if got is not None:
+            return got
+        import datetime as _dt
+        ep = _dt.date(1970, 1, 1)
+        ystart = np.array([(_dt.date(ybase + k, 1, 1) - ep).days for k in range(258)],
+                          dtype=np.int64)
+        mcum = np.array([0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334],
+                        dtype=np.int64)        # 0-based months, non-leap
+        luts[ybase] = (ystart, mcum)
+        return luts[ybase]
 
     def _e14_inv_of(self, nm):
         """The inverse day->code LUT for a date-dressed column, cached."""

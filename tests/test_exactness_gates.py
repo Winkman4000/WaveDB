@@ -33,6 +33,7 @@ def _pair_fixture():
     d0 = os.path.dirname(db0.cat.segment_paths('lineitem')[0])
     d = os.path.join(tempfile.gettempdir(), f'pairdb_{uuid.uuid4().hex[:8]}')
     _PDB = Database.create(d)
+    import helpers as _H; _H.register_dir(d)
     desc = con.execute("DESCRIBE lineitem").fetchall()
     _PDB.cat.add_table('lineitem', [[c[0], TJF._wt(c[1])] for c in desc])
     seg = 'lineitem_0.wdb'
