@@ -1927,13 +1927,17 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 # conjuncts on dressed fact columns will need their streams at
                 # survivor scale -- decompress them NOW, inside the wall's shadow,
                 # where they cost ~nothing. Returns None (not a mask).
-                for cnr9 in _resid_c9:
+                for cnr9 in list(_resid_c9) + list(proj):
                     for colr9 in cnr9.find_all(E.Column):
                         try:
                             sgr9, cpr9, ptrr9 = resolve(colr9)
                         except Exception:
                             continue
-                        cr9 = sgr9.cols.get(cpr9) if ptrr9 is None else None
+                        if ptrr9 is not None:            # parent column: warm its codes
+                            if cpr9 not in sgr9._codes:
+                                _pl_req9.append(lambda sg=sgr9, cp=cpr9: (sg.codes(cp), None)[1])
+                            continue
+                        cr9 = sgr9.cols.get(cpr9)
                         if cr9 is None or cpr9 in sgr9._codes:
                             continue
                         er9 = cr9.get('code_enc')

@@ -3199,3 +3199,17 @@ def e15_band_from_streams(Y, M, D, DL, BB, role, ybase, lo, hi, out):
         if b != role:
             days += np.int64(DL[i])
         out[i] = (days >= lo) and (days < hi)
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def pk_gather(buf, bits, rows, out):
+    """enc-17 codes AT ROWS: direct bit arithmetic, 1:1 granularity."""
+    mask = (np.int64(1) << bits) - 1
+    n = rows.shape[0]
+    for j in prange(n):
+        bitpos = np.int64(rows[j]) * bits
+        b = bitpos >> 3
+        sh = bitpos & 7
+        w = (np.int64(buf[b]) | (np.int64(buf[b + 1]) << 8)
+             | (np.int64(buf[b + 2]) << 16))
+        out[j] = (w >> sh) & mask

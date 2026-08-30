@@ -1663,6 +1663,13 @@ class Segment:
         if rows.size == 0:
             return np.empty(0, dtype=np.int64)
         c = self.cols[nm]
+        if c.get('code_enc') == 17 and nm not in self._codes:
+            # RAW PACKED: direct bit gather at rows, no full unpack
+            out17 = np.empty(rows.size, dtype=np.int64)
+            import wdb_kernels as _WKp
+            _WKp.pk_gather(np.asarray(self.buf[c['cstart']:c['cstart'] + c['czlen']]),
+                           c['pk_bits'], rows, out17)
+            return out17
         if c.get('code_enc') == 14 and nm not in self._codes:
             # SURVIVOR READ (the cascade's prerequisite organ): streams once
             # (query-cached), civil math + LUT only at the asked rows.
