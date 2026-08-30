@@ -2755,6 +2755,13 @@ def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
                     'ck': cp, 'pk': pp}
         except Exception:
             side = None
+        if side and _os.path.exists(side + '.mark') and not _os.path.exists(side):
+            # FAIL LOUD: a birthmark without its body is a lie -- remove it so the
+            # rebirth below persists cleanly (a 480MB road was rehashing every
+            # query for a day behind an orphan mark, 2026-08-30).
+            print('ROAD: orphan birthmark without body, removing: %s' % side, flush=True)
+            try: _os.remove(side + '.mark')
+            except Exception: pass
         if side and _os.path.exists(side) and _os.path.exists(side + '.mark'):
             try:
                 # THE BIRTHMARK (plist regime): the sidecar names BOTH parents'
