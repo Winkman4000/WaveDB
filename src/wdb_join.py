@@ -1969,6 +1969,55 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             return f"({float(v)})" if ('.' in v or 'e' in v.lower()) else f"({int(v)})"
         if type(node) in _ARITH_STR:
             return f"({build_fused(node.this)} {_ARITH_STR[type(node)]} {build_fused(node.expression)})"
+        if isinstance(node, E.Case):
+            # CASE in the FUSED KERNEL (Q12's home): the condition compiles to
+            # a truthy sub-expression (string trees ride _code_lut as a 0/1
+            # value slot; numeric compares inline), branches are ordinary
+            # fused exprs, and the whole thing is a numba conditional.
+            ifs9 = node.args.get('ifs', [])
+            if node.this is not None or not ifs9:
+                raise _FastUnsupported             # simple CASE x WHEN: not yet
+            d9 = node.args.get('default')
+            out9 = build_fused(d9) if d9 is not None else '(0)'
+            for br9 in reversed(ifs9):
+                cnd9 = _cond_fused(br9.this)
+                tv9 = build_fused(br9.args['true'])
+                out9 = f"(({tv9}) if ({cnd9}) else ({out9}))"
+            return out9
+        raise _FastUnsupported
+
+    def _cond_fused(cond):
+        """Compile a CASE condition to a fused truthy expression."""
+        if isinstance(cond, E.Paren):
+            return _cond_fused(cond.this)
+        if isinstance(cond, E.And):
+            return f"(({_cond_fused(cond.this)}) and ({_cond_fused(cond.expression)}))"
+        if isinstance(cond, E.Or):
+            return f"(({_cond_fused(cond.this)}) or ({_cond_fused(cond.expression)}))"
+        if isinstance(cond, E.Not):
+            return f"(not ({_cond_fused(cond.this)}))"
+        cols9 = list(cond.find_all(E.Column))
+        if cols9 and len({(c.table, c.name) for c in cols9}) == 1:
+            cseg9, cp9, cptr9 = resolve(cols9[0])
+            if cseg9.cols[cp9].get('dt') == 1:     # one string column: the LUT road
+                def _ev9(nd, vb):
+                    if isinstance(nd, E.Paren): return _ev9(nd.this, vb)
+                    if isinstance(nd, E.Or): return _ev9(nd.this, vb) or _ev9(nd.expression, vb)
+                    if isinstance(nd, E.And): return _ev9(nd.this, vb) and _ev9(nd.expression, vb)
+                    if isinstance(nd, E.Not): return not _ev9(nd.this, vb)
+                    if isinstance(nd, (E.EQ, E.NEQ)):
+                        lit9 = nd.expression if isinstance(nd.this, E.Column) else nd.this
+                        r9 = (vb == _lit_bytes(cseg9, cp9, lit9))
+                        return r9 if isinstance(nd, E.EQ) else (not r9)
+                    if isinstance(nd, E.In):
+                        return vb in [_lit_bytes(cseg9, cp9, x) for x in nd.expressions]
+                    if isinstance(nd, (E.Like, E.ILike)):
+                        return _like_fn(cseg9, cp9, nd.expression, isinstance(nd, E.ILike))(vb)
+                    raise _FastUnsupported
+                vk9 = _code_lut(cseg9, cp9, cptr9, lambda vb: _ev9(cond, vb))
+                return f"({vk9} != 0)"
+        if type(cond) in _CMP_STR:                 # numeric compare inline
+            return f"({build_fused(cond.this)} {_CMP_STR[type(cond)]} {build_fused(cond.expression)})"
         raise _FastUnsupported
 
     _CMP_STR = {E.GT: '>', E.LT: '<', E.GTE: '>=', E.LTE: '<=', E.EQ: '==', E.NEQ: '!='}
