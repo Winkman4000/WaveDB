@@ -889,6 +889,13 @@ class Segment:
             st.append(st[-1] + int(offs[_k][-1]))
         out = np.empty(self.N, dtype=np.bool_)
         import wdb_kernels as _WK15
+        # SIBLING SHARE (Jackson's walk): every clock consumer drinks from
+        # ONE decompression -- the band loads the cached streams (paying for
+        # them exactly once per query) and later consumers ride free.
+        Y5, M5, D5, DL5, BB5 = self._e15_streams(anm)
+        _WK15.e15_band_from_streams(Y5, M5, D5, DL5, BB5, role,
+                                    ca['ybase'], day_lo, day_hi, out)
+        return out
         def _wb(j9):
             import zstandard as _zs15
             dz9 = _zs15.ZstdDecompressor()

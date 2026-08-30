@@ -3176,3 +3176,26 @@ def e15_reconstruct_at(Y, M, D, DL, BB, rows, role, ybase, inv, dmin, out):
         if b != role:
             days += np.int64(DL[i])
         out[j] = inv[days - dmin]
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def e15_band_from_streams(Y, M, D, DL, BB, role, ybase, lo, hi, out):
+    """Clock band over ALREADY-DECOMPRESSED streams (the sibling share)."""
+    n = out.shape[0]
+    for i in prange(n):
+        mm = np.int64(M[i])
+        y = np.int64(ybase) + np.int64(Y[i])
+        if mm <= 1:
+            y -= 1
+        if y >= 0:
+            era = y // 400
+        else:
+            era = (y - 399) // 400
+        yoe = y - era * 400
+        mp = (mm + 10) % 12
+        doe = yoe * 365 + yoe // 4 - yoe // 100 + (153 * mp + 2) // 5 + np.int64(D[i])
+        days = era * 146097 + doe - 719468
+        b = (BB[i >> 3] >> (7 - (i & 7))) & 1
+        if b != role:
+            days += np.int64(DL[i])
+        out[i] = (days >= lo) and (days < hi)
