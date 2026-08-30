@@ -405,3 +405,25 @@ compose, arrow-LIKE sidestep); holes 10->8.
 SPEED WAR NEXT: Q12 4.0s / Q14 2.2s on pandas -- fast-path homes
 (CASE in the fused kernel; Q12 consumes the clock bit free).
 Enc-14 nomination gate over-wide on small ints (wart, docketed).
+
+
+## THE ADAPTIVE CASCADE DAY (2026-08-31): Q6 CROWNED — CAMPAIGN FIRST
+Jackson's session, three rulings forged into the pred door:
+(1) COUNT/GROUP-SURVIVORS is its own query class -- every conjunct
+must run; potency ORDERS work, it cannot skip it; (2) potency
+recalculates per stage (conjuncts correlate) with a TWO-TERM cost
+model -- fixed-cost serves cannot be reduced so they go FIRST;
+(3) SHADOW SCHEDULING: the clock band fans out only 5.4x of 16
+cores, so cheap serves run CONCURRENTLY inside its shadow
+(measured: 3 serves, 300ms serial -> 164 concurrent). Plus CASE in
+the fused kernel (string conds ride _code_lut as 0/1 slots) and
+the pair bit serving in the pred partition (third bit consumer).
+Q12: 4,763 -> 972 exact. AND THE CROWNS: Q6 148ms 1.11x -- THE
+ORIGIN QUERY BEATS DUCK, first time ever; Q3 250ms 1.13x best
+ever. MEASURED EN ROUTE: receipt-year on the clock is STREAM-BOUND
+(~182 floor in-dress; the byte-scan year exists only where a
+column owns its y-plane); survivor-scale clock read docketed.
+DOCKETED: the JOIN-shape survivor handoff (group scramble; suite
+q12-clause is its gate); a declared-pair col-vs-col suite test
+(the mask-drop passed the suite, caught only by pod exactness);
+sibling fusion (bit+band share streams, ~45ms); boards re-gate.
