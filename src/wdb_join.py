@@ -2205,6 +2205,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             _pp_t9 = _tk9()
             _resid_c9 = []
             _pl_iv9 = {}
+            _pl_req9 = []
             for cn9 in conj9:
                 served9 = None
                 try:
@@ -2220,20 +2221,21 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                                 and (ca9x.get('e16_partner') in (cpb9, None))
                                 and (cb9x.get('e16_partner') in (cpa9, None))):
                             # THE PAIR BIT ANSWERS IN THE PRED PARTITION too
-                            # (the declared clock's operator table, same as
-                            # the scatter): no reconstruction, no code slots.
-                            bit9x, dl9x = sga9.pair_bits(cpa9)
+                            # (the clock's operator table); banked as a
+                            # request, executed concurrently below.
                             t9y = type(cn9).__name__
                             if ca9x.get('code_enc') != 15:   # left is partner: flip
                                 t9y = {'GT': 'LT', 'LT': 'GT', 'GTE': 'LTE',
                                        'LTE': 'GTE', 'EQ': 'EQ', 'NEQ': 'NEQ'}[t9y]
-                            if t9y == 'LTE':   served9 = bit9x
-                            elif t9y == 'GT':  served9 = ~bit9x
-                            elif t9y == 'LT':  served9 = bit9x & (dl9x > 0)
-                            elif t9y == 'GTE': served9 = ~(bit9x & (dl9x > 0))
-                            elif t9y == 'EQ':  served9 = (dl9x == 0)
-                            else:              served9 = (dl9x > 0)
-                            _plane_mask9 = served9 if _plane_mask9 is None else (_plane_mask9 & served9)
+                            def _pb_run9(sg9=sga9, cp9r=cpa9, t9z=t9y):
+                                bit9x, dl9x = sg9.pair_bits(cp9r)
+                                if t9z == 'LTE':   return bit9x
+                                if t9z == 'GT':    return ~bit9x
+                                if t9z == 'LT':    return bit9x & (dl9x > 0)
+                                if t9z == 'GTE':   return ~(bit9x & (dl9x > 0))
+                                if t9z == 'EQ':    return (dl9x == 0)
+                                return (dl9x > 0)
+                            _pl_req9.append(_pb_run9)
                             served9 = True
                     if served9 is None and len(cols9) == 1 and isinstance(cn9, (E.GT, E.GTE, E.LT, E.LTE, E.EQ, E.Between)):
                         cseg9, cp9x, cptr9x = resolve(cols9[0])
@@ -2274,10 +2276,32 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     _resid_c9.append(cn9)
             for (_sg9, _cp9), (cseg9f, lo9f, hi9f) in list(_pl_iv9.items()):
                 if lo9f >= hi9f:
-                    m9f = np.zeros(int(cseg9f.N), dtype=bool)
+                    _pl_req9.append(lambda n9=int(cseg9f.N): np.zeros(n9, dtype=bool))
                 else:
-                    m9f = cseg9f.plane_test(_cp9, lo9f, hi9f)
-                _plane_mask9 = m9f if _plane_mask9 is None else (_plane_mask9 & m9f)
+                    _pl_req9.append(lambda c9z=cseg9f, p9z=_cp9, a9z=lo9f, b9z=hi9f:
+                                    c9z.plane_test(p9z, a9z, b9z))
+            if _pl_req9:
+                # SHADOW SCHEDULING (Jackson's law): fixed-cost serves cannot
+                # be reduced, so they run FIRST and TOGETHER -- the cheap
+                # serves finish inside the heaviest serve's shadow.
+                if len(_pl_req9) > 1:
+                    from concurrent.futures import ThreadPoolExecutor as _TPq
+                    with _TPq(max_workers=min(len(_pl_req9), 4)) as exq9:
+                        for m9f in exq9.map(lambda f9: f9(), _pl_req9):
+                            _plane_mask9 = m9f if _plane_mask9 is None else (_plane_mask9 & m9f)
+                else:
+                    m9f = _pl_req9[0]()
+                    _plane_mask9 = m9f if _plane_mask9 is None else (_plane_mask9 & m9f)
+            if (_plane_mask9 is not None and group is not None and rows9 is None
+                    and not _where_spent and len(ctx['alias2t']) == 1):
+                _sv9 = np.flatnonzero(_plane_mask9)
+                if _sv9.size * 4 < _plane_mask9.size:
+                    # SURVIVOR HANDOFF: the mask is selective enough that the
+                    # per-row leftovers (slots, keys, pred, kernel) all run at
+                    # survivor scale through the existing rows9 plumbing.
+                    rows9 = _sv9
+                    n = int(rows9.size)
+                    _plane_mask9 = None
             if _bill9 is not None:
                 print('JOIN BILL: PARTITION pre-pass=%.1fms' % ((_tk9() - _pp_t9) * 1000), flush=True)
             if _plane_mask9 is not None:
