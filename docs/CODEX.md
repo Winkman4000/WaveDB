@@ -427,3 +427,22 @@ DOCKETED: the JOIN-shape survivor handoff (group scramble; suite
 q12-clause is its gate); a declared-pair col-vs-col suite test
 (the mask-drop passed the suite, caught only by pod exactness);
 sibling fusion (bit+band share streams, ~45ms); boards re-gate.
+
+
+## THE TWO-CASCADE SESSION (2026-08-31 pm): LAWS BANKED, HOIST REVERTED
+Jackson's session. BANKED SUITE-GREEN: THE SURVIVOR READ (codes_at
+on enc-14/15/16 = streams-once + math-at-rows; every consumer
+silently faster) · THE COST CURVE (cost_of(nm,n)=a+b*n from stored
+bytes x calibrated family rates; zero-ms plans) · served-conjunct
+gate fix · concurrent serves live. LAWS RATIFIED, AWAITING THE
+STRUCTURE: the SHADOW ADMISSION LAW (join shadow iff max(0,F-W)<V)
+and TWO FORMAL CASCADES (selection vs count/group-survivors).
+THE HOIST (attempt 1, tools/hoist_attempt1.py): partition+handoff
+moved before gkeys so keys are BORN at survivor scale; q12-clause
+PASSED on joins; REVERTED because Q6 (scalar, single-table) went
+exact=False -- the scalar flow disturbed. CLUE: suite passed with
+the wrongness; scalar+plane-serve exactness is coverage gap #2
+(gap #1: declared-pair col-vs-col). NEXT SESSION OPENER: two suite
+exactness tests FIRST, then hoist attempt 2 hunting the scalar
+disturbance, then the admission scheduler on the curves.
+Q12 floor ~210 stands: needs hoisted handoff + sibling fusion.
