@@ -2318,7 +2318,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                             gk9h['full'] = np.asarray(gk9h['full'])[rows9]
             if _bill9 is not None:
                 print('JOIN BILL: PARTITION pre-pass=%.1fms' % ((_tk9() - _pp_t9) * 1000), flush=True)
-            if _plane_mask9 is not None:
+            if _plane_mask9 is not None or rows9 is not None:
                 conj9 = _resid_c9
             if _plane_mask9 is not None and not conj9:
                 pred_body = None
