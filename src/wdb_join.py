@@ -1923,6 +1923,30 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     _pl_req9.append(lambda c9z=cseg9f, p9z=_cp9, a9z=lo9f, b9z=hi9f:
                                     c9z.plane_test(p9z, a9z, b9z))
             if _pl_req9:
+                # ADMISSION OF LOADS (Jackson's law applied to reads): residual
+                # conjuncts on dressed fact columns will need their streams at
+                # survivor scale -- decompress them NOW, inside the wall's shadow,
+                # where they cost ~nothing. Returns None (not a mask).
+                for cnr9 in _resid_c9:
+                    for colr9 in cnr9.find_all(E.Column):
+                        try:
+                            sgr9, cpr9, ptrr9 = resolve(colr9)
+                        except Exception:
+                            continue
+                        cr9 = sgr9.cols.get(cpr9) if ptrr9 is None else None
+                        if cr9 is None or cpr9 in sgr9._codes:
+                            continue
+                        er9 = cr9.get('code_enc')
+                        if er9 == 14:
+                            def _warm14(sg=sgr9, cp=cpr9):
+                                cache = getattr(sg, '_e14_pl', None)
+                                if cache is None: cache = sg._e14_pl = {}
+                                if cp not in cache: cache[cp] = sg._e14_planes(cp)
+                                return None
+                            _pl_req9.append(_warm14)
+                        elif er9 in (15, 16):
+                            an9w = cr9['e16_partner'] if er9 == 16 else cpr9
+                            _pl_req9.append(lambda sg=sgr9, an=an9w: (sg._e15_streams(an), None)[1])
                 # SHADOW SCHEDULING (Jackson's law): fixed-cost serves cannot
                 # be reduced, so they run FIRST and TOGETHER -- the cheap
                 # serves finish inside the heaviest serve's shadow.
@@ -1930,10 +1954,12 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     from concurrent.futures import ThreadPoolExecutor as _TPq
                     with _TPq(max_workers=min(len(_pl_req9), 4)) as exq9:
                         for m9f in exq9.map(lambda f9: f9(), _pl_req9):
+                            if m9f is None: continue            # a warm-up, not a verdict
                             _plane_mask9 = m9f if _plane_mask9 is None else (_plane_mask9 & m9f)
                 else:
                     m9f = _pl_req9[0]()
-                    _plane_mask9 = m9f if _plane_mask9 is None else (_plane_mask9 & m9f)
+                    if m9f is not None:
+                        _plane_mask9 = m9f if _plane_mask9 is None else (_plane_mask9 & m9f)
             if (_plane_mask9 is not None and group is not None and rows9 is None
                     and not _where_spent):
                 _sv9 = np.flatnonzero(_plane_mask9)
