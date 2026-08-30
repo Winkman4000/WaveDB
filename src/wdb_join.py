@@ -2768,7 +2768,18 @@ def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
                 # identity (path+size+mtime) and the key pair; any mismatch is a
                 # hard refusal, never a guess -- a stale pointer misroutes rows.
                 if _js.load(open(side + '.mark')) == mark:
-                    ptr9 = np.load(side, mmap_mode='r')
+                    ram9 = getattr(db, '_road_ram', None)
+                    if ram9 is None:
+                        ram9 = db._road_ram = {}
+                    ptr9 = ram9.get(side)
+                    if ptr9 is None:
+                        # ROADS RIDE IN RAM: on a network mount the mmap re-pages
+                        # ~450ms per query (client cache too small for 480MB);
+                        # read once per process, narrowed to int32 where it fits.
+                        ptr9 = np.load(side, mmap_mode='r')
+                        ptr9 = (np.asarray(ptr9, dtype=np.int32) if pseg.N < (1 << 31)
+                                else np.ascontiguousarray(ptr9))
+                        ram9[side] = ptr9
                     if ptr9.shape[0] == cseg.N:
                         return ptr9
             except Exception:
