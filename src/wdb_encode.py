@@ -640,7 +640,8 @@ def _elect_pair15_retired(preps, cols):
             return False
         if p.get('dtype') == 3:
             return True
-        return (p.get('dtype') == 0 and -25567 <= int(u[0]) and int(u[-1]) <= 65700)
+        return (p.get('dtype') == 0 and 366 <= int(u[0]) and int(u[-1]) <= 65700
+                and np.asarray(u).size <= 20000)   # keys are dense-from-1; dates are neither
     dcols = [nm for nm in cols if eligible(preps[nm])]
     if os.environ.get('WDB_ENCODE_VERBOSE'):
         print('PAIR15: dcols=%r' % dcols, flush=True)
@@ -686,8 +687,8 @@ def _serialize_column(p, zc):
                          nm=p['nm'],
                          date_vals=(p['uniq'] if ((p.get('dtype') == 3
                                                    or (p.get('dtype') == 0 and p['mode'] in (0, 2)
-                                                       and np.asarray(p['uniq']).size
-                                                       and -25567 <= int(np.asarray(p['uniq'])[0])
+                                                       and 0 < np.asarray(p['uniq']).size <= 20000
+                                                       and 366 <= int(np.asarray(p['uniq'])[0])
                                                        and int(np.asarray(p['uniq'])[-1]) <= 65700))
                                                   and not p['has_null']
                                                   and p['mode'] in (0, 2)) else None))

@@ -1067,7 +1067,12 @@ def _lit_for_col(seg, colname, lit, arr_kind):
     if isinstance(lit, E.Cast):            # DATE '...' / CAST('...' AS DATE) -> unwrap to inner literal
         return _lit_for_col(seg, colname, lit.this, arr_kind)
     c = seg.cols[colname]
-    if c['dt'] == 3:                       # datetime: parse string/number to int64 epoch
+    if c['dt'] == 3:                       # datetime: parse string to int64 epoch
+        if not lit.is_string:              # numeric literal = NATIVE UNITS (day-int
+            try:                           # convention); silent-empty bands were a
+                return int(lit.this)       # fail-loud violation (2026-08-31 gates)
+            except ValueError:
+                return float(lit.this)
         return _parse_temporal(lit.this, seg.unit(colname))
     if not lit.is_string:
         if arr_kind in 'iu':
