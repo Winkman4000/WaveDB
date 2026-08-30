@@ -8,6 +8,25 @@ from wdb_engine import Segment
 TMP = tempfile.gettempdir()
 _files = []
 
+
+def _cleanup_temps():
+    """The suite leaked ~3GB/day of wt_* temps into /tmp (2026-08-30);
+    every temp registered here (and every wt_*/fixture dir) dies at exit."""
+    import glob as _g, shutil as _sh
+    for f in _files:
+        try: os.remove(f)
+        except Exception: pass
+    for pat in ('wt_*.parquet', 'wt_*.wdb', 'wt_*.wdb.*', 'joinfast_*', 'pairdb_*'):
+        for p in _g.glob(os.path.join(TMP, pat)):
+            try:
+                if os.path.isdir(p): _sh.rmtree(p, ignore_errors=True)
+                else: os.remove(p)
+            except Exception: pass
+
+
+import atexit as _atexit
+_atexit.register(_cleanup_temps)
+
 def roundtrip(df, columns=None):
     """Write df->parquet, encode->.wdb, load Segment. Returns (seg, parquet_path)."""
     tag = uuid.uuid4().hex[:8]
