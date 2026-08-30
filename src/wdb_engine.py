@@ -832,7 +832,7 @@ class Segment:
         jobs = [(3, j) for j in range(nfr)] + [(4, j) for j in range(nfr)]
         if len(jobs) > 1:
             from concurrent.futures import ThreadPoolExecutor as _TPs
-            with _TPs(max_workers=min(len(jobs), 8)) as exs:
+            with _TPs(max_workers=min(len(jobs), max(8, (__import__("os").cpu_count() or 8)))) as exs:
                 list(exs.map(_ws, jobs))
         else:
             _ws(jobs[0])
@@ -867,7 +867,7 @@ class Segment:
         jobs = [(p9, j9) for p9 in range(5) for j9 in range(nfr)]
         if len(jobs) > 1:
             from concurrent.futures import ThreadPoolExecutor as _TPs
-            with _TPs(max_workers=min(len(jobs), 8)) as exs:
+            with _TPs(max_workers=min(len(jobs), max(8, (__import__("os").cpu_count() or 8)))) as exs:
                 list(exs.map(_ws, jobs))
         else:
             _ws(jobs[0])
@@ -1070,7 +1070,7 @@ class Segment:
             outs[p9][lo9:lo9 + len(raw)] = np.frombuffer(raw, np.uint8)
         if len(jobs) > 1:
             from concurrent.futures import ThreadPoolExecutor as _TP14
-            with _TP14(max_workers=min(len(jobs), 8)) as ex14:
+            with _TP14(max_workers=min(len(jobs), max(8, (__import__("os").cpu_count() or 8)))) as ex14:
                 list(ex14.map(_w14, jobs))
         else:
             _w14(jobs[0])
