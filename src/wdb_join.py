@@ -2233,6 +2233,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                             elif t9y == 'GTE': served9 = ~(bit9x & (dl9x > 0))
                             elif t9y == 'EQ':  served9 = (dl9x == 0)
                             else:              served9 = (dl9x > 0)
+                            _plane_mask9 = served9 if _plane_mask9 is None else (_plane_mask9 & served9)
+                            served9 = True
                     if served9 is None and len(cols9) == 1 and isinstance(cn9, (E.GT, E.GTE, E.LT, E.LTE, E.EQ, E.Between)):
                         cseg9, cp9x, cptr9x = resolve(cols9[0])
                         c9x = cseg9.cols.get(cp9x)
