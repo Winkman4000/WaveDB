@@ -908,6 +908,34 @@ class Segment:
             _wb(0)
         return out
 
+    def cost_of(self, nm, n):
+        """THE COST CURVE: predicted serve cost (ms) for this column at n
+        rows -- cost = a + b*n. a is the fixed stream floor (stored bytes at
+        the calibrated medium bandwidth), b the family's measured per-row
+        rate. All constants calibrated from the deals/cascade benches;
+        derived from file metadata, deterministic, zero-time at plan."""
+        c = self.cols.get(nm)
+        if c is None:
+            return 0.0
+        enc = c.get('code_enc', 0)
+        MSPB = 1.0 / 1.0e6                    # 1 GB/s decompress -> ms per byte
+        if enc == 14:
+            a = 3.2 * self.N * MSPB           # y+m+d planes
+            b = 13e-6                          # civil math + LUT, measured
+        elif enc in (15, 16):
+            a = 3.4 * self.N * MSPB           # y/m/d + delta + bit streams
+            b = 14e-6
+        elif enc == 17:
+            a = (c.get('czlen') or 0) * MSPB * 0.15   # mmap-direct unpack
+            b = 2e-6
+        elif enc == 3:
+            a = (c.get('czlen') or 0) * MSPB
+            b = 1.5e-6                         # LUT/compare pass
+        else:
+            a = (c.get('czlen') or 0) * MSPB
+            b = 2e-6
+        return a + b * float(n)
+
     def _e14_inv_of(self, nm):
         """The inverse day->code LUT for a date-dressed column, cached."""
         td = np.asarray(self._typed_dict(nm)).astype(np.int64)
