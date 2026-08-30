@@ -3131,3 +3131,48 @@ def pk_unpack(buf, bits, n, out):
         w = (np.int64(buf[b]) | (np.int64(buf[b + 1]) << 8)
              | (np.int64(buf[b + 2]) << 16))
         out[i] = (w >> sh) & mask
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def e14_reconstruct_at(Y, M, D, rows, ybase, inv, dmin, out):
+    """FIELD-PLANE codes AT ROWS (the survivor read): streams decompress
+    once (cached per query), the math runs only where asked."""
+    n = rows.shape[0]
+    for j in prange(n):
+        i = rows[j]
+        mm = np.int64(M[i])
+        y = np.int64(ybase) + np.int64(Y[i])
+        if mm <= 1:
+            y -= 1
+        if y >= 0:
+            era = y // 400
+        else:
+            era = (y - 399) // 400
+        yoe = y - era * 400
+        mp = (mm + 10) % 12
+        doe = yoe * 365 + yoe // 4 - yoe // 100 + (153 * mp + 2) // 5 + np.int64(D[i])
+        out[j] = inv[era * 146097 + doe - 719468 - dmin]
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def e15_reconstruct_at(Y, M, D, DL, BB, rows, role, ybase, inv, dmin, out):
+    """CLOCK codes AT ROWS: anchor civil + delta swing, only where asked."""
+    n = rows.shape[0]
+    for j in prange(n):
+        i = rows[j]
+        mm = np.int64(M[i])
+        y = np.int64(ybase) + np.int64(Y[i])
+        if mm <= 1:
+            y -= 1
+        if y >= 0:
+            era = y // 400
+        else:
+            era = (y - 399) // 400
+        yoe = y - era * 400
+        mp = (mm + 10) % 12
+        doe = yoe * 365 + yoe // 4 - yoe // 100 + (153 * mp + 2) // 5 + np.int64(D[i])
+        days = era * 146097 + doe - 719468
+        b = (BB[i >> 3] >> (7 - (i & 7))) & 1
+        if b != role:
+            days += np.int64(DL[i])
+        out[j] = inv[days - dmin]
