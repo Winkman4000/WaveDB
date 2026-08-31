@@ -3230,3 +3230,40 @@ def e15_band_lut(Y, M, D, DL, BB, role, ystart, mcum, lo, hi, out):
         if b != role:
             days += np.int64(DL[i])
         out[i] = (days >= lo) and (days < hi)
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def pand(a, b):
+    """Parallel in-place AND of two bool masks (60M serial ANDs were
+    extending the shadow's wall by ~15ms each)."""
+    n = a.shape[0]
+    for i in prange(n):
+        a[i] = a[i] and b[i]
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def pcount_chunks(mask, counts, chunk):
+    nc = counts.shape[0]
+    n = mask.shape[0]
+    for c in prange(nc):
+        lo = c * chunk
+        hi = min(n, lo + chunk)
+        t = 0
+        for i in range(lo, hi):
+            if mask[i]:
+                t += 1
+        counts[c] = t
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def pfill_rows(mask, offs, out, chunk):
+    nc = offs.shape[0] - 1
+    n = mask.shape[0]
+    for c in prange(nc):
+        lo = c * chunk
+        hi = min(n, lo + chunk)
+        w = offs[c]
+        for i in range(lo, hi):
+            if mask[i]:
+                out[w] = i
+                w += 1

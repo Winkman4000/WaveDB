@@ -11,7 +11,8 @@ import re
 import sqlglot, sqlglot.expressions as E
 import numpy as np, pandas as pd, os
 from wdb_engine import Segment
-import wdb_sql, wdb_dml, wdb_agg, wdb_fkptr, wdb_exprjit, wdb_radix
+import wdb_sql
+import wdb_kernels, wdb_dml, wdb_agg, wdb_fkptr, wdb_exprjit, wdb_radix
 import wdb_measure_runtime as RT
 
 _CMP = {E.EQ: '==', E.NEQ: '!=', E.GT: '>', E.LT: '<', E.GTE: '>=', E.LTE: '<='}
@@ -1927,7 +1928,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 # conjuncts on dressed fact columns will need their streams at
                 # survivor scale -- decompress them NOW, inside the wall's shadow,
                 # where they cost ~nothing. Returns None (not a mask).
-                for cnr9 in list(_resid_c9) + list(proj):
+                for cnr9 in ([] if os.environ.get('WDB_NO_SHADOW_WARMS') else list(_resid_c9) + list(proj)):
                     for colr9 in cnr9.find_all(E.Column):
                         try:
                             sgr9, cpr9, ptrr9 = resolve(colr9)
@@ -1958,14 +1959,15 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     with _TPq(max_workers=min(len(_pl_req9), 16)) as exq9:
                         for m9f in exq9.map(lambda f9: f9(), _pl_req9):
                             if m9f is None: continue            # a warm-up, not a verdict
-                            _plane_mask9 = m9f if _plane_mask9 is None else (_plane_mask9 & m9f)
+                            (_plane_mask9 is None and (m9f is not None)) and None; _plane_mask9 = m9f if _plane_mask9 is None else (wdb_kernels.pand(_plane_mask9, m9f), _plane_mask9)[1]
                 else:
                     m9f = _pl_req9[0]()
                     if m9f is not None:
-                        _plane_mask9 = m9f if _plane_mask9 is None else (_plane_mask9 & m9f)
+                        (_plane_mask9 is None and (m9f is not None)) and None; _plane_mask9 = m9f if _plane_mask9 is None else (wdb_kernels.pand(_plane_mask9, m9f), _plane_mask9)[1]
             if (_plane_mask9 is not None and group is not None and rows9 is None
                     and not _where_spent):
-                _sv9 = np.flatnonzero(_plane_mask9)
+                import wdb_engine as _WE9
+                _sv9 = _WE9.Segment.mask_rows(_plane_mask9)
                 if _sv9.size * 4 < _plane_mask9.size:
                     # SURVIVOR HANDOFF: the mask is selective enough that the
                     # per-row leftovers (slots, keys, pred, kernel) all run at

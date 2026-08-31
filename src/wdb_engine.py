@@ -20,6 +20,21 @@ def _pool():
     return _POOL
 
 
+_LEAF_POOL = None
+
+
+def _leaf_pool():
+    """ONE shared executor for all frame-decompress leaf jobs -- three
+    loaders each spawning cpu_count() threads oversubscribed the box 3x
+    (measured on Q12's shadow). Leaf jobs never submit, so no deadlock."""
+    global _LEAF_POOL
+    if _LEAF_POOL is None:
+        import os as _osl
+        from concurrent.futures import ThreadPoolExecutor as _TPl
+        _LEAF_POOL = _TPl(max_workers=(_osl.cpu_count() or 8))
+    return _LEAF_POOL
+
+
 class Segment:
     def __init__(self, path):
         # memmap instead of read(): the file is demand-paged by the OS, so a Segment
@@ -837,9 +852,7 @@ class Segment:
                 BB[j9 * f8: j9 * f8 + raw.size] = raw
         jobs = [(3, j) for j in range(nfr)] + [(4, j) for j in range(nfr)]
         if len(jobs) > 1:
-            from concurrent.futures import ThreadPoolExecutor as _TPs
-            with _TPs(max_workers=min(len(jobs), max(8, (__import__("os").cpu_count() or 8)))) as exs:
-                list(exs.map(_ws, jobs))
+            list(_leaf_pool().map(_ws, jobs))
         else:
             _ws(jobs[0])
         bit = np.unpackbits(BB)[:self.N].astype(bool)
@@ -883,9 +896,7 @@ class Segment:
             outs[p9][o9:o9 + raw.size] = raw
         jobs = [(p9, j9) for p9 in range(5) for j9 in range(nfr)]
         if len(jobs) > 1:
-            from concurrent.futures import ThreadPoolExecutor as _TPs
-            with _TPs(max_workers=min(len(jobs), max(8, (__import__("os").cpu_count() or 8)))) as exs:
-                list(exs.map(_ws, jobs))
+            list(_leaf_pool().map(_ws, jobs))
         else:
             _ws(jobs[0])
         cache[key] = outs
@@ -979,6 +990,20 @@ class Segment:
         luts[ybase] = (ystart, mcum)
         return luts[ybase]
 
+    @staticmethod
+    def mask_rows(mask):
+        """Parallel flatnonzero for big bool masks."""
+        import wdb_kernels as _WKm
+        n = mask.shape[0]
+        chunk = 1 << 20
+        nc = (n + chunk - 1) // chunk
+        counts = np.empty(nc, np.int64)
+        _WKm.pcount_chunks(mask, counts, chunk)
+        offs = np.zeros(nc + 1, np.int64)
+        np.cumsum(counts, out=offs[1:])
+        out = np.empty(int(offs[-1]), np.int64)
+        _WKm.pfill_rows(mask, offs, out, chunk)
+        return out
     def _e14_inv_of(self, nm):
         """The inverse day->code LUT for a date-dressed column, cached."""
         td = np.asarray(self._typed_dict(nm)).astype(np.int64)
@@ -1087,8 +1112,7 @@ class Segment:
             outs[p9][lo9:lo9 + len(raw)] = np.frombuffer(raw, np.uint8)
         if len(jobs) > 1:
             from concurrent.futures import ThreadPoolExecutor as _TP14
-            with _TP14(max_workers=min(len(jobs), max(8, (__import__("os").cpu_count() or 8)))) as ex14:
-                list(ex14.map(_w14, jobs))
+            list(_leaf_pool().map(_w14, jobs))
         else:
             _w14(jobs[0])
         return outs
