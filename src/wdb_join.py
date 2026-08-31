@@ -684,22 +684,28 @@ def join_query(db, sql, columnar=False):
     # Plain dumps try the dict-space route first: a one-block walk must not pay a
     # full-table probe as routing overhead.
     if has_aggs:
-        try:
-            chain = _build_chain(db, tree, allow_hash=False)     # STORED pointers only:
+        tree1 = tree.copy()          # each attempt gets its OWN tree: the chain
+        try:                         # builder strips consumed equalities, and a
+                                     # discarded attempt must not poison the retry
+            chain = _build_chain(db, tree1, allow_hash=False)    # STORED pointers only:
         except _FastUnsupported:                                 # pre-resolved and free
             chain = None
         if chain is not None:
             try:
-                return _fast_pointer_agg(db, tree, chain, columnar)  # fully fused
+                return _fast_pointer_agg(db, tree1, chain, columnar)  # fully fused
             except _FastUnsupported:
-                pass
+                chain = None   # stored-only chain's plan declined (e.g. Q5's tree
+                               # needs hash edges): release it so the retry rebuilds
     import wdb_fastjoin
     fj = wdb_fastjoin.try_execute(db, tree)      # dict-space: semi-joins, cell post-maps,
     if fj is not None:                           # streaming dumps
         return fj
     if chain is None:
         try:
-            chain = _build_chain(db, tree)       # lazy: only when the tail will use it
+            tree2 = tree.copy()
+            chain = _build_chain(db, tree2)      # lazy: only when the tail will use it
+            if chain is not None:
+                tree = tree2                     # the stripped copy is the one to execute
         except _FastUnsupported:
             chain = None
     if chain is not None:
@@ -1233,6 +1239,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             if len(owners) != 1: raise _FastUnsupported
             a = owners[0]
         if a not in alias2t or nm not in cols_of[a]: raise _FastUnsupported
+        if a not in composed: raise _FastUnsupported   # alias outside THIS chain's tree
         return seg_of[a], phys_of[a].get(nm, nm), composed[a]   # composed[a] is None for the fact table
     def col_operand(node):
         # parent columns become ('g', arr, composed_ptr) so the gather happens per-chunk inside the
@@ -2931,28 +2938,13 @@ def _build_chain(db, tree, allow_hash=True):
             child_a, parent_a, fk_col = aB, aA, ('hash', kB, kA)
         else:
             continue                                             # neither key unique: rides WHERE as a filter
-        if child_a in edges:
-            continue                                             # child already parented: extra eq stays a filter
-        edges[child_a] = (parent_a, fk_col); parents.add(parent_a)
+        ee9 = edges.setdefault(child_a, [])
+        if any(pa9 == parent_a for pa9, _f9 in ee9):
+            continue                                 # duplicate eq for the same hop stays a filter
+        ee9.append((parent_a, fk_col)); parents.add(parent_a)
         if id(on) in {id(x) for x in w_eqs}:
             _edge_w.append(on)
 
-    if w9 is not None and _edge_w:
-        consumed = {id(x) for x in _edge_w}
-        kept = [cj for cj in _conjuncts(w9.this) if id(cj) not in consumed]
-        for cj in kept:                                          # col=col survivors: decline, don't crash
-            if (isinstance(cj, E.EQ) and isinstance(cj.this, E.Column)
-                    and isinstance(cj.expression, E.Column)
-                    and _own(cj.this) and _own(cj.expression)
-                    and _own(cj.this) != _own(cj.expression)):
-                raise _FastUnsupported
-        if kept:
-            merged = kept[0]
-            for cj in kept[1:]:
-                merged = E.And(this=merged, expression=cj)
-            w9.set('this', merged)
-        else:
-            tree.set('where', None)
     if not edges:                                                                # 0 joins: single-table query
         if len(tables) != 1: raise _FastUnsupported                              # multiple tables, no FK edge
         fact = tables[0][1]
@@ -2961,10 +2953,17 @@ def _build_chain(db, tree, allow_hash=True):
         if len(fact_candidates) != 1: raise _FastUnsupported                     # need a single rooted fact
         fact = fact_candidates[0]
 
-    # Linear chain (each child has one parent, single rooted fact): order it fact -> p1 -> p2 -> ...
-    order = [fact]; cur = fact
-    while cur in edges:
-        cur = edges[cur][0]; order.append(cur)
+    # THE TREE (Jackson's Q5): a child may have MANY parents. BFS from the
+    # fact records each alias's route; pruning keeps exactly the aliases on
+    # paths from the fact to anything the query actually reads.
+    prev9 = {}
+    bfs9 = [fact]
+    seen9 = {fact}
+    while bfs9:
+        c9t = bfs9.pop()
+        for pa9, _f9 in edges.get(c9t, []):
+            if pa9 not in seen9:
+                seen9.add(pa9); prev9[pa9] = c9t; bfs9.append(pa9)
 
     # JOIN PRUNING. An FK pointer is built only after verifying referential integrity (every child maps to
     # exactly one parent, parent key unique), so each child->parent INNER join is row-preserving -- joining
@@ -2984,8 +2983,11 @@ def _build_chain(db, tree, allow_hash=True):
                 ref.add(a)
             elif not a:                                          # unqualified: keep every candidate owner
                 ref.update(al for al, cs in cols_of.items() if col.name in cs)
-    keep_idx = max((i for i, a in enumerate(order) if a in ref), default=0)
-    keep = set(order[:keep_idx + 1])
+    keep = {fact}
+    for r9t in ref:
+        cur9t = r9t
+        while cur9t in prev9:
+            keep.add(cur9t); cur9t = prev9[cur9t]
 
     seg_of, sp_of = {}, {}
     for _, a in tables:
@@ -2996,7 +2998,8 @@ def _build_chain(db, tree, allow_hash=True):
     progress = True
     while progress:
         progress = False
-        for child_a, (parent_a, fk_col) in edges.items():
+        for child_a, ee9 in edges.items():
+          for parent_a, fk_col in ee9:
             if parent_a not in keep: continue                                    # pruned hop: skip the gather
             if child_a in composed and parent_a not in composed:
                 if isinstance(fk_col, tuple) and fk_col and fk_col[0] == 'hash':
@@ -3026,5 +3029,24 @@ def _build_chain(db, tree, allow_hash=True):
                 composed[parent_a] = p if cc is None else p[cc]                  # compose by gather
                 progress = True
     if any(a not in composed for a in keep): raise _FastUnsupported              # kept tables must connect
+    # THE STRIP RUNS ONLY ON SUCCESS: the allow_hash=False attempt used to
+    # consume edge equalities from WHERE and then raise, leaving the retry a
+    # gutted tree (Q5's nation vanished this way).
+    if w9 is not None and _edge_w:
+        consumed = {id(x) for x in _edge_w}
+        kept = [cj for cj in _conjuncts(w9.this) if id(cj) not in consumed]
+        # col=col survivors (Q5's c_nationkey = s_nationkey): neither side is
+        # unique, so it is not an edge -- it RIDES WHERE as a pred conjunct.
+        # build_pred compares the two parent VALUE streams through their
+        # pointer slots (dict-independent); if a side cannot resolve, the
+        # pred raises and the pandas tail catches it. The old blanket
+        # decline predates parent-vs-parent compare in the fused pred.
+        if kept:
+            merged = kept[0]
+            for cj in kept[1:]:
+                merged = E.And(this=merged, expression=cj)
+            w9.set('this', merged)
+        else:
+            tree.set('where', None)
     return dict(fact=fact, alias2t=alias2t, seg_of=seg_of, composed=composed, n=seg_of[fact].N,
                 edge_ptrs=edge_ptrs)
