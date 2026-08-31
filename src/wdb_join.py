@@ -73,13 +73,52 @@ def _chain_pandas(db, tree, ctx):
     for key in ('where', 'group', 'order'):
         nd = tree.args.get(key)
         if nd is not None: scan.append(nd)
+    alias9p = {p.alias for p in proj if isinstance(p, E.Alias)}
+    where = tree.args.get('where')
+    # SURVIVOR DISCIPLINE for the pandas tail (Q10 paid 41s decoding fact-
+    # scale strings it then threw away): gather ONLY the WHERE's columns
+    # full-width, mask, then fetch every remaining column at survivors.
+    wcols9 = set()
+    if where is not None:
+        for col in where.find_all(E.Column):
+            if col.table or col.name not in alias9p:
+                wcols9.add((owner(col), col.name))
+    need9 = []
     for rootn in scan:
         for col in rootn.find_all(E.Column):
-            a = owner(col); fk = f"{a}.{col.name}"
-            if fk not in frame: frame[fk] = gather(a, col.name)
+            if not col.table and col.name in alias9p:
+                continue                   # output alias (ORDER BY revenue): applies post-projection
+            a = owner(col)
+            if (a, col.name) not in need9:
+                need9.append((a, col.name))
+    for a, nm9 in need9:
+        if (a, nm9) in wcols9:
+            frame[f"{a}.{nm9}"] = gather(a, nm9)
     df = pd.DataFrame(frame) if frame else pd.DataFrame(index=range(ctx['n']))
-    where = tree.args.get('where')
-    if where is not None: df = df[_mask(df, where.this, R)]
+    if where is not None:
+        df = df[_mask(df, where.this, R)]
+    sv9 = df.index.to_numpy()
+    late9 = {}
+    for a, nm9 in need9:
+        fk = f"{a}.{nm9}"
+        if fk in df.columns:
+            continue
+        seg = seg_of[a]; pcol = phys_of[a].get(nm9, nm9); cptr = composed[a]
+        rows_a = sv9 if cptr is None else np.asarray(cptr)[sv9]
+        c9m = seg.cols.get(pcol, {})
+        try:
+            if (c9m.get('mode', 0) in (0, 1, 2) and not c9m.get('has_null')
+                    and not seg._override_vals_typed(pcol)):
+                cd9 = np.asarray(seg.codes_at(pcol, rows_a))
+                td9 = seg._typed_dict(pcol)
+                late9[fk] = (pd.Series([td9[c] for c in cd9], index=sv9) if c9m.get('dt') == 1
+                             else pd.Series(np.asarray(td9)[cd9], index=sv9))
+            else:
+                late9[fk] = pd.Series(seg.values_at(pcol, rows_a), index=sv9)
+        except Exception:
+            late9[fk] = pd.Series(np.asarray(gather(a, nm9))[sv9], index=sv9)
+    for fk, ser9 in late9.items():
+        df[fk] = ser9
     group = tree.args.get('group')
     has_agg = any(wdb_sql._agg_kind(p) is not None
                   or any(True for _ in p.find_all(E.Sum, E.Avg, E.Min, E.Max, E.Count))
