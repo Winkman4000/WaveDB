@@ -811,6 +811,12 @@ class Segment:
         (bit_bool[N] meaning anchor-column <= partner, delta_u8[N])."""
         c = self.cols[nm]
         anm = c['e16_partner'] if c['code_enc'] == 16 else nm
+        cached = (getattr(self, '_e14_pl', None) or {}).get((anm, 'e15s'))
+        if cached is not None:
+            # SIBLING SHARE: the streams are up -- the bit costs an unpack only.
+            BB = cached[4]
+            bit = np.unpackbits(BB)[:self.N].astype(np.bool_)
+            return bit, cached[3]
         ca = self.cols[anm]
         base = ca['cstart']; FR = ca['e15_FR']; nfr = ca['e15_nfr']; offs = ca['e15_offs']
         st = [base]
@@ -849,6 +855,17 @@ class Segment:
         got = cache.get(key)
         if got is not None:
             return got
+        import threading as _th15
+        lk = getattr(self, '_e15_lock', None)
+        if lk is None:
+            lk = self._e15_lock = _th15.Lock()
+        with lk:                                  # concurrent consumers load ONCE
+            got = cache.get(key)
+            if got is not None:
+                return got
+            return self._e15_streams_load(anm, cache, key)
+
+    def _e15_streams_load(self, anm, cache, key):
         ca = self.cols[anm]
         base = ca['cstart']; FR = ca['e15_FR']; nfr = ca['e15_nfr']; offs = ca['e15_offs']
         st = [base]

@@ -1949,14 +1949,13 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                                 return None
                             _pl_req9.append(_warm14)
                         elif er9 in (15, 16):
-                            an9w = cr9['e16_partner'] if er9 == 16 else cpr9
-                            _pl_req9.append(lambda sg=sgr9, an=an9w: (sg._e15_streams(an), None)[1])
+                            pass                    # a clock band/bit in the shadow loads these
                 # SHADOW SCHEDULING (Jackson's law): fixed-cost serves cannot
                 # be reduced, so they run FIRST and TOGETHER -- the cheap
                 # serves finish inside the heaviest serve's shadow.
                 if len(_pl_req9) > 1:
                     from concurrent.futures import ThreadPoolExecutor as _TPq
-                    with _TPq(max_workers=min(len(_pl_req9), 4)) as exq9:
+                    with _TPq(max_workers=min(len(_pl_req9), 16)) as exq9:
                         for m9f in exq9.map(lambda f9: f9(), _pl_req9):
                             if m9f is None: continue            # a warm-up, not a verdict
                             _plane_mask9 = m9f if _plane_mask9 is None else (_plane_mask9 & m9f)
