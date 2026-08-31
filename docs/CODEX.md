@@ -446,3 +446,34 @@ the wrongness; scalar+plane-serve exactness is coverage gap #2
 exactness tests FIRST, then hoist attempt 2 hunting the scalar
 disturbance, then the admission scheduler on the curves.
 Q12 floor ~210 stands: needs hoisted handoff + sibling fusion.
+
+
+## THE HUNT (2026-08-30, session 3): Q12 4,763 -> 300, Q4 CROWNED
+Jackson's orders: harden the suite, understand before abandoning,
+never trade correctness -- and fix it. THE EXACTNESS GATES (four
+new walls, tests/test_exactness_gates.py) caught, in order: the
+hoist's Q6 breaker (the pred block's _plane_mask9 re-init ERASING
+hoisted serves -- the WHY of attempt 1, one line), dt3 numeric
+literals silently emptying bands (now native day units), ORDER
+KEYS dressed as dates (nomination gate: u[0]>=366, V<=20000), the
+LUT band's 1-based month table. THE HOIST LANDED (keys born at
+survivor scale). CONVICTIONS by absolute-clock brackets: survivor
+slots full-decoding first (raw_dict_col want_codes); clock streams
+per-consumer (SIBLING SHARE: one locked loader feeds band + bit +
+survivor reads); an orphan birthmark hiding a per-query 60M rehash
+(fail-loud now); roads re-paging off the network mount (RAM-pinned
+int32); and the deepest -- wdb_qmem flushing _ptr_cache every query
+made the legacy .fkptr road a 480ms decompress+cumsum tax on EVERY
+join: the chain now rides the canonical .jptr road first (550ms
+back across Q12 and Q4). TABLE-DRIVEN CLOCK BAND (ystart+mcum,
+planes M/D 0-based). Loaders fan to the box. Suite runs ON THE POD
+(local /tmp leak fixed: suite temps cleaned per process).
+NUMBERS: Q12 300ms exact (0.78-1.04x, crosses duck once) · Q4 224
+1.13x CROWNED · Q3 1.20x best ever · Q6 1.10x · Q1 holds. Suite
+1696/0. THE LAST 90 TO 210, measured: dress floor 84 (streams 42 +
+LUT 42); partition wall ~175 = warm-loads contending with the band
+inside the shadow; gkeys 44 + assemble 110 serial after survivors
+(~15ms real per-row work, rest glue). NEXT OPENERS: warm-pool
+contention (one unified scheduler, the admission law on the cost
+curves), the serial post-survivor glue, then the boards re-gate on
+everything banked today. Q14 fast path still docketed.
