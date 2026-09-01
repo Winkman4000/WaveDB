@@ -477,3 +477,36 @@ inside the shadow; gkeys 44 + assemble 110 serial after survivors
 contention (one unified scheduler, the admission law on the cost
 curves), the serial post-survivor glue, then the boards re-gate on
 everything banked today. Q14 fast path still docketed.
+
+
+## THE TREE & THE DEAD GATE (2026-08-31): board ok=8, WRONG=0
+Q5 HOLE -> FACE ON THE FAST PATH: THE CHAIN IS A TREE (edges a
+multimap child->parents; BFS routes; pruning keeps fact->referenced
+paths); parent-vs-parent equalities ride WHERE as pred conjuncts
+(two pointer-slot VALUE streams, dict-independent; the old blanket
+decline predated that). Plan attempts ISOLATED (each _build_chain
+gets its own tree copy; strip only on success), uncomposed alias
+declines the plan, declined stored-only chain releases for the
+full-tree retry. 525ms exact; probe floor 247 (order band at
+parent scale DOCKETED). Q10 HOLE -> FACE, full-row exact: pandas
+tail skips output aliases and gathers non-WHERE columns AT
+SURVIVORS; values_at takes DICT CODES never rows (my violation --
+mode-5 sorted dict punished it; engine/encoder/data all vindicated,
+no re-encode). ~23s face: WHERE phase decodes fact-scale strings;
+speed home = fast-path mode-5 gkeys / descent top-k (DOCKETED).
+THE SILENT GATE IS DEAD: a failed pred build declines the plan
+instead of proceeding predicate-less (Q21 had shipped a confident
+wrong top-100). Its death exposed accidents the swallow served, now
+explicit: IS [NOT] NULL folds on no-null columns; MODE-4 sequence
+slots (raw_dict_col serves values as identity-coded base); THE MASK
+HANDSHAKE -- a pred declining ONLY on subquery-resolved INs (codes
+attached) ANDs the full WHERE mask into the plan (Q4 had been exact
+by accident via the numpy specs path; now a contract). Integer
+aggregates emit BIGINT (Q12's WRONG was 62071.0 vs 62071; the
+one-column qx check is retired -- the board referee is law).
+BOARD: 14 attempted | ok=8 (Q1,3,4,5,6,10,12,14) | holes=6 (Q7/13/22
+FROM-door, Q18 IN-subquery, Q19 compound ON, Q21 declines honestly)
+| wins=4 | WRONG=0. Suite 1696/0 on the pod at every push.
+NEXT OPENERS: Q10 speed (23s: mode-5 gkeys or descent top-20-by-
+SUM); Q5 parent-scale serve (525->~300); the FROM-subquery door
+(three holes, one organ); Q12's last 60 to 210; Q14 fast path.
