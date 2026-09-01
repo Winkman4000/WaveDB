@@ -510,3 +510,31 @@ FROM-door, Q18 IN-subquery, Q19 compound ON, Q21 declines honestly)
 NEXT OPENERS: Q10 speed (23s: mode-5 gkeys or descent top-20-by-
 SUM); Q5 parent-scale serve (525->~300); the FROM-subquery door
 (three holes, one organ); Q12's last 60 to 210; Q14 fast path.
+
+
+## THE COMPOSE (2026-09-01): board wins=6, wave total 2.3s == duck
+Q10 23s -> 198ms (1.71x) and Q5 519 -> 183ms (1.78x) from ONE
+conviction chain. Probe first (Jackson's law): group by the customer
+pointer, top-k, decode attributes for k rows -- 164ms exact; the
+census-descent (Threshold Algorithm) belongs to the UNFILTERED top-k
+lane (docketed): under filters the filtered counts cost the same
+bincount as the sums. fpa's native topk-attr door already served the
+shape once the cascade stopped declining; the attribute court I wrote
+was dead code and came out. CASCADE cuts riding every join: native
+keeps via parallel LUT kernel (128->47); running rule enforced -- a
+depth-1 parent keep applies AT the fact keep's survivors (5ms), never
+flowed to fact scale (60M gather+AND, 120ms). raw_dict_col caches the
+typed base per segment (1M-entry Python-list rebuild per slot, 35ms).
+THE COMPOSE: the full-tree chain composed grandparent roads at FACT
+SCALE with serial numpy (two 60M gathers, ~237ms per query) -> parallel
+compose kernel (pre-work 247->53). Early decline for unreachable
+referenced aliases at chain-build time. COLD-START named: codes_at on a
+mode-5 column factorizes the whole column (2s/column) -- attribute
+readers at rows must use values_at_rows; the rest is road pinning off
+the network mount (docketed). BOARD: 14 attempted | ok=8 | holes=6 |
+wins=6 (Q1 1.02, Q3 1.06, Q5 1.87, Q6 1.45, Q10 1.70, Q12 1.10; Q4 0.98
+breathing; Q14 0.41) | WRONG=0 | wave 2.3s duck 2.3s. Suite 1696/0.
+NEXT OPENERS: Q14 fast path (Div-of-Sums, the only sub-1x face); the
+FROM-subquery door (Q7/Q13/Q22; Q7 is tree-shaped inside it); Q4's
+last breath; cold-start road pinning; the unfiltered-top-k descent
+with Jackson's census bound.
