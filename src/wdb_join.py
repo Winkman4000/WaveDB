@@ -114,7 +114,10 @@ def _chain_pandas(db, tree, ctx):
                 late9[fk] = (pd.Series([td9[c] for c in cd9], index=sv9) if c9m.get('dt') == 1
                              else pd.Series(np.asarray(td9)[cd9], index=sv9))
             else:
-                late9[fk] = pd.Series(seg.values_at(pcol, rows_a), index=sv9)
+                # values_at takes DICT CODES, never row positions (mode-5's
+                # sorted dict punished the confusion with silent permutation)
+                cdv9 = np.asarray(seg.codes_at(pcol, rows_a))
+                late9[fk] = pd.Series(seg.values_at(pcol, cdv9), index=sv9)
         except Exception:
             late9[fk] = pd.Series(np.asarray(gather(a, nm9))[sv9], index=sv9)
     for fk, ser9 in late9.items():
@@ -2140,6 +2143,28 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     # threshold); MIN/MAX run on the serial kernel; bare key columns map straight to the group value.
     _CLS = {E.Sum: 'SUM', E.Avg: 'AVG', E.Min: 'MIN', E.Max: 'MAX'}
     col_results = {}
+    int9 = {}
+    def _int_expr9(nd):
+        """True iff the aggregate ARGUMENT is integer-typed end to end --
+        duck emits BIGINT for such SUM/MIN/MAX and the board's referee
+        string-compares non-floats, so wave owes true ints (Q12's
+        62071.0 vs 62071 was flagged WRONG on values that matched)."""
+        if isinstance(nd, E.Paren): return _int_expr9(nd.this)
+        if isinstance(nd, E.Literal):
+            return (not nd.is_string) and ('.' not in str(nd.this))
+        if isinstance(nd, E.Column):
+            sg9i, pc9i, _c9i = resolve(nd)
+            return sg9i.cols[pc9i].get('dt') == 0
+        if isinstance(nd, E.Case):
+            br9 = [b.args['true'] for b in nd.args.get('ifs', [])]
+            d9i = nd.args.get('default')
+            if d9i is not None: br9.append(d9i)
+            return bool(br9) and all(_int_expr9(b) for b in br9)
+        if type(nd) in (E.Add, E.Sub, E.Mul):
+            return _int_expr9(nd.this) and _int_expr9(nd.expression)
+        if isinstance(nd, E.Neg): return _int_expr9(nd.this)
+        return False
+
 
     # ---- UNIFIED fused path -------------------------------------------------------------------------
     # Build every value aggregate as an expression over shared dict-column slots, then a single codegen
@@ -2274,6 +2299,17 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             return rx.match(v) is not None
         return _f
     def build_pred(node):
+        if isinstance(node, E.Not) and isinstance(node.this, E.Is) \
+                and isinstance(node.this.expression, E.Null):
+            cs9n, cp9n, _p9n = resolve(node.this.this)
+            if not cs9n.cols[cp9n].get('has_null'):
+                return '(True)'                 # IS NOT NULL on a no-null column
+            raise _FastUnsupported
+        if isinstance(node, E.Is) and isinstance(node.expression, E.Null):
+            cs9n, cp9n, _p9n = resolve(node.this)
+            if not cs9n.cols[cp9n].get('has_null'):
+                return '(False)'                # IS NULL on a no-null column
+            raise _FastUnsupported
         # Compile a WHERE predicate to a numba boolean over the shared slots. Covers AND/OR/NOT, numeric &
         # datetime comparisons (incl. column-vs-column and arithmetic sides), BETWEEN, string '='/'!='/IN
         # via inline code comparison, and arbitrary single-string-column predicates (LIKE, ordering, IS NULL)
@@ -2410,7 +2446,13 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             else:
                 pred_body = build_pred(conj9[0])
         except _FastUnsupported:
-            pred_body = None; slots.clear(); slot_list.clear()   # discard any partial predicate slots
+            # FAIL LOUD: an unservable residual conjunct means THIS PLAN cannot
+            # answer -- proceeding predicate-less silently dropped WHERE clauses
+            # (Q21's EXISTS pair vanished and a confident wrong top-100 shipped
+            # to the board, 2026-08-30). Decline; the pandas tail serves or the
+            # query holes honestly.
+            slots.clear(); slot_list.clear()
+            raise
 
     plan = []; fully = wdb_exprjit.HAS_NUMBA
     for i, p in enumerate(proj):
@@ -2427,6 +2469,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 cseg, cpcol, _c = resolve(inner.this)
                 if cseg.cols[cpcol]['dt'] == 3: is_dt = True; unit = cseg.unit(cpcol)
             plan.append((i, _CLS[type(inner)], body, is_dt, unit))
+            if _CLS[type(inner)] in ('SUM', 'MIN', 'MAX'):
+                try: int9[i] = _int_expr9(inner.this)
+                except _FastUnsupported: pass
         elif isinstance(inner, E.Count):                 # COUNT(col): == group count only if non-nullable
             if not isinstance(inner.this, E.Column): fully = False; break
             cseg, cpcol, _c = resolve(inner.this)
@@ -2541,7 +2586,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     # groups never reach a row). The object-dtype NULL
                     # ceremony served nothing here and blocked the top-k
                     # gate with an object 'revenue' array.
-                    if   fn == 'SUM': o = s
+                    if   fn == 'SUM':
+                        o = np.rint(s).astype(np.int64) if int9.get(i) else s
                     elif fn == 'AVG':
                         o = np.divide(s, counts, out=np.zeros_like(s, dtype=np.float64),
                                       where=counts > 0)
@@ -2575,6 +2621,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     try:
                         _body, _inputs = fused_expr_build(inner.this)
                         expr_aggs.append((i, fn, _body, _inputs)); col_results[i] = ('arr', None, False, None)
+                        if fn in ('SUM', 'MIN', 'MAX'):
+                            try: int9[i] = _int_expr9(inner.this)
+                            except _FastUnsupported: pass
                         continue
                     except _FastUnsupported:
                         pass

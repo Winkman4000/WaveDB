@@ -1046,6 +1046,13 @@ def raw_dict_col(seg, name, want_codes=True):
     simple case (computed/inline/constant modes, nullable, overridden, or string), where the caller must
     fall back to the full _col decode."""
     c = seg.cols[name]
+    if c['mode'] == 4 and not c['has_null'] and c['dt'] in (0, 3) \
+            and not seg._override_vals_typed(name):
+        # MODE-4 SEQUENCE (value = f(position)): the decoded values ARE the
+        # per-row base and the codes are the identity -- base[codes[r]] = v[r].
+        # (A fused pred on such a column no longer declines the whole plan.)
+        base4 = np.asarray(seg._typed_dict(name), dtype=np.int64)
+        return base4, (seg.codes(name) if want_codes else None)
     if c['mode'] in (4, 5, 6) or c['has_null']: return None
     if seg._override_vals_typed(name):          return None
     if c['dt'] == 2:
