@@ -116,8 +116,7 @@ def _chain_pandas(db, tree, ctx):
             else:
                 # values_at takes DICT CODES, never row positions (mode-5's
                 # sorted dict punished the confusion with silent permutation)
-                cdv9 = np.asarray(seg.codes_at(pcol, rows_a))
-                late9[fk] = pd.Series(seg.values_at(pcol, cdv9), index=sv9)
+                late9[fk] = pd.Series(seg.values_at_rows(pcol, rows_a), index=sv9)
         except Exception:
             late9[fk] = pd.Series(np.asarray(gather(a, nm9))[sv9], index=sv9)
     for fk, ser9 in late9.items():
@@ -708,10 +707,105 @@ def denorm_rewrite(db, tree):
     return f"SELECT {', '.join(proj_sql)} FROM {child_t} GROUP BY {', '.join(gcols)}"
 
 
+def _attr_court(db, tree):
+    """THE ATTRIBUTE COURT (Jackson's Q10): GROUP BY k1..kn ORDER BY <sum alias>
+    DESC LIMIT k where ONE group column is a unique key of alias A and every
+    other group column is an attribute of A (or of a one-hop parent of A).
+    Those attributes are functionally dependent on the key: group by the key
+    alone, take the top k, and decode the attributes for k rows instead of
+    for every group. Returns rows or None (not this shape)."""
+    if not isinstance(tree, E.Select): return None
+    grp = tree.args.get('group'); order = tree.args.get('order'); lim = tree.args.get('limit')
+    if grp is None or order is None or lim is None: return None
+    if any(f is not None and f.find(E.Select) is not None for f in [tree.args.get('from')] + list(tree.args.get('joins') or [])):
+        return None
+    gcols = [g for g in grp.expressions]
+    if len(gcols) < 2 or not all(isinstance(g, E.Column) for g in gcols): return None
+    ords = order.expressions
+    if len(ords) != 1 or not isinstance(ords[0].this, E.Column) or not ords[0].args.get('desc'): return None
+    oname = ords[0].this.name
+    proj = list(tree.expressions)
+    aggs = [p for p in proj if isinstance(p, E.Alias) and isinstance(p.this, E.Sum)]
+    if len(aggs) != 1 or aggs[0].alias != oname: return None
+    if any(not (isinstance(p, E.Column) or p is aggs[0]) for p in proj): return None
+    try:
+        k = int(lim.expression.this)
+    except Exception:
+        return None
+    # alias -> table for the top-level FROM
+    alias2t = {}
+    for t9 in tree.find_all(E.Table):
+        if t9.find_ancestor(E.Select) is tree:
+            alias2t[t9.alias or t9.name] = t9.name
+    cols_of = {a: set(db.cat.column_names(t)) for a, t in alias2t.items()}
+    def own(c):
+        if c.table: return c.table if c.table in alias2t else None
+        o = [a for a, cs in cols_of.items() if c.name in cs]
+        return o[0] if len(o) == 1 else None
+    owners = [own(g) for g in gcols]
+    if any(o is None for o in owners): return None
+    # the key: exactly one group column unique in its table
+    keys = [(g, o) for g, o in zip(gcols, owners) if _key_is_unique(db, alias2t[o], g.name)]
+    if len(keys) != 1: return None
+    kcol, A = keys[0]
+    # one-hop parents of A via WHERE equalities (A.fk = B.key, B.key unique)
+    hop = {}
+    w = tree.args.get('where')
+    def _flat(x):
+        if isinstance(x, E.Paren): return _flat(x.this)
+        if isinstance(x, E.And): return _flat(x.this) + _flat(x.expression)
+        return [x]
+    for cj in (_flat(w.this) if w is not None else []):
+        if (isinstance(cj, E.EQ) and isinstance(cj.this, E.Column) and isinstance(cj.expression, E.Column)):
+            for x, y in ((cj.this, cj.expression), (cj.expression, cj.this)):
+                if own(x) == A and own(y) not in (None, A) and _key_is_unique(db, alias2t[own(y)], y.name):
+                    hop[own(y)] = (x.name, y.name)
+    for g, o in zip(gcols, owners):
+        if g is kcol: continue
+        if o != A and o not in hop: return None
+    # the stripped query: key + the sum, same FROM/WHERE, order by the sum, limit k
+    st = tree.copy()
+    st.set('expressions', [kcol.copy(), aggs[0].copy()])
+    st.set('group', E.Group(expressions=[kcol.copy()]))
+    rows = join_query(db, st.sql(dialect='duckdb'))
+    rows = rows[0] if isinstance(rows, tuple) else rows
+    if not rows: return []
+    segA = db.open_segment(db.cat.segment_paths(alias2t[A])[0], alias2t[A])
+    kv = np.asarray([r[0] for r in rows])
+    keyvals = np.asarray(wdb_sql._col(segA, kcol.name)[0])
+    import pandas as _pdA
+    rowsA = _pdA.Index(keyvals).get_indexer(kv)
+    if (rowsA < 0).any(): raise _FastUnsupported
+    def decode(seg, nm, rws):
+        return seg.values_at(nm, np.asarray(seg.codes_at(nm, np.asarray(rws, dtype=np.int64))))
+    segs = {A: segA}
+    rows_of = {A: rowsA}
+    for B, (fkA, keyB) in hop.items():
+        segB = db.open_segment(db.cat.segment_paths(alias2t[B])[0], alias2t[B])
+        p = np.asarray(_hash_pointer(db, alias2t[A], fkA, segA, alias2t[B], keyB, segB))
+        segs[B] = segB; rows_of[B] = p[rowsA]
+    out_cols = []
+    for p in proj:
+        if p is aggs[0]:
+            out_cols.append([r[1] for r in rows])
+        else:
+            o = own(p)
+            out_cols.append(list(decode(segs[o], p.name, rows_of[o])))
+    return [tuple(c[i] for c in out_cols) for i in range(len(rows))]
+
+
 def join_query(db, sql, columnar=False):
     import time as _t8
     _jq_t0 = _t8.perf_counter()
     tree = sqlglot.parse_one(sql, read='duckdb')
+    if not tree.args.get('_wdb_court'):
+        tree.set('_wdb_court', True)
+        try:
+            court9 = _attr_court(db, tree)
+        except _FastUnsupported:
+            court9 = None
+        if court9 is not None:
+            return court9
     joins = tree.args.get('joins')
     import wdb_sql as _ws
     has_aggs = any(_ws._agg_kind(p) is not None for p in tree.expressions)
@@ -1810,7 +1904,12 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 for kx9, cs9, cp9 in items9:
                     pm9 = _plane_serve9(cs9, cp9, kx9)
                     if m9 is None:
-                        m9 = pm9 if pm9 is not None else kx9[np.asarray(cs9.codes(cp9))]
+                        if pm9 is not None:
+                            m9 = pm9
+                        else:
+                            _cd9 = np.asarray(cs9.codes(cp9))
+                            m9 = np.empty(_cd9.shape[0], dtype=np.bool_)
+                            wdb_kernels.plut_u8(_cd9, np.ascontiguousarray(kx9, dtype=np.bool_), m9)
                     else:
                         r9i = np.flatnonzero(m9)
                         if r9i.size == 0: return m9
@@ -1837,12 +1936,17 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                               key=lambda a: -depth9.get(a, 0)):
                 if pa9 not in eps9: raise _FastUnsupported
                 ca9, p9 = eps9[pa9]
+                if ca9 == fact9 and keeps9.get(fact9) is not None and depth9.get(pa9) == 1:
+                    continue        # RUNNING RULE: a depth-1 parent keep applies AT THE
+                                    # FACT KEEP'S SURVIVORS below (15M rows, 5ms), never
+                                    # flowed to fact scale (60M gather + AND, 120ms)
                 flow9 = keeps9[pa9][np.asarray(p9)]       # verdict rides the road down
                 keeps9[ca9] = flow9 if keeps9.get(ca9) is None else (keeps9.get(ca9) & flow9)                     if ca9 in keeps9 else flow9
                 if ca9 not in homes9 and ca9 != fact9:
                     homes9[ca9] = []                      # transit alias now carries a keep
             fm9 = keeps9.get(fact9)
-            rows9 = np.flatnonzero(fm9) if fm9 is not None else None
+            import wdb_engine as _WEc
+            rows9 = _WEc.Segment.mask_rows(fm9) if fm9 is not None else None
             for a9, (ca9, p9) in eps9.items():
                 pass
             # any keep left on a fact-adjacent alias applies through its road
@@ -1851,9 +1955,13 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     k9 = keeps9[pa9]
                     pt9 = np.asarray(p9)
                     if rows9 is None:
-                        rows9 = np.flatnonzero(k9[pt9])
+                        _kr9 = np.empty(pt9.shape[0], dtype=np.bool_)
+                        wdb_kernels.plut_u8(pt9, np.ascontiguousarray(k9, dtype=np.bool_), _kr9)
+                        rows9 = _WEc.Segment.mask_rows(_kr9)
                     else:
-                        rows9 = rows9[k9[pt9[rows9]]]
+                        _kk9 = np.empty(rows9.shape[0], dtype=np.bool_)
+                        wdb_kernels.pkeep_via_ptr(rows9, pt9, np.ascontiguousarray(k9, dtype=np.bool_), _kk9)
+                        rows9 = rows9[_WEc.Segment.mask_rows(_kk9)]
             if rows9 is None: raise _FastUnsupported
             if _cb9 is not None:
                 _cb9.append(('roads+fnz', _tk9() - _ct9)); _ct9 = _tk9()
@@ -2033,6 +2141,139 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             _plane_mask9 = None; _resid_c9X = None; rows9 = None
     def _rw9(a):
         return a if (rows9 is None or a is None) else np.asarray(a)[rows9]
+    # ---- THE KEY-DEPENDENT TOP-K DOOR (Q10's shape, 2026-09-01) --------------
+    # GROUP BY a parent's unique key plus that parent's attributes (and its
+    # own parents' attributes), ORDER BY one aggregate, LIMIT k: group by the
+    # PARENT ROW alone (one int key), select the top k, and decode every
+    # attribute for k rows only. Duck decodes them for every group.
+    def _topk_attr_door():
+        order9 = tree.args.get('order'); limit9 = tree.args.get('limit')
+        if group is None or order9 is None or limit9 is None: return None
+        if _plane_mask9 is not None or (_resid_c9X and rows9 is None): return None
+        try:
+            k9 = int(limit9.expression.this)
+        except Exception:
+            return None
+        if k9 <= 0 or k9 > 10000: return None
+        ords9 = list(order9.expressions)
+        if len(ords9) != 1 or not isinstance(ords9[0].this, E.Column): return None
+        okey9 = ords9[0].this.name; desc9 = bool(ords9[0].args.get('desc'))
+        alias2t9 = ctx['alias2t']; edge_ptrs9 = ctx.get('edge_ptrs') or {}
+        # group columns: which alias is the key holder?
+        gcols9 = []
+        for g in gnodes:
+            if not isinstance(g, E.Column): return None
+            sg, pc, cp = resolve(g)
+            gcols9.append((g, sg, pc, cp))
+        def _alias_of(g):
+            return g.table or next((al for al in alias2t9 if g.name in cols_of[al]), None)
+        A9 = None
+        for g, sg, pc, cp in gcols9:
+            if cp is None: continue
+            a9 = _alias_of(g)
+            if not a9: return None
+            try:
+                if _key_is_unique(db, alias2t9.get(a9, a9), pc):
+                    A9 = a9; keyptr9 = cp; kseg9 = sg; break
+            except Exception:
+                continue
+        if A9 is None: return None
+        # every other group column: on A, or on a parent of A
+        def _attr_route(g, sg, cp):
+            al = _alias_of(g)
+            if al == A9: return ('A', None)
+            ep = edge_ptrs9.get(al)
+            if ep is not None and ep[0] == A9: return ('B', ep[1])
+            return None
+        routes9 = []
+        for g, sg, pc, cp in gcols9:
+            r9 = _attr_route(g, sg, cp)
+            if r9 is None: return None
+            routes9.append(r9)
+        # projections: group columns or SUM/COUNT/AVG aggregates
+        aggs9 = {}
+        def _ev9(nd, rows):
+            if isinstance(nd, E.Paren): return _ev9(nd.this, rows)
+            if isinstance(nd, E.Literal):
+                if nd.is_string: raise _FastUnsupported
+                return float(nd.this)
+            if isinstance(nd, E.Column):
+                sg, pc, cp = resolve(nd)
+                raw9 = wdb_sql.raw_dict_col(sg, pc, want_codes=False)
+                if raw9 is None: raise _FastUnsupported
+                rr = rows if cp is None else np.asarray(cp)[rows]
+                return raw9[0][np.asarray(sg.codes_at(pc, rr))].astype(np.float64)
+            if isinstance(nd, E.Neg): return -_ev9(nd.this, rows)
+            if isinstance(nd, E.Mul): return _ev9(nd.this, rows) * _ev9(nd.expression, rows)
+            if isinstance(nd, E.Add): return _ev9(nd.this, rows) + _ev9(nd.expression, rows)
+            if isinstance(nd, E.Sub): return _ev9(nd.this, rows) - _ev9(nd.expression, rows)
+            if isinstance(nd, E.Div): return _ev9(nd.this, rows) / _ev9(nd.expression, rows)
+            raise _FastUnsupported
+        plan9 = []
+        gnames9 = {(_alias_of(g), g.name) for g, _s, _p, _c in gcols9}
+        for i, p in enumerate(proj):
+            inner = p.this if isinstance(p, E.Alias) else p
+            al9 = p.alias if isinstance(p, E.Alias) else (inner.name if isinstance(inner, E.Column) else None)
+            if isinstance(inner, E.Column):
+                if (_alias_of(inner), inner.name) not in gnames9: return None
+                plan9.append(('col', inner, al9))
+            elif isinstance(inner, (E.Sum, E.Count, E.Avg)):
+                plan9.append(('agg', inner, al9))
+            else:
+                return None
+        if not any(kind == 'agg' and al9 == okey9 for kind, _n, al9 in plan9): return None
+        # survivors
+        if rows9 is not None:
+            rows = rows9
+        else:
+            m9 = get_mask()
+            rows = np.flatnonzero(m9) if m9 is not None else np.arange(n, dtype=np.int64)
+        key = np.asarray(keyptr9)[rows]
+        NK = int(kseg9.N)
+        cnt = np.bincount(key, minlength=NK)
+        vals9 = {}
+        try:
+            for kind, nd, al9 in plan9:
+                if kind != 'agg': continue
+                if isinstance(nd, E.Count):
+                    vals9[al9] = cnt.astype(np.float64)
+                else:
+                    w9 = _ev9(nd.this, rows)
+                    s9 = np.bincount(key, weights=w9, minlength=NK)
+                    vals9[al9] = (s9 / np.maximum(cnt, 1)) if isinstance(nd, E.Avg) else s9
+        except _FastUnsupported:
+            return None
+        present = np.flatnonzero(cnt > 0)
+        score = vals9[okey9][present]
+        kk = min(k9, present.size)
+        if kk == 0:
+            _bump_fast(); return [], [wdb_sql._alias(p) for p in proj]
+        sel = np.argpartition(-score if desc9 else score, kk - 1)[:kk]
+        sel = sel[np.argsort(-score[sel] if desc9 else score[sel], kind='stable')]
+        top = present[sel]
+        # decode attributes at k rows
+        cols_out = []
+        for kind, nd, al9 in plan9:
+            if kind == 'agg':
+                v = vals9[al9][top]
+                cols_out.append([int(x) for x in v] if isinstance(nd, E.Count) else [float(x) for x in v])
+            else:
+                sg, pc, cp = resolve(nd)
+                rt = _attr_route(nd, sg, cp)
+                rr = top if rt[0] == 'A' else np.asarray(rt[1])[top]
+                cols_out.append(list(sg.values_at_rows(pc, rr)))
+        rows_out = [tuple(c[i] for c in cols_out) for i in range(kk)]
+        if _bill9 is not None:
+            _bill9.append(('topk-attr door (%d survivors, %d groups)' % (rows.size, present.size), _tk9() - _fpa_t0))
+            print('JOIN BILL: ' + ' | '.join('%s=%.0fms' % (nm9, v9 * 1000) for nm9, v9 in _bill9), flush=True)
+        _bump_fast()
+        return rows_out, [wdb_sql._alias(p) for p in proj]
+    try:
+        _door9 = _topk_attr_door()
+    except _FastUnsupported:
+        _door9 = None
+    if _door9 is not None:
+        return _door9
     gkeys = []                                           # one per GROUP BY column
     for g in gnodes:
         gseg, gpcol, gcptr = resolve(g)

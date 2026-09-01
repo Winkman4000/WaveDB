@@ -3267,3 +3267,21 @@ def pfill_rows(mask, offs, out, chunk):
             if mask[i]:
                 out[w] = i
                 w += 1
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def plut_u8(codes, lut, out):
+    """Parallel bool LUT over u8/u16/int codes (kx[codes] at 60M was a serial
+    ~90ms numpy gather in the cascade's native keeps)."""
+    n = codes.shape[0]
+    for i in prange(n):
+        out[i] = lut[np.int64(codes[i])]
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def pkeep_via_ptr(rows, ptr, keep, out):
+    """out[j] = keep[ptr[rows[j]]] -- a parent keep applied through a road at
+    survivor rows, in parallel (serial numpy chained gathers cost ~118ms at 15M)."""
+    n = rows.shape[0]
+    for j in prange(n):
+        out[j] = keep[np.int64(ptr[np.int64(rows[j])])]
