@@ -3285,3 +3285,12 @@ def pkeep_via_ptr(rows, ptr, keep, out):
     n = rows.shape[0]
     for j in prange(n):
         out[j] = keep[np.int64(ptr[np.int64(rows[j])])]
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def pgather_ptr(p, cc, out):
+    """out[i] = p[cc[i]] -- composing a grandparent road through a parent road
+    at fact scale, in parallel (serial numpy fancy-index cost ~100ms per 60M)."""
+    n = cc.shape[0]
+    for i in prange(n):
+        out[i] = p[np.int64(cc[i])]

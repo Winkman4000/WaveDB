@@ -1055,12 +1055,17 @@ def raw_dict_col(seg, name, want_codes=True):
         return base4, (seg.codes(name) if want_codes else None)
     if c['mode'] in (4, 5, 6) or c['has_null']: return None
     if seg._override_vals_typed(name):          return None
-    if c['dt'] == 2:
-        base = np.asarray(seg._typed_dict(name), dtype=np.float64)
-    elif c['dt'] in (0, 3):
-        base = np.asarray(seg._typed_dict(name), dtype=np.int64)
-    else:
+    if c['dt'] not in (0, 2, 3):
         return None
+    bc = getattr(seg, '_base_cache', None)
+    if bc is None:
+        bc = seg._base_cache = {}
+    base = bc.get(name)
+    if base is None:
+        # the typed base is dict-sized and immutable per segment: build once
+        # (np.asarray over a 1M-entry Python list cost ~35ms per call)
+        base = np.asarray(seg._typed_dict(name), dtype=(np.float64 if c['dt'] == 2 else np.int64))
+        bc[name] = base
     return base, (seg.codes(name) if want_codes else None)
 
 def _parse_temporal(litstr, unit):

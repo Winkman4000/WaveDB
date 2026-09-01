@@ -707,105 +707,10 @@ def denorm_rewrite(db, tree):
     return f"SELECT {', '.join(proj_sql)} FROM {child_t} GROUP BY {', '.join(gcols)}"
 
 
-def _attr_court(db, tree):
-    """THE ATTRIBUTE COURT (Jackson's Q10): GROUP BY k1..kn ORDER BY <sum alias>
-    DESC LIMIT k where ONE group column is a unique key of alias A and every
-    other group column is an attribute of A (or of a one-hop parent of A).
-    Those attributes are functionally dependent on the key: group by the key
-    alone, take the top k, and decode the attributes for k rows instead of
-    for every group. Returns rows or None (not this shape)."""
-    if not isinstance(tree, E.Select): return None
-    grp = tree.args.get('group'); order = tree.args.get('order'); lim = tree.args.get('limit')
-    if grp is None or order is None or lim is None: return None
-    if any(f is not None and f.find(E.Select) is not None for f in [tree.args.get('from')] + list(tree.args.get('joins') or [])):
-        return None
-    gcols = [g for g in grp.expressions]
-    if len(gcols) < 2 or not all(isinstance(g, E.Column) for g in gcols): return None
-    ords = order.expressions
-    if len(ords) != 1 or not isinstance(ords[0].this, E.Column) or not ords[0].args.get('desc'): return None
-    oname = ords[0].this.name
-    proj = list(tree.expressions)
-    aggs = [p for p in proj if isinstance(p, E.Alias) and isinstance(p.this, E.Sum)]
-    if len(aggs) != 1 or aggs[0].alias != oname: return None
-    if any(not (isinstance(p, E.Column) or p is aggs[0]) for p in proj): return None
-    try:
-        k = int(lim.expression.this)
-    except Exception:
-        return None
-    # alias -> table for the top-level FROM
-    alias2t = {}
-    for t9 in tree.find_all(E.Table):
-        if t9.find_ancestor(E.Select) is tree:
-            alias2t[t9.alias or t9.name] = t9.name
-    cols_of = {a: set(db.cat.column_names(t)) for a, t in alias2t.items()}
-    def own(c):
-        if c.table: return c.table if c.table in alias2t else None
-        o = [a for a, cs in cols_of.items() if c.name in cs]
-        return o[0] if len(o) == 1 else None
-    owners = [own(g) for g in gcols]
-    if any(o is None for o in owners): return None
-    # the key: exactly one group column unique in its table
-    keys = [(g, o) for g, o in zip(gcols, owners) if _key_is_unique(db, alias2t[o], g.name)]
-    if len(keys) != 1: return None
-    kcol, A = keys[0]
-    # one-hop parents of A via WHERE equalities (A.fk = B.key, B.key unique)
-    hop = {}
-    w = tree.args.get('where')
-    def _flat(x):
-        if isinstance(x, E.Paren): return _flat(x.this)
-        if isinstance(x, E.And): return _flat(x.this) + _flat(x.expression)
-        return [x]
-    for cj in (_flat(w.this) if w is not None else []):
-        if (isinstance(cj, E.EQ) and isinstance(cj.this, E.Column) and isinstance(cj.expression, E.Column)):
-            for x, y in ((cj.this, cj.expression), (cj.expression, cj.this)):
-                if own(x) == A and own(y) not in (None, A) and _key_is_unique(db, alias2t[own(y)], y.name):
-                    hop[own(y)] = (x.name, y.name)
-    for g, o in zip(gcols, owners):
-        if g is kcol: continue
-        if o != A and o not in hop: return None
-    # the stripped query: key + the sum, same FROM/WHERE, order by the sum, limit k
-    st = tree.copy()
-    st.set('expressions', [kcol.copy(), aggs[0].copy()])
-    st.set('group', E.Group(expressions=[kcol.copy()]))
-    rows = join_query(db, st.sql(dialect='duckdb'))
-    rows = rows[0] if isinstance(rows, tuple) else rows
-    if not rows: return []
-    segA = db.open_segment(db.cat.segment_paths(alias2t[A])[0], alias2t[A])
-    kv = np.asarray([r[0] for r in rows])
-    keyvals = np.asarray(wdb_sql._col(segA, kcol.name)[0])
-    import pandas as _pdA
-    rowsA = _pdA.Index(keyvals).get_indexer(kv)
-    if (rowsA < 0).any(): raise _FastUnsupported
-    def decode(seg, nm, rws):
-        return seg.values_at(nm, np.asarray(seg.codes_at(nm, np.asarray(rws, dtype=np.int64))))
-    segs = {A: segA}
-    rows_of = {A: rowsA}
-    for B, (fkA, keyB) in hop.items():
-        segB = db.open_segment(db.cat.segment_paths(alias2t[B])[0], alias2t[B])
-        p = np.asarray(_hash_pointer(db, alias2t[A], fkA, segA, alias2t[B], keyB, segB))
-        segs[B] = segB; rows_of[B] = p[rowsA]
-    out_cols = []
-    for p in proj:
-        if p is aggs[0]:
-            out_cols.append([r[1] for r in rows])
-        else:
-            o = own(p)
-            out_cols.append(list(decode(segs[o], p.name, rows_of[o])))
-    return [tuple(c[i] for c in out_cols) for i in range(len(rows))]
-
-
 def join_query(db, sql, columnar=False):
     import time as _t8
     _jq_t0 = _t8.perf_counter()
     tree = sqlglot.parse_one(sql, read='duckdb')
-    if not tree.args.get('_wdb_court'):
-        tree.set('_wdb_court', True)
-        try:
-            court9 = _attr_court(db, tree)
-        except _FastUnsupported:
-            court9 = None
-        if court9 is not None:
-            return court9
     joins = tree.args.get('joins')
     import wdb_sql as _ws
     has_aggs = any(_ws._agg_kind(p) is not None for p in tree.expressions)
@@ -3373,9 +3278,20 @@ def _build_chain(db, tree, allow_hash=True):
                 if p is None: raise _FastUnsupported
                 cc = composed[child_a]
                 edge_ptrs[parent_a] = (child_a, p)       # child-scale road, kept for the downhill flow
-                composed[parent_a] = p if cc is None else p[cc]                  # compose by gather
+                if cc is None:
+                    composed[parent_a] = p
+                else:
+                    _pc9 = np.asarray(p); _cc9 = np.asarray(cc)
+                    _o9 = np.empty(_cc9.shape[0], dtype=_pc9.dtype)
+                    wdb_kernels.pgather_ptr(_pc9, _cc9, _o9)     # parallel compose
+                    composed[parent_a] = _o9                  # compose by gather
                 progress = True
     if any(a not in composed for a in keep): raise _FastUnsupported              # kept tables must connect
+    # EARLY DECLINE: an alias the query reads that this chain never composed
+    # (the stored-only attempt on a tree needing hash edges) fails HERE, not
+    # after running a 125ms cascade and dying in resolve (Q10's pre-work=256).
+    if any((a in alias2t) and (a not in composed) for a in ref):
+        raise _FastUnsupported
     # THE STRIP RUNS ONLY ON SUCCESS: the allow_hash=False attempt used to
     # consume edge equalities from WHERE and then raise, leaving the retry a
     # gutted tree (Q5's nation vanished this way).
