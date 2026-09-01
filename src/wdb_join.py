@@ -2449,10 +2449,28 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             # FAIL LOUD: an unservable residual conjunct means THIS PLAN cannot
             # answer -- proceeding predicate-less silently dropped WHERE clauses
             # (Q21's EXISTS pair vanished and a confident wrong top-100 shipped
-            # to the board, 2026-08-30). Decline; the pandas tail serves or the
-            # query holes honestly.
+            # to the board, 2026-08-30). ONE explicit exception: an IN whose
+            # subquery was resolved to codes (query arg kept for codes-unaware
+            # consumers) is the MASK layer's by design -- the pred skips exactly
+            # those and nothing else (Q4's EXISTS road). Anything else declines.
             slots.clear(); slot_list.clear()
-            raise
+            _fu9, _ok9 = [], []
+            for _cn9 in (conj9 if isinstance(conj9, list) else []):
+                try:
+                    build_pred(_cn9); _ok9.append(_cn9)
+                except _FastUnsupported:
+                    _fu9.append(_cn9)
+            slots.clear(); slot_list.clear()
+            if not _fu9 or not all(isinstance(_c9, E.In) and _c9.args.get('query') is not None
+                                    and (_c9.args.get('expressions') or []) for _c9 in _fu9):
+                raise
+            # The mask layer serves: the FULL WHERE mask (mask_eval knows the
+            # resolved codes) ANDs into the plan's mask; the pred stands down.
+            _mfull9 = get_mask()
+            if _mfull9 is None:
+                raise
+            _plane_mask9 = _mfull9 if _plane_mask9 is None else (_plane_mask9 & _mfull9)
+            pred_body = None
 
     plan = []; fully = wdb_exprjit.HAS_NUMBA
     for i, p in enumerate(proj):
