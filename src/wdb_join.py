@@ -912,6 +912,80 @@ def _left_count_frame(db, inner):
 
 
 
+def _grouped_in_rewrite(db, tree):
+    """THE WEIGHTED CENSUS SERVE (Jackson's Q18): `pkey IN (SELECT ckey FROM
+    child GROUP BY ckey HAVING AGG(col) cmp lit)` fetches no foreign data --
+    it keeps parents whose slot in a weighted bincount over the child's road
+    clears the bar. Resolve to the literal key list (monsters are rare) and
+    the query becomes a plain tree query. Declines loudly past 100k keys."""
+    w = tree.args.get('where')
+    if w is None: return
+    for node in list(w.find_all(E.In)):
+        q = node.args.get('query')
+        if q is None: continue
+        sub = q.this if isinstance(q, E.Subquery) else q
+        if not isinstance(sub, E.Select): continue
+        if node.find_ancestor(E.Select) is not None and node.find_ancestor(E.Select) is not tree: continue
+        if sub.args.get('joins') or sub.args.get('where'): continue
+        grp = sub.args.get('group'); hav = sub.args.get('having')
+        if grp is None or hav is None or len(grp.expressions) != 1: continue
+        gk = grp.expressions[0]
+        proj = list(sub.expressions)
+        if len(proj) != 1: continue
+        p0 = proj[0].this if isinstance(proj[0], E.Alias) else proj[0]
+        if not (isinstance(gk, E.Column) and isinstance(p0, E.Column) and p0.name == gk.name): continue
+        frm = sub.args.get('from') or sub.args.get('from_')
+        if frm is None or not isinstance(frm.this, E.Table): continue
+        childT = frm.this.name
+        hv = hav.this
+        if type(hv) not in (E.GT, E.GTE, E.LT, E.LTE): continue
+        ag = hv.this; lit = hv.expression
+        if not (isinstance(lit, E.Literal) and not lit.is_string): continue
+        thr = float(lit.this)
+        if isinstance(ag, E.Count) and (ag.this is None or isinstance(ag.this, E.Star)):
+            wcol = None
+        elif isinstance(ag, E.Sum) and isinstance(ag.this, E.Column):
+            wcol = ag.this.name
+        else:
+            continue
+        oc = node.this
+        if not isinstance(oc, E.Column): continue
+        # which alias/table owns the outer column
+        parentT = None
+        for t9 in tree.find_all(E.Table):
+            if t9.find_ancestor(E.Select) is tree and oc.name in set(db.cat.column_names(t9.name)):
+                if oc.table and (t9.alias or t9.name) != oc.table: continue
+                parentT = t9.name; break
+        if parentT is None or not _key_is_unique(db, parentT, oc.name): continue
+        try:
+            cseg, _s1 = _solo_segment(db, childT)
+            pseg, _s2 = _solo_segment(db, parentT)
+            road = np.asarray(_hash_pointer(db, childT, db.cat.phys_map(childT).get(gk.name, gk.name),
+                                            cseg, parentT, db.cat.phys_map(parentT).get(oc.name, oc.name), pseg))
+            cache = getattr(pseg, '_census_cache', None)
+            if cache is None: cache = pseg._census_cache = {}
+            ck9 = (childT, gk.name, wcol)
+            qsum = cache.get(ck9)
+            if qsum is None:
+                if wcol is None:
+                    qsum = np.bincount(road, minlength=pseg.N).astype(np.float64)
+                else:
+                    rw = wdb_sql.raw_dict_col(cseg, db.cat.phys_map(childT).get(wcol, wcol))
+                    if rw is None: continue
+                    qsum = np.bincount(road, weights=rw[0][np.asarray(rw[1])], minlength=pseg.N)
+                cache[ck9] = qsum
+            op9 = {E.GT: np.greater, E.GTE: np.greater_equal,
+                   E.LT: np.less, E.LTE: np.less_equal}[type(hv)]
+            prows = np.flatnonzero(op9(qsum, thr))
+            if prows.size > 100000: continue                 # stays a loud hole
+            keys = np.asarray(wdb_sql._col(pseg, db.cat.phys_map(parentT).get(oc.name, oc.name))[0])[prows]
+        except Exception:
+            continue
+        node.set('expressions', [E.Literal(this=str(int(k)), is_string=False) for k in keys.tolist()])
+        node.set('query', None)
+
+
+
 def _from_door(db, tree):
     """THE FROM DOOR (Q7/Q13/Q22): FROM (SELECT ...) alias -- run the INNER
     through the engine (it rides every fast path: trees, cascades, courts),
@@ -1073,6 +1147,7 @@ def join_query(db, sql, columnar=False):
     import time as _t8
     _jq_t0 = _t8.perf_counter()
     tree = sqlglot.parse_one(sql, read='duckdb')
+    _grouped_in_rewrite(db, tree)
     try:
         door9 = _from_door(db, tree)
     except _FastUnsupported:
@@ -2429,8 +2504,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             return None
         if k9 <= 0 or k9 > 10000: return None
         ords9 = list(order9.expressions)
-        if len(ords9) != 1 or not isinstance(ords9[0].this, E.Column): return None
+        if not ords9 or any(not isinstance(o9.this, E.Column) for o9 in ords9): return None
         okey9 = ords9[0].this.name; desc9 = bool(ords9[0].args.get('desc'))
+        attr_order9 = len(ords9) > 1 or True   # resolved after plan9: agg alias or attributes
         alias2t9 = ctx['alias2t']; edge_ptrs9 = ctx.get('edge_ptrs') or {}
         # group columns: which alias is the key holder?
         gcols9 = []
@@ -2517,12 +2593,35 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         except _FastUnsupported:
             return None
         present = np.flatnonzero(cnt > 0)
-        score = vals9[okey9][present]
         kk = min(k9, present.size)
         if kk == 0:
             _bump_fast(); return [], [wdb_sql._alias(p) for p in proj]
-        sel = np.argpartition(-score if desc9 else score, kk - 1)[:kk]
-        sel = sel[np.argsort(-score[sel] if desc9 else score[sel], kind='stable')]
+        if len(ords9) == 1 and okey9 in vals9:
+            score = vals9[okey9][present]
+            sel = np.argpartition(-score if desc9 else score, kk - 1)[:kk]
+            sel = sel[np.argsort(-score[sel] if desc9 else score[sel], kind='stable')]
+        else:
+            # ORDER BY ATTRIBUTES (Jackson's Q18: totalprice DESC, date):
+            # decode the order columns for the PRESENT groups (already tiny
+            # after the mask) and lexsort; the aggregate needed no ordering.
+            if present.size > 200000: return None
+            karr9 = []
+            for o9 in ords9:
+                if isinstance(o9.this, E.Column) and o9.this.name in vals9:
+                    a9v = vals9[o9.this.name][present]
+                else:
+                    sg9o, pc9o, cp9o = resolve(o9.this)
+                    rt9o = _attr_route(o9.this, sg9o, cp9o)
+                    rr9o = present if rt9o[0] == 'A' else np.asarray(rt9o[1])[present]
+                    v9o = sg9o.values_at_rows(pc9o, rr9o)
+                    a9v = np.asarray(v9o)
+                d9o = bool(o9.args.get('desc'))
+                if a9v.dtype.kind in 'ifu':
+                    karr9.append(-a9v if d9o else a9v)
+                else:
+                    _, inv9o = np.unique(a9v, return_inverse=True)
+                    karr9.append(-inv9o if d9o else inv9o)
+            sel = np.lexsort(tuple(reversed(karr9)))[:kk]
         top = present[sel]
         # decode attributes at k rows
         cols_out = []
