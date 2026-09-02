@@ -1547,6 +1547,10 @@ def _apply_order(rows, proj, order):
         target = o.this
         # find column index in proj by sql match or name
         idx=None
+        if isinstance(target, E.Literal) and not target.is_string:
+            idx = int(str(target.this)) - 1              # ORDER BY ordinal
+            if not (0 <= idx < len(proj)): raise NotImplementedError('ORDER BY ordinal out of range')
+            keys.append((idx, desc)); continue
         for i,p in enumerate(proj):
             inner=p.this if isinstance(p,E.Alias) else p
             if inner.sql()==target.sql() or _alias(p)==(target.name if isinstance(target,E.Column) else None):

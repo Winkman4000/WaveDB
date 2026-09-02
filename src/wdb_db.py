@@ -316,6 +316,9 @@ class Database:
                 if _rw is None:                                  # column -> single-table cube read; else gather
                     return wdb_join.join_query(self, sql)
                 sql = _rw; tree = _parse_sql_cached(_rw)         # fall through to the single-table path
+            frm9 = tree.args.get('from') or tree.args.get('from_')
+            if frm9 is not None and frm9.this.__class__.__name__ == 'Subquery':
+                return wdb_join.join_query(self, sql)     # THE FROM DOOR lives there
             name = self._table_in(tree)
             phys = self.cat.phys_map(name)
             import wdb_groupsets

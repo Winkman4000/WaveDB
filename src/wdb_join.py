@@ -707,10 +707,168 @@ def denorm_rewrite(db, tree):
     return f"SELECT {', '.join(proj_sql)} FROM {child_t} GROUP BY {', '.join(gcols)}"
 
 
+def _from_door(db, tree):
+    """THE FROM DOOR (Q7/Q13/Q22): FROM (SELECT ...) alias -- run the INNER
+    through the engine (it rides every fast path: trees, cascades, courts),
+    then evaluate the outer over the inner's small output frame. Returns rows
+    or None (not this shape)."""
+    frm = tree.args.get('from') or tree.args.get('from_')   # sqlglot renamed the key
+    if frm is None or not isinstance(frm.this, E.Subquery): return None
+    if tree.args.get('joins'): return None
+    if tree.args.get('having') is not None: return None
+    inner = frm.this.this
+    if not isinstance(inner, E.Select): return None
+    import pandas as pd
+    cols = [e.alias_or_name for e in inner.expressions]
+    if any(not c for c in cols): return None
+    _AGG9 = (E.Sum, E.Count, E.Avg, E.Min, E.Max)
+    if inner.args.get('group') is None and not any(
+            e.find(*_AGG9) is not None for e in inner.expressions):
+        # FLATTEN: an aggregate-less inner folds into the outer -- substitute
+        # the inner expressions for their aliases and run ONE tree query.
+        sub_map = {e.alias_or_name: (e.this if isinstance(e, E.Alias) else e)
+                   for e in inner.expressions}
+        flat = tree.copy()
+        for key9 in ('from', 'from_'):
+            if inner.args.get(key9) is not None:
+                flat.set(key9, inner.args[key9].copy())
+        flat.set('joins', [j.copy() for j in (inner.args.get('joins') or [])] or None)
+        names9 = [p.alias_or_name for p in flat.expressions]
+        order9 = flat.args.get('order')
+        if order9 is not None:
+            for o9 in order9.expressions:
+                if isinstance(o9.this, E.Column) and o9.this.name in names9:
+                    o9.set('this', E.Literal(this=str(names9.index(o9.this.name) + 1), is_string=False))
+        for c9 in list(flat.find_all(E.Column)):
+            if not c9.table and c9.name in sub_map:
+                c9.replace(sub_map[c9.name].copy())
+        iw9 = inner.args.get('where')
+        if iw9 is not None:
+            fw9 = flat.args.get('where')
+            merged9 = iw9.this.copy() if fw9 is None else E.And(
+                this=E.Paren(this=iw9.this.copy()), expression=E.Paren(this=fw9.this.copy()))
+            flat.set('where', E.Where(this=merged9))
+        return join_query(db, flat.sql(dialect='duckdb'))
+    rows = db.run(inner.sql(dialect='duckdb'))
+    rows = rows[0] if isinstance(rows, tuple) else rows
+    df = pd.DataFrame(list(rows), columns=cols)
+    def ev(nd):
+        if isinstance(nd, E.Paren): return ev(nd.this)
+        if isinstance(nd, E.Column): return df[nd.name]
+        if isinstance(nd, E.Literal):
+            return (nd.this if nd.is_string else (float(nd.this) if '.' in str(nd.this) else int(nd.this)))
+        if isinstance(nd, E.Neg): return -ev(nd.this)
+        if isinstance(nd, E.Mul): return ev(nd.this) * ev(nd.expression)
+        if isinstance(nd, E.Div): return ev(nd.this) / ev(nd.expression)
+        if isinstance(nd, E.Add): return ev(nd.this) + ev(nd.expression)
+        if isinstance(nd, E.Sub): return ev(nd.this) - ev(nd.expression)
+        raise _FastUnsupported
+    def mask(nd):
+        if isinstance(nd, E.Paren): return mask(nd.this)
+        if isinstance(nd, E.And): return mask(nd.this) & mask(nd.expression)
+        if isinstance(nd, E.Or): return mask(nd.this) | mask(nd.expression)
+        if isinstance(nd, E.Not): return ~mask(nd.this)
+        if isinstance(nd, E.In):
+            lits = [ev(x) for x in (nd.args.get('expressions') or [])]
+            if nd.args.get('query') is not None: raise _FastUnsupported
+            return ev(nd.this).isin(lits)
+        ops = {E.GT: '__gt__', E.GTE: '__ge__', E.LT: '__lt__', E.LTE: '__le__',
+               E.EQ: '__eq__', E.NEQ: '__ne__'}
+        if type(nd) in ops:
+            return getattr(ev(nd.this), ops[type(nd)])(ev(nd.expression))
+        raise _FastUnsupported
+    try:
+        w = tree.args.get('where')
+        if w is not None:
+            df = df[mask(w.this)]
+        grp = tree.args.get('group')
+        proj = list(tree.expressions)
+        _AGG = (E.Sum, E.Count, E.Avg, E.Min, E.Max)
+        def eval_on(nd, sub):
+            nonlocal df
+            keep = df; df = sub
+            try: return ev(nd)
+            finally: df = keep
+        def agg_val(node, sub):
+            if isinstance(node, E.Count) and (node.this is None or isinstance(node.this, E.Star)):
+                return int(len(sub))
+            arg = eval_on(node.this, sub)
+            if isinstance(node, E.Sum): return float(arg.sum())
+            if isinstance(node, E.Avg): return float(arg.mean())
+            if isinstance(node, E.Min): return arg.min()
+            if isinstance(node, E.Max): return arg.max()
+            if isinstance(node, E.Count): return int(arg.notna().sum())
+            raise _FastUnsupported
+        def proj_val(p, sub, gvals):
+            nd = p.this if isinstance(p, E.Alias) else p
+            if isinstance(nd, E.Column) and nd.name in gvals:
+                return gvals[nd.name]
+            if isinstance(nd, _AGG):
+                return agg_val(nd, sub)
+            if isinstance(nd, (E.Mul, E.Div, E.Add, E.Sub, E.Paren)) and nd.find(*_AGG) is not None:
+                def num(x):
+                    if isinstance(x, E.Paren): return num(x.this)
+                    if isinstance(x, _AGG): return agg_val(x, sub)
+                    if isinstance(x, E.Literal): return float(x.this) if not x.is_string else x.this
+                    if isinstance(x, E.Mul): return num(x.this) * num(x.expression)
+                    if isinstance(x, E.Div): return num(x.this) / num(x.expression)
+                    if isinstance(x, E.Add): return num(x.this) + num(x.expression)
+                    if isinstance(x, E.Sub): return num(x.this) - num(x.expression)
+                    raise _FastUnsupported
+                return num(nd)
+            raise _FastUnsupported
+        out = []
+        if grp is not None:
+            gnames = [g.name for g in grp.expressions if isinstance(g, E.Column)]
+            if len(gnames) != len(grp.expressions): raise _FastUnsupported
+            for kv, sub in df.groupby(gnames, sort=False, dropna=False):
+                kv = kv if isinstance(kv, tuple) else (kv,)
+                gvals = dict(zip(gnames, kv))
+                out.append(tuple(proj_val(p, sub, gvals) for p in proj))
+        else:
+            out.append(tuple(proj_val(p, df, {}) for p in proj))
+        order = tree.args.get('order')
+        if order is not None:
+            names = [(p.alias if isinstance(p, E.Alias) else (p.name if isinstance(p, E.Column) else None)) for p in proj]
+            keys = []
+            for o in order.expressions:
+                cn = o.this
+                if isinstance(cn, E.Column) and cn.name in names:
+                    keys.append((names.index(cn.name), bool(o.args.get('desc'))))
+                elif isinstance(cn, E.Literal):
+                    keys.append((int(cn.this) - 1, bool(o.args.get('desc'))))
+                else:
+                    raise _FastUnsupported
+            import functools
+            def cmp(a, b):
+                for idx, desc in keys:
+                    x, y = a[idx], b[idx]
+                    if x == y: continue
+                    lt = (x is None) or (y is not None and x < y)
+                    return (1 if lt else -1) if desc else (-1 if lt else 1)
+                return 0
+            out.sort(key=functools.cmp_to_key(cmp))
+        lim = tree.args.get('limit')
+        if lim is not None:
+            out = out[:int(lim.expression.this)]
+        return out
+    except _FastUnsupported:
+        raise
+    except Exception:
+        raise _FastUnsupported
+
+
+
 def join_query(db, sql, columnar=False):
     import time as _t8
     _jq_t0 = _t8.perf_counter()
     tree = sqlglot.parse_one(sql, read='duckdb')
+    try:
+        door9 = _from_door(db, tree)
+    except _FastUnsupported:
+        door9 = None
+    if door9 is not None:
+        return door9
     joins = tree.args.get('joins')
     import wdb_sql as _ws
     has_aggs = any(_ws._agg_kind(p) is not None for p in tree.expressions)
@@ -2181,6 +2339,45 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         return _door9
     gkeys = []                                           # one per GROUP BY column
     for g in gnodes:
+        if not isinstance(g, E.Column):
+            # EXPRESSION GROUP KEY RIDES THE DICT: transform the V dictionary
+            # values through the expression, collapse equal results, remap the
+            # codes -- O(V), never O(N) (Q7's l_shipdate/365 folds ~2500 days
+            # into 7 years at dict scale).
+            cols9g = list(g.find_all(E.Column))
+            if len(cols9g) != 1: return None
+            gseg, gpcol, gcptr = resolve(cols9g[0])
+            rawx = wdb_sql.raw_dict_col(gseg, gpcol, want_codes=False)
+            if rawx is None: return None
+            def _dx9(nd, bv):
+                if isinstance(nd, E.Paren): return _dx9(nd.this, bv)
+                if isinstance(nd, E.Column): return bv
+                if isinstance(nd, E.Literal):
+                    if nd.is_string: raise _FastUnsupported
+                    return float(nd.this)
+                if isinstance(nd, E.Neg): return -_dx9(nd.this, bv)
+                if isinstance(nd, E.Mul): return _dx9(nd.this, bv) * _dx9(nd.expression, bv)
+                if isinstance(nd, E.Div): return _dx9(nd.this, bv) / _dx9(nd.expression, bv)
+                if isinstance(nd, E.Add): return _dx9(nd.this, bv) + _dx9(nd.expression, bv)
+                if isinstance(nd, E.Sub): return _dx9(nd.this, bv) - _dx9(nd.expression, bv)
+                raise _FastUnsupported
+            try:
+                dv9 = _dx9(g, np.asarray(rawx[0], dtype=np.float64))
+            except _FastUnsupported:
+                return None
+            u9x, inv9x = np.unique(dv9, return_inverse=True)
+            inv9x = np.ascontiguousarray(inv9x, dtype=np.int64)
+            if gcptr is None and rows9 is not None:
+                full = inv9x[np.asarray(gseg.codes_at(gpcol, rows9))]
+            else:
+                full = inv9x[np.asarray(gseg.codes(gpcol))]
+                if full.size == 0: return [], [wdb_sql._alias(p) for p in proj]
+                if gcptr is None: full = _rw9(full)
+                else: gcptr = _rw9(gcptr)
+            gkeys.append({'seg': gseg, 'pcol': gpcol, 'cptr': gcptr, 'full': full,
+                          'K': int(u9x.size), 'labels': [wdb_sql._pyval(x) for x in u9x.tolist()],
+                          'expr': True})
+            continue
         gseg, gpcol, gcptr = resolve(g)
         if gseg.cols[gpcol]['mode'] == 4:
             # Affine-coded (mode 4): dense gids + labels, memoised on the immutable segment.
@@ -2643,8 +2840,24 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             plan.append((i, 'count', None, False, None))
         elif gkeys and isinstance(inner, E.Column):      # bare GROUP BY key column
             pseg, ppcol, _r = resolve(inner)
-            ki = next((j for j, k in enumerate(gkeys) if k['seg'] is pseg and k['pcol'] == ppcol), None)
+            ki = next((j for j, k in enumerate(gkeys)
+                       if k['seg'] is pseg and k['pcol'] == ppcol and not k.get('expr')
+                       and (k['cptr'] is _r or (k['cptr'] is not None and _r is not None
+                                                and k['cptr'] is not _r and False))), None)
+            if ki is None:
+                ki = next((j for j, k in enumerate(gkeys)
+                           if k['seg'] is pseg and k['pcol'] == ppcol and not k.get('expr')), None)
+                # two aliases of one table (Q7's n1/n2): (seg,pcol) is ambiguous,
+                # the composed pointer is the alias's identity -- no match means
+                # the pointers got rewritten (_rw9); match by group-node text then
+                gsql9c = inner.sql()
+                ki2 = next((j for j, gg in enumerate(gnodes) if gg.sql() == gsql9c), None)
+                if ki2 is not None: ki = ki2
             if ki is None: fully = False; break
+            plan.append((i, 'key', ki, False, None))
+        elif gkeys and any(gg.sql() == inner.sql() for gg in gnodes):
+            # EXPRESSION PROJECTION == EXPRESSION GROUP KEY (matched by text)
+            ki = next(j for j, gg in enumerate(gnodes) if gg.sql() == inner.sql())
             plan.append((i, 'key', ki, False, None))
         else:
             fully = False; break
