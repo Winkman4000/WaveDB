@@ -707,6 +707,211 @@ def denorm_rewrite(db, tree):
     return f"SELECT {', '.join(proj_sql)} FROM {child_t} GROUP BY {', '.join(gcols)}"
 
 
+def _rich_lonely_frame(db, inner):
+    """Q22's inner dissolved: single-table SELECT over customer where every
+    conjunct is one of {2-char-prefix IN literals (byte kernel), col > (scalar
+    AVG subquery of the same shape), NOT EXISTS (child fk = key) (the CENSUS:
+    a bincount of the child fk over the key's identity domain -- 'has no
+    orders' is 'the slot is empty')}. Returns the inner's frame or None."""
+    import pandas as pd
+    if inner.args.get('joins') or inner.args.get('group'): return None
+    frm = inner.args.get('from') or inner.args.get('from_')
+    if frm is None or not isinstance(frm.this, E.Table): return None
+    t1 = frm.this.name
+    try:
+        seg1, _sp = _solo_segment(db, t1)
+    except _FastUnsupported:
+        return None
+    phys1 = db.cat.phys_map(t1)
+    def _flat9(x):
+        if isinstance(x, E.Paren): return _flat9(x.this)
+        if isinstance(x, E.And): return _flat9(x.this) + _flat9(x.expression)
+        return [x]
+    def _prefix_node(nd):
+        if isinstance(nd, E.Substring):
+            a1 = nd.args.get('start'); a2 = nd.args.get('length')
+            if (isinstance(nd.this, E.Column) and a1 is not None and a2 is not None
+                    and str(a1.this) == '1' and str(a2.this) == '2'):
+                return nd.this
+        return None
+    def _mask_of(w9, seg):
+        m = None
+        for cj in _flat9(w9):
+            mm = None
+            if isinstance(cj, E.In):
+                pc = _prefix_node(cj.this)
+                lits = [str(x.this) for x in (cj.args.get('expressions') or []) if isinstance(x, E.Literal)]
+                if pc is None or not lits or any(len(x) != 2 for x in lits): return None
+                pre = seg.prefix2_codes(phys1.get(pc.name, pc.name))
+                want = np.array(sorted((ord(x[0]) << 8) | ord(x[1]) for x in lits), dtype=np.uint16)
+                mm = np.isin(pre, want)
+            elif type(cj) in (E.GT, E.GTE, E.LT, E.LTE) and isinstance(cj.this, E.Column):
+                rhs = cj.expression
+                if isinstance(rhs, E.Subquery) or isinstance(rhs, E.Select) or rhs.find(E.Select) is not None:
+                    sub = rhs.this if isinstance(rhs, E.Subquery) else rhs
+                    sv = _scalar_of(sub)
+                    if sv is None: return None
+                    rv = sv
+                elif isinstance(rhs, E.Literal) and not rhs.is_string:
+                    rv = float(rhs.this)
+                else:
+                    return None
+                raw = wdb_sql.raw_dict_col(seg, phys1.get(cj.this.name, cj.this.name))
+                if raw is None: return None
+                vals = raw[0][np.asarray(raw[1])]
+                op = {E.GT: np.greater, E.GTE: np.greater_equal,
+                      E.LT: np.less, E.LTE: np.less_equal}[type(cj)]
+                mm = op(vals, rv)
+            elif isinstance(cj, E.Exists) or (isinstance(cj, E.Not) and isinstance(cj.this, E.Exists)):
+                inv9 = isinstance(cj, E.Not)
+                ex = (cj.this if inv9 else cj).this
+                if not isinstance(ex, E.Select): return None
+                efrm = ex.args.get('from') or ex.args.get('from_')
+                if efrm is None or not isinstance(efrm.this, E.Table): return None
+                t2 = efrm.this.name
+                ew = ex.args.get('where')
+                if ew is None: return None
+                ecs = _flat9(ew.this)
+                if len(ecs) != 1 or not isinstance(ecs[0], E.EQ): return None
+                x9, y9 = ecs[0].this, ecs[0].expression
+                c2 = set(db.cat.column_names(t2))
+                if x9.name not in c2: x9, y9 = y9, x9
+                if x9.name not in c2 or y9.name not in set(db.cat.column_names(t1)): return None
+                seg2, _s2 = _solo_segment(db, t2)
+                kv1 = np.asarray(wdb_sql._col(seg1, phys1.get(y9.name, y9.name))[0]).astype(np.int64)
+                kmin = int(kv1.min())
+                if int(kv1.max()) - kmin + 1 != kv1.size: return None
+                fk9 = wdb_sql.raw_dict_col(seg2, db.cat.phys_map(t2).get(x9.name, x9.name))
+                if fk9 is None: return None
+                cen = np.bincount((fk9[0][np.asarray(fk9[1])]).astype(np.int64) - kmin,
+                                  minlength=kv1.size)
+                mm = (cen == 0) if inv9 else (cen > 0)
+            else:
+                return None
+            m = mm if m is None else (m & mm)
+        return m
+    def _scalar_of(sub):
+        if not isinstance(sub, E.Select): return None
+        sf = sub.args.get('from') or sub.args.get('from_')
+        if sf is None or not isinstance(sf.this, E.Table) or sf.this.name != t1: return None
+        sp = list(sub.expressions)
+        if len(sp) != 1: return None
+        ag = sp[0].this if isinstance(sp[0], E.Alias) else sp[0]
+        if not (isinstance(ag, E.Avg) and isinstance(ag.this, E.Column)): return None
+        sm = _mask_of(sub.args['where'].this, seg1) if sub.args.get('where') is not None else None
+        if sm is None and sub.args.get('where') is not None: return None
+        raw = wdb_sql.raw_dict_col(seg1, phys1.get(ag.this.name, ag.this.name))
+        if raw is None: return None
+        vals = raw[0][np.asarray(raw[1])]
+        return float(vals[sm].mean() if sm is not None else vals.mean())
+    w = inner.args.get('where')
+    if w is None: return None
+    m = _mask_of(w.this, seg1)
+    if m is None: return None
+    outcols = {}
+    for p in inner.expressions:
+        nd = p.this if isinstance(p, E.Alias) else p
+        nm9 = p.alias_or_name
+        pc9 = _prefix_node(nd)
+        if pc9 is not None:
+            pre = seg1.prefix2_codes(phys1.get(pc9.name, pc9.name))[m]
+            outcols[nm9] = [chr(x >> 8) + chr(x & 255) for x in pre.tolist()]
+        elif isinstance(nd, E.Column):
+            raw = wdb_sql.raw_dict_col(seg1, phys1.get(nd.name, nd.name))
+            if raw is None: return None
+            outcols[nm9] = raw[0][np.asarray(raw[1])][m]
+        else:
+            return None
+    return pd.DataFrame(outcols)
+
+
+
+def _left_count_frame(db, inner):
+    """Q13's LEFT JOIN dissolved (Jackson's reading: the join fetches NO
+    foreign data -- its whole meaning is 'the domain is ALL customers, absent
+    matches count zero'): filter the child by the ON's extra conjunct (a
+    front-coded LIKE runs as a byte kernel over the dict), bincount child fk
+    values over the parent's FULL key domain, zeros by construction. Returns
+    the inner's output frame or None."""
+    import pandas as pd
+    joins = inner.args.get('joins') or []
+    if len(joins) != 1: return None
+    jn = joins[0]
+    if (jn.args.get('side') or '').upper() != 'LEFT': return None
+    frm = inner.args.get('from') or inner.args.get('from_')
+    if frm is None or not isinstance(frm.this, E.Table): return None
+    t1 = frm.this.name; a1 = frm.this.alias or t1
+    if not isinstance(jn.this, E.Table): return None
+    t2 = jn.this.name; a2 = jn.this.alias or t2
+    grp = inner.args.get('group')
+    if grp is None or len(grp.expressions) != 1: return None
+    gk = grp.expressions[0]
+    if not isinstance(gk, E.Column): return None
+    proj = list(inner.expressions)
+    if len(proj) != 2: return None
+    kcol = proj[0].this if isinstance(proj[0], E.Alias) else proj[0]
+    cagg = proj[1]
+    if not (isinstance(kcol, E.Column) and kcol.name == gk.name): return None
+    if not (isinstance(cagg, E.Alias) and isinstance(cagg.this, E.Count)
+            and isinstance(cagg.this.this, E.Column)): return None
+    on = jn.args.get('on')
+    if on is None: return None
+    def _flat9(x):
+        if isinstance(x, E.Paren): return _flat9(x.this)
+        if isinstance(x, E.And): return _flat9(x.this) + _flat9(x.expression)
+        return [x]
+    eqs, extra = [], []
+    c1 = set(db.cat.column_names(t1)); c2 = set(db.cat.column_names(t2))
+    def owner9(c):
+        if c.table: return c.table
+        if c.name in c1 and c.name not in c2: return a1
+        if c.name in c2 and c.name not in c1: return a2
+        return None
+    for cj in _flat9(on):
+        if isinstance(cj, E.EQ) and isinstance(cj.this, E.Column) and isinstance(cj.expression, E.Column):
+            eqs.append(cj); continue
+        if all(owner9(x) == a2 for x in cj.find_all(E.Column)):
+            extra.append(cj); continue
+        return None
+    if len(eqs) != 1: return None
+    x, y = eqs[0].this, eqs[0].expression
+    if owner9(x) == a2: x, y = y, x
+    if owner9(x) != a1 or owner9(y) != a2: return None
+    if x.name != gk.name: return None
+    seg1, _sp1 = _solo_segment(db, t1)
+    seg2, _sp2 = _solo_segment(db, t2)
+    kv1 = np.asarray(wdb_sql._col(seg1, db.cat.phys_map(t1).get(x.name, x.name))[0]).astype(np.int64)
+    if kv1.size == 0: return None
+    kmin, kmax = int(kv1.min()), int(kv1.max())
+    if kmax - kmin + 1 != kv1.size: return None            # contiguous identity domain only
+    keep = None
+    for cj in extra:
+        node = cj; invert = False
+        if isinstance(node, E.Not): node = node.this; invert = True
+        if not isinstance(node, E.Like): return None
+        if node.args.get('negate'): invert = not invert   # some sqlglots fold NOT into Like
+        col9 = node.this; pat9 = node.expression
+        if not (isinstance(col9, E.Column) and isinstance(pat9, E.Literal) and pat9.is_string): return None
+        p = str(pat9.this)
+        if '_' in p or not (p.startswith('%') and p.endswith('%')): return None
+        needles = [t for t in p.split('%') if t]
+        if not needles or len(needles) > 2: return None
+        try:
+            m9 = seg2.like_mask_dict(db.cat.phys_map(t2).get(col9.name, col9.name), needles, invert=invert)
+        except Exception:
+            return None
+        keep = m9 if keep is None else (keep & m9)
+    fk9 = wdb_sql.raw_dict_col(seg2, db.cat.phys_map(t2).get(y.name, y.name))
+    if fk9 is None: return None
+    fkv = fk9[0][np.asarray(fk9[1])]
+    if keep is not None: fkv = fkv[keep]
+    cc = np.bincount(fkv.astype(np.int64) - kmin, minlength=kv1.size)
+    return pd.DataFrame({(proj[0].alias if isinstance(proj[0], E.Alias) else kcol.name):
+                         np.arange(kmin, kmax + 1, dtype=np.int64),
+                         cagg.alias: cc.astype(np.int64)})
+
+
+
 def _from_door(db, tree):
     """THE FROM DOOR (Q7/Q13/Q22): FROM (SELECT ...) alias -- run the INNER
     through the engine (it rides every fast path: trees, cascades, courts),
@@ -722,7 +927,8 @@ def _from_door(db, tree):
     cols = [e.alias_or_name for e in inner.expressions]
     if any(not c for c in cols): return None
     _AGG9 = (E.Sum, E.Count, E.Avg, E.Min, E.Max)
-    if inner.args.get('group') is None and not any(
+    _nested9 = next((x for x in inner.find_all(E.Select) if x is not inner), None)
+    if inner.args.get('group') is None and _nested9 is None and not any(
             e.find(*_AGG9) is not None for e in inner.expressions):
         # FLATTEN: an aggregate-less inner folds into the outer -- substitute
         # the inner expressions for their aliases and run ONE tree query.
@@ -749,9 +955,13 @@ def _from_door(db, tree):
                 this=E.Paren(this=iw9.this.copy()), expression=E.Paren(this=fw9.this.copy()))
             flat.set('where', E.Where(this=merged9))
         return join_query(db, flat.sql(dialect='duckdb'))
-    rows = db.run(inner.sql(dialect='duckdb'))
-    rows = rows[0] if isinstance(rows, tuple) else rows
-    df = pd.DataFrame(list(rows), columns=cols)
+    df = _left_count_frame(db, inner)
+    if df is None:
+        df = _rich_lonely_frame(db, inner)
+    if df is None:
+        rows = db.run(inner.sql(dialect='duckdb'))
+        rows = rows[0] if isinstance(rows, tuple) else rows
+        df = pd.DataFrame(list(rows), columns=cols)
     def ev(nd):
         if isinstance(nd, E.Paren): return ev(nd.this)
         if isinstance(nd, E.Column): return df[nd.name]

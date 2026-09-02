@@ -3294,3 +3294,99 @@ def pgather_ptr(p, cc, out):
     n = cc.shape[0]
     for i in prange(n):
         out[i] = p[np.int64(cc[i])]
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def plike2(blob, off, n1, n2, out):
+    """Ordered two-needle LIKE over a mode-5 inline stream: out[r] = row r's
+    bytes contain n1 and then n2 after it (n2 empty => single needle). The
+    Python-string version of this scan cost 15s on Q13; bytes cost ~150ms."""
+    R = off.shape[0] - 1
+    L1 = n1.shape[0]; L2 = n2.shape[0]
+    for r in prange(R):
+        a = off[r]; b = off[r + 1]
+        p1 = np.int64(-1)
+        i = a
+        while i <= b - L1:
+            k = 0
+            while k < L1 and blob[i + k] == n1[k]:
+                k += 1
+            if k == L1:
+                p1 = i + L1
+                break
+            i += 1
+        if p1 < 0:
+            out[r] = False
+            continue
+        if L2 == 0:
+            out[r] = True
+            continue
+        ok = False
+        i = p1
+        while i <= b - L2:
+            k = 0
+            while k < L2 and blob[i + k] == n2[k]:
+                k += 1
+            if k == L2:
+                ok = True
+                break
+            i += 1
+        out[r] = ok
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def pprefix2(blob, off, out):
+    """out[r] = first two bytes of row r as u16 (b0<<8|b1) -- a 2-byte read,
+    never a Python string (Q22's country code)."""
+    R = off.shape[0] - 1
+    for r in prange(R):
+        a = off[r]
+        if off[r + 1] - a >= 2:
+            out[r] = (np.uint16(blob[a]) << 8) | np.uint16(blob[a + 1])
+        else:
+            out[r] = 0
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def plike_fc(buf, restarts, R, V, n1, n2, keep):
+    """Ordered-needle LIKE over a FRONT-CODED dict: restart blocks walk
+    sequentially (prefix carry), blocks run in parallel. keep[code]=contains."""
+    nb = (V + R - 1) // R
+    L1 = n1.shape[0]; L2 = n2.shape[0]
+    for b in prange(nb):
+        o = np.int64(restarts[b])
+        prev = np.empty(4096, np.uint8)
+        hi = min(R, V - b * R)
+        for step in range(hi):
+            cp = np.int64(buf[o]) | (np.int64(buf[o + 1]) << 8)
+            sl = np.int64(buf[o + 2]) | (np.int64(buf[o + 3]) << 8)
+            o += 4
+            for t in range(sl):
+                prev[cp + t] = buf[o + t]
+            o += sl
+            plen = cp + sl
+            p1 = np.int64(-1)
+            i = 0
+            while i <= plen - L1:
+                k = 0
+                while k < L1 and prev[i + k] == n1[k]:
+                    k += 1
+                if k == L1:
+                    p1 = i + L1
+                    break
+                i += 1
+            ok = False
+            if p1 >= 0:
+                if L2 == 0:
+                    ok = True
+                else:
+                    i = p1
+                    while i <= plen - L2:
+                        k = 0
+                        while k < L2 and prev[i + k] == n2[k]:
+                            k += 1
+                        if k == L2:
+                            ok = True
+                            break
+                        i += 1
+            keep[b * R + step] = ok

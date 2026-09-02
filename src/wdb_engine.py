@@ -529,6 +529,102 @@ class Segment:
             off = np.zeros(len(lengths) + 1, dtype=np.int64); np.cumsum(lengths, out=off[1:])
             c['ivals'] = np.array([bytes(mv[off[i]:off[i+1]]) for i in range(len(lengths))], dtype=object)
         return c['ivals']
+    def inline_at(self, nm, rows):
+        """Mode-5 POINT READ: bytes at ROW positions. Decompresses lengths+bytes
+        once per column (cached on the column), then slices -- no full object
+        array, no np.unique. (values_at's mode-5 path built the whole sorted
+        dict to answer 20 lookups: 7s per query on Q10, 2026-09-01.)"""
+        c = self.cols[nm]
+        st = c.get('_istream')
+        if st is None:
+            lengths = np.frombuffer(self._dz.decompress(c['ilen']), dtype=np.uint32)
+            off = np.zeros(len(lengths) + 1, dtype=np.int64); np.cumsum(lengths, out=off[1:])
+            data = self._dz.decompress(c['ival'])
+            st = c['_istream'] = (off, memoryview(data))
+        off, mv = st
+        return [bytes(mv[off[r]:off[r + 1]]) for r in np.asarray(rows, dtype=np.int64).tolist()]
+
+    def inline_stream(self, nm):
+        """(blob_u8, off) of a mode-5 column's inline stream, cached -- the raw
+        substrate for byte kernels (LIKE, prefixes) that never touch Python."""
+        self.inline_at(nm, np.empty(0, dtype=np.int64))     # warm the cache
+        off, mv = self.cols[nm]['_istream']
+        blob = np.frombuffer(mv, dtype=np.uint8)
+        return blob, off
+
+    def like_mask(self, nm, needles):
+        """Bool[N]: rows whose bytes contain the needles IN ORDER (1 or 2)."""
+        import wdb_kernels as _WKl
+        blob, off = self.inline_stream(nm)
+        n1 = np.frombuffer(needles[0].encode() if isinstance(needles[0], str) else needles[0], dtype=np.uint8)
+        n2 = (np.frombuffer(needles[1].encode() if isinstance(needles[1], str) else needles[1], dtype=np.uint8)
+              if len(needles) > 1 else np.empty(0, dtype=np.uint8))
+        out = np.empty(self.N, dtype=np.bool_)
+        _WKl.plike2(blob, np.ascontiguousarray(off, dtype=np.int64), n1, n2, out)
+        return out
+
+    def dict_bytes(self, nm):
+        """The FULL front-coded dict byte space + restarts (chunks decompressed
+        in parallel and concatenated -- restarts are global offsets already)."""
+        c = self.cols[nm]
+        got = c.get('_dictbytes')
+        if got is not None:
+            return got
+        if 'restarts' not in c:
+            raise KeyError('not front-coded')
+        if c.get('chunked'):
+            nch = len(c['chunk_foff']) - 1
+            import zstandard as _z
+            def _dc(ch):
+                fb = c['chunk_base'] + int(c['chunk_foff'][ch])
+                fe = c['chunk_base'] + int(c['chunk_foff'][ch + 1])
+                return _z.ZstdDecompressor().decompress(bytes(self.buf[fb:fe]))
+            bufs = list(_leaf_pool().map(_dc, range(nch)))
+            blob = np.frombuffer(b''.join(bufs), dtype=np.uint8)
+        else:
+            raw = c.get('raw')
+            if raw is None:
+                raw = c['raw'] = self._dz.decompress(c['z'])
+            blob = np.frombuffer(raw, dtype=np.uint8)
+        got = c['_dictbytes'] = (blob, np.ascontiguousarray(np.asarray(c['restarts'], dtype=np.int64)))
+        return got
+
+    def like_mask_dict(self, nm, needles, invert=False):
+        """Bool[N] for an ordered-needle LIKE on a front-coded dict column:
+        the kernel tests V dictionary values, a LUT paints the rows."""
+        import wdb_kernels as _WKl
+        c = self.cols[nm]
+        blob, restarts = self.dict_bytes(nm)
+        V = int(c.get('n_dict') or c['V'])
+        n1 = np.frombuffer(needles[0].encode(), dtype=np.uint8)
+        n2 = (np.frombuffer(needles[1].encode(), dtype=np.uint8)
+              if len(needles) > 1 else np.empty(0, dtype=np.uint8))
+        keepd = np.empty(V, dtype=np.bool_)
+        _WKl.plike_fc(blob, restarts, int(c['R']), V, n1, n2, keepd)
+        if invert:
+            keepd = ~keepd
+        cds = np.asarray(self.codes(nm))
+        out = np.empty(cds.shape[0], dtype=np.bool_)
+        _WKl.plut_u8(cds, keepd, out)
+        return out
+
+    def prefix2_codes(self, nm):
+        """u16[N]: each row's first two bytes packed -- 2-byte reads at stream level."""
+        import wdb_kernels as _WKl
+        blob, off = self.inline_stream(nm)
+        out = np.empty(self.N, dtype=np.uint16)
+        _WKl.pprefix2(blob, np.ascontiguousarray(off, dtype=np.int64), out)
+        return out
+
+    def values_at_rows(self, nm, rows):
+        """Emission-ready Python values at ROW positions (the row-side twin of
+        values_at, which takes dict codes)."""
+        c = self.cols[nm]
+        if c['mode'] == 5 and not c.get('has_null'):
+            import wdb_sql as _WS5
+            return [_WS5._pyval(b) for b in self.inline_at(nm, rows)]
+        return self.values_at(nm, np.asarray(self.codes_at(nm, rows)))
+
     def _seq_decode(self, c):
         """Decode a mode-4 affine column to its int64 array (cached). dt-3 epochs stay int64
         here; _base_values/fetch view them as datetime64."""
