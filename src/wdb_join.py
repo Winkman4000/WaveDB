@@ -912,6 +912,53 @@ def _left_count_frame(db, inner):
 
 
 
+def _factor_or_rewrite(tree):
+    """SCHOOLBOOK ALGEBRA (Jackson's Q19): (E and A) or (E and B) = E and
+    (A or B). Any conjunct present in EVERY branch of a top-level OR hoists
+    out -- join equalities buried in OR branches become plain edges, and the
+    residual OR rides the pred."""
+    w = tree.args.get('where')
+    if w is None: return
+    def _ors(x):
+        if isinstance(x, E.Paren): return _ors(x.this)
+        if isinstance(x, E.Or): return _ors(x.this) + _ors(x.expression)
+        return [x]
+    def _ands(x):
+        if isinstance(x, E.Paren): return _ands(x.this)
+        if isinstance(x, E.And): return _ands(x.this) + _ands(x.expression)
+        return [x]
+    branches = _ors(w.this)
+    if len(branches) < 2: return
+    csets = [ {c.sql(): c for c in _ands(b)} for b in branches ]
+    common = set(csets[0].keys())
+    for cs in csets[1:]:
+        common &= set(cs.keys())
+    if not common: return
+    hoisted = [csets[0][k].copy() for k in sorted(common)]
+    reduced = []
+    collapse = False
+    for cs in csets:
+        rest = [c.copy() for k, c in cs.items() if k not in common]
+        if not rest:
+            collapse = True                        # a branch became TRUE: OR vanishes
+            break
+        rb = rest[0]
+        for c in rest[1:]:
+            rb = E.And(this=rb, expression=c)
+        reduced.append(E.Paren(this=rb))
+    parts = hoisted
+    if not collapse and reduced:
+        ob = reduced[0]
+        for r in reduced[1:]:
+            ob = E.Or(this=ob, expression=r)
+        parts = hoisted + [E.Paren(this=ob)]
+    new = parts[0]
+    for p in parts[1:]:
+        new = E.And(this=new, expression=p)
+    w.set('this', new)
+
+
+
 def _grouped_in_rewrite(db, tree):
     """THE WEIGHTED CENSUS SERVE (Jackson's Q18): `pkey IN (SELECT ckey FROM
     child GROUP BY ckey HAVING AGG(col) cmp lit)` fetches no foreign data --
@@ -1147,6 +1194,7 @@ def join_query(db, sql, columnar=False):
     import time as _t8
     _jq_t0 = _t8.perf_counter()
     tree = sqlglot.parse_one(sql, read='duckdb')
+    _factor_or_rewrite(tree)
     _grouped_in_rewrite(db, tree)
     try:
         door9 = _from_door(db, tree)
