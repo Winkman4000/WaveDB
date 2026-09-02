@@ -538,3 +538,35 @@ NEXT OPENERS: Q14 fast path (Div-of-Sums, the only sub-1x face); the
 FROM-subquery door (Q7/Q13/Q22; Q7 is tree-shaped inside it); Q4's
 last breath; cold-start road pinning; the unfiltered-top-k descent
 with Jackson's census bound.
+
+
+## THE DISSOLUTIONS (2026-09-02): THE BOARD IS FULL -- 14/14, 0 holes, 0 wrong
+SIX HOLES FELL IN ONE SESSION, every one to a dissolution, not an
+organ. Q7: THE FROM DOOR + THE FLATTEN (aggregate-less inner folds
+into the outer) + EXPRESSION GROUP KEYS RIDE THE DICT (transform V
+values, collapse, remap -- O(V) never O(N)) + alias-identity key
+matching (n1/n2). Q13 (CROWN 1.46x): Jackson saw the LEFT JOIN
+fetches NO foreign data -- domain=all customers, absent=zero: byte-
+kernel NOT LIKE over the front-coded dict (plike_fc: restart blocks,
+prefix carry; 118ms vs 15s of Python) + two bincounts. Q22: prefixes
+read as TWO BYTES (pprefix2), scalar AVG recurses over the same
+masks, NOT EXISTS = THE CENSUS SERVE (empty slot in the fk bincount).
+Q18: THE WEIGHTED CENSUS SERVE -- IN(GROUP BY key HAVING agg cmp lit)
+keeps parents whose weighted-bincount slot clears the bar; resolved
+to literal keys; census cached per parent segment; the topk-attr door
+learned ORDER BY ATTRIBUTES. Q19: SCHOOLBOOK ALGEBRA -- (E and A) or
+(E and B) = E and (A or B); common conjuncts hoist from OR branches;
+ZERO new organs; 1.12x on arrival. Q21 (the last): THE LONELY REWRITE
+-- the EXISTS pair is two parent keeps: per-order distinct-supplier
+censuses over the sorted road (pruns_distinct); keep = nsupp>=2 and
+late-distinct==1 injected as an In carrying _codes; the mask
+handshake accepts _codes INs; THE DECLARED CLOCK serves strict pair
+compares in the mask layer. sqlglot notes: from_ key, Like(negate).
+BOARD: ok=14 | holes=0 | wins=9 (Q5 1.87, Q10 1.68, Q6 1.67, Q13
+1.46, Q1 1.28, Q12 1.24, Q19 1.12, Q4 1.06, Q3 1.03) | WRONG=0.
+Suite 1696/0 at every push. SPEED WARS, probe floors proven: Q18
+296ms/1.67x (cascade declines parent literal-IN -- convict next);
+Q21 786ms/1.11x (same escape to pandas); Q7 2.1s (OR-pred at fact
+scale); Q22 census sidecar; Q14 Div-of-Sums. The campaign's law
+held: probe first, dissolve before building, measure before
+theorizing, never ship wrong.
