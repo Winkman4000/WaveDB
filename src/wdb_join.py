@@ -912,6 +912,132 @@ def _left_count_frame(db, inner):
 
 
 
+def _lonely_rewrite(db, tree):
+    """Q21's EXISTS pair dissolved (Jackson): EXISTS(l2: same key, other supp)
+    and NOT EXISTS(l3: same key, other supp, ALSO LATE) are two PARENT KEEPS
+    -- distinct-supplier censuses over the child's sorted road: keep orders
+    with nsupp >= 2 and late-distinct == 1 (the outer's own lateness conjunct
+    covers l1's side). The pair is replaced by one In carrying _codes on the
+    parent key; the mask layer serves it."""
+    w = tree.args.get('where')
+    if w is None: return
+    def _flat9(x):
+        if isinstance(x, E.Paren): return _flat9(x.this)
+        if isinstance(x, E.And): return _flat9(x.this) + _flat9(x.expression)
+        return [x]
+    conj = _flat9(w.this)
+    ex_pos = ex_neg = None
+    for cj in conj:
+        if isinstance(cj, E.Exists): ex_pos = cj
+        elif isinstance(cj, E.Not) and isinstance(cj.this, E.Exists): ex_neg = cj
+    if ex_pos is None or ex_neg is None: return
+    def _parts(ex):
+        sub = ex.this
+        if not isinstance(sub, E.Select): return None
+        f9 = sub.args.get('from') or sub.args.get('from_')
+        if f9 is None or not isinstance(f9.this, E.Table): return None
+        al = f9.this.alias or f9.this.name
+        ww = sub.args.get('where')
+        if ww is None: return None
+        return f9.this.name, al, _flat9(ww.this)
+    P1 = _parts(ex_pos); P2 = _parts(ex_neg.this)
+    if P1 is None or P2 is None or P1[0] != P2[0]: return
+    childT = P1[0]
+    def _corr_neq(cjs, al):
+        key_eq = neq = None; extra = []
+        for c in cjs:
+            if isinstance(c, E.EQ) and isinstance(c.this, E.Column) and isinstance(c.expression, E.Column):
+                key_eq = c
+            elif isinstance(c, E.NEQ) and isinstance(c.this, E.Column) and isinstance(c.expression, E.Column):
+                neq = c
+            else:
+                extra.append(c)
+        return key_eq, neq, extra
+    k1, n1, e1 = _corr_neq(P1[2], P1[1])
+    k2, n2, e2 = _corr_neq(P2[2], P2[1])
+    if k1 is None or n1 is None or e1: return
+    if k2 is None or n2 is None or len(e2) != 1: return
+    # the NOT-EXISTS extra conjunct, re-aliased to the OUTER, must appear in the outer WHERE
+    x2 = e2[0].copy()
+    outer_al = None
+    for c9 in x2.find_all(E.Column):
+        if c9.table == P2[1]:
+            pass
+    inner_al = P2[1]
+    outer_al = (k2.this.table if k2.this.table != inner_al else k2.expression.table) or ''
+    for c9 in x2.find_all(E.Column):
+        if c9.table == inner_al:
+            c9.set('table', E.Identifier(this=outer_al, quoted=False) if outer_al else None)
+    want = x2.sql()
+    if not any(c.sql() == want for c in conj): return
+    # key/supp/flag columns on the child
+    key_c = k1.this if (k1.this.table or '') == P1[1] else k1.expression
+    sup_c = n1.this if (n1.this.table or '') == P1[1] else n1.expression
+    try:
+        cseg, _s = _solo_segment(db, childT)
+        # the parent of the child's key via the outer key column (other side of k1)
+        okc = k1.expression if key_c is k1.this else k1.this
+        # find the parent table owning the outer key through the OUTER's edges:
+        pT = None
+        for t9 in tree.find_all(E.Table):
+            if t9.find_ancestor(E.Select) is not tree: continue
+            if t9.name == childT and (t9.alias or t9.name) != (okc.table or ''):
+                continue
+        # outer key column l1.l_orderkey belongs to the fact alias; the road's
+        # PARENT key is found through the catalog FK or unique-key equality in
+        # the outer WHERE: o_orderkey = l1.l_orderkey
+        peq = None
+        for c9 in conj:
+            if (isinstance(c9, E.EQ) and isinstance(c9.this, E.Column) and isinstance(c9.expression, E.Column)
+                    and {c9.this.name, c9.expression.name} >= {okc.name} and c9 is not k1):
+                a9, b9 = c9.this, c9.expression
+                other = b9 if a9.name == okc.name and (a9.table or '') == (okc.table or '') else (
+                        a9 if b9.name == okc.name and (b9.table or '') == (okc.table or '') else None)
+                if other is not None:
+                    peq = other; break
+        if peq is None: return
+        pT9 = None
+        for t9 in tree.find_all(E.Table):
+            if t9.find_ancestor(E.Select) is tree and peq.name in set(db.cat.column_names(t9.name)):
+                pT9 = t9.name; break
+        if pT9 is None or not _key_is_unique(db, pT9, peq.name): return
+        pseg, _s2 = _solo_segment(db, pT9)
+        road = np.asarray(_hash_pointer(db, childT, db.cat.phys_map(childT).get(key_c.name, key_c.name),
+                                        cseg, pT9, db.cat.phys_map(pT9).get(peq.name, peq.name), pseg))
+        if not bool((np.diff(road) >= 0).all()): return       # runs law: sorted roads only
+        # the flag: the NOT-EXISTS extra conjunct evaluated on the CHILD --
+        # only the declared-clock strict compare is served (Q21's late)
+        f9n = e2[0]
+        if not (type(f9n) in (E.GT, E.LT) and isinstance(f9n.this, E.Column)
+                and isinstance(f9n.expression, E.Column)): return
+        a9c, b9c = f9n.this.name, f9n.expression.name
+        big, small = (a9c, b9c) if isinstance(f9n, E.GT) else (b9c, a9c)
+        cc9 = cseg.cols.get(db.cat.phys_map(childT).get(big, big), {})
+        if cc9.get('code_enc') != 16 or cc9.get('e16_partner') != db.cat.phys_map(childT).get(small, small):
+            return
+        bit9, dl9 = cseg.pair_bits(db.cat.phys_map(childT).get(big, big))
+        flag = np.ascontiguousarray(np.asarray(bit9) & (np.asarray(dl9) > 0), dtype=np.bool_)
+        sup9 = wdb_sql.raw_dict_col(cseg, db.cat.phys_map(childT).get(sup_c.name, sup_c.name), want_codes=True)
+        if sup9 is None: return
+        supv = np.ascontiguousarray(np.asarray(sup9[1]), dtype=np.int64)
+        ch9 = np.flatnonzero(np.diff(road) != 0) + 1
+        starts = np.concatenate((np.array([0]), ch9, np.array([road.shape[0]]))).astype(np.int64)
+        nsupp = np.zeros(pseg.N, np.int32); nflag = np.zeros(pseg.N, np.int32)
+        wdb_kernels.pruns_distinct(starts, np.ascontiguousarray(road, dtype=np.int64), supv, flag, nsupp, nflag)
+        qual = np.flatnonzero((nsupp >= 2) & (nflag == 1)).astype(np.int64)
+    except Exception:
+        return
+    # replace the pair with one In carrying _codes on the parent key
+    innode = E.In(this=peq.copy())
+    innode.set('_codes', qual)
+    kept = [c for c in conj if c is not ex_pos and c is not ex_neg] + [innode]
+    new = kept[0]
+    for c in kept[1:]:
+        new = E.And(this=new.copy() if new is kept[0] else new, expression=c.copy() if not isinstance(c, E.In) else c)
+    w.set('this', new)
+
+
+
 def _factor_or_rewrite(tree):
     """SCHOOLBOOK ALGEBRA (Jackson's Q19): (E and A) or (E and B) = E and
     (A or B). Any conjunct present in EVERY branch of a top-level OR hoists
@@ -1195,6 +1321,7 @@ def join_query(db, sql, columnar=False):
     _jq_t0 = _t8.perf_counter()
     tree = sqlglot.parse_one(sql, read='duckdb')
     _factor_or_rewrite(tree)
+    _lonely_rewrite(db, tree)
     _grouped_in_rewrite(db, tree)
     try:
         door9 = _from_door(db, tree)
@@ -1917,6 +2044,25 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         if isinstance(node, E.And): return mask_eval(node.this) & mask_eval(node.expression)
         if isinstance(node, E.Or):  return mask_eval(node.this) | mask_eval(node.expression)
         if isinstance(node, E.Not): return ~mask_eval(node.this)
+        if (type(node) in (E.GT, E.LT) and isinstance(node.this, E.Column)
+                and isinstance(node.expression, E.Column)):
+            # THE DECLARED CLOCK in the mask layer: strict pair compares on an
+            # enc-16 dressed pair serve from the bit+delta streams (Q21's
+            # lateness reached get_mask through the lonely rewrite).
+            sgA9, pcA9, cpA9 = resolve(node.this)
+            sgB9, pcB9, cpB9 = resolve(node.expression)
+            if sgA9 is sgB9 and cpA9 is None and cpB9 is None:
+                big9, small9 = (pcA9, pcB9) if isinstance(node, E.GT) else (pcB9, pcA9)
+                cB9 = sgA9.cols.get(big9, {})
+                if cB9.get('code_enc') == 16 and cB9.get('e16_partner') == small9:
+                    b9m, d9m = sgA9.pair_bits(big9)
+                    return np.asarray(b9m) & (np.asarray(d9m) > 0)
+                cS9 = sgA9.cols.get(small9, {})
+                if cS9.get('code_enc') == 16 and cS9.get('e16_partner') == big9:
+                    b9m, d9m = sgA9.pair_bits(small9)
+                    return (~np.asarray(b9m)) & (np.asarray(d9m) > 0)
+            raise _FastUnsupported
+
         if type(node) in _OPS:
             op = type(node)
             def mk(seg, pcol):
@@ -3161,8 +3307,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 except _FastUnsupported:
                     _fu9.append(_cn9)
             slots.clear(); slot_list.clear()
-            if not _fu9 or not all(isinstance(_c9, E.In) and _c9.args.get('query') is not None
-                                    and (_c9.args.get('expressions') or []) for _c9 in _fu9):
+            if not _fu9 or not all(isinstance(_c9, E.In)
+                                    and ((_c9.args.get('query') is not None and (_c9.args.get('expressions') or []))
+                                         or _c9.args.get('_codes') is not None) for _c9 in _fu9):
                 raise
             # The mask layer serves: the FULL WHERE mask (mask_eval knows the
             # resolved codes) ANDs into the plan's mask; the pred stands down.

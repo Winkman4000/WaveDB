@@ -3390,3 +3390,28 @@ def plike_fc(buf, restarts, R, V, n1, n2, keep):
                             break
                         i += 1
             keep[b * R + step] = ok
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def pruns_distinct(starts, ptr, supp, flag, nsupp, nflag):
+    """Per contiguous run of ptr (a sorted road): count distinct supp values,
+    and distinct supp values among flagged rows (Q21's blame censuses)."""
+    S = starts.shape[0] - 1
+    for s in prange(S):
+        i = starts[s]; j = starts[s + 1]
+        c = 0; cf = 0
+        for a in range(i, j):
+            seen = False
+            for b in range(i, a):
+                if supp[b] == supp[a]:
+                    seen = True; break
+            if not seen:
+                c += 1
+            if flag[a]:
+                seenf = False
+                for b in range(i, a):
+                    if flag[b] and supp[b] == supp[a]:
+                        seenf = True; break
+                if not seenf:
+                    cf += 1
+        nsupp[ptr[i]] = c; nflag[ptr[i]] = cf
