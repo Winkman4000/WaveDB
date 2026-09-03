@@ -1040,9 +1040,11 @@ def _lonely_rewrite(db, tree):
 
 def _factor_or_rewrite(tree):
     """SCHOOLBOOK ALGEBRA (Jackson's Q19): (E and A) or (E and B) = E and
-    (A or B). Any conjunct present in EVERY branch of a top-level OR hoists
-    out -- join equalities buried in OR branches become plain edges, and the
-    residual OR rides the pred."""
+    (A or B). For EVERY OR conjunct of the WHERE (top-level or inside the
+    AND chain -- Q7), conjuncts common to all branches hoist out, and THE
+    IMPLIED KEEP adds col IN (union of pins) for columns pinned in every
+    branch -- a single-column keep the cascade serves at dict scale, the
+    exact OR re-checked at survivors."""
     w = tree.args.get('where')
     if w is None: return
     def _ors(x):
@@ -1053,34 +1055,193 @@ def _factor_or_rewrite(tree):
         if isinstance(x, E.Paren): return _ands(x.this)
         if isinstance(x, E.And): return _ands(x.this) + _ands(x.expression)
         return [x]
-    branches = _ors(w.this)
-    if len(branches) < 2: return
-    csets = [ {c.sql(): c for c in _ands(b)} for b in branches ]
-    common = set(csets[0].keys())
-    for cs in csets[1:]:
-        common &= set(cs.keys())
-    if not common: return
-    hoisted = [csets[0][k].copy() for k in sorted(common)]
-    reduced = []
-    collapse = False
-    for cs in csets:
-        rest = [c.copy() for k, c in cs.items() if k not in common]
-        if not rest:
-            collapse = True                        # a branch became TRUE: OR vanishes
-            break
-        rb = rest[0]
-        for c in rest[1:]:
-            rb = E.And(this=rb, expression=c)
-        reduced.append(E.Paren(this=rb))
-    parts = hoisted
-    if not collapse and reduced:
-        ob = reduced[0]
-        for r in reduced[1:]:
-            ob = E.Or(this=ob, expression=r)
-        parts = hoisted + [E.Paren(this=ob)]
-    new = parts[0]
-    for p in parts[1:]:
+    def _factor_one(ornode):
+        branches = _ors(ornode)
+        if len(branches) < 2: return [ornode]
+        csets = [ {c.sql(): c for c in _ands(b)} for b in branches ]
+        common = set(csets[0].keys())
+        for cs in csets[1:]:
+            common &= set(cs.keys())
+        hoisted = [csets[0][k].copy() for k in sorted(common)]
+        reduced = []
+        collapse = False
+        for cs in csets:
+            rest = [c.copy() for k, c in cs.items() if k not in common]
+            if not rest:
+                collapse = True
+                break
+            rb = rest[0]
+            for c in rest[1:]:
+                rb = E.And(this=rb, expression=c)
+            reduced.append(E.Paren(this=rb))
+        parts = list(hoisted)
+        if not collapse and reduced:
+            ob = reduced[0]
+            for r in reduced[1:]:
+                ob = E.Or(this=ob, expression=r)
+            parts.append(E.Paren(this=ob))
+            per_branch = []
+            for cs in csets:
+                pins = {}
+                for k, c in cs.items():
+                    if k in common: continue
+                    if isinstance(c, E.EQ) and isinstance(c.this, E.Column) and isinstance(c.expression, E.Literal):
+                        pins.setdefault(c.this.sql(), set()).add(c.expression.sql())
+                    elif (isinstance(c, E.In) and isinstance(c.this, E.Column) and c.args.get('query') is None
+                          and all(isinstance(x, E.Literal) for x in (c.args.get('expressions') or []))):
+                        pins.setdefault(c.this.sql(), set()).update(x.sql() for x in c.args['expressions'])
+                per_branch.append(pins)
+            cols_all = set(per_branch[0].keys())
+            for pb in per_branch[1:]:
+                cols_all &= set(pb.keys())
+            for colsql in sorted(cols_all):
+                union = set()
+                for pb in per_branch:
+                    union |= pb[colsql]
+                if len(union) > 64: continue
+                colnode = next(c.this for cs in csets for k, c in cs.items()
+                               if isinstance(c, (E.EQ, E.In)) and isinstance(c.this, E.Column) and c.this.sql() == colsql)
+                lits = [sqlglot.parse_one(x, read='duckdb') for x in sorted(union)]
+                parts.append(E.In(this=colnode.copy(), expressions=lits))
+        return parts if parts else [ornode]
+    out = []
+    changed = False
+    for cj in _ands(w.this):
+        if isinstance(cj, E.Or) or (isinstance(cj, E.Paren) and isinstance(cj.this, E.Or)):
+            rep = _factor_one(cj)
+            if len(rep) != 1 or rep[0] is not cj: changed = True
+            out.extend(rep)
+        else:
+            out.append(cj)
+    if not changed: return
+    new = out[0]
+    for p in out[1:]:
         new = E.And(this=new, expression=p)
+    w.set('this', new)
+
+
+def _lonely_rewrite(db, tree):
+    """Q21's EXISTS pair dissolved (Jackson): EXISTS(l2: same key, other supp)
+    and NOT EXISTS(l3: same key, other supp, ALSO LATE) are two PARENT KEEPS
+    -- distinct-supplier censuses over the child's sorted road: keep orders
+    with nsupp >= 2 and late-distinct == 1 (the outer's own lateness conjunct
+    covers l1's side). The pair is replaced by one In carrying _codes on the
+    parent key; the mask layer serves it."""
+    w = tree.args.get('where')
+    if w is None: return
+    def _flat9(x):
+        if isinstance(x, E.Paren): return _flat9(x.this)
+        if isinstance(x, E.And): return _flat9(x.this) + _flat9(x.expression)
+        return [x]
+    conj = _flat9(w.this)
+    ex_pos = ex_neg = None
+    for cj in conj:
+        if isinstance(cj, E.Exists): ex_pos = cj
+        elif isinstance(cj, E.Not) and isinstance(cj.this, E.Exists): ex_neg = cj
+    if ex_pos is None or ex_neg is None: return
+    def _parts(ex):
+        sub = ex.this
+        if not isinstance(sub, E.Select): return None
+        f9 = sub.args.get('from') or sub.args.get('from_')
+        if f9 is None or not isinstance(f9.this, E.Table): return None
+        al = f9.this.alias or f9.this.name
+        ww = sub.args.get('where')
+        if ww is None: return None
+        return f9.this.name, al, _flat9(ww.this)
+    P1 = _parts(ex_pos); P2 = _parts(ex_neg.this)
+    if P1 is None or P2 is None or P1[0] != P2[0]: return
+    childT = P1[0]
+    def _corr_neq(cjs, al):
+        key_eq = neq = None; extra = []
+        for c in cjs:
+            if isinstance(c, E.EQ) and isinstance(c.this, E.Column) and isinstance(c.expression, E.Column):
+                key_eq = c
+            elif isinstance(c, E.NEQ) and isinstance(c.this, E.Column) and isinstance(c.expression, E.Column):
+                neq = c
+            else:
+                extra.append(c)
+        return key_eq, neq, extra
+    k1, n1, e1 = _corr_neq(P1[2], P1[1])
+    k2, n2, e2 = _corr_neq(P2[2], P2[1])
+    if k1 is None or n1 is None or e1: return
+    if k2 is None or n2 is None or len(e2) != 1: return
+    # the NOT-EXISTS extra conjunct, re-aliased to the OUTER, must appear in the outer WHERE
+    x2 = e2[0].copy()
+    outer_al = None
+    for c9 in x2.find_all(E.Column):
+        if c9.table == P2[1]:
+            pass
+    inner_al = P2[1]
+    outer_al = (k2.this.table if k2.this.table != inner_al else k2.expression.table) or ''
+    for c9 in x2.find_all(E.Column):
+        if c9.table == inner_al:
+            c9.set('table', E.Identifier(this=outer_al, quoted=False) if outer_al else None)
+    want = x2.sql()
+    if not any(c.sql() == want for c in conj): return
+    # key/supp/flag columns on the child
+    key_c = k1.this if (k1.this.table or '') == P1[1] else k1.expression
+    sup_c = n1.this if (n1.this.table or '') == P1[1] else n1.expression
+    try:
+        cseg, _s = _solo_segment(db, childT)
+        # the parent of the child's key via the outer key column (other side of k1)
+        okc = k1.expression if key_c is k1.this else k1.this
+        # find the parent table owning the outer key through the OUTER's edges:
+        pT = None
+        for t9 in tree.find_all(E.Table):
+            if t9.find_ancestor(E.Select) is not tree: continue
+            if t9.name == childT and (t9.alias or t9.name) != (okc.table or ''):
+                continue
+        # outer key column l1.l_orderkey belongs to the fact alias; the road's
+        # PARENT key is found through the catalog FK or unique-key equality in
+        # the outer WHERE: o_orderkey = l1.l_orderkey
+        peq = None
+        for c9 in conj:
+            if (isinstance(c9, E.EQ) and isinstance(c9.this, E.Column) and isinstance(c9.expression, E.Column)
+                    and {c9.this.name, c9.expression.name} >= {okc.name} and c9 is not k1):
+                a9, b9 = c9.this, c9.expression
+                other = b9 if a9.name == okc.name and (a9.table or '') == (okc.table or '') else (
+                        a9 if b9.name == okc.name and (b9.table or '') == (okc.table or '') else None)
+                if other is not None:
+                    peq = other; break
+        if peq is None: return
+        pT9 = None
+        for t9 in tree.find_all(E.Table):
+            if t9.find_ancestor(E.Select) is tree and peq.name in set(db.cat.column_names(t9.name)):
+                pT9 = t9.name; break
+        if pT9 is None or not _key_is_unique(db, pT9, peq.name): return
+        pseg, _s2 = _solo_segment(db, pT9)
+        road = np.asarray(_hash_pointer(db, childT, db.cat.phys_map(childT).get(key_c.name, key_c.name),
+                                        cseg, pT9, db.cat.phys_map(pT9).get(peq.name, peq.name), pseg))
+        if not bool((np.diff(road) >= 0).all()): return       # runs law: sorted roads only
+        # the flag: the NOT-EXISTS extra conjunct evaluated on the CHILD --
+        # only the declared-clock strict compare is served (Q21's late)
+        f9n = e2[0]
+        if not (type(f9n) in (E.GT, E.LT) and isinstance(f9n.this, E.Column)
+                and isinstance(f9n.expression, E.Column)): return
+        a9c, b9c = f9n.this.name, f9n.expression.name
+        big, small = (a9c, b9c) if isinstance(f9n, E.GT) else (b9c, a9c)
+        cc9 = cseg.cols.get(db.cat.phys_map(childT).get(big, big), {})
+        if cc9.get('code_enc') != 16 or cc9.get('e16_partner') != db.cat.phys_map(childT).get(small, small):
+            return
+        bit9, dl9 = cseg.pair_bits(db.cat.phys_map(childT).get(big, big))
+        flag = np.ascontiguousarray(np.asarray(bit9) & (np.asarray(dl9) > 0), dtype=np.bool_)
+        sup9 = wdb_sql.raw_dict_col(cseg, db.cat.phys_map(childT).get(sup_c.name, sup_c.name), want_codes=True)
+        if sup9 is None: return
+        supv = np.ascontiguousarray(np.asarray(sup9[1]), dtype=np.int64)
+        ch9 = np.flatnonzero(np.diff(road) != 0) + 1
+        starts = np.concatenate((np.array([0]), ch9, np.array([road.shape[0]]))).astype(np.int64)
+        nsupp = np.zeros(pseg.N, np.int32); nflag = np.zeros(pseg.N, np.int32)
+        wdb_kernels.pruns_distinct(starts, np.ascontiguousarray(road, dtype=np.int64), supv, flag, nsupp, nflag)
+        qual = np.flatnonzero((nsupp >= 2) & (nflag == 1)).astype(np.int64)
+    except Exception:
+        return
+    # replace the pair with one In carrying _codes on the parent key
+    innode = E.In(this=peq.copy())
+    innode.set('_codes', qual)
+    kept = [c for c in conj if c is not ex_pos and c is not ex_neg] + [innode]
+    new = kept[0]
+    for c in kept[1:]:
+        new = E.And(this=new.copy() if new is kept[0] else new, expression=c.copy() if not isinstance(c, E.In) else c)
     w.set('this', new)
 
 
@@ -2341,41 +2502,111 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             _cb9 = [] if _bill9 is not None else None
             _ct9 = _tk9()
             plan9 = []
+            _cres9 = []                      # conjuncts the cascade cannot judge: the
+                                             # pred re-applies the WHERE at survivors
             for cn in _cflat(_w9c.this):
                 if cn.find(E.Select) is not None:
                     raise _FastUnsupported          # subqueries: never the cascade's to judge
                 cols9 = list(cn.find_all(E.Column))
-                if len(cols9) != 1: raise _FastUnsupported
+                if len(cols9) != 1:
+                    _cres9.append(cn); continue     # multi-column (Q7's OR): residual
                 cs9, cp9, cc9p = resolve(cols9[0])
                 c9 = cs9.cols.get(cp9) or {}
-                if c9.get('mode') not in (0, 1, 2): raise _FastUnsupported
-                V9 = int(c9['V'])
-                td9 = np.asarray(cs9._typed_dict(cp9))
-                kx9 = np.zeros(V9 + 1, bool)   # +1: null sentinel bin, False by law
-                if td9.dtype.kind in 'iuf' and len(td9):
+                kx9 = None
+                if c9.get('mode') == 5 and int(cs9.N) <= 4096 and c9.get('dt') == 1 and not c9.get('has_null'):
+                    # TINY MODE-5 DIM (nation names): the sorted inline dict is
+                    # the rank space the codes index -- keep by literal match.
+                    lits9 = None
+                    if isinstance(cn, E.EQ) and isinstance(cn.expression, E.Literal) and cn.expression.is_string:
+                        lits9 = {str(cn.expression.this)}
+                    elif (isinstance(cn, E.In) and cn.expressions
+                          and all(isinstance(e9, E.Literal) and e9.is_string for e9 in cn.expressions)):
+                        lits9 = {str(e9.this) for e9 in cn.expressions}
+                    if lits9 is None:
+                        _cres9.append(cn); continue
+                    cs9._raw_codes(cp9)
+                    idict9 = list(c9['_idict'])
+                    V9 = len(idict9)
+                    kx9 = np.zeros(V9 + 1, bool)
+                    for r9k, v9k in enumerate(idict9):
+                        sv9k = v9k.decode('utf-8', 'replace') if isinstance(v9k, (bytes, bytearray)) else str(v9k)
+                        kx9[r9k] = sv9k in lits9
+                    td9 = None
+                elif c9.get('mode') not in (0, 1, 2):
+                    _cres9.append(cn); continue
+                if kx9 is None:
+                    V9 = int(c9['V'])
+                    td9 = np.asarray(cs9._typed_dict(cp9))
+                    kx9 = np.zeros(V9 + 1, bool)   # +1: null sentinel bin, False by law
+                if td9 is None:
+                    pass
+                elif td9.dtype.kind in 'iuf' and len(td9):
                     keep9 = _dict_keep(cn, cs9, cp9, td9)
-                    if keep9 is None: raise _FastUnsupported
+                    if keep9 is None:
+                        _cres9.append(cn); continue
                     kx9[:len(keep9)] = keep9
                 elif isinstance(cn, E.EQ) and isinstance(cn.expression, E.Literal):
                     code9 = _code_of_literal(cs9, cp9, _lit_bytes(cs9, cp9, cn.expression))
                     if code9 is not None: kx9[code9] = True
                 elif isinstance(cn, E.In):
-                    if not cn.expressions:
-                        raise _FastUnsupported      # IN with no literal list (subquery form)
+                    if not cn.expressions or any(not isinstance(e9, E.Literal) for e9 in cn.expressions):
+                        _cres9.append(cn); continue
                     for e9 in cn.expressions:
-                        if not isinstance(e9, E.Literal):
-                            raise _FastUnsupported
                         code9 = _code_of_literal(cs9, cp9, _lit_bytes(cs9, cp9, e9))
                         if code9 is not None: kx9[code9] = True
                 else:
-                    raise _FastUnsupported
-                cnt9 = np.asarray(cs9.code_counts(cp9))[:V9]
+                    _cres9.append(cn); continue
+                try:
+                    cnt9 = np.asarray(cs9.code_counts(cp9))[:V9]
+                except Exception:
+                    cnt9 = np.bincount(np.asarray(cs9.codes(cp9)), minlength=V9)[:V9]
                 t9s = cnt9.sum()
                 prune9 = 1.0 - float(cnt9[kx9[:cnt9.size]].sum()) / t9s if t9s else 0.5
                 cost9 = 1.0 if cc9p is None else 6.0
                 plan9.append((prune9 / cost9, prune9, kx9, cs9, cp9, cc9p))
             if _cb9 is not None:
                 _cb9.append(('plan-build(metadata+censuses)', _tk9() - _ct9)); _ct9 = _tk9()
+            if not plan9: raise _FastUnsupported        # nothing servable: no cascade
+            # CONJUNCT FUSION: same-column keeps AND at dict scale into ONE
+            # serve (Q7's l_shipdate >= a / <= b paid two full plane_tests).
+            _fused9 = {}
+            for _pt9 in plan9:
+                _kk9 = (id(_pt9[3]), _pt9[4], id(_pt9[5]) if _pt9[5] is not None else None)  # per ALIAS (n1/n2)
+                if _kk9 in _fused9:
+                    _o9 = _fused9[_kk9]
+                    _kx9 = _o9[2] & _pt9[2]
+                    try:
+                        _cn9f = np.asarray(_pt9[3].code_counts(_pt9[4]))[:_kx9.size - 1]
+                        _t9f = _cn9f.sum()
+                        _pr9 = 1.0 - float(_cn9f[_kx9[:_cn9f.size]].sum()) / _t9f if _t9f else 0.5
+                    except Exception:
+                        _pr9 = 1.0 - (1.0 - _o9[1]) * (1.0 - _pt9[1])
+                    _cost9 = 1.0 if _pt9[5] is None else 6.0
+                    _fused9[_kk9] = (_pr9 / _cost9, _pr9, _kx9, _pt9[3], _pt9[4], _pt9[5])
+                else:
+                    _fused9[_kk9] = _pt9
+            plan9 = list(_fused9.values())
+            # THE ARBITER: leftovers are tolerated only when the plan holds a
+            # POTENT PARENT KEEP through a road (Q7's nation INs: expected keep
+            # < 5%). Fact-only plans with leftovers decline to the partition,
+            # whose shadow scheduling serves clock-shaped queries better
+            # (Q12 regressed 265 -> 358 under the cascade, 2026-09-03).
+            if _cres9:
+                _pk9 = [p for p in plan9 if p[5] is not None]
+                _keep9 = 1.0
+                for p in _pk9:
+                    _keep9 *= max(0.0, 1.0 - float(p[1]))
+                # ...and only when the per-survivor work is HEAVY enough that
+                # shrinking survivors pays for the cascade's own passes: two or
+                # more group keys, or a computed/dressed key (Q7). A single
+                # cheap key (Q5) aggregates faster in one fused kernel pass.
+                _keys_heavy9 = (group is not None and (len(group.expressions) >= 2
+                                or any(not isinstance(g9, E.Column) for g9 in group.expressions)))
+                if _bill9 is not None:
+                    print('JOIN BILL: cascade ARBITER leftovers=%d parent_keep=%.4f keys_heavy=%s'
+                          % (len(_cres9), _keep9, _keys_heavy9), flush=True)
+                if not _pk9 or _keep9 > 0.05 or not _keys_heavy9:
+                    raise _FastUnsupported
             plan9.sort(key=lambda x: -x[0])
             # JACKSON'S RUNNING RULE: potency picks WHICH filter is next;
             # (next filter's cost) < (aggregating the current survivors)
@@ -2474,8 +2705,15 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 for pa9, (ca9, _p9) in eps9.items():
                     if ca9 in depth9 and pa9 not in depth9:
                         depth9[pa9] = depth9[ca9] + 1; _ch9 = True
-            for pa9 in sorted((a for a in keeps9 if a != fact9),
-                              key=lambda a: -depth9.get(a, 0)):
+            _done9 = set()
+            while True:
+                # FIXPOINT: a keep flowing down creates a keep on the next alias
+                # (Q7: nation -> supplier -> fact; nation -> customer -> orders ->
+                # fact); a snapshot loop dropped every keep past the first hop.
+                _cand9 = [a for a in keeps9 if a != fact9 and a not in _done9 and keeps9[a] is not None]
+                if not _cand9: break
+                pa9 = max(_cand9, key=lambda a: depth9.get(a, 0))
+                _done9.add(pa9)
                 if pa9 not in eps9: raise _FastUnsupported
                 ca9, p9 = eps9[pa9]
                 if ca9 == fact9 and keeps9.get(fact9) is not None and depth9.get(pa9) == 1:
@@ -2514,7 +2752,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 else:
                     pc9r = np.asarray(cs9.codes(cp9))
                     rows9 = rows9[kx9[pc9r[np.asarray(cc9p)[rows9]]]]
-            _where_spent = True
+            _where_spent = not _cres9        # leftovers: the pred re-applies the full
+                                             # WHERE at survivor scale (cheap, exact)
             if _cb9 is not None:
                 _cb9.append(('residual@survivors', _tk9() - _ct9))
                 print('JOIN BILL: CASCADE-SUB ' + ' | '.join('%s=%.0fms' % (n9, v9 * 1000) for n9, v9 in _cb9), flush=True)
@@ -2667,7 +2906,19 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     and not _where_spent):
                 import wdb_engine as _WE9
                 _sv9 = _WE9.Segment.mask_rows(_plane_mask9)
-                if _sv9.size * 4 < _plane_mask9.size:
+                # RUNNING RULE on the handoff: a DRESSED group key (enc 14/15/16)
+                # costs a full 60M reconstruct at fact scale (Q7 paid 1.9s) but a
+                # cheap codes_at at survivors -- so any keep under ~60% hands off.
+                _dressed_key9 = False
+                for _g9 in (group.expressions if group is not None else []):
+                    for _gc9 in ([_g9] if isinstance(_g9, E.Column) else list(_g9.find_all(E.Column))):
+                        try:
+                            _gs9, _gp9, _gcp9 = resolve(_gc9)
+                            if _gcp9 is None and _gs9.cols.get(_gp9, {}).get('code_enc') in (14, 15, 16):
+                                _dressed_key9 = True
+                        except Exception:
+                            pass
+                if _sv9.size * 4 < _plane_mask9.size or (_dressed_key9 and _sv9.size * 5 < _plane_mask9.size * 3):
                     # SURVIVOR HANDOFF: the mask is selective enough that the
                     # per-row leftovers (slots, keys, pred, kernel) all run at
                     # survivor scale through the existing rows9 plumbing.

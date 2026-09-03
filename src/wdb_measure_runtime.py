@@ -113,7 +113,7 @@ def parallel_worth_it(n_rows):
 
 # --- wdb_join dense / fusion ceilings ---
 
-MULTI_GROUP_CEIL = 1 << 18   # max composite groups for dense multi-col GROUP BY (else -> hashing/fallback)
+MULTI_GROUP_CEIL = 1 << 21   # max composite groups for dense multi-col GROUP BY (else -> hashing/fallback); 2M x a few f64 slots is ~50MB, far cheaper than factorising 18M rows (Q7: 913K composite codes paid 400ms in pd.factorize)
 
 
 def dense_multigroup_fits(K):

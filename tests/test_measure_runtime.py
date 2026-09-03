@@ -63,13 +63,13 @@ def test_parallel_threshold():
 
 
 def test_join_ceilings():
-    assert RT.MULTI_GROUP_CEIL == (1 << 18)
+    assert RT.MULTI_GROUP_CEIL == (1 << 21)   # raised 2026-09-03: 913K composite groups (Q7) go dense instead of factorising 18M rows
     assert RT.GROUP_CD_CELL_CEIL == (1 << 22)
     assert RT.TALLY_MAX_RATIO == 0.9
     assert RT.LUT_MAX_CARD == 65536
     # dense multi-group: fits at/under the ceiling
-    assert RT.dense_multigroup_fits(1 << 18) is True
-    assert RT.dense_multigroup_fits((1 << 18) + 1) is False
+    assert RT.dense_multigroup_fits(1 << 21) is True
+    assert RT.dense_multigroup_fits((1 << 21) + 1) is False
     # grouped COUNT(DISTINCT) cell table
     assert RT.grouped_cdist_fits(1 << 11, 1 << 11) is True       # 2^22 == ceiling, inclusive
     assert RT.grouped_cdist_fits(1 << 11, (1 << 11) + 1) is False
