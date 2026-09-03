@@ -912,6 +912,78 @@ def _left_count_frame(db, inner):
 
 
 
+def _agg_expr_rewrite(db, tree):
+    """AGGREGATE ARITHMETIC (Q14's Div-of-Sums): a projection combining
+    aggregates with +-*/ and literals runs as hidden aggregate aliases
+    through the fused engine; the arithmetic evaluates on the results.
+    Returns rows or None (not this shape)."""
+    if not isinstance(tree, E.Select): return None
+    _AGG = (E.Sum, E.Count, E.Avg, E.Min, E.Max)
+    proj = list(tree.expressions)
+    def _plain(nd):
+        return isinstance(nd, _AGG) or isinstance(nd, E.Column)
+    need = False
+    for p in proj:
+        nd = p.this if isinstance(p, E.Alias) else p
+        if not _plain(nd) and nd.find(*_AGG) is not None:
+            need = True
+    if not need: return None
+    if tree.args.get('order') is not None or tree.args.get('having') is not None: return None
+    grp = tree.args.get('group')
+    hidden = []          # (alias, node)
+    def _hoist(nd):
+        # replace each aggregate subtree with a Column ref to a hidden alias
+        if isinstance(nd, _AGG):
+            al = '__agg%d' % len(hidden)
+            hidden.append((al, nd.copy()))
+            return E.Column(this=E.Identifier(this=al, quoted=False))
+        for k, v in list(nd.args.items()):
+            if isinstance(v, E.Expression):
+                nd.set(k, _hoist(v))
+            elif isinstance(v, list):
+                nd.set(k, [_hoist(x) if isinstance(x, E.Expression) else x for x in v])
+        return nd
+    outer = []           # per projection: ('col', idx) | ('expr', ast)
+    st = tree.copy()
+    new_exprs = []
+    for p in proj:
+        nd = (p.this if isinstance(p, E.Alias) else p).copy()
+        if isinstance(nd, E.Column):
+            outer.append(('col', len(new_exprs))); new_exprs.append(nd.copy())
+        elif isinstance(nd, _AGG):
+            al = '__agg%d' % len(hidden); hidden.append((al, nd.copy()))
+            outer.append(('hid', al))
+        else:
+            outer.append(('expr', _hoist(nd)))
+    for al, nd in hidden:
+        new_exprs.append(E.Alias(this=nd, alias=E.Identifier(this=al, quoted=False)))
+    st.set('expressions', new_exprs)
+    rows = join_query(db, st.sql(dialect='duckdb'))
+    rows = rows[0] if isinstance(rows, tuple) else rows
+    names = [e.alias_or_name for e in new_exprs]
+    def ev(nd, rec):
+        if isinstance(nd, E.Paren): return ev(nd.this, rec)
+        if isinstance(nd, E.Column): return rec[names.index(nd.name)]
+        if isinstance(nd, E.Literal): return float(nd.this) if not nd.is_string else nd.this
+        if isinstance(nd, E.Neg): return -ev(nd.this, rec)
+        if isinstance(nd, E.Mul): return ev(nd.this, rec) * ev(nd.expression, rec)
+        if isinstance(nd, E.Div):
+            d = ev(nd.expression, rec); return None if not d else ev(nd.this, rec) / d
+        if isinstance(nd, E.Add): return ev(nd.this, rec) + ev(nd.expression, rec)
+        if isinstance(nd, E.Sub): return ev(nd.this, rec) - ev(nd.expression, rec)
+        raise _FastUnsupported
+    out = []
+    for rec in rows:
+        row = []
+        for kind, x in outer:
+            if kind == 'col': row.append(rec[x])
+            elif kind == 'hid': row.append(rec[names.index(x)])
+            else: row.append(ev(x, rec))
+        out.append(tuple(row))
+    return out
+
+
+
 def _lonely_rewrite(db, tree):
     """Q21's EXISTS pair dissolved (Jackson): EXISTS(l2: same key, other supp)
     and NOT EXISTS(l3: same key, other supp, ALSO LATE) are two PARENT KEEPS
@@ -1481,6 +1553,12 @@ def join_query(db, sql, columnar=False):
     import time as _t8
     _jq_t0 = _t8.perf_counter()
     tree = sqlglot.parse_one(sql, read='duckdb')
+    try:
+        _ae9 = _agg_expr_rewrite(db, tree)
+    except _FastUnsupported:
+        _ae9 = None
+    if _ae9 is not None:
+        return _ae9
     _factor_or_rewrite(tree)
     _lonely_rewrite(db, tree)
     _grouped_in_rewrite(db, tree)
