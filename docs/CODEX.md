@@ -570,3 +570,28 @@ Q21 786ms/1.11x (same escape to pandas); Q7 2.1s (OR-pred at fact
 scale); Q22 census sidecar; Q14 Div-of-Sums. The campaign's law
 held: probe first, dissolve before building, measure before
 theorizing, never ship wrong.
+
+
+## THE CROSSINGS (2026-09-03): wins=12/14, wave 3.8s vs duck 4.9s
+FOUR QUERIES CROSSED DUCK IN ONE DAY. Q7 2,080->312 (1.05x): the
+survivor handoff PRICES the key (dressed keys hand off at keep<60%);
+MULTI_GROUP_CEIL 2^18->2^21; THE IMPLIED KEEP (an OR pinned on the
+same columns in every branch implies col IN (union)); the algebra pass
+on every OR conjunct (a stale duplicate def was shadowing it);
+cascade LEFTOVERS under THE ARBITER (potent parent keep <5% AND heavy
+keys, or parent keep <1%); tiny mode-5 dims keep by rank; flow to
+FIXPOINT (a snapshot loop dropped keeps past one hop); conjunct
+fusion PER ALIAS. Q18 2,200->273 (1.97x): mode-4 sequence keys in the
+cascade (cached array, never list() of 15M); the door picks THE
+ROUTABLE KEY; gate accepts ORDER BY attributes. Q21 2,200->749 (1.18x):
+cascade serves _codes INs; the door honors LEFTOVERS AT ROWS (it had
+consumed rows9 raw -- the referee caught it in one run). Q14 580->160
+(1.44x): AGGREGATE ARITHMETIC -- hidden aggregate aliases through the
+scalar engine, arithmetic on the results. Q5 rode the cascade laws to
+1.81x untouched. BOARD: ok=14 | holes=0 | wins=12 (Q3 0.99 at the
+line; Q22 0.77 the last under) | WRONG=0 | wave 3.8s duck 4.9s. Suite
+1696/0 at every push. Housekeeping: the remote URL had a baked-in
+token; now clean, helper=store. NEXT OPENERS: Q22 census sidecar
+(.cnt.npy law on fk columns); Q3 the last breath; the ARBITER as a
+true cost curve; Q21 786ms probe floor (the lonely censuses cached);
+cold-start road pinning.
