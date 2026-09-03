@@ -2513,7 +2513,15 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 cs9, cp9, cc9p = resolve(cols9[0])
                 c9 = cs9.cols.get(cp9) or {}
                 kx9 = None
-                if c9.get('mode') == 5 and int(cs9.N) <= 4096 and c9.get('dt') == 1 and not c9.get('has_null'):
+                if isinstance(cn, E.In) and cn.args.get('_codes') is not None:
+                    # A PRE-RESOLVED CODE SET (the lonely rewrite, exists roads):
+                    # the keep IS the code list -- paint it, no judging needed.
+                    V9 = int(c9.get('V') or cs9.N)
+                    kx9 = np.zeros(V9 + 1, bool)
+                    _cd9x = np.asarray(cn.args['_codes'], dtype=np.int64)
+                    kx9[_cd9x[(_cd9x >= 0) & (_cd9x < V9)]] = True
+                    td9 = None
+                elif c9.get('mode') == 5 and int(cs9.N) <= 4096 and c9.get('dt') == 1 and not c9.get('has_null'):
                     # TINY MODE-5 DIM (nation names): the sorted inline dict is
                     # the rank space the codes index -- keep by literal match.
                     lits9 = None
@@ -2635,7 +2643,10 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 if _bill9 is not None:
                     print('JOIN BILL: cascade ARBITER leftovers=%d parent_keep=%.4f keys_heavy=%s'
                           % (len(_cres9), _keep9, _keys_heavy9), flush=True)
-                if not _pk9 or _keep9 > 0.05 or not _keys_heavy9:
+                # ...or when the parent keep alone is tiny (< 1%): at that
+                # scale even a light key aggregates for nothing (Q21: Saudi x
+                # status-F x the lonely qualification).
+                if not _pk9 or _keep9 > 0.05 or (not _keys_heavy9 and _keep9 > 0.01):
                     raise _FastUnsupported
             plan9.sort(key=lambda x: -x[0])
             # JACKSON'S RUNNING RULE: potency picks WHICH filter is next;
@@ -2784,6 +2795,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     rows9 = rows9[kx9[pc9r[np.asarray(cc9p)[rows9]]]]
             _where_spent = not _cres9        # leftovers: the pred re-applies the full
                                              # WHERE at survivor scale (cheap, exact)
+            _cres_left9 = list(_cres9)
             if _cb9 is not None:
                 _cb9.append(('residual@survivors', _tk9() - _ct9))
                 print('JOIN BILL: CASCADE-SUB ' + ' | '.join('%s=%.0fms' % (n9, v9 * 1000) for n9, v9 in _cb9), flush=True)
@@ -2801,6 +2813,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             rows9 = None; _where_spent = False
     _plane_mask9 = None
     _resid_c9X = None
+    _cres_left9 = locals().get('_cres_left9', [])
     # THE HOISTED PARTITION (Jackson's structural ruling): serves and the
     # survivor handoff run BEFORE anything row-aligned exists, so keys,
     # slots and roads are BORN at survivor scale -- no retrofits.
@@ -3068,9 +3081,40 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         if not (any(kind == 'agg' and al9 == okey9 for kind, _n, al9 in plan9)
                 or all(o9.this.name in _pcols9 for o9 in ords9)):    # ORDER BY attributes (Q18)
             return None
-        # survivors
+        # survivors -- WITH the cascade's leftovers re-applied AT ROWS (the door
+        # once consumed rows9 raw and shipped Q21 wrong, 2026-09-03)
         if rows9 is not None:
             rows = rows9
+            for _lc9 in (_cres_left9 or []):
+                _mk9 = None
+                if (type(_lc9) in (E.GT, E.LT) and isinstance(_lc9.this, E.Column)
+                        and isinstance(_lc9.expression, E.Column)):
+                    _sA, _pA, _cA = resolve(_lc9.this); _sB, _pB, _cB = resolve(_lc9.expression)
+                    if _sA is _sB and _cA is None and _cB is None:
+                        _big, _small = (_pA, _pB) if isinstance(_lc9, E.GT) else (_pB, _pA)
+                        _cbig = _sA.cols.get(_big, {}); _csm = _sA.cols.get(_small, {})
+                        if _cbig.get('code_enc') == 16 and _cbig.get('e16_partner') == _small:
+                            _b9, _d9 = _sA.pair_bits(_big)
+                            _mk9 = np.asarray(_b9)[rows] & (np.asarray(_d9)[rows] > 0)
+                        elif _csm.get('code_enc') == 16 and _csm.get('e16_partner') == _big:
+                            _b9, _d9 = _sA.pair_bits(_small)
+                            _mk9 = (~np.asarray(_b9)[rows]) & (np.asarray(_d9)[rows] > 0)
+                else:
+                    _lcols = list(_lc9.find_all(E.Column))
+                    if len(_lcols) == 1:
+                        _sL, _pL, _cL = resolve(_lcols[0])
+                        _cLd = _sL.cols.get(_pL, {})
+                        if _cLd.get('mode') in (0, 1, 2):
+                            _tdL = np.asarray(_sL._typed_dict(_pL))
+                            _kpL = _dict_keep(_lc9, _sL, _pL, _tdL) if _tdL.dtype.kind in 'iuf' else None
+                            if _kpL is not None:
+                                _rr = rows if _cL is None else np.asarray(_cL)[rows]
+                                _cdL = np.asarray(_sL.codes_at(_pL, _rr))
+                                _kxL = np.zeros(int(_cLd['V']) + 1, bool); _kxL[:len(_kpL)] = _kpL
+                                _mk9 = _kxL[_cdL]
+                if _mk9 is None:
+                    return None                    # a leftover the door can't judge
+                rows = rows[_mk9]
         else:
             m9 = get_mask()
             rows = np.flatnonzero(m9) if m9 is not None else np.arange(n, dtype=np.int64)
