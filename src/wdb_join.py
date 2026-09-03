@@ -2532,6 +2532,36 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                         sv9k = v9k.decode('utf-8', 'replace') if isinstance(v9k, (bytes, bytearray)) else str(v9k)
                         kx9[r9k] = sv9k in lits9
                     td9 = None
+                elif c9.get('mode') == 4 and c9.get('dt') in (0, 3) and not c9.get('has_null'):
+                    # MODE-4 SEQUENCE KEY (o_orderkey): V == N, codes are the
+                    # identity; a literal keep marks positions (Q18's 100 monster
+                    # orders) -- searchsorted when the sequence is sorted.
+                    _rm4 = wdb_sql.raw_dict_col(cs9, cp9, want_codes=False)
+                    if _rm4 is None:
+                        _cres9.append(cn); continue
+                    _bv4 = _rm4[0]
+                    lits4 = None
+                    if isinstance(cn, E.EQ) and isinstance(cn.expression, E.Literal) and not cn.expression.is_string:
+                        lits4 = [int(cn.expression.this)]
+                    elif (isinstance(cn, E.In) and cn.expressions
+                          and all(isinstance(e9, E.Literal) and not e9.is_string for e9 in cn.expressions)):
+                        lits4 = [int(e9.this) for e9 in cn.expressions]
+                    if lits4 is None:
+                        _cres9.append(cn); continue
+                    V9 = int(_bv4.shape[0])
+                    kx9 = np.zeros(V9 + 1, bool)
+                    _sorted4 = c9.get('_m4_sorted')
+                    if _sorted4 is None:
+                        _sorted4 = c9['_m4_sorted'] = bool(V9 < 2 or (np.diff(_bv4) > 0).all())
+                    _la4 = np.asarray(sorted(lits4), dtype=np.int64)
+                    if _sorted4:
+                        _pos4 = np.searchsorted(_bv4, _la4)
+                        _ok4 = (_pos4 < V9)
+                        _ok4[_ok4] = _bv4[_pos4[_ok4]] == _la4[_ok4]
+                        kx9[_pos4[_ok4]] = True
+                    else:
+                        kx9[:V9] = np.isin(_bv4, _la4)
+                    td9 = None
                 elif c9.get('mode') not in (0, 1, 2):
                     _cres9.append(cn); continue
                 if kx9 is None:
@@ -2764,7 +2794,10 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             if n == 0:
                 _bump_fast()
                 return [], [wdb_sql._alias(p) for p in proj]
-        except Exception:
+        except Exception as _cex9:
+            if os.environ.get('WDB_CASCADE_DEBUG'):
+                import traceback as _tbc9
+                print('CASCADE-DECLINED:', repr(_cex9)[:100], flush=True); _tbc9.print_exc()
             rows9 = None; _where_spent = False
     _plane_mask9 = None
     _resid_c9X = None
@@ -2961,29 +2994,45 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             gcols9.append((g, sg, pc, cp))
         def _alias_of(g):
             return g.table or next((al for al in alias2t9 if g.name in cols_of[al]), None)
-        A9 = None
+        # THE KEY IS THE ALIAS EVERY OTHER GROUP COLUMN ROUTES TO (Q18: both
+        # c_name and o_orderkey are unique keys; only orders can host customer's
+        # attributes -- customer is orders' PARENT, not the reverse).
+        cands9 = []
         for g, sg, pc, cp in gcols9:
             if cp is None: continue
             a9 = _alias_of(g)
             if not a9: return None
             try:
                 if _key_is_unique(db, alias2t9.get(a9, a9), pc):
-                    A9 = a9; keyptr9 = cp; kseg9 = sg; break
+                    cands9.append((a9, cp, sg))
             except Exception:
                 continue
+        if not cands9: return None
+        def _route_for(A9c):
+            def _r(g):
+                al = _alias_of(g)
+                if al == A9c: return ('A', None)
+                ep = edge_ptrs9.get(al)
+                if ep is not None and ep[0] == A9c: return ('B', ep[1])
+                return None
+            rs = []
+            for g, sg, pc, cp in gcols9:
+                r9 = _r(g)
+                if r9 is None: return None
+                rs.append(r9)
+            return rs
+        A9 = None; routes9 = None
+        for a9c, cpc, sgc in cands9:
+            rs9 = _route_for(a9c)
+            if rs9 is not None:
+                A9 = a9c; keyptr9 = cpc; kseg9 = sgc; routes9 = rs9; break
         if A9 is None: return None
-        # every other group column: on A, or on a parent of A
         def _attr_route(g, sg, cp):
             al = _alias_of(g)
             if al == A9: return ('A', None)
             ep = edge_ptrs9.get(al)
             if ep is not None and ep[0] == A9: return ('B', ep[1])
             return None
-        routes9 = []
-        for g, sg, pc, cp in gcols9:
-            r9 = _attr_route(g, sg, cp)
-            if r9 is None: return None
-            routes9.append(r9)
         # projections: group columns or SUM/COUNT/AVG aggregates
         aggs9 = {}
         def _ev9(nd, rows):
@@ -3015,7 +3064,10 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 plan9.append(('agg', inner, al9))
             else:
                 return None
-        if not any(kind == 'agg' and al9 == okey9 for kind, _n, al9 in plan9): return None
+        _pcols9 = {n9.name for kind, n9, _a in plan9 if kind == 'col'}
+        if not (any(kind == 'agg' and al9 == okey9 for kind, _n, al9 in plan9)
+                or all(o9.this.name in _pcols9 for o9 in ords9)):    # ORDER BY attributes (Q18)
+            return None
         # survivors
         if rows9 is not None:
             rows = rows9

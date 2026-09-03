@@ -1051,7 +1051,7 @@ def raw_dict_col(seg, name, want_codes=True):
         # MODE-4 SEQUENCE (value = f(position)): the decoded values ARE the
         # per-row base and the codes are the identity -- base[codes[r]] = v[r].
         # (A fused pred on such a column no longer declines the whole plan.)
-        base4 = np.asarray(seg._typed_dict(name), dtype=np.int64)
+        base4 = np.asarray(seg._seq_decode(c), dtype=np.int64)   # the cached array, never list()
         return base4, (seg.codes(name) if want_codes else None)
     if c['mode'] in (4, 5, 6) or c['has_null']: return None
     if seg._override_vals_typed(name):          return None
