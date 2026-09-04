@@ -123,6 +123,45 @@ def has_subquery(tree):
             or any(True for _ in w.find_all(E.Exists)))
 
 
+def _self_exists_codes(db, tree, inner, icol, ocol, rest):
+    """THE SELF-EXISTS CODE SET: EXISTS (SELECT .. FROM T h2 WHERE h2.c = h1.c
+    AND P(h2)) on the SAME table and column needs no road -- the set of
+    c-codes among rows satisfying P IS the answer, already in the outer
+    column's own code space (megaboard cq-notexists, 2026-09-04)."""
+    try:
+        tc, _al = _inner_tables(inner)
+        if isinstance(tc, str):
+            it = tc
+        else:
+            if len(tc) != 1: return None
+            it = list(tc)[0]
+        outer_tables = [t.name for t in tree.find_all(E.Table) if t.find_ancestor(E.Select) is tree]
+        if len(set(outer_tables)) != 1 or list(set(outer_tables))[0] != it: return None
+        if icol != ocol: return None
+        import wdb_join as _J, wdb_sql as WS9
+        seg, _sp = _J._solo_segment(db, it)
+        pcol = db.cat.phys_map(it).get(icol, icol)
+        if seg.cols.get(pcol, {}).get('mode') not in (0, 1, 2, 3, 4, 5): return None
+        if rest:
+            cond = rest[0]
+            for r in rest[1:]:
+                cond = E.And(this=cond, expression=r)
+            cond = cond.copy()
+            for c9 in list(cond.find_all(E.Column)):
+                c9.set('table', None)                # inner alias -> bare column on the segment
+            _pm9 = db.cat.phys_map(it)
+            m = WS9._eval_pred(seg, cond, lambda nm: _pm9.get(nm, nm))
+            if m is None: return None
+            m = np.asarray(m, dtype=bool)
+        else:
+            m = None
+        codes = np.asarray(seg.codes(pcol))
+        sel = codes[m] if m is not None else codes
+        return np.unique(sel).astype(np.int64)
+    except Exception:
+        return None
+
+
 def _exists_road(db, tree, inner, icol, ocol, rest, outer_where=None, ex_node=None):
     """EXISTS over an FK road, executed as arrays: evaluate the residual
     child predicate with numpy (Column-vs-Column and Column-vs-literal
@@ -482,6 +521,8 @@ def rewrite(db, tree):
         in_node = E.In(this=E.column(ocol), query=E.Subquery(this=sub))
         rd9 = _exists_road(db, tree, inner, icol, ocol, rest,
                            outer_where=tree.args.get('where'), ex_node=ex)
+        if rd9 is None:
+            rd9 = _self_exists_codes(db, tree, inner, icol, ocol, rest)
         if rd9 is not None:
             # THE SCATTER FORM (Jackson's Q4 walk): child residual mask in
             # arrays -> road sidecar -> unique PARENT ROWS -> the _codes

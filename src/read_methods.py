@@ -395,4 +395,4 @@ def general_scan(ctx):
                 return r
     except Exception:
         pass
-    return wdb_sql.execute(ctx.seg, ctx.sql, col_map=ctx.cmap)
+    return wdb_sql.execute(ctx.seg, ctx.sql, col_map=ctx.cmap, tree=ctx.tree)   # the TREE carries resolved _codes; a re-parse loses them
