@@ -871,6 +871,8 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
                 rowout.append(int(groupdistinct(_dx[0].name, gi)))
             elif kind is None:
                 _inn2 = p.this if isinstance(p, E.Alias) else p
+                if isinstance(_inn2, E.AggFunc) or _inn2.find(E.AggFunc) is not None:
+                    raise NotImplementedError('unsupported aggregate: %s' % _inn2.sql()[:60])   # never a key
                 val, ok = _eval_scalar_safe(_inn2, env)         # bare col / arithmetic of base columns
                 if not ok:                                      # genuine derived key (sfn/date/const)
                     gk_i = _gki_of(p)

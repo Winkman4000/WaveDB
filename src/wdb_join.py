@@ -926,6 +926,19 @@ def _left_count_frame(db, inner):
 
 
 
+def has_agg_arith(tree):
+    """True when a projection combines aggregates with arithmetic (Q14's
+    Div-of-Sums, H2O q7's MAX-MIN): the single-table executor cannot plan it
+    and used to crash on a positional key fallback."""
+    if not isinstance(tree, E.Select): return False
+    _AGG = (E.Sum, E.Count, E.Avg, E.Min, E.Max)
+    for p in tree.expressions:
+        nd = p.this if isinstance(p, E.Alias) else p
+        if isinstance(nd, (E.Column, *_AGG)): continue
+        if nd.find(*_AGG) is not None: return True
+    return False
+
+
 def _agg_expr_rewrite(db, tree):
     """AGGREGATE ARITHMETIC (Q14's Div-of-Sums): a projection combining
     aggregates with +-*/ and literals runs as hidden aggregate aliases
@@ -1417,6 +1430,8 @@ def _from_door(db, tree):
     if tree.args.get('having') is not None: return None
     inner = frm.this.this
     if not isinstance(inner, E.Select): return None
+    if inner.find(E.Window) is not None:
+        raise NotImplementedError('window functions (ROW_NUMBER/RANK OVER) are not supported')  # loud, never a crash
     import pandas as pd
     cols = [e.alias_or_name for e in inner.expressions]
     if any(not c for c in cols): return None
@@ -3916,6 +3931,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     # gate with an object 'revenue' array.
                     if   fn == 'SUM':
                         o = np.rint(s).astype(np.int64) if int9.get(i) else s
+                    elif fn in ('MIN', 'MAX') and int9.get(i):
+                        o = np.rint(mn if fn == 'MIN' else mx).astype(np.int64)
                     elif fn == 'AVG':
                         o = np.divide(s, counts, out=np.zeros_like(s, dtype=np.float64),
                                       where=counts > 0)
