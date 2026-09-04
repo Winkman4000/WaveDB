@@ -1561,6 +1561,88 @@ def _grouped_in_rewrite(db, tree):
 
 
 
+def _window_topk_door(db, tree):
+    """THE TOP-K-PER-GROUP DOOR (H2O q8): FROM (SELECT cols..., ROW_NUMBER()
+    OVER (PARTITION BY p ORDER BY o [DESC]) AS rn FROM T [WHERE inner]) t
+    WHERE rn <= k. Dissolved: composite group ids over p, a COUNTING SCATTER
+    of row indices by group, each group's slice sorted by o in parallel,
+    the first k rows gathered. ROW_NUMBER only (RANK ties would need more)."""
+    frm = tree.args.get('from') or tree.args.get('from_')
+    if frm is None or not isinstance(frm.this, E.Subquery) or tree.args.get('joins'): return None
+    inner = frm.this.this
+    if not isinstance(inner, E.Select) or inner.args.get('group') or inner.args.get('joins'): return None
+    ifrm = inner.args.get('from') or inner.args.get('from_')
+    if ifrm is None or not isinstance(ifrm.this, E.Table): return None
+    tname = ifrm.this.name
+    wins = [p for p in inner.expressions if isinstance(p, E.Alias) and isinstance(p.this, E.Window)]
+    if len(wins) != 1: return None
+    walias = wins[0].alias; w = wins[0].this
+    if not isinstance(w.this, E.RowNumber): return None
+    part = [c for c in (w.args.get('partition_by') or [])]
+    if not part or not all(isinstance(c, E.Column) for c in part): return None
+    order = w.args.get('order')
+    if order is None or len(order.expressions) != 1 or not isinstance(order.expressions[0].this, E.Column): return None
+    ocol = order.expressions[0].this.name; desc = bool(order.expressions[0].args.get('desc'))
+    ow = tree.args.get('where')
+    if ow is None or tree.args.get('group') or tree.args.get('order') or tree.args.get('limit'): return None
+    cj = ow.this
+    if isinstance(cj, E.Paren): cj = cj.this
+    if not (isinstance(cj, (E.LTE, E.LT, E.EQ)) and isinstance(cj.this, E.Column) and cj.this.name == walias
+            and isinstance(cj.expression, E.Literal)): return None
+    k = int(cj.expression.this)
+    if isinstance(cj, E.LT): k -= 1
+    if k <= 0 or k > 1000: return None
+    outcols = []
+    for p in tree.expressions:
+        nd = p.this if isinstance(p, E.Alias) else p
+        if not isinstance(nd, E.Column) or nd.name == walias: return None
+        outcols.append(nd.name)
+    try:
+        seg, _sp = _solo_segment(db, tname)
+    except _FastUnsupported:
+        return None
+    pm = db.cat.phys_map(tname)
+    n = int(seg.N)
+    # inner WHERE -> survivor rows
+    iw = inner.args.get('where')
+    if iw is not None:
+        m = wdb_sql._eval_pred(seg, iw.this, lambda nm: pm.get(nm, nm))
+        rows = np.flatnonzero(np.asarray(m, dtype=bool))
+    else:
+        rows = np.arange(n, dtype=np.int64)
+    comp = np.zeros(rows.size, np.int64); K = 1
+    for c in part:
+        pc = pm.get(c.name, c.name); cd = seg.cols.get(pc, {})
+        if cd.get('has_null') or cd.get('mode') not in (0, 1, 2, 4): return None
+        codes = np.asarray(seg.codes_at(pc, rows)).astype(np.int64, copy=False)
+        V = int(cd.get('V') or (int(codes.max()) + 1 if codes.size else 1))
+        if K * V > (1 << 24): return None
+        comp = comp * V + codes; K *= V
+    raw = wdb_sql.raw_dict_col(seg, pm.get(ocol, ocol))
+    if raw is None: return None
+    vals = raw[0][np.asarray(raw[1])].astype(np.float64, copy=False)
+    cnt_all = np.bincount(comp, minlength=K)
+    present = np.flatnonzero(cnt_all)
+    offs0 = np.zeros(K + 1, np.int64); np.cumsum(cnt_all, out=offs0[1:])
+    cur = offs0[:-1].copy()
+    placed = np.empty(rows.size, np.int64)
+    wdb_kernels.pscatter_by_gid(np.ascontiguousarray(comp), np.ascontiguousarray(rows), cur, placed)
+    starts = offs0[present]; ends = offs0[present + 1]
+    out_rows = np.empty(present.size * k, np.int64); out_cnt = np.zeros(present.size, np.int64)
+    wdb_kernels.pgroup_topk(placed, vals, starts, ends, k, desc, out_rows, out_cnt)
+    keep = np.zeros(present.size * k, bool)
+    for t in range(k):
+        keep[t::k] = out_cnt > t
+    sel = out_rows[keep]
+    cols = []
+    for nm in outcols:
+        pc = pm.get(nm, nm)
+        cols.append(list(seg.values_at_rows(pc, sel)) if seg.cols.get(pc, {}).get('mode') == 5
+                    else _bulk_keyvals(seg, pc, np.asarray(seg.codes_at(pc, sel))))
+    return [tuple(col[i] for col in cols) for i in range(sel.size)]
+
+
+
 def _from_door(db, tree):
     """THE FROM DOOR (Q7/Q13/Q22): FROM (SELECT ...) alias -- run the INNER
     through the engine (it rides every fast path: trees, cascades, courts),
@@ -1573,7 +1655,10 @@ def _from_door(db, tree):
     inner = frm.this.this
     if not isinstance(inner, E.Select): return None
     if inner.find(E.Window) is not None:
-        raise NotImplementedError('window functions (ROW_NUMBER/RANK OVER) are not supported')  # loud, never a crash
+        r9 = _window_topk_door(db, tree)
+        if r9 is not None:
+            return r9
+        raise NotImplementedError('window functions beyond ROW_NUMBER top-k-per-group are not supported')
     import pandas as pd
     cols = [e.alias_or_name for e in inner.expressions]
     if any(not c for c in cols): return None

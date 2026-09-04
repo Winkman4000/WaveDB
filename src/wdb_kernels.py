@@ -3495,3 +3495,26 @@ def pgroup_median(out_vals, starts, ends, med):
         lo = (cnt - 1) // 2
         hi = cnt // 2
         med[g] = (sl[lo] + sl[hi]) / 2.0
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def pgroup_topk(idx_placed, vals, starts, ends, k, desc, out_rows, out_cnt):
+    """Top-k rows per group: idx_placed holds row indices grouped by gid;
+    each group's slice sorts by vals[row] (desc if desc), the first k row
+    indices land in out_rows[g*k : g*k+cnt]; out_cnt[g] = cnt."""
+    G = starts.shape[0]
+    for g in prange(G):
+        a = starts[g]; b = ends[g]
+        m = b - a
+        if m <= 0:
+            out_cnt[g] = 0
+            continue
+        sl = idx_placed[a:b]
+        v = np.empty(m, np.float64)
+        for t in range(m):
+            v[t] = -vals[sl[t]] if desc else vals[sl[t]]
+        order = np.argsort(v, kind='mergesort')
+        c = k if m > k else m
+        for t in range(c):
+            out_rows[g * k + t] = sl[order[t]]
+        out_cnt[g] = c
