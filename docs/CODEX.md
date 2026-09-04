@@ -595,3 +595,17 @@ token; now clean, helper=store. NEXT OPENERS: Q22 census sidecar
 (.cnt.npy law on fk columns); Q3 the last breath; the ARBITER as a
 true cost curve; Q21 786ms probe floor (the lonely censuses cached);
 cold-start road pinning.
+
+
+## THE LINE (2026-09-03 evening): wins=13/14, wave 3.5s vs duck 4.9s
+Q22 (1.79x) and Q3 (1.24x) were already won on a fresh pod -- the
+earlier scores were CPU breathing, not engine debt. Q19 275->132
+(2.16x): THE CASCADE SERVES SCALAR QUERIES (its gate demanded a group
+key); the arbiter prices TOTAL expected keep for scalars; the ZERO-
+SURVIVOR LAW held (a scalar emits exactly one row over an empty
+cascade -- five matrix tests caught the []). BOARD: ok=14 | holes=0 |
+wins=13 (Q7 0.98-1.04 pod-to-pod: a coin flip, needs ~15% margin) |
+WRONG=0 | wave 3.5s duck 4.9s. Suite 1696/0. NEXT STAGE: generality --
+run every board (ClickBench, mega, old TPC, this one), then hunt a
+dataset that exposes the engine's assumptions (FK roads, sorted
+child runs, dict-space serves).
