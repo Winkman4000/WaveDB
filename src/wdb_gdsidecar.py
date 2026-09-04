@@ -68,7 +68,8 @@ def build(seg, group_col, target_col):
     else:
         present = np.nonzero(counts)[0].astype(np.int64)
     meta = {'group_col': group_col, 'target_col': target_col,
-            'N': N, 'V': int(gmax), 'target_nullable': bool(tnull >= 0)}
+            'N': N, 'V': int(gmax), 'target_nullable': bool(tnull >= 0),
+            'idspace': gd.idspace_sig(seg, group_col)}
     return {'counts': counts.astype(np.int64, copy=False), 'present': present, 'meta': meta}
 
 

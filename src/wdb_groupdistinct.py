@@ -57,6 +57,27 @@ except Exception:                                    # numba absent: NumPy pack+
     _HAVE_NUMBA = False
 
 
+def idspace_sig(seg, col):
+    """THE ID-SPACE BIRTHMARK: which id space a group column lives in today
+    (raw values vs dict codes) and the dict's edges. A sidecar built under a
+    different space must be rejected -- a July RegionID shelf built on raw
+    values decoded today as codes produced right counts with WRONG labels
+    (ClickBench Q08/Q09, 2026-09-04)."""
+    r = _ids(seg, col)
+    if r is None:
+        return 'none'
+    _ids_, _nc, kd = r
+    V = int(seg.cols[col].get('V') or 0)
+    if kd is None:
+        return 'raw:%d' % V
+    try:
+        a = str(kd[0]) if V > 0 else ''
+        b = str(kd[max(0, V - 2)]) if V > 1 else ''
+    except Exception:
+        a = b = '?'
+    return 'dict:%d:%s:%s' % (V, a, b)
+
+
 def _ids(seg, col):
     """Per-row value-identity integer ids for `col`, plus (null_code or -1) and an optional by-code
     decode array. Returns (ids:int64, null_code:int, decode_or_None) or None if not value-identity."""

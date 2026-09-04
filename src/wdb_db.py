@@ -427,6 +427,21 @@ class Database:
         ck = (segment_path, group_col, target_col); hit = self._gd_cache.get(ck)
         if hit is None or hit[0] != key:
             s = wdb_gdsidecar.load(segment_path, group_col, target_col)
+            if s is not None:
+                # THE ID-SPACE BIRTHMARK: reject a shelf built in another id space
+                try:
+                    import wdb_groupdistinct as _gd
+                    tbl = next((t for t in self.cat.data['tables']
+                                if segment_path in self.cat.segment_paths(t)), None)
+                    seg = self.open_segment(segment_path, tbl) if tbl else None
+                    want = _gd.idspace_sig(seg, group_col) if seg is not None else None
+                    if want is None or s.get('meta', {}).get('idspace') != want:
+                        print('GD-SIDECAR: id-space birthmark mismatch (%s vs %s) -- shelf ignored: %s'
+                              % (s.get('meta', {}).get('idspace'), want, sp), flush=True)
+                        s = None
+                except Exception as _e:
+                    print('GD-SIDECAR: birthmark check failed (%s) -- shelf ignored' % _e, flush=True)
+                    s = None
             self._gd_cache[ck] = (key, s); return s
         return hit[1]
 
