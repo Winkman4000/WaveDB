@@ -458,7 +458,9 @@ def _descent_exec(db, tree, meta, s9, k, fseg):
             if isinstance(e, E9.Column):
                 a9 = own.get(e.name)
                 if a9 != fact_a: return _gate9('G9')
-                td = np.asarray(seg_of[a9]._typed_dict(e.name), dtype=np.float64)
+                _rdc = wdb_sql.raw_dict_col(seg_of[a9], e.name, want_codes=False)   # cached base
+                td = (np.asarray(_rdc[0], dtype=np.float64) if _rdc is not None
+                      else np.asarray(seg_of[a9]._typed_dict(e.name), dtype=np.float64))
                 return td[np.asarray(fseg.codes_at(e.name, r))]
             if isinstance(e, E9.Literal): return float(str(e.name))
             if isinstance(e, E9.Mul):
@@ -478,10 +480,9 @@ def _descent_exec(db, tree, meta, s9, k, fseg):
         for _, sg, cd in gk:
             comp = comp * (int(cd.max()) + 1 if cd.size else 1) + cd.astype(np.int64)
         gid, uniq = pd.factorize(comp, sort=False)
-        sums = np.zeros(len(uniq)); np.add.at(sums, gid, rev)
-        firsts = np.full(len(uniq), -1, np.int64)
-        for i9 in range(r.size):
-            if firsts[gid[i9]] < 0: firsts[gid[i9]] = i9
+        sums = np.bincount(gid, weights=rev, minlength=len(uniq))       # not np.add.at
+        _u9, firsts = np.unique(gid, return_index=True)                 # first row per group, vectorized
+        _f9 = np.full(len(uniq), -1, np.int64); _f9[_u9] = firsts; firsts = _f9
         keys2 = []
         for oe in tree.args.get('order').expressions[1:]:
             nm2 = oe.this.name
@@ -778,13 +779,26 @@ def _rich_lonely_frame(db, inner):
                 if x9.name not in c2: x9, y9 = y9, x9
                 if x9.name not in c2 or y9.name not in set(db.cat.column_names(t1)): return None
                 seg2, _s2 = _solo_segment(db, t2)
-                kv1 = np.asarray(wdb_sql._col(seg1, phys1.get(y9.name, y9.name))[0]).astype(np.int64)
-                kmin = int(kv1.min())
-                if int(kv1.max()) - kmin + 1 != kv1.size: return None
-                fk9 = wdb_sql.raw_dict_col(seg2, db.cat.phys_map(t2).get(x9.name, x9.name))
-                if fk9 is None: return None
-                cen = np.bincount((fk9[0][np.asarray(fk9[1])]).astype(np.int64) - kmin,
-                                  minlength=kv1.size)
+                # THE CENSUS, CACHED per (child, fk, parent key) on the parent
+                # segment -- Jackson's .cnt.npy law in process (106ms per query
+                # rebuilt a 15M bincount that never changes).
+                _cc9 = getattr(seg1, '_census_cache', None)
+                if _cc9 is None: _cc9 = seg1._census_cache = {}
+                _ck9 = ('fkcensus', t2, x9.name, y9.name)
+                _ent9 = _cc9.get(_ck9)
+                if _ent9 is None:
+                    _rk1 = wdb_sql.raw_dict_col(seg1, phys1.get(y9.name, y9.name), want_codes=False)
+                    kv1 = (np.asarray(_rk1[0], dtype=np.int64) if _rk1 is not None
+                           else np.asarray(wdb_sql._col(seg1, phys1.get(y9.name, y9.name))[0]).astype(np.int64))
+                    kmin = int(kv1.min())
+                    if int(kv1.max()) - kmin + 1 != kv1.size: return None
+                    fk9 = wdb_sql.raw_dict_col(seg2, db.cat.phys_map(t2).get(x9.name, x9.name))
+                    if fk9 is None: return None
+                    cen = np.bincount((fk9[0][np.asarray(fk9[1])]).astype(np.int64) - kmin,
+                                      minlength=kv1.size)
+                    _cc9[_ck9] = cen
+                else:
+                    cen = _ent9
                 mm = (cen == 0) if inv9 else (cen > 0)
             else:
                 return None
@@ -2570,7 +2584,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 _w9c = None            # cluster slice-scalar lane is faster: cascade stands down
         except Exception:
             pass
-    if _w9c is not None and gnodes and cd_col is None:
+    if _w9c is not None and cd_col is None:           # grouped OR scalar (Q19)
         try:
             def _cflat(x):
                 if isinstance(x, E.Paren): return _cflat(x.this)
@@ -2724,7 +2738,15 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 # ...or when the parent keep alone is tiny (< 1%): at that
                 # scale even a light key aggregates for nothing (Q21: Saudi x
                 # status-F x the lonely qualification).
-                if not _pk9 or _keep9 > 0.05 or (not _keys_heavy9 and _keep9 > 0.01):
+                _keep_all9 = 1.0
+                for p in plan9:
+                    _keep_all9 *= max(0.0, 1.0 - float(p[1]))
+                if not gnodes:
+                    # SCALAR: aggregation at survivors is trivial -- any potent
+                    # total keep (fact + parent, < 5%) pays for the cascade (Q19).
+                    if _keep_all9 > 0.05:
+                        raise _FastUnsupported
+                elif not _pk9 or _keep9 > 0.05 or (not _keys_heavy9 and _keep9 > 0.01):
                     raise _FastUnsupported
             plan9.sort(key=lambda x: -x[0])
             # JACKSON'S RUNNING RULE: potency picks WHICH filter is next;
@@ -2881,9 +2903,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 _bill9.append(('cascade %d->%d' % (n, rows9.size), _tk9() - _fpa_t0))
             n = int(rows9.size)
             _stage0 = _tk9()
-            if n == 0:
-                _bump_fast()
-                return [], [wdb_sql._alias(p) for p in proj]
+            if n == 0 and gnodes:            # GROUP BY over zero survivors: no groups.
+                _bump_fast()                 # A SCALAR still emits exactly one row
+                return [], [wdb_sql._alias(p) for p in proj]   # (COUNT=0, SUM=NULL) below.
         except Exception as _cex9:
             if os.environ.get('WDB_CASCADE_DEBUG'):
                 import traceback as _tbc9
