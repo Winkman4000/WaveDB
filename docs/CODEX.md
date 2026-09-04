@@ -609,3 +609,34 @@ WRONG=0 | wave 3.5s duck 4.9s. Suite 1696/0. NEXT STAGE: generality --
 run every board (ClickBench, mega, old TPC, this one), then hunt a
 dataset that exposes the engine's assumptions (FK roads, sorted
 child runs, dict-space serves).
+
+
+## THE GENERALITY STAGE (2026-09-04): all boards clean, a new realm
+ALL BOARDS: TPC-H 14/14 exact wins 13 (wave 3.5s vs duck 4.9s);
+Megaboard 103/103 (wave faster on 88, median 3.72x); ClickBench 42/43
+ok, false=0, Q27 timeout known. Two generality defects found by the
+existing boards before any new data: (1) THE ID-SPACE BIRTHMARK -- the
+group-distinct shelf validated only n==N; a July RegionID shelf built
+on raw values, decoded today as dict codes, gave right counts with
+WRONG labels at 4ms (ClickBench Q08/Q09). Sidecars carry their id
+space; a mismatch is refused loudly and reborn. (2) THE SELF-EXISTS
+CODE SET (megaboard cq-notexists): same-table EXISTS with an inner
+filter is a code set in the outer column's own space; and the
+fallback read door re-parsed SQL text, losing resolved _codes (now
+takes the tree). NEW REALM: H2O.ai db-benchmark groupby (50M rows,
+K=100, 500K-distinct string and int keys; bench/h2o_groupby.py with a
+numpy generator and the referee-law comparator). Findings: the single-
+table executor treated any unrecognized projection as a GROUP KEY and
+crashed on a positional fallback -> aggregate arithmetic routes to the
+engine that rewrites it; MEDIAN/STDDEV/CORR and window functions
+decline loudly; MIN/MAX emit integers like SUM. BOARD: ok=6/7
+attempted, wins=5 (q1 6.2x, q2 6.4x, q3 2.3x, q4 2.3x, q5 3.0x; q7
+0.83x), WRONG=0, three loud holes (median/stddev, window, corr). THE
+CARDINALITY WAR: q10 GROUP BY id1..id6 = 50M groups (V==N; duck 49s
+incl. fetchall) -- the composite overflow now declines loudly in 1.7s
+instead of a 37GB pandas hang; THE HASHED-COMPOSITE ORGAN for the
+moderate range (2^21..~20M groups) is the next real piece. Speed wars
+docketed: ClickBench Q09 (1.1s, COUNT DISTINCT in a multi-aggregate),
+cq-notexists (5.3s code walk), Q7 margin, H2O q7 (0.83x). Suite
+1696/0 at every push. NEXT: hashed-composite organ; MEDIAN/STDDEV/CORR
+aggregates; the join realm (JOB / H2O joins).
