@@ -3379,7 +3379,15 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         else:                                              # high-card: hash-factorise the composite to dense ids
             prod = 1
             for k in gkeys: prod *= k['K']
-            if prod > (1 << 62): raise _FastUnsupported    # mixed-radix code would overflow int64
+            if prod > (1 << 62):
+                # mixed-radix code would overflow int64. On a large survivor set the
+                # pandas tail is a 37GB hang (H2O q10: 50M rows, 50M groups); decline
+                # LOUDLY there -- the hashed-composite organ is the docketed fix.
+                if n > 10_000_000:
+                    raise NotImplementedError('composite GROUP BY key space overflows the dense '
+                                              'and mixed-radix paths (%d rows): hashed-composite '
+                                              'organ not built yet' % n)
+                raise _FastUnsupported
             # THE LEADING-RUN COURT (decode-spec law: group keys are IDENTITY
             # class -- never gather 60M co-key codes to label 1.1M groups).
             # Gate, proven exactly and gather-free: leading key fact-direct and
