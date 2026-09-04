@@ -3415,3 +3415,55 @@ def pruns_distinct(starts, ptr, supp, flag, nsupp, nflag):
                 if not seenf:
                     cf += 1
         nsupp[ptr[i]] = c; nflag[ptr[i]] = cf
+
+
+@njit(cache=True, nogil=True)
+def hcomposite2(w0, w1, gid, tk0, tk1, tg):
+    """THE HASHED COMPOSITE: open-addressing group ids over a 128-bit packed
+    key (two int64 words). Table arrays sized to a power of two >= 2n, tg
+    initialised to -1. Returns the number of groups; tk0/tk1 hold each
+    slot's key words, tg its gid (group g's words are found via rep below)."""
+    n = w0.shape[0]
+    mask = tk0.shape[0] - 1
+    ng = 0
+    for i in range(n):
+        a = w0[i]; b = w1[i]
+        h = (a * np.int64(-7046029254386353131)) ^ ((b + np.int64(0x9E3779B97F4A7C15)) * np.int64(-4265267296055464877))
+        h ^= (h >> np.int64(29))
+        j = np.int64(h) & mask
+        while True:
+            g = tg[j]
+            if g < 0:
+                tk0[j] = a; tk1[j] = b; tg[j] = ng; gid[i] = ng; ng += 1
+                break
+            if tk0[j] == a and tk1[j] == b:
+                gid[i] = g
+                break
+            j = (j + 1) & mask
+    return ng
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def hcomposite_rep(tg, tk0, tk1, g0, g1):
+    """Scatter each slot's key words to its group id (g0/g1 sized ngroups)."""
+    m = tg.shape[0]
+    for j in prange(m):
+        g = tg[j]
+        if g >= 0:
+            g0[g] = tk0[j]; g1[g] = tk1[j]
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def pack2(codes, shifts, words, w0, w1):
+    """Pack k code arrays (int64[k, n] as a 2-D view) into two words by the
+    given bit shifts; words[j] says which word column j lands in."""
+    k = codes.shape[0]; n = codes.shape[1]
+    for i in prange(n):
+        a = np.int64(0); b = np.int64(0)
+        for j in range(k):
+            v = codes[j, i] << shifts[j]
+            if words[j] == 0:
+                a |= v
+            else:
+                b |= v
+        w0[i] = a; w1[i] = b

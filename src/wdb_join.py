@@ -1975,8 +1975,15 @@ def _bulk_keyvals(seg, pcol, codes):
     if dt == 3:                                       # int64 epochs -> datetime64 -> _pyval string
         unit = seg.unit(pcol)
         out = [wdb_sql._pyval(x) for x in picked.astype(np.int64).view(f'datetime64[{unit}]')]
-    elif dt == 1:                                     # bytes -> str
-        out = [wdb_sql._pyval(x) for x in picked]
+    elif dt == 1:                                     # bytes -> str: decode the DICT once (V), gather at C speed
+        cache = getattr(seg, '_str_dict_cache', None)
+        if cache is None:
+            cache = seg._str_dict_cache = {}
+        tds = cache.get(pcol)
+        if tds is None or len(tds) != len(td):
+            tds = np.array([wdb_sql._pyval(x) for x in td], dtype=object)
+            cache[pcol] = tds
+        out = tds[safe].tolist()
     else:                                             # int / float -> python scalars (C-level tolist)
         out = picked.tolist()
     if nc is not None:
@@ -3364,6 +3371,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         if full.size == 0 and n > 0: return [], [wdb_sql._alias(p) for p in proj]
         gkeys.append({'seg': gseg, 'pcol': gpcol, 'cptr': gcptr, 'full': full, 'K': K9full})
     gid_to_comp = None                                    # set when a high-card composite is hash-factorised
+    _gid_words9 = None                                    # set by THE HASHED COMPOSITE
     if len(gkeys) == 0:
         K = 1; group_op = None; group_keys = []
     elif len(gkeys) == 1:                                 # single key: keep the gather-fused operand
@@ -3379,15 +3387,46 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         else:                                              # high-card: hash-factorise the composite to dense ids
             prod = 1
             for k in gkeys: prod *= k['K']
+            _gid_words9 = None
             if prod > (1 << 62):
-                # mixed-radix code would overflow int64. On a large survivor set the
-                # pandas tail is a 37GB hang (H2O q10: 50M rows, 50M groups); decline
-                # LOUDLY there -- the hashed-composite organ is the docketed fix.
-                if n > 10_000_000:
-                    raise NotImplementedError('composite GROUP BY key space overflows the dense '
-                                              'and mixed-radix paths (%d rows): hashed-composite '
-                                              'organ not built yet' % n)
-                raise _FastUnsupported
+                # THE HASHED COMPOSITE: pack the key codes by bit width into two
+                # 64-bit words and factorise with an open-addressing kernel --
+                # group ids at survivor scale, each group's key words kept for
+                # emission (H2O q10: 50M rows, 50M groups; the pandas tail was a
+                # 37GB hang, the mixed-radix code overflows int64).
+                widths9 = [max(1, int(k['K'] - 1).bit_length()) for k in gkeys]
+                if sum(widths9) > 126: raise _FastUnsupported
+                shifts9 = np.zeros(len(gkeys), np.int64); words9 = np.zeros(len(gkeys), np.int64)
+                _bit = 0; _wd = 0
+                for j9, wdt in enumerate(widths9):
+                    if _bit + wdt > 63:
+                        _wd += 1; _bit = 0
+                    shifts9[j9] = _bit; words9[j9] = _wd; _bit += wdt
+                cm9 = np.empty((len(gkeys), n), np.int64)
+                for j9, k in enumerate(gkeys):
+                    cm9[j9] = (k['full'][k['cptr']] if k['cptr'] is not None else k['full']).astype(np.int64, copy=False)
+                w0 = np.empty(n, np.int64); w1 = np.empty(n, np.int64)
+                wdb_kernels.pack2(cm9, shifts9, words9, w0, w1)
+                del cm9
+                tsz = 1 << max(4, int(2 * n - 1).bit_length())
+                tk0 = np.empty(tsz, np.int64); tk1 = np.empty(tsz, np.int64); tg = np.full(tsz, -1, np.int64)
+                gids = np.empty(n, np.int64)
+                ng9 = int(wdb_kernels.hcomposite2(w0, w1, gids, tk0, tk1, tg))
+                g0 = np.empty(ng9, np.int64); g1 = np.empty(ng9, np.int64)
+                wdb_kernels.hcomposite_rep(tg, tk0, tk1, g0, g1)
+                del tk0, tk1, tg, w0, w1
+                _gid_words9 = (g0, g1, shifts9, words9, widths9)
+                gid_to_comp = None
+                gids = np.ascontiguousarray(gids)
+                K = ng9; group_op = ('d', gids); group_keys = [(gids, K, None)]
+                _mono_gids = False
+                _hashed_done9 = True
+            else:
+                _hashed_done9 = False
+            if _hashed_done9:
+                pass
+            elif True:
+                pass
             # THE LEADING-RUN COURT (decode-spec law: group keys are IDENTITY
             # class -- never gather 60M co-key codes to label 1.1M groups).
             # Gate, proven exactly and gather-free: leading key fact-direct and
@@ -3396,7 +3435,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             # a run, its gathered codes can't either). Then boundaries come
             # from the leading key alone and the composite is computed AT THE
             # STARTS ONLY, mirroring the full radix exactly.
-            _lead_ok = (gkeys[0]['cptr'] is None
+            _lead_ok = (not _hashed_done9 and gkeys[0]['cptr'] is None
                         and all(k['cptr'] is not None for k in gkeys[1:]))
             if _lead_ok:
                 f0 = gkeys[0]['full'].astype(np.int64, copy=False)
@@ -3409,7 +3448,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                         if not bool(((cp9[1:] == cp9[:-1]) | nb9).all()):
                             _lead_ok = False
                             break
-            if _lead_ok:
+            if _hashed_done9:
+                pass
+            elif _lead_ok:
                 _mono_gids = True
                 starts = np.concatenate([[0], np.flatnonzero(nb9) + 1])
                 gids = np.zeros(n, np.int64)
@@ -3438,8 +3479,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     gid_to_comp = comp[starts]
                 else:
                     gids, gid_to_comp = pd.factorize(comp, sort=False)   # hash-factorise -> only groups present
-            gids = np.ascontiguousarray(gids.astype(np.int64))
-            K = len(gid_to_comp); group_op = ('d', gids); group_keys = [(gids, K, None)]
+            if not _hashed_done9:
+                gids = np.ascontiguousarray(gids.astype(np.int64))
+                K = len(gid_to_comp); group_op = ('d', gids); group_keys = [(gids, K, None)]
 
     # The codegen value path composes the composite group code INLINE (no comp array). The non-fused
     # plain / numpy / counts-only paths get a materialised group operand on demand via _group_op().
@@ -4059,7 +4101,13 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     # was a python loop over present groups calling fetch() per cell, which dominated high-card output.
     radices = [k['K'] for k in gkeys]
     kc_arr = []
-    if gkeys:
+    if gkeys and _gid_words9 is not None:
+        g0, g1, shifts9, words9, widths9 = _gid_words9
+        kc_arr = [None] * len(gkeys)
+        for j in range(len(gkeys)):
+            src9 = (g0 if words9[j] == 0 else g1)[present]
+            kc_arr[j] = (src9 >> int(shifts9[j])) & ((1 << widths9[j]) - 1)
+    elif gkeys:
         comp = (present.astype(np.int64, copy=True) if gid_to_comp is None
                 else np.asarray(gid_to_comp, dtype=np.int64)[present].copy())   # factorised id -> composite
         kc_arr = [None] * len(gkeys)
@@ -4139,7 +4187,10 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         if r[0] == 'key':
             gk = gkeys[r[1]]
             if 'labels' in gk:                            # affine/factorised key: gid -> value via label table
-                _lab = gk['labels']; col_lists.append([_lab[c] for c in kc_arr[r[1]].tolist()])
+                _labo = gk.get('_labels_obj')
+                if _labo is None:
+                    _labo = gk['_labels_obj'] = np.asarray(gk['labels'], dtype=object)
+                col_lists.append(_labo[kc_arr[r[1]]].tolist())     # C-speed gather, not a list comp
             else:
                 col_lists.append(_bulk_keyvals(gk['seg'], gk['pcol'], kc_arr[r[1]]))
         elif r[0] == 'count':
@@ -4150,6 +4201,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 unit = r[3]
                 col_lists.append([(wdb_sql._pyval(np.int64(v).view(f'datetime64[{unit}]')) if v is not None
                                    else None) for v in picked.tolist()])
+            elif picked.dtype.kind in 'iuf':
+                col_lists.append(picked.tolist())          # tolist() already yields Python scalars
             else:
                 col_lists.append([wdb_sql._pyval(v) for v in picked.tolist()])
     rows = list(zip(*col_lists)) if col_lists else [() for _ in present]
