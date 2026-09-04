@@ -640,3 +640,23 @@ docketed: ClickBench Q09 (1.1s, COUNT DISTINCT in a multi-aggregate),
 cq-notexists (5.3s code walk), Q7 margin, H2O q7 (0.83x). Suite
 1696/0 at every push. NEXT: hashed-composite organ; MEDIAN/STDDEV/CORR
 aggregates; the join realm (JOB / H2O joins).
+
+
+## THE CARDINALITY REALM, COMPLETE (2026-09-04, night): H2O groupby 10/10 exact
+THE HASHED COMPOSITE (composite key spaces past int64 pack by bit width
+into two words; open-addressing group ids at survivor scale; key words
+kept for emission) -- q10 50M groups exact, organ 2.4s. EMISSION AT C
+SPEED (dictionaries decode once per V, labels as object arrays, numeric
+cells skip _pyval) -- 57s -> 27.8s on 50M x 8 cells; lifted every high-
+cardinality query 50-70%. MOMENTS AS ALGEBRA (STDDEV/VARIANCE/CORR over
+hidden SUM/COUNT; q9 3.9x). THE ORDER-STATISTIC SIDE PASS (MEDIAN:
+counting scatter + per-group parallel sorts; q6 20.5s -> 1.85s). THE
+TOP-K-PER-GROUP DOOR (ROW_NUMBER OVER PARTITION/ORDER + rn<=k: scatter
+row indices, per-group sorts, gather; q8 exact, 1M rows). BOARD: q1
+7.4x, q2 7.8x, q3 4.3x, q4 2.5x, q5 5.0x, q9 3.9x, q10 ~1.6x (50M
+output rows; duck 49s incl. fetchall); faces under: q6 0.53, q7 0.96,
+q8 0.27 -- wars named (side-pass cost; sequential scatter + per-group
+allocations). WRONG=0 throughout; suite 1696/0 at every push. LAW
+HELD: probe first, dissolve before building, unknown shapes decline
+LOUDLY (never a crash, never a hang). NEXT: the join realm -- H2O
+joins (small/medium/big, the big-big 1:1 with no road), then JOB.
