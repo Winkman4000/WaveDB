@@ -926,17 +926,124 @@ def _left_count_frame(db, inner):
 
 
 
+_MOMENT9 = tuple(getattr(E, n) for n in ('Stddev', 'StddevSamp', 'StddevPop', 'Variance', 'VariancePop', 'Corr') if hasattr(E, n))
+
+
 def has_agg_arith(tree):
     """True when a projection combines aggregates with arithmetic (Q14's
-    Div-of-Sums, H2O q7's MAX-MIN): the single-table executor cannot plan it
-    and used to crash on a positional key fallback."""
+    Div-of-Sums, H2O q7's MAX-MIN) or uses a MOMENT aggregate (STDDEV,
+    VARIANCE, CORR -- algebra over hidden sums): the single-table executor
+    cannot plan these."""
     if not isinstance(tree, E.Select): return False
     _AGG = (E.Sum, E.Count, E.Avg, E.Min, E.Max)
     for p in tree.expressions:
         nd = p.this if isinstance(p, E.Alias) else p
+        if nd.find(*_MOMENT9) is not None: return True
+        if hasattr(E, 'Median') and nd.find(E.Median) is not None: return True
         if isinstance(nd, (E.Column, *_AGG)): continue
         if nd.find(*_AGG) is not None: return True
     return False
+
+
+def _moment_to_algebra(nd):
+    """STDDEV/VARIANCE/CORR as arithmetic over SUM/COUNT (sample forms, as
+    duck defaults): var_samp = (Sxx - Sx*Sx/n) / (n-1); corr = (n*Sxy - Sx*Sy)
+    / sqrt((n*Sxx - Sx^2) * (n*Syy - Sy^2)). Returns a rewritten node."""
+    def S(expr):  return E.Sum(this=expr.copy())
+    def N(expr):  return E.Count(this=expr.copy())
+    def mul(a, b): return E.Mul(this=a, expression=b)
+    def sub(a, b): return E.Sub(this=a, expression=b)
+    def div(a, b): return E.Div(this=a, expression=b)
+    def lit(x):   return E.Literal(this=str(x), is_string=False)
+    def sq(a):    return E.Mul(this=a.copy(), expression=a.copy())
+    t = type(nd).__name__
+    if t in ('Stddev', 'StddevSamp', 'Variance', 'StddevPop', 'VariancePop'):
+        x = nd.this
+        n = N(x); sx = S(x); sxx = S(sq(x))
+        denom = lit(1) if t.endswith('Pop') else sub(N(x), lit(1))
+        var = div(sub(sxx, div(mul(sx, sx.copy()), n)), (N(x) if t.endswith('Pop') else denom))
+        if t.startswith('Var'): return var
+        return E.Sqrt(this=var)
+    if t == 'Corr':
+        x, y = nd.this, nd.expression
+        n = N(x); sx = S(x); sy = S(y); sxy = S(mul(x.copy(), y.copy())); sxx = S(sq(x)); syy = S(sq(y))
+        num = sub(mul(n, sxy), mul(sx, sy))
+        dx = sub(mul(N(x), S(sq(x))), mul(S(x), S(x)))
+        dy = sub(mul(N(x), S(sq(y))), mul(S(y), S(y)))
+        return div(num, E.Sqrt(this=mul(dx, dy)))
+    return nd
+
+
+def _median_side(db, tree, med_nodes):
+    """THE ORDER-STATISTIC SIDE PASS: MEDIAN(col) per group for a single-table
+    GROUP BY -- composite group ids (mixed radix over key codes), ONE lexsort
+    of (gid, value), the middle of each run (mean of the two middles on even
+    counts, as duck's quantile_cont(0.5)). Returns {alias: {keytuple: median}}
+    keyed by the group columns' Python values, in GROUP BY order."""
+    frm = tree.args.get('from') or tree.args.get('from_')
+    if frm is None or not isinstance(frm.this, E.Table) or tree.args.get('joins'): return None
+    if tree.args.get('where') is not None: return None
+    grp = tree.args.get('group')
+    if grp is None: return None
+    gcols = list(grp.expressions)
+    if not all(isinstance(g, E.Column) for g in gcols): return None
+    tname = frm.this.name
+    try:
+        seg, _sp = _solo_segment(db, tname)
+    except _FastUnsupported:
+        return None
+    pm = db.cat.phys_map(tname)
+    n = int(seg.N)
+    comp = np.zeros(n, np.int64); K = 1
+    keyinfo = []
+    for g in gcols:
+        pc = pm.get(g.name, g.name)
+        c = seg.cols.get(pc, {})
+        if c.get('has_null') or c.get('mode') not in (0, 1, 2): return None
+        V = int(c['V'])
+        codes = np.asarray(seg.codes(pc)).astype(np.int64, copy=False)
+        if K * V > (1 << 62): return None
+        comp = comp * V + codes; K *= V
+        keyinfo.append((pc, V))
+    out = {}
+    for al, nd in med_nodes:
+        if not isinstance(nd.this, E.Column): return None
+        raw = wdb_sql.raw_dict_col(seg, pm.get(nd.this.name, nd.this.name))
+        if raw is None: return None
+        vals = raw[0][np.asarray(raw[1])].astype(np.float64, copy=False)
+        if K <= (1 << 24):
+            # THE COUNTING SCATTER: O(n) placement by group id, then each
+            # group's slice sorts in parallel -- no 50M-row lexsort.
+            cnt_all = np.bincount(comp, minlength=K)
+            present9 = np.flatnonzero(cnt_all)
+            offs0 = np.zeros(K + 1, np.int64); np.cumsum(cnt_all, out=offs0[1:])
+            cur = offs0[:-1].copy()
+            placed = np.empty(n, np.float64)
+            wdb_kernels.pscatter_by_gid(np.ascontiguousarray(comp), np.ascontiguousarray(vals), cur, placed)
+            starts = offs0[present9]; ends = offs0[present9 + 1]
+            med = np.empty(present9.size, np.float64)
+            wdb_kernels.pgroup_median(placed, starts, ends, med)
+            gcomp = present9
+        else:
+            order = np.lexsort((vals, comp))
+            cs = comp[order]; vs = vals[order]
+            starts = np.concatenate(([0], np.flatnonzero(np.diff(cs) != 0) + 1))
+            ends = np.concatenate((starts[1:], [n]))
+            cnt = ends - starts
+            lo = starts + (cnt - 1) // 2
+            hi = starts + cnt // 2
+            med = (vs[lo] + vs[hi]) / 2.0
+            gcomp = cs[starts]
+        # decode the composite back to key values, last key fastest
+        cols_v = [None] * len(keyinfo)
+        rem = gcomp.copy()
+        for j in range(len(keyinfo) - 1, -1, -1):
+            pc, V = keyinfo[j]
+            kc = rem % V; rem //= V
+            cols_v[j] = _bulk_keyvals(seg, pc, kc)
+        out[al] = {tuple(cols_v[j][i] for j in range(len(keyinfo))): float(med[i]) for i in range(len(gcomp))}
+    return out
+
 
 
 def _agg_expr_rewrite(db, tree):
@@ -952,7 +1059,9 @@ def _agg_expr_rewrite(db, tree):
     need = False
     for p in proj:
         nd = p.this if isinstance(p, E.Alias) else p
-        if not _plain(nd) and nd.find(*_AGG) is not None:
+        if nd.find(*_MOMENT9) is not None or (hasattr(E, 'Median') and nd.find(E.Median) is not None):
+            need = True
+        elif not _plain(nd) and nd.find(*_AGG) is not None:
             need = True
     if not need: return None
     if tree.args.get('order') is not None or tree.args.get('having') is not None: return None
@@ -973,9 +1082,22 @@ def _agg_expr_rewrite(db, tree):
     outer = []           # per projection: ('col', idx) | ('expr', ast)
     st = tree.copy()
     new_exprs = []
+    med_nodes = []       # (alias, Median node) served by the side pass
     for p in proj:
         nd = (p.this if isinstance(p, E.Alias) else p).copy()
-        if isinstance(nd, E.Column):
+        for md9 in list(nd.find_all(E.Median)) if hasattr(E, 'Median') else []:
+            al9 = '__med%d' % len(med_nodes)
+            med_nodes.append((al9, md9.copy()))
+            rep9 = E.Column(this=E.Identifier(this=al9, quoted=False))
+            if md9 is nd: nd = rep9
+            else: md9.replace(rep9)
+        for m9 in list(nd.find_all(*_MOMENT9)):
+            rep9 = _moment_to_algebra(m9)
+            if m9 is nd: nd = rep9
+            else: m9.replace(rep9)
+        if isinstance(nd, E.Column) and nd.name.startswith('__med'):
+            outer.append(('hid', nd.name))
+        elif isinstance(nd, E.Column):
             outer.append(('col', len(new_exprs))); new_exprs.append(nd.copy())
         elif isinstance(nd, _AGG):
             al = '__agg%d' % len(hidden); hidden.append((al, nd.copy()))
@@ -984,13 +1106,33 @@ def _agg_expr_rewrite(db, tree):
             outer.append(('expr', _hoist(nd)))
     for al, nd in hidden:
         new_exprs.append(E.Alias(this=nd, alias=E.Identifier(this=al, quoted=False)))
+    meds = None
+    if med_nodes:
+        meds = _median_side(db, tree, med_nodes)
+        if meds is None:
+            raise NotImplementedError('MEDIAN outside the single-table GROUP BY side pass')
+        gnames9 = [g.name for g in tree.args['group'].expressions]
+        for g9 in gnames9:
+            if not any((e.alias_or_name == g9) for e in new_exprs):
+                new_exprs.append(E.Column(this=E.Identifier(this=g9, quoted=False)))
     st.set('expressions', new_exprs)
     rows = join_query(db, st.sql(dialect='duckdb'))
     rows = rows[0] if isinstance(rows, tuple) else rows
     names = [e.alias_or_name for e in new_exprs]
+    if meds is not None:
+        gidx9 = [names.index(g9) for g9 in gnames9]
+        for al9, table9 in meds.items():
+            names.append(al9)
+            rows = [tuple(r) + (table9.get(tuple(r[j] for j in gidx9)),) for r in rows]
+    import math as _m9
     def ev(nd, rec):
         if isinstance(nd, E.Paren): return ev(nd.this, rec)
         if isinstance(nd, E.Column): return rec[names.index(nd.name)]
+        if isinstance(nd, E.Sqrt):
+            v = ev(nd.this, rec); return None if v is None or v < 0 else _m9.sqrt(v)
+        if isinstance(nd, E.Pow):
+            a = ev(nd.this, rec); b = ev(nd.expression, rec)
+            return None if a is None or b is None else a ** b
         if isinstance(nd, E.Literal): return float(nd.this) if not nd.is_string else nd.this
         if isinstance(nd, E.Neg): return -ev(nd.this, rec)
         if isinstance(nd, E.Mul): return ev(nd.this, rec) * ev(nd.expression, rec)

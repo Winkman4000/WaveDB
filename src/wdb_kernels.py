@@ -3467,3 +3467,31 @@ def pack2(codes, shifts, words, w0, w1):
             else:
                 b |= v
         w0[i] = a; w1[i] = b
+
+
+@njit(cache=True, nogil=True)
+def pscatter_by_gid(gid, vals, offs, out):
+    """Counting scatter: place each value into its group's slice (offs = start
+    per group, advanced in place). Sequential, O(n)."""
+    n = gid.shape[0]
+    for i in range(n):
+        g = gid[i]
+        out[offs[g]] = vals[i]
+        offs[g] += 1
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def pgroup_median(out_vals, starts, ends, med):
+    """Median per group over group-contiguous values: sort each slice
+    (groups in parallel), mean of the two middles on even counts."""
+    G = starts.shape[0]
+    for g in prange(G):
+        a = starts[g]; b = ends[g]
+        cnt = b - a
+        if cnt <= 0:
+            med[g] = np.nan
+            continue
+        sl = np.sort(out_vals[a:b])
+        lo = (cnt - 1) // 2
+        hi = cnt // 2
+        med[g] = (sl[lo] + sl[hi]) / 2.0
