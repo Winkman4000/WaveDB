@@ -2313,11 +2313,21 @@ def _bulk_keyvals(seg, pcol, codes):
     """Vectorised decode of an array of group-key dictionary codes -> list of python values. Group keys are
     value-identity (mode 0/2/5/6 -- mode-4 is gated out), so a single dict index replaces a per-row fetch()."""
     c = seg.cols[pcol]; dt = c['dt']
+    codes = np.asarray(codes)
+    nc = (c['V'] - 1) if c['has_null'] else None
+    if dt == 1 and not c['has_null']:
+        # THE DECODED-DICT SHELF: a V-scale object array of Python strings
+        # survives the per-query flush (the flush drops N-scale residue; a
+        # dictionary is the column's vocabulary) -- consult it BEFORE asking
+        # for the typed dict, or a 6.3M-string dict re-decodes every query
+        cache = getattr(seg, '_str_dict_cache', None)
+        if cache is not None:
+            tds = cache.get(pcol)
+            if tds is not None and len(tds) == int(c['V']):
+                return tds[codes].tolist()
     td = seg._typed_dict(pcol)
     if not isinstance(td, np.ndarray):
         td = np.array(td, dtype=object)
-    codes = np.asarray(codes)
-    nc = (c['V'] - 1) if c['has_null'] else None
     if len(td) == 0:                                  # all-null column -> every key is NULL
         return [None] * len(codes)
     safe = np.where(codes == nc, 0, codes) if nc is not None else codes   # null code -> dummy idx (fixed below)

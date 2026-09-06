@@ -609,11 +609,17 @@ class Segment:
         return out
 
     def prefix2_codes(self, nm):
-        """u16[N]: each row's first two bytes packed -- 2-byte reads at stream level."""
+        """u16[N]: each row's first two bytes packed -- 2-byte reads at stream
+        level, cached per column (3MB at 1.5M rows)."""
+        c = self.cols[nm]
+        got = c.get('_prefix2')
+        if got is not None:
+            return got
         import wdb_kernels as _WKl
         blob, off = self.inline_stream(nm)
         out = np.empty(self.N, dtype=np.uint16)
         _WKl.pprefix2(blob, np.ascontiguousarray(off, dtype=np.int64), out)
+        c['_prefix2'] = out
         return out
 
     def values_at_rows(self, nm, rows):
