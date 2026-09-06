@@ -660,3 +660,26 @@ allocations). WRONG=0 throughout; suite 1696/0 at every push. LAW
 HELD: probe first, dissolve before building, unknown shapes decline
 LOUDLY (never a crash, never a hang). NEXT: the join realm -- H2O
 joins (small/medium/big, the big-big 1:1 with no road), then JOB.
+
+
+## THE JOIN REALM (2026-09-05/06): H2O joins 8/8 exact
+New realm + board (bench/h2o_join.py: x 10M, small 10, medium 10K, big
+10M; five official SELECT-* joins + aggregate forms; FULL-ROW comparator
+-- x.id3 is not unique, and three 'wrongs' in this realm were the
+comparator, never the engine). THE ROAD JOIN: a row-emitting equi-join
+to a unique key is a POINTER, not a merge (_join_pointer keeps -1 for
+misses; INNER drops, LEFT emits NULLs; columns gather at rows / at the
+pointer; mode-aware reads) -- served j1..j5 INCLUDING the big-big 1:1
+(j5), which is just another road. The step-1 joiner accepts INNER/LEFT/
+RIGHT; the chain builder accepts explicit INNER ... ON (one gate hid a
+4-12x lead: a1 3.7x, a2 3.9x, a5 big-big aggregate 12.6x). THE DECODED-
+DICT SHELF consulted before the typed dict (the flush drops _tdict; a
+6.3M-string dict re-decoded per query: 4.0s -> 0.88s). Route trace:
+WDB_ROUTE_DEBUG. BOARD (clean morning): 5/5 SELECT-* exact at 0.58-
+0.72x (THE EMISSION WAR: 10M x 9-13 Python cells on both sides; floor
+~6-8s vs duck ~11.5); 3/3 aggregate forms winning. LAW HELD: A/B on the
+same pod before attribution -- a '63s regression' was host contention
+(load 25 on a shared box; duck stalled too); the committed source
+measured identically. NEXT: re-measure the join board on a quiet pod;
+the emission floor for SELECT-*; then JOB (junction-table joins --
+the first realm where the join truly fetches foreign data both ways).
