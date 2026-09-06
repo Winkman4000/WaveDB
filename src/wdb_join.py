@@ -1906,6 +1906,11 @@ def _from_door(db, tree):
 
 
 
+def _route9(name):
+    if os.environ.get('WDB_ROUTE_DEBUG'):
+        print('ROUTE: %s' % name, flush=True)
+
+
 def join_query(db, sql, columnar=False):
     import time as _t8
     _jq_t0 = _t8.perf_counter()
@@ -1915,6 +1920,7 @@ def join_query(db, sql, columnar=False):
     except _FastUnsupported:
         _ae9 = None
     if _ae9 is not None:
+        _route9('agg-arith')
         return _ae9
     _factor_or_rewrite(tree)
     _lonely_rewrite(db, tree)
@@ -1924,6 +1930,7 @@ def join_query(db, sql, columnar=False):
     except _FastUnsupported:
         door9 = None
     if door9 is not None:
+        _route9('from-door')
         return door9
     joins = tree.args.get('joins')
     import wdb_sql as _ws
@@ -1947,6 +1954,7 @@ def join_query(db, sql, columnar=False):
             chain = None
         if chain is not None:
             try:
+                _route9('fpa-stored')
                 return _fast_pointer_agg(db, tree1, chain, columnar)  # fully fused
             except _FastUnsupported:
                 chain = None   # stored-only chain's plan declined (e.g. Q5's tree
@@ -1954,6 +1962,7 @@ def join_query(db, sql, columnar=False):
     import wdb_fastjoin
     fj = wdb_fastjoin.try_execute(db, tree)      # dict-space: semi-joins, cell post-maps,
     if fj is not None:                           # streaming dumps
+        _route9('fastjoin')
         return fj
     if chain is None:
         try:
@@ -1968,8 +1977,10 @@ def join_query(db, sql, columnar=False):
             if __import__('os').environ.get('WDB_JOIN_BILL'):
                 print('JOIN BILL: pre-work(parse+chain)=%.0fms'
                       % ((_t8.perf_counter() - _jq_t0) * 1000), flush=True)
+            _route9('fpa-tree')
             return _fast_pointer_agg(db, tree, chain, columnar)  # hashed chain, fused agg
         except _FastUnsupported:
+            _route9('chain-pandas')
             return _chain_pandas(db, tree, chain)    # same chain, pandas agg/predicate tail
     if joins and len(joins) == 1 and not has_aggs:
         try:
@@ -1977,6 +1988,7 @@ def join_query(db, sql, columnar=False):
         except _FastUnsupported:
             _rj9 = None
         if _rj9 is not None:
+            _route9('road-join')
             return _rj9
     if not joins or len(joins) != 1:
         raise NotImplementedError("join: non-FK multi-join needs a hash join (not yet supported)")
@@ -2030,6 +2042,7 @@ def join_query(db, sql, columnar=False):
     rc = _materialize(db, rt, need_r)
     ldf = pd.DataFrame({f"{la}.{c}": lc[c] for c in lc})
     rdf = pd.DataFrame({f"{ra}.{c}": rc[c] for c in rc})
+    _route9('step1-merge')
     merged = ldf.merge(rdf, left_on=f"{la}.{lk}", right_on=f"{ra}.{rk}", how=_how9)
 
     R = lambda colnode: resolve(colnode.table, colnode.name)
@@ -4688,8 +4701,8 @@ def _build_chain(db, tree, allow_hash=True):
     tables = [(frm.name, frm.alias or frm.name)]
     for jn in (tree.args.get('joins') or []):
         if jn.args.get('side'): raise _FastUnsupported                           # INNER only
-        if jn.args.get('kind') and jn.args.get('kind') != 'CROSS':
-            raise _FastUnsupported                                               # comma-dialect rides as CROSS
+        if jn.args.get('kind') and str(jn.args.get('kind')).upper() not in ('CROSS', 'INNER'):
+            raise _FastUnsupported                                               # comma-dialect rides as CROSS; INNER ... ON is the same tree
         if jn.args.get('kind') == 'CROSS' and jn.args.get('on') is not None:
             raise _FastUnsupported
         if not isinstance(jn.this, E.Table): raise _FastUnsupported              # no subqueries
