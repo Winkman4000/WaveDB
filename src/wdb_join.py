@@ -9,7 +9,8 @@ Correctness first: verified against DuckDB. Unsupported shapes raise NotImplemen
 """
 import re
 import sqlglot, sqlglot.expressions as E
-import numpy as np, pandas as pd, os
+import numpy as np
+import time, pandas as pd, os
 from wdb_engine import Segment
 import wdb_sql
 import wdb_kernels, wdb_dml, wdb_agg, wdb_fkptr, wdb_exprjit, wdb_radix
@@ -1721,22 +1722,39 @@ def _road_join_emit(db, tree):
         cd = seg.cols.get(pc, {})
         if cd.get('mode') in (0, 1, 2) and cd.get('dt') == 1 and not cd.get('has_null'):
             return _bulk_keyvals(seg, pc, np.asarray(seg.codes_at(pc, rr)))   # dict strings: decode once per V
+        if cd.get('mode') == 5 and int(seg.N) <= 4_000_000 and rr.size > 4 * int(seg.N):
+            # SMALL MODE-5 SIDE READ MANY TIMES (a 10-row dim at 10M rows): decode
+            # the whole column ONCE to an object array and gather -- the inline
+            # slicer per row cost 3.9s here.
+            cache = getattr(seg, '_m5_obj_cache', None)
+            if cache is None:
+                cache = seg._m5_obj_cache = {}
+            arr = cache.get(pc)
+            if arr is None:
+                arr = np.array(list(seg.values_at_rows(pc, np.arange(int(seg.N), dtype=np.int64))), dtype=object)
+                cache[pc] = arr
+            return arr[rr].tolist()
         return list(seg.values_at_rows(pc, rr))
-    cols = []
-    for p in proj:
+    def one_col(p):
         nd = p.this if isinstance(p, E.Alias) else p
         if own(nd) == la:
-            cols.append(col_vals(lseg, lpm.get(nd.name, nd.name), rows))
-        else:
-            pc = rpm.get(nd.name, nd.name)
-            if miss is not None and miss.any():
-                safe = np.where(miss, 0, prow)
-                v = col_vals(rseg, pc, safe)
-                mi = miss.tolist()
-                cols.append([None if mi[i] else v[i] for i in range(len(v))])
-            else:
-                cols.append(col_vals(rseg, pc, prow))
+            return col_vals(lseg, lpm.get(nd.name, nd.name), rows)
+        pc = rpm.get(nd.name, nd.name)
+        if miss is not None and miss.any():
+            safe = np.where(miss, 0, prow)
+            v = col_vals(rseg, pc, safe)
+            mi = miss.tolist()
+            return [None if mi[i] else v[i] for i in range(len(v))]
+        return col_vals(rseg, pc, prow)
+    _bj = os.environ.get('WDB_JOIN_BILL')
+    cols = []
+    for p in proj:
+        _t0 = time.perf_counter() if _bj else 0.0
+        cols.append(one_col(p))                     # (threads measured: no gain -- GIL-bound materialisation)
+        if _bj: print('ROAD-JOIN col %s: %.0fms' % (wdb_sql._alias(p), (time.perf_counter() - _t0) * 1e3), flush=True)
+    _t0 = time.perf_counter() if _bj else 0.0
     rows_out = list(zip(*cols)) if cols else []
+    if _bj: print('ROAD-JOIN zip: %.0fms' % ((time.perf_counter() - _t0) * 1e3), flush=True)
     rows_out = wdb_sql._apply_order(rows_out, proj, tree.args.get('order'))
     lim = tree.args.get('limit')
     if lim is not None: rows_out = rows_out[:int(lim.expression.this)]
