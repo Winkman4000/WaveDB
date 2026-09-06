@@ -683,3 +683,25 @@ same pod before attribution -- a '63s regression' was host contention
 measured identically. NEXT: re-measure the join board on a quiet pod;
 the emission floor for SELECT-*; then JOB (junction-table joins --
 the first realm where the join truly fetches foreign data both ways).
+
+
+## THE JOIN REALM, SWEPT (2026-09-07): H2O joins 8/8 exact, 8/8 wins
+Wave 45.4s vs duck 69.2s. j1 1.42x, j2 1.53x, j3 LEFT 1.54x, j4 string
+key 1.45x, j5 big-big 1:1 1.54x; aggregate forms a1 4.5x, a2 4.2x, a5
+big-big 13.5x. Convictions: (1) the 63s 'regression' was HALF mine --
+host contention stalled duck too, but beneath it the chain's new INNER
+acceptance let SELECT-* joins pass the lazy chain, get declined by fpa,
+and fall to the pandas tail with the road-join door below: THE ROAD
+JOIN NOW RUNS BEFORE THE LAZY CHAIN (63.5s -> 11.5s). (2) The decoded-
+dict shelf delivered its isolated bill once routing stopped hiding it.
+(3) A ten-row dim's mode-5 column sliced per row 10M times (3.9s):
+SMALL MODE-5 SIDES DECODE ONCE AND GATHER (138ms); j1 11.8 -> 7.9s.
+(4) Parallel column reads measured, no gain (GIL-bound) -- removed;
+per-column bill under WDB_JOIN_BILL. The honest floor: ~3.4s of zip
+building 10M Python tuples, the cost duck pays in its own fetchall.
+BOARD OF BOARDS: TPC-H 14/14 (13 wins) | Megaboard 103/103 |
+ClickBench 42/43, false=0 | H2O groupby 10/10 (7 wins) | H2O joins 8/8
+(8 wins) | suite 1696/0 at every push. FIVE REALMS, ZERO LIES. NEXT
+SESSION: plan from here -- candidates: JOB (junction-table joins; the
+real hash-join question), the groupby wars (q6 side pass, q8 window
+scatter), old speed wars (ClickBench Q09, cq-notexists), Q7 margin.
