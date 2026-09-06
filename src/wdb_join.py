@@ -1643,6 +1643,107 @@ def _window_topk_door(db, tree):
 
 
 
+def _join_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
+    """A child->parent pointer that KEEPS -1 for unmatched child rows (the
+    road refuses them; INNER drops them, LEFT emits NULLs). Cached per
+    process on the child segment."""
+    cache = getattr(cseg, '_jptr_cache', None)
+    if cache is None:
+        cache = cseg._jptr_cache = {}
+    k = (ckey, ptbl, pkey)
+    got = cache.get(k)
+    if got is not None:
+        return got
+    import pandas as pd
+    pk = np.asarray(wdb_sql._col(pseg, pkey)[0])
+    ck = np.asarray(wdb_sql._col(cseg, ckey)[0])
+    if pk.dtype.kind in 'OSU' or ck.dtype.kind in 'OSU':
+        pk = pk.astype(object); ck = ck.astype(object)
+    pidx = pd.Index(pk)
+    if not pidx.is_unique: raise _FastUnsupported                 # many-to-many -> not a pointer
+    ptr = np.ascontiguousarray(pidx.get_indexer(ck), dtype=np.int64)
+    cache[k] = ptr
+    return ptr
+
+
+def _road_join_emit(db, tree):
+    """THE ROAD JOIN (H2O joins): a row-emitting two-table equi-join whose
+    right key is unique is a POINTER, not a merge -- the child's columns
+    gather at its rows, the parent's at the pointer. INNER drops -1 rows;
+    LEFT keeps them and emits NULLs for the parent side. Returns
+    (rows, names) or None (not this shape)."""
+    if not isinstance(tree, E.Select): return None
+    joins = tree.args.get('joins') or []
+    if len(joins) != 1 or tree.args.get('group') is not None or tree.args.get('where') is not None: return None
+    if tree.args.get('having') is not None: return None
+    jn = joins[0]
+    side = (jn.args.get('side') or '').upper(); kind = (jn.args.get('kind') or '').upper()
+    if kind not in ('', 'INNER') or side not in ('', 'LEFT'): return None
+    frm = tree.args.get('from') or tree.args.get('from_')
+    if frm is None or not isinstance(frm.this, E.Table) or not isinstance(jn.this, E.Table): return None
+    lt, la = frm.this.name, (frm.this.alias or frm.this.name)
+    rt, ra = jn.this.name, (jn.this.alias or jn.this.name)
+    on = jn.args.get('on')
+    if not (isinstance(on, E.EQ) and isinstance(on.this, E.Column) and isinstance(on.expression, E.Column)): return None
+    lcols = set(db.cat.column_names(lt)); rcols = set(db.cat.column_names(rt))
+    def own(c):
+        if c.table: return c.table
+        if c.name in lcols and c.name not in rcols: return la
+        if c.name in rcols and c.name not in lcols: return ra
+        return None
+    a, b = on.this, on.expression
+    if own(a) == ra: a, b = b, a
+    if own(a) != la or own(b) != ra: return None
+    proj = list(tree.expressions)
+    for p in proj:
+        nd = p.this if isinstance(p, E.Alias) else p
+        if not isinstance(nd, E.Column) or own(nd) not in (la, ra): return None
+    try:
+        if not _key_is_unique(db, rt, b.name): return None
+        lseg, _l = _solo_segment(db, lt); rseg, _r = _solo_segment(db, rt)
+    except _FastUnsupported:
+        return None
+    lpm = db.cat.phys_map(lt); rpm = db.cat.phys_map(rt)
+    ptr = _join_pointer(db, lt, lpm.get(a.name, a.name), lseg, rt, rpm.get(b.name, b.name), rseg)
+    n = int(lseg.N)
+    if side == 'LEFT':
+        rows = np.arange(n, dtype=np.int64); prow = ptr
+        miss = prow < 0
+    else:
+        rows = np.flatnonzero(ptr >= 0); prow = ptr[rows]; miss = None
+    def col_vals(seg, pc, rr):
+        # MODE-AWARE point reads: plain dict numerics ride base[codes_at]
+        # (cached base), everything else the general values_at_rows --
+        # a float column mis-read through the key-decoder shipped j1 wrong.
+        raw = wdb_sql.raw_dict_col(seg, pc, want_codes=False)
+        if raw is not None:
+            return raw[0][np.asarray(seg.codes_at(pc, rr))].tolist()
+        cd = seg.cols.get(pc, {})
+        if cd.get('mode') in (0, 1, 2) and cd.get('dt') == 1 and not cd.get('has_null'):
+            return _bulk_keyvals(seg, pc, np.asarray(seg.codes_at(pc, rr)))   # dict strings: decode once per V
+        return list(seg.values_at_rows(pc, rr))
+    cols = []
+    for p in proj:
+        nd = p.this if isinstance(p, E.Alias) else p
+        if own(nd) == la:
+            cols.append(col_vals(lseg, lpm.get(nd.name, nd.name), rows))
+        else:
+            pc = rpm.get(nd.name, nd.name)
+            if miss is not None and miss.any():
+                safe = np.where(miss, 0, prow)
+                v = col_vals(rseg, pc, safe)
+                mi = miss.tolist()
+                cols.append([None if mi[i] else v[i] for i in range(len(v))])
+            else:
+                cols.append(col_vals(rseg, pc, prow))
+    rows_out = list(zip(*cols)) if cols else []
+    rows_out = wdb_sql._apply_order(rows_out, proj, tree.args.get('order'))
+    lim = tree.args.get('limit')
+    if lim is not None: rows_out = rows_out[:int(lim.expression.this)]
+    return rows_out, [wdb_sql._alias(p) for p in proj]
+
+
+
 def _from_door(db, tree):
     """THE FROM DOOR (Q7/Q13/Q22): FROM (SELECT ...) alias -- run the INNER
     through the engine (it rides every fast path: trees, cascades, courts),
@@ -1870,11 +1971,20 @@ def join_query(db, sql, columnar=False):
             return _fast_pointer_agg(db, tree, chain, columnar)  # hashed chain, fused agg
         except _FastUnsupported:
             return _chain_pandas(db, tree, chain)    # same chain, pandas agg/predicate tail
+    if joins and len(joins) == 1 and not has_aggs:
+        try:
+            _rj9 = _road_join_emit(db, tree)
+        except _FastUnsupported:
+            _rj9 = None
+        if _rj9 is not None:
+            return _rj9
     if not joins or len(joins) != 1:
         raise NotImplementedError("join: non-FK multi-join needs a hash join (not yet supported)")
     jn = joins[0]
-    if (jn.args.get('side') or jn.args.get('kind')):
-        raise NotImplementedError("join: only INNER JOIN supported (step 1)")
+    _side9 = (jn.args.get('side') or '').upper(); _kind9 = (jn.args.get('kind') or '').upper()
+    if _kind9 not in ('', 'INNER') or _side9 not in ('', 'LEFT', 'RIGHT'):
+        raise NotImplementedError("join: only INNER/LEFT/RIGHT equi-joins (step 1)")
+    _how9 = {'': 'inner', 'LEFT': 'left', 'RIGHT': 'right'}[_side9]
     frm = tree.find(E.From).this
     lt, la = frm.name, (frm.alias or frm.name)
     rt, ra = jn.this.name, (jn.this.alias or jn.this.name)
@@ -1920,7 +2030,7 @@ def join_query(db, sql, columnar=False):
     rc = _materialize(db, rt, need_r)
     ldf = pd.DataFrame({f"{la}.{c}": lc[c] for c in lc})
     rdf = pd.DataFrame({f"{ra}.{c}": rc[c] for c in rc})
-    merged = ldf.merge(rdf, left_on=f"{la}.{lk}", right_on=f"{ra}.{rk}", how='inner')
+    merged = ldf.merge(rdf, left_on=f"{la}.{lk}", right_on=f"{ra}.{rk}", how=_how9)
 
     R = lambda colnode: resolve(colnode.table, colnode.name)
     where = tree.args.get('where')
