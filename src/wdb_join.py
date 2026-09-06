@@ -1959,6 +1959,17 @@ def join_query(db, sql, columnar=False):
             except _FastUnsupported:
                 chain = None   # stored-only chain's plan declined (e.g. Q5's tree
                                # needs hash edges): release it so the retry rebuilds
+    if joins and len(joins) == 1 and not has_aggs:
+        # THE ROAD JOIN goes BEFORE the lazy chain: a row-emitting equi-join
+        # the chain accepts (INNER ... ON) would otherwise land in the pandas
+        # tail (j1: 20s -> 63s the day INNER was accepted).
+        try:
+            _rj9 = _road_join_emit(db, tree)
+        except _FastUnsupported:
+            _rj9 = None
+        if _rj9 is not None:
+            _route9('road-join')
+            return _rj9
     import wdb_fastjoin
     fj = wdb_fastjoin.try_execute(db, tree)      # dict-space: semi-joins, cell post-maps,
     if fj is not None:                           # streaming dumps
@@ -1982,14 +1993,6 @@ def join_query(db, sql, columnar=False):
         except _FastUnsupported:
             _route9('chain-pandas')
             return _chain_pandas(db, tree, chain)    # same chain, pandas agg/predicate tail
-    if joins and len(joins) == 1 and not has_aggs:
-        try:
-            _rj9 = _road_join_emit(db, tree)
-        except _FastUnsupported:
-            _rj9 = None
-        if _rj9 is not None:
-            _route9('road-join')
-            return _rj9
     if not joins or len(joins) != 1:
         raise NotImplementedError("join: non-FK multi-join needs a hash join (not yet supported)")
     jn = joins[0]
