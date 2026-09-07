@@ -51,7 +51,7 @@ Q = [
  ('agg', 'median', "SELECT id4, MEDIAN(v3) FROM x GROUP BY id4"),
  ('agg', 'quantile', "SELECT QUANTILE_CONT(v3, 0.9) FROM x"),
  ('agg', 'mode', "SELECT MODE(id4) FROM x"),
- ('agg', 'string_agg', "SELECT id1, STRING_AGG(DISTINCT id4, ',') FROM x GROUP BY id1"),
+ ('agg', 'string_agg', "SELECT id1, STRING_AGG(DISTINCT id4, ',' ORDER BY id4) FROM x GROUP BY id1"),
  ('agg', 'bool_and', "SELECT BOOL_AND(b), BOOL_OR(b) FROM x"),
  ('agg', 'any_value', "SELECT id1, ANY_VALUE(v1) FROM x GROUP BY id1"),
  ('agg', 'filter_clause', "SELECT COUNT(*) FILTER (WHERE v1 > 3) FROM x"),

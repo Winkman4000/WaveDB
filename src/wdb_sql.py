@@ -995,6 +995,15 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
                 if len(_dx) != 1 or not isinstance(_dx[0], E.Column):
                     raise NotImplementedError("COUNT(DISTINCT) over expression/multiple columns")
                 rowout.append(int(groupdistinct(_dx[0].name, gi)))
+            elif kind is not None and kind[0] == 'ROWAGG':
+                # per-group row aggregate: the group's rows are order[gstarts:gends]
+                _rk9 = ('ROWAGG', kind[1].sql())
+                if _rk9 not in aggcache:
+                    aggcache[_rk9] = (None, None)
+                _rows9 = np.flatnonzero(mask) if mask is not None else np.arange(seg.N)
+                _sel9 = _rows9[order[gstarts[gi]:gends[gi]]]
+                _m9 = np.zeros(seg.N, bool); _m9[_sel9] = True
+                rowout.append(_rowagg_eval(seg, kind[1], _m9, seg_col))
             elif kind is None:
                 _inn2 = p.this if isinstance(p, E.Alias) else p
                 if isinstance(_inn2, E.AggFunc) or _inn2.find(E.AggFunc) is not None:
@@ -1053,7 +1062,109 @@ def _alias(p):
     return p.sql()
 def _is_agg(p):
     return p.find(E.AggFunc) is not None
+_ROWAGG_TYPES = tuple(getattr(E, n) for n in ('PercentileCont', 'PercentileDisc', 'Quantile', 'Mode', 'LogicalAnd', 'LogicalOr',
+                                               'GroupConcat', 'AnyValue', 'Filter', 'IgnoreNulls', 'Median') if hasattr(E, n))
+
+
+def _is_rowagg(inner):
+    """The ROW-AGGREGATE family: evaluated over each group's rows in Python/numpy --
+    QUANTILE/MEDIAN, MODE, BOOL_AND/OR, STRING_AGG, ANY_VALUE, FILTER (WHERE),
+    and SUM/COUNT over DISTINCT or over an expression."""
+    if isinstance(inner, _ROWAGG_TYPES): return True
+    if isinstance(inner, (E.Sum, E.Count, E.Avg, E.Min, E.Max)) and isinstance(inner.this, E.Distinct): return True
+    if isinstance(inner, E.Count) and inner.this is not None and not isinstance(inner.this, (E.Star, E.Column)): return True
+    return False
+
+
+def _rowagg_eval(seg, inner, rows_mask, seg_col):
+    """Evaluate a row-aggregate over the rows selected by rows_mask (bool[N] or None)."""
+    def ev(node): return _eval_rows(seg, node, rows_mask, seg_col)
+    def clean(a):
+        a = np.asarray(a, dtype=object) if not isinstance(a, np.ndarray) else a
+        if a.dtype == object:
+            keep = np.array([v is not None and not (isinstance(v, float) and np.isnan(v)) for v in a])
+            return a[keep]
+        return a[~np.isnan(a)] if a.dtype.kind == 'f' else a
+    t = type(inner).__name__
+    if t == 'IgnoreNulls': return _rowagg_eval(seg, inner.this, rows_mask, seg_col)
+    if t == 'Filter':
+        cond = np.asarray(ev(inner.expression.this), dtype=bool)
+        m2 = rows_mask.copy() if rows_mask is not None else np.ones(seg.N, bool)
+        m2[np.flatnonzero(m2)] = cond
+        inner2 = inner.this
+        if _is_rowagg(inner2): return _rowagg_eval(seg, inner2, m2, seg_col)
+        if isinstance(inner2, E.Count) and (inner2.this is None or isinstance(inner2.this, E.Star)): return int(m2.sum())
+        a = clean(ev(inner2.this))
+        if isinstance(inner2, E.Count): return int(a.shape[0])
+        if a.shape[0] == 0: return None
+        a = a.astype(np.float64)
+        return _pyval({'Sum': a.sum(), 'Avg': a.mean(), 'Min': a.min(), 'Max': a.max()}[type(inner2).__name__])
+    if t in ('PercentileCont', 'Quantile', 'Median', 'PercentileDisc'):
+        a = clean(ev(inner.this)).astype(np.float64)
+        if a.shape[0] == 0: return None
+        q = float(inner.expression.this) if t != 'Median' else 0.5
+        return float(np.quantile(a, q, method='linear' if t != 'PercentileDisc' else 'inverted_cdf'))
+    if t == 'Mode':
+        a = clean(ev(inner.this))
+        if a.shape[0] == 0: return None
+        u, c = np.unique(a.astype(str) if a.dtype == object else a, return_counts=True)
+        best = u[np.argmax(c)]
+        if a.dtype == object:
+            for v in a:
+                if str(v) == best: return _pyval(v)
+        return _pyval(best)
+    if t in ('LogicalAnd', 'LogicalOr'):
+        a = clean(ev(inner.this))
+        if a.shape[0] == 0: return None
+        b = np.asarray([bool(v) for v in a])
+        return bool(b.all()) if t == 'LogicalAnd' else bool(b.any())
+    if t == 'AnyValue':
+        a = clean(ev(inner.this))
+        return _pyval(a[0]) if a.shape[0] else None
+    if t == 'GroupConcat':
+        arg = inner.this; order9 = None
+        if isinstance(arg, E.Order):                       # STRING_AGG(x, sep ORDER BY k [DESC])
+            order9 = list(arg.expressions); arg = arg.this
+        distinct = isinstance(arg, E.Distinct)
+        node = arg.expressions[0] if distinct else arg
+        sep = str(inner.args['separator'].this) if inner.args.get('separator') is not None else ','
+        a = ev(node)
+        a = np.asarray(a, dtype=object) if not isinstance(a, np.ndarray) else a
+        keep = np.array([v is not None and not (isinstance(v, float) and np.isnan(v)) for v in a]) if a.dtype == object else ~np.isnan(a) if a.dtype.kind == 'f' else np.ones(a.shape[0], bool)
+        idx = np.flatnonzero(keep)
+        if order9 is not None:
+            keys9 = []
+            for o in reversed(order9):
+                k = np.asarray(ev(o.this), dtype=object)[idx]
+                kn = np.array([float(v) if not isinstance(v, (bytes, str)) else 0.0 for v in k]) if all(not isinstance(v, (bytes, str)) for v in k) else np.array([str(v) for v in k])
+                keys9.append(kn)
+            ordr = np.lexsort(tuple(keys9)) if keys9 else np.arange(idx.size)
+            if order9 and order9[-1].args.get('desc') and len(order9) == 1: ordr = ordr[::-1]
+            idx = idx[ordr]
+        vals = [(_pyval(v) if not isinstance(v, str) else v) for v in a[idx]]
+        vals = [str(v) for v in vals]
+        if distinct:
+            seen = set(); out = []
+            for v in vals:
+                if v not in seen: seen.add(v); out.append(v)
+            vals = out
+        return sep.join(vals) if vals else None
+    if isinstance(inner, (E.Sum, E.Count, E.Avg, E.Min, E.Max)):
+        arg = inner.this; distinct = isinstance(arg, E.Distinct)
+        node = arg.expressions[0] if distinct else arg
+        a = clean(ev(node))
+        if distinct:
+            a = np.unique(a.astype(str)) if a.dtype == object else np.unique(a)
+        if isinstance(inner, E.Count): return int(a.shape[0])
+        if a.shape[0] == 0: return None
+        a = a.astype(np.float64)
+        return _pyval({'Sum': a.sum(), 'Avg': a.mean(), 'Min': a.min(), 'Max': a.max()}[type(inner).__name__])
+    raise NotImplementedError('row aggregate %s' % t)
+
+
 def _agg_kind(p):
+    _in9 = p.this if isinstance(p, E.Alias) else p
+    if _is_rowagg(_in9): return ('ROWAGG', _in9)
     inner = p.this if isinstance(p,E.Alias) else p
     if isinstance(inner, E.Count):
         if isinstance(inner.this, E.Star) or inner.this is None: return ('COUNT_STAR',)
@@ -1255,6 +1366,8 @@ def _agg_scalar(seg, p, mask, seg_col):
         if c['has_null']: codes = codes[codes != (c['V'] - 1)]   # COUNT(DISTINCT) ignores NULL
         return int(np.unique(codes).size)
     kind=_agg_kind(p)
+    if kind is not None and kind[0] == 'ROWAGG':
+        return _rowagg_eval(seg, kind[1], mask, seg_col)
     if kind is None:
         # NEVER a crash: an aggregate or window the planner cannot name declines by name
         _inn9 = p.this if isinstance(p, E.Alias) else p

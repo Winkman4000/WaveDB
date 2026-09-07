@@ -937,8 +937,11 @@ def has_agg_arith(tree):
     cannot plan these."""
     if not isinstance(tree, E.Select): return False
     _AGG = (E.Sum, E.Count, E.Avg, E.Min, E.Max)
+    _ROW9 = tuple(getattr(E, n) for n in ('Filter', 'GroupConcat', 'AnyValue', 'IgnoreNulls', 'Mode', 'LogicalAnd', 'LogicalOr',
+                                          'PercentileCont', 'PercentileDisc', 'Quantile') if hasattr(E, n))
     for p in tree.expressions:
         nd = p.this if isinstance(p, E.Alias) else p
+        if isinstance(nd, _ROW9): continue                    # the row-aggregate family: the single-table path owns it
         if nd.find(*_MOMENT9) is not None: return True
         if hasattr(E, 'Median') and nd.find(E.Median) is not None: return True
         if isinstance(nd, (E.Column, *_AGG)): continue
