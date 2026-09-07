@@ -484,7 +484,7 @@ def _group_key(node, proj=None, _resolve_pos=True, node_sink=None):
     if _resolve_pos and proj and isinstance(g, E.Literal) and g.is_int:
         pos = int(g.this)
         if 1 <= pos <= len(proj):
-            return _group_key(proj[pos-1], proj, _resolve_pos=False)
+            return _group_key(proj[pos-1], proj, _resolve_pos=False, node_sink=node_sink)   # keep the sink: GROUP BY 1 over a CASE
     nm = _colname(g)
     if nm is not None and proj is not None:
         for p in proj:                                  # bare name matching a SELECT alias -> its expr
@@ -1127,6 +1127,10 @@ def _agg_scalar(seg, p, mask, seg_col):
         if c['has_null']: codes = codes[codes != (c['V'] - 1)]   # COUNT(DISTINCT) ignores NULL
         return int(np.unique(codes).size)
     kind=_agg_kind(p)
+    if kind is None:
+        # NEVER a crash: an aggregate or window the planner cannot name declines by name
+        _inn9 = p.this if isinstance(p, E.Alias) else p
+        raise NotImplementedError('unsupported aggregate/window: %s' % _inn9.sql()[:70])
     if kind[0]=='COUNT_STAR': return int(mask.sum()) if mask is not None else seg.N
     fn,cn=kind
     if isinstance(cn, tuple) and cn[0] == 'sfn':              # FN(length(col)) etc., no GROUP BY

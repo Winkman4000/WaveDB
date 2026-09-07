@@ -1047,6 +1047,19 @@ def _median_side(db, tree, med_nodes):
 
 
 
+def has_expr_group(tree):
+    """A GROUP BY key that is arithmetic over one column (id4 % 7): the join
+    engine's dict-space expression key serves it; the single-table planner
+    declines."""
+    if not isinstance(tree, E.Select): return False
+    g = tree.args.get('group')
+    if g is None: return False
+    for k in g.expressions:
+        if isinstance(k, (E.Mod, E.Div, E.Mul, E.Add, E.Sub, E.IntDiv)) and len(list(k.find_all(E.Column))) == 1:
+            return True
+    return False
+
+
 def _agg_expr_rewrite(db, tree):
     """AGGREGATE ARITHMETIC (Q14's Div-of-Sums): a projection combining
     aggregates with +-*/ and literals runs as hidden aggregate aliases
@@ -2078,6 +2091,8 @@ def join_query(db, sql, columnar=False):
     # which side of the ON belongs to which table
     a2t = {la: lt, ra: rt}
     le, re = on.this, on.expression
+    if not (isinstance(le, E.Column) and isinstance(re, E.Column)):
+        raise NotImplementedError("join: ON sides must be plain columns (expression in ON: %s)" % on.sql()[:60])
     if a2t.get(le.table) == lt and a2t.get(re.table) == rt:
         lk, rk = le.name, re.name
     elif a2t.get(le.table) == rt and a2t.get(re.table) == lt:
@@ -3749,10 +3764,10 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             # codes -- O(V), never O(N) (Q7's l_shipdate/365 folds ~2500 days
             # into 7 years at dict scale).
             cols9g = list(g.find_all(E.Column))
-            if len(cols9g) != 1: return None
+            if len(cols9g) != 1: raise _FastUnsupported            # declines RAISE (a None from fpa is 'no answer')
             gseg, gpcol, gcptr = resolve(cols9g[0])
             rawx = wdb_sql.raw_dict_col(gseg, gpcol, want_codes=False)
-            if rawx is None: return None
+            if rawx is None: raise _FastUnsupported
             def _dx9(nd, bv):
                 if isinstance(nd, E.Paren): return _dx9(nd.this, bv)
                 if isinstance(nd, E.Column): return bv
@@ -3764,11 +3779,12 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 if isinstance(nd, E.Div): return _dx9(nd.this, bv) / _dx9(nd.expression, bv)
                 if isinstance(nd, E.Add): return _dx9(nd.this, bv) + _dx9(nd.expression, bv)
                 if isinstance(nd, E.Sub): return _dx9(nd.this, bv) - _dx9(nd.expression, bv)
+                if isinstance(nd, E.Mod): return np.mod(_dx9(nd.this, bv), _dx9(nd.expression, bv))
+                if isinstance(nd, E.IntDiv): return np.floor_divide(_dx9(nd.this, bv), _dx9(nd.expression, bv))
                 raise _FastUnsupported
-            try:
-                dv9 = _dx9(g, np.asarray(rawx[0], dtype=np.float64))
-            except _FastUnsupported:
-                return None
+            dv9 = _dx9(g, np.asarray(rawx[0], dtype=np.float64))
+            if gseg.cols[gpcol].get('dt') == 0 and (dv9 == np.floor(dv9)).all():
+                dv9 = dv9.astype(np.int64)             # integer keys stay integers (labels emit as ints)
             u9x, inv9x = np.unique(dv9, return_inverse=True)
             inv9x = np.ascontiguousarray(inv9x, dtype=np.int64)
             if gcptr is None and rows9 is not None:
