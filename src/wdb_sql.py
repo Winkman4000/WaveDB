@@ -391,6 +391,25 @@ def _to_rows(v, nrows):
     a = np.empty(nrows, dtype=object); a[:] = v; return a
 
 
+def _expr_is_int(nd, seg, seg_col):
+    """True iff the expression is integer-typed end to end (int columns, int
+    literals, + - * % //, CASE over such) -- duck types SUM of it as BIGINT."""
+    if isinstance(nd, E.Paren): return _expr_is_int(nd.this, seg, seg_col)
+    if isinstance(nd, E.Literal): return (not nd.is_string) and ('.' not in str(nd.this))
+    if isinstance(nd, E.Column):
+        try: return seg.cols[seg_col(nd.name)].get('dt') == 0
+        except Exception: return False
+    if isinstance(nd, E.Case):
+        br = [b.args['true'] for b in nd.args.get('ifs', [])]
+        if nd.args.get('default') is not None: br.append(nd.args['default'])
+        return bool(br) and all(_expr_is_int(b, seg, seg_col) for b in br)
+    if type(nd) in (E.Add, E.Sub, E.Mul, E.Mod, E.IntDiv):
+        return _expr_is_int(nd.this, seg, seg_col) and _expr_is_int(nd.expression, seg, seg_col)
+    if isinstance(nd, E.Neg): return _expr_is_int(nd.this, seg, seg_col)
+    if isinstance(nd, E.Abs): return _expr_is_int(nd.this, seg, seg_col)
+    return False
+
+
 def _eval_rows(seg, node, mask, resolve=None):
     """Vectorised PER-ROW evaluation of a scalar expression over the (masked) rows -> numpy array of
     length = #selected rows. Used for genuine derived group keys that aren't a simple function of one
@@ -409,8 +428,12 @@ def _eval_rows(seg, node, mask, resolve=None):
             vals = np.empty(len(uc), dtype=object)
             for i, code in enumerate(uc):
                 v = seg.fetch(c, int(code))
-                vals[i] = v if isinstance(v, (bytes, bytearray)) else (b'' if v is None else str(v).encode())
-            return vals[inv]
+                if col.get('aux') == 9:                       # THE BOOL MARKER: a real bool, never bytes
+                    vals[i] = v if isinstance(v, bool) else (v == b'True')
+                else:
+                    vals[i] = v if isinstance(v, (bytes, bytearray)) else (b'' if v is None else str(v).encode())
+            out = vals[inv]
+            return out.astype(bool) if col.get('aux') == 9 else out
         v = np.asarray(seg.values(c)); return v[mask] if mask is not None else v
     if isinstance(n, E.Literal):
         return n.this.encode() if n.is_string else _literal_value(n)
@@ -436,6 +459,96 @@ def _eval_rows(seg, node, mask, resolve=None):
             then = _to_rows(_eval_rows(seg, iff.args.get('true'), mask, resolve), nrows)
             acc = np.where(cond, then, acc)
         return acc
+    # ---- THE FUNCTION VOCABULARY (scope stage, 2026-09-08): numeric, null, string, boolean
+    def ev(x): return _eval_rows(seg, x, mask, resolve)
+    def num(a):                                   # object arrays with None -> float with NaN
+        a = np.asarray(a)
+        if a.dtype == object:
+            return np.array([np.nan if v is None else float(v) for v in a], dtype=np.float64)
+        return a
+    def strs(a):                                  # bytes/None -> str/None object array
+        a = np.asarray(a, dtype=object) if not isinstance(a, np.ndarray) else a
+        return np.array([(v.decode('utf-8', 'replace') if isinstance(v, (bytes, bytearray)) else v) for v in a], dtype=object)
+    def rebytes(a):
+        return np.array([(v.encode() if isinstance(v, str) else v) for v in a], dtype=object)
+    if isinstance(n, E.Boolean): return bool(n.this)
+    if isinstance(n, E.Div):
+        l, r = num(ev(n.this)), num(ev(n.expression))
+        with np.errstate(divide='ignore', invalid='ignore'):
+            out = np.true_divide(l, r)
+        return np.where(r == 0, np.nan, out) if np.ndim(r) else (np.full_like(out, np.nan) if r == 0 else out)
+    if isinstance(n, E.Mod): return np.mod(num(ev(n.this)), num(ev(n.expression)))
+    if isinstance(n, E.IntDiv): return np.floor_divide(num(ev(n.this)), num(ev(n.expression)))
+    if isinstance(n, E.Round):
+        d = int(n.args['decimals'].this) if n.args.get('decimals') is not None else 0
+        return np.round(num(ev(n.this)), d)
+    if isinstance(n, E.Floor): return np.floor(num(ev(n.this)))
+    if isinstance(n, E.Ceil): return np.ceil(num(ev(n.this)))
+    if isinstance(n, E.Abs): return np.abs(num(ev(n.this)))
+    if isinstance(n, E.Sqrt): return np.sqrt(num(ev(n.this)))
+    if isinstance(n, E.Ln): return np.log(num(ev(n.this)))
+    if isinstance(n, E.Log):
+        if n.expression is not None: return np.log(num(ev(n.expression))) / np.log(num(ev(n.this)))
+        return np.log10(num(ev(n.this)))
+    if isinstance(n, E.Pow): return np.power(num(ev(n.this)), num(ev(n.expression)))
+    if isinstance(n, E.Coalesce):
+        parts = [n.this] + list(n.args.get('expressions') or [])
+        acc = None
+        nrows = int(np.count_nonzero(mask)) if mask is not None else seg.N
+        for p in parts:
+            v = _to_rows(ev(p), nrows)
+            vo = np.asarray(v, dtype=object)
+            if acc is None: acc = vo.copy()
+            else:
+                isn = np.array([x is None or (isinstance(x, float) and np.isnan(x)) for x in acc])
+                acc = np.where(isn, vo, acc)
+        return acc
+    if isinstance(n, E.Nullif):
+        a = ev(n.this); b = ev(n.expression)
+        ao = np.asarray(a, dtype=object); eq = np.asarray(a) == b
+        return np.where(eq, None, ao)
+    if isinstance(n, E.Length): return np.array([None if v is None else len(v) for v in strs(ev(n.this))], dtype=object)
+    if isinstance(n, E.Upper): return rebytes(np.array([None if v is None else v.upper() for v in strs(ev(n.this))], dtype=object))
+    if isinstance(n, E.Lower): return rebytes(np.array([None if v is None else v.lower() for v in strs(ev(n.this))], dtype=object))
+    if isinstance(n, E.Substring):
+        st = int(n.args['start'].this); ln = int(n.args['length'].this) if n.args.get('length') is not None else None
+        return rebytes(np.array([None if v is None else (v[st-1:] if ln is None else v[st-1:st-1+ln]) for v in strs(ev(n.this))], dtype=object))
+    if type(n).__name__ == 'Replace':
+        old_, new_ = str(n.expression.this), str(n.args['replacement'].this)
+        return rebytes(np.array([None if v is None else v.replace(old_, new_) for v in strs(ev(n.this))], dtype=object))
+    if isinstance(n, (E.DPipe, E.Concat)):
+        parts = [n.this, n.expression] if isinstance(n, E.DPipe) else list(n.expressions)
+        nrows = int(np.count_nonzero(mask)) if mask is not None else seg.N
+        cols = [strs(_to_rows(ev(p), nrows)) for p in parts]
+        return rebytes(np.array([None if any(c[i] is None for c in cols) else ''.join(str(c[i]) for c in cols) for i in range(nrows)], dtype=object))
+    if isinstance(n, (E.Like, E.ILike)):
+        import re as _re
+        pat = str(n.expression.this); rx = '^' + _re.escape(pat).replace('%', '.*').replace('_', '.') + '$'
+        flags = _re.I if isinstance(n, E.ILike) else 0
+        cre = _re.compile(rx, flags)
+        out = np.array([False if v is None else bool(cre.match(v)) for v in strs(ev(n.this))])
+        return ~out if n.args.get('negate') else out
+    if isinstance(n, E.RegexpLike):
+        import re as _re
+        cre = _re.compile(str(n.expression.this))
+        return np.array([False if v is None else bool(cre.search(v)) for v in strs(ev(n.this))])
+    if isinstance(n, E.Is):
+        v = np.asarray(ev(n.this), dtype=object)
+        isn = np.array([x is None or (isinstance(x, float) and np.isnan(x)) for x in v])
+        return isn if isinstance(n.expression, E.Null) else (v == bool(n.expression.this))
+    if isinstance(n, E.In) and n.args.get('query') is None:
+        v = np.asarray(ev(n.this), dtype=object)
+        lits = set(ev(x) for x in n.expressions)
+        out = np.array([x in lits for x in v])
+        return out
+    if isinstance(n, E.Between):
+        v = num(ev(n.this)); return (v >= num(ev(n.args['low']))) & (v <= num(ev(n.args['high'])))
+    if isinstance(n, E.Cast):
+        v = ev(n.this); t = n.to.sql().upper()
+        if any(k in t for k in ('INT', 'BIGINT')): return np.array([None if x is None else int(float(x)) for x in np.asarray(v, dtype=object)], dtype=object)
+        if any(k in t for k in ('DOUBLE', 'FLOAT', 'REAL', 'DECIMAL', 'NUMERIC')): return num(v)
+        if 'CHAR' in t or 'TEXT' in t or 'STRING' in t: return rebytes(np.array([None if x is None else str(x) for x in np.asarray(v, dtype=object)], dtype=object))
+        raise TypeError('cast to %s' % t)
     raise TypeError(f"_eval_rows: unsupported node {type(n).__name__}")
 
 
@@ -794,9 +907,22 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
     aggcache={}
     def groupagg(colname, fn, gi):
         is_sfn = isinstance(colname, tuple) and colname[0] == 'sfn'
-        ckey = colname if not is_sfn else colname            # tuple is hashable -> fine as cache key
+        is_rx = isinstance(colname, tuple) and colname[0] == 'rowexpr'
+        ckey = colname if not is_rx else ('rowexpr', colname[1].sql())
         if ckey not in aggcache:
-            if is_sfn:                                        # AVG/SUM/... over length(col) etc.
+            if is_rx:                                         # FN(<row expression>) per group
+                try:
+                    _rv = _eval_rows(seg, colname[1], mask, seg_col)
+                except TypeError as _te:
+                    raise NotImplementedError('aggregate over expression: %s' % str(_te)[:60])
+                _rv = np.asarray(_rv, dtype=object) if not isinstance(_rv, np.ndarray) else _rv
+                if _rv.dtype == object:
+                    nm = np.array([v is None or (isinstance(v, float) and np.isnan(v)) for v in _rv])
+                    arr = np.array([0.0 if x else float(v) for x, v in zip(nm, _rv)], dtype=np.float64)
+                else:
+                    nm = np.isnan(_rv) if _rv.dtype.kind == 'f' else None
+                    arr = _rv
+            elif is_sfn:                                      # AVG/SUM/... over length(col) etc.
                 arr, nm = _sfn_array(seg, colname[1], seg_col(colname[2]), mask, colname[3] if len(colname) > 3 else None)
             else:
                 pcol = seg_col(colname)
@@ -938,6 +1064,8 @@ def _agg_kind(p):
             if cn is not None: return (nm, cn)
             sf = _scalar_fn(inner.this)               # FN(length(col)) -> carry the sfn spec
             if sf is not None: return (nm, sf)         # (FN, ('sfn', fname, colname))
+            if inner.this is not None and not isinstance(inner.this, E.Star) and inner.this.find(E.Column) is not None:
+                return (nm, ('rowexpr', inner.this))   # FN(<any row expression>) -> evaluated per row
             return (nm, None)
     return None  # not an aggregate -> group key
 def _count_topk_plan(proj, agg_specs, tree):
@@ -1133,6 +1261,26 @@ def _agg_scalar(seg, p, mask, seg_col):
         raise NotImplementedError('unsupported aggregate/window: %s' % _inn9.sql()[:70])
     if kind[0]=='COUNT_STAR': return int(mask.sum()) if mask is not None else seg.N
     fn,cn=kind
+    if isinstance(cn, tuple) and cn[0] == 'rowexpr':          # FN(<row expression>), no GROUP BY
+        try:
+            arr = _eval_rows(seg, cn[1], mask, seg_col)
+        except TypeError as _te:
+            raise NotImplementedError('aggregate over expression: %s' % str(_te)[:60])
+        arr = np.asarray(arr, dtype=object) if not isinstance(arr, np.ndarray) else arr
+        if arr.dtype == object:
+            keep = np.array([v is not None and not (isinstance(v, float) and np.isnan(v)) for v in arr])
+            arr = arr[keep]
+        else:
+            keep = ~np.isnan(arr) if arr.dtype.kind == 'f' else np.ones(arr.shape[0], bool)
+            arr = arr[keep]
+        if fn == 'COUNT': return int(arr.shape[0])
+        if arr.shape[0] == 0: return None
+        arr = arr.astype(np.float64) if arr.dtype == object else arr
+        if fn in ('MIN', 'MAX'): return _pyval(arr.min() if fn == 'MIN' else arr.max())
+        _r9 = _pyval(_sum_avg(arr, fn))
+        if fn == 'SUM' and _r9 is not None and _expr_is_int(cn[1], seg, seg_col):
+            _r9 = int(round(_r9))                             # INTEGER EMISSION: an integer-TYPED expression sums to an int
+        return _r9
     if isinstance(cn, tuple) and cn[0] == 'sfn':              # FN(length(col)) etc., no GROUP BY
         arr, nm = _sfn_array(seg, cn[1], seg_col(cn[2]), mask, cn[3] if len(cn) > 3 else None)
         if nm is not None: arr = arr[~nm]
@@ -1392,6 +1540,23 @@ def _dict_eq_mask(seg, name, neg, lit):
 
 
 def _eval_pred(seg, node, seg_col):
+    """Predicate over all rows -> bool[N]. The core handles the dict-space forms;
+    anything it declines by name falls back to per-row evaluation."""
+    try:
+        return _eval_pred_core(seg, node, seg_col)
+    except NotImplementedError as _ne:
+        if node.find(E.Select) is not None: raise
+        try:
+            out = _eval_rows(seg, node, None, seg_col)
+        except TypeError:
+            raise _ne
+        out = np.asarray(out)
+        if out.dtype != bool:
+            out = np.array([bool(v) if v is not None else False for v in out], dtype=bool)
+        return out
+
+
+def _eval_pred_core(seg, node, seg_col):
     if isinstance(node, E.And): return _eval_pred(seg,node.this,seg_col) & _eval_pred(seg,node.expression,seg_col)
     if isinstance(node, E.Or):  return _eval_pred(seg,node.this,seg_col) | _eval_pred(seg,node.expression,seg_col)
     if isinstance(node, E.Not): return ~_eval_pred(seg,node.this,seg_col)
