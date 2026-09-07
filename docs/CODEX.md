@@ -705,3 +705,35 @@ ClickBench 42/43, false=0 | H2O groupby 10/10 (7 wins) | H2O joins 8/8
 SESSION: plan from here -- candidates: JOB (junction-table joins; the
 real hash-join question), the groupby wars (q6 side pass, q8 window
 scatter), old speed wars (ClickBench Q09, cq-notexists), Q7 margin.
+
+
+## THE SCOPE STAGE (2026-09-07/08): 100/100 SQL constructs exact
+bench/sql_scope.py: 100 constructs vs duck on a 200K realm with nulls,
+booleans, dates -- classified OK / WRONG / HOLE (loud) / CRASH. Sunday
+morning: OK=51 HOLE=31 CRASH=13 WRONG=4. Monday night: OK=100. THE
+WRONGS (four, the class that matters): QUALIFY and DISTINCT ON were
+silently IGNORED (now rewrites into the top-k door); booleans emitted as
+strings (THE BOOL MARKER, aux=9, decoded at the typed dict and the point
+read); integer sums as floats (INTEGER EMISSION in one post-pass, TYPE-
+based: FLOOR sums to a double, an integer expression to a BIGINT). THE
+CRASHES (13): the single-table planner declines BY NAME anything it
+cannot classify. THE FAMILIES: expressions (the row evaluator learned
+the function vocabulary; aggregate arguments and predicates fall back
+to it), windows (THE WINDOW DOOR: one lexsort by (partition, order),
+every function as arithmetic over the sorted order; QUALIFY evaluated
+over its own output), joins (the step-1 joiner general: USING, multi-
+column ON, computed keys, one-sided extras filter their side BEFORE
+the merge, CROSS/non-equi bounded, FULL OUTER with extras = INNER under
+every conjunct + both sides unmatched), aggregates (THE ROW-AGGREGATE
+family over per-group slices: QUANTILE/MODE/BOOL_AND/STRING_AGG/
+ANY_VALUE/FILTER/DISTINCT-and-expression args), subqueries (the
+correlated-scalar decorrelation accepts arithmetic around the
+aggregate; ANY/ALL, SELECT-list scalars and nested-aggregation CTEs are
+re-entries BEFORE routing), literal relations (wdb_literal.py on
+sqlglot's executor, gated by the LIVE catalog -- the suite caught the
+first gate). LAWS HELD: rewrites re-enter before routing or the router
+chooses from the old text; a decline is a raise, never a None; LAG and
+STRING_AGG on tied keys are legally ambiguous -- the probe orders
+deterministically. Honest note: the new families are correctness
+faces (row evaluator, pandas joiner); the dict-space transform is the
+speed home when a board asks. Suite 1696/0 at every push.
