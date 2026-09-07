@@ -56,6 +56,35 @@ def _prewarm_worker(task):
         seg._codes.clear()          # workers are transient build vessels; unbounded per-process code
     return built, nb, round(time.perf_counter() - t0, 2)          # caches OOM cgroup-limited boxes
 
+def _int_emission(ctx, res):
+    """INTEGER EMISSION for the single-table doors (the join engine's law):
+    SUM over an integer column emits an integer. Every door that accumulates
+    in float64 gets typed here, once, instead of each emitter separately."""
+    try:
+        import sqlglot.expressions as E
+        tree = ctx.tree
+        rows = res[0] if isinstance(res, tuple) else res
+        if not rows or not isinstance(rows, list): return res
+        idx = []
+        for i, p in enumerate(tree.expressions):
+            nd = p.this if isinstance(p, E.Alias) else p
+            if isinstance(nd, E.Sum) and isinstance(nd.this, E.Column):
+                pc = (ctx.cmap or {}).get(nd.this.name, nd.this.name)
+                if ctx.seg.cols.get(pc, {}).get('dt') == 0 and not ctx.seg.cols[pc].get('has_null'):
+                    idx.append(i)
+        if not idx or len(rows[0]) != len(tree.expressions): return res
+        out = []
+        for r in rows:
+            r = list(r)
+            for i in idx:
+                v = r[i]
+                if isinstance(v, float) and v == int(v): r[i] = int(v)
+            out.append(tuple(r))
+        return (out, res[1]) if isinstance(res, tuple) else out
+    except Exception:
+        return res
+
+
 class Database:
     def __init__(self, catalog):
         self.cat = catalog
@@ -316,6 +345,9 @@ class Database:
                 if _rw is None:                                  # column -> single-table cube read; else gather
                     return wdb_join.join_query(self, sql)
                 sql = _rw; tree = _parse_sql_cached(_rw)         # fall through to the single-table path
+            _rw9 = wdb_join.qualify_rewrite(tree) or wdb_join.distinct_on_rewrite(tree)
+            if _rw9 is not None:
+                return self._run_impl(_rw9, escalate)      # QUALIFY / DISTINCT ON -> the top-k door's shape
             frm9 = tree.args.get('from') or tree.args.get('from_')
             if frm9 is not None and frm9.this.__class__.__name__ == 'Subquery':
                 return wdb_join.join_query(self, sql)     # THE FROM DOOR lives there
@@ -353,7 +385,7 @@ class Database:
                 controller._SERVED[0] = None
                 wdb_ledger.reset_stages()
                 _t0 = _time.perf_counter()
-                _res = controller.route_single_segment(ctx)
+                _res = _int_emission(ctx, controller.route_single_segment(ctx))
                 _ms = (_time.perf_counter() - _t0) * 1000
                 _rows = _res[0] if isinstance(_res, tuple) else _res
                 wdb_ledger.log(ctx.seg, sql, controller._SERVED[0] or '?', _ms,

@@ -42,6 +42,8 @@ def _encode_column(col):
     dtype = 0 if k in 'iu' else (2 if k == 'f' else (3 if k == 'M' else 1))
     N = len(data)
     codes = np.empty(N, dtype=np.int64); aux = 0
+    if k == 'b' or (k == 'O' and N and all(isinstance(v, (bool, np.bool_)) for v in data[:64] if v is not None)):
+        aux = 9                                              # THE BOOL MARKER: dt1 strings 'False'/'True' decode to Python bools
     if dtype == 3:
         aux = _unit_code(np.datetime_data(data.dtype)[0])   # remember the time unit
         iv = data.view('int64')                              # time IS an int64 count

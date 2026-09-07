@@ -894,7 +894,16 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
                     elif fn=='SUM': rowout.append(int(sums[gi]) if is_int else _pyval(sums[gi]))
                     else: rowout.append(_pyval(float(sums[gi])/c))   # AVG always float
             else:
-                fn,cn=kind; rowout.append(_pyval(groupagg(cn, fn, gi)))
+                fn,cn=kind; _gv9 = groupagg(cn, fn, gi)
+                if fn == 'SUM' and cn is not None and _gv9 is not None:
+                    # INTEGER EMISSION (the join engine's law, here too): SUM over an
+                    # integer column is an integer -- 5964.0 vs 5964 was 'wrong'
+                    try:
+                        if seg.cols[seg_col(cn)].get('dt') == 0 and float(_gv9) == float(int(round(float(_gv9)))):
+                            _gv9 = int(round(float(_gv9)))
+                    except Exception:
+                        pass
+                rowout.append(_pyval(_gv9))
         rows.append(tuple(rowout))
 
     # ---- HAVING ----

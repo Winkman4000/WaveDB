@@ -1585,7 +1585,7 @@ def _window_topk_door(db, tree):
     if order is None or len(order.expressions) != 1 or not isinstance(order.expressions[0].this, E.Column): return None
     ocol = order.expressions[0].this.name; desc = bool(order.expressions[0].args.get('desc'))
     ow = tree.args.get('where')
-    if ow is None or tree.args.get('group') or tree.args.get('order') or tree.args.get('limit'): return None
+    if ow is None or tree.args.get('group'): return None
     cj = ow.this
     if isinstance(cj, E.Paren): cj = cj.this
     if not (isinstance(cj, (E.LTE, E.LT, E.EQ)) and isinstance(cj.this, E.Column) and cj.this.name == walias
@@ -1640,7 +1640,11 @@ def _window_topk_door(db, tree):
         pc = pm.get(nm, nm)
         cols.append(list(seg.values_at_rows(pc, sel)) if seg.cols.get(pc, {}).get('mode') == 5
                     else _bulk_keyvals(seg, pc, np.asarray(seg.codes_at(pc, sel))))
-    return [tuple(col[i] for col in cols) for i in range(sel.size)]
+    out9 = [tuple(col[i] for col in cols) for i in range(sel.size)]
+    out9 = wdb_sql._apply_order(out9, list(tree.expressions), tree.args.get('order'))   # outer ORDER BY (DISTINCT ON)
+    lim9 = tree.args.get('limit')
+    if lim9 is not None: out9 = out9[:int(lim9.expression.this)]
+    return out9
 
 
 
@@ -1759,6 +1763,53 @@ def _road_join_emit(db, tree):
     lim = tree.args.get('limit')
     if lim is not None: rows_out = rows_out[:int(lim.expression.this)]
     return rows_out, [wdb_sql._alias(p) for p in proj]
+
+
+
+def qualify_rewrite(tree):
+    """QUALIFY <window> <cmp> <lit>  ->  SELECT cols FROM (SELECT cols, <window>
+    AS __q FROM ...) t WHERE __q <cmp> <lit>: the top-k-per-group door's shape.
+    Returns SQL or None. (The clause was silently IGNORED before, 2026-09-08.)"""
+    q = tree.args.get('qualify')
+    if q is None: return None
+    cond = q.this
+    if isinstance(cond, E.Paren): cond = cond.this
+    if not (type(cond) in (E.EQ, E.LTE, E.LT) and isinstance(cond.this, E.Window)
+            and isinstance(cond.expression, E.Literal)):
+        raise NotImplementedError('QUALIFY beyond <window> <=|<|= <literal>')
+    inner = tree.copy(); inner.set('qualify', None)
+    inner.set('order', None); inner.set('limit', None)
+    inner.set('expressions', list(inner.expressions) + [E.Alias(this=cond.this.copy(), alias=E.Identifier(this='__q', quoted=False))])
+    names = [p.alias_or_name for p in tree.expressions]
+    outer_cols = ', '.join(names)
+    op = {E.EQ: '=', E.LTE: '<=', E.LT: '<'}[type(cond)]
+    tail = ''
+    if tree.args.get('order') is not None: tail += ' ' + tree.args['order'].sql(dialect='duckdb')
+    if tree.args.get('limit') is not None: tail += ' ' + tree.args['limit'].sql(dialect='duckdb')
+    return 'SELECT %s FROM (%s) t WHERE __q %s %s%s' % (outer_cols, inner.sql(dialect='duckdb'), op, cond.expression.sql(), tail)
+
+
+def distinct_on_rewrite(tree):
+    """DISTINCT ON (k...) cols ORDER BY k..., rest  ->  ROW_NUMBER() OVER
+    (PARTITION BY k ORDER BY rest) = 1 through the top-k-per-group door.
+    Returns SQL or None. (The clause was silently IGNORED before.)"""
+    d = tree.args.get('distinct')
+    if d is None or d.args.get('on') is None: return None
+    on = d.args['on']
+    keys = list(on.expressions) if isinstance(on, E.Tuple) else [on]
+    if not all(isinstance(k, E.Column) for k in keys): raise NotImplementedError('DISTINCT ON non-column keys')
+    order = tree.args.get('order')
+    if order is None: raise NotImplementedError('DISTINCT ON without ORDER BY (arbitrary pick)')
+    knames = [k.name for k in keys]
+    rest = [o for o in order.expressions if not (isinstance(o.this, E.Column) and o.this.name in knames)]
+    if not rest: raise NotImplementedError('DISTINCT ON needs an ORDER BY beyond its keys')
+    win = 'ROW_NUMBER() OVER (PARTITION BY %s ORDER BY %s)' % (', '.join(knames), ', '.join(o.sql(dialect='duckdb') for o in rest))
+    inner = tree.copy(); inner.set('distinct', None); inner.set('order', None); inner.set('limit', None)
+    inner.set('expressions', list(inner.expressions) + [sqlglot.parse_one('SELECT %s AS __q' % win, read='duckdb').expressions[0]])
+    names = [p.alias_or_name for p in tree.expressions]
+    tail = ' ' + order.sql(dialect='duckdb')
+    if tree.args.get('limit') is not None: tail += ' ' + tree.args['limit'].sql(dialect='duckdb')
+    return 'SELECT %s FROM (%s) t WHERE __q = 1%s' % (', '.join(names), inner.sql(dialect='duckdb'), tail)
 
 
 

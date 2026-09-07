@@ -1440,6 +1440,8 @@ class Segment:
         if c['dt'] == 0: return [int(v) for v in c['vals']]
         if c['dt'] == 2: return np.frombuffer(b''.join(c['vals']), dtype='<f8')   # vectorized + memoized
         if c['dt'] == 3: return [struct.unpack('<q', v)[0] for v in c['vals']]   # int64 epoch
+        if c.get('aux') == 9 and c['dt'] == 1:               # THE BOOL MARKER: decode to Python bools at the source
+            return [(v == b'True') for v in self.dict_vals(nm)]
         return self.dict_vals(nm)  # bytes
     def unit(self, nm):
         return _DT_UNITS[self.cols[nm]['aux']]
@@ -1483,6 +1485,12 @@ class Segment:
             return np.array(dvals, dtype=np.int64)[codes].view(f'datetime64[{unit}]')
         return np.array(dvals, dtype=object)[codes]
     def fetch(self, nm, code):
+        v9 = self._fetch_raw(nm, code)
+        if isinstance(v9, (bytes, bytearray)) and self.cols[nm].get('aux') == 9 and self.cols[nm]['dt'] == 1:
+            return v9 == b'True'                                  # THE BOOL MARKER at the point read
+        return v9
+
+    def _fetch_raw(self, nm, code):
         """Random-access the dictionary value for a given code. O(1) for plain columns,
         O(R) for front-coded columns (jump to restart block, walk <=R deltas).
         Synthetic codes (>= V) resolve to override values."""
