@@ -1071,6 +1071,7 @@ def _agg_expr_rewrite(db, tree):
     def _plain(nd):
         return isinstance(nd, _AGG) or isinstance(nd, E.Column)
     need = False
+    if tree.find(E.Window) is not None: return None       # windows own their aggregates
     for p in proj:
         nd = p.this if isinstance(p, E.Alias) else p
         if nd.find(*_MOMENT9) is not None or (hasattr(E, 'Median') and nd.find(E.Median) is not None):
@@ -1826,6 +1827,174 @@ def distinct_on_rewrite(tree):
 
 
 
+def _window_door(db, tree):
+    """THE WINDOW DOOR: single-table SELECT with window projections. Survivors,
+    composite partition ids, ONE lexsort by (partition, order), boundaries,
+    then each function as vectorised arithmetic over the sorted order:
+    ROW_NUMBER, RANK, DENSE_RANK, NTILE, LAG/LEAD, FIRST_VALUE, and
+    SUM/COUNT/AVG/MIN/MAX OVER (partition totals, or running when ORDER BY).
+    Returns (rows, names) or None (not this shape)."""
+    if not isinstance(tree, E.Select): return None
+    if tree.args.get('group') is not None or tree.args.get('joins') or tree.args.get('having') is not None: return None
+    frm = tree.args.get('from') or tree.args.get('from_')
+    if frm is None or not isinstance(frm.this, E.Table): return None
+    proj = list(tree.expressions)
+    wins = [(i, p) for i, p in enumerate(proj) if isinstance(p, E.Alias) and isinstance(p.this, E.Window)]
+    if not wins: return None
+    for p in proj:
+        nd = p.this if isinstance(p, E.Alias) else p
+        if not isinstance(nd, (E.Column, E.Window)): return None
+    tname = frm.this.name
+    try:
+        seg, _sp = _solo_segment(db, tname)
+    except _FastUnsupported:
+        return None
+    pm = db.cat.phys_map(tname)
+    n = int(seg.N)
+    w = tree.args.get('where')
+    if w is not None:
+        m = wdb_sql._eval_pred(seg, w.this, lambda nm: pm.get(nm, nm))
+        rows = np.flatnonzero(np.asarray(m, dtype=bool))
+    else:
+        rows = np.arange(n, dtype=np.int64)
+    R = rows.size
+    def col_at(nm, rr):
+        pc = pm.get(nm, nm)
+        raw = wdb_sql.raw_dict_col(seg, pc, want_codes=False)
+        if raw is not None:
+            return raw[0][np.asarray(seg.codes_at(pc, rr))]
+        return np.asarray(_bulk_keyvals(seg, pc, np.asarray(seg.codes_at(pc, rr))), dtype=object)
+    def sort_key(node, rr):
+        """numeric sort key for an order expression (strings by dict code)."""
+        if not isinstance(node, E.Column): raise _FastUnsupported
+        pc = pm.get(node.name, node.name)
+        cd = seg.cols.get(pc, {})
+        if cd.get('dt') == 1:
+            return np.asarray(seg.codes_at(pc, rr)).astype(np.float64)      # sorted dict: code order = value order
+        raw = wdb_sql.raw_dict_col(seg, pc, want_codes=False)
+        if raw is None: raise _FastUnsupported
+        return raw[0][np.asarray(seg.codes_at(pc, rr))].astype(np.float64)
+    out_cols = {}
+    for i, p in wins:
+        win = p.this; fn = win.this
+        part = list(win.args.get('partition_by') or [])
+        order = win.args.get('order')
+        ords = list(order.expressions) if order is not None else []
+        # partition ids
+        if part:
+            gid = np.zeros(R, np.int64); K = 1
+            for c in part:
+                if not isinstance(c, E.Column): raise _FastUnsupported
+                pc = pm.get(c.name, c.name); cd = seg.cols.get(pc, {})
+                V = int(cd.get('V') or 1)
+                codes = np.asarray(seg.codes_at(pc, rows)).astype(np.int64)
+                if K * V > (1 << 62): raise _FastUnsupported
+                gid = gid * V + codes; K *= V
+            _u, gid = np.unique(gid, return_inverse=True)
+        else:
+            gid = np.zeros(R, np.int64)
+        keys = [gid]
+        for o in ords:
+            k = sort_key(o.this, rows)
+            keys.append(-k if o.args.get('desc') else k)
+        order_idx = np.lexsort(tuple(reversed(keys)))          # primary = gid, then order keys
+        g_sorted = gid[order_idx]
+        starts = np.concatenate(([0], np.flatnonzero(np.diff(g_sorted) != 0) + 1))
+        seg_id = np.cumsum(np.concatenate(([0], (np.diff(g_sorted) != 0).astype(np.int64))))   # partition index per sorted pos
+        pos_in = np.arange(R) - starts[seg_id]                  # 0-based position within partition
+        sizes = np.diff(np.concatenate((starts, [R])))
+        fname = type(fn).__name__
+        val = None
+        if fname == 'RowNumber':
+            val = pos_in + 1
+        elif fname in ('Rank', 'DenseRank'):
+            if not ords: raise _FastUnsupported
+            ok = np.stack([keys[j + 1][order_idx] for j in range(len(ords))], axis=1)
+            new = np.ones(R, bool)
+            new[1:] = (g_sorted[1:] != g_sorted[:-1]) | np.any(ok[1:] != ok[:-1], axis=1)
+            if fname == 'DenseRank':
+                dr = np.cumsum(new) - 1
+                val = dr - (np.cumsum(new) - 1)[starts][seg_id] + 1
+            else:
+                idx_new = np.where(new, np.arange(R), 0)
+                last_new = np.maximum.accumulate(idx_new)
+                val = last_new - starts[seg_id] + 1
+        elif fname == 'Ntile':
+            nb = int(fn.this.this)
+            sz = sizes[seg_id]; base = sz // nb; rem = sz % nb
+            # first `rem` buckets get base+1 rows
+            cut = rem * (base + 1)
+            val = np.where(pos_in < cut, pos_in // np.maximum(base + 1, 1) + 1,
+                           rem + (pos_in - cut) // np.maximum(base, 1) + 1)
+        elif fname in ('Lag', 'Lead'):
+            col = fn.this
+            off = int(fn.args['offset'].this) if fn.args.get('offset') is not None else 1
+            if not isinstance(col, E.Column): raise _FastUnsupported
+            vals = col_at(col.name, rows[order_idx])
+            shifted = np.empty(R, dtype=object)
+            if fname == 'Lag':
+                src = np.arange(R) - off; okm = pos_in >= off
+            else:
+                src = np.arange(R) + off; okm = pos_in + off < sizes[seg_id]
+            src = np.clip(src, 0, R - 1)
+            picked = np.asarray(vals, dtype=object)[src]
+            val = np.where(okm, picked, None)
+        elif fname == 'FirstValue':
+            col = fn.this
+            if not isinstance(col, E.Column): raise _FastUnsupported
+            vals = np.asarray(col_at(col.name, rows[order_idx]), dtype=object)
+            val = vals[starts[seg_id]]
+        elif fname in ('Sum', 'Count', 'Avg', 'Min', 'Max'):
+            arg = fn.this
+            if fname == 'Count' and (arg is None or isinstance(arg, E.Star)):
+                x = np.ones(R, np.float64)
+            else:
+                if not isinstance(arg, E.Column): raise _FastUnsupported
+                x = np.asarray(col_at(arg.name, rows[order_idx]), dtype=np.float64)
+            if ords:                                            # running (ROWS UNBOUNDED PRECEDING)
+                cs = np.cumsum(x); base = np.concatenate(([0.0], cs))[starts][seg_id]
+                run = cs - base
+                if fname in ('Sum', 'Count'): val = run
+                elif fname == 'Avg': val = run / (pos_in + 1)
+                else:
+                    acc = np.minimum.accumulate if fname == 'Min' else np.maximum.accumulate
+                    val = np.empty(R); 
+                    for gi9 in range(starts.size):
+                        a9 = starts[gi9]; b9 = a9 + sizes[gi9]; val[a9:b9] = acc(x[a9:b9])
+            else:                                               # partition totals
+                tot = np.add.reduceat(x, starts)
+                if fname in ('Sum', 'Count'): val = tot[seg_id]
+                elif fname == 'Avg': val = (tot / sizes)[seg_id]
+                else:
+                    red = np.minimum.reduceat if fname == 'Min' else np.maximum.reduceat
+                    val = red(x, starts)[seg_id]
+            if fname == 'Count' or (fname == 'Sum' and arg is not None and isinstance(arg, E.Column)
+                                    and seg.cols.get(pm.get(arg.name, arg.name), {}).get('dt') == 0):
+                val = np.asarray(val).astype(np.int64)
+        else:
+            raise NotImplementedError('window function %s' % fname)
+        # back to survivor order
+        inv = np.empty(R, np.int64); inv[order_idx] = np.arange(R)
+        out_cols[i] = np.asarray(val, dtype=object)[inv] if not isinstance(val, np.ndarray) or val.dtype == object else val[inv]
+    cols = []
+    for i, p in enumerate(proj):
+        if i in out_cols:
+            v = out_cols[i]
+            cols.append(v.tolist() if v.dtype != object else [x for x in v])
+        else:
+            nd = p.this if isinstance(p, E.Alias) else p
+            cols.append(list(_bulk_keyvals(seg, pm.get(nd.name, nd.name), np.asarray(seg.codes_at(pm.get(nd.name, nd.name), rows))))
+                        if seg.cols.get(pm.get(nd.name, nd.name), {}).get('mode') != 5
+                        else list(seg.values_at_rows(pm.get(nd.name, nd.name), rows)))
+    out = list(zip(*cols)) if cols else []
+    out = [tuple(int(x) if isinstance(x, (np.integer,)) else (float(x) if isinstance(x, np.floating) else x) for x in r) for r in out]
+    out = wdb_sql._apply_order(out, proj, tree.args.get('order'))
+    lim = tree.args.get('limit')
+    if lim is not None: out = out[:int(lim.expression.this)]
+    return out, [wdb_sql._alias(p) for p in proj]
+
+
+
 def _from_door(db, tree):
     """THE FROM DOOR (Q7/Q13/Q22): FROM (SELECT ...) alias -- run the INNER
     through the engine (it rides every fast path: trees, cascades, courts),
@@ -1997,6 +2166,15 @@ def join_query(db, sql, columnar=False):
     import time as _t8
     _jq_t0 = _t8.perf_counter()
     tree = sqlglot.parse_one(sql, read='duckdb')
+    if tree.find(E.Window) is not None and not (tree.args.get('from') or tree.args.get('from_')).this.__class__.__name__ == 'Subquery':
+        try:
+            _wd9 = _window_door(db, tree)
+        except _FastUnsupported:
+            _wd9 = None
+        if _wd9 is not None:
+            _route9('window-door')
+            return _wd9
+        raise NotImplementedError('window shape beyond the window door')
     try:
         _ae9 = _agg_expr_rewrite(db, tree)
     except _FastUnsupported:
