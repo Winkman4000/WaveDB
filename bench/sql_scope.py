@@ -86,6 +86,7 @@ Q = [
  ('join', 'left_rows', "SELECT x.id6, d.dname FROM x LEFT JOIN d ON x.id4 = d.id4 AND d.id4 < 50 WHERE x.id4 IN (5, 60)"),
  ('join', 'right_join', "SELECT d.dname, COUNT(x.id6) FROM x RIGHT JOIN d ON x.id4 = d.id4 GROUP BY d.dname"),
  ('join', 'full_outer', "SELECT COUNT(*) FROM x FULL OUTER JOIN d ON x.id4 = d.id4"),
+ ('join', 'full_outer_extra', "SELECT d.dname, COUNT(x.id6) FROM x FULL OUTER JOIN d ON x.id4 = d.id4 AND x.id4 < 3 GROUP BY d.dname"),
  ('join', 'cross_join', "SELECT COUNT(*) FROM d a CROSS JOIN d b"),
  ('join', 'self_join', "SELECT COUNT(*) FROM d a JOIN d b ON a.id4 = b.id4 + 1"),
  ('join', 'using', "SELECT COUNT(*) FROM x JOIN d USING (id4)"),

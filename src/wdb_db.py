@@ -330,6 +330,14 @@ class Database:
             return result
         if isinstance(tree, E.Select):
             import wdb_cte
+            import wdb_literal
+            def _is_stored9(nm):
+                try:
+                    self.cat.get_table(nm); return True
+                except Exception:
+                    return False
+            if wdb_literal.references_only_literals(tree, _is_stored9):
+                return wdb_literal.run_literal(tree)       # LITERAL RELATIONS: no stored table touched
             if wdb_cte.has_cte(tree):
                 tree = wdb_cte.rewrite(tree)      # flatten views before anything resolves
                 sql = tree.sql()
@@ -354,6 +362,16 @@ class Database:
                 _t9 = wdb_subquery.substitute_select_scalars(self, tree.copy())
                 if _t9.sql() != sql:
                     return self._run_impl(_t9.sql(), escalate)     # SELECT-list scalars -> literals
+            _hr9 = wdb_join.hidden_rewrite(tree)
+            if _hr9 is not None:
+                _sql9, _nh9 = _hr9
+                _out9 = self._run_impl(_sql9, escalate)
+                if _nh9:
+                    _rows9, _hdr9 = _out9 if isinstance(_out9, tuple) else (_out9, None)
+                    _rows9 = [r[:len(r) - _nh9] for r in _rows9]
+                    if _hdr9: _hdr9 = _hdr9[:len(_hdr9) - _nh9]
+                    return (_rows9, _hdr9) if _hdr9 is not None else _rows9
+                return _out9
             _rw9 = wdb_join.qualify_rewrite(tree) or wdb_join.distinct_on_rewrite(tree)
             if _rw9 is not None:
                 return self._run_impl(_rw9, escalate)      # QUALIFY / DISTINCT ON -> the top-k door's shape

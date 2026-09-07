@@ -1008,7 +1008,12 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
             if isinstance(_inn, E.Count) and isinstance(_inn.this, E.Distinct):   # COUNT(DISTINCT col) per group
                 _dx = _inn.this.expressions
                 if len(_dx) != 1 or not isinstance(_dx[0], E.Column):
-                    raise NotImplementedError("COUNT(DISTINCT) over expression/multiple columns")
+                    if len(_dx) != 1: raise NotImplementedError("COUNT(DISTINCT) over multiple columns")
+                    _rows9 = np.flatnonzero(mask) if mask is not None else np.arange(seg.N)
+                    _sel9 = _rows9[order[gstarts[gi]:gends[gi]]]
+                    _m9 = np.zeros(seg.N, bool); _m9[_sel9] = True
+                    rowout.append(_rowagg_eval(seg, _inn, _m9, seg_col)); ki += 0
+                    continue
                 rowout.append(int(groupdistinct(_dx[0].name, gi)))
             elif kind is not None and kind[0] == 'ROWAGG':
                 # per-group row aggregate: the group's rows are order[gstarts:gends]
@@ -1366,7 +1371,9 @@ def _agg_scalar(seg, p, mask, seg_col):
     if isinstance(_inner, E.Count) and isinstance(_inner.this, E.Distinct):   # COUNT(DISTINCT col)
         _dx = _inner.this.expressions
         if len(_dx) != 1 or not isinstance(_dx[0], E.Column):
-            raise NotImplementedError("COUNT(DISTINCT) over expression/multiple columns")
+            if len(_dx) == 1:                                   # COUNT(DISTINCT <expression>): the row aggregate
+                return _rowagg_eval(seg, _inner, mask, seg_col)
+            raise NotImplementedError("COUNT(DISTINCT) over multiple columns")
         cn = seg_col(_dx[0].name); c = seg.cols[cn]
         if mask is None and c['mode'] != 4 and seg._overrides(cn) is None:
             return int(c['V'] - c['has_null'])         # no filter: distinct count == dict cardinality (O(1))

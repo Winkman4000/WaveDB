@@ -1783,6 +1783,51 @@ def _road_join_emit(db, tree):
 
 
 
+def hidden_rewrite(tree):
+    """Three rewrites into shapes every door already serves:
+    GROUP BY ALL -> the non-aggregate projections; HAVING over a non-projected
+    aggregate -> a hidden projection, stripped after; ORDER BY an expression
+    over projected aliases -> a hidden projection, stripped after.
+    Returns (sql, n_hidden) or None."""
+    if not isinstance(tree, E.Select): return None
+    t = tree.copy(); changed = False
+    _AGG = (E.AggFunc,)
+    g = t.args.get('group')
+    if g is not None and not g.expressions and any(isinstance(x, E.Column) and x.name.upper() == 'ALL' for x in [g]) :
+        pass
+    if g is not None and g.args.get('all'):
+        keys = [(p.this if isinstance(p, E.Alias) else p).copy() for p in t.expressions
+                if (p.this if isinstance(p, E.Alias) else p).find(*_AGG) is None]
+        t.set('group', E.Group(expressions=keys)); changed = True
+    defs = {p.alias: p.this for p in t.expressions if isinstance(p, E.Alias)}
+    def _subst(x):                                        # projected aliases -> their definitions
+        x = x.copy()
+        for c in list(x.find_all(E.Column)):
+            if not c.table and c.name in defs:
+                c.replace(defs[c.name].copy())
+        return x
+    hidden = 0
+    h = t.args.get('having')
+    if h is not None:
+        for ag in list(h.this.find_all(*_AGG)):
+            if not any(ag == (p.this if isinstance(p, E.Alias) else p) for p in t.expressions):
+                al = '__h%d' % hidden; hidden += 1        # project it hidden; HAVING keeps the aggregate text
+                t.set('expressions', list(t.expressions) + [E.Alias(this=ag.copy(), alias=E.Identifier(this=al, quoted=False))])
+                changed = True
+    o = t.args.get('order')
+    if o is not None:
+        proj_sqls = {(p.this if isinstance(p, E.Alias) else p).sql() for p in t.expressions}
+        for oe in o.expressions:
+            x = oe.this
+            if isinstance(x, (E.Column, E.Literal, E.AggFunc)): continue   # doors order by aggregates natively
+            if x.sql() in proj_sqls: continue                              # already projected
+            al = '__o%d' % hidden; hidden += 1
+            t.set('expressions', list(t.expressions) + [E.Alias(this=_subst(x), alias=E.Identifier(this=al, quoted=False))])
+            oe.set('this', E.Column(this=E.Identifier(this=al, quoted=False))); changed = True
+    if not changed: return None
+    return t.sql(dialect='duckdb'), hidden
+
+
 def qualify_rewrite(tree):
     """QUALIFY <window> <cmp> <lit>  ->  SELECT cols FROM (SELECT cols, <window>
     AS __q FROM ...) t WHERE __q <cmp> <lit>: the top-k-per-group door's shape.
@@ -2376,8 +2421,11 @@ def join_query(db, sql, columnar=False):
         mixed = mixed + pre_l          # a left-side ON filter on a LEFT join only unmatches (post, as NULL-safe filter below)
     elif _how9 == 'right' and pre_r:
         mixed = mixed + pre_r
-    elif _how9 == 'outer' and (pre_l or pre_r or mixed):
-        raise NotImplementedError("join: FULL OUTER with extra ON conjuncts")
+    _full_extras = []
+    if _how9 == 'outer' and (pre_l or pre_r or mixed):
+        # FULL OUTER with extra ON conjuncts: the ON decides MATCHING only -- match
+        # as INNER under every conjunct, then append the unmatched rows of BOTH sides
+        _full_extras = pre_l + pre_r + mixed; pre_l = []; pre_r = []; mixed = []
     if (_how9 in ('left', 'right')) and mixed:
         raise NotImplementedError("join: OUTER join with a two-sided ON conjunct")
     _route9('step1-merge')
@@ -2387,7 +2435,18 @@ def join_query(db, sql, columnar=False):
             ka, kb = f"__lk{j9}", f"__rk{j9}"
             ldf[ka] = _series(ldf, a).values; rdf[kb] = _series(rdf, b).values
             lkeys.append(ka); rkeys.append(kb)
-        merged = ldf.merge(rdf, left_on=lkeys, right_on=rkeys, how=_how9)
+        if _full_extras:
+            ldf = ldf.copy(); rdf = rdf.copy()
+            ldf['__lid'] = np.arange(len(ldf)); rdf['__rid'] = np.arange(len(rdf))
+            inner9 = ldf.merge(rdf, left_on=lkeys, right_on=rkeys, how='inner')
+            for x in _full_extras:
+                inner9 = inner9[_mask_df(inner9, x)]
+            ul = ldf[~ldf['__lid'].isin(inner9['__lid'])]
+            ur = rdf[~rdf['__rid'].isin(inner9['__rid'])]
+            merged = pd.concat([inner9, ul, ur], ignore_index=True, sort=False)
+            merged = merged.drop(columns=['__lid', '__rid'])
+        else:
+            merged = ldf.merge(rdf, left_on=lkeys, right_on=rkeys, how=_how9)
         merged = merged.drop(columns=lkeys + rkeys)
     else:                                                   # CROSS / non-equi: bounded cross product
         if len(ldf) * len(rdf) > 20_000_000:
