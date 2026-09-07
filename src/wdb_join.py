@@ -2257,58 +2257,112 @@ def join_query(db, sql, columnar=False):
         raise NotImplementedError("join: non-FK multi-join needs a hash join (not yet supported)")
     jn = joins[0]
     _side9 = (jn.args.get('side') or '').upper(); _kind9 = (jn.args.get('kind') or '').upper()
-    if _kind9 not in ('', 'INNER') or _side9 not in ('', 'LEFT', 'RIGHT'):
-        raise NotImplementedError("join: only INNER/LEFT/RIGHT equi-joins (step 1)")
-    _how9 = {'': 'inner', 'LEFT': 'left', 'RIGHT': 'right'}[_side9]
+    if _kind9 not in ('', 'INNER', 'CROSS', 'OUTER') or _side9 not in ('', 'LEFT', 'RIGHT', 'FULL'):
+        raise NotImplementedError("join: only INNER/LEFT/RIGHT/FULL/CROSS (step 1)")
+    _how9 = {'': 'inner', 'LEFT': 'left', 'RIGHT': 'right', 'FULL': 'outer'}[_side9]
     frm = tree.find(E.From).this
     lt, la = frm.name, (frm.alias or frm.name)
     rt, ra = jn.this.name, (jn.this.alias or jn.this.name)
-    on = jn.args.get('on')
-    if not isinstance(on, E.EQ):
-        raise NotImplementedError("join: ON must be a single equality (step 1)")
-    # which side of the ON belongs to which table
+    lcols = set(db.cat.column_names(lt)); rcols = set(db.cat.column_names(rt))
     a2t = {la: lt, ra: rt}
-    le, re = on.this, on.expression
-    if not (isinstance(le, E.Column) and isinstance(re, E.Column)):
-        raise NotImplementedError("join: ON sides must be plain columns (expression in ON: %s)" % on.sql()[:60])
-    if a2t.get(le.table) == lt and a2t.get(re.table) == rt:
-        lk, rk = le.name, re.name
-    elif a2t.get(le.table) == rt and a2t.get(re.table) == lt:
-        lk, rk = re.name, le.name
-    else:
-        raise NotImplementedError("join: ON columns must reference the two joined tables")
-
-    lcols = {c[0] for c in db.cat.get_table(lt)['schema'].__iter__()} if False else set(db.cat.column_names(lt))
-    rcols = set(db.cat.column_names(rt))
-
-    # (FK-pointer fast path already attempted above via _build_chain)
-
-    def resolve(tbl_alias, name):
-        """(alias, col) -> merged-frame key 'alias.col'. Unqualified resolves by membership."""
-        if tbl_alias:
-            return f"{tbl_alias}.{name}"
-        if name in lcols and name in rcols:
-            raise NotImplementedError(f"ambiguous column {name!r}")
-        return f"{la}.{name}" if name in lcols else f"{ra}.{name}"
-
-    # collect needed columns per table from the whole statement
-    need_l, need_r = {lk}, {rk}
+    def side_of(col):
+        if col.table: return 'L' if col.table == la else ('R' if col.table == ra else None)
+        if col.name in lcols and col.name not in rcols: return 'L'
+        if col.name in rcols and col.name not in lcols: return 'R'
+        return None
+    def sides_in(node):
+        return {side_of(c) for c in node.find_all(E.Column)}
+    # ---- the ON: equalities (keys), extras (filters), USING, CROSS
+    eqs, extras = [], []
+    on = jn.args.get('on')
+    if jn.args.get('using'):
+        for u in jn.args['using']:
+            nm = u.name if hasattr(u, 'name') else str(u)
+            eqs.append((E.Column(this=E.Identifier(this=nm, quoted=False), table=E.Identifier(this=la, quoted=False)),
+                        E.Column(this=E.Identifier(this=nm, quoted=False), table=E.Identifier(this=ra, quoted=False))))
+    elif on is not None:
+        def _fl(x):
+            if isinstance(x, E.Paren): return _fl(x.this)
+            if isinstance(x, E.And): return _fl(x.this) + _fl(x.expression)
+            return [x]
+        for cj in _fl(on):
+            if isinstance(cj, E.EQ) and sides_in(cj.this) and sides_in(cj.expression) \
+                    and sides_in(cj.this) != sides_in(cj.expression) and None not in sides_in(cj.this) | sides_in(cj.expression) \
+                    and len(sides_in(cj.this)) == 1 and len(sides_in(cj.expression)) == 1:
+                a, b = cj.this, cj.expression
+                if sides_in(a) == {'R'}: a, b = b, a
+                eqs.append((a, b))
+            else:
+                extras.append(cj)
+    elif _kind9 != 'CROSS':
+        raise NotImplementedError("join: no ON/USING")
+    if any(None in sides_in(x) for x in extras): raise NotImplementedError("join: ambiguous column in ON")
+    # ---- needed columns
+    need_l, need_r = set(), set()
+    def _need(node):
+        for talias, cname in _all_columns(node):
+            if talias == la or (not talias and cname in lcols and cname not in rcols): need_l.add(cname)
+            elif talias == ra or (not talias and cname in rcols and cname not in lcols): need_r.add(cname)
+            elif not talias and cname in lcols and cname in rcols:
+                raise NotImplementedError(f"ambiguous column {cname!r}")
     for part in (tree.expressions, [tree.args.get('where')], (tree.args.get('group').expressions if tree.args.get('group') else []),
-                 (tree.args.get('order').expressions if tree.args.get('order') else [])):
+                 (tree.args.get('order').expressions if tree.args.get('order') else []), [x for pr in eqs for x in pr], extras):
         for node in part:
-            if node is None: continue
-            for talias, cname in _all_columns(node):
-                if talias == la or (not talias and cname in lcols and cname not in rcols): need_l.add(cname)
-                elif talias == ra or (not talias and cname in rcols and cname not in lcols): need_r.add(cname)
-                elif not talias and cname in lcols and cname in rcols:
-                    raise NotImplementedError(f"ambiguous column {cname!r}")
-
-    lc = _materialize(db, lt, need_l)
-    rc = _materialize(db, rt, need_r)
+            if node is not None: _need(node)
+    if not need_l: need_l.add(next(iter(lcols)))
+    if not need_r: need_r.add(next(iter(rcols)))
+    def resolve(tbl_alias, name):
+        if tbl_alias: return f"{tbl_alias}.{name}"
+        if name in lcols and name in rcols: raise NotImplementedError(f"ambiguous column {name!r}")
+        return f"{la}.{name}" if name in lcols else f"{ra}.{name}"
+    lc = _materialize(db, lt, need_l); rc = _materialize(db, rt, need_r)
     ldf = pd.DataFrame({f"{la}.{c}": lc[c] for c in lc})
     rdf = pd.DataFrame({f"{ra}.{c}": rc[c] for c in rc})
+    R = lambda colnode: resolve(colnode.table, colnode.name)
+    def _series(df, node):
+        """a join-key side as a Series: a column, or arithmetic over ONE column (a.id4 + 1)."""
+        if isinstance(node, E.Column): return df[R(node)]
+        if isinstance(node, E.Paren): return _series(df, node.this)
+        if isinstance(node, E.Literal): return float(node.this) if '.' in str(node.this) else int(node.this)
+        if isinstance(node, E.Neg): return -_series(df, node.this)
+        ops = {E.Add: lambda a, b: a + b, E.Sub: lambda a, b: a - b, E.Mul: lambda a, b: a * b, E.Div: lambda a, b: a / b, E.Mod: lambda a, b: a % b}
+        if type(node) in ops: return ops[type(node)](_series(df, node.this), _series(df, node.expression))
+        raise NotImplementedError("join: ON key expression %s" % node.sql()[:40])
+    # extras that belong to one side filter that side BEFORE the merge (outer-join semantics)
+    def _mask_df(df, node):
+        return _mask(df, node, R)
+    pre_r = [x for x in extras if sides_in(x) == {'R'}]
+    pre_l = [x for x in extras if sides_in(x) == {'L'}]
+    mixed = [x for x in extras if len(sides_in(x)) == 2]
+    if _how9 in ('inner', 'left') and pre_r:
+        for x in pre_r: rdf = rdf[_mask_df(rdf, x)]
+    if _how9 in ('inner', 'right') and pre_l:
+        for x in pre_l: ldf = ldf[_mask_df(ldf, x)]
+    if _how9 == 'inner':
+        mixed = mixed + ([] if pre_r else []) 
+    elif _how9 == 'left' and pre_l:
+        mixed = mixed + pre_l          # a left-side ON filter on a LEFT join only unmatches (post, as NULL-safe filter below)
+    elif _how9 == 'right' and pre_r:
+        mixed = mixed + pre_r
+    elif _how9 == 'outer' and (pre_l or pre_r or mixed):
+        raise NotImplementedError("join: FULL OUTER with extra ON conjuncts")
+    if (_how9 in ('left', 'right')) and mixed:
+        raise NotImplementedError("join: OUTER join with a two-sided ON conjunct")
     _route9('step1-merge')
-    merged = ldf.merge(rdf, left_on=f"{la}.{lk}", right_on=f"{ra}.{rk}", how=_how9)
+    if eqs:
+        lkeys, rkeys = [], []
+        for j9, (a, b) in enumerate(eqs):
+            ka, kb = f"__lk{j9}", f"__rk{j9}"
+            ldf[ka] = _series(ldf, a).values; rdf[kb] = _series(rdf, b).values
+            lkeys.append(ka); rkeys.append(kb)
+        merged = ldf.merge(rdf, left_on=lkeys, right_on=rkeys, how=_how9)
+        merged = merged.drop(columns=lkeys + rkeys)
+    else:                                                   # CROSS / non-equi: bounded cross product
+        if len(ldf) * len(rdf) > 20_000_000:
+            raise NotImplementedError("join: cross product too large (%d x %d)" % (len(ldf), len(rdf)))
+        merged = ldf.merge(rdf, how='cross')
+    for x in mixed:
+        merged = merged[_mask_df(merged, x)]
 
     R = lambda colnode: resolve(colnode.table, colnode.name)
     where = tree.args.get('where')
