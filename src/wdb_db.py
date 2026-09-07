@@ -345,6 +345,15 @@ class Database:
                 if _rw is None:                                  # column -> single-table cube read; else gather
                     return wdb_join.join_query(self, sql)
                 sql = _rw; tree = _parse_sql_cached(_rw)         # fall through to the single-table path
+            import wdb_subquery
+            if tree.find(sqlglot.exp.All) is not None or tree.find(sqlglot.exp.Any) is not None:
+                _t9 = wdb_subquery.rewrite_any_all(tree.copy())
+                if _t9.sql() != sql:
+                    return self._run_impl(_t9.sql(), escalate)     # ANY/ALL -> MIN/MAX scalar or IN
+            if any(p.find(sqlglot.exp.Subquery) is not None for p in tree.expressions):
+                _t9 = wdb_subquery.substitute_select_scalars(self, tree.copy())
+                if _t9.sql() != sql:
+                    return self._run_impl(_t9.sql(), escalate)     # SELECT-list scalars -> literals
             _rw9 = wdb_join.qualify_rewrite(tree) or wdb_join.distinct_on_rewrite(tree)
             if _rw9 is not None:
                 return self._run_impl(_rw9, escalate)      # QUALIFY / DISTINCT ON -> the top-k door's shape

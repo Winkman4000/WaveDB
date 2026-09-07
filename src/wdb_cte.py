@@ -98,7 +98,12 @@ def _flatten_once(outer, cte_sel):
     # aggregating CTE + filtering/selecting outer: flatten to HAVING/WHERE on the inner
     if (outer.args.get('group') is not None or outer.args.get('joins')
             or any(_is_agg(p) for p in outer.expressions)):
-        raise NotImplementedError("CTE shape not flattenable (nested aggregation)")
+        if outer.args.get('joins'):
+            raise NotImplementedError("CTE shape not flattenable (joins)")
+        # NESTED AGGREGATION: the CTE becomes a FROM subquery -- the FROM door runs
+        # the inner to a frame and evaluates the outer over it
+        outer.set('from_', E.From(this=E.Subquery(this=cte_sel.copy(), alias=E.TableAlias(this=E.Identifier(this='__cte', quoted=False)))))
+        return outer
     agg_aliases = set()
     for p in cte_sel.expressions:
         if isinstance(p, E.Alias) and _is_agg(p):

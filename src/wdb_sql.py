@@ -713,7 +713,9 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
             return [tuple(row)], [_alias(p) for p in proj]
         else:
             # row projection (SELECT cols ... [WHERE] [ORDER BY] [LIMIT]) -> return rows
-            cols = [seg_col(_colname(p if not isinstance(p,E.Alias) else p.this)) for p in proj]
+            _inner9 = [(p.this if isinstance(p, E.Alias) else p) for p in proj]
+            _exprs9 = [n for n in _inner9 if not isinstance(n, E.Column)]
+            cols = [seg_col(_colname(n)) if isinstance(n, E.Column) else None for n in _inner9]
             idx = np.nonzero(mask)[0] if mask is not None else np.arange(N)
             order = tree.args.get('order'); lim = _limit(tree); off = _offset(tree)
             distinct = tree.args.get('distinct') is not None
@@ -721,8 +723,21 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
             if early and (lim is not None or off):
                 idx = idx[off: off + lim] if lim is not None else idx[off:]
             out = []
-            colvals = {c: seg.values(c) for c in cols}
-            for i in idx: out.append(tuple(_pyval(colvals[c][i]) for c in cols))
+            colvals = {c: seg.values(c) for c in cols if c is not None}
+            if _exprs9:
+                # EXPRESSION PROJECTIONS in a row select (v1 - 3.0 AS dev): the row evaluator at idx
+                _m9 = np.zeros(N, bool); _m9[idx] = True
+                _ev9 = {}
+                for j, n in enumerate(_inner9):
+                    if not isinstance(n, E.Column):
+                        try:
+                            _ev9[j] = np.asarray(_eval_rows(seg, n, _m9, seg_col), dtype=object)
+                        except TypeError as _te:
+                            raise NotImplementedError('row projection: %s' % str(_te)[:60])
+                for k, i in enumerate(idx):
+                    out.append(tuple((_pyval(_ev9[j][k]) if j in _ev9 else _pyval(colvals[cols[j]][i])) for j in range(len(_inner9))))
+            else:
+                for i in idx: out.append(tuple(_pyval(colvals[c][i]) for c in cols))
             if distinct:                                           # SELECT DISTINCT -> dedup (order-preserving)
                 seen = set(); ded = []
                 for r in out:

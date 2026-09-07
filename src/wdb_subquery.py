@@ -115,6 +115,55 @@ def _samecol_codes(db, tree, node, sub):
     return codes, has_null
 
 
+def rewrite_any_all(tree):
+    """x > ALL (sub) -> x > (SELECT MAX(col) ...); x > ANY -> MIN; < ALL -> MIN;
+    < ANY -> MAX; = ANY -> IN; <> ALL -> NOT IN. In-tree; returns the tree."""
+    for nd in list(tree.find_all(E.All)) + list(tree.find_all(E.Any)):
+        sub = nd.this
+        if isinstance(sub, E.Select): sub = E.Subquery(this=sub)      # duckdb parse: ALL (SELECT ...) carries the Select bare
+        if not isinstance(sub, E.Subquery) or not isinstance(sub.this, E.Select) or len(sub.this.expressions) != 1: continue
+        cmp_ = nd.parent
+        if not isinstance(cmp_, (E.GT, E.GTE, E.LT, E.LTE, E.EQ, E.NEQ)): continue
+        is_all = isinstance(nd, E.All)
+        t = type(cmp_).__name__
+        if t in ('EQ', 'NEQ'):
+            if (t == 'EQ' and not is_all) or (t == 'NEQ' and is_all):
+                inn = E.In(this=cmp_.this.copy(), query=sub.copy())
+                cmp_.replace(E.Not(this=inn) if t == 'NEQ' else inn)
+            continue
+        want = 'MAX' if ((t in ('GT', 'GTE')) == is_all) else 'MIN'
+        inner = sub.this.copy()
+        p0 = inner.expressions[0]
+        p0i = p0.this if isinstance(p0, E.Alias) else p0
+        agg = (E.Max if want == 'MAX' else E.Min)(this=p0i.copy())
+        inner.set('expressions', [E.Alias(this=agg, alias=E.Identifier(this='__aa', quoted=False))])
+        nd.replace(E.Subquery(this=inner))
+    return tree
+
+
+def substitute_select_scalars(db, tree):
+    """Uncorrelated scalar subqueries in the SELECT list become literals."""
+    itn = None
+    for p in list(tree.expressions):
+        for sub in list(p.find_all(E.Subquery)):
+            inner = sub.this
+            if not isinstance(inner, E.Select): continue
+            inner_names = set()
+            f = inner.args.get('from') or inner.args.get('from_')
+            if f is None or not isinstance(f.this, E.Table): continue
+            outer_alias = None
+            of = tree.args.get('from') or tree.args.get('from_')
+            if of is not None and isinstance(of.this, E.Table):
+                outer_alias = of.this.alias or of.this.name
+            corr = any(c.table and c.table not in (f.this.alias or f.this.name,) for c in inner.find_all(E.Column))
+            if corr: continue
+            rows = _run_inner(db, sub)
+            if len(rows) != 1 or len(rows[0]) != 1:
+                raise ValueError("scalar subquery returned %d rows" % len(rows))
+            sub.replace(_lit(rows[0][0]))
+    return tree
+
+
 def has_subquery(tree):
     w = tree.args.get('where')
     if w is None:
@@ -471,7 +520,13 @@ def _try_window_decorrelate(db, tree):
     if len(inner.expressions) != 1:
         return None
     import wdb_sql
-    ak = wdb_sql._agg_kind(inner.expressions[0])
+    _p0 = inner.expressions[0]
+    _p0i = _p0.this if isinstance(_p0, E.Alias) else _p0
+    _aggs9 = list(_p0i.find_all(E.AggFunc))
+    if len(_aggs9) != 1 or _p0i.find(E.Subquery) is not None:
+        return None
+    _agg_node9 = _aggs9[0]
+    ak = wdb_sql._agg_kind(_agg_node9)
     if ak is None or ak[0] not in ('SUM', 'AVG', 'MIN', 'MAX', 'COUNT_STAR'):
         return None
     ce = _corr_eq(inner, None, _inner_colset(db, inner))
@@ -482,7 +537,15 @@ def _try_window_decorrelate(db, tree):
         return None                              # partition key must be the same column
     fname = {'SUM': 'SUM', 'AVG': 'AVG', 'MIN': 'MIN', 'MAX': 'MAX', 'COUNT_STAR': 'COUNT'}[ak[0]]
     arg = '*' if ak[0] == 'COUNT_STAR' else ak[1]
-    win_sql = f"{fname}({arg}) OVER (PARTITION BY {icol}) AS __corr0"
+    if _agg_node9 is _p0i:
+        win_sql = f"{fname}({arg}) OVER (PARTITION BY {icol}) AS __corr0"
+    else:                                        # arithmetic around the aggregate: MAX(v3) - 0.001
+        _expr9 = _p0i.copy()
+        import sqlglot as _sg
+        _wn = _sg.parse_one(f"SELECT {fname}({arg}) OVER (PARTITION BY {icol}) FROM x").expressions[0]
+        for _an in list(_expr9.find_all(E.AggFunc)):
+            _an.replace(_wn.copy())
+        win_sql = _expr9.sql() + " AS __corr0"
     new = tree.copy()
     new.set('where', None)
     proj = list(new.expressions)

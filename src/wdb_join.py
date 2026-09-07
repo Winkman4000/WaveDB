@@ -1793,7 +1793,7 @@ def qualify_rewrite(tree):
     if isinstance(cond, E.Paren): cond = cond.this
     if not (type(cond) in (E.EQ, E.LTE, E.LT) and isinstance(cond.this, E.Window)
             and isinstance(cond.expression, E.Literal)):
-        raise NotImplementedError('QUALIFY beyond <window> <=|<|= <literal>')
+        return None                                   # the window door evaluates general QUALIFY over its output
     inner = tree.copy(); inner.set('qualify', None)
     inner.set('order', None); inner.set('limit', None)
     inner.set('expressions', list(inner.expressions) + [E.Alias(this=cond.this.copy(), alias=E.Identifier(this='__q', quoted=False))])
@@ -1842,11 +1842,19 @@ def _window_door(db, tree):
     frm = tree.args.get('from') or tree.args.get('from_')
     if frm is None or not isinstance(frm.this, E.Table): return None
     proj = list(tree.expressions)
-    wins = [(i, p) for i, p in enumerate(proj) if isinstance(p, E.Alias) and isinstance(p.this, E.Window)]
+    _ARITH9 = (E.Add, E.Sub, E.Mul, E.Div, E.Paren, E.Neg)
+    def _win_expr_ok(nd):
+        """a Window, or arithmetic with literals around exactly one Window"""
+        if isinstance(nd, E.Window): return True
+        if isinstance(nd, E.Literal): return True
+        if isinstance(nd, _ARITH9): return all(_win_expr_ok(c) for c in nd.args.values() if isinstance(c, E.Expression))
+        return False
+    wins = [(i, p) for i, p in enumerate(proj) if isinstance(p, E.Alias) and p.this.find(E.Window) is not None]
     if not wins: return None
     for p in proj:
         nd = p.this if isinstance(p, E.Alias) else p
-        if not isinstance(nd, (E.Column, E.Window)): return None
+        if isinstance(nd, E.Column): continue
+        if not (_win_expr_ok(nd) and len(list(nd.find_all(E.Window))) == 1): return None
     tname = frm.this.name
     try:
         seg, _sp = _solo_segment(db, tname)
@@ -1878,8 +1886,19 @@ def _window_door(db, tree):
         if raw is None: raise _FastUnsupported
         return raw[0][np.asarray(seg.codes_at(pc, rr))].astype(np.float64)
     out_cols = {}
+    def _arith9(nd, wv):
+        if isinstance(nd, E.Window): return wv
+        if isinstance(nd, E.Literal): return float(nd.this)
+        if isinstance(nd, E.Paren): return _arith9(nd.this, wv)
+        if isinstance(nd, E.Neg): return -_arith9(nd.this, wv)
+        a, b = _arith9(nd.this, wv), _arith9(nd.expression, wv)
+        if isinstance(nd, E.Add): return a + b
+        if isinstance(nd, E.Sub): return a - b
+        if isinstance(nd, E.Mul): return a * b
+        return a / b
     for i, p in wins:
-        win = p.this; fn = win.this
+        outer9 = p.this
+        win = outer9.find(E.Window); fn = win.this
         part = list(win.args.get('partition_by') or [])
         order = win.args.get('order')
         ords = list(order.expressions) if order is not None else []
@@ -1976,6 +1995,8 @@ def _window_door(db, tree):
                 val = np.asarray(val).astype(np.int64)
         else:
             raise NotImplementedError('window function %s' % fname)
+        if outer9 is not win:
+            val = _arith9(outer9, np.asarray(val, dtype=np.float64))
         # back to survivor order
         inv = np.empty(R, np.int64); inv[order_idx] = np.arange(R)
         out_cols[i] = np.asarray(val, dtype=object)[inv] if not isinstance(val, np.ndarray) or val.dtype == object else val[inv]
@@ -1991,10 +2012,18 @@ def _window_door(db, tree):
                         else list(seg.values_at_rows(pm.get(nd.name, nd.name), rows)))
     out = list(zip(*cols)) if cols else []
     out = [tuple(int(x) if isinstance(x, (np.integer,)) else (float(x) if isinstance(x, np.floating) else x) for x in r) for r in out]
+    names9 = [wdb_sql._alias(p) for p in proj]
+    q9 = tree.args.get('qualify')
+    if q9 is not None and out:
+        # QUALIFY over the door's own output (column vs window alias, e.g. v3 > __corr0)
+        import pandas as pd
+        df9 = pd.DataFrame(out, columns=names9)
+        m9 = _mask(df9, q9.this, lambda c: c.name)
+        out = [r for r, k in zip(out, np.asarray(m9, dtype=bool)) if k]
     out = wdb_sql._apply_order(out, proj, tree.args.get('order'))
     lim = tree.args.get('limit')
     if lim is not None: out = out[:int(lim.expression.this)]
-    return out, [wdb_sql._alias(p) for p in proj]
+    return out, names9
 
 
 
