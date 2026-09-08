@@ -1964,7 +1964,16 @@ def _window_door(db, tree):
         for o in ords:
             k = sort_key(o.this, rows)
             keys.append(-k if o.args.get('desc') else k)
-        order_idx = np.lexsort(tuple(reversed(keys)))          # primary = gid, then order keys
+        if not ords:
+            # PARTITION-ONLY windows need no sort: a counting scatter by group id (O(N))
+            G9 = int(gid.max()) + 1 if R else 0
+            cnt9 = np.bincount(gid, minlength=G9)
+            offs9 = np.zeros(G9 + 1, np.int64); np.cumsum(cnt9, out=offs9[1:])
+            cur9 = offs9[:-1].copy()
+            order_idx = np.empty(R, np.int64)
+            wdb_kernels.pscatter_by_gid(np.ascontiguousarray(gid), np.arange(R, dtype=np.int64), cur9, order_idx)
+        else:
+            order_idx = np.lexsort(tuple(reversed(keys)))      # primary = gid, then order keys
         g_sorted = gid[order_idx]
         starts = np.concatenate(([0], np.flatnonzero(np.diff(g_sorted) != 0) + 1))
         seg_id = np.cumsum(np.concatenate(([0], (np.diff(g_sorted) != 0).astype(np.int64))))   # partition index per sorted pos
@@ -2045,26 +2054,33 @@ def _window_door(db, tree):
         # back to survivor order
         inv = np.empty(R, np.int64); inv[order_idx] = np.arange(R)
         out_cols[i] = np.asarray(val, dtype=object)[inv] if not isinstance(val, np.ndarray) or val.dtype == object else val[inv]
-    cols = []
+    names9 = [wdb_sql._alias(p) for p in proj]
+    # column ARRAYS first (numeric where the column is numeric); QUALIFY filters the
+    # arrays before a single row is materialised
+    arrs = []
     for i, p in enumerate(proj):
         if i in out_cols:
-            v = out_cols[i]
-            cols.append(v.tolist() if v.dtype != object else [x for x in v])
+            arrs.append(out_cols[i])
         else:
             nd = p.this if isinstance(p, E.Alias) else p
-            cols.append(list(_bulk_keyvals(seg, pm.get(nd.name, nd.name), np.asarray(seg.codes_at(pm.get(nd.name, nd.name), rows))))
-                        if seg.cols.get(pm.get(nd.name, nd.name), {}).get('mode') != 5
-                        else list(seg.values_at_rows(pm.get(nd.name, nd.name), rows)))
+            pc = pm.get(nd.name, nd.name)
+            raw = wdb_sql.raw_dict_col(seg, pc, want_codes=False)
+            if raw is not None:
+                arrs.append(raw[0][np.asarray(seg.codes_at(pc, rows))])
+            elif seg.cols.get(pc, {}).get('mode') != 5:
+                arrs.append(np.asarray(_bulk_keyvals(seg, pc, np.asarray(seg.codes_at(pc, rows))), dtype=object))
+            else:
+                arrs.append(np.asarray(list(seg.values_at_rows(pc, rows)), dtype=object))
+    q9 = tree.args.get('qualify')
+    if q9 is not None and R:
+        env9 = {nm: a for nm, a in zip(names9, arrs)}
+        m9 = np.asarray(wdb_sql._eval_rows(seg, q9.this, None, None, env=env9))
+        if m9.dtype != bool:
+            m9 = np.array([bool(v) if v is not None else False for v in m9], dtype=bool)
+        arrs = [a[m9] for a in arrs]
+    cols = [(a.tolist() if a.dtype != object else list(a)) for a in arrs]
     out = list(zip(*cols)) if cols else []
     out = [tuple(int(x) if isinstance(x, (np.integer,)) else (float(x) if isinstance(x, np.floating) else x) for x in r) for r in out]
-    names9 = [wdb_sql._alias(p) for p in proj]
-    q9 = tree.args.get('qualify')
-    if q9 is not None and out:
-        # QUALIFY over the door's own output (column vs window alias, e.g. v3 > __corr0)
-        import pandas as pd
-        df9 = pd.DataFrame(out, columns=names9)
-        m9 = _mask(df9, q9.this, lambda c: c.name)
-        out = [r for r, k in zip(out, np.asarray(m9, dtype=bool)) if k]
     out = wdb_sql._apply_order(out, proj, tree.args.get('order'))
     lim = tree.args.get('limit')
     if lim is not None: out = out[:int(lim.expression.this)]
