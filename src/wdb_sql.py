@@ -853,8 +853,28 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
         elif gk[0] == 'rowexpr':
             # general per-row expression (e.g. CASE WHEN ...): evaluate over the masked rows, then
             # factorize the resulting values. Not injective / multi-column, so it is its own dimension.
-            row_gv = _eval_rows(seg, rowexpr_nodes[gk[1]], mask, seg_col)
-            u, inv = np.unique(row_gv, return_inverse=True)
+            _nd9 = rowexpr_nodes[gk[1]]
+            _ds9 = _dict_string_col(seg, _nd9, seg_col, any_dt=True)
+            if _ds9 is not None:
+                # ONE-COLUMN expression key IN CODE SPACE: evaluate over the dictionary (V),
+                # unique the V labels, and the row inverse is an int gather through the codes
+                _nm9, _pc9 = _ds9
+                _td9 = seg._typed_dict(_pc9)
+                _td9 = np.asarray(_td9, dtype=object) if not isinstance(_td9, np.ndarray) else _td9
+                _ov9 = _eval_rows(seg, _nd9, None, seg_col, env={_nm9: _td9})
+                _ov9 = np.asarray(_ov9, dtype=object) if not isinstance(_ov9, np.ndarray) else _ov9
+                u, _invv9 = np.unique(_ov9.astype(str) if _ov9.dtype == object else _ov9, return_inverse=True)
+                if _ov9.dtype == object:
+                    _first9 = {}
+                    for _k9, _v9 in zip(_invv9.tolist(), _ov9.tolist()):
+                        _first9.setdefault(_k9, _v9)
+                    u = np.array([_first9[_k9] for _k9 in range(len(u))], dtype=object)
+                _cd9 = np.asarray(seg.codes(_pc9))
+                if mask is not None: _cd9 = _cd9[mask]
+                inv = _invv9[_cd9]
+            else:
+                row_gv = _eval_rows(seg, _nd9, mask, seg_col)
+                u, inv = np.unique(row_gv, return_inverse=True)
             metas.append((None, 'computed', u, None))
         elif gk[0] == 'sfn':
             # scalar fn over a column (length(col), regexp_replace(col,...)): evaluate over the
