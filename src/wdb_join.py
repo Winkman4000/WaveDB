@@ -2922,6 +2922,23 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     _tk9 = _t9.perf_counter
     _fpa_t0 = _tk9()
     _bill9 = [] if __import__('os').environ.get('WDB_JOIN_BILL') else None
+    if not tree.args.get('joins'):
+        # MIN/MAX OF A STRING COLUMN belongs to the dictionary (wdb_sql reads the
+        # extreme PRESENT value at V-scale); the fused path would decode N strings
+        frm9 = tree.args.get('from') or tree.args.get('from_')
+        if frm9 is not None and isinstance(frm9.this, E.Table):
+            try:
+                seg9, _ = _solo_segment(db, frm9.this.name)
+                pm9 = db.cat.phys_map(frm9.this.name)
+                for p9 in tree.expressions:
+                    nd9 = p9.this if isinstance(p9, E.Alias) else p9
+                    if isinstance(nd9, (E.Min, E.Max)) and isinstance(nd9.this, E.Column):
+                        if seg9.cols.get(pm9.get(nd9.this.name, nd9.this.name), {}).get('dt') == 1:
+                            raise _FastUnsupported
+            except _FastUnsupported:
+                raise
+            except Exception:
+                pass
     rows9 = None
     _where_spent = False
     _stage0 = _fpa_t0

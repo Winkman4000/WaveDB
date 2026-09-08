@@ -414,7 +414,47 @@ def _expr_is_int(nd, seg, seg_col):
     return False
 
 
-def _eval_rows(seg, node, mask, resolve=None):
+_STRFN_TYPES = tuple(getattr(E, n) for n in ('Length', 'Upper', 'Lower', 'Substring', 'Replace', 'Like', 'ILike', 'RegexpLike',
+                                              'Trim', 'Concat', 'DPipe', 'StartsWith', 'Contains') if hasattr(E, n))
+
+
+def _dict_string_col(seg, node, resolve, any_dt=False):
+    """If the node's only column input is ONE dictionary column (string by default;
+    any_dt=True admits numeric dictionaries too), return (name, physical)."""
+    cols = list(node.find_all(E.Column))
+    names = {c.name for c in cols}
+    if len(names) != 1: return None
+    nm = cols[0].name
+    pc = resolve(nm) if resolve is not None else nm
+    c = seg.cols.get(pc)
+    if c is None or c.get('mode') not in (0, 1, 2) or c.get('has_null'): return None
+    if not any_dt and c.get('dt') != 1: return None
+    if node.find(E.Select) is not None or node.find(E.AggFunc) is not None: return None
+    return nm, pc
+
+
+def _eval_rows(seg, node, mask, resolve=None, env=None):
+    """Row-wise evaluation. env: {column name: array} overrides (THE DICTIONARY
+    MAP evaluates a string function once per distinct value and gathers)."""
+    n = node.this if isinstance(node, E.Alias) else node
+    _MAPPABLE9 = _STRFN_TYPES + (E.Case, E.Coalesce, E.Nullif, E.Cast)
+    if env is None and (isinstance(n, _MAPPABLE9) or (type(n) in (E.EQ, E.NEQ, E.GT, E.LT, E.GTE, E.LTE) and n.find(*_MAPPABLE9) is not None)):
+        ds = _dict_string_col(seg, n, resolve, any_dt=True)
+        if ds is not None:
+            nm, pc = ds
+            V = int(seg.cols[pc]['V'])
+            codes = np.asarray(seg.codes(pc))
+            if mask is not None: codes = codes[mask]
+            td = seg._typed_dict(pc)
+            td = np.asarray(td, dtype=object) if not isinstance(td, np.ndarray) else td
+            outv = _eval_rows(seg, n, None, resolve, env={nm: td})
+            outv = np.asarray(outv, dtype=object) if not isinstance(outv, np.ndarray) else outv
+            if outv.shape[0] != V: raise TypeError('dictionary map: %d values for V=%d' % (outv.shape[0], V))
+            return outv[codes]
+    return _eval_rows_core(seg, node, mask, resolve, env)
+
+
+def _eval_rows_core(seg, node, mask, resolve=None, env=None):
     """Vectorised PER-ROW evaluation of a scalar expression over the (masked) rows -> numpy array of
     length = #selected rows. Used for genuine derived group keys that aren't a simple function of one
     column (e.g. CASE WHEN ...), which must be evaluated per row then factorized. String values are
@@ -423,7 +463,9 @@ def _eval_rows(seg, node, mask, resolve=None):
     for unsupported nodes (caller keeps the prior 'unsupported' behavior)."""
     import operator
     n = node.this if isinstance(node, E.Alias) else node
-    if isinstance(n, E.Paren): return _eval_rows(seg, n.this, mask, resolve)
+    if isinstance(n, E.Paren): return _eval_rows(seg, n.this, mask, resolve, env)
+    if isinstance(n, E.Column) and env is not None and n.name in env:
+        return env[n.name]
     if isinstance(n, E.Column):
         c = resolve(n.name) if resolve is not None else n.name; col = seg.cols[c]
         if col['dt'] == 1:                                   # string dict col: decode distinct survivors
@@ -442,29 +484,29 @@ def _eval_rows(seg, node, mask, resolve=None):
     if isinstance(n, E.Literal):
         return n.this.encode() if n.is_string else _literal_value(n)
     if isinstance(n, E.Null): return None
-    if isinstance(n, E.Not): return ~_eval_rows(seg, n.this, mask, resolve)
-    if isinstance(n, E.And): return _eval_rows(seg, n.this, mask, resolve) & _eval_rows(seg, n.expression, mask, resolve)
-    if isinstance(n, E.Or):  return _eval_rows(seg, n.this, mask, resolve) | _eval_rows(seg, n.expression, mask, resolve)
+    if isinstance(n, E.Not): return ~_eval_rows(seg, n.this, mask, resolve, env)
+    if isinstance(n, E.And): return _eval_rows(seg, n.this, mask, resolve, env) & _eval_rows(seg, n.expression, mask, resolve, env)
+    if isinstance(n, E.Or):  return _eval_rows(seg, n.this, mask, resolve, env) | _eval_rows(seg, n.expression, mask, resolve, env)
     if isinstance(n, (E.EQ, E.NEQ, E.GT, E.LT, E.GTE, E.LTE)):
-        l = _eval_rows(seg, n.this, mask, resolve); r = _eval_rows(seg, n.expression, mask, resolve)
+        l = _eval_rows(seg, n.this, mask, resolve, env); r = _eval_rows(seg, n.expression, mask, resolve, env)
         op = {E.EQ:operator.eq, E.NEQ:operator.ne, E.GT:operator.gt,
               E.LT:operator.lt, E.GTE:operator.ge, E.LTE:operator.le}[type(n)]
         return op(l, r)
-    if isinstance(n, E.Neg): return -_eval_rows(seg, n.this, mask, resolve)
-    if isinstance(n, E.Add): return _eval_rows(seg, n.this, mask, resolve) + _eval_rows(seg, n.expression, mask, resolve)
-    if isinstance(n, E.Sub): return _eval_rows(seg, n.this, mask, resolve) - _eval_rows(seg, n.expression, mask, resolve)
-    if isinstance(n, E.Mul): return _eval_rows(seg, n.this, mask, resolve) * _eval_rows(seg, n.expression, mask, resolve)
+    if isinstance(n, E.Neg): return -_eval_rows(seg, n.this, mask, resolve, env)
+    if isinstance(n, E.Add): return _eval_rows(seg, n.this, mask, resolve, env) + _eval_rows(seg, n.expression, mask, resolve, env)
+    if isinstance(n, E.Sub): return _eval_rows(seg, n.this, mask, resolve, env) - _eval_rows(seg, n.expression, mask, resolve, env)
+    if isinstance(n, E.Mul): return _eval_rows(seg, n.this, mask, resolve, env) * _eval_rows(seg, n.expression, mask, resolve, env)
     if isinstance(n, E.Case):
-        nrows = int(np.count_nonzero(mask)) if mask is not None else seg.N
+        nrows = (len(next(iter(env.values()))) if env else ((int(np.count_nonzero(mask)) if mask.dtype == bool else int(mask.size)) if mask is not None else seg.N))
         default = n.args.get('default')
-        acc = _to_rows(_eval_rows(seg, default, mask, resolve), nrows) if default is not None else np.full(nrows, None, object)
+        acc = _to_rows(_eval_rows(seg, default, mask, resolve, env), nrows) if default is not None else np.full(nrows, None, object)
         for iff in reversed(n.args.get('ifs') or []):        # last WHEN wins if listed first -> reverse-fold
-            cond = _eval_rows(seg, iff.this, mask, resolve)
-            then = _to_rows(_eval_rows(seg, iff.args.get('true'), mask, resolve), nrows)
+            cond = _eval_rows(seg, iff.this, mask, resolve, env)
+            then = _to_rows(_eval_rows(seg, iff.args.get('true'), mask, resolve, env), nrows)
             acc = np.where(cond, then, acc)
         return acc
     # ---- THE FUNCTION VOCABULARY (scope stage, 2026-09-08): numeric, null, string, boolean
-    def ev(x): return _eval_rows(seg, x, mask, resolve)
+    def ev(x): return _eval_rows(seg, x, mask, resolve, env)
     def num(a):                                   # object arrays with None -> float with NaN
         a = np.asarray(a)
         if a.dtype == object:
@@ -498,7 +540,7 @@ def _eval_rows(seg, node, mask, resolve=None):
     if isinstance(n, E.Coalesce):
         parts = [n.this] + list(n.args.get('expressions') or [])
         acc = None
-        nrows = int(np.count_nonzero(mask)) if mask is not None else seg.N
+        nrows = (len(next(iter(env.values()))) if env else ((int(np.count_nonzero(mask)) if mask.dtype == bool else int(mask.size)) if mask is not None else seg.N))
         for p in parts:
             v = _to_rows(ev(p), nrows)
             vo = np.asarray(v, dtype=object)
@@ -522,7 +564,7 @@ def _eval_rows(seg, node, mask, resolve=None):
         return rebytes(np.array([None if v is None else v.replace(old_, new_) for v in strs(ev(n.this))], dtype=object))
     if isinstance(n, (E.DPipe, E.Concat)):
         parts = [n.this, n.expression] if isinstance(n, E.DPipe) else list(n.expressions)
-        nrows = int(np.count_nonzero(mask)) if mask is not None else seg.N
+        nrows = (len(next(iter(env.values()))) if env else ((int(np.count_nonzero(mask)) if mask.dtype == bool else int(mask.size)) if mask is not None else seg.N))
         cols = [strs(_to_rows(ev(p), nrows)) for p in parts]
         return rebytes(np.array([None if any(c[i] is None for c in cols) else ''.join(str(c[i]) for c in cols) for i in range(nrows)], dtype=object))
     if isinstance(n, (E.Like, E.ILike)):
@@ -1013,10 +1055,11 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
                 _dx = _inn.this.expressions
                 if len(_dx) != 1 or not isinstance(_dx[0], E.Column):
                     if len(_dx) != 1: raise NotImplementedError("COUNT(DISTINCT) over multiple columns")
-                    _rows9 = np.flatnonzero(mask) if mask is not None else np.arange(seg.N)
+                    _rows9 = aggcache.get('__rows9')
+                    if _rows9 is None:
+                        _rows9 = aggcache['__rows9'] = (np.flatnonzero(mask) if mask is not None else np.arange(seg.N))
                     _sel9 = _rows9[order[gstarts[gi]:gends[gi]]]
-                    _m9 = np.zeros(seg.N, bool); _m9[_sel9] = True
-                    rowout.append(_rowagg_eval(seg, _inn, _m9, seg_col)); ki += 0
+                    rowout.append(_rowagg_eval(seg, _inn, _sel9, seg_col)); ki += 0
                     continue
                 rowout.append(int(groupdistinct(_dx[0].name, gi)))
             elif kind is not None and kind[0] == 'ROWAGG':
@@ -1024,10 +1067,11 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
                 _rk9 = ('ROWAGG', kind[1].sql())
                 if _rk9 not in aggcache:
                     aggcache[_rk9] = (None, None)
-                _rows9 = np.flatnonzero(mask) if mask is not None else np.arange(seg.N)
-                _sel9 = _rows9[order[gstarts[gi]:gends[gi]]]
-                _m9 = np.zeros(seg.N, bool); _m9[_sel9] = True
-                rowout.append(_rowagg_eval(seg, kind[1], _m9, seg_col))
+                _rows9 = aggcache.get('__rows9')
+                if _rows9 is None:
+                    _rows9 = aggcache['__rows9'] = (np.flatnonzero(mask) if mask is not None else np.arange(seg.N))
+                _sel9 = _rows9[order[gstarts[gi]:gends[gi]]]           # ROW INDICES, not a 10M bool per group
+                rowout.append(_rowagg_eval(seg, kind[1], _sel9, seg_col))
             elif kind is None:
                 _inn2 = p.this if isinstance(p, E.Alias) else p
                 if isinstance(_inn2, E.AggFunc) or _inn2.find(E.AggFunc) is not None:
@@ -1100,6 +1144,42 @@ def _is_rowagg(inner):
     return False
 
 
+def _distinct_tuples_eval(seg, node, rows_mask, seg_col):
+    """DISTINCT over an expression of dictionary columns: evaluate the expression
+    on the DISTINCT code tuples (unique of a composite over the survivors), not
+    on every row. Returns the evaluated object array (one per distinct tuple),
+    or None when a column is not a plain dictionary."""
+    cols = []
+    for c in node.find_all(E.Column):
+        if c.name not in cols: cols.append(c.name)
+    if not cols or node.find(E.Select) is not None or node.find(E.AggFunc) is not None: return None
+    pcs = []
+    for nm in cols:
+        pc = seg_col(nm) if seg_col is not None else nm
+        cd = seg.cols.get(pc)
+        if cd is None or cd.get('mode') not in (0, 1, 2) or cd.get('has_null'): return None
+        pcs.append(pc)
+    comp = None; K = 1
+    for pc in pcs:
+        V = int(seg.cols[pc]['V'])
+        codes = np.asarray(seg.codes(pc)).astype(np.int64)
+        if rows_mask is not None: codes = codes[rows_mask]
+        if K * V > (1 << 62): return None
+        comp = codes if comp is None else comp * V + codes
+        K *= V
+    uniq = np.unique(comp)
+    env = {}
+    rem = uniq.copy()
+    for nm, pc in reversed(list(zip(cols, pcs))):
+        V = int(seg.cols[pc]['V'])
+        kc = rem % V; rem = rem // V
+        td = seg._typed_dict(pc)
+        td = np.asarray(td, dtype=object) if not isinstance(td, np.ndarray) else td
+        env[nm] = td[kc]
+    out = _eval_rows(seg, node, None, seg_col, env=env)
+    return np.asarray(out, dtype=object) if not isinstance(out, np.ndarray) else out
+
+
 def _rowagg_eval(seg, inner, rows_mask, seg_col):
     """Evaluate a row-aggregate over the rows selected by rows_mask (bool[N] or None)."""
     def ev(node): return _eval_rows(seg, node, rows_mask, seg_col)
@@ -1113,8 +1193,11 @@ def _rowagg_eval(seg, inner, rows_mask, seg_col):
     if t == 'IgnoreNulls': return _rowagg_eval(seg, inner.this, rows_mask, seg_col)
     if t == 'Filter':
         cond = np.asarray(ev(inner.expression.this), dtype=bool)
-        m2 = rows_mask.copy() if rows_mask is not None else np.ones(seg.N, bool)
-        m2[np.flatnonzero(m2)] = cond
+        if rows_mask is not None and rows_mask.dtype != bool:       # index array
+            m2 = rows_mask[cond]
+        else:
+            m2 = rows_mask.copy() if rows_mask is not None else np.ones(seg.N, bool)
+            m2[np.flatnonzero(m2)] = cond
         inner2 = inner.this
         if _is_rowagg(inner2): return _rowagg_eval(seg, inner2, m2, seg_col)
         if isinstance(inner2, E.Count) and (inner2.this is None or isinstance(inner2.this, E.Star)): return int(m2.sum())
@@ -1140,9 +1223,16 @@ def _rowagg_eval(seg, inner, rows_mask, seg_col):
     if t in ('LogicalAnd', 'LogicalOr'):
         a = clean(ev(inner.this))
         if a.shape[0] == 0: return None
-        b = np.asarray([bool(v) for v in a])
+        b = a.astype(bool) if a.dtype != object else np.fromiter((bool(v) for v in a), dtype=bool, count=a.shape[0])
         return bool(b.all()) if t == 'LogicalAnd' else bool(b.any())
     if t == 'AnyValue':
+        if isinstance(inner.this, E.Column):
+            pc = seg_col(inner.this.name) if seg_col is not None else inner.this.name
+            rows = (np.flatnonzero(rows_mask) if rows_mask.dtype == bool else rows_mask) if rows_mask is not None else None
+            first = int(rows[0]) if rows is not None and rows.size else (0 if rows is None and seg.N else None)
+            if first is None: return None
+            v = list(seg.values_at_rows(pc, np.array([first], dtype=np.int64)))[0]     # ONE point read
+            return _pyval(v) if v is not None else _pyval(clean(ev(inner.this))[0]) if clean(ev(inner.this)).shape[0] else None
         a = clean(ev(inner.this))
         return _pyval(a[0]) if a.shape[0] else None
     if t == 'GroupConcat':
@@ -1152,7 +1242,19 @@ def _rowagg_eval(seg, inner, rows_mask, seg_col):
         distinct = isinstance(arg, E.Distinct)
         node = arg.expressions[0] if distinct else arg
         sep = str(inner.args['separator'].this) if inner.args.get('separator') is not None else ','
-        a = ev(node)
+        a = None
+        _self_order9 = (order9 is not None and len(order9) == 1 and order9[0].this.sql() == node.sql())
+        if distinct and (order9 is None or _self_order9):
+            a = _distinct_tuples_eval(seg, node, rows_mask, seg_col)
+            if a is not None and _self_order9:
+                keep0 = np.array([v is not None for v in a]); a = a[keep0]
+                sk = np.array([str(v) if isinstance(v, (bytes, str)) else v for v in a])
+                try: ordr = np.argsort(sk.astype(float), kind='stable')
+                except Exception: ordr = np.argsort(sk.astype(str), kind='stable')
+                if order9[0].args.get('desc'): ordr = ordr[::-1]
+                a = a[ordr]; order9 = None
+        if a is None:
+            a = ev(node)
         a = np.asarray(a, dtype=object) if not isinstance(a, np.ndarray) else a
         keep = np.array([v is not None and not (isinstance(v, float) and np.isnan(v)) for v in a]) if a.dtype == object else ~np.isnan(a) if a.dtype.kind == 'f' else np.ones(a.shape[0], bool)
         idx = np.flatnonzero(keep)
@@ -1176,7 +1278,12 @@ def _rowagg_eval(seg, inner, rows_mask, seg_col):
     if isinstance(inner, (E.Sum, E.Count, E.Avg, E.Min, E.Max)):
         arg = inner.this; distinct = isinstance(arg, E.Distinct)
         node = arg.expressions[0] if distinct else arg
-        a = clean(ev(node))
+        a = None
+        if distinct:
+            dt9 = _distinct_tuples_eval(seg, node, rows_mask, seg_col)
+            if dt9 is not None: a = clean(dt9)
+        if a is None:
+            a = clean(ev(node))
         if distinct:
             a = np.unique(a.astype(str)) if a.dtype == object else np.unique(a)
         if isinstance(inner, E.Count): return int(a.shape[0])
@@ -1427,6 +1534,21 @@ def _agg_scalar(seg, p, mask, seg_col):
         if len(arr) == 0: return None
         if fn in ('MIN', 'MAX'): return _pyval(arr.min() if fn == 'MIN' else arr.max())
         return _pyval(_sum_avg(arr, fn))
+    _c9 = seg.cols.get(seg_col(cn), {})
+    if fn in ('MIN', 'MAX') and _c9.get('dt') == 1 and _c9.get('mode') in (0, 1, 2):
+        # MIN/MAX OF A STRING COLUMN over the DICTIONARY: the extreme of the
+        # PRESENT distinct values (V-scale), never a 10M-string decode
+        codes = np.asarray(seg.codes(seg_col(cn)))
+        if mask is not None: codes = codes[mask]
+        if codes.size == 0: return None
+        nullcode = (int(_c9['V']) - 1) if _c9.get('has_null') else None
+        uc = np.unique(codes)
+        if nullcode is not None: uc = uc[uc != nullcode]
+        if uc.size == 0: return None
+        td = seg._typed_dict(seg_col(cn))
+        vals = [td[int(k)] for k in uc]
+        v = min(vals) if fn == 'MIN' else max(vals)
+        return _pyval(v)
     arr, nm = _col(seg, seg_col(cn))
     if mask is not None:
         arr = arr[mask]; nm = nm[mask] if nm is not None else None
@@ -1681,6 +1803,16 @@ def _dict_eq_mask(seg, name, neg, lit):
 def _eval_pred(seg, node, seg_col):
     """Predicate over all rows -> bool[N]. The core handles the dict-space forms;
     anything it declines by name falls back to per-row evaluation."""
+    _CMP9 = (E.EQ, E.NEQ, E.GT, E.LT, E.GTE, E.LTE)
+    if isinstance(node, _STRFN_TYPES) or (type(node) in _CMP9 and isinstance(node.this, _STRFN_TYPES)):
+        if _dict_string_col(seg, node, seg_col) is not None:
+            # THE DICTIONARY MAP first: LIKE/ILIKE/functions over a dictionary
+            # string column evaluate once per distinct value (the core's own LIKE
+            # route decoded per row: 3.0s vs 0.3s at 10M)
+            out = np.asarray(_eval_rows(seg, node, None, seg_col))
+            if out.dtype != bool:
+                out = np.array([bool(v) if v is not None else False for v in out], dtype=bool)
+            return out
     try:
         return _eval_pred_core(seg, node, seg_col)
     except NotImplementedError as _ne:
