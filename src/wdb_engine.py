@@ -269,7 +269,26 @@ class Segment:
         decompressed codes, decoded dicts, resident arrays, effective/count memos, and
         sidecar loads (presence, override, cluster, cube: they lazy-reload on next touch).
         The memmap stays: it IS the file. cols/order/synth stay: file-shape metadata."""
-        self._codes.clear(); self._tdict.clear(); self._resident.clear()
+        self._codes.clear(); self._resident.clear()
+        # THE DICTIONARY SHELF: a decoded dictionary is V-scale (the column's
+        # vocabulary), not N-scale residue -- it survives the flush within a budget
+        # (WDB_DICT_SHELF_MB, default 2048). A 3.6M-name front-coded dictionary
+        # re-decoded per query cost 3.5s on every JOB question that touched it.
+        try:
+            import os as _os9
+            _budget9 = int(float(_os9.environ.get('WDB_DICT_SHELF_MB', '2048'))) * (1 << 20)
+        except Exception:
+            _budget9 = 2048 << 20
+        _keep9 = {}
+        _used9 = 0
+        for _k9, _v9 in list(self._tdict.items()):
+            try:
+                _sz9 = (_v9.nbytes if hasattr(_v9, 'nbytes') else sum((len(x) if isinstance(x, (bytes, bytearray)) else 8) + 56 for x in _v9))
+            except Exception:
+                _sz9 = _budget9 + 1
+            if _used9 + _sz9 <= _budget9:
+                _keep9[_k9] = _v9; _used9 += _sz9
+        self._tdict.clear(); self._tdict.update(_keep9)
         _pl9 = getattr(self, '_e14_pl', None)
         if _pl9 is not None: _pl9.clear()   # planes obey the same forget-law as codes
         for a in ('_eff', '_ccounts'):

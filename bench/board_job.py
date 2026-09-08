@@ -33,6 +33,9 @@ def main():
         name = os.path.basename(f)[:-4]
         if only and name not in only: continue
         q = open(f).read().strip().rstrip(';')
+        # JOB aliases aka_title AS at -- a reserved word in duck's parser: rename on BOTH sides
+        import re as _re
+        q = _re.sub(r'\bAS at\b', 'AS at1', q); q = _re.sub(r'\bat\.', 'at1.', q)
         try:
             t0 = time.perf_counter(); e = con.execute(q).fetchall(); dm = time.perf_counter() - t0
         except Exception as ex:

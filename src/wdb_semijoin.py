@@ -40,7 +40,9 @@ def _conjuncts(node):
 
 
 def execute(db, tree):
-    import wdb_sql
+    import wdb_sql, os, time
+    _bill = [] if os.environ.get('WDB_SEMI_BILL') else None
+    _tk = time.perf_counter; _t0 = _tk()
     from wdb_join import _solo_segment, _FastUnsupported, _bulk_keyvals
     frm = tree.args.get('from') or tree.args.get('from_')
     tabs = [frm.this] + [jn.this for jn in (tree.args.get('joins') or [])]
@@ -84,6 +86,7 @@ def execute(db, tree):
             mm = np.asarray(wdb_sql._eval_pred(seg, c2, lambda nm, pm=pms[a]: pm.get(nm, nm)), dtype=bool)
             m = mm if m is None else (m & mm)
         keeps[a] = m if m is not None else np.ones(int(seg.N), bool)
+        if _bill is not None: _bill.append(('local %s(%d) keep=%d' % (a, int(seg.N), int(keeps[a].sum())), _tk() - _t0)); _t0 = _tk()
     # key columns as int64 arrays (NULL -> -1)
     keycache = {}
     def keys(a, col):
@@ -127,8 +130,16 @@ def execute(db, tree):
         if sk.size == 0:
             return np.zeros_like(dst_keep)
         mx = int(max(sk.max(), dst_keys.max())) if dst_keys.size else int(sk.max())
+        idx = np.flatnonzero(dst_keep)
+        if idx.size == 0: return dst_keep
         if mx < 200_000_000:
             lut = np.zeros(mx + 2, bool); lut[sk] = True
+            if idx.size * 8 < dst_keys.size:
+                # SURVIVORS ONLY: once the keep is small, gather only the kept rows' keys
+                dk = dst_keys[idx]
+                hit_s = lut[np.where(dk < 0, mx + 1, dk)]
+                out = np.zeros_like(dst_keep); out[idx[hit_s]] = True
+                return out
             hit = lut[np.where(dst_keys < 0, mx + 1, dst_keys)]
         else:
             hit = np.isin(dst_keys, np.unique(sk))
@@ -141,6 +152,7 @@ def execute(db, tree):
             if na.sum() != keeps[a].sum(): keeps[a] = na; changed = True
             nb = prune(xa, keeps[a], xb, keeps[b])
             if nb.sum() != keeps[b].sum(): keeps[b] = nb; changed = True
+            if _bill is not None: _bill.append(('r%d %s-%s keep %d/%d' % (_round, a, b, int(keeps[a].sum()), int(keeps[b].sum())), _tk() - _t0)); _t0 = _tk()
         if not changed: break
     # any table empty -> every MIN is NULL (a scalar over an empty join)
     empty = any(int(k.sum()) == 0 for k in keeps.values())
@@ -166,4 +178,7 @@ def execute(db, tree):
             vals = [v for v in vals if v is not None]
             out.append(wdb_sql._pyval(min(vals) if isinstance(nd, E.Min) else max(vals)) if vals else None)
     names = [wdb_sql._alias(p) for p in tree.expressions]
+    if _bill is not None:
+        _bill.append(('emit', _tk() - _t0))
+        print('SEMI BILL: ' + ' | '.join('%s=%.0fms' % (n, v * 1000) for n, v in _bill), flush=True)
     return [tuple(out)], names
