@@ -219,10 +219,14 @@ def _scalar_cmp(seg, node, col_map):
     if sp is None:
         return None
     v = lit.this
-    try:
-        v = int(str(v))
-    except Exception:
-        v = str(v)
+    if getattr(lit, 'is_string', False):
+        v = str(v)                              # a STRING literal stays a string: '01' is not 1
+    else:
+        try:
+            v = int(str(v))
+        except Exception:
+            try: v = float(str(v))
+            except Exception: v = str(v)
     return sp, _SCMP[tn], v
 
 

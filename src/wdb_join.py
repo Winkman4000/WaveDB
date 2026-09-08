@@ -2411,6 +2411,28 @@ def join_query(db, sql, columnar=False):
     pre_r = [x for x in extras if sides_in(x) == {'R'}]
     pre_l = [x for x in extras if sides_in(x) == {'L'}]
     mixed = [x for x in extras if len(sides_in(x)) == 2]
+    # PREDICATE PUSHDOWN: single-sided WHERE conjuncts filter their side BEFORE the
+    # merge -- exact for INNER; for an outer join only the preserved side (the
+    # other side's WHERE stays post-merge, where NULLs from unmatched rows count).
+    # Without it a 10M x 10M self-join on a 1000-rows-per-key pair built 10 BILLION
+    # pairs before the WHERE (scope speed board, multi_col_on).
+    _wh9 = tree.args.get('where')
+    _post_where9 = []
+    if _wh9 is not None:
+        def _fl2(x):
+            if isinstance(x, E.Paren): return _fl2(x.this)
+            if isinstance(x, E.And): return _fl2(x.this) + _fl2(x.expression)
+            return [x]
+        for cj in _fl2(_wh9.this):
+            sd = sides_in(cj)
+            if cj.find(E.Subquery) is not None or None in sd:
+                _post_where9.append(cj); continue
+            if sd == {'L'} and _how9 in ('inner', 'left'):
+                ldf = ldf[_mask_df(ldf, cj)]
+            elif sd == {'R'} and _how9 in ('inner', 'right'):
+                rdf = rdf[_mask_df(rdf, cj)]
+            else:
+                _post_where9.append(cj)
     if _how9 in ('inner', 'left') and pre_r:
         for x in pre_r: rdf = rdf[_mask_df(rdf, x)]
     if _how9 in ('inner', 'right') and pre_l:
@@ -2458,7 +2480,11 @@ def join_query(db, sql, columnar=False):
     R = lambda colnode: resolve(colnode.table, colnode.name)
     where = tree.args.get('where')
     if where is not None:
-        merged = merged[_mask(merged, where.this, R)]
+        _rest9 = None
+        for cj in _post_where9:
+            _rest9 = cj if _rest9 is None else E.And(this=_rest9, expression=cj)
+        if _rest9 is not None:
+            merged = merged[_mask(merged, _rest9, R)]
 
     proj = tree.expressions
     group = tree.args.get('group')
@@ -3081,6 +3107,10 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         b = wdb_sql._lit_for_col(seg, pcol, e, 'O')
         return b if isinstance(b, (bytes, bytearray)) else str(b).encode()
     def leaf(colnode, make_bool):
+        if not isinstance(colnode, E.Column):
+            # NEVER a silent column: a function/expression LHS (SUBSTRING(id3,3,2) = '10')
+            # used to resolve through .name to the inner column and evaluate id3 = '10'
+            raise _FastUnsupported
         seg, pcol, cptr = resolve(colnode)       # evaluate un-gathered, then gather the bool via composed ptr
         b = make_bool(seg, pcol)
         return b if cptr is None else b[cptr]
@@ -3394,6 +3424,15 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 cols9 = list(cn.find_all(E.Column))
                 if len(cols9) != 1:
                     _cres9.append(cn); continue     # multi-column (Q7's OR): residual
+                # THE BARE-COLUMN LAW: a keep is judged over ONE column's dictionary,
+                # so every comparison in the conjunct must stand on that bare column.
+                # SUBSTRING(id3,3,2) = '10' has one column and was judged as id3 = '10'
+                # (an empty keep, a silent zero) -- a function LHS is residual.
+                _CMP9 = (E.EQ, E.NEQ, E.GT, E.GTE, E.LT, E.LTE, E.Between, E.In, E.Like, E.ILike, E.Is)
+                _cmps9 = [cn] if isinstance(cn, _CMP9) else []
+                _cmps9 += [x for x in cn.find_all(*_CMP9) if x is not cn]
+                if not _cmps9 or any(not isinstance(x.this, E.Column) for x in _cmps9):
+                    _cres9.append(cn); continue
                 cs9, cp9, cc9p = resolve(cols9[0])
                 c9 = cs9.cols.get(cp9) or {}
                 kx9 = None

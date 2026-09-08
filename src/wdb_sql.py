@@ -407,6 +407,10 @@ def _expr_is_int(nd, seg, seg_col):
         return _expr_is_int(nd.this, seg, seg_col) and _expr_is_int(nd.expression, seg, seg_col)
     if isinstance(nd, E.Neg): return _expr_is_int(nd.this, seg, seg_col)
     if isinstance(nd, E.Abs): return _expr_is_int(nd.this, seg, seg_col)
+    if isinstance(nd, E.Nullif): return _expr_is_int(nd.this, seg, seg_col) and _expr_is_int(nd.expression, seg, seg_col)
+    if isinstance(nd, E.Coalesce):
+        parts = [nd.this] + list(nd.args.get('expressions') or [])
+        return all(_expr_is_int(p, seg, seg_col) for p in parts)
     return False
 
 
