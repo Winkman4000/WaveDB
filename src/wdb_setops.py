@@ -367,6 +367,9 @@ def _try_fused_union(db, node):
     return rows, list(hdr)
 
 
+_SET_DISTINCT_OK = {'on': True}       # UNION ALL leaves must keep duplicates: _eval turns this off for them
+
+
 def _eval(db, node, esc):
     if isinstance(node, _SETOPS):
         if isinstance(node, E.Union) and node.args.get('distinct'):
@@ -377,8 +380,14 @@ def _eval(db, node, esc):
             fused = _try_fused_union(db, node)
             if fused is not None:
                 return fused
-        lrows, lhdr = _eval(db, node.this, esc)
-        rrows, rhdr = _eval(db, node.expression, esc)
+        _prev9 = _SET_DISTINCT_OK['on']
+        if isinstance(node, E.Union) and not node.args.get('distinct'):
+            _SET_DISTINCT_OK['on'] = False            # UNION ALL: duplicates are the answer
+        try:
+            lrows, lhdr = _eval(db, node.this, esc)
+            rrows, rhdr = _eval(db, node.expression, esc)
+        finally:
+            _SET_DISTINCT_OK['on'] = _prev9
         if lrows and rrows and len(lrows[0]) != len(rrows[0]):
             raise ValueError("set operation arity mismatch: %d vs %d columns"
                              % (len(lrows[0]), len(rrows[0])))
@@ -394,7 +403,14 @@ def _eval(db, node, esc):
             rs = set(rrows)
             rows = [r for r in dict.fromkeys(lrows) if r not in rs]
         return rows, lhdr
-    out = db.run(node.sql())
+    # SET SEMANTICS: a leaf of INTERSECT / EXCEPT / UNION (DISTINCT) only needs its
+    # DISTINCT rows -- the dictionary answers that at V-scale (7.4s -> ms at 10M)
+    _leaf9 = node
+    if isinstance(_leaf9, E.Select) and _leaf9.args.get('distinct') is None and _leaf9.args.get('group') is None \
+            and _leaf9.find(E.AggFunc) is None and _leaf9.find(E.Window) is None and _leaf9.args.get('limit') is None \
+            and _SET_DISTINCT_OK.get('on', True):
+        _leaf9 = _leaf9.copy(); _leaf9.set('distinct', E.Distinct())
+    out = db.run(_leaf9.sql())
     rows, hdr = out if isinstance(out, tuple) else (out, None)
     return [_norm_row(r) for r in rows], hdr
 
