@@ -362,6 +362,14 @@ class Database:
                 _t9 = wdb_subquery.substitute_select_scalars(self, tree.copy())
                 if _t9.sql() != sql:
                     return self._run_impl(_t9.sql(), escalate)     # SELECT-list scalars -> literals
+            if tree.args.get('order') is not None and tree.args.get('limit') is not None and tree.args.get('group') is None \
+                    and not tree.args.get('joins'):
+                try:
+                    _tk9 = wdb_join._topk_rows_door(self, tree)
+                except wdb_join._FastUnsupported:
+                    _tk9 = None
+                if _tk9 is not None:
+                    return _tk9                                # THE TOP-K ROWS DOOR
             _hr9 = wdb_join.hidden_rewrite(tree)
             if _hr9 is not None:
                 _sql9, _nh9 = _hr9

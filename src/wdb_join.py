@@ -2072,6 +2072,90 @@ def _window_door(db, tree):
 
 
 
+def _topk_rows_door(db, tree):
+    """THE TOP-K ROWS DOOR: SELECT cols FROM t [WHERE] ORDER BY keys LIMIT k on a
+    single table with no group/aggregate/window -- argpartition on the first
+    order key over survivors (ties at the k-th value kept), a full sort only
+    over the candidates, then gather the projections at the winners. The row
+    select used to materialise 10M Python tuples and sort them (26.9s)."""
+    if not isinstance(tree, E.Select): return None
+    if tree.args.get('group') is not None or tree.args.get('joins') or tree.args.get('distinct') is not None: return None
+    order = tree.args.get('order'); lim = tree.args.get('limit')
+    if order is None or lim is None: return None
+    try:
+        k = int(lim.expression.this)
+    except Exception:
+        return None
+    off = tree.args.get('offset')
+    off_n = int(off.expression.this) if off is not None else 0
+    if k <= 0 or k + off_n > 1_000_000: return None
+    frm = tree.args.get('from') or tree.args.get('from_')
+    if frm is None or not isinstance(frm.this, E.Table): return None
+    if tree.find(E.AggFunc) is not None or tree.find(E.Window) is not None or tree.find(E.Select) is not tree: return None
+    for p in tree.expressions:
+        nd = p.this if isinstance(p, E.Alias) else p
+        if not isinstance(nd, E.Column): return None
+    okeys = list(order.expressions)
+    if not all(isinstance(o.this, E.Column) for o in okeys): return None
+    tname = frm.this.name
+    try:
+        seg, _sp = _solo_segment(db, tname)
+    except _FastUnsupported:
+        return None
+    pm = db.cat.phys_map(tname)
+    try:
+        cm9 = seg.cluster_meta()
+    except Exception:
+        cm9 = None
+    if cm9 is not None and pm.get(okeys[0].this.name, okeys[0].this.name) == cm9.get('key'):
+        return None                       # ordered by the CLUSTER KEY: the clustertopk door is faster
+    w = tree.args.get('where')
+    if w is not None:
+        m = wdb_sql._eval_pred(seg, w.this, lambda nm: pm.get(nm, nm))
+        rows = np.flatnonzero(np.asarray(m, dtype=bool))
+    else:
+        rows = np.arange(int(seg.N), dtype=np.int64)
+    if rows.size == 0: return [], [wdb_sql._alias(p) for p in tree.expressions]
+    def key_of(col, rr):
+        pc = pm.get(col.name, col.name); cd = seg.cols.get(pc, {})
+        if cd.get('has_null') or cd.get('mode') not in (0, 1, 2, 4): raise _FastUnsupported
+        if cd.get('mode') in (0, 1, 2):
+            # SORTED DICTIONARIES (np.unique at encode; front-coding requires order):
+            # code order IS value order for strings and numbers alike -- the key is
+            # the codes, no base gather
+            return np.asarray(seg.codes_at(pc, rr)).astype(np.int64)
+        raw = wdb_sql.raw_dict_col(seg, pc, want_codes=False)
+        if raw is None: raise _FastUnsupported
+        return raw[0][np.asarray(seg.codes_at(pc, rr))]
+    need = k + off_n
+    k0 = key_of(okeys[0].this, rows)
+    desc0 = bool(okeys[0].args.get('desc'))
+    kk = -k0 if desc0 else k0
+    if need < rows.size:
+        part = np.argpartition(kk, need - 1)[:need]
+        thresh = kk[part].max()
+        cand = np.flatnonzero(kk <= thresh)                           # every row tied at the k-th value
+    else:
+        cand = np.arange(rows.size)
+    # full ORDER BY over the candidates only
+    keys = []
+    for o in reversed(okeys):
+        kv = key_of(o.this, rows[cand])
+        keys.append(-kv if o.args.get('desc') else kv)
+    order_idx = np.lexsort(tuple(keys)) if len(keys) > 1 else np.argsort(keys[0], kind='stable')
+    win = rows[cand][order_idx][off_n:off_n + k]
+    cols = []
+    for p in tree.expressions:
+        nd = p.this if isinstance(p, E.Alias) else p
+        pc = pm.get(nd.name, nd.name)
+        if seg.cols.get(pc, {}).get('mode') == 5:
+            cols.append(list(seg.values_at_rows(pc, win)))
+        else:
+            cols.append(_bulk_keyvals(seg, pc, np.asarray(seg.codes_at(pc, win))))
+    return [tuple(c[i] for c in cols) for i in range(win.size)], [wdb_sql._alias(p) for p in tree.expressions]
+
+
+
 def _from_door(db, tree):
     """THE FROM DOOR (Q7/Q13/Q22): FROM (SELECT ...) alias -- run the INNER
     through the engine (it rides every fast path: trees, cascades, courts),
