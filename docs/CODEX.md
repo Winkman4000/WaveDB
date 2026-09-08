@@ -737,3 +737,34 @@ STRING_AGG on tied keys are legally ambiguous -- the probe orders
 deterministically. Honest note: the new families are correctness
 faces (row evaluator, pandas joiner); the dict-space transform is the
 speed home when a board asks. Suite 1696/0 at every push.
+
+
+## THE SCOPE SPEED STAGE (2026-09-08): the faces billed and struck
+bench/board_scope.py: all 100 constructs at 10M rows, wave vs duck,
+exact-checked -- a permanent third eye beside the realms. Morning:
+wave 140.7s vs duck 15.8s, 52 wins, and TWO WRONGS at scale the 200K
+probe never saw. Evening: wave ~29s, 55+ wins, median 1.5x, 100/100.
+CONVICTIONS: PREDICATE PUSHDOWN in the step-1 joiner (a 10M x 10M self-
+join built ten billion pairs before its WHERE); string literals stay
+strings in _scalar_cmp ('01' is not 1); NULLIF/COALESCE typed for
+integer emission; THE BARE-COLUMN LAW twice -- the cascade's mask leaf
+and its plan-build accepted a function LHS and resolved it through
+.name to the inner column (SUBSTRING(id3,3,2) = '10' judged as id3 =
+'10': a SILENT ZERO, only on front-coded columns at scale). ORGANS:
+THE DICTIONARY MAP (a function over a dictionary column evaluates once
+per distinct value and gathers through the codes; DISTINCT aggregates
+over expressions on distinct code tuples; MIN/MAX of strings from the
+extreme present code) -- concat 21.4s -> 0.30, regexp 10.6 -> 0.29,
+like 5.6 -> 0.37, substring 4.0 -> 0.37, string_agg 11.9 -> 1.8; THE
+TOP-K ROWS DOOR (argpartition with ties, codes as keys for sorted
+dictionaries, yields to clustertopk) 26.9s -> 0.66; SET SEMANTICS AT THE
+LEAVES (INTERSECT/EXCEPT/UNION leaves DISTINCT at V-scale) 7.4 -> 0.03,
+6.5 -> 0.04; the window door filters on arrays before materialising
+and counting-scatters partition-only windows (scalar_corr 11.6 -> 1.6);
+one-column expression group keys in code space (case_multi 4.0 ->
+0.06). PROBE LAWS: ANY_VALUE is legally ambiguous per group; float sums
+differ in the 14th digit -- the board's %.6g comparator is the referee.
+LEFT: small row-aggregates ~0.8-1.0s (count_if, bool_and, coalesce,
+nullif: one column read plus Python -- a composite map or a kernel),
+using 0.8s (a small dim through the step-1 joiner; the road organ),
+min_max_str 1.6s. Suite 1696/0 at every push.
