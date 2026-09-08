@@ -504,7 +504,18 @@ def _eval_rows_core(seg, node, mask, resolve=None, env=None):
     if isinstance(n, E.Literal):
         return n.this.encode() if n.is_string else _literal_value(n)
     if isinstance(n, E.Null): return None
-    if isinstance(n, E.Not): return ~_eval_rows(seg, n.this, mask, resolve, env)
+    if isinstance(n, E.Not):
+        inner = np.asarray(_eval_rows(seg, n.this, mask, resolve, env), dtype=bool)
+        cols9 = list(n.this.find_all(E.Column))
+        if len(cols9) == 1 and isinstance(n.this, (E.Like, E.ILike, E.RegexpLike, E.EQ, E.NEQ, E.GT, E.LT, E.GTE, E.LTE, E.In, E.Between)):
+            if env is not None and cols9[0].name in env:
+                isn = np.array([v is None for v in np.asarray(env[cols9[0].name], dtype=object)], dtype=bool)
+                return ~inner & ~isn                          # THREE-VALUED LOGIC: NOT of a NULL predicate is not true
+            _cn9 = resolve(cols9[0].name) if resolve is not None else cols9[0].name
+            if seg.cols.get(_cn9, {}).get('has_null'):
+                _rc9 = np.asarray(seg.codes(_cn9)); _rc9 = _rc9[mask] if mask is not None else _rc9
+                return ~inner & ~(_rc9 == (int(seg.cols[_cn9]['V']) - 1))
+        return ~inner
     if isinstance(n, E.And): return _eval_rows(seg, n.this, mask, resolve, env) & _eval_rows(seg, n.expression, mask, resolve, env)
     if isinstance(n, E.Or):  return _eval_rows(seg, n.this, mask, resolve, env) | _eval_rows(seg, n.expression, mask, resolve, env)
     if isinstance(n, (E.EQ, E.NEQ, E.GT, E.LT, E.GTE, E.LTE)):
@@ -592,8 +603,11 @@ def _eval_rows_core(seg, node, mask, resolve=None, env=None):
         pat = str(n.expression.this); rx = '^' + _re.escape(pat).replace('%', '.*').replace('_', '.') + '$'
         flags = _re.I if isinstance(n, E.ILike) else 0
         cre = _re.compile(rx, flags)
-        out = np.array([False if v is None else bool(cre.match(v)) for v in strs(ev(n.this))])
-        return ~out if n.args.get('negate') else out
+        sv = strs(ev(n.this))
+        isn = np.array([v is None for v in sv], dtype=bool)
+        out = np.array([False if v is None else bool(cre.match(v)) for v in sv])
+        # THREE-VALUED LOGIC: NULL [NOT] LIKE is never true (JOB 1b: NULL notes leaked through NOT LIKE)
+        return (~out & ~isn) if n.args.get('negate') else out
     if isinstance(n, E.RegexpLike):
         import re as _re
         cre = _re.compile(str(n.expression.this))

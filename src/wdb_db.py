@@ -343,6 +343,12 @@ class Database:
                 sql = tree.sql()
             if tree.args.get('joins'):
                 import os as _os9
+                import wdb_semijoin
+                if wdb_semijoin.shape_ok(tree):
+                    try:
+                        return wdb_semijoin.execute(self, tree)     # THE SEMI-JOIN FIXPOINT (MIN/MAX-only multi-joins)
+                    except wdb_semijoin._Decline:
+                        pass
                 if _os9.environ.get('WDB_JOIN_BILL'):
                     import time as _t9
                     _d0 = _t9.perf_counter()
