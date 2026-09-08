@@ -468,6 +468,23 @@ def _like_mode5(seg, pc, pat, icase):
 
 
 
+def _like_prefix_range(vals, isn, pat, icase):
+    """Anchored-start LIKE over a SORTED dictionary: the prefix is a contiguous
+    code range (two binary searches); the regex verifies only that range."""
+    import re as _re, bisect
+    if icase or '_' in pat or '\\' in pat or not pat or pat[0] == '%': return None
+    prefix = pat.split('%')[0].encode()
+    b = [(v.encode() if isinstance(v, str) else (v if v is not None else b'')) for v in vals]
+    lo = bisect.bisect_left(b, prefix); hi = bisect.bisect_left(b, prefix + b'\xff\xff\xff\xff')
+    out = np.zeros(len(b), bool)
+    if hi <= lo: return out
+    rx = '^' + _re.escape(pat).replace('%', '.*') + '$'
+    cre = _re.compile(rx, _re.S)
+    for j in range(lo, hi):
+        if not isn[j] and cre.match(b[j].decode('utf-8', 'replace')): out[j] = True
+    return out
+
+
 def _like_vectorised(vals, isn, pat, icase, sarr=None):
     """LIKE over an object array of bytes/str: numpy byte ops build a CANDIDATE
     SUPERSET (every '%'-separated token present, anchors honoured), then the
@@ -486,6 +503,13 @@ def _like_vectorised(vals, isn, pat, icase, sarr=None):
     elif _sc9 is not None and _sc9[0] is vals:
         arr = _sc9[1]
     else:
+        # THE WIDTH LAW: a fixed-width S-array is V x max length; plot summaries make
+        # that gigabytes. Past 256MB, the regex path over the list is the cheaper truth.
+        mx = 0
+        for v in b:
+            if len(v) > mx: mx = len(v)
+        if mx * len(b) > (256 << 20):
+            return None
         try:
             arr = np.array(b, dtype='S')                 # fixed width bytes
         except Exception:
@@ -498,6 +522,12 @@ def _like_vectorised(vals, isn, pat, icase, sarr=None):
     cand = ~isn
     for i, t in enumerate(toks):
         tb = t.encode()
+        if i > 0 and cand.sum() * 8 < cand.size:
+            # CHAINED ON CANDIDATES: later tokens only scan the rows the first token kept
+            ci = np.flatnonzero(cand); sub = arr[ci]
+            hit = (np.char.endswith(sub, tb) if (i == len(toks) - 1 and anchored_end) else (np.char.find(sub, tb) >= 0))
+            cand[ci[~hit]] = False
+            continue
         if i == 0 and anchored_start:
             cand &= np.char.startswith(arr, tb)
         elif i == len(toks) - 1 and anchored_end:
@@ -686,7 +716,11 @@ def _eval_rows_core(seg, node, mask, resolve=None, env=None):
         raw9 = ev(n.this)
         raw9 = np.asarray(raw9, dtype=object) if not isinstance(raw9, np.ndarray) else raw9
         isn = np.array([v is None for v in raw9], dtype=bool) if raw9.dtype == object else np.zeros(raw9.shape[0], bool)
-        out = _like_vectorised(raw9, isn, pat, isinstance(n, E.ILike))
+        out = None
+        if env is not None and isinstance(n.this, E.Column) and n.this.name in env:
+            out = _like_prefix_range(raw9, isn, pat, isinstance(n, E.ILike))     # env = a SORTED dictionary
+        if out is None:
+            out = _like_vectorised(raw9, isn, pat, isinstance(n, E.ILike))
         if out is None:
             rx = '^' + _re.escape(pat).replace('%', '.*').replace('_', '.') + '$'
             flags = _re.I if isinstance(n, E.ILike) else 0
@@ -1976,6 +2010,11 @@ def _eval_pred(seg, node, seg_col):
 
 
 def _eval_pred_core(seg, node, seg_col):
+    if isinstance(node, E.Is) and isinstance(node.this, E.Column) and isinstance(node.expression, E.Null):
+        _c9 = seg.cols.get(seg_col(node.this.name), {})
+        if not _c9.get('has_null'):
+            # IS [NOT] NULL on a column without nulls is a CONSTANT (was a 2.3s decode)
+            return np.zeros(int(seg.N), bool) if not node.args.get('not') else np.ones(int(seg.N), bool)
     if isinstance(node, E.And): return _eval_pred(seg,node.this,seg_col) & _eval_pred(seg,node.expression,seg_col)
     if isinstance(node, E.Or):  return _eval_pred(seg,node.this,seg_col) | _eval_pred(seg,node.expression,seg_col)
     if isinstance(node, E.Not): return ~_eval_pred(seg,node.this,seg_col)

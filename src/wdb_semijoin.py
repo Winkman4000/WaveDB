@@ -108,27 +108,105 @@ def execute(db, tree):
             if nm is not None: out = np.where(nm, -1, out)
         keycache[k] = out
         return out
+    def keys_at(a, col, idx):
+        """key values at the given rows only (point reads) -- NULL -> -1"""
+        seg = segs[a]; pc = pms[a].get(col, col); cd = seg.cols.get(pc)
+        if cd is None: raise _Decline('no such column %s.%s' % (a, col))
+        if cd.get('dt') != 0: raise _Decline('non-integer join key %s.%s' % (a, col))
+        if (a, col) in keycache:
+            return keycache[(a, col)][idx]
+        inv9 = getattr(seg, '_inv_cache', {}).get(pc)
+        if inv9 is None and int(seg.N) >= 1_000_000:
+            inv9 = inverted(a, [col])
+        if inv9 is not None:
+            u9, offs9, _o9, rank9 = inv9
+            pos9 = np.asarray(rank9[idx]).astype(np.int64)
+            return u9[np.searchsorted(offs9, pos9, side='right') - 1]    # THE REVERSE ROAD answers point reads
+        raw = wdb_sql.raw_dict_col(seg, pc, want_codes=False)
+        if raw is not None:
+            vals = np.asarray(raw[0]).astype(np.int64)
+            if cd.get('has_null'): vals = np.append(vals, -1)
+            return vals[np.asarray(seg.codes_at(pc, idx))]
+        return np.array([(-1 if v is None else int(v)) for v in seg.values_at_rows(pc, idx)], dtype=np.int64)
     # edge merge: several equalities between the same pair -> composite keys
     pair = {}
     for a, ca, b, cb in edges:
         key = (a, b) if a < b else (b, a)
         pair.setdefault(key, []).append((ca, cb) if a < b else (cb, ca))
-    def combined(a, cols_a, b, cols_b):
-        ka = [keys(a, c) for c in cols_a]; kb = [keys(b, c) for c in cols_b]
-        if len(ka) == 1: return ka[0], kb[0]
-        # composite: pack (values are ids < 2^31 in IMDB)
-        xa = np.zeros_like(ka[0]); xb = np.zeros_like(kb[0])
-        for va, vb in zip(ka, kb):
-            xa = xa * (1 << 31) + np.where(va < 0, 0, va); xb = xb * (1 << 31) + np.where(vb < 0, 0, vb)
-        xa = np.where(np.any(np.stack([v < 0 for v in ka]), axis=0), -1, xa)
-        xb = np.where(np.any(np.stack([v < 0 for v in kb]), axis=0), -1, xb)
-        return xa, xb
+    def pack(t, cols):
+        ks = [keys(t, c) for c in cols]
+        if len(ks) == 1: return ks[0]
+        x = np.zeros_like(ks[0])
+        for v in ks: x = x * (1 << 31) + np.where(v < 0, 0, v)      # ids < 2^31 in IMDB
+        return np.where(np.any(np.stack([v < 0 for v in ks]), axis=0), -1, x)
+    # THE REVERSE ROAD: an inverted index per key column (sorted unique values,
+    # offsets, row order) -- born once per segment file, mmap'd -- so a small
+    # surviving key set on one side yields its rows on the other without a
+    # pass over N. Used when the source keep is small relative to the target.
+    def inverted(a, cols_a):
+        if len(cols_a) != 1: return None
+        seg = segs[a]; pc = pms[a].get(cols_a[0], cols_a[0])
+        cache = getattr(seg, '_inv_cache', None)
+        if cache is None: cache = seg._inv_cache = {}
+        if pc in cache: return cache[pc]
+        path = getattr(seg, 'path', None) or getattr(seg, '_path', None)
+        fn = ('%s.%s.inv' % (path, pc)) if path else None       # three mmap'd .npy files: u / offs / order
+        try:
+            if fn and __import__('os').path.exists(fn + '.rank.npy'):
+                u = np.load(fn + '.u.npy'); offs = np.load(fn + '.offs.npy')
+                order = np.load(fn + '.order.npy', mmap_mode='r'); rank = np.load(fn + '.rank.npy', mmap_mode='r')
+                cache[pc] = (u, offs, order, rank)
+                return cache[pc]
+        except Exception:
+            pass
+        vals = keys(a, cols_a[0])
+        order = np.argsort(vals, kind='stable').astype(np.int32 if vals.size < 2**31 else np.int64)
+        sv = vals[order]
+        u, starts = np.unique(sv, return_index=True)
+        offs = np.append(starts, sv.size).astype(np.int64)
+        rank = np.empty_like(order); rank[order] = np.arange(order.size, dtype=order.dtype)   # row -> position
+        cache[pc] = (u, offs, order, rank)
+        if fn:
+            try:
+                _os9 = __import__('os')
+                for nm9, arr9 in (('u', u), ('offs', offs), ('order', order), ('rank', rank)):
+                    np.save(fn + '.%s.tmp.npy' % nm9, arr9)
+                    _os9.replace(fn + '.%s.tmp.npy' % nm9, fn + '.%s.npy' % nm9)
+                cache[pc] = (u, offs, np.load(fn + '.order.npy', mmap_mode='r'), np.load(fn + '.rank.npy', mmap_mode='r'))
+            except Exception as _e:
+                if __import__('os').environ.get('WDB_SEMI_BILL'):
+                    print('SEMI: inverted sidecar save failed for %s: %s' % (fn, str(_e)[:80]), flush=True)
+        return cache[pc]
+    def prune_inverted(inv, sk, dst_keep, dst_n):
+        u, offs, order, _rank = inv
+        pos = np.searchsorted(u, sk)
+        pos = pos[(pos < u.size)]
+        hit = pos[u[pos] == sk[:pos.size]] if pos.size == sk.size else pos[np.isin(u[pos], sk)]
+        if hit.size == 0: return np.zeros_like(dst_keep)
+        out = np.zeros_like(dst_keep)
+        for p in hit.tolist():
+            rows = order[offs[p]:offs[p + 1]]
+            out[rows] = True
+        return out & dst_keep
     # fixpoint
-    def prune(src_keys, src_keep, dst_keys, dst_keep):
-        sk = src_keys[src_keep]
+    def prune(src, src_cols, src_keep, dst, dst_cols, dst_keep):
+        n_src = int(segs[src].N); n_dst = int(segs[dst].N)
+        src_idx = np.flatnonzero(src_keep)
+        if src_idx.size == 0:
+            return np.zeros_like(dst_keep)
+        # SOURCE keys: point reads at the surviving rows when the keep is small
+        if len(src_cols) == 1:
+            sk = keys_at(src, src_cols[0], src_idx) if src_idx.size * 4 < n_src else keys(src, src_cols[0])[src_idx]
+        else:
+            sk = pack(src, src_cols)[src_idx]
         sk = sk[sk >= 0]
         if sk.size == 0:
             return np.zeros_like(dst_keep)
+        if len(dst_cols) == 1 and n_dst >= 1_000_000 and sk.size <= 20_000 and int(dst_keep.sum()) * 2 > src_idx.size:
+            inv = inverted(dst, dst_cols)
+            if inv is not None:
+                return prune_inverted(inv, np.unique(sk), dst_keep, n_dst)
+        dst_keys = pack(dst, dst_cols)
         mx = int(max(sk.max(), dst_keys.max())) if dst_keys.size else int(sk.max())
         idx = np.flatnonzero(dst_keep)
         if idx.size == 0: return dst_keep
@@ -144,18 +222,26 @@ def execute(db, tree):
         else:
             hit = np.isin(dst_keys, np.unique(sk))
         return dst_keep & hit
+    counts = {a: int(np.count_nonzero(k)) for a, k in keeps.items()}
     for _round in range(12):
         changed = False
         for (a, b), pairs in pair.items():
-            xa, xb = combined(a, [p[0] for p in pairs], b, [p[1] for p in pairs])
-            na = prune(xb, keeps[b], xa, keeps[a])
-            if na.sum() != keeps[a].sum(): keeps[a] = na; changed = True
-            nb = prune(xa, keeps[a], xb, keeps[b])
-            if nb.sum() != keeps[b].sum(): keeps[b] = nb; changed = True
-            if _bill is not None: _bill.append(('r%d %s-%s keep %d/%d' % (_round, a, b, int(keeps[a].sum()), int(keeps[b].sum())), _tk() - _t0)); _t0 = _tk()
+            ca9 = [p[0] for p in pairs]; cb9 = [p[1] for p in pairs]
+            # prune the side with MORE survivors from the side with fewer, first
+            def _step(x, cx, y, cy):
+                nonlocal changed
+                ny = prune(x, cx, keeps[x], y, cy, keeps[y])
+                cnt = int(np.count_nonzero(ny))
+                if cnt != counts[y]:
+                    keeps[y] = ny; counts[y] = cnt; changed = True
+            if counts[a] >= counts[b]:
+                _step(b, cb9, a, ca9); _step(a, ca9, b, cb9)
+            else:
+                _step(a, ca9, b, cb9); _step(b, cb9, a, ca9)
+            if _bill is not None: _bill.append(('r%d %s-%s keep %d/%d' % (_round, a, b, counts[a], counts[b]), _tk() - _t0)); _t0 = _tk()
         if not changed: break
     # any table empty -> every MIN is NULL (a scalar over an empty join)
-    empty = any(int(k.sum()) == 0 for k in keeps.values())
+    empty = any(c == 0 for c in counts.values())
     out = []
     for p in tree.expressions:
         nd = p.this if isinstance(p, E.Alias) else p
