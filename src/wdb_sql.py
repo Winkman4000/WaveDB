@@ -427,7 +427,7 @@ def _dict_string_col(seg, node, resolve, any_dt=False):
     nm = cols[0].name
     pc = resolve(nm) if resolve is not None else nm
     c = seg.cols.get(pc)
-    if c is None or c.get('mode') not in (0, 1, 2) or c.get('has_null'): return None
+    if c is None or c.get('mode') not in (0, 1, 2): return None
     if not any_dt and c.get('dt') != 1: return None
     if node.find(E.Select) is not None or node.find(E.AggFunc) is not None: return None
     return nm, pc
@@ -447,9 +447,18 @@ def _eval_rows(seg, node, mask, resolve=None, env=None):
             if mask is not None: codes = codes[mask]
             td = seg._typed_dict(pc)
             td = np.asarray(td, dtype=object) if not isinstance(td, np.ndarray) else td
+            if seg.cols[pc].get('has_null'):
+                td = np.append(td.astype(object), None)                # the null code maps to None
             outv = _eval_rows(seg, n, None, resolve, env={nm: td})
             outv = np.asarray(outv, dtype=object) if not isinstance(outv, np.ndarray) else outv
             if outv.shape[0] != V: raise TypeError('dictionary map: %d values for V=%d' % (outv.shape[0], V))
+            if outv.dtype == object:
+                # numeric-or-None over V collapses to float with NaN (a numeric N-array gathers fast)
+                try:
+                    if all(v is None or isinstance(v, (int, float, np.integer, np.floating, bool, np.bool_)) for v in outv):
+                        outv = np.array([np.nan if v is None else float(v) for v in outv], dtype=np.float64)
+                except Exception:
+                    pass
             return outv[codes]
     return _eval_rows_core(seg, node, mask, resolve, env)
 
@@ -468,8 +477,19 @@ def _eval_rows_core(seg, node, mask, resolve=None, env=None):
         return env[n.name]
     if isinstance(n, E.Column):
         c = resolve(n.name) if resolve is not None else n.name; col = seg.cols[c]
-        if col['dt'] == 1:                                   # string dict col: decode distinct survivors
+        if col['dt'] == 1:                                   # string dict col
             rc = seg.codes(c); rc = rc[mask] if mask is not None else rc
+            V9 = int(col.get('V') or 0)
+            if col.get('mode') in (0, 1, 2) and V9 and V9 <= max(rc.size, 1):
+                # THE DICTIONARY GATHER: V decoded values, one int gather -- no unique over N
+                td9 = seg._typed_dict(c)
+                td9 = np.asarray(td9, dtype=object) if not isinstance(td9, np.ndarray) else td9
+                if col.get('aux') == 9:
+                    tdb = np.array([(v if isinstance(v, bool) else (v == b'True')) for v in td9], dtype=bool)
+                    if col.get('has_null'): tdb = np.append(tdb, False)
+                    return tdb[rc]
+                if col.get('has_null'): td9 = np.append(td9, None)
+                return td9[rc]
             uc, inv = np.unique(rc, return_inverse=True)
             vals = np.empty(len(uc), dtype=object)
             for i, code in enumerate(uc):
@@ -1562,13 +1582,12 @@ def _agg_scalar(seg, p, mask, seg_col):
         if mask is not None: codes = codes[mask]
         if codes.size == 0: return None
         nullcode = (int(_c9['V']) - 1) if _c9.get('has_null') else None
-        uc = np.unique(codes)
-        if nullcode is not None: uc = uc[uc != nullcode]
-        if uc.size == 0: return None
-        td = seg._typed_dict(seg_col(cn))
-        vals = [td[int(k)] for k in uc]
-        v = min(vals) if fn == 'MIN' else max(vals)
-        return _pyval(v)
+        if nullcode is not None:
+            codes = codes[codes != nullcode]
+            if codes.size == 0: return None
+        # SORTED DICTIONARY: the extreme CODE is the extreme value (O(N) min/max, no unique)
+        k = int(codes.min()) if fn == 'MIN' else int(codes.max())
+        return _pyval(seg._typed_dict(seg_col(cn))[k])
     arr, nm = _col(seg, seg_col(cn))
     if mask is not None:
         arr = arr[mask]; nm = nm[mask] if nm is not None else None

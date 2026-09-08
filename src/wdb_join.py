@@ -2343,6 +2343,20 @@ def join_query(db, sql, columnar=False):
     import time as _t8
     _jq_t0 = _t8.perf_counter()
     tree = sqlglot.parse_one(sql, read='duckdb')
+    for _jn9 in (tree.args.get('joins') or []):
+        # USING (c) -> ON l.c = r.c: the chain builder and the road organ read ON
+        if _jn9.args.get('using') and _jn9.args.get('on') is None:
+            _frm9 = tree.args.get('from') or tree.args.get('from_')
+            if _frm9 is not None and isinstance(_frm9.this, E.Table) and isinstance(_jn9.this, E.Table):
+                _la9 = _frm9.this.alias or _frm9.this.name; _ra9 = _jn9.this.alias or _jn9.this.name
+                _cond9 = None
+                for _u9 in _jn9.args['using']:
+                    _nm9 = _u9.name if hasattr(_u9, 'name') else str(_u9)
+                    _eq9 = E.EQ(this=E.Column(this=E.Identifier(this=_nm9, quoted=False), table=E.Identifier(this=_la9, quoted=False)),
+                                expression=E.Column(this=E.Identifier(this=_nm9, quoted=False), table=E.Identifier(this=_ra9, quoted=False)))
+                    _cond9 = _eq9 if _cond9 is None else E.And(this=_cond9, expression=_eq9)
+                _jn9.set('on', _cond9); _jn9.set('using', None)
+
     if tree.find(E.Window) is not None and not (tree.args.get('from') or tree.args.get('from_')).this.__class__.__name__ == 'Subquery':
         try:
             _wd9 = _window_door(db, tree)
