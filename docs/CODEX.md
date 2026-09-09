@@ -768,3 +768,36 @@ LEFT: small row-aggregates ~0.8-1.0s (count_if, bool_and, coalesce,
 nullif: one column read plus Python -- a composite map or a kernel),
 using 0.8s (a small dim through the step-1 joiner; the road organ),
 min_max_str 1.6s. Suite 1696/0 at every push.
+
+
+## THE JOB REALM (2026-09-09): the semi-join fixpoint and the reverse road
+IMDB (21 tables; cast_info 36M, movie_info 15M, name 4M) pulled and built
+in fifteen minutes: duckdb referee, encodes, catalog (bench/job_realm.py),
+the 113 Join Order Benchmark queries as a board (bench/board_job.py; the
+'at' alias is a reserved word in duck's parser -- renamed both sides).
+First board: 109/109 named holes, ONE family -- two facts meeting
+through a shared parent, which the one-fact road tree declines by name.
+THE SEMI-JOIN FIXPOINT (src/wdb_semijoin.py): every JOB query projects
+only MIN/MAX, and under MIN/MAX row multiplication is irrelevant -- a
+table contributes the extreme over its rows that PARTICIPATE. Local
+filters seed each table's keep, every equality edge prunes both sides
+to the other's surviving keys, iterate to stability, MIN by the extreme
+present dictionary code. No hash join, no row explosion. 113/113 EXACT
+on the first full board (wave 592s vs duck 10.6s). THE REVERSE ROAD:
+an inverted index per join-key column (sorted uniques, offsets, row
+order, and the inverse permutation RANK) in four mmap'd .npy sidecars,
+born once -- serves prunes from a small keep AND point reads without
+decompression (u[searchsorted(offs, rank[row])]). LAWS: three-valued
+logic under NOT/LIKE (NULL notes leaked through NOT LIKE in 1b); npz
+members are not mmaps; counts tracked, never re-summed over 36M bools;
+a fixed-width S-array is V x max length (THE WIDTH LAW); prefix LIKE on
+a sorted dictionary is a contiguous code range; string IN always in
+code space; IS [NOT] NULL on a null-free column is a constant; a
+dictionary is V-scale vocabulary and survives the flush (THE
+DICTIONARY SHELF, budgeted, size estimated ONCE). THE PATTERN OF THE
+DAY: every JOB cost that fell was a per-row pass over N hiding behind
+a shape with a V-scale or survivor-scale answer. Duck wins JOB by brute
+vectorised scanning; we win, when we do, by never scanning. 6a 4.3 ->
+0.49s, 15b 385 -> 1.8s, 29a 14.4 -> 2.7s. NEXT: the fixpoint should
+start from the most selective table and never materialise an all-true
+keep; the board twice in one process for the honest warm total.
