@@ -275,6 +275,23 @@ class Database:
                           'fd_freed_bytes': freed,
                           'wall_s': round(time.perf_counter() - t_all, 1)}
 
+    def _new_doors(self, tree, sql):
+        """THE PRECEDENCE LAW: the controller's doors serve first; the doors born in
+        the scope stage (aggregate arithmetic, expression group keys, windows, top-k
+        rows) only answer what the controller declined BY NAME. Returns a result or None."""
+        import wdb_join
+        E9 = sqlglot.exp
+        if tree.args.get('order') is not None and tree.args.get('limit') is not None and tree.args.get('group') is None \
+                and not tree.args.get('joins') and tree.find(E9.Window) is None and tree.find(E9.AggFunc) is None:
+            try:
+                r = wdb_join._topk_rows_door(self, tree)
+                if r is not None: return r
+            except wdb_join._FastUnsupported:
+                pass
+        if tree.find(E9.Window) is not None or wdb_join.has_agg_arith(tree) or wdb_join.has_expr_group(tree):
+            return wdb_join.join_query(self, sql)
+        return None
+
     def _table_in(self, tree):
         f = tree.find(E.From)
         if f is None: raise NotImplementedError("SELECT without FROM")
@@ -368,14 +385,6 @@ class Database:
                 _t9 = wdb_subquery.substitute_select_scalars(self, tree.copy())
                 if _t9.sql() != sql:
                     return self._run_impl(_t9.sql(), escalate)     # SELECT-list scalars -> literals
-            if tree.args.get('order') is not None and tree.args.get('limit') is not None and tree.args.get('group') is None \
-                    and not tree.args.get('joins'):
-                try:
-                    _tk9 = wdb_join._topk_rows_door(self, tree)
-                except wdb_join._FastUnsupported:
-                    _tk9 = None
-                if _tk9 is not None:
-                    return _tk9                                # THE TOP-K ROWS DOOR
             _hr9 = wdb_join.hidden_rewrite(tree)
             if _hr9 is not None:
                 _sql9, _nh9 = _hr9
@@ -392,10 +401,6 @@ class Database:
             frm9 = tree.args.get('from') or tree.args.get('from_')
             if frm9 is not None and frm9.this.__class__.__name__ == 'Subquery':
                 return wdb_join.join_query(self, sql)     # THE FROM DOOR lives there
-            if wdb_join.has_agg_arith(tree):
-                return wdb_join.join_query(self, sql)     # AGGREGATE ARITHMETIC lives there
-            if wdb_join.has_expr_group(tree):
-                return wdb_join.join_query(self, sql)     # EXPRESSION GROUP KEYS ride the dict there
             if frm9 is not None and frm9.this.__class__.__name__ == 'Values':
                 raise NotImplementedError('VALUES as a table source is not supported')
             name = self._table_in(tree)
@@ -433,10 +438,8 @@ class Database:
                 try:
                     _res = _int_emission(ctx, controller.route_single_segment(ctx))
                 except NotImplementedError as _ne9:
-                    # the controller's doors declined by name; a window shape gets the join
-                    # engine's window door LAST (its precedence over wdb_window went FALSE)
-                    if tree.find(sqlglot.exp.Window) is not None:
-                        return wdb_join.join_query(self, sql)
+                    _r9 = self._new_doors(tree, sql)          # NEW DOORS LAST (Q25/Q35/w-runsum all regressed on precedence)
+                    if _r9 is not None: return _r9
                     raise
                 _ms = (_time.perf_counter() - _t0) * 1000
                 _rows = _res[0] if isinstance(_res, tuple) else _res
