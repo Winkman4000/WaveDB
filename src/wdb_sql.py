@@ -447,11 +447,17 @@ def _mode5_sarray(seg, pc):
     vals = seg.values(pc)
     b = [(v if isinstance(v, (bytes, bytearray)) else (v.encode() if isinstance(v, str) else b'')) for v in vals]
     isn = np.array([v is None for v in vals], dtype=bool)
-    try:
-        arr = np.array(b, dtype='S')
-    except Exception:
-        return None
-    cache[pc] = (arr, isn, b)
+    obj = np.array(b, dtype=object)
+    mx = max((len(v) for v in b), default=0)
+    arr = None
+    import os as _os9
+    _budget9 = int(float(_os9.environ.get('WDB_SARRAY_MB', '1024'))) << 20
+    if mx * len(b) <= _budget9:
+        try:
+            arr = np.array(b, dtype='S')
+        except Exception:
+            arr = None
+    cache[pc] = (arr, isn, b, obj)
     return cache[pc]
 
 
@@ -463,7 +469,8 @@ def _mode5_null(seg, pc):
 def _like_mode5(seg, pc, pat, icase):
     got = _mode5_sarray(seg, pc)
     if got is None: return None
-    arr, isn, b = got
+    arr, isn, b, obj = got
+    if arr is None: return None                      # too wide for an S-array: the regex path
     return _like_vectorised(b, isn, pat, icase, sarr=arr)
 
 
@@ -474,7 +481,9 @@ def _like_prefix_range(vals, isn, pat, icase):
     import re as _re, bisect
     if icase or '_' in pat or '\\' in pat or not pat or pat[0] == '%': return None
     prefix = pat.split('%')[0].encode()
-    b = [(v.encode() if isinstance(v, str) else (v if v is not None else b'')) for v in vals]
+    b = vals.tolist() if isinstance(vals, np.ndarray) else list(vals)
+    if b and not isinstance(b[0], (bytes, bytearray)):
+        b = [(v.encode() if isinstance(v, str) else (v if v is not None else b'')) for v in b]
     lo = bisect.bisect_left(b, prefix); hi = bisect.bisect_left(b, prefix + b'\xff\xff\xff\xff')
     out = np.zeros(len(b), bool)
     if hi <= lo: return out
@@ -715,7 +724,8 @@ def _eval_rows_core(seg, node, mask, resolve=None, env=None):
         pat = str(n.expression.this)
         raw9 = ev(n.this)
         raw9 = np.asarray(raw9, dtype=object) if not isinstance(raw9, np.ndarray) else raw9
-        isn = np.array([v is None for v in raw9], dtype=bool) if raw9.dtype == object else np.zeros(raw9.shape[0], bool)
+        isn = np.equal(raw9, None) if raw9.dtype == object else np.zeros(raw9.shape[0], bool)      # vectorised null scan
+        isn = np.asarray(isn, dtype=bool)
         out = None
         if env is not None and isinstance(n.this, E.Column) and n.this.name in env:
             out = _like_prefix_range(raw9, isn, pat, isinstance(n, E.ILike))     # env = a SORTED dictionary
@@ -1978,6 +1988,24 @@ def _eval_pred(seg, node, seg_col):
     """Predicate over all rows -> bool[N]. The core handles the dict-space forms;
     anything it declines by name falls back to per-row evaluation."""
     _CMP9 = (E.EQ, E.NEQ, E.GT, E.LT, E.GTE, E.LTE)
+    if isinstance(node, (E.EQ, E.NEQ, E.In)) and isinstance(node.this, E.Column):
+        _pc9 = seg_col(node.this.name) if seg_col is not None else node.this.name
+        _cd9 = seg.cols.get(_pc9, {})
+        if _cd9.get('mode') == 5 and _cd9.get('dt') == 1:
+            _lits9 = ([node.expression] if not isinstance(node, E.In) else list(node.args.get('expressions') or []))
+            if _lits9 and all(isinstance(L, E.Literal) and L.is_string for L in _lits9) and node.args.get('query') is None:
+                got = _mode5_sarray(seg, _pc9)
+                if got is not None:
+                    _arr9, _isn9, _b9, _obj9 = got
+                    if isinstance(node, E.In):
+                        _set9 = set(L.this.encode() for L in _lits9)
+                        m = np.fromiter((x in _set9 for x in _b9), dtype=bool, count=len(_b9)) if len(_set9) > 4 else np.zeros(len(_b9), bool)
+                        if len(_set9) <= 4:
+                            for lv in _set9: m |= (_obj9 == lv)
+                    else:
+                        m = (_obj9 == _lits9[0].this.encode())
+                        if isinstance(node, E.NEQ): m = ~m & ~_isn9
+                    return m
     if isinstance(node, (E.Like, E.ILike)) and isinstance(node.this, E.Column):
         _pc9 = seg_col(node.this.name) if seg_col is not None else node.this.name
         _cd9 = seg.cols.get(_pc9, {})
@@ -2087,8 +2115,9 @@ def _eval_pred_core(seg, node, seg_col):
             raise NotImplementedError("IN with unresolved subquery")
         lits=node.args.get('expressions') or []
         c0 = seg.cols.get(seg_col(col))
-        if (c0 is not None and c0.get('mode') in (0, 1, 2) and len(lits) > 64
+        if (c0 is not None and c0.get('mode') in (0, 1, 2) and (len(lits) > 64 or c0.get('dt') == 1)
                 and all(isinstance(L, E.Literal) for L in lits)):
+            # ALWAYS code space for string dictionaries (a 3-value IN decoded 36M rows: 4.7s -> 0.1s)
             # big literal lists on dict columns: bind values to CODES once, isin over raw
             # codes -- never decode the column (a 4k-value NOT IN was minutes of string decode)
             import wdb_wherescan as _WS

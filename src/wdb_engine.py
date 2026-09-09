@@ -281,11 +281,20 @@ class Segment:
             _budget9 = 2048 << 20
         _keep9 = {}
         _used9 = 0
+        _szc9 = getattr(self, '_tdict_sz', None)
+        if _szc9 is None: _szc9 = self._tdict_sz = {}
         for _k9, _v9 in list(self._tdict.items()):
-            try:
-                _sz9 = (_v9.nbytes if hasattr(_v9, 'nbytes') else sum((len(x) if isinstance(x, (bytes, bytearray)) else 8) + 56 for x in _v9))
-            except Exception:
-                _sz9 = _budget9 + 1
+            _sz9 = _szc9.get(_k9)
+            if _sz9 is None:                              # estimate ONCE per dictionary (a 2.7M-entry sum per flush was 0.9s)
+                try:
+                    if hasattr(_v9, 'nbytes'): _sz9 = int(_v9.nbytes)
+                    else:
+                        _n9 = len(_v9); _step9 = max(1, _n9 // 4096)
+                        _samp9 = _v9[::_step9]
+                        _sz9 = int(sum((len(x) if isinstance(x, (bytes, bytearray)) else 8) + 56 for x in _samp9) * (_n9 / max(1, len(_samp9))))
+                except Exception:
+                    _sz9 = _budget9 + 1
+                _szc9[_k9] = _sz9
             if _used9 + _sz9 <= _budget9:
                 _keep9[_k9] = _v9; _used9 += _sz9
         self._tdict.clear(); self._tdict.update(_keep9)
