@@ -801,3 +801,36 @@ vectorised scanning; we win, when we do, by never scanning. 6a 4.3 ->
 0.49s, 15b 385 -> 1.8s, 29a 14.4 -> 2.7s. NEXT: the fixpoint should
 start from the most selective table and never materialise an all-true
 keep; the board twice in one process for the honest warm total.
+
+
+## THE BOARD CENSUS (2026-09-09, evening): every realm re-run, with peak RSS
+TPC-H 14/14 (12 wins, 3.2s vs 4.4s, 8.9GB) | Megaboard 98/103 -> the 5
+FALSE were MINE | ClickBench 42/43 false=0 but median 1.17x (was 3.10x)
+-> Q25/Q35 were MINE | H2O groupby 10/10 (7 wins, 55.5GB peak) | H2O
+joins 8/8 (8 wins, 21.8GB) | Scope 100/100 (71 wins, median 2.26x,
+16.8s vs 14.6s -- ahead in total) | JOB 113/113 (143s vs 12s, 11GB).
+THE DISEASE, twice: new doors pre-empting older, faster, exact ones.
+(1) has_agg_arith saw the SUM inside SUM(x) OVER and sent windows to
+the join engine, whose window door ignored frame specs and RANGE peer
+semantics -- five megaboard windows FALSE. Fixed and banked: windows
+own their aggregates; THE FRAME LAW; the join engine's window door
+last. (2) The top-k rows door pre-empted the sorted-projection door
+(Q25 40ms -> 615ms) and has_expr_group pre-empted the affine-group door
+(Q35 95ms -> 13.3s). Fixed with THE PRECEDENCE LAW (controller first,
+new doors answer only declines) -- exact, but it OVER-YIELDS: the old
+path serves top_no_group and case_multi slowly instead of declining
+(scope board 16.8s -> 56.6s, still 100/100). NEXT: narrow the rule --
+yield only to the specialised fast doors (sorted projection, cluster
+top-k, affine group), never to the general scan. ALSO DOCKETED: the old
+window door accumulates integer running sums in float64 (w-runsum: 105
+boundary rows differ from duck's exact BIGINT); RSS peaks of 65.7GB
+(megaboard) and 55.5GB (H2O groupby) are emission/window
+materialisations -- the shelf ceiling must govern them. THE PLANS
+AGREED WITH JACKSON: one sidecar registry (manifest, birthmark
+validated on every load, births under the BIRTH GATE, disk budget with
+named declines, vacuum) and one process-wide shelf (byte ceiling as a
+fraction of RAM, LRU, named declines instead of OOM, one representation
+of mode-5 text as an mmap'd sidecar, db.stats()). JOIN, restated in
+Jackson's terms: a join declares a shared value space; the work is
+aligning dictionaries; rows follow values -- the key-space fixpoint and,
+further out, columns as sparse 0/1 matrices over one V-space.
