@@ -394,8 +394,6 @@ class Database:
                 return wdb_join.join_query(self, sql)     # THE FROM DOOR lives there
             if wdb_join.has_agg_arith(tree):
                 return wdb_join.join_query(self, sql)     # AGGREGATE ARITHMETIC lives there
-            if tree.find(sqlglot.exp.Window) is not None:
-                return wdb_join.join_query(self, sql)     # THE WINDOW DOOR lives there
             if wdb_join.has_expr_group(tree):
                 return wdb_join.join_query(self, sql)     # EXPRESSION GROUP KEYS ride the dict there
             if frm9 is not None and frm9.this.__class__.__name__ == 'Values':
@@ -432,7 +430,14 @@ class Database:
                 controller._SERVED[0] = None
                 wdb_ledger.reset_stages()
                 _t0 = _time.perf_counter()
-                _res = _int_emission(ctx, controller.route_single_segment(ctx))
+                try:
+                    _res = _int_emission(ctx, controller.route_single_segment(ctx))
+                except NotImplementedError as _ne9:
+                    # the controller's doors declined by name; a window shape gets the join
+                    # engine's window door LAST (its precedence over wdb_window went FALSE)
+                    if tree.find(sqlglot.exp.Window) is not None:
+                        return wdb_join.join_query(self, sql)
+                    raise
                 _ms = (_time.perf_counter() - _t0) * 1000
                 _rows = _res[0] if isinstance(_res, tuple) else _res
                 wdb_ledger.log(ctx.seg, sql, controller._SERVED[0] or '?', _ms,

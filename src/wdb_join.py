@@ -942,6 +942,7 @@ def has_agg_arith(tree):
     for p in tree.expressions:
         nd = p.this if isinstance(p, E.Alias) else p
         if isinstance(nd, _ROW9): continue                    # the row-aggregate family: the single-table path owns it
+        if nd.find(E.Window) is not None: continue           # windows own their aggregates (SUM(x) OVER is not SUM arithmetic)
         if nd.find(*_MOMENT9) is not None: return True
         if hasattr(E, 'Median') and nd.find(E.Median) is not None: return True
         if isinstance(nd, (E.Column, *_AGG)): continue
@@ -1057,6 +1058,7 @@ def has_expr_group(tree):
     if not isinstance(tree, E.Select): return False
     g = tree.args.get('group')
     if g is None: return False
+    if tree.find(E.Window) is not None: return False
     for k in g.expressions:
         if isinstance(k, (E.Mod, E.Div, E.Mul, E.Add, E.Sub, E.IntDiv)) and len(list(k.find_all(E.Column))) == 1:
             return True
@@ -1947,6 +1949,19 @@ def _window_door(db, tree):
         part = list(win.args.get('partition_by') or [])
         order = win.args.get('order')
         ords = list(order.expressions) if order is not None else []
+        spec = win.args.get('spec')
+        if spec is not None:
+            # THE FRAME LAW: this door computes cumulative ROWS UNBOUNDED PRECEDING ... CURRENT ROW
+            # only; any other frame (2 PRECEDING, RANGE peers, FOLLOWING) declines by name
+            _k9 = (spec.args.get('kind') or '').upper(); _st9 = str(spec.args.get('start') or '').upper(); _en9 = str(spec.args.get('end') or 'CURRENT ROW').upper()
+            if not (_k9 == 'ROWS' and 'UNBOUNDED' in _st9 and 'CURRENT' in _en9):
+                raise NotImplementedError('window frame %s not served by the window door' % spec.sql()[:50])
+        elif ords and type(fn).__name__ in ('Sum', 'Count', 'Avg', 'Min', 'Max'):
+            # no frame + ORDER BY = SQL's default RANGE frame: peers (ties) share the running value.
+            # Serve it only when the order key has no ties among survivors; else decline by name.
+            _k0 = sort_key(ords[0].this, rows)
+            if np.unique(_k0).size != _k0.size:
+                raise NotImplementedError('running window over a tied ORDER BY (RANGE peers) not served by the window door')
         # partition ids
         if part:
             gid = np.zeros(R, np.int64); K = 1
