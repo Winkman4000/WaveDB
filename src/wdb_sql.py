@@ -470,7 +470,10 @@ def _like_mode5(seg, pc, pat, icase):
     got = _mode5_sarray(seg, pc)
     if got is None: return None
     arr, isn, b, obj = got
-    if arr is None: return None                      # too wide for an S-array: the regex path
+    if arr is None:
+        if '_' in pat or '\\' in pat: return None
+        toks = [t for t in pat.split('%') if t != '']
+        return _like_joined(b, isn, pat, icase, toks, pat[:1] != '%', pat[-1:] != '%')   # too wide for an S-array
     return _like_vectorised(b, isn, pat, icase, sarr=arr)
 
 
@@ -490,6 +493,46 @@ def _like_prefix_range(vals, isn, pat, icase):
     rx = '^' + _re.escape(pat).replace('%', '.*') + '$'
     cre = _re.compile(rx, _re.S)
     for j in range(lo, hi):
+        if not isn[j] and cre.match(b[j].decode('utf-8', 'replace')): out[j] = True
+    return out
+
+
+_JOINED_CACHE = {}
+
+
+def _like_joined(b, isn, pat, icase, toks, anchored_start, anchored_end):
+    """LIKE over WIDE columns (an S-array would be gigabytes): ONE joined byte
+    buffer with a separator, bytes.find for the rarest token at C speed (hits
+    are few), hit offsets mapped to rows, regex verifies candidates only."""
+    import re as _re
+    if not toks: return None
+    key = id(b)
+    got = _JOINED_CACHE.get(key)
+    if got is None or got[0] is not b:
+        sep = b'\x00'
+        buf = sep.join(b)
+        lens = np.fromiter((len(v) for v in b), dtype=np.int64, count=len(b))
+        starts = np.zeros(len(b) + 1, np.int64); np.cumsum(lens + 1, out=starts[1:])
+        _JOINED_CACHE[key] = (b, buf, starts)
+        if len(_JOINED_CACHE) > 8: _JOINED_CACHE.pop(next(iter(_JOINED_CACHE)))
+        got = _JOINED_CACHE[key]
+    _b, buf, starts = got
+    if icase:
+        buf = buf.lower(); toks = [t.lower() for t in toks]
+    # the rarest token = the longest one; scan for it
+    tok = max(toks, key=len).encode()
+    hits = []
+    p = buf.find(tok)
+    while p >= 0:
+        hits.append(p); p = buf.find(tok, p + 1)
+        if len(hits) > 5_000_000: return None
+    if not hits:
+        return np.zeros(len(b), bool)
+    rows = np.unique(np.searchsorted(starts, np.asarray(hits, dtype=np.int64), side='right') - 1)
+    rx = '^' + _re.escape(pat).replace('%', '.*') + '$'
+    cre = _re.compile(rx, (_re.I if icase else 0) | _re.S)
+    out = np.zeros(len(b), bool)
+    for j in rows.tolist():
         if not isn[j] and cre.match(b[j].decode('utf-8', 'replace')): out[j] = True
     return out
 
@@ -518,7 +561,7 @@ def _like_vectorised(vals, isn, pat, icase, sarr=None):
         for v in b:
             if len(v) > mx: mx = len(v)
         if mx * len(b) > (256 << 20):
-            return None
+            return _like_joined(b, isn, pat, icase, toks, anchored_start, anchored_end)
         try:
             arr = np.array(b, dtype='S')                 # fixed width bytes
         except Exception:

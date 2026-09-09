@@ -180,13 +180,18 @@ def execute(db, tree):
     def prune_inverted(inv, sk, dst_keep, dst_n):
         u, offs, order, _rank = inv
         pos = np.searchsorted(u, sk)
-        pos = pos[(pos < u.size)]
-        hit = pos[u[pos] == sk[:pos.size]] if pos.size == sk.size else pos[np.isin(u[pos], sk)]
+        ok = pos < u.size
+        pos = pos[ok]; skk = sk[ok]
+        hit = pos[u[pos] == skk]
         if hit.size == 0: return np.zeros_like(dst_keep)
-        out = np.zeros_like(dst_keep)
-        for p in hit.tolist():
-            rows = order[offs[p]:offs[p + 1]]
-            out[rows] = True
+        st = offs[hit]; ln = offs[hit + 1] - st
+        total = int(ln.sum())
+        if total == 0: return np.zeros_like(dst_keep)
+        # RANGES-CONCAT: every posting list gathered in one vectorised pass
+        base = np.repeat(st - np.concatenate(([0], np.cumsum(ln)[:-1])), ln)
+        idx = np.arange(total, dtype=np.int64) + base
+        rows = np.asarray(order[idx])
+        out = np.zeros_like(dst_keep); out[rows] = True
         return out & dst_keep
     # fixpoint
     def prune(src, src_cols, src_keep, dst, dst_cols, dst_keep):
@@ -202,14 +207,26 @@ def execute(db, tree):
         sk = sk[sk >= 0]
         if sk.size == 0:
             return np.zeros_like(dst_keep)
-        if len(dst_cols) == 1 and n_dst >= 1_000_000 and sk.size <= 20_000 and int(dst_keep.sum()) * 2 > src_idx.size:
+        if len(dst_cols) == 1 and n_dst >= 1_000_000 and sk.size * 8 < n_dst and counts.get(dst, n_dst) * 2 > src_idx.size:
             inv = inverted(dst, dst_cols)
             if inv is not None:
                 return prune_inverted(inv, np.unique(sk), dst_keep, n_dst)
-        dst_keys = pack(dst, dst_cols)
-        mx = int(max(sk.max(), dst_keys.max())) if dst_keys.size else int(sk.max())
         idx = np.flatnonzero(dst_keep)
         if idx.size == 0: return dst_keep
+        if len(dst_cols) == 1 and idx.size * 4 < n_dst and n_dst >= 1_000_000:
+            # SURVIVORS ONLY through the reverse road's RANK: keys at the kept rows,
+            # never the whole column (a 2.2M keep on a 36M table walked all 36M)
+            dk = keys_at(dst, dst_cols[0], idx)
+            mx2 = int(max(sk.max(), dk.max())) if dk.size else int(sk.max())
+            if mx2 < 200_000_000:
+                lut2 = np.zeros(mx2 + 2, bool); lut2[sk] = True
+                hit2 = lut2[np.where(dk < 0, mx2 + 1, dk)]
+            else:
+                hit2 = np.isin(dk, np.unique(sk))
+            out = np.zeros_like(dst_keep); out[idx[hit2]] = True
+            return out
+        dst_keys = pack(dst, dst_cols)
+        mx = int(max(sk.max(), dst_keys.max())) if dst_keys.size else int(sk.max())
         if mx < 200_000_000:
             lut = np.zeros(mx + 2, bool); lut[sk] = True
             if idx.size * 8 < dst_keys.size:
