@@ -890,3 +890,32 @@ engine, (6) the encoder's mode judgement; product gaps -- DML meets
 sidecars/shelves, concurrency, a wire, EXPLAIN/cost model, bad-input
 robustness; research -- the key-space fixpoint, the join family as
 sparse matrices over one V-space.
+
+
+## THE STRUCTURAL DAY (2026-09-11): six gaps on the state-of-the-engine map
+(1) JOINS THAT COUNT -- THE COUNTING FIXPOINT: weights on the join tree
+after the semi-join reduction; COUNT/SUM/AVG/GROUP BY through junction
+tables without a pair; JOB-COUNT 113/113 exact. (3) TRANSIENT RAM -- THE
+WORKING-SET GOVERNOR (WDB_WORK_MB, 25% of RAM/cgroup): an N-scale Python
+result over budget declines BY NAME; db.stream(sql) yields blocks built
+from columnar arrays and freed behind (50M rows: 55GB -> 14.7GB peak);
+STREAM-AND-CLEAN (Jackson's rule): the row evaluator walks big columns
+in WDB_BLOCK_ROWS blocks and keeps only each block's decision. (2)
+MULTI-SEGMENT JOINS -- SEGMENT PARTIALS: a catalog override pins the
+multi-segment fact to one segment per pass, every door sees a solo
+segment, partials merge by wdb_merge's law (one multi-segment table per
+join; the merged-dictionary view is the next step). (4) THE DATE FAMILY
+-- a 2M-row dates realm; datetime64 emits as date/datetime; EXTRACT /
+DATE_TRUNC / INTERVAL (calendar clamp) / DATEDIFF / LAST_DAY / STRFTIME /
+EPOCH / casts; 35/35. THE CAST LAW: a TYPE-CHANGING CAST is not
+transparent -- three compilers stripped CAST(ts AS DATE) to ts and
+compared microseconds to days, silently. (5) OUTER JOINS AND FRAMES --
+RIGHT and FULL on the road (unmatched parents once, with NULLs), WHERE
+on the road (single-sided conjuncts filter their side; IS NULL is the
+only truth on a NULL side); the window door serves ROWS k PRECEDING,
+the default RANGE frame (peers share the LAST peer), RANGE UNBOUNDED;
+five constructs exact, 2-3x ahead. (6) THE MODE AUDIT: the registry
+names storage misfits; fjdb's hits (a symlink to ClickBench's July
+segment, pre-guard) carries six narrow mode-4 columns -- every predicate
+on them decodes 100M rows; the encoder's judgement itself was already
+right; re-encode scheduled. Suite 1696/0 at every push (seven today).
