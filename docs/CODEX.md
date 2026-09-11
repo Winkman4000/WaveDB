@@ -834,3 +834,35 @@ of mode-5 text as an mmap'd sidecar, db.stats()). JOIN, restated in
 Jackson's terms: a join declares a shared value space; the work is
 aligning dictionaries; rows follow values -- the key-space fixpoint and,
 further out, columns as sparse 0/1 matrices over one V-space.
+
+
+## THE DISCIPLINE STAGE (2026-09-10): the precedence law, the registry, the shelf
+THE PRECEDENCE LAW, narrowed: a new-door shape (aggregate arithmetic,
+expression group key, window, top-k rows) goes to the scope-stage doors
+FIRST unless a SPECIALISED fast door claims it -- asked through the
+controller's own detect() (sorted projection, cluster/value top-k,
+first-k, distinct-limit, affine group/sum, the old window door,
+heavypair, sumtopk, gridwalk, smallk) -- and never yields to the general
+scan; and LAST for whatever the controller declines by name. 'Old
+first' is as wrong as 'new first': precedence is decided by what a
+door IS. ClickBench Q25 51ms, Q35 95ms; scope 100/100 at 17.3s vs duck
+17.5s. INTEGER ACCUMULATION in the old window door (w-runsum exact, 58.3M
+rows, int64 end to end; two literal 0.0s had promoted the cumsum).
+COUNT(DISTINCT col) back on its group-distinct door (Q09 53s -> 1.15s).
+THE REGISTRY (wdb_sidecar.py): twelve families known by suffix; scan /
+stats / manifest / vacuum; a sidecar older than its segment is false by
+construction; may_birth() refuses births past WDB_SIDECAR_GB by name.
+Census: 350 sidecars, 7.7GB, all fresh. THE SHELF (wdb_shelf.py): one
+process-wide LRU with a byte ceiling (25% of RAM or of the cgroup
+limit), refusals by name; dictionaries, inline text (ONE representation:
+object array + joined buffer), reverse-road uniques, the string caches;
+db.stats() prints shelf and registry. WHY: this pod has a 128GB cgroup
+ceiling; two ClickBench boards died oom_kill because the unbounded
+inline-text shelves accumulated hits.URL/SearchPhrase at 100M rows in
+three copies (Q16 alone: 5.3GB). Under the shelf: ClickBench 42/43,
+false=0, faster 24, median 3.35x (was 3.10x). LESSONS: never rsync src
+while a board runs (lazy imports); pgrep -f with '\|' is a literal in
+ERE -- it reported 0 while nine boards ran concurrently. OPEN: transient
+working sets (emission of 50M-row results, giant group-bys: mega peak
+65.7GB, H2O groupby 55.5GB) are not shelf objects -- the ceiling must
+learn to govern them too (chunked emission, spill, or named declines).
