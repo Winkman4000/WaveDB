@@ -6,6 +6,7 @@ construction; families with a .mark carry their own birthmark too).
     python3 -m wdb_sidecar stats  DBDIR        # by family: count, bytes, stale, orphans
     python3 -m wdb_sidecar vacuum DBDIR        # delete stale + orphaned sidecars
     python3 -m wdb_sidecar manifest DBDIR      # write DBDIR/sidecars.json
+    python3 -m wdb_sidecar audit DBDIR         # storage modes vs cardinality: misfits named
 
 Births go through may_birth(): a disk budget (WDB_SIDECAR_GB, default 64) refuses
 new births with a NAMED decline instead of filling the disk.
@@ -122,6 +123,44 @@ def vacuum(dbdir, dry=False):
     return gone, freed
 
 
+def audit(dbdir, print_out=True):
+    """THE MODE AUDIT: every column's storage mode against its cardinality -- a sequence
+    (mode 4) on a narrow column, inline strings (mode 5) on a low-cardinality column, a
+    dictionary on a unique id -- named with a re-encode recommendation. Stale encodes
+    (before a guard was added) show up here instead of as slow queries."""
+    import sys as _sys
+    _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from wdb_engine import Segment
+    import numpy as np
+    findings = []
+    for n in sorted(os.listdir(dbdir)):
+        if not n.endswith('.wdb'): continue
+        try:
+            seg = Segment(os.path.join(dbdir, n))
+        except Exception as e:
+            findings.append((n, '*', 'unreadable: %s' % str(e)[:60])); continue
+        N = int(seg.N)
+        for col, c in seg.cols.items():
+            mode = c.get('mode'); V = int(c.get('V') or 0); dt = c.get('dt')
+            if mode == 4:
+                try:
+                    vals = np.asarray(seg._seq_decode(c))
+                    span = int(vals.max() - vals.min()) if vals.size else 0
+                    if span < (1 << 16):
+                        findings.append((n, col, 'MODE 4 (sequence) on a narrow column (span %d): a dictionary column; every predicate decodes %s rows -- RE-ENCODE' % (span, format(N, ','))))
+                except Exception:
+                    pass
+            elif mode == 5 and dt == 1 and N > 100_000:
+                findings.append((n, col, 'mode 5 (inline strings), %s rows: LIKE/= walk the text (cached under the shelf); fine if near-unique' % format(N, ',')))
+            elif mode in (0, 1, 2) and dt == 0 and V == N and N > 1_000_000:
+                findings.append((n, col, 'dictionary on a unique integer (V == N = %s): a sequence encode would be smaller' % format(N, ',')))
+    if print_out:
+        print('MODE AUDIT %s: %d findings' % (dbdir, len(findings)))
+        for n, col, msg in findings:
+            print('  %-24s %-18s %s' % (n, col, msg))
+    return findings
+
+
 def budget_bytes():
     try:
         return int(float(os.environ.get('WDB_SIDECAR_GB', '64')) * 1e9)
@@ -161,6 +200,7 @@ if __name__ == '__main__':
         print(__doc__); sys.exit(1)
     cmd, d = sys.argv[1], sys.argv[2]
     if cmd == 'stats': stats(d)
+    elif cmd == 'audit': audit(d)
     elif cmd == 'vacuum': vacuum(d, dry='--dry' in sys.argv)
     elif cmd == 'manifest': print(json.dumps({k: v for k, v in manifest(d).items() if k != 'sidecars'}))
     else: print(__doc__)
