@@ -1698,11 +1698,11 @@ def _road_join_emit(db, tree):
     (rows, names) or None (not this shape)."""
     if not isinstance(tree, E.Select): return None
     joins = tree.args.get('joins') or []
-    if len(joins) != 1 or tree.args.get('group') is not None or tree.args.get('where') is not None: return None
+    if len(joins) != 1 or tree.args.get('group') is not None: return None
     if tree.args.get('having') is not None: return None
     jn = joins[0]
     side = (jn.args.get('side') or '').upper(); kind = (jn.args.get('kind') or '').upper()
-    if kind not in ('', 'INNER') or side not in ('', 'LEFT'): return None
+    if kind not in ('', 'INNER', 'OUTER') or side not in ('', 'LEFT', 'RIGHT', 'FULL'): return None
     frm = tree.args.get('from') or tree.args.get('from_')
     if frm is None or not isinstance(frm.this, E.Table) or not isinstance(jn.this, E.Table): return None
     lt, la = frm.this.name, (frm.this.alias or frm.this.name)
@@ -1728,15 +1728,63 @@ def _road_join_emit(db, tree):
     except _FastUnsupported:
         return None
     lpm = db.cat.phys_map(lt); rpm = db.cat.phys_map(rt)
+    # WHERE on the road: single-sided conjuncts filter their side BEFORE the pointer is read;
+    # a conjunct touching both sides is applied to the joined rows
+    _where9 = tree.args.get('where')
+    def _fl9(x):
+        if isinstance(x, E.Paren): return _fl9(x.this)
+        if isinstance(x, E.And): return _fl9(x.this) + _fl9(x.expression)
+        return [x]
+    _conj9 = _fl9(_where9.this) if _where9 is not None else []
+    def _sides9(cj): return {own(c) for c in cj.find_all(E.Column)}
+    def _strip9(cj):
+        c2 = cj.copy()
+        for c in c2.find_all(E.Column): c.set('table', None)
+        return c2
+    def _null_side_truth9(cj, null_alias):
+        """truth of a conjunct when every column of null_alias is NULL: only IS NULL survives"""
+        if isinstance(cj, E.Is) and isinstance(cj.this, E.Column) and own(cj.this) == null_alias and isinstance(cj.expression, E.Null):
+            return not bool(cj.args.get('not'))
+        if isinstance(cj, E.Or):
+            return _null_side_truth9(cj.this, null_alias) or _null_side_truth9(cj.expression, null_alias)
+        return False
+    for cj in _conj9:
+        if None in _sides9(cj) or cj.find(E.Subquery) is not None: return None
     ptr = _join_pointer(db, lt, lpm.get(a.name, a.name), lseg, rt, rpm.get(b.name, b.name), rseg)
     n = int(lseg.N)
+    rmiss = None                                      # RIGHT/FULL: parent rows nobody points at (NULL child side)
     if side == 'LEFT':
         rows = np.arange(n, dtype=np.int64); prow = ptr
         miss = prow < 0
+    elif side in ('RIGHT', 'FULL'):
+        if side == 'FULL':
+            rows = np.arange(n, dtype=np.int64); prow = ptr; miss = prow < 0
+        else:
+            rows = np.flatnonzero(ptr >= 0); prow = ptr[rows]; miss = None
+        hit = np.zeros(int(rseg.N), bool); hit[ptr[ptr >= 0]] = True
+        rmiss = np.flatnonzero(~hit)
     else:
         rows = np.flatnonzero(ptr >= 0); prow = ptr[rows]; miss = None
     import wdb_govern
-    wdb_govern.ask(int(rows.size), len(proj), 'join result')               # THE GOVERNOR
+    wdb_govern.ask(int(rows.size) + (int(rmiss.size) if rmiss is not None else 0), len(proj), 'join result')   # THE GOVERNOR
+    if _conj9:
+        keep = np.ones(int(rows.size), bool)
+        for cj in _conj9:
+            sd = _sides9(cj)
+            if sd == {la}:
+                keep &= np.asarray(wdb_sql._eval_pred(lseg, _strip9(cj), lambda nm: lpm.get(nm, nm)), dtype=bool)[rows]
+            elif sd == {ra}:
+                m_r = np.asarray(wdb_sql._eval_pred(rseg, _strip9(cj), lambda nm: rpm.get(nm, nm)), dtype=bool)
+                if miss is not None:
+                    kk = np.zeros(int(rows.size), bool); okp = ~miss
+                    kk[okp] = m_r[prow[okp]]; kk[miss] = _null_side_truth9(cj, ra)
+                    keep &= kk
+                else:
+                    keep &= m_r[prow]
+            else:
+                return None                                  # a two-sided conjunct: the general joiner
+        rows = rows[keep]; prow = prow[keep]
+        if miss is not None: miss = miss[keep]
     def col_vals(seg, pc, rr):
         # MODE-AWARE point reads: plain dict numerics ride base[codes_at]
         # (cached base), everything else the general values_at_rows --
@@ -1780,6 +1828,25 @@ def _road_join_emit(db, tree):
     _t0 = time.perf_counter() if _bj else 0.0
     rows_out = list(zip(*cols)) if cols else []
     if _bj: print('ROAD-JOIN zip: %.0fms' % ((time.perf_counter() - _t0) * 1e3), flush=True)
+    if rmiss is not None and rmiss.size and _where9 is not None:
+        # the WHERE applies to unmatched-parent rows too: child columns are NULL there
+        keep_r = np.ones(int(rmiss.size), bool)
+        for cj in _conj9:
+            sd = _sides9(cj)
+            if sd == {ra}:
+                keep_r &= np.asarray(wdb_sql._eval_pred(rseg, _strip9(cj), lambda nm: rpm.get(nm, nm)), dtype=bool)[rmiss]
+            else:
+                # any conjunct that needs a child column sees NULL: IS NULL passes, everything else fails
+                keep_r &= _null_side_truth9(cj, la)
+        rmiss = rmiss[keep_r]
+    if rmiss is not None and rmiss.size:
+        # unmatched PARENT rows: child columns NULL, parent columns read at rmiss
+        extra = []
+        for p in proj:
+            nd = p.this if isinstance(p, E.Alias) else p
+            if own(nd) == la: extra.append([None] * int(rmiss.size))
+            else: extra.append(col_vals(rseg, rpm.get(nd.name, nd.name), rmiss))
+        rows_out += list(zip(*extra))
     rows_out = wdb_sql._apply_order(rows_out, proj, tree.args.get('order'))
     lim = tree.args.get('limit')
     if lim is not None: rows_out = rows_out[:int(lim.expression.this)]
@@ -1955,18 +2022,22 @@ def _window_door(db, tree):
         order = win.args.get('order')
         ords = list(order.expressions) if order is not None else []
         spec = win.args.get('spec')
+        # THE FRAME LAW: frames are named -- ROWS UNBOUNDED PRECEDING (cumulative), ROWS k PRECEDING
+        # (sliding), and the default RANGE frame (peers share the running value); anything else
+        # (FOLLOWING, RANGE with offsets) declines by name
+        frame_k = None; range_peers = False
         if spec is not None:
-            # THE FRAME LAW: this door computes cumulative ROWS UNBOUNDED PRECEDING ... CURRENT ROW
-            # only; any other frame (2 PRECEDING, RANGE peers, FOLLOWING) declines by name
             _k9 = (spec.args.get('kind') or '').upper(); _st9 = str(spec.args.get('start') or '').upper(); _en9 = str(spec.args.get('end') or 'CURRENT ROW').upper()
-            if not (_k9 == 'ROWS' and 'UNBOUNDED' in _st9 and 'CURRENT' in _en9):
+            _sside9 = str(spec.args.get('start_side') or '').upper(); _eside9 = str(spec.args.get('end_side') or '').upper()
+            if 'CURRENT' not in _en9 and _en9 != '':
+                raise NotImplementedError('window frame %s not served by the window door' % spec.sql()[:50])
+            if _k9 == 'ROWS' and 'UNBOUNDED' in _st9: frame_k = None
+            elif _k9 == 'ROWS' and _st9.isdigit() and 'PRECEDING' in _sside9: frame_k = int(_st9)
+            elif _k9 == 'RANGE' and 'UNBOUNDED' in _st9: range_peers = True
+            else:
                 raise NotImplementedError('window frame %s not served by the window door' % spec.sql()[:50])
         elif ords and type(fn).__name__ in ('Sum', 'Count', 'Avg', 'Min', 'Max'):
-            # no frame + ORDER BY = SQL's default RANGE frame: peers (ties) share the running value.
-            # Serve it only when the order key has no ties among survivors; else decline by name.
-            _k0 = sort_key(ords[0].this, rows)
-            if np.unique(_k0).size != _k0.size:
-                raise NotImplementedError('running window over a tied ORDER BY (RANGE peers) not served by the window door')
+            range_peers = True                                   # SQL's default frame
         # partition ids
         if part:
             gid = np.zeros(R, np.int64); K = 1
@@ -2047,16 +2118,42 @@ def _window_door(db, tree):
             else:
                 if not isinstance(arg, E.Column): raise _FastUnsupported
                 x = np.asarray(col_at(arg.name, rows[order_idx]), dtype=np.float64)
-            if ords:                                            # running (ROWS UNBOUNDED PRECEDING)
+            if ords and frame_k is not None:                    # SLIDING: ROWS k PRECEDING .. CURRENT ROW
+                cs0 = np.concatenate(([0.0], np.cumsum(x)))
+                lo_i = np.maximum(np.arange(R) - frame_k, starts[seg_id])
+                nrow = np.arange(R) - lo_i + 1
+                if fname in ('Sum', 'Count'): val = cs0[np.arange(R) + 1] - cs0[lo_i]
+                elif fname == 'Avg': val = (cs0[np.arange(R) + 1] - cs0[lo_i]) / nrow
+                else:
+                    # min/max over a small sliding window: stack the k+1 shifted views (k <= 512)
+                    if frame_k > 512: raise NotImplementedError('sliding MIN/MAX over a %d-row frame' % frame_k)
+                    val = x.copy()
+                    for sh in range(1, frame_k + 1):
+                        shifted = np.concatenate((np.full(sh, np.nan), x[:-sh])) if sh < R else np.full(R, np.nan)
+                        okm = (np.arange(R) - sh) >= starts[seg_id]
+                        cand = np.where(okm, shifted, np.nan)
+                        val = np.fmin(val, cand) if fname == 'Min' else np.fmax(val, cand)
+            elif ords:                                          # running: cumulative, or RANGE peers
                 cs = np.cumsum(x); base = np.concatenate(([0.0], cs))[starts][seg_id]
-                run = cs - base
+                if range_peers:
+                    # peers (equal order keys within a partition) share the value at the LAST peer
+                    ok = np.stack([keys[j + 1][order_idx] for j in range(len(ords))], axis=1)
+                    new = np.ones(R, bool); new[1:] = (g_sorted[1:] != g_sorted[:-1]) | np.any(ok[1:] != ok[:-1], axis=1)
+                    tie_id = np.cumsum(new) - 1
+                    last = np.zeros(int(tie_id.max()) + 1, np.int64); np.maximum.at(last, tie_id, np.arange(R))
+                    at = last[tie_id]
+                    run = cs[at] - base
+                    cnt = (at - starts[seg_id] + 1)
+                else:
+                    run = cs - base; cnt = pos_in + 1
                 if fname in ('Sum', 'Count'): val = run
-                elif fname == 'Avg': val = run / (pos_in + 1)
+                elif fname == 'Avg': val = run / cnt
                 else:
                     acc = np.minimum.accumulate if fname == 'Min' else np.maximum.accumulate
-                    val = np.empty(R); 
+                    val = np.empty(R)
                     for gi9 in range(starts.size):
                         a9 = starts[gi9]; b9 = a9 + sizes[gi9]; val[a9:b9] = acc(x[a9:b9])
+                    if range_peers: val = val[at]
             else:                                               # partition totals
                 tot = np.add.reduceat(x, starts)
                 if fname in ('Sum', 'Count'): val = tot[seg_id]
