@@ -275,6 +275,29 @@ class Database:
                           'fd_freed_bytes': freed,
                           'wall_s': round(time.perf_counter() - t_all, 1)}
 
+    _SPECIALISED = ('sorted_proj', 'cluster_topk', 'value_topk', 'firstsorted', 'firstk', 'distinctlim',
+                    'affinegroup', 'affinesum', 'window', 'heavypair', 'sumtopk', 'gridwalk', 'smallk')
+
+    def _new_door_shape(self, tree):
+        import wdb_join
+        E9 = sqlglot.exp
+        if tree.args.get('joins'): return False
+        if tree.find(E9.Window) is not None: return True
+        if wdb_join.has_agg_arith(tree) or wdb_join.has_expr_group(tree): return True
+        return (tree.args.get('order') is not None and tree.args.get('limit') is not None
+                and tree.args.get('group') is None and tree.find(E9.AggFunc) is None)
+
+    def _specialised_claims(self, ctx):
+        """Does one of the controller's SPECIALISED fast doors detect this query?"""
+        for nm in self._SPECIALISED:
+            rd = getattr(read_methods, nm, None)
+            if rd is None: continue
+            try:
+                if rd.detect(ctx) is not None: return True
+            except Exception:
+                continue
+        return False
+
     def _new_doors(self, tree, sql):
         """THE PRECEDENCE LAW: the controller's doors serve first; the doors born in
         the scope stage (aggregate arithmetic, expression group keys, windows, top-k
@@ -435,10 +458,16 @@ class Database:
                 controller._SERVED[0] = None
                 wdb_ledger.reset_stages()
                 _t0 = _time.perf_counter()
+                # THE PRECEDENCE LAW, narrowed: a new-door shape goes to the new doors FIRST
+                # unless a SPECIALISED fast door claims it (sorted projection, cluster/value
+                # top-k, affine group, the old window door...) -- never yield to the general scan
+                if self._new_door_shape(tree) and not self._specialised_claims(ctx):
+                    _r9 = self._new_doors(tree, sql)
+                    if _r9 is not None: return _r9
                 try:
                     _res = _int_emission(ctx, controller.route_single_segment(ctx))
                 except NotImplementedError as _ne9:
-                    _r9 = self._new_doors(tree, sql)          # NEW DOORS LAST (Q25/Q35/w-runsum all regressed on precedence)
+                    _r9 = self._new_doors(tree, sql)          # and LAST for whatever the controller declined by name
                     if _r9 is not None: return _r9
                     raise
                 _ms = (_time.perf_counter() - _t0) * 1000
