@@ -919,3 +919,34 @@ names storage misfits; fjdb's hits (a symlink to ClickBench's July
 segment, pre-guard) carries six narrow mode-4 columns -- every predicate
 on them decodes 100M rows; the encoder's judgement itself was already
 right; re-encode scheduled. Suite 1696/0 at every push (seven today).
+
+
+## THE FIXTURE REPAIR AND THE LITERAL-VALUE LAW (2026-09-12)
+fjdb's hits_0.wdb was a symlink to ClickBench's July segment, pre-guard
+(six flag columns as 100M-value sequences). A full re-encode is not
+viable on this pod: the streaming encoder held 37GB and managed 4 of 105
+columns in 83 minutes -- THE ENCODER NEEDS THE GOVERNOR (encode a column,
+write it, free it; per-column parallelism under a byte budget). The
+right road: repoint to hits_14 (same rows, post-guard dictionaries),
+remove every hits_0 sidecar BY NAME (dictionary codes differ between
+encodes; mtime cannot see it), drop the plan-cache ledger. Within the
+hour the new fixture exposed a July silent wrong: _dict_eq_mask's
+presence-bitmap shortcut (enc-8 columns) passed the literal NODE to
+_code_of -- str(Literal) is the quoted SQL, so = '' matched nothing
+and <> '' everything (sq-notin 99.6M vs 12.8M). THE LITERAL-VALUE
+LAW: the value, never the node. Megaboard on the healthy fixture: 102/
+103, faster on 91, median 4.69x -- A NEW RECORD (was 89 / 3.73x); t-null
+0.62s -> 0.00s, u-unionall 0.85s -> 0.14s. OPEN: g-substr WAVE-ERROR
+(ascii decode of Cyrillic in a SUBSTR path). EXPLAIN: db.explain(sql) --
+which door served, every bill, rows, wall, peak RSS, shelf and governor.
+DML MEETS THE DOORS (local, uncommitted, untested): the truth test on a
+parquet-encoded realm found DELETE silently deleting zero rows (the
+segment class expects a canonical buffer) and INSERT crashing on the
+type name str -- and NO controller door consults presence or overrides:
+eight doors confidently wrong after one DELETE. Fixed locally: DELETE
+tombstones parquet realms; type names; THE PRESENCE GATE (a segment
+with tombstones or overrides is served by the general scan only until
+compaction). NEXT: sync, rerun /tmp/dml.py, suite, commit; db.compact();
+convict g-substr. TWO LESSONS: a second fixture finds what the first
+cannot -- realm diversity is a correctness instrument; a fast door that
+cannot see a tombstone is a wrong answer waiting for the first DELETE.
