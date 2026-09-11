@@ -2161,7 +2161,11 @@ def _dict_eq_mask(seg, name, neg, lit):
     # to the code scan as ever.
     if c.get('code_enc') in (8, 9) and not c.get('has_null'):
         import wdb_wherescan as _WS
-        dcode = _WS._code_of(seg, name, lit)
+        # the literal's VALUE, never the node (str(Literal) is the quoted SQL: '' became b"''",
+        # so = '' matched nothing and <> '' everything on every enc-8 column -- sq-notin, 2026-09-12)
+        _lv9 = _WS._litval(lit) if isinstance(lit, E.Expression) else lit
+        if _lv9 is None: return None
+        dcode = _WS._code_of(seg, name, _lv9)
         if dcode is None:                       # literal absent from the dictionary
             return np.ones(int(seg.N), bool) if neg else np.zeros(int(seg.N), bool)
         d8 = c.get('e8d') if c.get('code_enc') == 8 else c.get('e9d')

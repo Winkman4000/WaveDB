@@ -403,6 +403,74 @@ class Database:
         cols = {n: [r[i] for r in rows] for i, n in enumerate(names)} if names else {}
         return cols, names
 
+    def explain(self, sql, run=True):
+        """EXPLAIN: the plan you can read. Runs the query with the route trace and the
+        bills switched on and returns a report -- which door served (the controller's
+        _SERVED or the join engine's ROUTE), each stage's bill, rows out, wall time,
+        peak RSS, and what the shelf and governor did. run=False reports routing only
+        (the shapes the doors would claim) without executing."""
+        import os as _os, io, contextlib, time as _t, resource
+        import controller, wdb_shelf, wdb_govern
+        keys = ('WDB_ROUTE_DEBUG', 'WDB_JOIN_BILL', 'WDB_SEMI_BILL', 'WDB_CASCADE_DEBUG')
+        prev = {k: _os.environ.get(k) for k in keys}
+        for k in keys: _os.environ[k] = '1'
+        buf = io.StringIO()
+        controller._SERVED[0] = None
+        rss0 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        ev0 = wdb_shelf.SHELF.evictions; rf0 = wdb_shelf.SHELF.refusals
+        t0 = _t.perf_counter(); rows = None; err = None
+        try:
+            with contextlib.redirect_stdout(buf):
+                if run:
+                    r = self.run(sql)
+                    rows = r[0] if isinstance(r, tuple) else r
+                else:
+                    tree = _parse_sql_cached(sql)
+                    print('shape: %s' % ('multi-table' if tree.args.get('joins') else 'single-table'))
+                    if not tree.args.get('joins'):
+                        try:
+                            name = self._table_in(tree)
+                            import read_methods
+                            phys = self.cat.phys_map(name)
+                            cmap = {c: phys.get(c, c) for c in self.cat.column_names(name)}
+                            paths = self.cat.segment_paths(name)
+                            ctx = read_methods.ReadContext(self, name, self.open_segment(paths[0], name), paths[0], tree, cmap, sql, None)
+                            claims = [nm for nm in self._SPECIALISED if getattr(read_methods, nm, None) is not None and (getattr(read_methods, nm).detect(ctx) is not None)]
+                            print('specialised doors claiming: %s' % (claims or 'none'))
+                            print('new-door shape: %s' % self._new_door_shape(tree))
+                        except Exception as e:
+                            print('routing probe: %s' % str(e)[:80])
+        except Exception as e:
+            err = e
+        finally:
+            for k, v in prev.items():
+                if v is None: _os.environ.pop(k, None)
+                else: _os.environ[k] = v
+        wall = _t.perf_counter() - t0
+        lines = [l for l in buf.getvalue().splitlines() if l.strip() and not l.startswith('Numba') and 'warn' not in l.lower()]
+        served = controller._SERVED[0]
+        route = [l for l in lines if l.startswith('ROUTE:')]
+        bills = [l for l in lines if 'BILL' in l]
+        other = [l for l in lines if l not in route and l not in bills][:12]
+        out = []
+        out.append('EXPLAIN %s' % sql.strip().replace(chr(10), ' ')[:160])
+        out.append('  served by : %s' % (served or (route[-1].replace('ROUTE: ', 'join engine / ') if route else 'n/a')))
+        if route: out.append('  route     : %s' % ' -> '.join(r.replace('ROUTE: ', '') for r in route))
+        for b in bills: out.append('  bill      : %s' % b.replace('JOIN BILL: ', '').replace('RUN BILL: ', '').replace('SEMI BILL: ', 'semi: ')[:200])
+        for o in other: out.append('  note      : %s' % o[:200])
+        if run:
+            out.append('  rows out  : %s' % (len(rows) if rows is not None else 'error: %s' % str(err)[:100]))
+            out.append('  wall      : %.3fs' % wall)
+            out.append('  peak RSS  : %.2f GB (this process)' % (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6))
+            out.append('  shelf     : %d objects, %.2f GB of %.2f GB; evictions +%d, refusals +%d' % (
+                len(wdb_shelf.SHELF._items), wdb_shelf.SHELF._bytes / 1e9, wdb_shelf.ceiling_bytes() / 1e9,
+                wdb_shelf.SHELF.evictions - ev0, wdb_shelf.SHELF.refusals - rf0))
+            out.append('  governor  : budget %.1f GB (WDB_WORK_MB)' % (wdb_govern.budget_bytes() / 1e9))
+        report = chr(10).join(out)
+        if err is not None and run:
+            raise type(err)(str(err) + chr(10) + report) if isinstance(err, NotImplementedError) else err
+        return report
+
     def stream(self, sql, block_rows=None):
         """STREAM-AND-CLEAN: yield the result in row blocks the caller pulls; each block
         is built from column arrays and freed behind. Uses the join engine's columnar
