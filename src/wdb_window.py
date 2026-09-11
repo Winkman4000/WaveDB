@@ -967,7 +967,11 @@ def execute(seg, spec):
             else:
                 out_s = shifted
         elif k in ('sum', 'avg', 'count'):
-            vv = _load(w['arg'])[perm] if w['arg'] is not None else None
+            # INTEGER ACCUMULATION: SUM/MIN/MAX over an integer column run in int64 end to
+            # end (w-runsum: float64 running sums flipped 105 rows at QUALIFY rs > 4e10)
+            _exact9 = (w['arg'] is not None and w.get('kind') in ('sum', 'min', 'max')
+                       and seg.cols.get(w['arg'], {}).get('dt') == 0)
+            vv = _load(w['arg'], exact=_exact9)[perm] if w['arg'] is not None else None
             cs = np.cumsum(vv) if vv is not None else None
             if w['frame'] is not None:               # ROWS k PRECEDING .. CURRENT ROW
                 fk = w['frame'][1]
@@ -977,7 +981,7 @@ def execute(seg, spec):
                 if k == 'count':
                     out_s = nrow
                 else:
-                    cs0 = np.concatenate(([0.0], cs))
+                    cs0 = np.concatenate((np.zeros(1, dtype=cs.dtype), cs))    # keep the accumulator's dtype (int64 stays int64)
                     wsum = cs0[np.arange(1, N + 1)] - cs0[lo_i]
                     out_s = wsum if k == 'sum' else wsum / nrow
             elif spec['ocol'] is None:               # whole-partition aggregate
@@ -991,7 +995,7 @@ def execute(seg, spec):
                 if k == 'count':
                     out_s = (tie_ends[tg] - lane_start[lane_id_sorted] + 1).astype(np.int64)
                 else:
-                    base = np.where(lane_start > 0, cs[lane_start - 1], 0.0)
+                    base = np.where(lane_start > 0, cs[lane_start - 1], np.zeros((), dtype=cs.dtype))
                     rs = cs[tie_ends[tg]] - base[lane_id_sorted]
                     out_s = rs if k == 'sum' else \
                         rs / (tie_ends[tg] - lane_start[lane_id_sorted] + 1)
