@@ -595,6 +595,27 @@ def _like_vectorised(vals, isn, pat, icase, sarr=None):
     return cand
 
 
+def _eval_rows_streamed(seg, node, resolve=None):
+    """STREAM-AND-CLEAN (Jackson's rule): a per-row decision over a big column walks it
+    in blocks, keeps only the decision for each block, and frees the block behind --
+    the working set is one block, not N. Dictionary-mappable nodes still take the
+    V-scale map (already bounded); everything else streams past WDB_BLOCK_ROWS."""
+    import wdb_govern
+    n = int(seg.N); br = wdb_govern.block_rows()
+    if n <= br or _dict_string_col(seg, node.this if isinstance(node, E.Alias) else node, resolve, any_dt=True) is not None:
+        return _eval_rows(seg, node, None, resolve)
+    out = np.empty(n, dtype=bool)
+    for lo in range(0, n, br):
+        hi = min(n, lo + br)
+        m = np.zeros(n, dtype=bool); m[lo:hi] = True          # a block mask: the evaluator only touches these rows
+        part = np.asarray(_eval_rows(seg, node, m, resolve))
+        if part.dtype != bool:
+            part = np.array([bool(v) if v is not None else False for v in part], dtype=bool)
+        out[lo:hi] = part
+        del part, m                                              # cleaned up behind
+    return out
+
+
 def _eval_rows(seg, node, mask, resolve=None, env=None):
     """Row-wise evaluation. env: {column name: array} overrides (THE DICTIONARY
     MAP evaluates a string function once per distinct value and gathers)."""
@@ -2073,7 +2094,7 @@ def _eval_pred(seg, node, seg_col):
     except NotImplementedError as _ne:
         if node.find(E.Select) is not None: raise
         try:
-            out = _eval_rows(seg, node, None, seg_col)
+            out = _eval_rows_streamed(seg, node, seg_col)
         except TypeError:
             raise _ne
         out = np.asarray(out)

@@ -403,6 +403,35 @@ class Database:
         cols = {n: [r[i] for r in rows] for i, n in enumerate(names)} if names else {}
         return cols, names
 
+    def stream(self, sql, block_rows=None):
+        """STREAM-AND-CLEAN: yield the result in row blocks the caller pulls; each block
+        is built from column arrays and freed behind. Uses the join engine's columnar
+        path when it serves; otherwise the governed row path (which declines by name
+        past the working-set budget)."""
+        import wdb_govern, wdb_join, numpy as np
+        br = block_rows or wdb_govern.block_rows()
+        cols = None
+        try:
+            r = wdb_join.join_query(self, sql, columnar=True)
+            if isinstance(r, tuple) and len(r) == 2 and isinstance(r[0], dict):
+                cols, _names9 = r
+            elif isinstance(r, dict) and r:
+                cols = r
+        except Exception:
+            cols = None
+        if cols is not None:
+            names = list(cols.keys()); arrs = [np.asarray(cols[n]) for n in names]
+            n = int(arrs[0].shape[0]) if arrs else 0
+            for lo in range(0, n, br):
+                hi = min(n, lo + br)
+                lists = [(a[lo:hi].tolist() if a.dtype != object else list(a[lo:hi])) for a in arrs]
+                yield names, list(zip(*lists))
+                del lists
+            return
+        rows, names = self.run(sql)
+        for lo in range(0, len(rows), br):
+            yield names, rows[lo:lo + br]
+
     def run(self, sql, escalate=None):
         """Depth-guarded: recursive runs (subquery rewrites, join sub-queries) share
         memory within one outer query; at depth 0 wdb_qmem.flush forgets everything

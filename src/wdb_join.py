@@ -1735,6 +1735,8 @@ def _road_join_emit(db, tree):
         miss = prow < 0
     else:
         rows = np.flatnonzero(ptr >= 0); prow = ptr[rows]; miss = None
+    import wdb_govern
+    wdb_govern.ask(int(rows.size), len(proj), 'join result')               # THE GOVERNOR
     def col_vals(seg, pc, rr):
         # MODE-AWARE point reads: plain dict numerics ride base[codes_at]
         # (cached base), everything else the general values_at_rows --
@@ -5079,6 +5081,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     # column through its dict, and bulk-pull each aggregate -- then zip columns into row tuples. The old path
     # was a python loop over present groups calling fetch() per cell, which dominated high-card output.
     radices = [k['K'] for k in gkeys]
+    if not columnar:
+        import wdb_govern
+        wdb_govern.ask(int(present.size), len(proj), 'grouped result')    # THE GOVERNOR: rows as Python cells
     kc_arr = []
     if gkeys and _gid_words9 is not None:
         g0, g1, shifts9, words9, widths9 = _gid_words9
