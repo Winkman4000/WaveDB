@@ -866,3 +866,27 @@ ERE -- it reported 0 while nine boards ran concurrently. OPEN: transient
 working sets (emission of 50M-row results, giant group-bys: mega peak
 65.7GB, H2O groupby 55.5GB) are not shelf objects -- the ceiling must
 learn to govern them too (chunked emission, spill, or named declines).
+
+
+## THE COUNTING FIXPOINT (2026-09-11): joins that count
+The biggest generality gap named on the state-of-the-engine map: the
+MIN/MAX fixpoint was only legal without multiplicity. Now, after the
+semi-join reduction, the join hypergraph's VALUE CLASSES form a join
+tree; rooted at the aggregate's table, every surviving row's WEIGHT is
+the product over its classes (except the one to its parent) of the
+partner weight sums in the child subtrees -- COUNT(*) = sum of root
+weights, SUM(T.x) = weighted sum, AVG = ratio, GROUP BY on root keys =
+weights per key. No pair is ever built (Yannakakis). Routing: MIN/MAX
+fixpoint first; the counting fixpoint LAST, only when the road engine
+declines (TPC-H stays on the roads). JOB-COUNT: 113/113 EXACT (wave
+149s vs duck 11s -- the fixpoint's speed). Also today: the set-op leaf
+cost convicted (fjdb encodes AdvEngineID as a mode-4 sequence, V == N;
+the .bst.npz is blockstats, not a bitset; np.isin -> direct compare);
+THE STATE OF THE ENGINE map: structural gaps in order -- (1) joins that
+count [DONE], (2) multi-segment tables in the join engine (19 solo-
+segment gates), (3) transient working-set RAM (emission, giant group-
+bys), (4) date/time functions, (5) outer joins and frames in the join
+engine, (6) the encoder's mode judgement; product gaps -- DML meets
+sidecars/shelves, concurrency, a wire, EXPLAIN/cost model, bad-input
+robustness; research -- the key-space fixpoint, the join family as
+sparse matrices over one V-space.
