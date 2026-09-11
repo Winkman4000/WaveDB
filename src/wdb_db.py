@@ -307,6 +307,62 @@ class Database:
         except Exception as e:
             print('SIDECARS: %s' % e)
 
+    def _null_fold(self, tree):
+        """THE NULL FOLD: col IS [NOT] NULL on a column WITHOUT nulls is a boolean
+        literal (four consumers used to decode the 100M-row column to learn it);
+        the WHERE simplifies; a WHERE folded to FALSE answers by the ZERO-SURVIVOR
+        law. Returns (tree, 'false'|'changed'|None)."""
+        E9 = sqlglot.exp
+        w = tree.args.get('where')
+        if w is None or tree.args.get('joins') or w.this.find(E9.Is) is None: return tree, None
+        try:
+            name = self._table_in(tree)
+            seg = self.open_segment(self.cat.segment_paths(name)[0], name)
+            pm = self.cat.phys_map(name)
+        except Exception:
+            return tree, None
+        t = tree.copy(); changed = False
+        for nd in list(t.args['where'].this.find_all(E9.Is)):
+            if not (isinstance(nd.this, E9.Column) and isinstance(nd.expression, E9.Null)): continue
+            c = seg.cols.get(pm.get(nd.this.name, nd.this.name))
+            if c is None or c.get('has_null'): continue
+            nd.replace(E9.Boolean(this=False)); changed = True
+        if not changed: return tree, None
+        def simp(n):
+            if isinstance(n, E9.Paren): return simp(n.this)
+            if isinstance(n, E9.Not):
+                x = simp(n.this)
+                return E9.Boolean(this=not x.this) if isinstance(x, E9.Boolean) else E9.Not(this=x)
+            if isinstance(n, E9.And):
+                a, b = simp(n.this), simp(n.expression)
+                if isinstance(a, E9.Boolean): return b if a.this else a
+                if isinstance(b, E9.Boolean): return a if b.this else b
+                return E9.And(this=a, expression=b)
+            if isinstance(n, E9.Or):
+                a, b = simp(n.this), simp(n.expression)
+                if isinstance(a, E9.Boolean): return a if a.this else b
+                if isinstance(b, E9.Boolean): return b if b.this else a
+                return E9.Or(this=a, expression=b)
+            return n
+        cond = simp(t.args['where'].this)
+        if isinstance(cond, E9.Boolean):
+            if cond.this:
+                t.set('where', None); return t, 'changed'
+            return t, 'false'
+        t.set('where', E9.Where(this=cond)); return t, 'changed'
+
+    def _zero_survivors(self, tree):
+        """The ZERO-SURVIVOR law: a scalar aggregate over no rows is ONE row (COUNT 0, else NULL); anything else is empty."""
+        E9 = sqlglot.exp
+        names = [wdb_sql._alias(p) for p in tree.expressions]
+        if tree.args.get('group') is None and tree.expressions and all((p.this if isinstance(p, E9.Alias) else p).find(E9.AggFunc) is not None or isinstance((p.this if isinstance(p, E9.Alias) else p), E9.AggFunc) for p in tree.expressions):
+            row = []
+            for p in tree.expressions:
+                nd = p.this if isinstance(p, E9.Alias) else p
+                row.append(0 if isinstance(nd, E9.Count) else None)
+            return [tuple(row)], names
+        return [], names
+
     def _new_doors(self, tree, sql):
         """THE PRECEDENCE LAW: the controller's doors serve first; the doors born in
         the scope stage (aggregate arithmetic, expression group keys, windows, top-k
@@ -417,6 +473,11 @@ class Database:
                 _t9 = wdb_subquery.substitute_select_scalars(self, tree.copy())
                 if _t9.sql() != sql:
                     return self._run_impl(_t9.sql(), escalate)     # SELECT-list scalars -> literals
+            _tf9, _how9 = self._null_fold(tree)
+            if _how9 == 'false':
+                return self._zero_survivors(tree)
+            if _how9 == 'changed':
+                return self._run_impl(_tf9.sql(), escalate)
             _hr9 = wdb_join.hidden_rewrite(tree)
             if _hr9 is not None:
                 _sql9, _nh9 = _hr9

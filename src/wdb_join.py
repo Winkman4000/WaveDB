@@ -3368,8 +3368,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             return leaf(node.this, mk)
         if isinstance(node, E.Is) and isinstance(node.expression, E.Null):   # IS NULL (Not(Is) = IS NOT NULL)
             def mk(seg, pcol):
-                c = seg.cols[pcol]; codes = seg.codes(pcol)
-                if not c['has_null']: return np.zeros(len(codes), dtype=bool)  # non-nullable -> nothing
+                c = seg.cols[pcol]
+                if not c['has_null']: return np.zeros(int(seg.N), dtype=bool)  # non-nullable -> nothing, WITHOUT reading the column
+                codes = seg.codes(pcol)
                 return codes == (c['V'] - 1)                                   # null is reserved code V-1
             return leaf(node.this, mk)
         if isinstance(node, (E.Like, E.ILike)):              # LIKE -> code-LUT over the dict, gathered
@@ -4786,6 +4787,21 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 raise
             _plane_mask9 = _mfull9 if _plane_mask9 is None else (_plane_mask9 & _mfull9)
             pred_body = None
+        # CONSTANT FOLDING: a predicate that compiled to (False)/(True) -- IS [NOT] NULL on a
+        # no-null column -- must not drag its column into a kernel slot (a 100M-row mode-4
+        # decode cost 614ms to evaluate a constant on the megaboard's t-null/f-isnotnull)
+        _parts9 = list(pred_body) if isinstance(pred_body, tuple) else ([pred_body] if pred_body is not None else [])
+        if _parts9 and all(p9 in ('(False)', '(True)') for p9 in _parts9):
+            slots.clear(); slot_list.clear()
+            if any(p9 == '(False)' for p9 in _parts9):
+                _plane_mask9 = np.zeros(int(seg_of[fact].N), bool)      # no mask evaluation: the constant IS the mask
+                _maskc['m'] = _plane_mask9
+            else:
+                _maskc['m'] = None                                       # (True): as if there were no WHERE
+            pred_body = None
+        elif _parts9 and any(p9 == '(True)' for p9 in _parts9):
+            _rest9 = [p9 for p9 in _parts9 if p9 != '(True)']
+            pred_body = tuple(_rest9) if len(_rest9) > 1 else _rest9[0]
 
     plan = []; fully = wdb_exprjit.HAS_NUMBA
     for i, p in enumerate(proj):
