@@ -1922,7 +1922,10 @@ def _window_door(db, tree):
         pc = pm.get(nm, nm)
         raw = wdb_sql.raw_dict_col(seg, pc, want_codes=False)
         if raw is not None:
-            return raw[0][np.asarray(seg.codes_at(pc, rr))]
+            v = raw[0][np.asarray(seg.codes_at(pc, rr))]
+            if seg.cols.get(pc, {}).get('dt') == 3 and np.asarray(v).dtype.kind != 'M':
+                v = np.asarray(v).astype(np.int64).view('datetime64[%s]' % seg.unit(pc))   # a date column IS datetime64
+            return v
         return np.asarray(_bulk_keyvals(seg, pc, np.asarray(seg.codes_at(pc, rr))), dtype=object)
     def sort_key(node, rr):
         """numeric sort key for an order expression (strings by dict code)."""
@@ -2083,7 +2086,10 @@ def _window_door(db, tree):
             pc = pm.get(nd.name, nd.name)
             raw = wdb_sql.raw_dict_col(seg, pc, want_codes=False)
             if raw is not None:
-                arrs.append(raw[0][np.asarray(seg.codes_at(pc, rows))])
+                _v9 = raw[0][np.asarray(seg.codes_at(pc, rows))]
+                if seg.cols.get(pc, {}).get('dt') == 3 and np.asarray(_v9).dtype.kind != 'M':
+                    _v9 = np.asarray(_v9).astype(np.int64).view('datetime64[%s]' % seg.unit(pc))
+                arrs.append(_v9)
             elif seg.cols.get(pc, {}).get('mode') != 5:
                 arrs.append(np.asarray(_bulk_keyvals(seg, pc, np.asarray(seg.codes_at(pc, rows))), dtype=object))
             else:
@@ -2095,9 +2101,9 @@ def _window_door(db, tree):
         if m9.dtype != bool:
             m9 = np.array([bool(v) if v is not None else False for v in m9], dtype=bool)
         arrs = [a[m9] for a in arrs]
-    cols = [(a.tolist() if a.dtype != object else list(a)) for a in arrs]
+    cols = [([wdb_sql._pyval(x) for x in a] if a.dtype.kind == 'M' else (a.tolist() if a.dtype != object else list(a))) for a in arrs]
     out = list(zip(*cols)) if cols else []
-    out = [tuple(int(x) if isinstance(x, (np.integer,)) else (float(x) if isinstance(x, np.floating) else x) for x in r) for r in out]
+    out = [tuple(int(x) if isinstance(x, (np.integer,)) else (float(x) if isinstance(x, np.floating) else (wdb_sql._pyval(x) if isinstance(x, np.datetime64) else x)) for x in r) for r in out]
     out = wdb_sql._apply_order(out, proj, tree.args.get('order'))
     lim = tree.args.get('limit')
     if lim is not None: out = out[:int(lim.expression.this)]
@@ -3122,6 +3128,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     def col_operand(node):
         # parent columns become ('g', arr, composed_ptr) so the gather happens per-chunk inside the
         # threaded kernel instead of materialising the full gathered array here.
+        if not isinstance(node, E.Column):
+            raise _FastUnsupported                  # THE BARE-COLUMN LAW: CAST(ts AS DATE) resolved through .name to ts
         seg, pcol, cptr = resolve(node)
         if cptr is None:
             raw = wdb_sql.raw_dict_col(seg, pcol)         # plain dict numeric col -> defer/fuse the decode
@@ -3138,6 +3146,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     def eval_arith(node):
         # Materialise an arithmetic expression to a per-fact-row value array (+ combined null mask).
         # Each column is resolved through its composed pointer, so expressions may mix tables in the chain.
+        if isinstance(node, E.Cast) and any(k in node.to.sql().upper() for k in ('DATE', 'TIME', 'CHAR', 'TEXT', 'STRING', 'BOOL')):
+            raise _FastUnsupported                  # a TYPE-CHANGING cast is not transparent
         if isinstance(node, (E.Paren, E.Cast)): return eval_arith(node.this)
         if isinstance(node, E.Neg):
             a, na = eval_arith(node.this); return -a, na
@@ -3165,7 +3175,12 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         if not wdb_exprjit.HAS_NUMBA: raise _FastUnsupported
         inputs = []; slot = {}
         def emit(node):
-            if isinstance(node, (E.Paren, E.Cast)): return emit(node.this)
+            if isinstance(node, E.Paren): return emit(node.this)
+            if isinstance(node, E.Cast):
+                _t9 = node.to.sql().upper()
+                if any(k in _t9 for k in ('DATE', 'TIME', 'CHAR', 'TEXT', 'STRING', 'BOOL')):
+                    raise _FastUnsupported            # a TYPE-CHANGING cast is not transparent (CAST(ts AS DATE) = d compared us to days)
+                return emit(node.this)
             if isinstance(node, E.Neg): return f"(-{emit(node.this)})"
             if isinstance(node, E.Column):
                 seg, pcol, cptr = resolve(node)               # cptr: fact->parent pointer (None for the fact)
@@ -4498,6 +4513,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     # arithmetic over them (string / nullable / computed), or numba is unavailable.
     slots = {}; slot_list = []                       # (id(seg), pcol, id(cptr)) -> global slot index
     def build_fused(node):
+        if isinstance(node, E.Cast) and any(k in node.to.sql().upper() for k in ('DATE', 'TIME', 'CHAR', 'TEXT', 'STRING', 'BOOL')):
+            raise _FastUnsupported                  # a TYPE-CHANGING cast is not transparent
         if isinstance(node, (E.Paren, E.Cast)): return build_fused(node.this)
         if isinstance(node, E.Neg): return f"(-{build_fused(node.this)})"
         if isinstance(node, E.Column):

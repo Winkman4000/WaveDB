@@ -628,10 +628,7 @@ def _eval_rows(seg, node, mask, resolve=None, env=None):
             V = int(seg.cols[pc]['V'])
             codes = np.asarray(seg.codes(pc))
             if mask is not None: codes = codes[mask]
-            td = seg._typed_dict(pc)
-            td = np.asarray(td, dtype=object) if not isinstance(td, np.ndarray) else td
-            if seg.cols[pc].get('has_null'):
-                td = np.append(td.astype(object), None)                # the null code maps to None
+            td = _typed_dict_dt(seg, pc)
             outv = _eval_rows(seg, n, None, resolve, env={nm: td})
             outv = np.asarray(outv, dtype=object) if not isinstance(outv, np.ndarray) else outv
             if outv.shape[0] != V: raise TypeError('dictionary map: %d values for V=%d' % (outv.shape[0], V))
@@ -644,6 +641,151 @@ def _eval_rows(seg, node, mask, resolve=None, env=None):
                     pass
             return outv[codes]
     return _eval_rows_core(seg, node, mask, resolve, env)
+
+
+
+_DATE_NODE_NAMES = ('Extract', 'Year', 'Month', 'Day', 'Quarter', 'Week', 'DayOfWeek', 'DayOfYear', 'Hour', 'Minute', 'Second',
+                    'DateTrunc', 'TimestampTrunc', 'DateAdd', 'DateSub', 'TimestampAdd', 'TimestampSub', 'DateDiff', 'TimestampDiff',
+                    'LastDay', 'TimeToStr', 'StrfTime', 'DateToStr', 'TimeToUnix', 'UnixToTime', 'Epoch')
+
+
+def _dt64(a):
+    """anything date-like -> datetime64 (ints stay ints: the caller decides the unit)"""
+    a = np.asarray(a)
+    if a.dtype.kind == 'M': return a
+    if a.dtype == object:
+        return np.array([np.datetime64('NaT') if v is None else np.datetime64(v.decode() if isinstance(v, bytes) else v) for v in a], dtype='datetime64[us]')
+    if a.dtype.kind in 'US': return a.astype('datetime64[us]')
+    return a
+
+
+def _typed_dict_dt(seg, pc):
+    """a column's typed dictionary with dates as datetime64[unit] (null code -> NaT/None)"""
+    td = seg._typed_dict(pc)
+    if seg.cols[pc].get('dt') == 3:
+        td = np.asarray(td, dtype=np.int64).view('datetime64[%s]' % seg.unit(pc))
+        if seg.cols[pc].get('has_null'): td = np.append(td, np.datetime64('NaT'))
+        return td
+    td = np.asarray(td, dtype=object) if not isinstance(td, np.ndarray) else td
+    if seg.cols[pc].get('has_null'): td = np.append(td.astype(object), None)
+    return td
+
+
+def _is_date_node(n):
+    return type(n).__name__ in _DATE_NODE_NAMES
+
+
+def _date_family(seg, n, mask, resolve, env):
+    """THE DATE FAMILY over datetime64 (calendar semantics as duck: month/year intervals clamp the day)."""
+    def ev(x): return _eval_rows(seg, x, mask, resolve, env)
+    def dt64(a):
+        a = np.asarray(a)
+        if a.dtype.kind == 'M': return a
+        if a.dtype == object:
+            return np.array([np.datetime64('NaT') if v is None else np.datetime64(v.decode() if isinstance(v, bytes) else v) for v in a], dtype='datetime64[us]')
+        if a.dtype.kind in 'US': return a.astype('datetime64[us]')
+        return a
+    def ymd(a):
+        a = dt64(a); Y = a.astype('datetime64[Y]'); M = a.astype('datetime64[M]'); D = a.astype('datetime64[D]')
+        y = Y.astype(np.int64) + 1970; m = (M.astype(np.int64) % 12) + 1; d = (D - M).astype(np.int64) + 1
+        return y, m, d, D
+    def days_in_month(y, m):
+        start = ((y - 1970) * 12 + (m - 1)).astype('datetime64[M]')      # this month, 1970-origin month index
+        return ((start + np.timedelta64(1, 'M')).astype('datetime64[D]') - start.astype('datetime64[D]')).astype(np.int64)
+    def from_ymd(y, m, d):
+        m0 = (y - 1970) * 12 + (m - 1)
+        return (m0.astype('datetime64[M]').astype('datetime64[D]') + (d - 1).astype('timedelta64[D]'))
+    def extract(field, a):
+        field = str(field).upper()
+        a = dt64(a); y, m, d, D = ymd(a)
+        if field in ('YEAR', 'Y', 'YY', 'YYYY'): return y
+        if field in ('MONTH', 'MON', 'MM'): return m
+        if field in ('DAY', 'DD', 'DAYOFMONTH'): return d
+        if field == 'QUARTER': return (m - 1) // 3 + 1
+        if field in ('DOW', 'DAYOFWEEK', 'WEEKDAY'): return (D.astype(np.int64) + 4) % 7          # 1970-01-01 was a Thursday; Sunday = 0
+        if field in ('ISODOW',): return ((D.astype(np.int64) + 3) % 7) + 1
+        if field in ('DOY', 'DAYOFYEAR'): return (D - a.astype('datetime64[Y]').astype('datetime64[D]')).astype(np.int64) + 1
+        if field in ('WEEK', 'ISOWEEK'):
+            import datetime as _dt9
+            di = D.astype(np.int64)
+            return np.array([(_dt9.date(1970, 1, 1) + _dt9.timedelta(days=int(x))).isocalendar()[1] for x in di], dtype=np.int64)
+        us = a.astype('datetime64[us]').astype(np.int64)
+        if field == 'HOUR': return (us // 3_600_000_000) % 24
+        if field == 'MINUTE': return (us // 60_000_000) % 60
+        if field == 'SECOND': return (us // 1_000_000) % 60
+        if field in ('EPOCH',): return us / 1e6
+        raise TypeError('EXTRACT %s' % field)
+    if isinstance(n, E.Extract):
+        return extract(n.this.name if hasattr(n.this, 'name') else n.this.sql(), ev(n.expression))
+    for _cls9, _fld9 in (('Year', 'YEAR'), ('Month', 'MONTH'), ('Day', 'DAY'), ('Quarter', 'QUARTER'), ('Week', 'WEEK'), ('DayOfWeek', 'DOW'), ('DayOfYear', 'DOY'), ('Hour', 'HOUR'), ('Minute', 'MINUTE'), ('Second', 'SECOND')):
+        if type(n).__name__ == _cls9 and hasattr(E, _cls9):
+            return extract(_fld9, ev(n.this))
+    if type(n).__name__ in ('DateTrunc', 'TimestampTrunc'):
+        unit = str(n.args.get('unit').this if hasattr(n.args.get('unit'), 'this') else n.args.get('unit')).upper().strip("'")
+        a = dt64(ev(n.this))
+        if unit in ('YEAR', 'Y'): return a.astype('datetime64[Y]').astype('datetime64[D]')
+        if unit == 'QUARTER':
+            y, m, d, D = ymd(a); return from_ymd(y, ((m - 1) // 3) * 3 + 1, np.ones_like(d))
+        if unit == 'MONTH': return a.astype('datetime64[M]').astype('datetime64[D]')
+        if unit == 'WEEK':
+            D = a.astype('datetime64[D]'); return D - (((D.astype(np.int64) + 3) % 7)).astype('timedelta64[D]')   # Monday
+        if unit == 'DAY': return a.astype('datetime64[D]') if np.datetime_data(a.dtype)[0] == 'D' else a.astype('datetime64[D]').astype(a.dtype)
+        if unit == 'HOUR': return a.astype('datetime64[h]').astype(a.dtype)
+        if unit == 'MINUTE': return a.astype('datetime64[m]').astype(a.dtype)
+        if unit == 'SECOND': return a.astype('datetime64[s]').astype(a.dtype)
+        raise TypeError('DATE_TRUNC %s' % unit)
+    def interval_add(a, iv, sign):
+        a = dt64(a); nlit = iv.this; k = int(nlit.this if isinstance(nlit, E.Literal) else ev(nlit)) * sign
+        unit = str(iv.args.get('unit').this if hasattr(iv.args.get('unit'), 'this') else iv.args.get('unit')).upper().rstrip('S')
+        if unit in ('DAY',): return a + np.timedelta64(k, 'D')
+        if unit in ('HOUR', 'MINUTE', 'SECOND'):
+            code = {'HOUR': 'h', 'MINUTE': 'm', 'SECOND': 's'}[unit]
+            return a.astype('datetime64[us]') + np.timedelta64(k, code)
+        if unit in ('WEEK',): return a + np.timedelta64(7 * k, 'D')
+        if unit in ('MONTH', 'YEAR'):
+            y, m, d, D = ymd(a); months = k * (12 if unit == 'YEAR' else 1)
+            tot = y * 12 + (m - 1) + months; y2 = tot // 12; m2 = tot % 12 + 1
+            d2 = np.minimum(d, days_in_month(y2, m2))
+            out = from_ymd(y2, m2, d2)
+            if np.datetime_data(a.dtype)[0] != 'D':
+                out = out.astype(a.dtype) + (a - a.astype('datetime64[D]').astype(a.dtype))   # keep the time of day
+            return out
+        raise TypeError('INTERVAL %s' % unit)
+    if isinstance(n, (E.Add, E.Sub)) and (isinstance(n.expression, E.Interval) or isinstance(n.this, E.Interval)):
+        iv = n.expression if isinstance(n.expression, E.Interval) else n.this
+        base = n.this if isinstance(n.expression, E.Interval) else n.expression
+        return interval_add(ev(base), iv, 1 if isinstance(n, E.Add) else -1)
+    if type(n).__name__ in ('DateAdd', 'DateSub', 'TimestampAdd', 'TimestampSub'):
+        k = ev(n.expression); unit = str(n.args.get('unit').this if hasattr(n.args.get('unit'), 'this') else n.args.get('unit')).upper()
+        iv = E.Interval(this=E.Literal(this=str(int(np.asarray(k).flat[0])), is_string=False), unit=E.Var(this=unit))
+        return interval_add(ev(n.this), iv, 1 if 'Add' in type(n).__name__ else -1)
+    if type(n).__name__ in ('DateDiff', 'TimestampDiff'):
+        unit = str(n.args.get('unit').this if hasattr(n.args.get('unit'), 'this') else (n.args.get('unit') or 'DAY')).upper().rstrip('S')
+        end = dt64(ev(n.this)); start = dt64(ev(n.expression))
+        if unit == 'DAY': return (end.astype('datetime64[D]') - start.astype('datetime64[D]')).astype(np.int64)
+        if unit == 'MONTH':
+            y1, m1, _, _ = ymd(start); y2, m2, _, _ = ymd(end); return (y2 - y1) * 12 + (m2 - m1)
+        if unit == 'YEAR':
+            y1, _, _, _ = ymd(start); y2, _, _, _ = ymd(end); return y2 - y1
+        if unit in ('HOUR', 'MINUTE', 'SECOND'):
+            code = {'HOUR': 'h', 'MINUTE': 'm', 'SECOND': 's'}[unit]
+            return (end.astype('datetime64[%s]' % code).astype(np.int64) - start.astype('datetime64[%s]' % code).astype(np.int64))
+        raise TypeError('DATEDIFF %s' % unit)
+    if type(n).__name__ == 'LastDay':
+        y, m, d, D = ymd(ev(n.this)); return from_ymd(y, m, days_in_month(y, m))
+    if type(n).__name__ in ('TimeToStr', 'StrfTime', 'DateToStr'):
+        fmt = str(n.args.get('format').this)
+        import datetime as _dt9
+        a = dt64(ev(n.this)); us = a.astype('datetime64[us]').astype(np.int64)
+        base = _dt9.datetime(1970, 1, 1)
+        return np.array([(base + _dt9.timedelta(microseconds=int(x))).strftime(fmt).encode() for x in us], dtype=object)
+    if type(n).__name__ in ('TimeToUnix', 'UnixToTime', 'Epoch'):
+        a = dt64(ev(n.this)); return a.astype('datetime64[us]').astype(np.int64) / 1e6
+    if isinstance(n, E.Sub):
+        l = ev(n.this); r = ev(n.expression)
+        if np.asarray(l).dtype.kind == 'M' and np.asarray(r).dtype.kind == 'M':
+            return (np.asarray(l).astype('datetime64[D]') - np.asarray(r).astype('datetime64[D]')).astype(np.int64)   # DATE - DATE = days
+    raise TypeError('_date_family: %s' % type(n).__name__)
 
 
 def _eval_rows_core(seg, node, mask, resolve=None, env=None):
@@ -683,7 +825,10 @@ def _eval_rows_core(seg, node, mask, resolve=None, env=None):
                     vals[i] = v if isinstance(v, (bytes, bytearray)) else (b'' if v is None else str(v).encode())
             out = vals[inv]
             return out.astype(bool) if col.get('aux') == 9 else out
-        v = np.asarray(seg.values(c)); return v[mask] if mask is not None else v
+        v = np.asarray(seg.values(c))
+        if col.get('dt') == 3 and v.dtype.kind != 'M':
+            v = v.astype(np.int64).view('datetime64[%s]' % seg.unit(c))       # a date column IS datetime64
+        return v[mask] if mask is not None else v
     if isinstance(n, E.Literal):
         return n.this.encode() if n.is_string else _literal_value(n)
     if isinstance(n, E.Null): return None
@@ -705,8 +850,23 @@ def _eval_rows_core(seg, node, mask, resolve=None, env=None):
         l = _eval_rows(seg, n.this, mask, resolve, env); r = _eval_rows(seg, n.expression, mask, resolve, env)
         op = {E.EQ:operator.eq, E.NEQ:operator.ne, E.GT:operator.gt,
               E.LT:operator.lt, E.GTE:operator.ge, E.LTE:operator.le}[type(n)]
+        la, ra = np.asarray(l), np.asarray(r)
+        if la.dtype.kind == 'M' or ra.dtype.kind == 'M':                      # dates compare as datetime64 at a common unit
+            if la.dtype.kind != 'M': la = np.asarray([np.datetime64(x.decode() if isinstance(x, bytes) else x) for x in np.atleast_1d(la)]) if la.dtype == object or la.dtype.kind in 'US' else la
+            if ra.dtype.kind != 'M': ra = np.asarray([np.datetime64(x.decode() if isinstance(x, bytes) else x) for x in np.atleast_1d(ra)]) if ra.dtype == object or ra.dtype.kind in 'US' else ra
+            if la.dtype.kind == 'M' and ra.dtype.kind == 'M':
+                la = la.astype('datetime64[us]'); ra = ra.astype('datetime64[us]')
+                if ra.shape == (1,) and la.shape != (1,): ra = ra[0]
+                return op(la, ra)
         return op(l, r)
     if isinstance(n, E.Neg): return -_eval_rows(seg, n.this, mask, resolve, env)
+    if isinstance(n, (E.Add, E.Sub)) and (isinstance(n.expression, E.Interval) or isinstance(n.this, E.Interval)):
+        return _date_family(seg, n, mask, resolve, env)          # d + INTERVAL 30 DAY: calendar arithmetic
+    if isinstance(n, E.Sub):
+        _l9 = _eval_rows(seg, n.this, mask, resolve, env); _r9 = _eval_rows(seg, n.expression, mask, resolve, env)
+        if np.asarray(_l9).dtype.kind == 'M' and np.asarray(_r9).dtype.kind == 'M':
+            return (np.asarray(_l9).astype('datetime64[D]') - np.asarray(_r9).astype('datetime64[D]')).astype(np.int64)   # DATE - DATE = days
+        return _l9 - _r9
     if isinstance(n, E.Add): return _eval_rows(seg, n.this, mask, resolve, env) + _eval_rows(seg, n.expression, mask, resolve, env)
     if isinstance(n, E.Sub): return _eval_rows(seg, n.this, mask, resolve, env) - _eval_rows(seg, n.expression, mask, resolve, env)
     if isinstance(n, E.Mul): return _eval_rows(seg, n.this, mask, resolve, env) * _eval_rows(seg, n.expression, mask, resolve, env)
@@ -732,6 +892,10 @@ def _eval_rows_core(seg, node, mask, resolve=None, env=None):
     def rebytes(a):
         return np.array([(v.encode() if isinstance(v, str) else v) for v in a], dtype=object)
     if isinstance(n, E.Boolean): return bool(n.this)
+    if _is_date_node(n): return _date_family(seg, n, mask, resolve, env)
+    if isinstance(n, E.Anonymous) and str(n.this).upper() in ('DATE_PART', 'DATEPART') and len(n.expressions) == 2:
+        fld = n.expressions[0]; fld = str(fld.this if isinstance(fld, E.Literal) else fld.name)
+        return _date_family(seg, E.Extract(this=E.Var(this=fld.upper()), expression=n.expressions[1]), mask, resolve, env)
     if isinstance(n, E.Div):
         l, r = num(ev(n.this)), num(ev(n.expression))
         with np.errstate(divide='ignore', invalid='ignore'):
@@ -820,7 +984,15 @@ def _eval_rows_core(seg, node, mask, resolve=None, env=None):
         v = ev(n.this); t = n.to.sql().upper()
         if any(k in t for k in ('INT', 'BIGINT')): return np.array([None if x is None else int(float(x)) for x in np.asarray(v, dtype=object)], dtype=object)
         if any(k in t for k in ('DOUBLE', 'FLOAT', 'REAL', 'DECIMAL', 'NUMERIC')): return num(v)
-        if 'CHAR' in t or 'TEXT' in t or 'STRING' in t: return rebytes(np.array([None if x is None else str(x) for x in np.asarray(v, dtype=object)], dtype=object))
+        if 'CHAR' in t or 'TEXT' in t or 'STRING' in t:
+            va = np.asarray(v)
+            if va.dtype.kind == 'M':
+                return rebytes(np.array([s9.encode() for s9 in np.datetime_as_string(va.astype('datetime64[D]') if np.datetime_data(va.dtype)[0] == 'D' else va.astype('datetime64[s]'), unit='D' if np.datetime_data(va.dtype)[0] == 'D' else 's')], dtype=object))
+            return rebytes(np.array([None if x is None else str(x) for x in np.asarray(v, dtype=object)], dtype=object))
+        if 'DATE' in t and 'TIME' not in t:
+            return _dt64(v).astype('datetime64[D]')
+        if 'TIMESTAMP' in t or 'DATETIME' in t:
+            return _dt64(v).astype('datetime64[us]')
         raise TypeError('cast to %s' % t)
     raise TypeError(f"_eval_rows: unsupported node {type(n).__name__}")
 
@@ -899,6 +1071,11 @@ def _group_key(node, proj=None, _resolve_pos=True, node_sink=None):
         return ('const', _literal_value(g))
     if isinstance(g, E.Case):                               # CASE WHEN ...: genuine derived key,
         if node_sink is not None: node_sink[g.sql()] = g    # evaluated per row then factorized
+        return ('rowexpr', g.sql())
+    if len({c.name for c in g.find_all(E.Column)}) == 1 and g.find(E.AggFunc) is None and g.find(E.Select) is None:
+        # ANY expression over ONE column (EXTRACT(DOW), YEAR(d), date_part, STRFTIME, arithmetic):
+        # a derived key evaluated over the DICTIONARY (V-scale) and factorised
+        if node_sink is not None: node_sink[g.sql()] = g
         return ('rowexpr', g.sql())
     raise NotImplementedError(f"unsupported GROUP BY key: {g.sql()!r}")
 
@@ -1086,10 +1263,10 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
                 # ONE-COLUMN expression key IN CODE SPACE: evaluate over the dictionary (V),
                 # unique the V labels, and the row inverse is an int gather through the codes
                 _nm9, _pc9 = _ds9
-                _td9 = seg._typed_dict(_pc9)
-                _td9 = np.asarray(_td9, dtype=object) if not isinstance(_td9, np.ndarray) else _td9
+                _td9 = _typed_dict_dt(seg, _pc9)
                 _ov9 = _eval_rows(seg, _nd9, None, seg_col, env={_nm9: _td9})
                 _ov9 = np.asarray(_ov9, dtype=object) if not isinstance(_ov9, np.ndarray) else _ov9
+                if _ov9.dtype.kind == 'M': _ov9 = np.array([_pyval(x) for x in _ov9], dtype=object)   # keys emit as dates
                 u, _invv9 = np.unique(_ov9.astype(str) if _ov9.dtype == object else _ov9, return_inverse=True)
                 if _ov9.dtype == object:
                     _first9 = {}
@@ -1425,7 +1602,10 @@ def _distinct_tuples_eval(seg, node, rows_mask, seg_col):
         V = int(seg.cols[pc]['V'])
         kc = rem % V; rem = rem // V
         td = seg._typed_dict(pc)
-        td = np.asarray(td, dtype=object) if not isinstance(td, np.ndarray) else td
+        if seg.cols[pc].get('dt') == 3:
+            td = np.asarray(td, dtype=np.int64).view('datetime64[%s]' % seg.unit(pc))
+        else:
+            td = np.asarray(td, dtype=object) if not isinstance(td, np.ndarray) else td
         env[nm] = td[kc]
     out = _eval_rows(seg, node, None, seg_col, env=env)
     return np.asarray(out, dtype=object) if not isinstance(out, np.ndarray) else out
@@ -1616,10 +1796,14 @@ def _pyval(v):
         try: return v.decode('utf-8','surrogatepass')
         except: return v
     if isinstance(v, np.datetime64):
-        s = str(v)
-        # render as plain date when the value is exactly midnight (DATE-like), else full timestamp
-        if 'T00:00:00' in s and s.endswith('00:00:00.000000'): return s[:10]
-        return s.replace('T',' ')
+        # A DATE IS A DATE: day-unit values emit as datetime.date, finer units as datetime.datetime
+        import datetime as _dt9
+        if np.isnat(v): return None
+        unit = np.datetime_data(v.dtype)[0]
+        if unit == 'D':
+            return _dt9.date(1970, 1, 1) + _dt9.timedelta(days=int(v.astype('datetime64[D]').astype(np.int64)))
+        us = int(v.astype('datetime64[us]').astype(np.int64))
+        return _dt9.datetime(1970, 1, 1) + _dt9.timedelta(microseconds=us)
     if isinstance(v,(np.integer,)): return int(v)
     if isinstance(v,(np.floating,)): return float(v)
     return v
@@ -2113,6 +2297,8 @@ def _eval_pred_core(seg, node, seg_col):
     if isinstance(node, E.Or):  return _eval_pred(seg,node.this,seg_col) | _eval_pred(seg,node.expression,seg_col)
     if isinstance(node, E.Not): return ~_eval_pred(seg,node.this,seg_col)
     if isinstance(node, E.Paren): return _eval_pred(seg,node.this,seg_col)
+    if isinstance(node, (E.EQ,E.NEQ,E.GT,E.LT,E.GTE,E.LTE)) and isinstance(node.this, E.Cast) and isinstance(node.this.this, E.Column):
+        raise NotImplementedError("predicate LHS Cast (type-changing): the row evaluator serves it")   # never stripped to the bare column
     if isinstance(node, (E.EQ,E.NEQ,E.GT,E.LT,E.GTE,E.LTE)):
         col=_colname(node.this)
         if col is None:                        # LHS isn't a bare column: try scalar-expression

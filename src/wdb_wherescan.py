@@ -129,9 +129,13 @@ def _col_lit(node):
     if op is None:
         return None
     a, b = node.this, node.expression
-    if isinstance(a, E.Column) and isinstance(b, (E.Literal, E.Cast, E.Neg)):
+    def _is_lit(x):                                  # a Cast/Neg only counts when it WRAPS a literal:
+        n = x                                        # CAST(ts AS DATE) = d is a column expression, not a literal
+        while isinstance(n, (E.Cast, E.Neg, E.Paren)): n = n.this
+        return isinstance(n, E.Literal)
+    if isinstance(a, E.Column) and _is_lit(b):
         return a.name, _litval(b), op
-    if isinstance(b, E.Column) and isinstance(a, (E.Literal, E.Cast, E.Neg)):
+    if isinstance(b, E.Column) and _is_lit(a):
         flip = {'>=': '<=', '<=': '>='}
         return b.name, _litval(a), flip.get(op, op)
     return None
