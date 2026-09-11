@@ -17,13 +17,20 @@ class _Decline(Exception):
 def shape_ok(tree):
     """MIN/MAX-only projections, comma/INNER joins on plain columns, no group/order/limit/subquery/window."""
     if not isinstance(tree, E.Select): return False
-    if tree.args.get('group') is not None or tree.args.get('having') is not None: return False
-    if tree.args.get('order') is not None or tree.args.get('limit') is not None: return False
+    if tree.args.get('having') is not None: return False
     if tree.find(E.Window) is not None or tree.find(E.Subquery) is not None: return False
     if not tree.expressions: return False
+    g = tree.args.get('group')
+    naggs = 0
     for p in tree.expressions:
         nd = p.this if isinstance(p, E.Alias) else p
-        if not isinstance(nd, (E.Min, E.Max)) or not isinstance(nd.this, E.Column): return False
+        if isinstance(nd, (E.Min, E.Max)) and isinstance(nd.this, E.Column): naggs += 1; continue
+        if isinstance(nd, E.Count) and (nd.this is None or isinstance(nd.this, E.Star)): naggs += 1; continue
+        if isinstance(nd, (E.Sum, E.Avg)) and isinstance(nd.this, E.Column): naggs += 1; continue
+        if isinstance(nd, E.Column) and g is not None: continue    # a group key (only with GROUP BY)
+        return False
+    if naggs == 0: return False                                    # a row dump is not this organ
+    if g is not None and not all(isinstance(k, E.Column) for k in g.expressions): return False
     joins = tree.args.get('joins') or []
     for jn in joins:
         if (jn.args.get('side') or '') or (jn.args.get('kind') or '').upper() not in ('', 'INNER', 'CROSS'): return False
@@ -271,6 +278,14 @@ def execute(db, tree):
                 _step(a, ca9, b, cb9); _step(b, cb9, a, ca9)
             if _bill is not None: _bill.append(('r%d %s-%s keep %d/%d' % (_round, a, b, counts[a], counts[b]), _tk() - _t0)); _t0 = _tk()
         if not changed: break
+    state = {'alias2t': alias2t, 'segs': segs, 'pms': pms, 'keeps': keeps, 'counts': counts, 'pair': pair,
+             'keys_at': keys_at, 'keys': keys, 'owner': owner, 'tree': tree}
+    if _needs_weights(tree):
+        out9 = _counting_emit(db, state)
+        if _bill is not None:
+            _bill.append(('weights+emit', _tk() - _t0))
+            print('SEMI BILL: ' + ' | '.join('%s=%.0fms' % (n, v * 1000) for n, v in _bill), flush=True)
+        return out9
     # any table empty -> every MIN is NULL (a scalar over an empty join)
     empty = any(c == 0 for c in counts.values())
     out = []
@@ -299,3 +314,189 @@ def execute(db, tree):
         _bill.append(('emit', _tk() - _t0))
         print('SEMI BILL: ' + ' | '.join('%s=%.0fms' % (n, v * 1000) for n, v in _bill), flush=True)
     return [tuple(out)], names
+
+
+def _needs_weights(tree):
+    for p in tree.expressions:
+        nd = p.this if isinstance(p, E.Alias) else p
+        if isinstance(nd, (E.Count, E.Sum, E.Avg)): return True
+    return tree.args.get('group') is not None
+
+
+def _counting_emit(db, state):
+    """THE COUNTING FIXPOINT (Yannakakis): after the semi-join reduction, the join
+    hypergraph's VALUE CLASSES (one per equality-connected set of columns) form a
+    join tree. Rooted at the aggregate's table, every surviving row's WEIGHT is
+    the product, over the value classes it touches (except the one to its
+    parent), of the partner counts in the child subtrees; COUNT(*) is the sum of
+    root weights, SUM(T.x) the weighted sum, GROUP BY keys aggregate weights per
+    key. No pair is ever built. Acyclic hypergraphs only (declines otherwise)."""
+    import wdb_sql
+    tree = state['tree']; alias2t = state['alias2t']; segs = state['segs']; pms = state['pms']
+    keeps = state['keeps']; counts = state['counts']; pair = state['pair']; keys_at = state['keys_at']; owner = state['owner']
+    if any(c == 0 for c in counts.values()):
+        return _empty_result(tree)
+    # value classes: union-find over (alias, col)
+    parent = {}
+    def find(x):
+        while parent.setdefault(x, x) != x:
+            parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+    def union(a, b): parent[find(a)] = find(b)
+    for (a, b), pairs in pair.items():
+        for ca, cb in pairs:
+            union((a, ca), (b, cb))
+    classes = {}
+    for (a, b), pairs in pair.items():
+        for ca, cb in pairs:
+            r = find((a, ca))
+            classes.setdefault(r, set()).update({(a, ca), (b, cb)})
+    # hypergraph acyclicity by GYO reduction; also builds the join tree (parent pointers)
+    tabs = list(alias2t.keys())
+    tab_classes = {t: set() for t in tabs}
+    for r, cols in classes.items():
+        for (a, c) in cols: tab_classes[a].add(r)
+    if any(len(cs) > 1 for cs in tab_classes.values()) and len(tabs) > 1:
+        pass
+    # pick the root: the table owning the aggregates / group keys (all must agree)
+    root = None
+    for p in tree.expressions:
+        nd = p.this if isinstance(p, E.Alias) else p
+        col = nd.this if isinstance(nd, (E.Sum, E.Avg, E.Min, E.Max)) else (nd if isinstance(nd, E.Column) else None)
+        if col is not None:
+            o = owner(col)
+            if root is not None and o != root: raise _Decline('counting fixpoint: aggregates/keys span several tables')
+            root = o
+    g = tree.args.get('group')
+    if g is not None:
+        for k in g.expressions:
+            o = owner(k)
+            if root is not None and o != root: raise _Decline('counting fixpoint: group keys span several tables')
+            root = o
+    if root is None: root = tabs[0]
+    # join tree by BFS over tables sharing a value class; a table reached twice = a cycle -> decline
+    tree_parent = {root: None}; order = [root]; seen_cls = set()
+    frontier = [root]
+    while frontier:
+        nxt = []
+        for t in frontier:
+            for r in tab_classes[t]:
+                if r in seen_cls: continue
+                seen_cls.add(r)
+                for (a, c) in classes[r]:
+                    if a == t: continue
+                    if a in tree_parent:
+                        raise _Decline('counting fixpoint: cyclic join hypergraph (table %s reached twice)' % a)
+                    tree_parent[a] = (t, r); order.append(a); nxt.append(a)
+        frontier = nxt
+    if len(tree_parent) != len(tabs): raise _Decline('counting fixpoint: disconnected join graph')
+    # class column per (table, class)
+    def class_col(t, r):
+        for (a, c) in classes[r]:
+            if a == t: return c
+        return None
+    # bottom-up: weight per surviving row of each table = product over child classes of the
+    # child-side partner weight sums keyed by value
+    row_weight = {}
+    lut = {}                                # (table, class) -> dense value -> summed weight of that table's rows under the value
+    def build_lut(t, r):
+        idx = np.flatnonzero(keeps[t])
+        kv = keys_at(t, class_col(t, r), idx)
+        w = row_weight[t]
+        ok = kv >= 0
+        kv = kv[ok]; w = w[ok]
+        mx = int(kv.max()) if kv.size else 0
+        if mx > 400_000_000: raise _Decline('counting fixpoint: key space too large for a dense LUT')
+        acc = np.zeros(mx + 1, np.float64)
+        np.add.at(acc, kv, w) if kv.size < 2_000_000 else None
+        if kv.size >= 2_000_000:
+            acc = np.bincount(kv, weights=w, minlength=mx + 1).astype(np.float64)
+        lut[(t, r)] = acc
+    for t in reversed(order):
+        idx = np.flatnonzero(keeps[t])
+        w = np.ones(idx.size, np.float64)
+        up = tree_parent[t]
+        for r in tab_classes[t]:
+            if up is not None and r == up[1]: continue           # the class to the parent is applied by the parent
+            # multiply by the product over the OTHER tables in this class of their LUT at this row's value
+            kv = keys_at(t, class_col(t, r), idx)
+            for (a, c) in classes[r]:
+                if a == t: continue
+                if (a, r) not in lut: raise _Decline('counting fixpoint: child not reduced before parent')
+                acc = lut[(a, r)]
+                safe = np.where((kv >= 0) & (kv < acc.size), kv, 0)
+                f = acc[safe]; f[(kv < 0) | (kv >= acc.size)] = 0.0
+                w = w * f
+        row_weight[t] = w
+        if up is not None:
+            build_lut(t, up[1])
+    idx = np.flatnonzero(keeps[root]); w = row_weight[root]
+    # emit
+    names = [wdb_sql._alias(p) for p in tree.expressions]
+    seg = segs[root]; pm = pms[root]
+    def col_vals(col):
+        pc = pm.get(col.name, col.name)
+        raw = wdb_sql.raw_dict_col(seg, pc, want_codes=False)
+        if raw is not None:
+            vals = np.asarray(raw[0], dtype=np.float64)
+            if seg.cols[pc].get('has_null'): vals = np.append(vals, np.nan)
+            return vals[np.asarray(seg.codes_at(pc, idx))]
+        return np.array([(np.nan if v is None else float(v)) for v in seg.values_at_rows(pc, idx)], dtype=np.float64)
+    def emit_agg(nd, sel):
+        if isinstance(nd, E.Count): return int(round(w[sel].sum()))
+        if isinstance(nd, (E.Sum, E.Avg)):
+            v = col_vals(nd.this)[sel]; ww = w[sel]; ok = ~np.isnan(v)
+            tot = float((v[ok] * ww[ok]).sum()); cnt = float(ww[ok].sum())
+            if cnt == 0: return None
+            if isinstance(nd, E.Avg): return tot / cnt
+            isint = seg.cols.get(pm.get(nd.this.name, nd.this.name), {}).get('dt') == 0
+            return int(round(tot)) if isint else tot
+        if isinstance(nd, (E.Min, E.Max)):
+            v = col_vals(nd.this)[sel] if seg.cols.get(pm.get(nd.this.name, nd.this.name), {}).get('dt') != 1 else None
+            if v is None:
+                pc = pm.get(nd.this.name, nd.this.name); codes = np.asarray(seg.codes_at(pc, idx))[sel]
+                if seg.cols[pc].get('has_null'): codes = codes[codes != int(seg.cols[pc]['V']) - 1]
+                if codes.size == 0: return None
+                return wdb_sql._pyval(seg._typed_dict(pc)[int(codes.min()) if isinstance(nd, E.Min) else int(codes.max())])
+            v = v[~np.isnan(v)]
+            if v.size == 0: return None
+            r = float(v.min()) if isinstance(nd, E.Min) else float(v.max())
+            return int(r) if seg.cols.get(pm.get(nd.this.name, nd.this.name), {}).get('dt') == 0 else r
+        raise _Decline('counting fixpoint: aggregate %s' % type(nd).__name__)
+    if g is None:
+        sel = np.ones(idx.size, bool)
+        return [tuple(emit_agg(p.this if isinstance(p, E.Alias) else p, sel) for p in tree.expressions)], names
+    # GROUP BY keys of the root table: composite codes -> groups
+    kcols = [k.name for k in g.expressions]
+    comp = np.zeros(idx.size, np.int64); K = 1; dec = []
+    for kc in kcols:
+        pc = pm.get(kc, kc); V = int(seg.cols[pc]['V']); codes = np.asarray(seg.codes_at(pc, idx)).astype(np.int64)
+        comp = comp * V + codes; K *= V; dec.append((pc, V))
+    u, inv = np.unique(comp, return_inverse=True)
+    out = []
+    for gi in range(u.size):
+        sel = inv == gi
+        row = []
+        rem = int(u[gi]); keyvals = {}
+        for pc, V in reversed(dec):
+            keyvals[pc] = rem % V; rem //= V
+        for p in tree.expressions:
+            nd = p.this if isinstance(p, E.Alias) else p
+            if isinstance(nd, E.Column):
+                pc = pm.get(nd.name, nd.name)
+                row.append(wdb_sql._pyval(seg._typed_dict(pc)[keyvals[pc]]) if seg.cols[pc].get('mode') != 5 else list(seg.values_at_rows(pc, idx[sel][:1]))[0])
+            else:
+                row.append(emit_agg(nd, sel))
+        out.append(tuple(row))
+    return out, names
+
+
+def _empty_result(tree):
+    import wdb_sql
+    names = [wdb_sql._alias(p) for p in tree.expressions]
+    if tree.args.get('group') is not None: return [], names
+    row = []
+    for p in tree.expressions:
+        nd = p.this if isinstance(p, E.Alias) else p
+        row.append(0 if isinstance(nd, E.Count) else None)
+    return [tuple(row)], names

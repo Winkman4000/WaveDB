@@ -449,9 +449,9 @@ class Database:
             if tree.args.get('joins'):
                 import os as _os9
                 import wdb_semijoin
-                if wdb_semijoin.shape_ok(tree):
+                if wdb_semijoin.shape_ok(tree) and not wdb_semijoin._needs_weights(tree):
                     try:
-                        return wdb_semijoin.execute(self, tree)     # THE SEMI-JOIN FIXPOINT (MIN/MAX-only multi-joins)
+                        return wdb_semijoin.execute(self, tree)     # THE SEMI-JOIN FIXPOINT (MIN/MAX-only multi-joins): first
                     except wdb_semijoin._Decline:
                         pass
                 if _os9.environ.get('WDB_JOIN_BILL'):
@@ -462,7 +462,16 @@ class Database:
                 else:
                     _rw = wdb_join.denorm_rewrite(self, tree)    # join that groups by a denormalised parent
                 if _rw is None:                                  # column -> single-table cube read; else gather
-                    return wdb_join.join_query(self, sql)
+                    try:
+                        return wdb_join.join_query(self, sql)
+                    except NotImplementedError as _ne9:
+                        # THE COUNTING FIXPOINT: last -- only when the road engine declines the join shape
+                        if wdb_semijoin.shape_ok(tree) and wdb_semijoin._needs_weights(tree):
+                            try:
+                                return wdb_semijoin.execute(self, tree)
+                            except wdb_semijoin._Decline:
+                                pass
+                        raise
                 sql = _rw; tree = _parse_sql_cached(_rw)         # fall through to the single-table path
             import wdb_subquery
             if tree.find(sqlglot.exp.All) is not None or tree.find(sqlglot.exp.Any) is not None:
