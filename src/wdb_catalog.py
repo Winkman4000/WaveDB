@@ -179,5 +179,8 @@ class Catalog:
             self.save()
 
     def segment_paths(self, name):
+        ov = getattr(self, '_seg_override', None)
+        if ov and name in ov:
+            return list(ov[name])                     # SEGMENT PARTIALS: a table pinned to one segment
         t = self.get_table(name)
         return [os.path.join(self.dbdir, s) for s in t['segments']]
