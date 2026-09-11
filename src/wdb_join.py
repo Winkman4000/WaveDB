@@ -3638,7 +3638,14 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                         _ok4[_ok4] = _bv4[_pos4[_ok4]] == _la4[_ok4]
                         kx9[_pos4[_ok4]] = True
                     else:
-                        kx9[:V9] = np.isin(_bv4, _la4)
+                        # UNSORTED SEQUENCE: a direct compare per literal beats np.isin's sort
+                        # (fjdb encodes AdvEngineID as a 100M-value sequence: 130ms -> 40ms)
+                        if len(_la4) <= 8:
+                            _m4 = _bv4 == _la4[0]
+                            for _lv4 in _la4[1:]: _m4 |= (_bv4 == _lv4)
+                            kx9[:V9] = _m4
+                        else:
+                            kx9[:V9] = np.isin(_bv4, _la4)
                     td9 = None
                 elif c9.get('mode') not in (0, 1, 2):
                     _cres9.append(cn); continue
