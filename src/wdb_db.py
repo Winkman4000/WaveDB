@@ -298,6 +298,15 @@ class Database:
                 continue
         return False
 
+    def stats(self):
+        """Why is RAM high? What sidecars exist? -- the shelf and the registry, printed."""
+        import wdb_shelf, wdb_sidecar
+        wdb_shelf.SHELF.stats()
+        try:
+            wdb_sidecar.stats(self.cat.root if hasattr(self.cat, 'root') else os.path.dirname(self.cat.segment_paths(next(iter(self.cat.data['tables'])))[0]))
+        except Exception as e:
+            print('SIDECARS: %s' % e)
+
     def _new_doors(self, tree, sql):
         """THE PRECEDENCE LAW: the controller's doors serve first; the doors born in
         the scope stage (aggregate arithmetic, expression group keys, windows, top-k

@@ -146,16 +146,26 @@ def execute(db, tree):
     def inverted(a, cols_a):
         if len(cols_a) != 1: return None
         seg = segs[a]; pc = pms[a].get(cols_a[0], cols_a[0])
+        import wdb_shelf
         cache = getattr(seg, '_inv_cache', None)
         if cache is None: cache = seg._inv_cache = {}
-        if pc in cache: return cache[pc]
+        if pc in cache:
+            if wdb_shelf.SHELF.get(('inv', getattr(seg, 'path', id(seg)), pc)) is None:
+                cache.pop(pc, None)                  # the shelf evicted it: reload from the sidecar
+            else:
+                return cache[pc]
         path = getattr(seg, 'path', None) or getattr(seg, '_path', None)
         fn = ('%s.%s.inv' % (path, pc)) if path else None       # three mmap'd .npy files: u / offs / order
+        import wdb_sidecar
         try:
-            if fn and __import__('os').path.exists(fn + '.rank.npy'):
+            if fn and __import__('os').path.exists(fn + '.rank.npy') \
+                    and wdb_sidecar.is_fresh(__import__('os').path.dirname(path), __import__('os').path.basename(fn + '.rank.npy')):
+                # THE BIRTHMARK: a sidecar older than its segment is false by construction
                 u = np.load(fn + '.u.npy'); offs = np.load(fn + '.offs.npy')
                 order = np.load(fn + '.order.npy', mmap_mode='r'); rank = np.load(fn + '.rank.npy', mmap_mode='r')
                 cache[pc] = (u, offs, order, rank)
+                try: wdb_shelf.SHELF.put(('inv', getattr(seg, 'path', id(seg)), pc), cache[pc], u.nbytes + offs.nbytes, kind='reverse-road')
+                except wdb_shelf.ShelfRefused: pass
                 return cache[pc]
         except Exception:
             pass
@@ -169,10 +179,14 @@ def execute(db, tree):
         if fn:
             try:
                 _os9 = __import__('os')
+                wdb_sidecar.may_birth(_os9.path.dirname(path), int(u.nbytes + offs.nbytes + order.nbytes + rank.nbytes),
+                                      'reverse road %s.%s' % (_os9.path.basename(path), pc))   # THE DISK GATE
                 for nm9, arr9 in (('u', u), ('offs', offs), ('order', order), ('rank', rank)):
                     np.save(fn + '.%s.tmp.npy' % nm9, arr9)
                     _os9.replace(fn + '.%s.tmp.npy' % nm9, fn + '.%s.npy' % nm9)
                 cache[pc] = (u, offs, np.load(fn + '.order.npy', mmap_mode='r'), np.load(fn + '.rank.npy', mmap_mode='r'))
+            except wdb_sidecar.BirthRefused as _e:
+                print('SEMI: %s -- serving from RAM this query' % str(_e)[:120], flush=True)
             except Exception as _e:
                 if __import__('os').environ.get('WDB_SEMI_BILL'):
                     print('SEMI: inverted sidecar save failed for %s: %s' % (fn, str(_e)[:80]), flush=True)

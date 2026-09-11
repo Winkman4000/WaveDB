@@ -437,28 +437,26 @@ _SARRAY_CACHE = {}
 
 
 def _mode5_sarray(seg, pc):
-    """The column's values as a fixed-width S-array, cached on the segment (survives the
-    per-query flush: it is the column's own text, built once)."""
-    cache = getattr(seg, '_m5_sarray', None)
-    if cache is None:
-        cache = seg._m5_sarray = {}
-    got = cache.get(pc)
+    """Inline-string (mode 5) text on THE SHELF, ONE representation: the object array
+    of bytes (serves = and IN), the joined buffer + offsets (serves LIKE at C speed),
+    the null mask. Evicted by the shelf's LRU, refused by name past the ceiling."""
+    import wdb_shelf
+    key = ('m5text', getattr(seg, 'path', id(seg)), pc)
+    got = wdb_shelf.SHELF.get(key)
     if got is not None: return got
     vals = seg.values(pc)
     b = [(v if isinstance(v, (bytes, bytearray)) else (v.encode() if isinstance(v, str) else b'')) for v in vals]
     isn = np.array([v is None for v in vals], dtype=bool)
     obj = np.array(b, dtype=object)
-    mx = max((len(v) for v in b), default=0)
-    arr = None
-    import os as _os9
-    _budget9 = int(float(_os9.environ.get('WDB_SARRAY_MB', '1024'))) << 20
-    if mx * len(b) <= _budget9:
-        try:
-            arr = np.array(b, dtype='S')
-        except Exception:
-            arr = None
-    cache[pc] = (arr, isn, b, obj)
-    return cache[pc]
+    buf = b'\x00'.join(b)
+    lens = np.fromiter((len(v) for v in b), dtype=np.int64, count=len(b))
+    starts = np.zeros(len(b) + 1, np.int64); np.cumsum(lens + 1, out=starts[1:])
+    ent = (None, isn, obj, obj, buf, starts)      # (sarr=None, isn, b, obj, buf, starts) -- callers index by position
+    try:
+        wdb_shelf.SHELF.put(key, ent, len(buf) + starts.nbytes + isn.nbytes + wdb_shelf.nbytes_of(obj), kind='inline-text')
+    except wdb_shelf.ShelfRefused as e:
+        pass                                          # served this query, not retained
+    return ent
 
 
 def _mode5_null(seg, pc):
@@ -469,12 +467,10 @@ def _mode5_null(seg, pc):
 def _like_mode5(seg, pc, pat, icase):
     got = _mode5_sarray(seg, pc)
     if got is None: return None
-    arr, isn, b, obj = got
-    if arr is None:
-        if '_' in pat or '\\' in pat: return None
-        toks = [t for t in pat.split('%') if t != '']
-        return _like_joined(b, isn, pat, icase, toks, pat[:1] != '%', pat[-1:] != '%')   # too wide for an S-array
-    return _like_vectorised(b, isn, pat, icase, sarr=arr)
+    _arr, isn, b, obj, buf, starts = got
+    if '_' in pat or '\\' in pat: return None
+    toks = [t for t in pat.split('%') if t != '']
+    return _like_joined(b, isn, pat, icase, toks, pat[:1] != '%', pat[-1:] != '%', joined=(buf, starts))
 
 
 
@@ -500,22 +496,23 @@ def _like_prefix_range(vals, isn, pat, icase):
 _JOINED_CACHE = {}
 
 
-def _like_joined(b, isn, pat, icase, toks, anchored_start, anchored_end):
+def _like_joined(b, isn, pat, icase, toks, anchored_start, anchored_end, joined=None):
     """LIKE over WIDE columns (an S-array would be gigabytes): ONE joined byte
     buffer with a separator, bytes.find for the rarest token at C speed (hits
     are few), hit offsets mapped to rows, regex verifies candidates only."""
     import re as _re
     if not toks: return None
-    key = id(b)
-    got = _JOINED_CACHE.get(key)
+    import wdb_shelf
+    key = ('joined', id(b))
+    got = (b, joined[0], joined[1]) if joined is not None else wdb_shelf.SHELF.get(key)
     if got is None or got[0] is not b:
         sep = b'\x00'
         buf = sep.join(b)
         lens = np.fromiter((len(v) for v in b), dtype=np.int64, count=len(b))
         starts = np.zeros(len(b) + 1, np.int64); np.cumsum(lens + 1, out=starts[1:])
-        _JOINED_CACHE[key] = (b, buf, starts)
-        if len(_JOINED_CACHE) > 8: _JOINED_CACHE.pop(next(iter(_JOINED_CACHE)))
-        got = _JOINED_CACHE[key]
+        got = (b, buf, starts)
+        try: wdb_shelf.SHELF.put(key, got, len(buf) + starts.nbytes, kind='joined-text')
+        except wdb_shelf.ShelfRefused: pass
     _b, buf, starts = got
     if icase:
         buf = buf.lower(); toks = [t.lower() for t in toks]
@@ -549,7 +546,8 @@ def _like_vectorised(vals, isn, pat, icase, sarr=None):
     anchored_end = toks[-1] != ''
     toks = [t for t in toks if t != '']
     b = vals if (sarr is not None and isinstance(vals, list)) else [(v.encode() if isinstance(v, str) else (v if v is not None else b'')) for v in vals]
-    _sc9 = _SARRAY_CACHE.get(id(vals)) if isinstance(vals, np.ndarray) else None
+    import wdb_shelf
+    _sc9 = wdb_shelf.SHELF.get(('sarr', id(vals))) if isinstance(vals, np.ndarray) else None
     if sarr is not None:
         arr = sarr
     elif _sc9 is not None and _sc9[0] is vals:
@@ -567,8 +565,8 @@ def _like_vectorised(vals, isn, pat, icase, sarr=None):
         except Exception:
             return None
         if isinstance(vals, np.ndarray) and vals.shape[0] >= 100_000:
-            _SARRAY_CACHE[id(vals)] = (vals, arr)        # keyed by identity: the dictionary shelf keeps vals alive
-            if len(_SARRAY_CACHE) > 16: _SARRAY_CACHE.pop(next(iter(_SARRAY_CACHE)))
+            try: wdb_shelf.SHELF.put(('sarr', id(vals)), (vals, arr), arr.nbytes, kind='dictionary-sarray')   # identity-keyed: the shelf holds vals
+            except wdb_shelf.ShelfRefused: pass
     if icase:
         arr = np.char.lower(arr); toks = [t.lower() for t in toks]
     cand = ~isn
@@ -1367,8 +1365,12 @@ def _is_rowagg(inner):
     QUANTILE/MEDIAN, MODE, BOOL_AND/OR, STRING_AGG, ANY_VALUE, FILTER (WHERE),
     and SUM/COUNT over DISTINCT or over an expression."""
     if isinstance(inner, _ROWAGG_TYPES): return True
-    if isinstance(inner, (E.Sum, E.Count, E.Avg, E.Min, E.Max)) and isinstance(inner.this, E.Distinct): return True
-    if isinstance(inner, E.Count) and inner.this is not None and not isinstance(inner.this, (E.Star, E.Column)): return True
+    if isinstance(inner, (E.Sum, E.Count, E.Avg, E.Min, E.Max)) and isinstance(inner.this, E.Distinct):
+        _dx = inner.this.expressions
+        if isinstance(inner, E.Count) and len(_dx) == 1 and isinstance(_dx[0], E.Column):
+            return False                          # COUNT(DISTINCT col): the group-distinct doors own it (ClickBench Q09: 1.1s -> 53s as a row aggregate)
+        return True
+    if isinstance(inner, E.Count) and inner.this is not None and not isinstance(inner.this, (E.Star, E.Column, E.Distinct)): return True
     return False
 
 
@@ -2039,7 +2041,7 @@ def _eval_pred(seg, node, seg_col):
             if _lits9 and all(isinstance(L, E.Literal) and L.is_string for L in _lits9) and node.args.get('query') is None:
                 got = _mode5_sarray(seg, _pc9)
                 if got is not None:
-                    _arr9, _isn9, _b9, _obj9 = got
+                    _arr9, _isn9, _b9, _obj9 = got[0], got[1], got[2], got[3]
                     if isinstance(node, E.In):
                         _set9 = set(L.this.encode() for L in _lits9)
                         m = np.fromiter((x in _set9 for x in _b9), dtype=bool, count=len(_b9)) if len(_set9) > 4 else np.zeros(len(_b9), bool)

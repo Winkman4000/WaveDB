@@ -270,34 +270,23 @@ class Segment:
         sidecar loads (presence, override, cluster, cube: they lazy-reload on next touch).
         The memmap stays: it IS the file. cols/order/synth stay: file-shape metadata."""
         self._codes.clear(); self._resident.clear()
-        # THE DICTIONARY SHELF: a decoded dictionary is V-scale (the column's
-        # vocabulary), not N-scale residue -- it survives the flush within a budget
-        # (WDB_DICT_SHELF_MB, default 2048). A 3.6M-name front-coded dictionary
-        # re-decoded per query cost 3.5s on every JOB question that touched it.
+        # THE SHELF: a decoded dictionary is V-scale vocabulary, not N-scale residue --
+        # it survives the flush only while the process-wide shelf keeps it (byte
+        # ceiling, LRU). Anything the shelf evicted is dropped here too.
         try:
-            import os as _os9
-            _budget9 = int(float(_os9.environ.get('WDB_DICT_SHELF_MB', '2048'))) * (1 << 20)
+            import wdb_shelf
+            _keep9 = {}
+            for _k9, _v9 in list(self._tdict.items()):
+                _key9 = ('tdict', getattr(self, 'path', id(self)), _k9)
+                if wdb_shelf.SHELF.get(_key9) is None:
+                    try:
+                        wdb_shelf.SHELF.put(_key9, _v9, wdb_shelf.nbytes_of(_v9), kind='dictionary')
+                    except wdb_shelf.ShelfRefused:
+                        continue
+                _keep9[_k9] = _v9
+            self._tdict.clear(); self._tdict.update(_keep9)
         except Exception:
-            _budget9 = 2048 << 20
-        _keep9 = {}
-        _used9 = 0
-        _szc9 = getattr(self, '_tdict_sz', None)
-        if _szc9 is None: _szc9 = self._tdict_sz = {}
-        for _k9, _v9 in list(self._tdict.items()):
-            _sz9 = _szc9.get(_k9)
-            if _sz9 is None:                              # estimate ONCE per dictionary (a 2.7M-entry sum per flush was 0.9s)
-                try:
-                    if hasattr(_v9, 'nbytes'): _sz9 = int(_v9.nbytes)
-                    else:
-                        _n9 = len(_v9); _step9 = max(1, _n9 // 4096)
-                        _samp9 = _v9[::_step9]
-                        _sz9 = int(sum((len(x) if isinstance(x, (bytes, bytearray)) else 8) + 56 for x in _samp9) * (_n9 / max(1, len(_samp9))))
-                except Exception:
-                    _sz9 = _budget9 + 1
-                _szc9[_k9] = _sz9
-            if _used9 + _sz9 <= _budget9:
-                _keep9[_k9] = _v9; _used9 += _sz9
-        self._tdict.clear(); self._tdict.update(_keep9)
+            self._tdict.clear()
         _pl9 = getattr(self, '_e14_pl', None)
         if _pl9 is not None: _pl9.clear()   # planes obey the same forget-law as codes
         for a in ('_eff', '_ccounts'):
