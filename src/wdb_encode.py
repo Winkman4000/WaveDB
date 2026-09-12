@@ -26,7 +26,11 @@ NUM_THRESHOLD = 50000   # delta-code numeric dictionaries above this cardinality
 R = 128
 ZSTD_LEVEL = 9
 BLOCK_ROWS = int(os.environ.get('WDB_BLOCK_ROWS', 524288))   # rows per enc=3 frame
-CODE_ZSTD_LEVEL = 19    # code-stream compression: clustered/skewed code arrays compress hugely
+# code-stream compression level. Measured on 10.7M-row ClickBench columns: level 19 -> 9 is
+# 7-13x faster (URL 14.5s -> 1.9s, SearchPhrase 18.1s -> 1.4s) for 6-8% more bytes (EventTime
+# 22%). Ingest speed wins by default; WDB_CODE_ZSTD=19 for archival encodes.
+CODE_ZSTD_LEVEL = int(os.environ.get('WDB_CODE_ZSTD', '9'))
+INLINE_ZSTD_LEVEL = 19  # mode-5 inline value blobs: the mode decision is a size race at the archival level
 CHUNK_DICT = bool(int(os.environ.get('WDB_CHUNK_DICT', '1')))   # block-segment front-coded dicts (default on; WDB_CHUNK_DICT=0 to opt out)
 CHUNK_DICT_VALS = 16384                                          # values per independent zstd frame (mult of R)
 _INLINE_ENABLED = True  # mode-5 inline strings (toggleable for ablation/debug)
@@ -172,6 +176,67 @@ def _dict_bytes_plain(valb):
     for u in valb: out += struct.pack('<I', len(u)) + u
     return out
 
+def _front_code_py(valb):
+    """the reference front-coder (Python): restart every R values; per value <HH cp suflen> + suffix"""
+    fc = bytearray(); restarts = []; prev = b''
+    for i, sv in enumerate(valb):
+        if i % R == 0: prev = b''; restarts.append(len(fc))
+        cp = 0; m = min(len(prev), len(sv))
+        while cp < m and prev[cp] == sv[cp]: cp += 1
+        suf = sv[cp:]; fc += struct.pack('<HH', cp, len(suf)) + suf; prev = sv
+    return bytes(fc), np.array(restarts, dtype=np.uint32)
+
+
+def _front_code(valb):
+    """THE FRONT-CODER IN NUMBA: the dictionary as one byte buffer + offsets; a compiled loop
+    computes each value's common prefix with its predecessor and emits <HH cp suflen>+suffix
+    with a restart every R values -- byte-identical to _front_code_py (15s of Python per 2.7M
+    URLs -> ~0.2s). Falls back to Python without numba."""
+    try:
+        import numba
+    except Exception:
+        return _front_code_py(valb)
+    n = len(valb)
+    if n == 0:
+        return b'', np.zeros(0, dtype=np.uint32)
+    lens = np.fromiter((len(v) for v in valb), dtype=np.int64, count=n)
+    offs = np.zeros(n + 1, dtype=np.int64); np.cumsum(lens, out=offs[1:])
+    buf = np.frombuffer(b''.join(valb), dtype=np.uint8)
+    out, rst, total = _front_code_jit(buf, offs, n, R)
+    return out[:total].tobytes(), rst
+
+
+def _front_code_jit_py(buf, offs, n, R):
+    # sizing: every value costs 4 header bytes + at most its full length
+    out = np.empty(int(offs[-1]) + 4 * n, dtype=np.uint8)
+    rst = np.empty((n + R - 1) // R, dtype=np.uint32)
+    pos = 0; pstart = 0; plen = 0; nr = 0
+    for i in range(n):
+        s0 = offs[i]; l0 = offs[i + 1] - s0
+        if i % R == 0:
+            plen = 0; rst[nr] = pos; nr += 1
+        m = plen if plen < l0 else l0
+        cp = 0
+        while cp < m and buf[pstart + cp] == buf[s0 + cp]:
+            cp += 1
+        suf = l0 - cp
+        out[pos] = cp & 0xFF; out[pos + 1] = (cp >> 8) & 0xFF
+        out[pos + 2] = suf & 0xFF; out[pos + 3] = (suf >> 8) & 0xFF
+        pos += 4
+        for k in range(suf):
+            out[pos + k] = buf[s0 + cp + k]
+        pos += suf
+        pstart = s0; plen = l0
+    return out, rst, pos
+
+
+try:
+    import numba as _nb9
+    _front_code_jit = _nb9.njit(cache=True)(_front_code_jit_py)
+except Exception:
+    _front_code_jit = _front_code_jit_py
+
+
 def _dict_bytes(p, zc):
     if p['mode'] == 0:
         return _dict_bytes_plain(p['valb'])
@@ -198,13 +263,8 @@ def _dict_bytes(p, zc):
             z = zc.compress(deltas.tobytes())
             out += struct.pack('<I', len(z)) + z
     else:
-        fc = bytearray(); restarts = []; prev = b''
-        for i, sv in enumerate(p['valb']):
-            if i % R == 0: prev = b''; restarts.append(len(fc))
-            cp = 0; m = min(len(prev), len(sv))
-            while cp < m and prev[cp] == sv[cp]: cp += 1
-            suf = sv[cp:]; fc += struct.pack('<HH', cp, len(suf)) + suf; prev = sv
-        fc = bytes(fc); rst = np.array(restarts, dtype=np.uint32); nb = len(rst)
+        fc, rst = _front_code(p['valb'])
+        nb = len(rst)
         if p['aux'] & 0x40:                       # chunked: one independent zstd frame per CHUNK_DICT_VALS
             V = len(p['valb']); CH = CHUNK_DICT_VALS; BPC = CH // R
             n_chunks = (V + CH - 1) // CH
@@ -738,7 +798,10 @@ def _serialize_inline(p):
     rows = valb[np.asarray(p['codes'])]                     # row-order bytes (has_null==0 by gate)
     lengths = np.fromiter((len(x) for x in rows), dtype=np.uint32, count=len(rows))
     concat = b''.join(rows.tolist())
-    zc = zstd.ZstdCompressor(level=CODE_ZSTD_LEVEL)
+    # the inline VALUE blob keeps the archival level: the inline-vs-dictionary decision is a
+    # size race and must not ride the code-stream speed knob (a near-unique column flipped
+    # modes when CODE_ZSTD_LEVEL went 19 -> 9)
+    zc = zstd.ZstdCompressor(level=max(CODE_ZSTD_LEVEL, INLINE_ZSTD_LEVEL))
     zl = zc.compress(lengths.tobytes()); zv = zc.compress(concat)
     out = bytearray()
     out += _header(p['nm'], p['V'], p['bits'], 1, 5, 0, p['aux'])
