@@ -1267,7 +1267,12 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
                 _ov9 = _eval_rows(seg, _nd9, None, seg_col, env={_nm9: _td9})
                 _ov9 = np.asarray(_ov9, dtype=object) if not isinstance(_ov9, np.ndarray) else _ov9
                 if _ov9.dtype.kind == 'M': _ov9 = np.array([_pyval(x) for x in _ov9], dtype=object)   # keys emit as dates
-                u, _invv9 = np.unique(_ov9.astype(str) if _ov9.dtype == object else _ov9, return_inverse=True)
+                if _ov9.dtype == object:
+                    # UTF-8, never astype(str): numpy decodes bytes as ASCII (g-substr died on Cyrillic)
+                    _ks9 = np.array([('\x00NULL' if x is None else (x.decode('utf-8', 'surrogateescape') if isinstance(x, (bytes, bytearray)) else str(x))) for x in _ov9])
+                    u, _invv9 = np.unique(_ks9, return_inverse=True)
+                else:
+                    u, _invv9 = np.unique(_ov9, return_inverse=True)
                 if _ov9.dtype == object:
                     _first9 = {}
                     for _k9, _v9 in zip(_invv9.tolist(), _ov9.tolist()):
