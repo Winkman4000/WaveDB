@@ -950,3 +950,28 @@ compaction). NEXT: sync, rerun /tmp/dml.py, suite, commit; db.compact();
 convict g-substr. TWO LESSONS: a second fixture finds what the first
 cannot -- realm diversity is a correctness instrument; a fast door that
 cannot see a tombstone is a wrong answer waiting for the first DELETE.
+
+
+## DML MEETS THE DOORS (2026-09-13): the truth test
+A DML path never run against a referee on a real realm is a hypothesis.
+The truth test (a parquet-encoded copy of the scope realm; eight doors;
+DELETE, INSERT, flush, compact; vs duck) found in its first minutes:
+DELETE silently deleting ZERO rows (the segment class wanted a canonical
+buffer a parquet realm never has); INSERT replacing a 200,000-row
+segment with a 1-row one (re-encoding from a buffer holding only the
+new row -- DATA LOSS, caught by the presence sidecar's count); and NO
+controller door consulting presence or overrides -- eight doors
+confidently wrong after one DELETE. LAWS: DELETE tombstones cold
+segments; a table with a cold segment and no canonical buffer appends
+to the hot tier (a DML-born table keeps its buffer); THE PRESENCE GATE
+-- a segment carrying tombstones or overrides is served by the general
+scan only; COMPACTION GIVES THE DOORS BACK -- a single dirty segment is
+rewritten clean and EVERY derived artefact of a removed segment goes
+with it (codes and positions are reborn). Lifecycle: DELETE 41,722 ->
+INSERT -> flush (x_1) -> compact (x_0 + x_1 -> x_2, 158,279 live):
+before 0 / after 0 / insert 0 / compact 0 wrong, doors serving again.
+Also: THE UTF-8 LAW (never astype(str) on bytes: ASCII; g-substr on
+Cyrillic). Megaboard on the healthy fixture stands at 91 wins / 4.69x.
+NEXT: the encoder under the governor (encode a column, write it, free
+it; per-column parallelism under a byte budget); concurrency; a wire;
+the string family's speed (SUBSTR over a 6M-entry dictionary: 31s).
