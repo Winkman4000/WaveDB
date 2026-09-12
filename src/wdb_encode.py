@@ -911,7 +911,9 @@ def _column_job(input_path, nm, reader):
         prep = _prep_column(nm, arr)
         del arr
     blob, size = _serialize_column(prep, zstd.ZstdCompressor(level=ZSTD_LEVEL))
-    return nm, bytes(blob), size
+    import resource as _rs
+    peak = _rs.getrusage(_rs.RUSAGE_SELF).ru_maxrss * 1024      # this worker's peak so far: THE MEASURED TRUTH
+    return nm, bytes(blob), size, peak
 
 
 def _column_cost(input_path, cols, reader, N):
@@ -934,7 +936,10 @@ def _column_cost(input_path, cols, reader, N):
                 nuniq = n0
             frac = nuniq / n0
             if 'string' in t or 'binary' in t or 'large' in t:
-                est[nm] = 8.0 * (1 + 20 * frac)          # strings: dictionary + front-coding + zstd
+                if nuniq <= 4096:
+                    est[nm] = 0.5                         # a low-cardinality string is an enum: a narrow column
+                else:
+                    est[nm] = 8.0 * (1 + 20 * frac)      # strings: dictionary + front-coding + zstd
             elif frac > 0.5:
                 est[nm] = 2.0                             # near-unique numerics: sequence / delta
             elif nuniq <= 16:
@@ -975,9 +980,22 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0)
             budget = phys // 2
         except Exception:
             budget = 32 << 30
-    def working_set(nm):
+    def cls(nm):
         e = est.get(nm, 1.0)
-        return int(N * (120 if e >= 8 else (50 if e >= 2 else 25))) + (400 << 20)
+        return 'string' if e >= 8 else ('wide' if e >= 2 else 'narrow')
+    measured = {'string': 250, 'wide': 100, 'narrow': 40}     # bytes per row: conservative starts (URL/Referer/Title peak ~25 GB at 100M rows), raised as workers report
+    def working_set(nm):
+        return int(N * measured[cls(nm)]) + (400 << 20)
+    def learn(nm, peak):
+        # THE ENCODER MEASURES ITSELF: a worker's peak RSS updates its class's bytes-per-row
+        # (max seen, plus 25% headroom) so the budget stops guessing after the first column.
+        # One observation can never teach more than "two of this class fit the budget": an
+        # outlier (73 GB on URL) had starved the string class to one column at a time.
+        c = cls(nm); seen = (peak - (400 << 20)) / max(1, N) * 1.25
+        cap = (budget / 2 - (400 << 20)) / max(1, N)
+        seen = min(seen, cap)
+        if seen > measured[c]:
+            measured[c] = seen
     sizes = {}
     fh = open(out_path, 'wb')
     fh.write(b'WVDB4' + struct.pack('<H', len(cols)) + struct.pack('<I', N))
@@ -985,7 +1003,13 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0)
     while pending:
         inflight = {}; used = 0
         try:
-            with cf.ProcessPoolExecutor(max_workers=nworkers) as ex:
+            # a FRESH PROCESS PER COLUMN: ru_maxrss is a process-lifetime max, so a reused worker
+            # reported its heaviest column's peak for every later one (a flag column at 658 B/row)
+            try:
+                ex_ctx = cf.ProcessPoolExecutor(max_workers=nworkers, max_tasks_per_child=1)
+            except TypeError:
+                ex_ctx = cf.ProcessPoolExecutor(max_workers=nworkers)
+            with ex_ctx as ex:
                 while pending or inflight:
                     while pending and len(inflight) < nworkers:
                         heavy_in = sum(1 for v in inflight.values() if est.get(v, 1.0) >= 8)
@@ -1000,12 +1024,14 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0)
                         used += working_set(nm)
                     if not inflight: break
                     fut = next(iter(cf.as_completed(list(inflight.keys()))))
+                    res = fut.result()                 # BEFORE the pop: a result that raises leaves the column in inflight for the re-queue
                     nm = inflight.pop(fut); used -= working_set(nm)
-                    cname, blob, size = fut.result()
+                    cname, blob, size = res[0], res[1], res[2]
+                    if len(res) > 3: learn(cname, int(res[3]))
                     fh.write(blob); fh.flush(); sizes[cname] = size
                     del blob
                     if verbose:
-                        print('  encoded %-24s (%d/%d, %.0fs, %d in flight)' % (cname, len(sizes), len(cols), time.time() - t0, len(inflight)), flush=True)
+                        print('  encoded %-24s (%d/%d, %.0fs, %d in flight, class %s @ %.0f B/row)' % (cname, len(sizes), len(cols), time.time() - t0, len(inflight), cls(cname), measured[cls(cname)]), flush=True)
         except cf.process.BrokenProcessPool:
             lost = [v for v in inflight.values() if v not in sizes]
             pending = lost + [p for p in pending if p not in sizes]
@@ -1020,7 +1046,8 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0)
         if missing and not pending:
             print('  completeness: %d columns missing after the pool (%s): encoding in-process' % (len(missing), ', '.join(missing[:5])), flush=True)
             for nm in missing:
-                cname, blob, size = _column_job(input_path, nm, reader)
+                res = _column_job(input_path, nm, reader)
+                cname, blob, size = res[0], res[1], res[2]
                 fh.write(blob); fh.flush(); sizes[cname] = size; del blob
     fh.close()
     out = None
