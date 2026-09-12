@@ -81,9 +81,21 @@ def _encode_column(col):
     return dtype, has_null, V, valb, codes, aux, uniq
 
 def _pack_codes(codes, bits):
+    """bit-pack in CHUNKS: the N x bits intermediate was 16 GB for 100M x 20-bit codes
+    (measured: the true peak of a string column's encode, not the strings)"""
     codes = np.asarray(codes, dtype=np.uint64)
-    bitsarr = ((codes[:,None] >> np.arange(bits-1,-1,-1,dtype=np.uint64)) & 1).astype(np.uint8).reshape(-1)
-    return np.packbits(bitsarr).tobytes()
+    n = codes.size
+    if n == 0: return b''
+    step = max(1, (1 << 23) // max(1, bits) * 8)           # ~8M bit-cells per chunk
+    step -= step % 8                                        # chunk rows x bits must be a multiple of 8 bits
+    if step <= 0: step = 8
+    shifts = np.arange(bits - 1, -1, -1, dtype=np.uint64)
+    out = bytearray()
+    for lo in range(0, n, step):
+        part = codes[lo:lo + step]
+        bitsarr = ((part[:, None] >> shifts) & 1).astype(np.uint8).reshape(-1)
+        out += np.packbits(bitsarr).tobytes()
+    return bytes(out)
 
 def _try_seq(nm, col, allow_seq=True):
     """Mode-4 (affine/sequence) detection for non-null int/datetime columns. Returns a mode-4
@@ -117,6 +129,12 @@ def _try_seq(nm, col, allow_seq=True):
             tv = int(np.count_nonzero(np.bincount((iv - lo).astype(np.int64))))
             if tv <= 65536:
                 return None                           # narrow: the dict modes win
+        else:
+            # THE CARDINALITY LAW: judge by DISTINCT COUNT, not span -- CounterID (6,506 values
+            # spanning millions) became a 100M-value sequence under the span-only guard (2026-09-14)
+            samp = iv[:: max(1, iv.size // 4_000_000)]
+            if np.unique(samp).size <= 65536 and samp.size >= 65536:
+                return None
     blob = wdb_seqcodec.encode(iv, max_exc_frac=0.2)  # fire only on clear wins (>=80% conform)
     if blob is None:
         return None
@@ -229,8 +247,15 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
     packed = bytes([0]) + _pack_codes(codes, bits)
     width = 1 if bits <= 8 else (2 if bits <= 16 else 4)
     wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[width]
-    z = zstd.ZstdCompressor(level=CODE_ZSTD_LEVEL).compress(np.asarray(codes, dtype=wdt).tobytes())
-    zsec = bytes([1, width]) + struct.pack('<I', len(z)) + z
+    # THE LAYOUT LAW (Jackson): a low-V column is a bit-pack laid down as fast as possible --
+    # zstd only earns its time on wide codes. Narrow codes (<= 4 bits) skip the zstd candidate
+    # when the pack is already small; wider ones compress the BYTE-ALIGNED codes as before.
+    # (IsRefresh, V=2: 1.2s of zstd per 2M rows to lose to a 250KB pack.)
+    if bits <= 4 and len(packed) <= (64 << 20):
+        zsec = None
+    else:
+        z = zstd.ZstdCompressor(level=CODE_ZSTD_LEVEL).compress(np.asarray(codes, dtype=wdt).tobytes())
+        zsec = bytes([1, width]) + struct.pack('<I', len(z)) + z
     # tag 8 = SPARSE-DEFAULT (Jackson's dress): store nothing for the dominant value.
     # presence bitmap + rank checkpoints + bitpacked literals. Beat zstd outright on
     # SearchPhrase (50.4 vs 52.6 MB) with zero decoders; adopted on strict size
@@ -432,7 +457,7 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
             np.cumsum([len(f) for f in frames], out=offs[1:])
             cand9 = (bytes([3, width]) + struct.pack('<II', BR9, len(frames))
                      + offs.tobytes() + b''.join(frames))
-            if len(cand9) <= len(zsec) * 1.10 \
+            if len(cand9) <= (len(zsec) if zsec is not None else len(packed)) * 1.10 \
                     and (blocked is None or len(cand9) <= 1.10 * len(blocked)):
                 blocked = cand9                  # Jackson's rule: fine frames
                 break                            # up to +10%; else the coarse
@@ -497,7 +522,7 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
             eo = np.concatenate([[0], np.cumsum(eb)]).astype(np.uint32)
             e5 = (bytes([5, 2]) + struct.pack('<IIQH', BR5, nb5, int(patches.size), 15)
                   + hot.tobytes() + eo.tobytes() + patches.tobytes() + pk.tobytes())
-            if len(e5) <= len(zsec) * 1.25 and (best is not packed or len(e5) < len(best)):
+            if len(e5) <= (len(zsec) if zsec is not None else len(packed)) * 1.25 and (best is not packed or len(e5) < len(best)):
                 best = e5
             elif V5 > 270:
                 # tag 6 = WARM BUCKETS: hot nibble -> warm byte (255 seats) -> u16 cold.
@@ -772,21 +797,170 @@ def _cluster_order(kc, N):
                                    values=vals, offsets=offsets)
 
 
-def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0):
-    """Memory-bounded encode: read + serialize ONE column at a time so peak memory is a single
-    column rather than the whole table. For the no-cluster, no-FD case (each column independent).
-    Output is byte-identical to encode(): same _prep_column/_serialize_column per column, same
-    column order, same header."""
-    cols, N = wdb_read.column_schema(input_path, columns, reader=reader)
-    blobs = {}; sizes = {}
-    for nm in cols:
+def _arrow_string_prep(nm, chunked):
+    """THE ARROW LAW: a string column is dictionary-encoded IN ARROW MEMORY (no 100M Python
+    objects -- measured 45 GB and 387s for one 100M-row column the pandas way), its dictionary
+    sorted with arrow, codes remapped with numpy. Returns a prep dict like _prep_column's
+    (mode 0/1 strings) or None when the column is not a string column."""
+    import pyarrow as pa, pyarrow.compute as pc
+    t = chunked.type
+    if not (pa.types.is_string(t) or pa.types.is_large_string(t) or pa.types.is_binary(t) or pa.types.is_large_binary(t)):
+        return None
+    if isinstance(chunked, pa.ChunkedArray):
+        chunked = pa.concat_arrays(chunked.chunks) if chunked.num_chunks > 1 else chunked.chunk(0)
+    de = pc.dictionary_encode(chunked)                      # indices (int32) + dictionary (unique, first-seen order)
+    dct = de.dictionary; idx = de.indices
+    null_mask = None; has_null = 0
+    if chunked.null_count:
+        null_mask = np.asarray(pc.is_null(chunked).to_numpy(zero_copy_only=False), dtype=bool); has_null = 1
+    order = pc.sort_indices(dct).to_numpy()                 # dictionary in sorted order
+    rank = np.empty(len(order), np.int64); rank[order] = np.arange(len(order))
+    codes = np.zeros(len(chunked), np.int64)
+    raw = idx.to_numpy(zero_copy_only=False)
+    if null_mask is not None:
+        nn = ~null_mask
+        codes[nn] = rank[np.asarray(raw[nn], dtype=np.int64)]; codes[null_mask] = len(order)
+    else:
+        codes[:] = rank[np.asarray(raw, dtype=np.int64)]
+    sorted_dict = pc.take(dct, pa.array(order))
+    valb = [(v if isinstance(v, bytes) else v.encode('utf-8', 'surrogatepass')) for v in sorted_dict.to_pylist()]
+    del de, dct, idx, raw, sorted_dict
+    V = len(valb) + has_null
+    bits = max(1, int(np.ceil(np.log2(max(V, 2)))))
+    mode = 1 if (V - has_null) > FC_THRESHOLD else 0
+    uniq = None
+    return dict(nm=nm, dtype=1, has_null=has_null, V=V, valb=valb, codes=codes, aux=0, uniq=uniq, bits=bits, mode=mode)
+
+
+def _column_job(input_path, nm, reader):
+    """one column, start to blob, in a worker process (reads its own column: no table in RAM)"""
+    prep = None
+    if str(input_path).lower().endswith('.parquet'):
+        try:
+            import pyarrow.parquet as pq
+            col = pq.read_table(input_path, columns=[nm]).column(0)
+            prep = _arrow_string_prep(nm, col)
+            del col
+        except Exception:
+            prep = None
+    if prep is None:
         arr = wdb_read.read_one_column(input_path, nm, reader=reader)
-        blobs[nm], sizes[nm] = _serialize_column(_prep_column(nm, arr),
-                                                 zstd.ZstdCompressor(level=ZSTD_LEVEL))
+        prep = _prep_column(nm, arr)
         del arr
-    out = bytearray(b'WVDB4'); out += struct.pack('<H', len(cols)); out += struct.pack('<I', N)
-    for nm in cols: out += blobs[nm]
-    open(out_path, 'wb').write(out)
+    blob, size = _serialize_column(prep, zstd.ZstdCompressor(level=ZSTD_LEVEL))
+    return nm, bytes(blob), size
+
+
+def _column_cost(input_path, cols, reader, N):
+    """THE ORDER OF OPERATIONS (Jackson): columns ranked by expected encode cost so the heavy
+    ones (wide dictionaries, strings: front-coding + zstd) start first and never become the
+    tail, while the layout-only ones (flags, sequences, narrow codes) fill the gaps. Cost is
+    estimated from the schema and a sample, never from a full read."""
+    est = {}
+    try:
+        import pyarrow.parquet as pq
+        pf = pq.ParquetFile(input_path)
+        samp = pf.read_row_group(0, columns=cols)
+        n0 = max(1, samp.num_rows)
+        for nm in cols:
+            c = samp.column(nm)
+            t = str(c.type)
+            try:
+                nuniq = len(c.unique())
+            except Exception:
+                nuniq = n0
+            frac = nuniq / n0
+            if 'string' in t or 'binary' in t or 'large' in t:
+                est[nm] = 8.0 * (1 + 20 * frac)          # strings: dictionary + front-coding + zstd
+            elif frac > 0.5:
+                est[nm] = 2.0                             # near-unique numerics: sequence / delta
+            elif nuniq <= 16:
+                est[nm] = 0.3                             # flags and small enums: a bit-pack
+            else:
+                est[nm] = 1.0 + 4 * frac
+    except Exception:
+        est = {nm: 1.0 for nm in cols}
+    return est
+
+
+def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0):
+    """THE ENCODER UNDER THE GOVERNOR: every column is an independent job in a worker
+    process (it reads its own column: the table is never in RAM); jobs start heavy-first
+    (_column_cost) so the long ones never become the tail and lighter ones FILL THE GAPS;
+    the number in flight is capped by workers AND by a byte budget (WDB_ENCODE_MB, default
+    half of RAM / cgroup) on measured working-set classes, with at most three string
+    columns cooking at once; each finished blob is written to the file the moment it lands
+    and freed. SELF-HEALING: a pool killed by the OOM killer halves its concurrency and
+    re-queues the columns it was cooking -- the governor's promise is never to crash. Blob
+    order in the file is completion order: the reader keys columns by name and the catalog
+    holds the logical order."""
+    import concurrent.futures as cf, os as _os
+    cols, N = wdb_read.column_schema(input_path, columns, reader=reader)
+    est = _column_cost(input_path, cols, reader, N)
+    order = sorted(cols, key=lambda c: -est.get(c, 1.0))
+    nworkers = max(1, min(workers or (_os.cpu_count() or 4), _os.cpu_count() or 4))
+    try:
+        budget = int(float(_os.environ.get('WDB_ENCODE_MB', '0'))) << 20
+    except Exception:
+        budget = 0
+    if not budget:
+        try:
+            phys = _os.sysconf('SC_PAGE_SIZE') * _os.sysconf('SC_PHYS_PAGES')
+            with open('/sys/fs/cgroup/memory.max') as f:
+                v = f.read().strip()
+                if v.isdigit(): phys = min(phys, int(v))
+            budget = phys // 2
+        except Exception:
+            budget = 32 << 30
+    def working_set(nm):
+        e = est.get(nm, 1.0)
+        return int(N * (120 if e >= 8 else (50 if e >= 2 else 25))) + (400 << 20)
+    sizes = {}
+    fh = open(out_path, 'wb')
+    fh.write(b'WVDB4' + struct.pack('<H', len(cols)) + struct.pack('<I', N))
+    pending = list(order); verbose = bool(_os.environ.get('WDB_ENCODE_VERBOSE'))
+    while pending:
+        inflight = {}; used = 0
+        try:
+            with cf.ProcessPoolExecutor(max_workers=nworkers) as ex:
+                while pending or inflight:
+                    while pending and len(inflight) < nworkers:
+                        heavy_in = sum(1 for v in inflight.values() if est.get(v, 1.0) >= 8)
+                        pick = None
+                        for i9, cand in enumerate(pending):
+                            if est.get(cand, 1.0) >= 8 and heavy_in >= 3: continue
+                            if not inflight or used + working_set(cand) <= budget:
+                                pick = i9; break
+                        if pick is None: break
+                        nm = pending.pop(pick)
+                        inflight[ex.submit(_column_job, input_path, nm, reader)] = nm
+                        used += working_set(nm)
+                    if not inflight: break
+                    fut = next(iter(cf.as_completed(list(inflight.keys()))))
+                    nm = inflight.pop(fut); used -= working_set(nm)
+                    cname, blob, size = fut.result()
+                    fh.write(blob); fh.flush(); sizes[cname] = size
+                    del blob
+                    if verbose:
+                        print('  encoded %-24s (%d/%d, %.0fs, %d in flight)' % (cname, len(sizes), len(cols), time.time() - t0, len(inflight)), flush=True)
+        except cf.process.BrokenProcessPool:
+            lost = [v for v in inflight.values() if v not in sizes]
+            pending = lost + [p for p in pending if p not in sizes]
+            if nworkers <= 1:
+                fh.close(); raise
+            nworkers = max(1, nworkers // 2)
+            print('  pool killed (memory): retreating to %d workers, re-queueing %d columns (%s)' % (nworkers, len(lost), ', '.join(lost[:5])), flush=True)
+        # THE COMPLETENESS LAW: the header promised len(cols) blobs; whatever the retreats lost
+        # is encoded again, in this process, before the file closes (measured: URL and Referer
+        # vanished across two retreats and the encode reported success)
+        missing = [c for c in cols if c not in sizes]
+        if missing and not pending:
+            print('  completeness: %d columns missing after the pool (%s): encoding in-process' % (len(missing), ', '.join(missing[:5])), flush=True)
+            for nm in missing:
+                cname, blob, size = _column_job(input_path, nm, reader)
+                fh.write(blob); fh.flush(); sizes[cname] = size; del blob
+    fh.close()
+    out = None
     if cubes:
         try:
             from wdb_engine import Segment
@@ -808,7 +982,7 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0)
         _birth_differentiator_shelves(out_path)
     except Exception:
         pass
-    return dict(n_rows=N, n_cols=len(cols), bytes=len(out), seconds=time.time() - t0,
+    return dict(n_rows=N, n_cols=len(cols), bytes=(len(out) if out is not None else __import__('os').path.getsize(out_path)), seconds=time.time() - t0,
                 sizes=sizes, cluster=None)
 
 
