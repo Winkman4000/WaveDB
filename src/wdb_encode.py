@@ -119,7 +119,14 @@ def _try_seq(nm, col, allow_seq=True):
     if k in 'iu':
         dtype = 0; aux = 0; iv = data.astype(np.int64, copy=False)
     elif k == 'M':
-        dtype = 3; aux = _unit_code(np.datetime_data(data.dtype)[0]); iv = data.view('int64')
+        # THE CLOCK LAW: a clock that REPEATS (EventTime: ~70 rows per second) is a key -- a
+        # DICTIONARY whose staircase is the sequence, which the window and range doors read
+        # (enc=2); as a mode-4 sequence it lost them (w-runmin 1.9s -> 23s). A clock that
+        # never repeats (a reading per row, an affine series) is a genuine sequence.
+        _iv9 = data.view('int64'); _sm9 = _iv9[:: max(1, _iv9.size // 2_000_000)]
+        if _sm9.size >= 1024 and np.unique(_sm9).size < 0.9 * _sm9.size:
+            return None
+        dtype = 3; aux = _unit_code(np.datetime_data(data.dtype)[0]); iv = _iv9
     else:
         return None                                   # floats / strings: not eligible
     # cardinality guard: a narrow column (flags, enums, small ids) is a DICTIONARY
@@ -312,7 +319,10 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
     # when the pack is already small; wider ones compress the BYTE-ALIGNED codes as before.
     # (IsRefresh, V=2: 1.2s of zstd per 2M rows to lose to a 250KB pack.)
     if bits <= 4 and len(packed) <= (64 << 20):
-        zsec = None
+        # narrow codes: a CHEAP zstd (level 3, 0.3s per 100M rows) still wins the runs a
+        # time-clustered table produces (skipping it cost 1.8 GB on the clustered encode)
+        z = zstd.ZstdCompressor(level=3, threads=4).compress(np.asarray(codes, dtype=wdt).tobytes())
+        zsec = bytes([1, width]) + struct.pack('<I', len(z)) + z
     else:
         z = zstd.ZstdCompressor(level=CODE_ZSTD_LEVEL, threads=4).compress(np.asarray(codes, dtype=wdt).tobytes())   # zstd's own threads: measured 2x on a 43 MB code stream
         zsec = bytes([1, width]) + struct.pack('<I', len(z)) + z
@@ -895,19 +905,39 @@ def _arrow_string_prep(nm, chunked):
     return dict(nm=nm, dtype=1, has_null=has_null, V=V, valb=valb, codes=codes, aux=0, uniq=uniq, bits=bits, mode=mode)
 
 
-def _column_job(input_path, nm, reader):
-    """one column, start to blob, in a worker process (reads its own column: no table in RAM)"""
+_CASTS = {
+    # DECLARED CASTS at ingest (the operator's ruling, never a guess): a uint16 day count is a
+    # DATE, an int64 epoch-second count is a TIMESTAMP
+    'date_days':      lambda a: np.asarray(a).astype(np.int64).astype('datetime64[D]'),
+    'timestamp_s':    lambda a: np.asarray(a).astype(np.int64).astype('datetime64[s]'),
+    'timestamp_ms':   lambda a: np.asarray(a).astype(np.int64).astype('datetime64[ms]'),
+    'timestamp_us':   lambda a: np.asarray(a).astype(np.int64).astype('datetime64[us]'),
+}
+
+
+def _column_job(input_path, nm, reader, cast=None, perm_path=None):
+    """one column, start to blob, in a worker process (reads its own column: no table in RAM).
+    perm_path: THE CLUSTER ORDER -- a row permutation every column gathers through, so the
+    segment is time-ordered and the clock columns become STAIRCASES (free ordering for
+    windows and ranges: the reference encode had it; the raw file order does not)."""
     prep = None
-    if str(input_path).lower().endswith('.parquet'):
+    perm = np.load(perm_path, mmap_mode='r') if perm_path else None
+    if cast is None and str(input_path).lower().endswith('.parquet'):
         try:
-            import pyarrow.parquet as pq
+            import pyarrow as pa, pyarrow.parquet as pq, pyarrow.compute as pc
             col = pq.read_table(input_path, columns=[nm]).column(0)
+            if perm is not None:
+                col = pc.take(col, pa.array(np.asarray(perm)))
             prep = _arrow_string_prep(nm, col)
             del col
         except Exception:
             prep = None
     if prep is None:
         arr = wdb_read.read_one_column(input_path, nm, reader=reader)
+        if perm is not None:
+            arr = arr[np.asarray(perm)]
+        if cast is not None:
+            arr = _CASTS[cast](arr)
         prep = _prep_column(nm, arr)
         del arr
     blob, size = _serialize_column(prep, zstd.ZstdCompressor(level=ZSTD_LEVEL))
@@ -951,7 +981,7 @@ def _column_cost(input_path, cols, reader, N):
     return est
 
 
-def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0):
+def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0, casts=None, cluster_by=None):
     """THE ENCODER UNDER THE GOVERNOR: every column is an independent job in a worker
     process (it reads its own column: the table is never in RAM); jobs start heavy-first
     (_column_cost) so the long ones never become the tail and lighter ones FILL THE GAPS;
@@ -997,6 +1027,18 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0)
         if seen > measured[c]:
             measured[c] = seen
     sizes = {}
+    perm_path = None
+    if cluster_by:
+        # THE CLUSTER ORDER: argsort the clustering column(s) once (stable), share the
+        # permutation as an mmap'd file; every worker gathers its column through it
+        keys9 = [cluster_by] if isinstance(cluster_by, str) else list(cluster_by)
+        arrs9 = [np.asarray(wdb_read.read_one_column(input_path, k, reader=reader)) for k in keys9]
+        perm = np.lexsort(tuple(reversed(arrs9))).astype(np.int64 if N >= (1 << 31) else np.int32)
+        del arrs9
+        perm_path = out_path + '.perm.tmp.npy'
+        np.save(perm_path, perm); del perm
+        if _os.environ.get('WDB_ENCODE_VERBOSE'):
+            print('  cluster order by %s computed (%d rows)' % (', '.join(keys9), N), flush=True)
     fh = open(out_path, 'wb')
     fh.write(b'WVDB4' + struct.pack('<H', len(cols)) + struct.pack('<I', N))
     pending = list(order); verbose = bool(_os.environ.get('WDB_ENCODE_VERBOSE'))
@@ -1020,7 +1062,7 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0)
                                 pick = i9; break
                         if pick is None: break
                         nm = pending.pop(pick)
-                        inflight[ex.submit(_column_job, input_path, nm, reader)] = nm
+                        inflight[ex.submit(_column_job, input_path, nm, reader, (casts or {}).get(nm), perm_path)] = nm
                         used += working_set(nm)
                     if not inflight: break
                     fut = next(iter(cf.as_completed(list(inflight.keys()))))
@@ -1046,10 +1088,13 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0)
         if missing and not pending:
             print('  completeness: %d columns missing after the pool (%s): encoding in-process' % (len(missing), ', '.join(missing[:5])), flush=True)
             for nm in missing:
-                res = _column_job(input_path, nm, reader)
+                res = _column_job(input_path, nm, reader, (casts or {}).get(nm), perm_path)
                 cname, blob, size = res[0], res[1], res[2]
                 fh.write(blob); fh.flush(); sizes[cname] = size; del blob
     fh.close()
+    if perm_path:
+        try: _os.remove(perm_path)
+        except OSError: pass
     out = None
     if cubes:
         try:
@@ -1076,7 +1121,7 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0)
                 sizes=sizes, cluster=None)
 
 
-def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_specs=None, cluster_by=None, cubes=None, stream=False, date_pairs=None):
+def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_specs=None, cluster_by=None, cubes=None, stream=False, date_pairs=None, casts=None):
     """fd_specs: optional {dependent_col: determinant_col} — store the dependent column as
     a mode-3 FD-reference into the determinant (lossless iff the FD is exact; callers pass
     only verified FDs). Determinant must be a normal (non-FD) column in the same segment.
@@ -1085,8 +1130,8 @@ def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_s
     import os, concurrent.futures as cf
     fd_specs = fd_specs or {}
     t0 = time.time()
-    if stream and cluster_by is None and not fd_specs:
-        return _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0)
+    if stream and not fd_specs:                      # the streaming encoder carries cluster_by (a shared permutation)
+        return _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0, casts=casts, cluster_by=cluster_by)
     coldata, N, cols = wdb_read.read_columns(input_path, columns, reader=reader)
     cluster_meta = None
     if cluster_by is not None:

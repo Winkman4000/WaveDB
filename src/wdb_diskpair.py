@@ -179,6 +179,15 @@ def execute(seg, spec):
     NB, BR = _block_geometry(seg, keys)
     if NB == 0:
         return None
+    # THE GRID LAW: every blocked (enc=3) key column must share the segment's block geometry;
+    # an encode where candidates won at different frame sizes (EventTime at 524,288 rows,
+    # SearchEngineID at 65,536 -- the code-stream level changed which tag won) declines by
+    # name instead of broadcasting two grids together (g-exyear2, 2026-09-12)
+    for _pi, k in keys:
+        if k['kind'] in ('col', 'scalar'):
+            c = seg.cols.get(k['src'])
+            if c is not None and c.get('code_enc') == 3 and int(c['BR']) != BR:
+                return None
     N = int(seg.N)
     # per-key block readers
     readers = []
