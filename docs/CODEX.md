@@ -1009,3 +1009,29 @@ law is the proof. Runs: 1595s -> 980s -> 771s -> 635s, 7.02 GB, peak
 reference encode. OPEN: EventDate/EventTime as dt=3 need the reference
 encode's conversion (config, not a bug); point fjdb at the governed
 segment; per-class levels; SELECT * ... ORDER BY LIMIT star expansion.
+
+
+## THE ENGINE ON ITS OWN INGEST (2026-09-12/13): an encoder's choices are query-time laws
+Pointing fjdb at a governed segment was the true test of the encoder.
+Correct at once (102/103) and SLOW (72 wins vs 91): the reference's
+clocks are STAIRCASES and ours were blocked frames, because a
+staircase only exists when rows arrive time-sorted. LAWS: DECLARED
+CASTS (the operator types day counts and epoch seconds); THE GRID LAW
+(diskpair declines mismatched frame grids by name -- g-exyear2); THE
+CLUSTER ORDER (cluster_by in the streaming encoder: one permutation,
+every worker gathers through it); THE CLOCK LAW (a clock that repeats
+is a key -- dictionary + staircase -- never a sequence; a clock that
+never repeats is a genuine sequence). RESULT: hits_gov7, megaboard
+103/103 -- every query exact on our own ingest for the first time --
+faster on 80, median 2.66x; the window family back (w-runmin 2.06s vs
+23s); cq-notexists 0.41s. ROW ORDER IS A COMPRESSION PARAMETER
+(Jackson's reading): every compressor we have is a same-as-the-row-
+above detector; sorting chooses the neighbours; there is one order for
+the whole table and every column competes for it. Time order gave the
+clocks their staircase and scattered the sessions the file order kept
+local (+1.8 GB on the near-unique ids). The secondary key cannot buy
+locality back at second resolution (~70 rows per tick); the choice is
+which RESOLUTION comes first, or an order-independent representation
+for bursty ids (the differentiator shelf). bench/order_lab.py is the
+instrument. Also learned: cb25db's catalog had pointed at the July
+pre-guard segment all along; ~65 GB of historical encodes cleared.
