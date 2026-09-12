@@ -1035,3 +1035,21 @@ which RESOLUTION comes first, or an order-independent representation
 for bursty ids (the differentiator shelf). bench/order_lab.py is the
 instrument. Also learned: cb25db's catalog had pointed at the July
 pre-guard segment all along; ~65 GB of historical encodes cleared.
+
+
+## SEAL 2026-09-13 (late): the honest standing of the governed encode
+gov7 (time order, level 9, all 105 columns): on the 25 columns the
+reference carries, OURS IS SMALLER (5.09 vs 5.37 GB); the other 3.68 GB
+is 80 columns the boards never touch -- the earlier +1.8 GB claim
+compared file order to time order on the bursty ids and was never a
+comparison against the reference. gov7 IS single-coordinate time order
+(EventDate is a function of EventTime; the second key reorders
+nothing). Megaboard cold pass 80 wins / 2.66x, WARM pass 77 wins /
+2.08x, 103/103 exact both times. The gap to the reference (91 / 4.69x)
+is a family of SearchPhrase <> '' filters ~10x slower (f-neq 0.33s vs
+0.02, g-where 0.36 vs 0.04) plus IsLink/IsDownload flags where the
+layout law's pack lost to a zstd that catches time-ordered zero runs
+(2.5 -> 10.2 MB): candidate-selection and door-level work, NOT order and
+NOT sidecars. NEXT: per-query diff on the SearchPhrase family (which
+door served on each segment), let zstd win narrow codes when it wins by
+4x, then item 2 (concurrency).
