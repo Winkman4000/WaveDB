@@ -314,7 +314,7 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
     if bits <= 4 and len(packed) <= (64 << 20):
         zsec = None
     else:
-        z = zstd.ZstdCompressor(level=CODE_ZSTD_LEVEL).compress(np.asarray(codes, dtype=wdt).tobytes())
+        z = zstd.ZstdCompressor(level=CODE_ZSTD_LEVEL, threads=4).compress(np.asarray(codes, dtype=wdt).tobytes())   # zstd's own threads: measured 2x on a 43 MB code stream
         zsec = bytes([1, width]) + struct.pack('<I', len(z)) + z
     # tag 8 = SPARSE-DEFAULT (Jackson's dress): store nothing for the dominant value.
     # presence bitmap + rank checkpoints + bitpacked literals. Beat zstd outright on
@@ -1015,7 +1015,7 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0)
                         heavy_in = sum(1 for v in inflight.values() if est.get(v, 1.0) >= 8)
                         pick = None
                         for i9, cand in enumerate(pending):
-                            if est.get(cand, 1.0) >= 8 and heavy_in >= 3: continue
+                            if est.get(cand, 1.0) >= 8 and heavy_in >= 4: continue        # strings measured 9-25 GB: four fit
                             if not inflight or used + working_set(cand) <= budget:
                                 pick = i9; break
                         if pick is None: break
