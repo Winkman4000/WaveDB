@@ -975,3 +975,37 @@ Cyrillic). Megaboard on the healthy fixture stands at 91 wins / 4.69x.
 NEXT: the encoder under the governor (encode a column, write it, free
 it; per-column parallelism under a byte budget); concurrency; a wire;
 the string family's speed (SUBSTR over a 6M-entry dictionary: 31s).
+
+
+## THE ENCODER UNDER THE GOVERNOR (2026-09-12): ingest for real-sized tables
+The 100M-row ClickBench table went from 30 hours projected (OOM-killed
+twice at 128 GB) to 635 seconds. THE LAWS, each measured: THE LAYOUT
+LAW (Jackson) -- _code_section computed every candidate and kept the
+smallest, so a two-valued flag paid a full zstd pass over 100M byte-
+aligned codes to lose to a 250 KB bit-pack; narrow codes skip zstd and
+lay the bits down. THE ARROW LAW -- the pandas string path costs ~450
+B/row (45 GB, 387s for one column); strings dictionary-encode in arrow
+memory, sort in arrow, remap in numpy. CHUNKED PACKING -- the true peak
+was _pack_codes building an N x bits uint64 matrix (16 GB); chunked,
+byte-identical: 45 GB -> 9 GB per string column. THE DRIVER -- one
+process per column reading its own column; heavy-first with lighter
+columns FILLING THE GAPS; a byte budget; every blob written the moment
+it lands, in completion order (the reader keys by name). SELF-HEALING --
+a pool the kernel kills halves and re-queues. THE COMPLETENESS LAW --
+the retreats had silently lost URL and Referer and reported success
+(the cause: pop before result). THE CARDINALITY LAW -- judge sequences
+by distinct count, not span (CounterID). THE FRONT-CODER IN NUMBA (15s
+-> 2.2s, byte-identical). THE CODE-STREAM LEVEL 19 -> 9 (7-13x for ~6%;
+the inline decision stays at the archival level: the suite caught the
+flip). THE ENCODER MEASURES ITSELF -- workers report peak RSS, a fresh
+process per column (ru_maxrss is process-lifetime), bounded learning.
+THE COMPRESSION POLICY -- trained dictionaries give nothing after front-
+coding; zstd threads halve the code stream. On beating zstd at ground
+level (Jackson's question): its internals are a decade of tuned C; the
+frontier we own is ABOVE it -- the right representation per column
+class reaches the entropy floor before compression matters; the layout
+law is the proof. Runs: 1595s -> 980s -> 771s -> 635s, 7.02 GB, peak
+57.7 GB under the 128 GB wall, 12/12 ClickBench queries exact vs the
+reference encode. OPEN: EventDate/EventTime as dt=3 need the reference
+encode's conversion (config, not a bug); point fjdb at the governed
+segment; per-class levels; SELECT * ... ORDER BY LIMIT star expansion.
