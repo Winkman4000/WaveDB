@@ -46,6 +46,9 @@ def _segment_to_df(seg, schema, phys=None, defaults=None):
             vals = seg.values(pcol)
             if pm is not None: vals = vals[pm]
             vals = list(vals)
+            if seg.cols.get(pcol, {}).get('dt') == 1:
+                # inline / front-coded strings come back as bytes or bytearray: the encoder hashes str
+                vals = [(v.decode('utf-8', 'replace') if isinstance(v, (bytes, bytearray)) else v) for v in vals]
         else:
             vals = [defaults.get(c)] * liveN      # ADD COLUMN: default materialized at compaction
         if wt == 'datetime':
@@ -62,8 +65,13 @@ def compact(catalog, name, seg_files=None):
     all_segs = list(tinfo['segments'])
     targets = seg_files if seg_files is not None else all_segs
     targets = [s for s in targets if s in all_segs]
-    if len(targets) < 2:
+    def _dirty(sf):
+        p = os.path.join(catalog.dbdir, sf)
+        return os.path.exists(wdb_presence.path_for(p)) or os.path.exists(wdb_override.path_for(p))
+    if len(targets) < 2 and not any(_dirty(sf) for sf in targets):
         return {'merged': [], 'new_segment': None, 'rows': 0, 'labels_in': 0, 'labels_kept': 0}
+    # a SINGLE segment carrying tombstones or overrides is rewritten clean: that is how the
+    # fast doors come back after DML (THE PRESENCE GATE serves it slowly until then)
 
     # 1) decode + union the target segments
     dfs = []
@@ -105,6 +113,12 @@ def compact(catalog, name, seg_files=None):
         if os.path.exists(sc): os.remove(sc)
         oc = wdb_override.path_for(p)                # drop the now-stale override sidecar
         if os.path.exists(oc): os.remove(oc)
+        # EVERY derived artefact of the removed segment goes with it (roads, censuses, shelves,
+        # reverse roads...): dictionary codes and row positions are reborn with the segment
+        for fn in os.listdir(catalog.dbdir):
+            if fn.startswith(s + '.') and fn != s:
+                try: os.remove(os.path.join(catalog.dbdir, fn))
+                except OSError: pass
     fl[new_seg] = kept
     catalog.save()
     return {'merged': targets, 'new_segment': new_seg, 'rows': len(union),
