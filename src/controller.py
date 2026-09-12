@@ -148,6 +148,25 @@ def _plan_replay(ctx):
 def route_single_segment(ctx):
     """Route a request over a single clean segment to its read, else the general scan.
     Byte-identical to the previous wdb_db try-chain."""
+    # THE PRESENCE GATE: a segment carrying tombstones (DELETE) or overrides (UPDATE) is
+    # served by the general scan only -- it seeds its mask with presence and reads through
+    # overrides; the specialised doors answer from censuses, sidecars and planes that were
+    # born from the rows as encoded and cannot see a tombstone. Correctness first;
+    # compaction restores the doors. (Found 2026-09-12: eight doors confidently wrong
+    # after one DELETE.)
+    try:
+        _dirty9 = (ctx.seg.presence_mask() is not None) or (ctx.seg._overrides_any() if hasattr(ctx.seg, '_overrides_any') else False)
+    except Exception:
+        _dirty9 = False
+    if not _dirty9:
+        try:
+            import wdb_override
+            _dirty9 = bool(wdb_override.load(ctx.seg.path))
+        except Exception:
+            _dirty9 = False
+    if _dirty9:
+        _SERVED[0] = 'general_scan';  _PATH_SINK(ctx, 'general_scan') if _PATH_SINK is not None else None
+        return R.general_scan(ctx)
     _rp = _plan_replay(ctx)
     if _rp is not None:
         return _rp
