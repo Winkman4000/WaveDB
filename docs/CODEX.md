@@ -1075,3 +1075,30 @@ coin-flips within 0.05s of duck, and g-len (LENGTH() as a group key,
 source -- the per-column peak the learner reports is the candidate
 zoo over 800 MB arrays; halving the base unlocks full-width encodes),
 then g-len, then concurrency.
+
+
+## A: MAKE IT A DATABASE (2026-09-13): the wire
+Decision (Jackson): A first -- concurrency, crash safety, a wire, errors --
+because the goal is the official benchmarks and a submission is a
+working database: install, load, run the 43 queries three times through
+the system's own command line, report load time and storage. THE WIRE,
+first form: bin/wdb (init, load with --cluster-by/--cast, sql/file/shell
+in table|csv|tsv|json, explain, tables, stats, audit, compact, flush,
+vacuum; exit codes 0/1/2/3); the lifecycle exact from the command line
+on a database that did not exist a minute earlier. THE CLICKBENCH KIT
+(benchmark/clickbench: install.sh, load.sh, run.sh, queries.sql).
+Measured: a CLI query cost 3.5s before any work (imports + JIT loading)
+-- the floor would swamp every sub-second query. THE WIRE, second form:
+ keeps one warm engine (HTTP: POST /sql, /explain; GET
+/health, /tables; DML; one query at a time under a lock -- no
+concurrency claim yet);  is a stdlib-only client:
+3.5s -> 0.078s per query. THE WATCHDOG: the engine runs in a child; an
+OOM-killed or crashed child is restarted; the client retries; THE LEDGER
+prints wall, RSS and SQL per query. RESULT: the full kit through the
+wire, 43 x 3: 42 answered, hot total 10.0s, one null -- COUNT(DISTINCT
+UserID) grouped by 6M SearchPhrase values, a transient intermediate the
+governor does not bound (the in-process board has always errored there
+too). NEXT: a bounded group-distinct organ for that query (the last
+ClickBench null); crash safety (journal + recovery); a concurrency
+harness; then the load step as the kit measures it, and the first
+results.json.
