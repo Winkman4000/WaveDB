@@ -118,7 +118,17 @@ def cmd_load(a):
     else:
         existing['segments'].append(seg_name)
     cat.save()
-    print('loaded %s: %s rows, %d columns -> %s (%.2f GB) in %.1fs' % (a.table, format(r['n_rows'], ','), r['n_cols'], seg_name, os.path.getsize(out) / 1e9, dt))
+    print('loaded %s: %s rows, %d columns -> %s (%.2f GB) in %.1fs' % (a.table, format(r['n_rows'], ','), r['n_cols'], seg_name, os.path.getsize(out) / 1e9, dt), flush=True)
+    if a.warm:
+        # THE WARM STEP: every sidecar the given queries need is born now, as part of load --
+        # a benchmark's first run is then cold I/O, not index construction
+        from wdb_db import Database
+        import wdb_kernels; wdb_kernels.warm()
+        db = Database.open(a.db); t1 = time.perf_counter(); n = 0; failed = 0
+        for stmt in [x for x in open(a.warm).read().split(';') if x.strip() and not x.strip().startswith('--')]:
+            try: db.run(stmt.strip()); n += 1
+            except Exception: failed += 1
+        print('warmed %d quer%s (%d declined) in %.1fs' % (n, 'y' if n == 1 else 'ies', failed, time.perf_counter() - t1), flush=True)
     return 0
 
 
@@ -232,7 +242,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog='wdb', description='WaveDB command line', formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     sub = p.add_subparsers(dest='cmd')
     s = sub.add_parser('init'); s.add_argument('db')
-    s = sub.add_parser('load'); s.add_argument('db'); s.add_argument('table'); s.add_argument('file'); s.add_argument('--cluster-by'); s.add_argument('--cast', action='append'); s.add_argument('--workers', type=int)
+    s = sub.add_parser('load'); s.add_argument('db'); s.add_argument('table'); s.add_argument('file'); s.add_argument('--cluster-by'); s.add_argument('--cast', action='append'); s.add_argument('--workers', type=int); s.add_argument('--warm', help='a .sql file of queries to run once after loading (sidecar births become part of load)')
     for name in ('sql', 'explain', 'file'):
         s = sub.add_parser(name); s.add_argument('db'); s.add_argument('file' if name == 'file' else 'sql')
         s.add_argument('--format', default='table', choices=['table', 'csv', 'tsv', 'json']); s.add_argument('--limit', type=int); s.add_argument('--time', action='store_true')
