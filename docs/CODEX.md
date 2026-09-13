@@ -1053,3 +1053,25 @@ layout law's pack lost to a zstd that catches time-ordered zero runs
 NOT sidecars. NEXT: per-query diff on the SearchPhrase family (which
 door served on each segment), let zstd win narrow codes when it wins by
 4x, then item 2 (concurrency).
+
+
+## THE CHUNK LAW, and the engine on its own ingest -- settled (2026-09-13)
+The SearchPhrase <> '' family was 7x slower on our segment with the
+same door and the same encoding. PROFILE BEFORE THEORY: one zstd
+decompress of 0.31s per query vs nine tiny ones -- the DICTIONARY, not
+the bitmap; binary-search probes decompress the chunk holding each
+value; the reference has 368 frames of 16,384, ours was one 6M-value
+frame because the arrow string prep never copied _prep_column's chunk
+flag. Every big string dictionary (URL, Referer, Title, SearchPhrase)
+paid a full decompress on every lookup, LIKE and <> ''. Three
+theories before the profile (the second coordinate, the row order,
+cold sidecars) were each partly plausible and each wrong. RESULT on
+gov8 (cluster_by=['EventTime'], chunked dictionaries): megaboard
+103/103 both passes, faster on 86, median 3.44x, TOTAL WAVE 76.3s vs
+the reference run's 79.9s -- a segment built in eleven minutes by our
+own ingest now beats the borrowed one on wall clock. Remaining: nine
+coin-flips within 0.05s of duck, and g-len (LENGTH() as a group key,
+0.34s vs 0.04). NEXT: THE NARROW-CODES LAW (codes as uint32 at the
+source -- the per-column peak the learner reports is the candidate
+zoo over 800 MB arrays; halving the base unlocks full-width encodes),
+then g-len, then concurrency.
