@@ -1102,3 +1102,25 @@ too). NEXT: a bounded group-distinct organ for that query (the last
 ClickBench null); crash safety (journal + recovery); a concurrency
 harness; then the load step as the kit measures it, and the first
 results.json.
+
+
+## THE SERVER-KILLER, CONVICTED (2026-09-14): profile before theory, and when the profiler cannot see it, use the signal
+The kit's engine child died idle, seconds after 'serving'. Three theories
+(the second coordinate, cold sidecars, COUNT(DISTINCT)) fell to
+measurement. The instruments that named it: the ledger printing the SQL
+BEFORE a run; a cgroup monitor with top processes by RSS (8 -> 127 GB in
+eight seconds on AVG(length(URL)) GROUP BY CounterID); a 30 GB address-
+space limit (under it the query succeeded at 7.3 GB -- a different door
+explodes, and its MemoryError reads as a decline); faulthandler on
+SIGUSR1 fired by a shell watcher at 40 GB, the only thing that names a
+frame inside a C call holding the GIL: the fused cascade's
+np.asarray(typed_dict) with no dtype -- THE WIDTH LAW: a list of 6M
+bytes becomes a fixed-width S<maxlen> array, tens of GB in one call.
+Twenty-four such sites; the fix at the source: a string dictionary is
+an object array, never a list. Also: the dictionary map made universal
+in _eval_rows, cached once per query. RESULT: the first fully clean
+ClickBench run through the wire -- 43/43, 0 nulls, 0 restarts, hot
+total 10.4s, median 0.159s, slowest 0.89s; cold run 85.3s (births) --
+the load step should absorb the births before submission. LESSON: the
+kill pattern in the same command line as the launch matched itself,
+twice; kill and launch in separate calls, permanently.
