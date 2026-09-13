@@ -125,7 +125,19 @@ def supervise(dbdir, host='127.0.0.1', port=8765):
         time.sleep(1)
 
 
+def _die_with_parent():
+    """an engine child never outlives its watchdog: an orphan holding the port answered 500s
+    with a stale catalog for a whole harness run (2026-09-14)"""
+    try:
+        import ctypes, signal
+        libc = ctypes.CDLL('libc.so.6', use_errno=True)
+        libc.prctl(1, signal.SIGTERM)                  # PR_SET_PDEATHSIG
+    except Exception:
+        pass
+
+
 def serve(dbdir, host='127.0.0.1', port=8765):
+    _die_with_parent()
     state = _State(dbdir)
     httpd = ThreadingHTTPServer((host, port), make_handler(state))
     print('wdb serving %s on http://%s:%d  (POST /sql, /explain; GET /health, /tables)' % (dbdir, host, port), flush=True)

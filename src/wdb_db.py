@@ -88,6 +88,7 @@ def _int_emission(ctx, res):
 class Database:
     def __init__(self, catalog):
         self.cat = catalog
+        self._cat_stamp = None
         self._seg_cache = {}   # path -> ((mtime_ns,size), Segment): immutable .wdb base, reused across queries
         self._ptr_cache = {}   # (child_seg_path, fk_col) -> ((mtime_ns,size), int64 ptr array)
         self._gd_cache = {}    # (seg_path, group, target) -> ((mtime_ns,size), sidecar dict): load .npz once
@@ -97,10 +98,36 @@ class Database:
         # and uses the fully parallel fused scan, which wins when one query owns all cores. Both
         # paths return identical results; the choice is the caller's, per-run or as this default.
         self.escalate = False
+        self._cat_stamp = self._catalog_stamp()
 
     @classmethod
     def create(cls, dbdir): return cls(Catalog.create(dbdir))
-    @classmethod
+
+    def _catalog_stamp(self):
+        try:
+            st = os.stat(os.path.join(self.cat.dbdir, 'catalog.json'))
+            return (st.st_mtime_ns, st.st_size)
+        except Exception:
+            return None
+
+    def refresh(self):
+        """THE CATALOG IS THE TRUTH: a long-lived engine re-reads it when another process has
+        changed it (a compaction, a flush, a DDL) -- the server kept serving a segment that
+        a writer had replaced and answered 500 to 106,245 queries in a row (2026-09-14).
+        Cheap: one stat per query; a reload only when the stamp moved."""
+        st = self._catalog_stamp()
+        if st != self._cat_stamp:
+            self.cat = Catalog.open(self.cat.dbdir)
+            self._cat_stamp = st
+            self._seg_cache.clear(); self._ptr_cache.clear(); self._gd_cache.clear()
+            try:
+                import wdb_sqlcache
+                wdb_sqlcache.clear() if hasattr(wdb_sqlcache, 'clear') else None
+            except Exception:
+                pass
+            return True
+        return False
+
     @staticmethod
     def recover(dbdir, verbose=False):
         """RECOVERY ON OPEN: the counterpart of the rename law. Every write path writes a
@@ -542,6 +569,8 @@ class Database:
         """Depth-guarded: recursive runs (subquery rewrites, join sub-queries) share
         memory within one outer query; at depth 0 wdb_qmem.flush forgets everything
         data-derived. A query leaves the engine as if it was never there."""
+        if getattr(self, '_qdepth', 0) == 0:
+            self.refresh()                                   # another process may have rewritten the table
         import wdb_qmem, os as _os9
         _bill9 = _os9.environ.get('WDB_JOIN_BILL')
         if _bill9:
@@ -549,7 +578,16 @@ class Database:
             _r0 = _t9.perf_counter()
         self._qdepth = getattr(self, '_qdepth', 0) + 1
         try:
-            r9 = self._run_impl(sql, escalate)
+            try:
+                r9 = self._run_impl(sql, escalate)
+            except (FileNotFoundError, OSError) as _fe9:
+                # THE SWAP WINDOW: a query that began under the old catalog reached for a
+                # segment a writer just replaced (compaction). The catalog is the truth --
+                # refresh it and run once more; a second failure is a real error.
+                if self._qdepth == 1 and self.refresh():
+                    r9 = self._run_impl(sql, escalate)
+                else:
+                    raise
             if _bill9 and self._qdepth == 1:
                 print('RUN BILL: impl=%.0fms' % ((_t9.perf_counter() - _r0) * 1000), flush=True)
             return r9
