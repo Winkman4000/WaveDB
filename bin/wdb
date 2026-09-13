@@ -183,10 +183,18 @@ def cmd_flush(a):
 
 def _client(server, path, body):
     """THE THIN CLIENT: stdlib only -- no numpy, no engine import -- so a query costs the wire, not 3.5s of startup"""
-    import urllib.request
+    import urllib.request, urllib.error
     req = urllib.request.Request(server.rstrip('/') + path, data=json.dumps(body).encode(), headers={'Content-Type': 'application/json'})
-    with urllib.request.urlopen(req, timeout=3600) as r:
-        return json.loads(r.read().decode())
+    last = None
+    for attempt in range(8):                        # the server may be restarting (the watchdog): wait, retry
+        try:
+            with urllib.request.urlopen(req, timeout=3600) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.URLError as e:
+            last = e; time.sleep(1 + attempt)
+        except ConnectionError as e:
+            last = e; time.sleep(1 + attempt)
+    return {'error': 'server unreachable at %s: %s' % (server, last), 'kind': 'failed'}
 
 
 def _via_server(server, argv):
@@ -209,7 +217,7 @@ def _via_server(server, argv):
 
 
 def cmd_serve(a):
-    import wdb_server; wdb_server.serve(a.db, host=a.host, port=a.port); return 0
+    import wdb_server; wdb_server.supervise(a.db, host=a.host, port=a.port); return 0
 
 
 def main(argv=None):
