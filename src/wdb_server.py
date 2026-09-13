@@ -68,6 +68,8 @@ def make_handler(state):
                 return self._send(400, {'error': 'empty sql', 'kind': 'error'})
             with state.lock:
                 t0 = time.perf_counter()
+                if os.environ.get('WDB_SERVE_LEDGER'):
+                    print('  -> rss %.2f GB  %s' % (_rss_gb(), sql[:100].replace(chr(10), ' ')), flush=True)   # BEFORE the run: a killer names itself
                 try:
                     if self.path == '/explain':
                         return self._send(200, {'plan': state.db.explain(sql, run=bool(req.get('run', True)))})

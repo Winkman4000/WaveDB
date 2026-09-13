@@ -69,9 +69,12 @@ def _hot_gids(hot_path, a, b, V, Vb):
     for col in (a, b):
         Vc = V[col]
         vals = df[col].to_numpy()
-        if Vc.dtype.kind == 'S':
+        _is_str9 = Vc.dtype.kind == 'S' or (Vc.dtype == object and Vc.size and isinstance(Vc[0], (bytes, bytearray)))
+        if _is_str9:
+            # a string dictionary is an object array of bytes now (THE WIDTH LAW at the source);
+            # keys compare as bytes either way
             key = np.array([v.encode('utf-8', 'surrogatepass') if isinstance(v, str) else v
-                            for v in vals], dtype=Vc.dtype)
+                            for v in vals], dtype=(Vc.dtype if Vc.dtype.kind == 'S' else object))
         else:
             try:
                 key = vals.astype(Vc.dtype, copy=False)

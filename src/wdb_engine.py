@@ -1447,6 +1447,14 @@ class Segment:
         r = self._typed_dict_uncached(nm)
         if self.cols[nm]['mode'] != 6:   # mode-6 synth value can change via register_synth; don't memo
             self._tdict[nm] = r
+        # THE WIDTH LAW at the source: a STRING dictionary is an object array, never a Python
+        # list -- np.asarray(list_of_bytes) builds a fixed-width S<maxlen> array (6M URLs x a
+        # thousands-byte longest value = tens of GB in one C call, GIL held: the fused cascade
+        # OOM-killed the server on AVG(length(URL)) before any watchdog could see it)
+        _c9 = self.cols[nm]
+        if _c9.get('dt') == 1 and isinstance(r, list) and _c9.get('mode') in (0, 1, 2):
+            r = np.array(r, dtype=object)
+            if _c9['mode'] != 6: self._tdict[nm] = r
         return r
     def _typed_dict_uncached(self, nm):
         c = self.cols[nm]

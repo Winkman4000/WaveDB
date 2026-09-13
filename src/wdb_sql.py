@@ -620,25 +620,37 @@ def _eval_rows(seg, node, mask, resolve=None, env=None):
     """Row-wise evaluation. env: {column name: array} overrides (THE DICTIONARY
     MAP evaluates a string function once per distinct value and gathers)."""
     n = node.this if isinstance(node, E.Alias) else node
-    _MAPPABLE9 = _STRFN_TYPES + (E.Case, E.Coalesce, E.Nullif, E.Cast)
-    if env is None and (isinstance(n, _MAPPABLE9) or (type(n) in (E.EQ, E.NEQ, E.GT, E.LT, E.GTE, E.LTE) and n.find(*_MAPPABLE9) is not None)):
+    # THE DICTIONARY MAP, universal: ANY expression (not a bare column or literal; no aggregate,
+    # subquery or window inside) that depends on exactly ONE dictionary column is evaluated
+    # once per distinct value and gathered by code. It used to fire for a fixed list of node
+    # types; AVG(length(URL)) took the row path and decoded 100M URLs into Python strings --
+    # 16 GB/s until the kernel killed the server (ClickBench, 2026-09-14).
+    if (env is None and not isinstance(n, (E.Column, E.Literal, E.Star, E.Null, E.Boolean, E.Paren))
+            and n.find(E.AggFunc, E.Select, E.Window, E.Subquery) is None):
         ds = _dict_string_col(seg, n, resolve, any_dt=True)
         if ds is not None:
             nm, pc = ds
             V = int(seg.cols[pc]['V'])
             codes = np.asarray(seg.codes(pc))
             if mask is not None: codes = codes[mask]
-            td = _typed_dict_dt(seg, pc)
-            outv = _eval_rows(seg, n, None, resolve, env={nm: td})
-            outv = np.asarray(outv, dtype=object) if not isinstance(outv, np.ndarray) else outv
-            if outv.shape[0] != V: raise TypeError('dictionary map: %d values for V=%d' % (outv.shape[0], V))
-            if outv.dtype == object:
-                # numeric-or-None over V collapses to float with NaN (a numeric N-array gathers fast)
-                try:
-                    if all(v is None or isinstance(v, (int, float, np.integer, np.floating, bool, np.bool_)) for v in outv):
-                        outv = np.array([np.nan if v is None else float(v) for v in outv], dtype=np.float64)
-                except Exception:
-                    pass
+            # ONCE PER QUERY: the mapped values over V are cached for the query's lifetime -- a
+            # per-group row aggregate (AVG(length(URL)) GROUP BY CounterID) re-mapped the 6M-value
+            # dictionary 6,506 times, decoding it into Python strings each time (16 GB/s, OOM)
+            _ck9 = ('dmap', pc, n.sql())
+            outv = seg._codes.get(_ck9) if hasattr(seg, '_codes') else None
+            if outv is None:
+                td = _typed_dict_dt(seg, pc)
+                outv = _eval_rows(seg, n, None, resolve, env={nm: td})
+                outv = np.asarray(outv, dtype=object) if not isinstance(outv, np.ndarray) else outv
+                if outv.shape[0] != V: raise TypeError('dictionary map: %d values for V=%d' % (outv.shape[0], V))
+                if outv.dtype == object:
+                    # numeric-or-None over V collapses to float with NaN (a numeric N-array gathers fast)
+                    try:
+                        if all(v is None or isinstance(v, (int, float, np.integer, np.floating, bool, np.bool_)) for v in outv):
+                            outv = np.array([np.nan if v is None else float(v) for v in outv], dtype=np.float64)
+                    except Exception:
+                        pass
+                if hasattr(seg, '_codes'): seg._codes[_ck9] = outv
             return outv[codes]
     return _eval_rows_core(seg, node, mask, resolve, env)
 
