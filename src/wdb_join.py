@@ -31,6 +31,14 @@ def _materialize(db, table, cols):
         seg = db.open_segment(paths[0], table)
         if seg.presence_mask() is None:
             return {c: seg.values(phys.get(c, c)) for c in cols}
+    if len(paths) > 1 and not hot:
+        # THE UNION: typed arrays exactly as a single segment gives them (the row-SELECT fallback
+        # built object arrays that pandas merged to nothing: a two-key self-join answered 0)
+        try:
+            u, _ = _solo_segment(db, table)
+            return {c: u.values(phys.get(c, c)) for c in cols}
+        except _FastUnsupported:
+            pass
     rows, _ = db.run(f"SELECT {', '.join(cols)} FROM {table}")
     arrs = list(zip(*rows)) if rows else [()] * len(cols)
     return {c: np.array(arrs[i], dtype=object) for i, c in enumerate(cols)}
@@ -2807,6 +2815,15 @@ def _coerce_lit(series, lit):
         return pd.Timestamp(str(lit.this))
     if k in 'iuf':
         return float(lit.this) if (k == 'f' or '.' in str(lit.this)) else int(lit.this)
+    if k == 'O':
+        # an OBJECT column carries whatever the row path put there: ints, floats, bytes or str --
+        # coerce the literal to the ELEMENT type, not to bytes by default (a column of Python ints
+        # compared to b'7' answered 0 for 25,669 on the multi-segment fallback, 2026-09-13)
+        first = next((v for v in series.values[:1000] if v is not None), None)
+        if isinstance(first, bool): return bool(lit.this)
+        if isinstance(first, (int, np.integer)) and not lit.is_string: return int(float(lit.this))
+        if isinstance(first, (float, np.floating)) and not lit.is_string: return float(lit.this)
+        if isinstance(first, str): return str(lit.this)
     s = lit.this
     return s.encode() if isinstance(s, str) else s
 

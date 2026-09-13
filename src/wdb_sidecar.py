@@ -32,6 +32,29 @@ FAMILIES = [
     (r'\.npz$',                  'npz-shelf',      '?',  'various'),
 ]
 _SEG = re.compile(r'^(?P<seg>[A-Za-z0-9_]+_[0-9]+\.wdb)\.(?P<rest>.+)$')
+_UNION = re.compile(r'^(?P<table>[A-Za-z0-9_]+)\.union-(?P<hash>[0-9a-f]{12})\.wdb\.(?P<rest>.+)$')
+
+
+def current_union_hashes(dbdir):
+    """THE UNION BIRTHMARK, read back: for every multi-segment table in the catalog, the hash
+    a union of its CURRENT segment set would carry. A union sidecar whose hash is not in this
+    set was born under a segment set that no longer exists -- stale by construction."""
+    import json, hashlib
+    out = {}
+    try:
+        cat = json.load(open(os.path.join(dbdir, 'catalog.json')))
+    except Exception:
+        return out
+    for t, info in cat.get('tables', {}).items():
+        segs = info.get('segments') or []
+        if len(segs) < 2: continue
+        paths = [os.path.join(dbdir, sf) for sf in segs]
+        try:
+            stamp = hashlib.sha1('|'.join('%s:%d:%d' % (p, int(os.stat(p).st_mtime_ns), os.stat(p).st_size) for p in paths).encode()).hexdigest()[:12]
+        except FileNotFoundError:
+            continue
+        out[t] = stamp
+    return out
 
 
 def classify(fname):
@@ -41,7 +64,11 @@ def classify(fname):
     return None
 
 
+_union_hashes_cache = {}
+
+
 def scan(dbdir):
+    _union_hashes_cache.pop(dbdir, None)
     """Every sidecar in dbdir with its family, source segment, size, and truth."""
     out = []
     try:
@@ -68,7 +95,14 @@ def scan(dbdir):
             rest = m.group('rest')
             col = rest.split('.')[0].split('__')[0]
         status = 'ok'
-        if seg is None or seg not in segs:
+        mu = _UNION.match(n) if m is None else None
+        if mu is not None:
+            # a UNION sidecar: its segment is virtual; fresh iff its hash is the table's current one
+            seg = '%s.union-%s.wdb' % (mu.group('table'), mu.group('hash')); col = mu.group('rest').split('.')[0].split('__')[0]
+            cur = _union_hashes_cache.get(dbdir)
+            if cur is None: cur = _union_hashes_cache[dbdir] = current_union_hashes(dbdir)
+            status = 'ok' if cur.get(mu.group('table')) == mu.group('hash') else 'stale'
+        elif seg is None or seg not in segs:
             status = 'orphan'
         else:
             try:
@@ -185,6 +219,9 @@ class BirthRefused(Exception):
 def is_fresh(dbdir, fname):
     """A sidecar is TRUE only if it is newer than its segment (and its .mark, if any, matches)."""
     p = os.path.join(dbdir, fname)
+    mu = _UNION.match(fname)
+    if mu is not None:
+        return os.path.exists(p) and current_union_hashes(dbdir).get(mu.group('table')) == mu.group('hash')
     m = _SEG.match(fname)
     if not m or not os.path.exists(p):
         return False

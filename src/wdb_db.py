@@ -650,8 +650,11 @@ class Database:
                 import os as _os9
                 import wdb_segparts
                 if wdb_segparts.multi_segment_tables(self, tree):
-                    _sp9 = wdb_segparts.execute(self, tree, sql)      # SEGMENT PARTIALS: one multi-segment table
-                    if _sp9 is not None: return _sp9
+                    try:
+                        _sp9 = wdb_segparts.execute(self, tree, sql)      # SEGMENT PARTIALS: one multi-segment table
+                        if _sp9 is not None: return _sp9
+                    except NotImplementedError:
+                        pass                          # two multi-segment tables: the union view serves them below
                 import wdb_semijoin
                 if wdb_semijoin.shape_ok(tree) and not wdb_semijoin._needs_weights(tree):
                     try:
