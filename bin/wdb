@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""wdb -- the WaveDB command line.
+
+  wdb init    DB                                  create an empty database directory
+  wdb load    DB TABLE FILE [--cluster-by C,..] [--cast COL=KIND ..] [--workers N]
+                                                  encode a parquet/csv into a segment and register the table
+  wdb sql     DB "SELECT ..."  [--format table|csv|tsv|json] [--limit N] [--time]
+  wdb file    DB FILE.sql      [--format ..]      run each ;-separated statement in a file
+  wdb shell   DB                                  interactive prompt (; ends a statement; .quit .tables .format)
+  wdb explain DB "SELECT ..."  [--no-run]         the plan you can read: door, bills, rows, wall, RSS
+  wdb tables  DB                                  tables, columns, segments, row counts
+  wdb stats   DB                                  the shelf and the sidecar registry
+  wdb audit   DB                                  storage modes vs cardinality: misfits named
+  wdb compact DB TABLE                            apply tombstones/overrides; rewrite segments clean
+  wdb flush   DB TABLE                            promote the hot tier to a new segment
+  wdb vacuum  DB [--dry]                          remove stale/orphaned sidecars
+
+Exit codes: 0 ok · 1 SQL/engine error (declined by name, or failed) · 2 usage · 3 I/O.
+"""
+import sys, os, time, json, csv, argparse
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), 'src'))
+
+
+def _open(dbdir):
+    from wdb_db import Database
+    if not os.path.exists(os.path.join(dbdir, 'catalog.json')):
+        sys.stderr.write('wdb: %s is not a WaveDB database (no catalog.json). Try: wdb init %s\n' % (dbdir, dbdir)); sys.exit(3)
+    return Database.open(dbdir)
+
+
+def _fmt_cell(v):
+    if v is None: return 'NULL'
+    if isinstance(v, float): return ('%.6f' % v).rstrip('0').rstrip('.') if abs(v) < 1e15 else repr(v)
+    if isinstance(v, (bytes, bytearray)): return v.decode('utf-8', 'replace')
+    return str(v)
+
+
+def _emit(rows, names, fmt, out=sys.stdout, limit=None):
+    if limit is not None: rows = rows[:limit]
+    if fmt == 'json':
+        def js(v):
+            if isinstance(v, (bytes, bytearray)): return v.decode('utf-8', 'replace')
+            if hasattr(v, 'isoformat'): return v.isoformat()
+            return v
+        out.write(json.dumps([dict(zip(names, (js(v) for v in r))) for r in rows], ensure_ascii=False) + '\n'); return
+    if fmt in ('csv', 'tsv'):
+        w = csv.writer(out, delimiter=(',' if fmt == 'csv' else '\t'), lineterminator='\n')
+        w.writerow(names)
+        for r in rows: w.writerow([_fmt_cell(v) for v in r])
+        return
+    cells = [[_fmt_cell(v) for v in r] for r in rows]
+    widths = [min(60, max([len(n)] + [len(c[i]) for c in cells])) for i, n in enumerate(names)] if names else []
+    def line(vals): return '| ' + ' | '.join(v[:60].ljust(w) for v, w in zip(vals, widths)) + ' |'
+    out.write(line(names) + '\n'); out.write('|' + '|'.join('-' * (w + 2) for w in widths) + '|\n')
+    for c in cells: out.write(line(c) + '\n')
+    out.write('(%d row%s)\n' % (len(rows), '' if len(rows) == 1 else 's'))
+
+
+def _run_one(db, sql, fmt, limit, timed):
+    s = sql.strip().rstrip(';').strip()
+    if not s: return 0
+    head = s.split(None, 1)[0].upper()
+    t0 = time.perf_counter()
+    try:
+        if head in ('INSERT', 'DELETE', 'UPDATE'):
+            import wdb_dml
+            fn = {'INSERT': wdb_dml.insert, 'DELETE': wdb_dml.delete, 'UPDATE': wdb_dml.update}[head]
+            n = fn(db.cat, s)
+            sys.stdout.write('%s %s row%s%s\n' % (head, n, '' if n == 1 else 's', ('  (%.3fs)' % (time.perf_counter() - t0)) if timed else '')); return 0
+        r = db.run(s)
+        rows, names = (r if isinstance(r, tuple) else (r, ['col%d' % i for i in range(len(r[0]) if r else 0)]))
+        _emit(list(rows), list(names), fmt, limit=limit)
+        if timed: sys.stdout.write('(%.3fs)\n' % (time.perf_counter() - t0))
+        return 0
+    except NotImplementedError as e:
+        sys.stderr.write('wdb: not supported: %s\n' % str(e).splitlines()[0][:300]); return 1
+    except (KeyError, ValueError) as e:
+        sys.stderr.write('wdb: error: %s\n' % str(e)[:300]); return 1
+    except Exception as e:
+        sys.stderr.write('wdb: %s: %s\n' % (type(e).__name__, str(e)[:300])); return 1
+
+
+def cmd_init(a):
+    from wdb_catalog import Catalog
+    if os.path.exists(os.path.join(a.db, 'catalog.json')):
+        sys.stderr.write('wdb: %s already exists\n' % a.db); return 2
+    os.makedirs(a.db, exist_ok=True); Catalog.create(a.db); print('created %s' % a.db); return 0
+
+
+def cmd_load(a):
+    import wdb_encode
+    from wdb_catalog import Catalog
+    from wdb_engine import Segment
+    if not os.path.exists(a.file): sys.stderr.write('wdb: no such file %s\n' % a.file); return 3
+    if not os.path.exists(os.path.join(a.db, 'catalog.json')):
+        os.makedirs(a.db, exist_ok=True); Catalog.create(a.db)
+    cat = Catalog.open(a.db)
+    casts = dict(c.split('=', 1) for c in (a.cast or []))
+    cluster = [c for c in (a.cluster_by or '').split(',') if c] or None
+    existing = cat.data['tables'].get(a.table)
+    seg_name = '%s_%d.wdb' % (a.table, len(existing['segments']) if existing else 0)
+    out = os.path.join(a.db, seg_name)
+    t0 = time.perf_counter()
+    r = wdb_encode.encode(a.file, out, stream=True, workers=a.workers, casts=casts or None, cluster_by=cluster)
+    dt = time.perf_counter() - t0
+    seg = Segment(out)
+    def tname(c):
+        m = seg.cols[c]
+        return {0: 'int', 1: 'str', 2: 'float', 3: ('date' if seg.unit(c) == 'D' else 'timestamp')}.get(m.get('dt'), 'str')
+    if existing is None:
+        cat.data['tables'][a.table] = {'schema': [[c, tname(c)] for c in seg.order], 'segments': [seg_name], 'mode': 'segment'}
+    else:
+        existing['segments'].append(seg_name)
+    cat.save()
+    print('loaded %s: %s rows, %d columns -> %s (%.2f GB) in %.1fs' % (a.table, format(r['n_rows'], ','), r['n_cols'], seg_name, os.path.getsize(out) / 1e9, dt))
+    return 0
+
+
+def cmd_sql(a):
+    return _run_one(_open(a.db), a.sql, a.format, a.limit, a.time)
+
+
+def cmd_file(a):
+    db = _open(a.db); code = 0
+    for stmt in [s for s in open(a.file).read().split(';') if s.strip() and not s.strip().startswith('--')]:
+        code = max(code, _run_one(db, stmt, a.format, a.limit, a.time))
+    return code
+
+
+def cmd_shell(a):
+    db = _open(a.db)
+    try: import readline  # noqa
+    except Exception: pass
+    print('WaveDB shell -- %s. End statements with ; -- .quit to leave, .tables, .format table|csv|json' % a.db)
+    fmt = 'table'; buf = ''
+    while True:
+        try: line = input('wdb> ' if not buf else '  -> ')
+        except (EOFError, KeyboardInterrupt): print(); return 0
+        st = line.strip()
+        if not buf and st in ('.quit', '.exit', 'quit', 'exit'): return 0
+        if not buf and st == '.tables': cmd_tables(a); continue
+        if not buf and st.startswith('.format'): fmt = st.split()[1]; continue
+        buf += line + '\n'
+        if ';' in line:
+            parts = buf.split(';')
+            for stmt in parts[:-1]: _run_one(db, stmt, fmt, None, True)
+            buf = parts[-1]
+
+
+def cmd_explain(a):
+    db = _open(a.db)
+    try: print(db.explain(a.sql, run=not a.no_run)); return 0
+    except NotImplementedError as e:
+        sys.stderr.write('wdb: not supported: %s\n' % str(e).splitlines()[0][:300]); return 1
+
+
+def cmd_tables(a):
+    db = _open(a.db)
+    from wdb_engine import Segment
+    rows = []
+    for t in db.cat.list_tables():
+        info = db.cat.get_table(t); n = 0
+        for p in db.cat.segment_paths(t):
+            try: n += int(Segment(p).N)
+            except Exception: pass
+        rows.append((t, len(info['schema']), len(info['segments']), n))
+    _emit(rows, ['table', 'columns', 'segments', 'rows'], 'table'); return 0
+
+
+def cmd_stats(a):   _open(a.db).stats(); return 0
+def cmd_audit(a):   import wdb_sidecar; wdb_sidecar.audit(a.db); return 0
+def cmd_vacuum(a):  import wdb_sidecar; wdb_sidecar.vacuum(a.db, dry=a.dry); return 0
+def cmd_compact(a):
+    r = _open(a.db).compact(a.table); print('compacted %s: merged %s -> %s (%s rows)' % (a.table, r.get('merged'), r.get('new_segment'), r.get('rows'))); return 0
+def cmd_flush(a):
+    db = _open(a.db); import wdb_dml
+    print('flushed %s: %s hot rows -> a new segment' % (a.table, wdb_dml.flush(db.cat, a.table))); return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog='wdb', description='WaveDB command line', formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    sub = p.add_subparsers(dest='cmd')
+    s = sub.add_parser('init'); s.add_argument('db')
+    s = sub.add_parser('load'); s.add_argument('db'); s.add_argument('table'); s.add_argument('file'); s.add_argument('--cluster-by'); s.add_argument('--cast', action='append'); s.add_argument('--workers', type=int)
+    for name in ('sql', 'explain', 'file'):
+        s = sub.add_parser(name); s.add_argument('db'); s.add_argument('file' if name == 'file' else 'sql')
+        s.add_argument('--format', default='table', choices=['table', 'csv', 'tsv', 'json']); s.add_argument('--limit', type=int); s.add_argument('--time', action='store_true')
+        if name == 'explain': s.add_argument('--no-run', action='store_true')
+    s = sub.add_parser('shell'); s.add_argument('db')
+    for name in ('tables', 'stats', 'audit'):
+        s = sub.add_parser(name); s.add_argument('db')
+    s = sub.add_parser('vacuum'); s.add_argument('db'); s.add_argument('--dry', action='store_true')
+    for name in ('compact', 'flush'):
+        s = sub.add_parser(name); s.add_argument('db'); s.add_argument('table')
+    a = p.parse_args(argv)
+    if not a.cmd: p.print_help(); return 2
+    return globals()['cmd_' + a.cmd](a)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
