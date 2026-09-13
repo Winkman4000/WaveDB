@@ -8,7 +8,7 @@
 Every answer must equal a VALID state: queries invariant to the delete must be exact;
 queries affected by it must equal either the before or the after truth. Nothing may
 crash, and the server must never restart.
-usage: python3 bench/concurrency_test.py [seconds] [clients]
+usage: python3 bench/concurrency_test.py [seconds] [clients] [segments]
 """
 import sys, os, time, json, shutil, threading, subprocess, urllib.request
 sys.path.insert(0, 'src')
@@ -39,12 +39,15 @@ def norm(rows):
 
 def main():
     T = int(sys.argv[1]) if len(sys.argv) > 1 else 60; K = int(sys.argv[2]) if len(sys.argv) > 2 else 8
+    NSEG = int(sys.argv[3]) if len(sys.argv) > 3 else 1
     shutil.rmtree(DB, ignore_errors=True); os.makedirs(DB)
-    import wdb_encode
-    wdb_encode.encode(SRC, DB + '/x_0.wdb', stream=True, workers=4)
-    from wdb_engine import Segment
-    s = Segment(DB + '/x_0.wdb')
-    json.dump({'tables': {'x': {'schema': [[c, 'str'] for c in s.order], 'segments': ['x_0.wdb'], 'mode': 'segment'}}}, open(DB + '/catalog.json', 'w'))
+    import pyarrow.parquet as pq
+    t = pq.read_table(SRC); step = (t.num_rows + NSEG - 1) // NSEG
+    for i in range(NSEG):
+        p = '/tmp/conc_slice%d.parquet' % i; pq.write_table(t.slice(i * step, step), p)
+        r = subprocess.run([PY, 'bin/wdb', 'load', DB, 'x', p, '--workers', '4'], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr[-300:]
+    print('segments: %d' % NSEG, flush=True)
     TR = truth()
     srv = subprocess.Popen([PY, 'bin/wdb', 'serve', DB, '--port', str(PORT)], stdout=open('/tmp/conc_serve.log', 'w'), stderr=subprocess.STDOUT)
     for _ in range(90):
@@ -76,8 +79,8 @@ def main():
               "for k in range(%d):\n"
               "    db = Database.open('%s')\n"
               "    n = wdb_dml.delete(db.cat, 'DELETE FROM x WHERE id4 = 7')\n"
-              "    r = db.compact('x'); print('cycle', k, 'deleted', n, 'compacted', r.get('new_segment'), r.get('rows'), flush=True)\n"
-              "    time.sleep(2)\n") % (max(1, T // 15), DB)
+              "    r = db.compact('x', tier_rows=%d); print('cycle', k, 'deleted', n, 'compacted', r.get('merged'), '->', r.get('new_segment'), r.get('rows'), flush=True)\n"
+              "    time.sleep(2)\n") % (max(1, T // 15), DB, 120_000 if NSEG > 1 else 25_000_000)
     wp = subprocess.Popen([PY, '-c', writer], stdout=open('/tmp/conc_writer.log', 'w'), stderr=subprocess.STDOUT)
     # the racers: two engines birthing the same sidecars at once
     racer = ("import sys; sys.path.insert(0, 'src')\nfrom wdb_db import Database\n"

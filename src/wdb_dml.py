@@ -211,6 +211,7 @@ def delete(catalog, sql):
 
     if mode == 'buffered':
         segs = catalog.get_table(name)['segments']
+        _batch9 = {}                                  # THE ATOMIC DELETE: every segment in ONE write
         for sf, sp in zip(segs, catalog.segment_paths(name)):
             seg = Segment(sp); register_synth(catalog, seg, name)
             if pred is None:
@@ -219,7 +220,8 @@ def delete(catalog, sql):
                 m = wdb_sql._eval_pred(seg, pred, lambda x: phys.get(x, x))
                 idx = np.nonzero(m)[0]
             if len(idx):
-                deleted += wdb_presence.mark_deleted(sp, seg.N, idx)
+                _batch9[sp] = (seg.N, idx)
+        deleted += wdb_presence.mark_deleted_many(_batch9)
         hp = hot_path(catalog, name)
         if os.path.exists(hp):
             before = len(pd.read_parquet(hp))
@@ -236,6 +238,7 @@ def delete(catalog, sql):
             # NO CANONICAL BUFFER (a realm encoded straight from parquet): tombstone the cold
             # segments' presence sidecars -- the buffered strategy. A DELETE that silently
             # removes nothing is a lie (found 2026-09-12: deleted 0 on every parquet realm).
+            _batch9b = {}
             for sf, sp in zip(catalog.get_table(name)['segments'], catalog.segment_paths(name)):
                 seg = Segment(sp); register_synth(catalog, seg, name)
                 if pred is None:
@@ -244,7 +247,8 @@ def delete(catalog, sql):
                     m = wdb_sql._eval_pred(seg, pred, lambda x: phys.get(x, x))
                     idx = np.nonzero(m)[0]
                 if len(idx):
-                    deleted += wdb_presence.mark_deleted(sp, seg.N, idx)
+                    _batch9b[sp] = (seg.N, idx)
+            deleted += wdb_presence.mark_deleted_many(_batch9b)
             hp = hot_path(catalog, name)
             if os.path.exists(hp):
                 before = len(pd.read_parquet(hp))

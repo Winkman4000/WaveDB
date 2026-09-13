@@ -63,7 +63,7 @@ DEFAULT_MAX_SEGMENTS = int(os.environ.get('WDB_MAX_SEGMENTS') or 8)
 
 def _dirty_file(catalog, sf):
     p = os.path.join(catalog.dbdir, sf)
-    return os.path.exists(wdb_presence.path_for(p)) or os.path.exists(wdb_override.path_for(p))
+    return wdb_presence.has(p) or os.path.exists(wdb_override.path_for(p))
 
 
 def plan(catalog, name, tier_rows=None, max_segments=None):
@@ -156,8 +156,7 @@ def compact(catalog, name, seg_files=None, all_segments=False, tier_rows=None, m
         fl.pop(s, None)
         p = os.path.join(catalog.dbdir, s)
         if os.path.exists(p): os.remove(p)
-        sc = wdb_presence.path_for(p)               # drop the now-stale presence sidecar
-        if os.path.exists(sc): os.remove(sc)
+        wdb_presence.forget(p)                       # drop the segment's entry from the TABLE presence file
         oc = wdb_override.path_for(p)                # drop the now-stale override sidecar
         if os.path.exists(oc): os.remove(oc)
         # EVERY derived artefact of the removed segment goes with it (roads, censuses, shelves,

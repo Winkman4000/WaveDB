@@ -106,6 +106,8 @@ def make_handler(state):
                 except (KeyError, ValueError) as e:
                     self._send(200, {'error': str(e)[:400], 'kind': 'error'})
                 except Exception as e:
+                    import traceback
+                    print('wdb serve: FAILED %s: %s\n%s' % (type(e).__name__, str(e)[:200], ''.join(traceback.format_exc().splitlines(True)[-4:])), flush=True)   # the ledger names a failure
                     self._send(500, {'error': '%s: %s' % (type(e).__name__, str(e)[:400]), 'kind': 'failed'})
 
         def _execute(self, req, sql, t0):

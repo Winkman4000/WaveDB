@@ -1,6 +1,6 @@
 """THE CRASH HARNESS: kill the engine at every named write step and prove the database
 opens and still answers exactly afterward.
-usage: python3 bench/crash_test.py            (uses /workspace/data/scope/x.parquet)
+usage: python3 bench/crash_test.py [K]        (K segments, built as K loads; /workspace/data/scope/x.parquet)
 """
 import sys, os, shutil, subprocess, json, time
 sys.path.insert(0, 'src')
@@ -35,13 +35,17 @@ def same(a, b):
     def nm(v): return ('%.6g' % v) if isinstance(v, float) else str(v)
     return [sorted(tuple(nm(v) for v in r) for r in x) for x in a] == [sorted(tuple(nm(v) for v in r) for r in x) for x in b]
 
+K = int(sys.argv[1]) if len(sys.argv) > 1 else 1        # segments: the database is built as K loads
+
+
 def fresh():
-    shutil.rmtree(DB, ignore_errors=True)
-    rc, out = run("import sys; sys.path.insert(0,'src'); import wdb_encode, json, os\n"
-                  "os.makedirs('%s'); wdb_encode.encode('%s', '%s/x_0.wdb', stream=True, workers=4)\n"
-                  "from wdb_engine import Segment; s = Segment('%s/x_0.wdb')\n"
-                  "json.dump({'tables': {'x': {'schema': [[c, 'str'] for c in s.order], 'segments': ['x_0.wdb'], 'mode': 'segment'}}}, open('%s/catalog.json', 'w'))\n" % (DB, SRC, DB, DB, DB))
-    assert rc == 0, out
+    shutil.rmtree(DB, ignore_errors=True); os.makedirs(DB)
+    import pyarrow.parquet as pq
+    t = pq.read_table(SRC); step = (t.num_rows + K - 1) // K
+    for i in range(K):
+        p = '/tmp/crash_slice%d.parquet' % i; pq.write_table(t.slice(i * step, step), p)
+        r = subprocess.run([PY, 'bin/wdb', 'load', DB, 'x', p, '--workers', '4'], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr[-300:]
     rc, out = run("import sys; sys.path.insert(0,'src'); from wdb_db import Database; import wdb_dml\n"
                   "db = Database.open('%s'); print('deleted', wdb_dml.delete(db.cat, 'DELETE FROM x WHERE id4 = 7'))" % DB)
     assert rc == 0, out
@@ -49,10 +53,11 @@ def fresh():
 def main():
     print('truth from duck...', flush=True); T = truth(DB)
     results = []
+    print('segments per database: %d (tier ceiling: %d rows -> a tiered compaction merges a subset)' % (K, 120_000 if K > 1 else 25_000_000), flush=True)
     for point in ('encode:renamed', 'compact:segment-written', 'compact:catalog-saved'):
         fresh()
         rc, out = run("import sys; sys.path.insert(0,'src'); from wdb_db import Database\n"
-                      "db = Database.open('%s'); print(db.compact('x'))" % DB, env={'WDB_CRASH_AT': point})
+                      "db = Database.open('%s'); print(db.compact('x', tier_rows=%d))" % (DB, 120_000 if K > 1 else 25_000_000), env={'WDB_CRASH_AT': point})
         died = rc == -9 or 'CRASH POINT' in out
         files = sorted(f for f in os.listdir(DB) if f.endswith('.wdb') or f.endswith('.partial'))
         try:
@@ -62,7 +67,7 @@ def main():
         # a second compaction after recovery must also work
         try:
             rc2, out2 = run("import sys; sys.path.insert(0,'src'); from wdb_db import Database\n"
-                            "db = Database.open('%s'); r = db.compact('x'); print('recompacted', r['new_segment'], r['rows'])" % DB)
+                            "db = Database.open('%s'); r = db.compact('x', tier_rows=%d); print('recompacted', r['new_segment'], r['rows'])" % (DB, 120_000 if K > 1 else 25_000_000))
             B = answers(DB); ok2 = same(B, T) and rc2 == 0
         except Exception as e:
             ok2 = False
