@@ -1195,3 +1195,29 @@ the union's resident int32 code streams, not the CPU: the single-segment
 path should keep decoded codes resident under the shelf too. LEFT: one
 hole (both tables multi-segment), the registry naming rule for union
 sidecars, then steps 2, 4, 5.
+
+
+## SEAL 2026-09-13 (late): B COMPLETE, and the like-for-like DuckDB reference
+B, all five steps, in one day: the instrument (7 silent wrongs found in
+five minutes); tiered compaction; the union (8.06x -> 1.00x); the last
+hole and the union in the registry; the harnesses on the five-segment
+realm -- which found A REAL ATOMICITY GAP (a DELETE across five segments
+was five atomic writes; readers between them saw partial deletes) and
+produced THE TABLE-LEVEL PRESENCE FILE (one file per table, one rename
+per statement). Eight silent wrongs surfaced by the multi-segment realm
+today, every one in code a fast door had hidden. THE DUCKDB REFERENCE
+(benchmark/clickbench/duck_reference.sh): DuckDB run the way ClickBench
+runs it -- native load with their conversions, 43 x 3, fresh process,
+cold cache -- on the same pod, same protocol as our kit: WaveDB wire
+cold 67.7s / hot 10.5s vs DuckDB cold 58.4s / hot 51.9s; hot WaveDB
+faster on 43/43 (median 2.38x); cold faster on 34/43 (median 1.87x);
+storage 9.9 GB vs 26.3 GB; load 866s vs 90s. The cold total is worse
+only because of three queries (Q20 16.2s, Q22 15.7s, Q27 11.6s): the
+LIKE-on-URL/Title family paying the RAM-only joined text buffer on first
+touch -- without them ~24s vs ~50s. NEXT SESSION (before the JOB board):
+(1) THE JOINED-BUFFER SIDECAR under the registry (cold 67.7s -> ~25s);
+(2) the encoder's candidate-at-a-time lever (load); (3) the wire floor
+(~0.1s per query: HTTP+JSON+dispatch -- a persistent connection or raw
+socket); (4) the rare swap race, now instrumented; (5) the single-
+segment path keeping decoded codes resident like the union does
+(Jackson's observation). Then C: the key-space fixpoint.
