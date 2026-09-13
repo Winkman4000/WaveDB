@@ -103,6 +103,8 @@ def compact(catalog, name, seg_files=None):
     os.remove(tmp_pq)
 
     # 4) update catalog: drop merged segments (list + labels + disk), add the new one
+    from wdb_encode import _crash_point
+    _crash_point('compact:segment-written')          # new segment exists; catalog still points at the old ones
     tinfo['segments'] = [s for s in tinfo['segments'] if s not in targets] + [new_seg]
     fl = tinfo.setdefault('fd_labels', {})
     for s in targets:
@@ -121,6 +123,7 @@ def compact(catalog, name, seg_files=None):
                 except OSError: pass
     fl[new_seg] = kept
     catalog.save()
+    _crash_point('compact:catalog-saved')            # catalog points at the new segment; old files still on disk
     return {'merged': targets, 'new_segment': new_seg, 'rows': len(union),
             'labels_in': len(candidate_labels), 'labels_kept': len(kept),
             'fd_encoded': len(fd_specs)}

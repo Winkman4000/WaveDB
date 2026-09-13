@@ -101,7 +101,45 @@ class Database:
     @classmethod
     def create(cls, dbdir): return cls(Catalog.create(dbdir))
     @classmethod
+    @staticmethod
+    def recover(dbdir, verbose=False):
+        """RECOVERY ON OPEN: the counterpart of the rename law. Every write path writes a
+        '.partial' and renames, so a crash leaves at most a partial file (swept here), a
+        segment the catalog never learned about (a compaction that died after writing its
+        segment: reported, never deleted -- vacuum can), or a catalog that names a segment
+        that is gone (refused loudly: that is data loss, and silence would hide it)."""
+        report = {'swept': [], 'unknown_segments': [], 'missing_segments': []}
+        try:
+            names = os.listdir(dbdir)
+        except FileNotFoundError:
+            return report
+        for n in names:
+            if n.endswith('.partial') or n.endswith('.tmp') or n.endswith('.tmp.npy') or n.endswith('.tmp.npz'):
+                try: os.remove(os.path.join(dbdir, n)); report['swept'].append(n)
+                except OSError: pass
+        try:
+            cat = Catalog.open(dbdir)
+            known = set()
+            for t in cat.list_tables():
+                for sfile, spath in zip(cat.get_table(t)['segments'], cat.segment_paths(t)):
+                    known.add(sfile)
+                    if not os.path.exists(spath):
+                        report['missing_segments'].append((t, sfile))
+            for n in names:
+                if n.endswith('.wdb') and n not in known and not os.path.islink(os.path.join(dbdir, n)):
+                    report['unknown_segments'].append(n)
+        except Exception:
+            pass
+        if verbose or report['swept'] or report['unknown_segments'] or report['missing_segments']:
+            if report['swept']: print('wdb recover: swept %d partial file(s): %s' % (len(report['swept']), ', '.join(report['swept'][:4])), flush=True)
+            if report['unknown_segments']: print('wdb recover: %d segment file(s) the catalog does not name (a crash before the catalog saved?): %s -- `wdb vacuum` removes them' % (len(report['unknown_segments']), ', '.join(report['unknown_segments'][:4])), flush=True)
+        if report['missing_segments']:
+            raise RuntimeError('wdb recover: the catalog names segment(s) that are not on disk: %s -- refusing to open silently' % report['missing_segments'][:4])
+        return report
+
+    @classmethod
     def open(cls, dbdir):
+        cls.recover(dbdir)
         db = cls(Catalog.open(dbdir))
         try:
             import wdb_shelves

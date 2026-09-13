@@ -33,7 +33,7 @@ class Catalog:
     def save(self):
         tmp = os.path.join(self.dbdir, CATALOG_NAME + '.tmp')
         with open(tmp, 'w') as f:
-            json.dump(self.data, f, indent=2)
+            json.dump(self.data, f, indent=2); f.flush(); os.fsync(f.fileno())
         os.replace(tmp, os.path.join(self.dbdir, CATALOG_NAME))  # atomic
 
     # ---- tables ----

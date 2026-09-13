@@ -170,7 +170,7 @@ def _prep_column(nm, col, allow_seq=True):
     if mode == 1 and CHUNK_DICT:
         aux |= 0x40                                     # bit6 = write the dict as chunked zstd frames
     return dict(nm=nm, dtype=dtype, has_null=has_null, V=V, valb=valb,
-                codes=codes.astype(np.uint64), aux=aux, uniq=uniq, bits=bits, mode=mode)
+                codes=codes.astype(np.uint32 if V < (1 << 32) else np.uint64), aux=aux, uniq=uniq, bits=bits, mode=mode)   # THE NARROW-CODES LAW: codes travel at the narrowest width
 
 def _header(nm, V, bits, dtype, mode, has_null, aux):
     hb = nm.encode()
@@ -888,7 +888,7 @@ def _arrow_string_prep(nm, chunked):
         null_mask = np.asarray(pc.is_null(chunked).to_numpy(zero_copy_only=False), dtype=bool); has_null = 1
     order = pc.sort_indices(dct).to_numpy()                 # dictionary in sorted order
     rank = np.empty(len(order), np.int64); rank[order] = np.arange(len(order))
-    codes = np.zeros(len(chunked), np.int64)
+    codes = np.zeros(len(chunked), np.uint32 if len(order) < (1 << 31) else np.int64)
     raw = idx.to_numpy(zero_copy_only=False)
     if null_mask is not None:
         nn = ~null_mask
@@ -918,6 +918,15 @@ _CASTS = {
     'timestamp_ms':   lambda a: np.asarray(a).astype(np.int64).astype('datetime64[ms]'),
     'timestamp_us':   lambda a: np.asarray(a).astype(np.int64).astype('datetime64[us]'),
 }
+
+
+def _crash_point(name):
+    """THE CRASH HARNESS: WDB_CRASH_AT=<name> kills the process here (SIGKILL: no cleanup,
+    no finally) so recovery can be tested at every step of every write path."""
+    if os.environ.get('WDB_CRASH_AT') == name:
+        import signal
+        print('CRASH POINT %s: dying' % name, flush=True)
+        os.kill(os.getpid(), signal.SIGKILL)
 
 
 def _column_job(input_path, nm, reader, cast=None, perm_path=None):
@@ -1044,6 +1053,7 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
         np.save(perm_path, perm); del perm
         if _os.environ.get('WDB_ENCODE_VERBOSE'):
             print('  cluster order by %s computed (%d rows)' % (', '.join(keys9), N), flush=True)
+    _final9 = out_path; out_path = out_path + '.partial'        # THE RENAME LAW: a partial file never wears the final name
     fh = open(out_path, 'wb')
     fh.write(b'WVDB4' + struct.pack('<H', len(cols)) + struct.pack('<I', N))
     pending = list(order); verbose = bool(_os.environ.get('WDB_ENCODE_VERBOSE'))
@@ -1096,7 +1106,9 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
                 res = _column_job(input_path, nm, reader, (casts or {}).get(nm), perm_path)
                 cname, blob, size = res[0], res[1], res[2]
                 fh.write(blob); fh.flush(); sizes[cname] = size; del blob
-    fh.close()
+    fh.flush(); _os.fsync(fh.fileno()); fh.close()
+    _os.replace(out_path, _final9); out_path = _final9
+    _crash_point('encode:renamed')
     if perm_path:
         try: _os.remove(perm_path)
         except OSError: pass

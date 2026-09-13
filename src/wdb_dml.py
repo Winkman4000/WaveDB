@@ -8,6 +8,7 @@ appending without re-encoding every time.
 import os, sqlglot, sqlglot.expressions as E
 import pandas as pd, numpy as np
 import wdb_encode, wdb_labels
+from wdb_encode import _crash_point
 
 _PD = {'int': 'Int64', 'float': 'float64', 'string': 'object', 'datetime': 'datetime64[ns]'}
 _DT_CODE = {'int': 0, 'string': 1, 'float': 2, 'datetime': 3}
@@ -110,7 +111,10 @@ def _append_parquet(path, df_new):
         df = pd.concat([pd.read_parquet(path), df_new], ignore_index=True)
     else:
         df = df_new
-    df.to_parquet(path, index=False)
+    tmp = path + '.partial'
+    df.to_parquet(tmp, index=False)
+    with open(tmp, 'rb') as f: os.fsync(f.fileno())
+    os.replace(tmp, path)                              # THE RENAME LAW: never a half-written buffer
     return df
 
 def _encode_segment(catalog, name, src_parquet):
