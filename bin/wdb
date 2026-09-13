@@ -14,6 +14,8 @@
   wdb compact DB TABLE                            apply tombstones/overrides; rewrite segments clean
   wdb flush   DB TABLE                            promote the hot tier to a new segment
   wdb vacuum  DB [--dry]                          remove stale/orphaned sidecars
+  wdb serve   DB [--host H] [--port P]            a long-lived server (warm shelves, warm JIT); then
+                                                  wdb sql DB "..." --server http://127.0.0.1:8765  (or WDB_SERVER=...)
 
 Exit codes: 0 ok · 1 SQL/engine error (declined by name, or failed) · 2 usage · 3 I/O.
 """
@@ -179,6 +181,37 @@ def cmd_flush(a):
     print('flushed %s: %s hot rows -> a new segment' % (a.table, wdb_dml.flush(db.cat, a.table))); return 0
 
 
+def _client(server, path, body):
+    """THE THIN CLIENT: stdlib only -- no numpy, no engine import -- so a query costs the wire, not 3.5s of startup"""
+    import urllib.request
+    req = urllib.request.Request(server.rstrip('/') + path, data=json.dumps(body).encode(), headers={'Content-Type': 'application/json'})
+    with urllib.request.urlopen(req, timeout=3600) as r:
+        return json.loads(r.read().decode())
+
+
+def _via_server(server, argv):
+    """handle sql/explain/file against a running server; returns exit code"""
+    a = argv
+    if a.cmd == 'explain':
+        r = _client(server, '/explain', {'sql': a.sql, 'run': not a.no_run}); print(r.get('plan') or r.get('error')); return 0 if 'plan' in r else 1
+    stmts = [a.sql] if a.cmd == 'sql' else [x for x in open(a.file).read().split(';') if x.strip() and not x.strip().startswith('--')]
+    code = 0
+    for st in stmts:
+        t0 = time.perf_counter()
+        r = _client(server, '/sql', {'sql': st, 'limit': a.limit})
+        if 'error' in r:
+            sys.stderr.write('wdb: %s: %s\n' % ('not supported' if r.get('kind') == 'unsupported' else 'error', r['error'])); code = 1; continue
+        if r.get('statement'):
+            sys.stdout.write('%s %s row%s\n' % (r['statement'], r['rows'][0][0], '' if r['rows'][0][0] == 1 else 's')); continue
+        _emit(r['rows'], r['names'], a.format)
+        if a.time: sys.stdout.write('(%.3fs engine, %.3fs wall)\n' % (r.get('wall', 0), time.perf_counter() - t0))
+    return code
+
+
+def cmd_serve(a):
+    import wdb_server; wdb_server.serve(a.db, host=a.host, port=a.port); return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog='wdb', description='WaveDB command line', formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     sub = p.add_subparsers(dest='cmd')
@@ -187,7 +220,9 @@ def main(argv=None):
     for name in ('sql', 'explain', 'file'):
         s = sub.add_parser(name); s.add_argument('db'); s.add_argument('file' if name == 'file' else 'sql')
         s.add_argument('--format', default='table', choices=['table', 'csv', 'tsv', 'json']); s.add_argument('--limit', type=int); s.add_argument('--time', action='store_true')
+        s.add_argument('--server', default=os.environ.get('WDB_SERVER'), help='ask a running `wdb serve` (URL) instead of opening DB in-process')
         if name == 'explain': s.add_argument('--no-run', action='store_true')
+    s = sub.add_parser('serve'); s.add_argument('db'); s.add_argument('--host', default='127.0.0.1'); s.add_argument('--port', type=int, default=8765)
     s = sub.add_parser('shell'); s.add_argument('db')
     for name in ('tables', 'stats', 'audit'):
         s = sub.add_parser(name); s.add_argument('db')
@@ -196,6 +231,8 @@ def main(argv=None):
         s = sub.add_parser(name); s.add_argument('db'); s.add_argument('table')
     a = p.parse_args(argv)
     if not a.cmd: p.print_help(); return 2
+    if a.cmd in ('sql', 'explain', 'file') and getattr(a, 'server', None):
+        return _via_server(a.server, a)                 # before any heavy import
     return globals()['cmd_' + a.cmd](a)
 
 
