@@ -1124,3 +1124,27 @@ total 10.4s, median 0.159s, slowest 0.89s; cold run 85.3s (births) --
 the load step should absorb the births before submission. LESSON: the
 kill pattern in the same command line as the launch matched itself,
 twice; kill and launch in separate calls, permanently.
+
+
+## A, COMPLETE (2026-09-13): make it a database
+THE WIRE (bin/wdb; wdb serve + a stdlib client: 3.5s -> 0.078s per
+query); THE WATCHDOG AND THE LEDGER; CRASH SAFETY (the rename law
+everywhere, fsync, recovery on open, the crash harness: 3/3 survive
+exact); CONCURRENCY PROVEN (the catalog is the truth -- a long-lived
+engine re-reads it when its stamp moves; the swap window retries once;
+a child never outlives its watchdog; 50,813 answers / 0 wrong / 0
+errors / 0 restarts under DELETE->compact and racing births); ERROR
+SURFACES (syntax / error / unsupported / timeout / failed with exit
+codes); TIMEOUTS AND CANCEL (reply first, then a clean death; a lost
+reply is never re-run); THE WARM STEP (births are part of load). THE
+FIRST results.json -- the full ClickBench protocol end to end: load
+866s (758 encode + 101 warm), storage 9.93 GB, 43/43, hot total 10.5s,
+median 0.153s, cold run 1 67.7s. The four cold spikes (Q20, Q22, Q27,
+Q28 at 11-16s -> 0.2-0.5s hot) are the LIKE-on-URL/Title queries paying
+the joined text buffer, a RAM-only shelf a separate warm process cannot
+hand to the server: PERSIST IT AS A SIDECAR under the registry and run
+1 becomes cold I/O. Also convicted on the way: THE WIDTH LAW AT THE
+SOURCE (a string dictionary is an object array) -- found with
+faulthandler on a signal after three theories failed. NEXT: the joined-
+buffer sidecar; the 12s AVG(length(URL)) general-scan face; then B --
+multi-segment as the normal state.
