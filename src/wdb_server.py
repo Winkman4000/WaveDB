@@ -33,6 +33,7 @@ class _State:
         wdb_kernels.warm()
         self.db = Database.open(dbdir); self.dbdir = dbdir
         self.lock = threading.Lock(); self.queries = 0; self.started = time.time()
+        self.timeout = float(os.environ.get('WDB_QUERY_TIMEOUT') or 0) or None; self.cancel = threading.Event()
 
 
 def make_handler(state):
@@ -63,14 +64,54 @@ def make_handler(state):
                 req = self._body()
             except Exception as e:
                 return self._send(400, {'error': 'bad json: %s' % e, 'kind': 'error'})
+            if self.path == '/cancel':
+                return self.do_POST_cancel()
+            state.cancel.clear()
             sql = (req.get('sql') or '').strip().rstrip(';')
             if not sql:
                 return self._send(400, {'error': 'empty sql', 'kind': 'error'})
+            timeout = float(req.get('timeout') or state.timeout or 0) or None
             with state.lock:
                 t0 = time.perf_counter()
                 if os.environ.get('WDB_SERVE_LEDGER'):
                     print('  -> rss %.2f GB  %s' % (_rss_gb(), sql[:100].replace(chr(10), ' ')), flush=True)   # BEFORE the run: a killer names itself
+                if timeout:
+                    # THE TIMEOUT: the query runs in a worker thread; past the deadline the client is
+                    # answered with a named error FIRST, then this engine child exits and the watchdog
+                    # brings up a fresh one -- numba/numpy loops have no cancellation point, so the
+                    # only honest interruption is a clean death. /cancel uses the same door.
+                    box = {}
+                    def work():
+                        try: box['r'] = self._execute(req, sql, t0)
+                        except BaseException as e: box['e'] = e
+                    th = threading.Thread(target=work, daemon=True); th.start()
+                    th.join(timeout)
+                    if th.is_alive() or state.cancel.is_set():
+                        why = 'cancelled' if state.cancel.is_set() else 'timeout after %.1fs' % timeout
+                        self._send(200, {'error': why, 'kind': 'timeout'})
+                        try:
+                            self.wfile.flush(); self.connection.shutdown(1); self.connection.close()   # the reply must land before the death
+                        except Exception:
+                            pass
+                        print('wdb serve: %s -- this engine exits so the watchdog restarts it clean: %s' % (why, sql[:80]), flush=True)
+                        time.sleep(0.5); os._exit(75)
+                    if 'e' in box: raise box['e']
+                    return box['r']
                 try:
+                    return self._execute(req, sql, t0)
+                except NotImplementedError as e:
+                    self._send(200, {'error': str(e).splitlines()[0][:400], 'kind': 'unsupported'})
+                except _ParseErrors() as e:
+                    self._send(200, {'error': 'syntax: %s' % str(e).splitlines()[0][:400], 'kind': 'syntax'})
+                except (KeyError, ValueError) as e:
+                    self._send(200, {'error': str(e)[:400], 'kind': 'error'})
+                except Exception as e:
+                    self._send(500, {'error': '%s: %s' % (type(e).__name__, str(e)[:400]), 'kind': 'failed'})
+
+        def _execute(self, req, sql, t0):
+            """run one statement and send its reply; exceptions propagate to the caller's naming"""
+            if True:
+                if True:
                     if self.path == '/explain':
                         return self._send(200, {'plan': state.db.explain(sql, run=bool(req.get('run', True)))})
                     head = sql.split(None, 1)[0].upper()
@@ -91,13 +132,18 @@ def make_handler(state):
                     else:
                         out['rows'] = [[_js(v) for v in r] for r in rows]
                     self._send(200, out)
-                except NotImplementedError as e:
-                    self._send(200, {'error': str(e).splitlines()[0][:400], 'kind': 'unsupported'})
-                except (KeyError, ValueError) as e:
-                    self._send(200, {'error': str(e)[:400], 'kind': 'error'})
-                except Exception as e:
-                    self._send(500, {'error': '%s: %s' % (type(e).__name__, str(e)[:400]), 'kind': 'failed'})
+
+        def do_POST_cancel(self):
+            state.cancel.set(); self._send(200, {'ok': True, 'note': 'the running query will be answered with kind=cancelled and the engine restarted clean'})
     return H
+
+
+def _ParseErrors():
+    try:
+        import sqlglot.errors
+        return (sqlglot.errors.ParseError, sqlglot.errors.TokenError)
+    except Exception:
+        return (SyntaxError,)
 
 
 def _rss_gb():
@@ -121,7 +167,7 @@ def supervise(dbdir, host='127.0.0.1', port=8765):
         rc = p.wait()
         if rc in (0, -2, -15):
             return
-        print('wdb serve: engine child exited rc=%s after %.0fs (%s) -- restarting (%d)' % (rc, time.time() - t0, 'OOM-killed' if rc == -9 else 'crashed', n), flush=True)
+        print('wdb serve: engine child exited rc=%s after %.0fs (%s) -- restarting (%d)' % (rc, time.time() - t0, 'OOM-killed' if rc == -9 else ('timeout/cancel' if rc == 75 else 'crashed'), n), flush=True)
         time.sleep(1)
 
 

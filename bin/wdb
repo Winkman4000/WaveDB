@@ -81,6 +81,8 @@ def _run_one(db, sql, fmt, limit, timed):
     except (KeyError, ValueError) as e:
         sys.stderr.write('wdb: error: %s\n' % str(e)[:300]); return 1
     except Exception as e:
+        if type(e).__name__ in ('ParseError', 'TokenError'):
+            sys.stderr.write('wdb: syntax error: %s\n' % str(e).splitlines()[0][:300]); return 1
         sys.stderr.write('wdb: %s: %s\n' % (type(e).__name__, str(e)[:300])); return 1
 
 
@@ -191,6 +193,10 @@ def _client(server, path, body):
             with urllib.request.urlopen(req, timeout=3600) as r:
                 return json.loads(r.read().decode())
         except urllib.error.URLError as e:
+            # retry ONLY when nobody answered (connection refused: the watchdog is restarting);
+            # a reply lost mid-flight means the query RAN -- never run it twice
+            if 'refused' not in str(e).lower():
+                return {'error': 'the server closed the connection during the query (%s)' % str(e)[:80], 'kind': 'failed'}
             last = e; time.sleep(1 + attempt)
         except ConnectionError as e:
             last = e; time.sleep(1 + attempt)
@@ -206,9 +212,10 @@ def _via_server(server, argv):
     code = 0
     for st in stmts:
         t0 = time.perf_counter()
-        r = _client(server, '/sql', {'sql': st, 'limit': a.limit})
+        r = _client(server, '/sql', {'sql': st, 'limit': a.limit, 'timeout': a.timeout})
         if 'error' in r:
-            sys.stderr.write('wdb: %s: %s\n' % ('not supported' if r.get('kind') == 'unsupported' else 'error', r['error'])); code = 1; continue
+            label = {'unsupported': 'not supported', 'syntax': 'syntax error', 'timeout': 'timeout', 'failed': 'failed'}.get(r.get('kind'), 'error')
+            sys.stderr.write('wdb: %s: %s\n' % (label, r['error'])); code = 1; continue
         if r.get('statement'):
             sys.stdout.write('%s %s row%s\n' % (r['statement'], r['rows'][0][0], '' if r['rows'][0][0] == 1 else 's')); continue
         _emit(r['rows'], r['names'], a.format)
@@ -217,6 +224,7 @@ def _via_server(server, argv):
 
 
 def cmd_serve(a):
+    if a.timeout: os.environ['WDB_QUERY_TIMEOUT'] = str(a.timeout)
     import wdb_server; wdb_server.supervise(a.db, host=a.host, port=a.port); return 0
 
 
@@ -229,8 +237,9 @@ def main(argv=None):
         s = sub.add_parser(name); s.add_argument('db'); s.add_argument('file' if name == 'file' else 'sql')
         s.add_argument('--format', default='table', choices=['table', 'csv', 'tsv', 'json']); s.add_argument('--limit', type=int); s.add_argument('--time', action='store_true')
         s.add_argument('--server', default=os.environ.get('WDB_SERVER'), help='ask a running `wdb serve` (URL) instead of opening DB in-process')
+        s.add_argument('--timeout', type=float, help='seconds; past it the server answers a named timeout and restarts its engine clean')
         if name == 'explain': s.add_argument('--no-run', action='store_true')
-    s = sub.add_parser('serve'); s.add_argument('db'); s.add_argument('--host', default='127.0.0.1'); s.add_argument('--port', type=int, default=8765)
+    s = sub.add_parser('serve'); s.add_argument('db'); s.add_argument('--host', default='127.0.0.1'); s.add_argument('--port', type=int, default=8765); s.add_argument('--timeout', type=float, help='default per-query timeout in seconds')
     s = sub.add_parser('shell'); s.add_argument('db')
     for name in ('tables', 'stats', 'audit'):
         s = sub.add_parser(name); s.add_argument('db')
