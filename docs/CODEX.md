@@ -1165,3 +1165,33 @@ boards now: TPC-H 14/14 (12 wins) . Megaboard 103/103 (86 wins, 3.44x)
 . ClickBench 43/43 (42 wins, 9.45x) . H2O groupby 10/10 (7) . H2O joins
 8/8 (8) . Scope 100/100 (71, 2.47x) . JOB 113/113 (2 -- the one we lose)
 . Dates 35/35.
+
+
+## B, STEP 3 (2026-09-13): THE MERGED-DICTIONARY VIEW -- from 8.06x to 1.00x in one session
+STEP 1, the instrument (bench/board_segments.py: the same rows as one
+segment and as five, 100 constructs, exact vs duck, timed on both)
+found SEVEN SILENT WRONGS on the shipped multi-segment path in five
+minutes (has_agg knew five aggregate types; SUM(DISTINCT) as a plain
+partial; lost integer emission) -- a second fixture finds what the first
+cannot, third time this month. STEP 3, the union (src/wdb_union.py): K
+sorted dictionaries merge once per column; a remap table per segment;
+codes() as the concatenation of the remapped streams, int32, resident
+across queries; everything else derives; what a union cannot serve
+declines BY NAME. The truth test first (13/13 columns exact). Routing
+in three moves, each visible on the board: the general scan (83 ok);
+the controller with the precedence law (windows via the new door, set
+ops 204x -> 0.91x); _solo_segment RETURNS THE UNION -- the nineteenth
+gate opened for the join engine and every scope-stage door at once.
+Then the last 1.57x: point reads instead of full-column materialisation
+per group (9.5s -> 0.8s), and the union serving values_at and
+resident_values. RESULT: 99 ok / 1 hole / 0 wrong, 16.5s -> 16.4s,
+1.00x. Two laws from the suite: A VIRTUAL TABLE NEEDS A BIRTHMARK (a
+sidecar born under one union must never be read by another: hash of
+paths, mtimes, sizes in the name), and A NAMED DECLINE CAUGHT BY
+ BECOMES A WRONG ANSWER (_code_of_literal turned the
+union's decline into 'literal absent -> 0 rows'); grep for that pattern.
+Jackson's observation that segmented ran FASTER in four families was
+the union's resident int32 code streams, not the CPU: the single-segment
+path should keep decoded codes resident under the shelf too. LEFT: one
+hole (both tables multi-segment), the registry naming rule for union
+sidecars, then steps 2, 4, 5.
