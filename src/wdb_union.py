@@ -120,21 +120,47 @@ class SegmentUnion:
         return self.codes(col)[np.asarray(rows)]
 
     def values(self, col):
+        cached = self._vals_cache.get(col) if hasattr(self, '_vals_cache') else None
+        if cached is not None: return cached
         td = self._typed_dict(col); c = self.cols[col]
         codes = self.codes(col)
         if c['has_null']:
             # the segment's convention: a nullable column reads as an object array with None
             tdn = np.append(np.asarray(td, dtype=object), None)
-            return tdn[codes]
-        return np.asarray(td)[codes]
+            out = tdn[codes]
+        else:
+            out = np.asarray(td)[codes]
+        if not hasattr(self, '_vals_cache'): self._vals_cache = {}
+        self._vals_cache[col] = out                  # query-lifetime (dropped in drop_derived)
+        return out
 
     def values_at_rows(self, col, rows):
-        return self.values(col)[np.asarray(rows)]
+        # POINT READS through the codes -- never the full column (a per-group row aggregate
+        # materialised 10M values 100 times: 7.5s of a 9.5s query)
+        td = self._typed_dict(col); c = self.cols[col]
+        codes = self.codes(col)[np.asarray(rows)]
+        if c['has_null']:
+            return np.append(np.asarray(td, dtype=object), None)[codes]
+        return np.asarray(td)[codes]
 
     def fetch(self, col, code):
         td = self._typed_dict(col); c = self.cols[col]
         if c['has_null'] and int(code) == c['V'] - 1: return None
         return td[int(code)]
+
+    def values_at(self, col, codes):
+        """emission-ready Python values for an array of merged codes (the segment's batch fetch)"""
+        import wdb_sql
+        codes = np.asarray(codes, dtype=np.int64)
+        if codes.size == 0: return []
+        td = self._typed_dict(col); c = self.cols[col]
+        u, inv = np.unique(codes, return_inverse=True)
+        vals = [None if (c['has_null'] and int(x) == c['V'] - 1) else wdb_sql._pyval(td[int(x)]) for x in u]
+        return [vals[i] for i in inv]
+
+    def resident_values(self, col):
+        """the full per-row array (query-lifetime; the segment keeps it resident under a budget)"""
+        return self.values(col)
 
     def dict_vals(self, col):
         """the dictionary values in code order (strings as an object array of bytes)"""
@@ -169,6 +195,7 @@ class SegmentUnion:
     def add_const_column(self, *a, **k): raise NotImplementedError('union: read-only')
 
     def drop_derived(self):
+        if hasattr(self, '_vals_cache'): self._vals_cache.clear()      # N-scale values: per query only
         # the remapped code streams derive from IMMUTABLE segments: they persist across queries
         # (set ops rebuilt them per leaf: 176x); only a catalog refresh discards the union itself.
         # The per-query caches of the underlying segments are dropped as usual.
