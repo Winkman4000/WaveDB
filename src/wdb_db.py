@@ -924,8 +924,11 @@ class Database:
     def flush(self, name):
         return wdb_dml.flush(self.cat, name)
 
-    def compact(self, name, seg_files=None):
-        """Merge cold segments into one, verifying FD labels on the union."""
-        return wdb_compact.compact(self.cat, name, seg_files)
+    def compact(self, name, seg_files=None, all_segments=False, tier_rows=None, max_segments=None):
+        """Compact by THE TIERED POLICY (default), or everything into one (all_segments=True),
+        or the named segments. Verifies FD labels on the merged rows."""
+        r = wdb_compact.compact(self.cat, name, seg_files, all_segments=all_segments, tier_rows=tier_rows, max_segments=max_segments)
+        self.refresh()
+        return r
 
     def tables(self): return self.cat.list_tables()

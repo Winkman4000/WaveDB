@@ -11,7 +11,8 @@
   wdb tables  DB                                  tables, columns, segments, row counts
   wdb stats   DB                                  the shelf and the sidecar registry
   wdb audit   DB                                  storage modes vs cardinality: misfits named
-  wdb compact DB TABLE                            apply tombstones/overrides; rewrite segments clean
+  wdb compact DB TABLE [--all|--plan] [--tier-rows N] [--max-segments K]
+                                                  the tiered policy: dirty segments rewritten, small ones merged up to a tier; --all = one segment
   wdb flush   DB TABLE                            promote the hot tier to a new segment
   wdb vacuum  DB [--dry]                          remove stale/orphaned sidecars
   wdb serve   DB [--host H] [--port P]            a long-lived server (warm shelves, warm JIT); then
@@ -187,7 +188,14 @@ def cmd_stats(a):   _open(a.db).stats(); return 0
 def cmd_audit(a):   import wdb_sidecar; wdb_sidecar.audit(a.db); return 0
 def cmd_vacuum(a):  import wdb_sidecar; wdb_sidecar.vacuum(a.db, dry=a.dry); return 0
 def cmd_compact(a):
-    r = _open(a.db).compact(a.table); print('compacted %s: merged %s -> %s (%s rows)' % (a.table, r.get('merged'), r.get('new_segment'), r.get('rows'))); return 0
+    db = _open(a.db)
+    if a.plan:
+        import wdb_compact
+        pick = wdb_compact.plan(db.cat, a.table, a.tier_rows, a.max_segments)
+        print('would merge: %s' % (pick or 'nothing (the table is tiered)')); return 0
+    r = db.compact(a.table, all_segments=a.all, tier_rows=a.tier_rows, max_segments=a.max_segments)
+    if not r.get('merged'): print('nothing to compact: %s is tiered and clean' % a.table); return 0
+    print('compacted %s: merged %s -> %s (%s rows)' % (a.table, r.get('merged'), r.get('new_segment'), r.get('rows'))); return 0
 def cmd_flush(a):
     db = _open(a.db); import wdb_dml
     print('flushed %s: %s hot rows -> a new segment' % (a.table, wdb_dml.flush(db.cat, a.table))); return 0
@@ -256,6 +264,11 @@ def main(argv=None):
     s = sub.add_parser('vacuum'); s.add_argument('db'); s.add_argument('--dry', action='store_true')
     for name in ('compact', 'flush'):
         s = sub.add_parser(name); s.add_argument('db'); s.add_argument('table')
+        if name == 'compact':
+            s.add_argument('--all', action='store_true', help='everything into one segment (the tiered policy is the default)')
+            s.add_argument('--plan', action='store_true', help='show what the tiered policy would merge, without merging')
+            s.add_argument('--tier-rows', type=int, help='a merged segment stops growing here (default WDB_SEGMENT_ROWS or 25M)')
+            s.add_argument('--max-segments', type=int, help='over this many, the two smallest merge regardless (default 8)')
     a = p.parse_args(argv)
     if not a.cmd: p.print_help(); return 2
     if a.cmd in ('sql', 'explain', 'file') and getattr(a, 'server', None):

@@ -57,17 +57,62 @@ def _segment_to_df(seg, schema, phys=None, defaults=None):
             data[pcol] = pd.array(vals, dtype=_PD.get(wt, 'object'))
     return pd.DataFrame(data)
 
-def compact(catalog, name, seg_files=None):
-    """Merge the given cold segments (default: all) into one new segment, verifying labels.
+DEFAULT_TIER_ROWS = int(os.environ.get('WDB_SEGMENT_ROWS') or 25_000_000)    # a tier's ceiling: merged segments stop growing here
+DEFAULT_MAX_SEGMENTS = int(os.environ.get('WDB_MAX_SEGMENTS') or 8)
+
+
+def _dirty_file(catalog, sf):
+    p = os.path.join(catalog.dbdir, sf)
+    return os.path.exists(wdb_presence.path_for(p)) or os.path.exists(wdb_override.path_for(p))
+
+
+def plan(catalog, name, tier_rows=None, max_segments=None):
+    """THE TIERED POLICY (B, step 2): which segments to merge, size-tiered like a log-structured
+    store -- many segments is the normal state, never 'everything into one'.
+      1. a DIRTY segment (tombstones, overrides) is always rewritten -- alone, or with the small
+         segments it can absorb under the tier ceiling;
+      2. small segments merge greedily, smallest first, into one until the next would push the
+         merged size past tier_rows; big segments are left alone;
+      3. when the table still has more than max_segments, the two smallest merge regardless.
+    Returns the list of segment files to merge (possibly empty)."""
+    from wdb_engine import Segment
+    tier_rows = tier_rows or DEFAULT_TIER_ROWS; max_segments = max_segments or DEFAULT_MAX_SEGMENTS
+    tinfo = catalog.get_table(name); segs = list(tinfo['segments'])
+    if not segs: return []
+    sizes = {}
+    for sf in segs:
+        try: sizes[sf] = int(Segment(os.path.join(catalog.dbdir, sf)).N)
+        except Exception: sizes[sf] = 0
+    dirty = [sf for sf in segs if _dirty_file(catalog, sf)]
+    order = sorted(segs, key=lambda sf: sizes[sf])
+    if dirty:
+        pick = [dirty[0]]; total = sizes[dirty[0]]
+        for sf in order:                                # absorb small clean neighbours under the ceiling
+            if sf in pick: continue
+            if total + sizes[sf] <= tier_rows: pick.append(sf); total += sizes[sf]
+        return pick
+    pick = []; total = 0
+    for sf in order:
+        if total + sizes[sf] <= tier_rows: pick.append(sf); total += sizes[sf]
+        else: break
+    if len(pick) >= 2: return pick
+    if len(segs) > max_segments: return order[:2]      # over the cap: the two smallest merge regardless
+    return []
+
+
+def compact(catalog, name, seg_files=None, all_segments=False, tier_rows=None, max_segments=None):
+    """Merge segments into one new segment, verifying labels. Default: THE TIERED POLICY (plan);
+    all_segments=True merges everything into one (the old behaviour); seg_files names them.
     Returns dict(merged=[...], new_segment=..., rows=N, labels_in=k, labels_kept=k)."""
     tinfo = catalog.get_table(name)
     schema = tinfo['schema']
     all_segs = list(tinfo['segments'])
-    targets = seg_files if seg_files is not None else all_segs
+    if seg_files is not None: targets = seg_files
+    elif all_segments: targets = all_segs
+    else: targets = plan(catalog, name, tier_rows, max_segments)
     targets = [s for s in targets if s in all_segs]
     def _dirty(sf):
-        p = os.path.join(catalog.dbdir, sf)
-        return os.path.exists(wdb_presence.path_for(p)) or os.path.exists(wdb_override.path_for(p))
+        return _dirty_file(catalog, sf)
     if len(targets) < 2 and not any(_dirty(sf) for sf in targets):
         return {'merged': [], 'new_segment': None, 'rows': 0, 'labels_in': 0, 'labels_kept': 0}
     # a SINGLE segment carrying tombstones or overrides is rewritten clean: that is how the

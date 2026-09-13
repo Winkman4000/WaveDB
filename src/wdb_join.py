@@ -5100,10 +5100,14 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     # no GROUP BY: SQL demands ONE row even over zero rows,
                     # with NULL aggregates -- the ceremony earns its keep.
                     o = np.full(K, None, dtype=object)
-                    if   fn == 'SUM': o = s.astype(object); o[~nz] = None
+                    # INTEGER EMISSION for the whole-table row too: an integer-typed SUM/MIN/MAX is
+                    # an int (the union exposed floats here -- blockstats had always answered the
+                    # single segment first: 1.0, 500000.0, 29998773.0 for 1, 500000, 29998773)
+                    if   fn == 'SUM':
+                        o = (np.rint(s).astype(np.int64) if int9.get(i) else s).astype(object); o[~nz] = None
                     elif fn == 'AVG': o[nz] = s[nz] / counts[nz]
-                    elif fn == 'MIN': o[nz] = mn[nz]
-                    else:             o[nz] = mx[nz]
+                    elif fn == 'MIN': o[nz] = (np.rint(mn[nz]).astype(np.int64) if int9.get(i) else mn[nz])
+                    else:             o[nz] = (np.rint(mx[nz]).astype(np.int64) if int9.get(i) else mx[nz])
                 col_results[i] = ('arr', o, is_dt, unit)
     else:
         specs = []          # (i, fn, value_op, nullmask_op) for COUNT/SUM/AVG
