@@ -35,6 +35,12 @@ def _classify(proj):
         node = _inner(p)
         if _is_cdistinct(node):                       # COUNT(DISTINCT col): merged via value-set union, not partials
             plan.append(('cdistinct', node.this.expressions[0].name)); continue
+        # NOT MERGEABLE from partials: an aggregate over DISTINCT (SUM(DISTINCT v) summed 5x across
+        # 5 segments), a FILTER clause, or an aggregate wrapped in arithmetic -- decline by name
+        if isinstance(node, E.AggFunc) and isinstance(node.this, E.Distinct):
+            raise NotImplementedError(f"multi-segment merge: {node.sql()} is not mergeable from partials (the union view serves it)")
+        if isinstance(node, E.Filter) or (not isinstance(node, (E.Column, E.AggFunc)) and node.find(E.AggFunc) is not None):
+            raise NotImplementedError(f"multi-segment merge: {node.sql()[:60]} is not mergeable from partials (the union view serves it)")
         if isinstance(node, E.Column):
             nm = node.name
             if nm not in keys: keys.append(nm)
@@ -123,7 +129,9 @@ def merge_query(segs, hot_parquet, sql, col_map=None):
     proj = tree.expressions
     group = tree.args.get('group')
     has_group = group is not None
-    has_agg = any(isinstance(_inner(p), _AGG) for p in proj)
+    # ANY aggregate counts -- MODE, QUANTILE, BOOL_AND, STRING_AGG had fallen into the row-union
+    # path and came back once per segment (the segments board, 2026-09-13: 7 silent wrongs)
+    has_agg = any(isinstance(_inner(p), E.AggFunc) or _inner(p).find(E.AggFunc) is not None for p in proj)
 
     # ---- no aggregates, no GROUP BY: plain row union ----
     if not has_agg and not has_group:
@@ -211,7 +219,17 @@ def merge_query(segs, hot_parquet, sql, col_map=None):
             elif entry[0] == 'cdistinct':
                 row.append(len(cd.get(entry[1], {}).get(key, ())))
             elif entry[0] in ('sum', 'count_star', 'min', 'max'):
-                row.append(full[entry[1]])
+                v = full[entry[1]]
+                # INTEGER EMISSION across segments: a SUM/MIN/MAX of an integer-typed expression is an int
+                # (SUM(id4 // 7) came back 67895654.0 from the merge, an int from a single segment)
+                if isinstance(v, float) and v == v and float(v).is_integer():
+                    try:
+                        _pn = _inner(proj[len(row)])
+                        if isinstance(_pn, (E.Sum, E.Min, E.Max)) and wdb_sql._expr_is_int(_pn.this, segs[0], lambda x: (col_map or {}).get(x, x)):
+                            v = int(v)
+                    except Exception:
+                        pass
+                row.append(v)
             elif entry[0] == 'avg':
                 s = full[entry[1]]; n = full[entry[2]]
                 row.append(None if not n else s / n)
