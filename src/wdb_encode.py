@@ -902,7 +902,12 @@ def _arrow_string_prep(nm, chunked):
     bits = max(1, int(np.ceil(np.log2(max(V, 2)))))
     mode = 1 if (V - has_null) > FC_THRESHOLD else 0
     uniq = None
-    return dict(nm=nm, dtype=1, has_null=has_null, V=V, valb=valb, codes=codes, aux=0, uniq=uniq, bits=bits, mode=mode)
+    aux = 0
+    if mode == 1 and CHUNK_DICT:
+        aux |= 0x40      # THE CHUNK LAW: a big front-coded dictionary is written as independent zstd frames
+                         # (CHUNK_DICT_VALS values each) so a lookup decompresses one frame, not 6M values
+                         # (SearchPhrase <> '' on gov7: 0.34s = one 6M-value frame per probe; the reference 0.05s)
+    return dict(nm=nm, dtype=1, has_null=has_null, V=V, valb=valb, codes=codes, aux=aux, uniq=uniq, bits=bits, mode=mode)
 
 
 _CASTS = {
