@@ -2963,8 +2963,19 @@ def _fast_detect(db, lt, la, rt, ra, lk, rk):
 
 def _solo_segment(db, name):
     paths = db.cat.segment_paths(name)
-    if len(paths) != 1: raise _FastUnsupported
     if os.path.exists(wdb_dml.hot_path(db.cat, name)): raise _FastUnsupported
+    import wdb_override
+    if len(paths) > 1:
+        # THE MERGED-DICTIONARY VIEW: a multi-segment table is one table to the join engine and
+        # every scope-stage door (this was the nineteenth `_solo_segment` gate); dirty segments
+        # (tombstones, overrides) still decline -- the presence gate keeps them on the general scan
+        segs9 = [db.open_segment(p, name) for p in paths]
+        for sg9 in segs9:
+            if sg9.presence_mask() is not None or wdb_override.load(sg9.path) or any(c.get('mode') == 6 for c in sg9.cols.values()):
+                raise _FastUnsupported
+        u9 = db._union(name, segs9, paths)
+        return u9, u9.path
+    if len(paths) != 1: raise _FastUnsupported
     seg = db.open_segment(paths[0], name)
     if seg.presence_mask() is not None: raise _FastUnsupported
     import wdb_override
@@ -3355,6 +3366,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         try:
             if c['mode'] == 5: seg._raw_codes(pcol); dv = seg.cols[pcol].get('_idict')
             else: dv = seg.dict_vals(pcol)
+        except NotImplementedError:
+            raise                                       # a DECLINE BY NAME is never a missing literal (the union: 0 rows for 533)
         except Exception:
             dv = None
         if dv is None:

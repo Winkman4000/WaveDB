@@ -120,6 +120,7 @@ class Database:
             self.cat = Catalog.open(self.cat.dbdir)
             self._cat_stamp = st
             self._seg_cache.clear(); self._ptr_cache.clear(); self._gd_cache.clear()
+            if hasattr(self, '_union_cache'): self._union_cache.clear()
             try:
                 import wdb_sqlcache
                 wdb_sqlcache.clear() if hasattr(wdb_sqlcache, 'clear') else None
@@ -427,6 +428,32 @@ class Database:
                 row.append(0 if isinstance(nd, E9.Count) else None)
             return [tuple(row)], names
         return [], names
+
+    @staticmethod
+    def _segments_clean(segs):
+        """the union is for CLEAN segments: tombstones, overrides (UPDATE) or synthetic columns on
+        any segment keep the table on the merge path that knows them (the suite's UPDATE tests
+        ran past V with a union that could not see the overrides)"""
+        import wdb_override
+        for sg in segs:
+            try:
+                if sg.presence_mask() is not None: return False
+                if wdb_override.load(sg.path): return False
+                if any(c.get('mode') == 6 for c in sg.cols.values()): return False
+            except Exception:
+                return False
+        return True
+
+    def _union(self, name, segs, paths):
+        """the union view for a multi-segment table, cached per catalog stamp (refresh() clears)"""
+        import wdb_union
+        cache = getattr(self, '_union_cache', None)
+        if cache is None: cache = self._union_cache = {}
+        key = (name, tuple(paths))
+        u = cache.get(key)
+        if u is None:
+            u = cache[key] = wdb_union.SegmentUnion(segs, paths)
+        return u
 
     def _new_doors(self, tree, sql):
         """THE PRECEDENCE LAW: the controller's doors serve first; the doors born in
@@ -739,6 +766,35 @@ class Database:
                 live = wdb_gridwalk_live.try_live(segs[0], hot, tree, cmap)
                 if live is not None:
                     return live
+            if len(segs) > 1 and hot is None and self._segments_clean(segs):
+                # THE MERGED-DICTIONARY VIEW: K segments as one table through the general scan --
+                # the path that serves windows, ORDER BY, set ops and every aggregate exactly.
+                # The per-segment partial merge stays as the fallback when the union declines.
+                try:
+                    u = self._union(name, segs, paths)
+                    # through the CONTROLLER: the fast doors that need only the union's API (code
+                    # sets, dictionary counts, top-k by code...) serve; a door that touches what a
+                    # union cannot give declines by name and the chain falls to the general scan
+                    ctx = read_methods.ReadContext(self, name, u, u.path, tree, cmap, sql, esc)
+                    controller._SERVED[0] = None
+                    # THE PRECEDENCE LAW applies to the union exactly as to a single segment: the
+                    # scope-stage doors (top-k rows, windows, expression keys, aggregate arithmetic)
+                    # first unless a specialised door claims the shape, and last on a decline
+                    if self._new_door_shape(tree) and not self._specialised_claims(ctx):
+                        _r9 = self._new_doors(tree, sql)
+                        if _r9 is not None:
+                            controller._SERVED[0] = 'union:' + str(controller._SERVED[0] or 'new-door'); return _r9
+                    try:
+                        r = controller.route_single_segment(ctx)
+                    except NotImplementedError:
+                        _r9 = self._new_doors(tree, sql)
+                        if _r9 is None: raise
+                        controller._SERVED[0] = 'union:' + str(controller._SERVED[0] or 'new-door'); return _r9
+                    if controller._SERVED[0] in (None, 'general_scan'): controller._SERVED[0] = 'union_scan'
+                    else: controller._SERVED[0] = 'union:' + str(controller._SERVED[0])
+                    return r
+                except NotImplementedError:
+                    pass
             return wdb_merge.merge_query(segs, hot, sql, col_map=cmap)
         import wdb_setops
         if wdb_setops.is_setop(tree):
