@@ -1148,3 +1148,20 @@ SOURCE (a string dictionary is an object array) -- found with
 faulthandler on a signal after three theories failed. NEXT: the joined-
 buffer sidecar; the 12s AVG(length(URL)) general-scan face; then B --
 multi-segment as the normal state.
+
+
+## THE CLICKBENCH BOARD ON OUR OWN INGEST (2026-09-13): 43/43, faster on 42, median 9.45x
+The referee comparison on the governed segment (hits_gov8: time-
+clustered, chunked dictionaries, declared casts), cold pass with births:
+43/43 exact, 0 false, FASTER ON 42 OF 43, median ratio 9.45x. The one
+duck wins is Q40 (149ms vs 112ms, cold). The previous standing on the
+borrowed segment was 42/43, faster on 24, median 3.35x. What changed:
+THE CHUNK LAW (string lookups stopped decompressing 6M values), THE
+WIDTH LAW at the source (the 43rd query answers), the universal
+dictionary map, the cluster order with the clock staircases. The kit
+run through the wire: hot 10.5s / median 0.153s / cold 67.7s; the
+board says the engine underneath is 9.45x duck at the median. Board of
+boards now: TPC-H 14/14 (12 wins) . Megaboard 103/103 (86 wins, 3.44x)
+. ClickBench 43/43 (42 wins, 9.45x) . H2O groupby 10/10 (7) . H2O joins
+8/8 (8) . Scope 100/100 (71, 2.47x) . JOB 113/113 (2 -- the one we lose)
+. Dates 35/35.
