@@ -1032,7 +1032,7 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
         # peaks near 3 GB and a small dictionary near 7 GB (measured 2026-09-14)
         e = est.get(nm, 1.0)
         return 'string' if e >= 8 else ('wide' if e >= 2.0 else ('mid' if e >= 1.5 else ('narrow' if e >= 0.5 else 'tiny')))
-    measured = {'string': 250, 'wide': 100, 'mid': 70, 'narrow': 40, 'tiny': 25}     # bytes per row: conservative starts (URL/Referer/Title peak ~25 GB at 100M rows), raised as workers report
+    measured = {'string': 480, 'wide': 100, 'mid': 70, 'narrow': 40, 'tiny': 25}   # strings: the MEASURED peak (Referer 47 GB at 100M rows) -- three together killed the pool at 3/4     # bytes per row: conservative starts (URL/Referer/Title peak ~25 GB at 100M rows), raised as workers report
     def working_set(nm):
         return int(N * measured[cls(nm)]) + (400 << 20)
     def learn(nm, peak):
