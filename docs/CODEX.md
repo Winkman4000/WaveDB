@@ -1221,3 +1221,24 @@ touch -- without them ~24s vs ~50s. NEXT SESSION (before the JOB board):
 socket); (4) the rare swap race, now instrumented; (5) the single-
 segment path keeping decoded codes resident like the union does
 (Jackson's observation). Then C: the key-space fixpoint.
+
+
+## THE FRAMED TEXT AND THE PARALLEL NEEDLE (2026-09-14): the cold LIKE family
+The four cold spikes were _typed_dict decoding 6M front-coded URLs into
+Python objects (16s) and joining them into a haystack -- every process,
+never written down. THE TEXT BUFFER SIDECAR (born once under the
+registry); raw at first: 2.35s warm but ~8s from disk, I/O-bound on
+3.4 GB of uncompressed URLs. THE FRAMED TEXT: zstd frames split at
+VALUE boundaries (a needle never spans two values, so never two
+frames), exposing exactly what the scan needs -- find(needle, start)
+and slicing; URL 3.4 GB -> 519 MB, Title 1.26 GB -> 230 MB. THE
+PARALLEL NEEDLE: frames decompress in threads (zstd releases the GIL); a
+two-pass numba kernel (count, then fill into exact offsets -- the first
+version zeroed a 33 MB buffer per frame, 28 GB of memset) finds every
+occurrence across cores. URL LIKE: 16.3s -> 1.36s; Title: 11.3s ->
+0.52s. THE KIT vs DuckDB native, same pod: WaveDB cold 67.7s -> 44.2s
+(now under duck cold 58.4s; faster on 34/43, median 1.87x), hot 10.7s
+vs 51.9s (42/43, 2.51x). Left cold: Q27 (12.2s, the 6M-group
+SearchPhrase aggregate -- not LIKE) and Q28 (a draw). Loose thread: the
+warm step re-birthed fresh text sidecars once (a level-9 birth then a
+level-3 one); a warm step must never rewrite what it finds.
