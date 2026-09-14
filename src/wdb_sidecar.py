@@ -20,6 +20,7 @@ FAMILIES = [
     (r'\.cnt\.npy$',             'census',         'V',  'wdb_join (count sidecar)'),
     (r'\.txz\.bin$',             'text-buffer',    'V',  'wdb_wherescan (joined dictionary text, zstd frames)'),
     (r'\.txi\.npy$',             'text-frames',    'V',  'wdb_wherescan (frame index)'),
+    (r'\.clen\.npy$',            'length',         'V',  'wdb_wherescan (character lengths)'),
     (r'\.txo\.npy$',             'text-offsets',   'V',  'wdb_wherescan (joined dictionary offsets)'),
     (r'\.ptrep$',                'pointer-rep',    'N',  'wdb_ptrep'),
     (r'\.pt2$',                  'pair-table',     'V2', 'wdb_pairfold / diskpair'),

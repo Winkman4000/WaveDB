@@ -329,6 +329,12 @@ class FramedText:
         self.fh = open(path, 'rb'); self._last = (-1, None)
         import zstandard; self._dz = zstandard.ZstdDecompressor()
     def __len__(self): return self.total
+    def _frame_bytes(self, i):
+        """decompress frame i without touching the shared cache (thread-safe)"""
+        with open(self.path, 'rb') as fh:
+            fh.seek(int(self.file_start[i])); raw = fh.read(int(self.file_start[i + 1] - self.file_start[i]))
+        import zstandard
+        return zstandard.ZstdDecompressor().decompress(raw, max_output_size=int(self.hay_start[i + 1] - self.hay_start[i]))
     def _frame(self, i):
         if self._last[0] == i: return self._last[1]
         self.fh.seek(int(self.file_start[i])); raw = self.fh.read(int(self.file_start[i + 1] - self.file_start[i]))
@@ -378,6 +384,53 @@ def _framed_write(path, hay, offs, target=32 << 20):
         idx.append((int(offs[V]), fpos)); f.flush(); os.fsync(f.fileno())
     os.replace(path + '.partial', path)
     return np.asarray(idx, dtype=np.int64)
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _char_count_kernel(buf, starts, out, base):
+    """UTF-8 character count per value: bytes that are not continuation bytes (10xxxxxx)"""
+    V = starts.size - 1
+    for v in prange(V):
+        a = starts[v] - base; b = starts[v + 1] - base
+        n = 0
+        for i in range(a, b):
+            if (buf[i] & 0xC0) != 0x80: n += 1
+        out[v] = n
+
+
+def char_lengths(seg, col):
+    """THE LENGTH SIDECAR: length(col) over a string dictionary as a V-scale int32 array -- born
+    from the framed text with one parallel pass (UTF-8 characters, not bytes), never a Python
+    string. AVG(length(URL)) had front-decoded 6M URLs into objects: 12s cold for a number that
+    is a difference of offsets."""
+    base = getattr(seg, 'path', None)
+    if not base: return None
+    lp = base + '.' + col + '.clen.npy'
+    import wdb_sidecar
+    dbdir = os.path.dirname(base)
+    if os.path.exists(lp) and wdb_sidecar.is_fresh(dbdir, os.path.basename(lp)):
+        return np.load(lp)
+    hay, offs = _text_buffer(seg, col)            # births the framed text if needed
+    V = int(offs.size) - 1
+    out = np.zeros(V, np.int32)
+    if isinstance(hay, FramedText):
+        def one(i):
+            b = np.frombuffer(hay._frame_bytes(i), dtype=np.uint8)
+            lo = int(np.searchsorted(offs, int(hay.hay_start[i]), side='left')); hi = int(np.searchsorted(offs, int(hay.hay_start[i + 1]), side='left'))
+            part = np.zeros(hi - lo, np.int32)
+            _char_count_kernel(b, np.asarray(offs[lo:hi + 1], dtype=np.int64), part, int(hay.hay_start[i]))
+            return lo, part
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for lo, part in ex.map(one, range(hay.nf)):
+                out[lo:lo + part.size] = part
+    else:
+        _char_count_kernel(np.frombuffer(hay, dtype=np.uint8), np.asarray(offs, dtype=np.int64), out, 0)
+    try:
+        if wdb_sidecar.may_birth(dbdir, out.nbytes, 'length %s' % col):
+            np.save(lp + '.partial.npy', out); os.replace(lp + '.partial.npy', lp)
+    except Exception:
+        pass
+    return out
 
 
 def _text_buffer(seg, col):

@@ -3380,6 +3380,18 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         if full is not None:
             code = full.get(bytes(lit_bytes), -1)
             litcache[key] = code; return code
+        if c.get('dt') == 1 and c.get('mode') in (0, 1) and int(c.get('V', 0)) >= 50_000:
+            # A SORTED DICTIONARY IS A BINARY SEARCH: ~22 probes through fetch (one chunk each),
+            # never the full decode (dict_vals of 6M URLs: 12s, to answer `URL <> ''`)
+            try:
+                import wdb_wherescan
+                _cd = wdb_wherescan._code_of(seg, pcol, bytes(lit_bytes))
+                code = -1 if _cd is None else int(_cd)
+                litcache[key] = code; return code
+            except NotImplementedError:
+                raise
+            except Exception:
+                pass
         try:
             if c['mode'] == 5: seg._raw_codes(pcol); dv = seg.cols[pcol].get('_idict')
             else: dv = seg.dict_vals(pcol)
@@ -3795,8 +3807,22 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     _cres9.append(cn); continue
                 if kx9 is None:
                     V9 = int(c9['V'])
-                    td9 = np.asarray(cs9._typed_dict(cp9))
                     kx9 = np.zeros(V9 + 1, bool)   # +1: null sentinel bin, False by law
+                    if (c9.get('dt') == 1 and V9 >= 200_000 and type(cn) in (E.EQ, E.NEQ)
+                            and isinstance(cn.expression, E.Literal) and isinstance(cn.this, E.Column)):
+                        # THE BIG-DICTIONARY LITERAL: one binary search, never the whole dictionary --
+                        # the fused door spent 18s decoding 6M URLs for `URL <> ''` and then DECLINED
+                        # the query (Q27 cold), leaving the general scan to answer in 1.5s
+                        _c9l = _code_of_literal(cs9, cp9, _lit_bytes(cs9, cp9, cn.expression))
+                        if isinstance(cn, E.EQ):
+                            if _c9l is not None and _c9l >= 0: kx9[_c9l] = True
+                        else:
+                            kx9[:V9] = True
+                            if _c9l is not None and _c9l >= 0: kx9[_c9l] = False
+                            if c9.get('has_null'): kx9[V9 - 1] = False
+                        td9 = None
+                    else:
+                        td9 = np.asarray(cs9._typed_dict(cp9))
                 if td9 is None:
                     pass
                 elif td9.dtype.kind in 'iuf' and len(td9):

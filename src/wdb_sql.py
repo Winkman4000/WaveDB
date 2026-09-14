@@ -633,6 +633,14 @@ def _eval_rows(seg, node, mask, resolve=None, env=None):
             V = int(seg.cols[pc]['V'])
             codes = np.asarray(seg.codes(pc))
             if mask is not None: codes = codes[mask]
+            if (isinstance(n, E.Length) and isinstance(n.this, E.Column) and seg.cols[pc].get('dt') == 1
+                    and seg.cols[pc].get('mode') == 1 and V >= 100_000 and not seg.cols[pc].get('has_null')):
+                try:                                     # THE LENGTH SIDECAR: no strings at all
+                    import wdb_wherescan
+                    cl = wdb_wherescan.char_lengths(seg, pc)
+                    if cl is not None and cl.size == V: return cl.astype(np.int64)[codes]
+                except Exception:
+                    pass
             # ONCE PER QUERY: the mapped values over V are cached for the query's lifetime -- a
             # per-group row aggregate (AVG(length(URL)) GROUP BY CounterID) re-mapped the 6M-value
             # dictionary 6,506 times, decoding it into Python strings each time (16 GB/s, OOM)
