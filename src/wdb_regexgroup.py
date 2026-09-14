@@ -9,6 +9,7 @@ per DISTINCT value against the dictionary, then aggregates by weight. MIN(col) i
 are value-sorted, so the first code carrying each label is its minimum. The regex applies to V
 distinct values instead of N rows -- a ~10x reduction on ClickBench's Referer.
 """
+import os
 import numpy as np
 import re
 import zstandard as zstd
@@ -157,9 +158,16 @@ def detect(seg, tree, col_map):
 
 
 def _code_counts(seg, col):
-    """Row count per dict code: one parallel pass over the blocked frames."""
+    """Row count per dict code: THE CENSUS (Segment.code_counts -- the .cnt.npy sidecar, born once)
+    when the segment has it; otherwise one parallel pass over the blocked frames (5.6s on Referer
+    every process: the registry already knew the answer)."""
     c = seg.cols[col]
     V = int(c['V'])
+    try:
+        cc9 = seg.code_counts(col)
+        if cc9 is not None and len(cc9) >= V: return np.asarray(cc9)[:V]
+    except Exception:
+        pass
     if c.get('code_enc') != 3 or col in seg._codes:
         cc = np.asarray(seg._raw_codes(col))
         return np.bincount(cc, minlength=V)
@@ -193,9 +201,57 @@ def execute(seg, spec):
     if mk in memo:
         counts, lens, lab_ids, uniq, empty_code = memo[mk]
     else:
-        counts, lens, lab_ids, uniq, empty_code = _derive(seg, col, spec)
+        loaded = _load_sidecar(seg, col, spec)
+        if loaded is not None:
+            lens, lab_ids, uniq, empty_code = loaded
+            counts = _code_counts(seg, col)
+        else:
+            counts, lens, lab_ids, uniq, empty_code = _derive(seg, col, spec)
+            _save_sidecar(seg, col, spec, lens, lab_ids, uniq, empty_code)
         memo[mk] = (counts, lens, lab_ids, uniq, empty_code)
     return _emit(seg, spec, counts, lens, lab_ids, uniq, empty_code)
+
+
+def _sidecar_path(seg, col, spec):
+    import hashlib
+    base = getattr(seg, 'path', None)
+    if not base or str(os.path.basename(base)).find('.union-') >= 0: return None
+    h = hashlib.sha1(('%s|%s|%s' % (spec['pat'], spec['rep'], spec.get('lenfn'))).encode()).hexdigest()[:8]
+    return '%s.%s.rg-%s.npz' % (base, col, h)
+
+
+def _load_sidecar(seg, col, spec):
+    """THE REGEX-GROUP SIDECAR: the road's V-scale result (label id per value, the distinct
+    labels, character lengths) born once and loaded in milliseconds -- 19.7M Referers took 15s
+    to hostize on every fresh process (Q28 cold), for a result that never changes"""
+    p = _sidecar_path(seg, col, spec)
+    if not p or not os.path.exists(p): return None
+    try:
+        import wdb_sidecar
+        if not wdb_sidecar.is_fresh(os.path.dirname(p), os.path.basename(p)): return None
+        z = np.load(p, allow_pickle=False)
+        lab_ids = z['lab_ids']; lens = z['lens']; ub = z['uniq_bytes'].tobytes(); uo = z['uniq_offs']
+        uniq = np.array([ub[int(uo[i]):int(uo[i + 1])] for i in range(int(uo.size) - 1)], dtype=object)
+        ec = int(z['empty_code'][0]); empty_code = None if ec < 0 else ec
+        return lens, lab_ids, uniq, empty_code
+    except Exception:
+        return None
+
+
+def _save_sidecar(seg, col, spec, lens, lab_ids, uniq, empty_code):
+    p = _sidecar_path(seg, col, spec)
+    if not p: return
+    try:
+        import wdb_sidecar
+        ub = [v if isinstance(v, (bytes, bytearray)) else str(v).encode() for v in uniq]
+        uo = np.zeros(len(ub) + 1, np.int64); np.cumsum([len(v) for v in ub], out=uo[1:])
+        nbytes = int(np.asarray(lab_ids).nbytes + np.asarray(lens).nbytes + uo[-1] + uo.nbytes)
+        if not wdb_sidecar.may_birth(os.path.dirname(p), nbytes, 'regex-group %s' % col): return
+        np.savez(p + '.partial.npz', lab_ids=np.asarray(lab_ids, dtype=np.int32), lens=np.asarray(lens, dtype=np.int32),
+                 uniq_bytes=np.frombuffer(b''.join(ub), dtype=np.uint8), uniq_offs=uo, empty_code=np.array([-1 if empty_code is None else int(empty_code)], dtype=np.int64))
+        os.replace(p + '.partial.npz', p)                                    # the rename law
+    except Exception:
+        pass
 
 
 _CANON_PAT = '^https?://(?:www\\.)?([^/]+)/.*$'
