@@ -261,7 +261,11 @@ def execute(db, tree):
             hit = np.isin(dst_keys, np.unique(sk))
         return dst_keep & hit
     counts = {a: int(np.count_nonzero(k)) for a, k in keeps.items()}
-    for _round in range(12):
+    if os.environ.get('WDB_KEYSPACE', '1') != '0':
+        _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inverted, prune_inverted, pack, _bill, _tk)
+        _t0 = _tk()
+    else:
+      for _round in range(12):
         changed = False
         for (a, b), pairs in pair.items():
             ca9 = [p[0] for p in pairs]; cb9 = [p[1] for p in pairs]
@@ -314,6 +318,144 @@ def execute(db, tree):
         _bill.append(('emit', _tk() - _t0))
         print('SEMI BILL: ' + ' | '.join('%s=%.0fms' % (n, v * 1000) for n, v in _bill), flush=True)
     return [tuple(out)], names
+
+
+def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inverted, prune_inverted, pack, _bill, _tk):
+    """THE KEY-SPACE FIXPOINT (Jackson's two phases, 2026-09-14). Phase 1 -- isolation -- is done
+    by the caller: every table has applied its own filters. Phase 2 -- the conjoined space:
+    the join columns collapse into SHARED VALUE SPACES (one per equivalence class of equal
+    columns: 'movie' = t.id = ci.movie_id = mk.movie_id = mc.movie_id); a space's live set is
+    the intersection of the KEY SETS of the tables that restrict it (an unfiltered table
+    restricts nothing); a table whose spaces shrank re-derives its rows against the live sets --
+    smallest table first, the giant last, each pass costing the rows MATCHED, never the table --
+    which shrinks its other spaces; until nothing shrinks. The old sweep asked cast_info (36M)
+    about name and title before the keyword filter had reached it: 5.5s of a 6.9s query."""
+    import time
+    t0 = [_tk()]
+    def bill(msg):
+        if _bill is not None:
+            _bill.append((msg, _tk() - t0[0])); t0[0] = _tk()
+    # ---- the spaces: union-find over (alias, column) ----
+    parent = {}
+    def find(x):
+        while parent.setdefault(x, x) != x:
+            parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+    for a, ca, b, cb in edges:
+        ra, rb = find((a, ca)), find((b, cb))
+        if ra != rb: parent[ra] = rb
+    members = {}
+    for a, ca, b, cb in edges:
+        members.setdefault(find((a, ca)), set()).add((a, ca)); members.setdefault(find((b, cb)), set()).add((b, cb))
+    spaces = {r: sorted(m) for r, m in members.items()}
+    cols_of = {a: sorted({c for (x, c) in parent if x == a}) for a in alias2t}
+    n_of = {a: int(segs[a].N) for a in alias2t}
+    # ---- key sets: the live keys of a table's column (None = no restriction) ----
+    full = {a: counts[a] == n_of[a] for a in alias2t}
+    kcache = {}
+    def keyset(a, c):
+        if full[a]: return None
+        ck = (a, c, counts[a])                     # cached per (table, column, live count): a key set
+        if ck in kcache: return kcache[ck]         # only changes when its table shrinks
+        idx = np.flatnonzero(keeps[a])
+        if idx.size == 0: return np.zeros(0, np.int64)
+        k = keys_at(a, c, idx) if idx.size * 4 < n_of[a] else keys(a, c)[idx]
+        k = k[k >= 0]
+        if k.size == 0:
+            out = np.zeros(0, np.int64)
+        else:
+            mx = int(k.max())
+            if mx < 200_000_000:
+                # A KEY SET IS A BITMAP, NOT A SORT: keys are dense ids; np.unique on 2.7M positions
+                # cost 1.27s, twice per key set, three key sets for cast_info (5.1s of a query)
+                lut = np.zeros(mx + 1, bool); lut[k] = True
+                out = np.flatnonzero(lut).astype(np.int64)
+            else:
+                out = np.unique(k)
+        kcache[ck] = out
+        return out
+    live = {}          # space root -> sorted live keys, or None
+    scache = {}
+    def _isect(cur, ks):
+        """A SPACE IS A BITMAP INTERSECTION: keys are dense ids; np.intersect1d sorted the
+        concatenation of 1.27M and 1.9M keys, 76 times in one query (1.8s of 2.3s)"""
+        if cur.size == 0 or ks.size == 0: return np.zeros(0, np.int64)
+        mx = int(max(cur[-1], ks[-1]))
+        if mx < 200_000_000:
+            m = np.zeros(mx + 1, bool); m[cur] = True
+            return ks[m[ks]]
+        return np.intersect1d(cur, ks, assume_unique=True)
+    def space_live(r):
+        sk = (r, tuple(counts[a] for (a, c) in spaces[r]))    # cached by the members' live counts
+        if sk in scache: return scache[sk]
+        cur = None
+        for (a, c) in spaces[r]:
+            ks = keyset(a, c)
+            if ks is None: continue
+            cur = ks if cur is None else _isect(cur, ks)
+        scache[sk] = cur
+        return cur
+    for r in spaces: live[r] = space_live(r)
+    bill('spaces %d' % len(spaces))
+    # ---- the worklist: tables whose spaces restrict them, smallest first ----
+    def restrict(a):
+        """re-derive a's rows against the live sets of its spaces; True if it shrank"""
+        changed = False
+        for c in cols_of[a]:
+            r = find((a, c)); S = live.get(r)
+            if S is None: continue
+            keep = keeps[a]; n = n_of[a]
+            if counts[a] == 0: return changed
+            if n >= 1_000_000 and S.size * 8 < n:
+                inv = inverted(a, [c])
+                if inv is not None:
+                    new = prune_inverted(inv, S, keep, n)
+                else:
+                    new = None
+            else:
+                new = None
+            if new is None:
+                idx = np.flatnonzero(keep)
+                dk = keys_at(a, c, idx) if idx.size * 4 < n else keys(a, c)[idx]
+                mx = int(max(S.max() if S.size else 0, dk.max() if dk.size else 0))
+                if mx < 200_000_000:
+                    lut = np.zeros(mx + 2, bool); lut[S] = True
+                    hit = lut[np.where(dk < 0, mx + 1, dk)]
+                else:
+                    hit = np.isin(dk, S)
+                new = np.zeros_like(keep); new[idx[hit]] = True
+            cnt = int(np.count_nonzero(new))
+            if cnt != counts[a]:
+                keeps[a] = new; counts[a] = cnt; full[a] = False; changed = True
+        return changed
+    pending = set(alias2t)
+    rounds = 0
+    while pending and rounds < 64:
+        rounds += 1
+        # the smallest table among those that could be restricted goes first; the giant waits
+        cand = [a for a in pending if any(live.get(find((a, c))) is not None for c in cols_of[a])]
+        if not cand: break
+        # THE SMALLEST SIGNAL FIRST: the table whose restricting space is smallest goes next (a
+        # keyword space of size 1 cuts mk to 24K, which hands title a 24K movie set instead of
+        # mc's 1.15M) -- not the smallest table
+        def _signal(x):
+            sz = [live[find((x, c))].size for c in cols_of[x] if live.get(find((x, c))) is not None]
+            return (min(sz) if sz else 1 << 62, counts[x])
+        a = min(cand, key=_signal)
+        pending.discard(a)
+        before = counts[a]
+        if restrict(a):
+            bill('%s %d->%d' % (a, before, counts[a]))
+            # a shrank: its spaces may shrink; every member table of a shrunk space is pending again
+            for c in cols_of[a]:
+                r = find((a, c)); old = live.get(r); new = space_live(r)
+                if new is not None and (old is None or new.size < old.size):
+                    live[r] = new
+                    for (b, _c) in spaces[r]:
+                        if b != a: pending.add(b)
+        else:
+            bill('%s %d (no change)' % (a, before))
+    bill('keyspace rounds=%d' % rounds)
 
 
 def _needs_weights(tree):
