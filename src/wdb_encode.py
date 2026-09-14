@@ -276,10 +276,20 @@ def _dict_bytes(p, zc):
             V = len(p['valb']); CH = CHUNK_DICT_VALS; BPC = CH // R
             n_chunks = (V + CH - 1) // CH
             ustart = []; czl = []; frames = []
+            bounds = []
             for j in range(n_chunks):
                 b0 = int(rst[j*BPC])
                 b1 = int(rst[(j+1)*BPC]) if (j+1)*BPC < nb else len(fc)
-                fr = zc.compress(fc[b0:b1]); frames.append(fr); ustart.append(b0); czl.append(len(fr))
+                bounds.append((b0, b1)); ustart.append(b0)
+            # THE PARALLEL FRAMES: the dictionary chunks are independent zstd frames and zstd
+            # releases the GIL -- 575 frames of Title took 23s on one core (the string tail)
+            from concurrent.futures import ThreadPoolExecutor
+            _lvl9 = getattr(zc, '_wdb_level', ZSTD_LEVEL)
+            def _cz9(b):
+                return zstd.ZstdCompressor(level=_lvl9).compress(fc[b[0]:b[1]])
+            with ThreadPoolExecutor(max_workers=min(16, max(1, os.cpu_count() or 4))) as _ex9:
+                frames = list(_ex9.map(_cz9, bounds))
+            czl = [len(fr) for fr in frames]
             out += struct.pack('<H', R) + struct.pack('<I', CH) + struct.pack('<I', n_chunks)
             out += struct.pack('<I', nb) + rst.tobytes() + struct.pack('<I', len(fc))
             out += np.array(ustart, dtype=np.uint32).tobytes()
@@ -882,6 +892,12 @@ def _arrow_string_prep(nm, chunked):
     if not (pa.types.is_string(t) or pa.types.is_large_string(t) or pa.types.is_binary(t) or pa.types.is_large_binary(t)):
         return None
     if isinstance(chunked, pa.ChunkedArray):
+        if pa.types.is_string(chunked.type):
+            # THE LARGE-STRING CAST: 100M titles exceed arrow's 2 GB 'string' offset space; the concat
+            # raised 'offset overflow', the exception was swallowed, and every big string column fell
+            # to the pandas/Python-object path -- 170s and 57 GB per column (the string tail, 2026-09-14).
+            # (Per-chunk dictionary_encode + unify_dictionaries was measured: 5+ minutes on one core.)
+            chunked = pc.cast(chunked, pa.large_string())
         chunked = pa.concat_arrays(chunked.chunks) if chunked.num_chunks > 1 else chunked.chunk(0)
     de = pc.dictionary_encode(chunked)                      # indices (int32) + dictionary (unique, first-seen order)
     dct = de.dictionary; idx = de.indices
@@ -942,11 +958,16 @@ def _column_job(input_path, nm, reader, cast=None, perm_path=None):
         try:
             import pyarrow as pa, pyarrow.parquet as pq, pyarrow.compute as pc
             col = pq.read_table(input_path, columns=[nm]).column(0)
+            if pa.types.is_string(col.type):
+                col = pc.cast(col, pa.large_string())        # before the take: the gathered column overflows 'string' offsets too
             if perm is not None:
                 col = pc.take(col, pa.array(np.asarray(perm)))
             prep = _arrow_string_prep(nm, col)
             del col
-        except Exception:
+        except Exception as _e9:
+            # A FALLBACK THAT IS SILENT IS A FAST PATH THAT ISN'T THERE: the arrow path had failed
+            # on every big string column for weeks ('offset overflow') and nobody knew
+            print('  arrow prep declined %s (%s: %s) -- falling back to the object path' % (nm, type(_e9).__name__, str(_e9)[:80]), flush=True)
             prep = None
     if prep is None:
         arr = wdb_read.read_one_column(input_path, nm, reader=reader)
@@ -1032,7 +1053,7 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
         # peaks near 3 GB and a small dictionary near 7 GB (measured 2026-09-14)
         e = est.get(nm, 1.0)
         return 'string' if e >= 8 else ('wide' if e >= 2.0 else ('mid' if e >= 1.5 else ('narrow' if e >= 0.5 else 'tiny')))
-    measured = {'string': 480, 'wide': 100, 'mid': 70, 'narrow': 40, 'tiny': 25}   # strings: the MEASURED peak (Referer 47 GB at 100M rows) -- three together killed the pool at 3/4     # bytes per row: conservative starts (URL/Referer/Title peak ~25 GB at 100M rows), raised as workers report
+    measured = {'string': 310, 'wide': 100, 'mid': 70, 'narrow': 40, 'tiny': 25}   # strings: the MEASURED peak on the arrow path (Title 29 GB at 100M rows; it was 57 GB on the object path)     # bytes per row: conservative starts (URL/Referer/Title peak ~25 GB at 100M rows), raised as workers report
     def working_set(nm):
         return int(N * measured[cls(nm)]) + (400 << 20)
     def learn(nm, peak):
