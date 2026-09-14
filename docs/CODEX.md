@@ -1279,3 +1279,23 @@ the strings' own working set (47 GB each: the front-coder holds the
 column as Python objects) is the load story's next lever, then the
 candidate zoo's time (each candidate compresses the full stream).
 NEXT: the string columns' memory, the wire floor, then C.
+
+
+## THE STRING TAIL, CLOSED (2026-09-14): the arrow path was never running
+Title alone: 170s, 57 GB. _arrow_string_prep concatenated the chunked
+column; 100M titles exceed arrow's 2 GB string offset space; the
+'offset overflow' was swallowed by , and
+every big string column had fallen to the Python-object path for weeks
+-- the 9 GB arrow path we had measured never ran on the columns that
+mattered. THE LARGE-STRING CAST (before the concat AND before the
+cluster gather's take, which overflows the same way): 170s -> 65s, 57
+-> 29 GB. THE PARALLEL FRAMES (dictionary zstd frames in a thread
+pool). Per-chunk encode + unify_dictionaries: measured 5+ minutes on
+one core, rejected. LAW: A FALLBACK THAT IS SILENT IS A FAST PATH THAT
+ISN'T THERE -- the decline now prints by name, and it named the second
+overflow within a minute of existing. THE LOAD: 866 -> 732 -> 671 ->
+405s, zero retreats, 12 in flight, children peak 39 GB; exact vs duck.
+Thirty hours to six and three-quarter minutes in one week. What is
+left in the encoder is time, not memory: the candidate zoo compresses
+the full stream once per candidate, and arrow's dictionary_encode +
+sort_indices are single-threaded (15s per big string). NEXT: C.
