@@ -301,7 +301,7 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
     above', the steps are the exceptions. EventTime measured: 3.13 MB zstd -> 1.37 MB steps, and
     the steps serve point reads/GROUP BY with NO decode. Smallest candidate wins; incompressible
     arrays stay raw, paying only the tag byte."""
-    arr = np.asarray(codes, dtype=np.int64)
+    arr = np.asarray(codes, dtype=np.int64)          # ONE int64 view of the stream, shared by every candidate (six copies of 800 MB were alive at once)
     stair = None
     if arr.size:
         d = np.diff(arr)
@@ -311,6 +311,8 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
             gbits = max(1, int(gaps.max()).bit_length()) if gaps.size else 1
             pay = _pack_codes(gaps, gbits) if gaps.size else b''
             stair = bytes([2, gbits]) + struct.pack('<I', steps.size) + pay
+            del steps, gaps, pay
+    d = None                                          # the diff is dead past the staircase test
     packed = bytes([0]) + _pack_codes(codes, bits)
     width = 1 if bits <= 8 else (2 if bits <= 16 else 4)
     wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[width]
@@ -331,15 +333,15 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
     # SearchPhrase (50.4 vs 52.6 MB) with zero decoders; adopted on strict size
     # dominance only -- no knobs, smaller or nothing.
     sparse = None
-    cn8 = np.bincount(np.asarray(codes, dtype=np.int64)) if codes.size else np.zeros(0)
+    cn8 = np.bincount(arr) if codes.size else np.zeros(0)
     dflt = int(cn8.argmax()) if cn8.size else 0
     if codes.size and cn8.size and cn8[dflt] * 2 > codes.size:               # majority default: the only shape it fits
-        pres = (np.asarray(codes, dtype=np.int64) != dflt)
+        pres = (arr != dflt)
         lits = np.asarray(codes)[pres]
         pb = np.packbits(pres)
         CK = 65536
         nck = (codes.size + CK - 1) // CK
-        per = np.add.reduceat(pres.astype(np.int64),
+        per = np.add.reduceat(pres.astype(np.uint8),
                               np.arange(0, codes.size, CK))
         ck = np.zeros(nck, dtype=np.uint64)
         if nck > 1:
@@ -354,12 +356,12 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
     tiered = None
     if codes.size and cn8.size and cn8[dflt] * 2 > codes.size and bits <= 8 \
             and cn8.size <= 256:
-        arr9 = np.asarray(codes, dtype=np.int64)
+        arr9 = arr
         pres9 = arr9 != dflt
         pb9 = np.packbits(pres9)
         CK = 65536
         nck9 = (codes.size + CK - 1) // CK
-        per9 = np.add.reduceat(pres9.astype(np.int64), np.arange(0, codes.size, CK))
+        per9 = np.add.reduceat(pres9.astype(np.uint8), np.arange(0, codes.size, CK)).astype(np.int64)
         ck9 = np.zeros(nck9, dtype=np.uint64)
         if nck9 > 1:
             ck9[1:] = np.cumsum(per9[:-1]).astype(np.uint64)
@@ -387,7 +389,7 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
     # column is structurally never worse than bitpack (+1B/block).
     bplus = None
     if codes.size and bits <= 16:
-        arrA = np.asarray(codes, dtype=np.int64)
+        arrA = arr
         B10 = 4096
         nblkA = (arrA.size + B10 - 1) // B10
         bndA = np.flatnonzero(np.diff(arrA) != 0)
@@ -448,7 +450,7 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
             nw9 = (n9 + 63) // 64
             pad9 = (-n9) % 64
             pl9 = np.zeros(bits * nw9, np.uint64)
-            arr9 = np.asarray(codes, np.int64)
+            arr9 = arr
             for p9 in range(bits):
                 bc9 = ((arr9 >> (bits - 1 - p9)) & 1).astype(np.uint8)
                 if pad9:
@@ -488,7 +490,7 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
     _e13_tags = set(x for x in os.environ.get('WDB_E13_TAGS', '').split(',') if x)
     _e13_want = os.environ.get('WDB_E13_FORCE') or (nm is not None and nm in _e13_tags)
     if _e13_want and codes.size and int(np.max(codes)) >= 256:
-        a13 = np.asarray(codes, dtype=np.int64)
+        a13 = arr
         nby = (max(1, int(np.max(a13)).bit_length()) + 7) // 8
         if nby > 1:
             cxb13 = zstd.ZstdCompressor(level=3)
@@ -541,7 +543,7 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
     # SIZE (year width from the real range), the size election alone ELECTS.
     if date_vals is not None and codes.size:
         try:
-            dv = np.asarray(date_vals, dtype=np.int64)[np.asarray(codes, dtype=np.int64)]
+            dv = np.asarray(date_vals, dtype=np.int64)[arr]
             dt64 = dv.astype('timedelta64[D]') + np.datetime64('1970-01-01')
             Y14 = dt64.astype('datetime64[Y]').astype(np.int64) + 1970
             ybase = int(Y14.min())
@@ -572,7 +574,7 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
     # (no frame ever inflates), an escape-array hunt, and a stream decode that beats
     # parallel zstd -- measured 0.1ms/84ms point, 54ms/70ms stream on ResolutionWidth.
     if enc5_ok and best is not stair:
-        arr16 = np.asarray(codes, dtype=np.int64)
+        arr16 = arr
         V5 = int(arr16.max()) + 1 if arr16.size else 0
         if 15 < V5 <= 65535:
             cn5 = np.bincount(arr16, minlength=V5)
@@ -635,7 +637,7 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
     # decompression charges. zstd keeps the column only when it shrinks it
     # more than it slows it.
     if best and best[0] == 3 and bits >= 2 and bits <= 16 and codes.size >= (1 << 22):
-        arr17 = np.asarray(codes, dtype=np.int64)
+        arr17 = arr
         tb17 = np.zeros(arr17.size * bits, dtype=np.uint8)
         for k17 in range(bits):
             tb17[k17::bits] = (arr17 >> k17) & 1
@@ -1021,13 +1023,16 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
             with open('/sys/fs/cgroup/memory.max') as f:
                 v = f.read().strip()
                 if v.isdigit(): phys = min(phys, int(v))
-            budget = phys // 2
+            budget = phys * 3 // 4                 # THREE-QUARTERS: children peaked at 55 GB of 128 at half; the page cache yields
         except Exception:
             budget = 32 << 30
     def cls(nm):
+        # FIVE CLASSES, not three: one heavy 'narrow' member (a 40%-distinct hash) had set the
+        # price for every flag column -- the class was budgeted at 12.5 GB/column when a flag
+        # peaks near 3 GB and a small dictionary near 7 GB (measured 2026-09-14)
         e = est.get(nm, 1.0)
-        return 'string' if e >= 8 else ('wide' if e >= 2 else 'narrow')
-    measured = {'string': 250, 'wide': 100, 'narrow': 40}     # bytes per row: conservative starts (URL/Referer/Title peak ~25 GB at 100M rows), raised as workers report
+        return 'string' if e >= 8 else ('wide' if e >= 2.0 else ('mid' if e >= 1.5 else ('narrow' if e >= 0.5 else 'tiny')))
+    measured = {'string': 250, 'wide': 100, 'mid': 70, 'narrow': 40, 'tiny': 25}     # bytes per row: conservative starts (URL/Referer/Title peak ~25 GB at 100M rows), raised as workers report
     def working_set(nm):
         return int(N * measured[cls(nm)]) + (400 << 20)
     def learn(nm, peak):
