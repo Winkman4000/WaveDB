@@ -6,6 +6,7 @@ equality edge prunes both sides to the other's surviving keys (dense-id
 lookup tables, O(N)); iterate to stability; MIN/MAX per column over its
 table's survivors (strings by the extreme present dictionary code)."""
 import numpy as np
+import wdb_shelf
 import sqlglot
 from sqlglot import exp as E
 
@@ -90,7 +91,19 @@ def execute(db, tree):
             c2 = c.copy()
             for col in c2.find_all(E.Column):
                 col.set('table', None)
-            mm = np.asarray(wdb_sql._eval_pred(seg, c2, lambda nm, pm=pms[a]: pm.get(nm, nm)), dtype=bool)
+            # THE PREDICATE SHELF: a local predicate's result on an immutable segment is a fact --
+            # kept as an index list on the shelf across queries (JOB's 113 queries reuse the same
+            # few filters on the same big tables: mi.info LIKE ... on 14.8M rows was 392ms, every
+            # time). A segment with tombstones or overrides never gets here (_solo_segment).
+            _pk9 = ('pred', seg.path, c2.sql())
+            _hit9 = wdb_shelf.SHELF.get(_pk9)
+            if _hit9 is not None:
+                mm = np.zeros(int(seg.N), bool); mm[_hit9] = True
+            else:
+                mm = np.asarray(wdb_sql._eval_pred(seg, c2, lambda nm, pm=pms[a]: pm.get(nm, nm)), dtype=bool)
+                _il9 = np.flatnonzero(mm).astype(np.int32 if seg.N < (1 << 31) else np.int64)
+                try: wdb_shelf.SHELF.put(_pk9, _il9, int(_il9.nbytes), kind='predicate')
+                except Exception: pass
             m = mm if m is None else (m & mm)
         keeps[a] = m if m is not None else np.ones(int(seg.N), bool)
         if _bill is not None: _bill.append(('local %s(%d) keep=%d' % (a, int(seg.N), int(keeps[a].sum())), _tk() - _t0)); _t0 = _tk()
@@ -198,6 +211,21 @@ def execute(db, tree):
                 if __import__('os').environ.get('WDB_SEMI_BILL'):
                     print('SEMI: inverted sidecar save failed for %s: %s' % (fn, str(_e)[:80]), flush=True)
         return cache[pc]
+    def rows_for_keys(inv, sk):
+        """THE ROWS OF A KEY SET: the reverse road's postings for the keys in sk, as row positions --
+        cost proportional to the rows matched, no N-scale bitmap"""
+        u, offs, order, _rank = inv
+        pos = np.searchsorted(u, sk)
+        ok = pos < u.size
+        pos = pos[ok]; skk = sk[ok]
+        hit = pos[u[pos] == skk]
+        if hit.size == 0: return np.zeros(0, np.int64)
+        st = offs[hit]; ln = offs[hit + 1] - st
+        total = int(ln.sum())
+        if total == 0: return np.zeros(0, np.int64)
+        base = np.repeat(st - np.concatenate(([0], np.cumsum(ln)[:-1])), ln)
+        idx = np.arange(total, dtype=np.int64) + base
+        return np.asarray(order[idx]).astype(np.int64)
     def prune_inverted(inv, sk, dst_keep, dst_n):
         u, offs, order, _rank = inv
         pos = np.searchsorted(u, sk)
@@ -262,7 +290,7 @@ def execute(db, tree):
         return dst_keep & hit
     counts = {a: int(np.count_nonzero(k)) for a, k in keeps.items()}
     if os.environ.get('WDB_KEYSPACE', '1') != '0':
-        _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inverted, prune_inverted, pack, _bill, _tk)
+        _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inverted, rows_for_keys, pack, _bill, _tk)
         _t0 = _tk()
     else:
       for _round in range(12):
@@ -320,7 +348,7 @@ def execute(db, tree):
     return [tuple(out)], names
 
 
-def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inverted, prune_inverted, pack, _bill, _tk):
+def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inverted, rows_for_keys, pack, _bill, _tk):
     """THE KEY-SPACE FIXPOINT (Jackson's two phases, 2026-09-14). Phase 1 -- isolation -- is done
     by the caller: every table has applied its own filters. Phase 2 -- the conjoined space:
     the join columns collapse into SHARED VALUE SPACES (one per equivalence class of equal
@@ -353,11 +381,15 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
     # ---- key sets: the live keys of a table's column (None = no restriction) ----
     full = {a: counts[a] == n_of[a] for a in alias2t}
     kcache = {}
+    idx_of = {}        # THE LIVE ROW LIST per table, kept beside the bool keep: never re-derived per step
+    def live_idx(a):
+        if a not in idx_of: idx_of[a] = np.flatnonzero(keeps[a])
+        return idx_of[a]
     def keyset(a, c):
         if full[a]: return None
         ck = (a, c, counts[a])                     # cached per (table, column, live count): a key set
         if ck in kcache: return kcache[ck]         # only changes when its table shrinks
-        idx = np.flatnonzero(keeps[a])
+        idx = live_idx(a)
         if idx.size == 0: return np.zeros(0, np.int64)
         k = keys_at(a, c, idx) if idx.size * 4 < n_of[a] else keys(a, c)[idx]
         k = k[k >= 0]
@@ -406,16 +438,16 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
             if S is None: continue
             keep = keeps[a]; n = n_of[a]
             if counts[a] == 0: return changed
-            if n >= 1_000_000 and S.size * 8 < n:
+            idx = live_idx(a)
+            rows = None
+            if n >= 1_000_000 and S.size * 8 < n and S.size * 4 < idx.size:
+                # the giant, cut by a small space: the road's postings, then only those already live
                 inv = inverted(a, [c])
                 if inv is not None:
-                    new = prune_inverted(inv, S, keep, n)
-                else:
-                    new = None
-            else:
-                new = None
-            if new is None:
-                idx = np.flatnonzero(keep)
+                    r = rows_for_keys(inv, S)
+                    rows = r[keep[r]] if idx.size < n else r
+                    rows.sort()
+            if rows is None:
                 dk = keys_at(a, c, idx) if idx.size * 4 < n else keys(a, c)[idx]
                 mx = int(max(S.max() if S.size else 0, dk.max() if dk.size else 0))
                 if mx < 200_000_000:
@@ -423,10 +455,12 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
                     hit = lut[np.where(dk < 0, mx + 1, dk)]
                 else:
                     hit = np.isin(dk, S)
-                new = np.zeros_like(keep); new[idx[hit]] = True
-            cnt = int(np.count_nonzero(new))
+                rows = idx[hit]
+            cnt = int(rows.size)
             if cnt != counts[a]:
+                new = np.zeros_like(keep); new[rows] = True       # one N-scale write per shrink, not three
                 keeps[a] = new; counts[a] = cnt; full[a] = False; changed = True
+                idx_of[a] = rows
         return changed
     pending = set(alias2t)
     rounds = 0
