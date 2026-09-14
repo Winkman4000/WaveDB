@@ -19,6 +19,7 @@ Zero columns enter the codes cache; the pipeline's residency is its survivors. D
 distinct, having, deleted rows, overrides on involved columns, non-conjunctive WHERE, LIKE/regex.
 Prototype of this exact pipeline ran Q39 (a 45 s timeout) in ~1 s steady-state, exact vs DuckDB.
 """
+import os
 import numpy as np
 import sqlglot.expressions as E
 from concurrent.futures import ThreadPoolExecutor
@@ -274,6 +275,151 @@ def _like(node):
     return n.this.name, needle, kind, neg
 
 
+from numba import njit, prange
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _find_all_kernel(buf, nd):
+    """all start positions of nd in buf -- two passes over parallel chunks (count, then fill into
+    exact offsets): no big zeroed buffer per call"""
+    n = buf.size; m = nd.size
+    if m == 0 or n < m: return np.zeros(0, np.int64)
+    nchunks = 64
+    step = (n + nchunks - 1) // nchunks
+    counts = np.zeros(nchunks, np.int64)
+    first = nd[0]
+    for c in prange(nchunks):
+        lo = c * step; hi = min(n - m + 1, (c + 1) * step)
+        k = 0; i = lo
+        while i < hi:
+            if buf[i] == first:
+                ok = True
+                for j in range(1, m):
+                    if buf[i + j] != nd[j]:
+                        ok = False; break
+                if ok: k += 1
+            i += 1
+        counts[c] = k
+    starts = np.zeros(nchunks + 1, np.int64)
+    for c in range(nchunks): starts[c + 1] = starts[c] + counts[c]
+    out = np.empty(starts[nchunks], np.int64)
+    for c in prange(nchunks):
+        lo = c * step; hi = min(n - m + 1, (c + 1) * step)
+        p = starts[c]; i = lo
+        while i < hi:
+            if buf[i] == first:
+                ok = True
+                for j in range(1, m):
+                    if buf[i + j] != nd[j]:
+                        ok = False; break
+                if ok:
+                    out[p] = i; p += 1
+            i += 1
+    return out
+
+
+class FramedText:
+    """THE FRAMED TEXT: the joined dictionary bytes as zstd frames split at VALUE boundaries
+    (URLs compress ~8x: 3.4 GB of text is ~400 MB of I/O), exposing exactly what the LIKE scan
+    needs -- find(needle, start) and slicing -- decompressing one frame at a time. A needle never
+    spans two values, so it never spans two frames. The last frame is cached."""
+    def __init__(self, path, index):
+        self.path = path; self.hay_start = np.asarray(index[:, 0], dtype=np.int64); self.file_start = np.asarray(index[:, 1], dtype=np.int64)
+        self.total = int(index[-1, 0]); self.nf = int(index.shape[0]) - 1
+        self.fh = open(path, 'rb'); self._last = (-1, None)
+        import zstandard; self._dz = zstandard.ZstdDecompressor()
+    def __len__(self): return self.total
+    def _frame(self, i):
+        if self._last[0] == i: return self._last[1]
+        self.fh.seek(int(self.file_start[i])); raw = self.fh.read(int(self.file_start[i + 1] - self.file_start[i]))
+        b = self._dz.decompress(raw, max_output_size=int(self.hay_start[i + 1] - self.hay_start[i]))
+        self._last = (i, b); return b
+    def find(self, sub, start=0):
+        if start >= self.total: return -1
+        i = int(np.searchsorted(self.hay_start, start, side='right')) - 1
+        while i < self.nf:
+            b = self._frame(i); off = int(self.hay_start[i])
+            p = b.find(sub, max(0, start - off))
+            if p >= 0: return off + p
+            i += 1
+        return -1
+    def __getitem__(self, sl):
+        a, b = sl.start or 0, (sl.stop if sl.stop is not None else self.total)
+        i = int(np.searchsorted(self.hay_start, a, side='right')) - 1
+        fb = self._frame(i); off = int(self.hay_start[i])
+        return fb[a - off:b - off]
+    def find_all_parallel(self, sub, threads=8):
+        """every occurrence position of sub in the whole text (frames in parallel)"""
+        nd = np.frombuffer(sub, dtype=np.uint8)
+        def one(i):
+            self.fh_local = getattr(self, 'fh_local', None)
+            with open(self.path, 'rb') as fh:
+                fh.seek(int(self.file_start[i])); raw = fh.read(int(self.file_start[i + 1] - self.file_start[i]))
+            import zstandard
+            b = zstandard.ZstdDecompressor().decompress(raw, max_output_size=int(self.hay_start[i + 1] - self.hay_start[i]))
+            pos = _find_all_kernel(np.frombuffer(b, dtype=np.uint8), nd)
+            return pos + int(self.hay_start[i])
+        with ThreadPoolExecutor(max_workers=threads) as ex:
+            parts = list(ex.map(one, range(self.nf)))
+        return np.concatenate(parts) if parts else np.zeros(0, np.int64)
+
+
+def _framed_write(path, hay, offs, target=32 << 20):
+    """write hay as zstd frames split at value boundaries; returns the (F+1, 2) index"""
+    import zstandard
+    cz = zstandard.ZstdCompressor(level=3, threads=4)      # a birth happens once, at warm: fast beats small here
+    idx = []; fpos = 0; i = 0; V = int(offs.size) - 1
+    with open(path + '.partial', 'wb') as f:
+        while i < V:
+            j = int(np.searchsorted(offs, int(offs[i]) + target, side='left'))
+            j = max(j, i + 1); j = min(j, V)
+            chunk = hay[int(offs[i]):int(offs[j])]
+            z = cz.compress(chunk); idx.append((int(offs[i]), fpos)); f.write(z); fpos += len(z); i = j
+        idx.append((int(offs[V]), fpos)); f.flush(); os.fsync(f.fileno())
+    os.replace(path + '.partial', path)
+    return np.asarray(idx, dtype=np.int64)
+
+
+def _text_buffer(seg, col):
+    """THE TEXT BUFFER SIDECAR: the dictionary's values joined into one byte string plus their
+    offsets -- born once from _typed_dict (6M front-coded URLs decoded into Python objects:
+    16 seconds, every process, never written down) and mmap'd thereafter. The LIKE family reads
+    it without a single Python object; the hay bytes are memoised per process."""
+    memo = seg.__dict__.setdefault('_ws_text_memo', {})
+    if col in memo: return memo[col]
+    base = getattr(seg, 'path', None)
+    tp = (base + '.' + col + '.txz.bin') if base else None          # zstd frames split at value boundaries
+    ip = (base + '.' + col + '.txi.npy') if base else None          # the frame index
+    op = (base + '.' + col + '.txo.npy') if base else None          # value offsets
+    hay = offs = None
+    if tp and os.path.exists(tp) and os.path.exists(op) and os.path.exists(ip):
+        try:
+            import wdb_sidecar
+            dbdir = os.path.dirname(base)
+            if all(wdb_sidecar.is_fresh(dbdir, os.path.basename(p)) for p in (tp, op, ip)):
+                offs = np.load(op, mmap_mode='r'); hay = FramedText(tp, np.load(ip))
+        except Exception:
+            hay = offs = None
+    if hay is None:
+        vals = seg._typed_dict(col)
+        V = len(vals)
+        bs = [v if isinstance(v, (bytes, bytearray)) else (v.encode() if isinstance(v, str) else bytes(v)) for v in vals]
+        lens = np.fromiter((len(v) for v in bs), np.int64, V)
+        offs = np.zeros(V + 1, np.int64); np.cumsum(lens, out=offs[1:])
+        hay = b''.join(bs)
+        if tp and not str(base).startswith('union'):
+            try:
+                import wdb_sidecar
+                if wdb_sidecar.may_birth(os.path.dirname(base), len(hay) // 4 + offs.nbytes, 'text-buffer %s' % col):
+                    idx = _framed_write(tp, hay, offs)                                  # the rename law inside
+                    np.save(ip + '.partial.npy', idx); os.replace(ip + '.partial.npy', ip)
+                    np.save(op + '.partial.npy', offs); os.replace(op + '.partial.npy', op)
+            except Exception:
+                pass
+    memo[col] = (hay, offs)
+    return hay, offs
+
+
 def _like_flags(seg, col, needle, kind='contains'):
     """Boolean flag[code] = dict value contains needle. THE DICT IS THE HAYSTACK: the row data
     is never string-compared -- all distinct values are scanned once (C-speed buffer find with
@@ -283,13 +429,8 @@ def _like_flags(seg, col, needle, kind='contains'):
     mk = (col, needle, kind)
     if mk in memo:
         return memo[mk]
-    vals = seg._typed_dict(col)
-    V = len(vals)
-    bs = [v if isinstance(v, (bytes, bytearray)) else
-          (v.encode() if isinstance(v, str) else bytes(v)) for v in vals]
-    lens = np.fromiter((len(v) for v in bs), np.int64, V)
-    offs = np.zeros(V + 1, np.int64); np.cumsum(lens, out=offs[1:])
-    hay = b''.join(bs)
+    hay, offs = _text_buffer(seg, col)
+    V = int(offs.size) - 1
     nd = needle.encode() if isinstance(needle, str) else needle
     flag = np.zeros(V, bool)
     if kind == 'general':
@@ -334,6 +475,14 @@ def _like_flags(seg, col, needle, kind='contains'):
                 pos = hay.find(nd, int(offs[i + 1]))
             else:
                 pos = hay.find(nd, pos + 1)
+    elif isinstance(hay, FramedText) and len(nd) >= 2:
+        # THE PARALLEL NEEDLE: frames decompress in threads (zstd releases the GIL) and a numba
+        # kernel finds every occurrence across cores; a hit maps to its value by offsets. Python's
+        # single-threaded find took 1.9s over 3.4 GB of URL text; this is memory-bound across 16 cores.
+        hits = hay.find_all_parallel(nd)
+        if hits.size:
+            codes = np.searchsorted(offs, hits, side='right') - 1
+            flag[np.unique(codes)] = True
     else:
         pos = hay.find(nd)
         while pos >= 0:
