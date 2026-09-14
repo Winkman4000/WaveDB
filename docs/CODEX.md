@@ -1242,3 +1242,19 @@ vs 51.9s (42/43, 2.51x). Left cold: Q27 (12.2s, the 6M-group
 SearchPhrase aggregate -- not LIKE) and Q28 (a draw). Loose thread: the
 warm step re-birthed fresh text sidecars once (a level-9 birth then a
 level-3 one); a warm step must never rewrite what it finds.
+
+
+## SEAL 2026-09-14: the cold face, most of it
+THE FRAMED TEXT + THE PARALLEL NEEDLE (LIKE: 16.3s -> 1.36s), THE BIG-
+DICTIONARY LITERAL (a sorted dictionary is a binary search: the fused
+door had decoded 6M URLs to test URL <> '' and then declined; Q27 12.6s
+-> 2.5s), THE LENGTH SIDECAR (length() over a dictionary as a V-scale
+array, no strings). Kit vs DuckDB native, same pod: WaveDB cold 67.7s
+-> 42.9s (duck 58.4s), hot 10.8s (duck 51.9s), 42/43 hot. LEFT: Q28
+(13.2s cold) -- the Referer regex group decodes the dictionary for the
+regex; it wants the framed text per frame, never 6M Python objects (the
+typed_dict-from-frames attempt was 30s: building the strings faster is
+the wrong lesson; not building them is the right one). Cold-run
+comparisons on this pod are +/-1s noisy (no drop_caches). NEXT: Q28;
+the warm step must never rewrite a fresh sidecar; the encoder lever;
+the wire floor; then C.
