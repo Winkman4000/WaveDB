@@ -1258,3 +1258,24 @@ the wrong lesson; not building them is the right one). Cold-run
 comparisons on this pod are +/-1s noisy (no drop_caches). NEXT: Q28;
 the warm step must never rewrite a fresh sidecar; the encoder lever;
 the wire floor; then C.
+
+
+## THE COLD FACE CLOSED, AND THE LOAD STORY OPENED (2026-09-14, late)
+THE REGEX-GROUP SIDECAR + the census: Q28 13.2s -> 2.0s (the prefix-run
+road WAS serving and WAS the 15s; its V-scale result is written once;
+the door recounted 100M rows the registry had already counted). THE
+CLEAN KIT RUN vs DuckDB native, same pod: WaveDB cold 20.4s / hot 10.2s
+vs 58.4s / 51.9s; cold faster on 36/43 (2.44x), hot 42/43 (2.86x); no
+query over 2.6s cold; cold was 67.7s two sessions ago. Verified: a warm
+pass never rewrites a fresh sidecar; the warm pass is 30s. THE LOAD:
+866s vs duck 90s. THE SHARED VIEW: _code_section made nine int64
+copies of the same stream; one view, transients freed: ClientIP 10.8 ->
+5.8 GB, byte-identical. Five learner classes; budget three-quarters;
+THE HONEST STRING START (480 B/row: three strings together killed the
+pool -- the self-healing retreated and re-queued, as designed). 866 ->
+732 -> 671s, up to 8 in flight, zero retreats. THE STRING TAIL: 103/105
+columns done at 515s; the last 150s is OriginalURL and Title alone --
+the strings' own working set (47 GB each: the front-coder holds the
+column as Python objects) is the load story's next lever, then the
+candidate zoo's time (each candidate compresses the full stream).
+NEXT: the string columns' memory, the wire floor, then C.
