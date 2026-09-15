@@ -28,6 +28,18 @@ def main():
     files = sorted(glob.glob(ROOT + '/q/*.sql'), key=lambda p: (int(''.join(ch for ch in os.path.basename(p) if ch.isdigit()) or 0), os.path.basename(p)))
     files = [f for f in files if os.path.basename(f)[0].isdigit()]
     only = set(a for a in sys.argv[1:] if not a.startswith('--'))
+    if '--warm' in sys.argv:
+        # THE WARM STEP (as the ClickBench kit): every query once, untimed -- births, the shelved
+        # predicates and key columns, the roads' first touch -- before the clock starts
+        import re as _re
+        t0 = time.perf_counter(); n = 0
+        for f in files:
+            name = os.path.basename(f)[:-4]
+            if only and name not in only: continue
+            q = open(f).read().strip().rstrip(';'); q = _re.sub(r'\bAS at\b', 'AS at1', q); q = _re.sub(r'\bat\.', 'at1.', q)
+            try: db.run(q); n += 1
+            except Exception: pass
+        print('WARM: %d queries in %.1fs' % (n, time.perf_counter() - t0), flush=True)
     tally = {}; wt = dt = 0.0; wins = 0; holes = {}
     for f in files:
         name = os.path.basename(f)[:-4]
