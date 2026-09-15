@@ -1332,3 +1332,34 @@ truth about the stream: on first touch the overlap is real (4.3s ->
 0.76s); warm, the pool buys nothing because the predicate evaluators
 hold the GIL -- ISOLATION SHOULD BE NUMBA KERNELS (nogil) so the
 concurrency is real; that is the next organ. Then the per-step kernel.
+
+
+## C, THE SECOND ACT (2026-09-15): from the tax to the band
+After the key-space fixpoint the JOB gap was a TAX -- ~60ms on each of
+113 queries, no monster. Each cut came from a bill: THE STRING RANK ROAD
+(MIN/MAX over an inline column as one argmin over int32 ranks: 17e 0.32
+-> 0.18); THE APPLIED SPACE (a space already applied is not applied
+again) -- which EXPOSED a real bug: a late isolation landing had
+overwritten the keep and the redundant re-application had been silently
+repairing it (JOB 5c: '#1' for '11,830,420'); A LANDING INTERSECTS. THE
+PLAN CACHE and THE FRESHNESS CACHE: measured neutral within the board's
++/-1s, kept -- and the measurement said the glue is not where the second
+lives. The scratch bitmap: rejected (np.zeros is a lazy calloc). JOB-
+COUNT had no warm step: 39.9s was mostly first-touch. 2,440 deepcopy
+calls per query rebuilding stripped conjuncts: in the plan now. DECLINE
+BEFORE THE WORK, twice more: the fused door factorised 4.2M inline
+names to build a code lookup for a LIKE and then declined (3.85s ->
+0.011s with THE PREFIX ON THE RANK ROAD: an anchored prefix is a range
+of the sorted order); the road engine rebuilt a 36M-row cast_info ->
+name pointer every COUNT query to re-discover that IMDB has orphan
+foreign keys -- THE REMEMBERED REFUSAL (a .no birthmark; the second-ask
+memory had lived in db.__dict__, which the per-query flush wiped, so
+cast_info's roads were never born). Jackson asked whether isolation
+runs concurrently: measured -- structurally yes; really on first touch
+(4.3s -> 0.5s); warm, the pool buys little because the predicate
+evaluators hold the GIL; THE NEEDLE IN THE INLINE LIKE fixed the biggest
+holder; isolation as nogil kernels is the general answer. STANDING: JOB
+warm 12-13s vs 10.5-11 (31-39 wins); JOB-COUNT warm 15.0s vs 8.8s; all
+226 exact throughout; from 137.8s / 149s a week ago. NEXT: the regex
+verify in numba; the weights during the settle; the JOB first-touch as a
+load step; the per-step kernel.
