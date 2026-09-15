@@ -353,16 +353,27 @@ def execute(db, tree):
             out.append(None); continue
         rows = np.flatnonzero(keeps[a])
         cd = seg.cols.get(pc, {})
-        codes = np.asarray(seg.codes(pc))[rows] if cd.get('mode') in (0, 1, 2) else None
+        codes = _codes_shelved(seg, pc)[rows] if cd.get('mode') in (0, 1, 2) else None
         if codes is not None:
             if cd.get('has_null'):
                 codes = codes[codes != int(cd['V']) - 1]
             if codes.size == 0:
                 out.append(None); continue
             k = int(codes.min()) if isinstance(nd, E.Min) else int(codes.max())     # sorted dictionary
-            v = seg._typed_dict(pc)[k]
+            v = seg.fetch(pc, k)                       # ONE chunk, not the 4.1M-value dictionary decoded for one entry
             out.append(wdb_sql._pyval(v))
         else:
+            srank = _string_rank(seg, pc) if (cd.get('dt') == 1 and int(seg.N) >= 200_000) else None
+            if srank is not None:
+                # THE STRING RANK ROAD: MIN/MAX over an inline (mode-5) column is one argmin over
+                # int32 ranks and a single point read -- not 322K Python objects per query
+                rr = srank[rows]
+                ok = rr >= 0
+                if not ok.any():
+                    out.append(None); continue
+                j = rows[ok][int(rr[ok].argmin()) if isinstance(nd, E.Min) else int(rr[ok].argmax())]
+                out.append(wdb_sql._pyval(seg.values_at_rows(pc, np.array([j]))[0]))
+                continue
             vals = list(seg.values_at_rows(pc, rows))
             vals = [v for v in vals if v is not None]
             out.append(wdb_sql._pyval(min(vals) if isinstance(nd, E.Min) else max(vals)) if vals else None)
@@ -371,6 +382,54 @@ def execute(db, tree):
         _bill.append(('emit', _tk() - _t0))
         print('SEMI BILL: ' + ' | '.join('%s=%.0fms' % (n, v * 1000) for n, v in _bill), flush=True)
     return [tuple(out)], names
+
+
+def _string_rank(seg, pc):
+    """each row's rank in the column's sorted order (NULL -> -1), int32, born once as a sidecar
+    (<seg>.<col>.srank.npy) and shelved; a sort of 4.2M names is ~5s, once"""
+    import os
+    key = ('srank', seg.path, pc)
+    hit = wdb_shelf.SHELF.get(key)
+    if hit is not None: return hit
+    fn = seg.path + '.' + pc + '.srank.npy'
+    try:
+        import wdb_sidecar
+        if os.path.exists(fn) and wdb_sidecar.is_fresh(os.path.dirname(seg.path), os.path.basename(fn)):
+            r = np.load(fn)
+            try: wdb_shelf.SHELF.put(key, r, int(r.nbytes), kind='string-rank')
+            except Exception: pass
+            return r
+    except Exception:
+        pass
+    vals = np.asarray(seg.values(pc), dtype=object)
+    isn = np.array([v is None for v in vals], dtype=bool)
+    order = np.argsort(np.where(isn, b'', vals), kind='stable')
+    rank = np.empty(vals.size, np.int32); rank[order] = np.arange(vals.size, dtype=np.int32)
+    rank[isn] = -1
+    try:
+        import wdb_sidecar
+        if wdb_sidecar.may_birth(os.path.dirname(seg.path), int(rank.nbytes), 'string rank %s' % pc):
+            np.save(fn + '.partial.npy', rank); os.replace(fn + '.partial.npy', fn)
+    except Exception:
+        pass
+    try: wdb_shelf.SHELF.put(key, rank, int(rank.nbytes), kind='string-rank')
+    except Exception: pass
+    return rank
+
+
+def _codes_shelved(seg, pc):
+    """THE CODE COLUMN ON THE SHELF: an emit column's codes on an immutable segment, decoded once
+    per process as int32 -- MIN(n.name) over 322K live rows decoded the 4.1M-row name stream
+    every query (146ms of a 190ms query) because per-query caches flush"""
+    key = ('codes', seg.path, pc)
+    hit = wdb_shelf.SHELF.get(key)
+    if hit is not None: return hit
+    c = np.asarray(seg.codes(pc))
+    if c.size >= 200_000 and int(seg.cols[pc].get('V', 0)) < (1 << 31):
+        c = c.astype(np.int32)
+        try: wdb_shelf.SHELF.put(key, c, int(c.nbytes), kind='codes')
+        except Exception: pass
+    return c
 
 
 def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inverted, rows_for_keys, pack, _bill, _tk, futs=None, pool=None, keycache=None):
@@ -468,8 +527,10 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
         f = futs[a]
         if not f.done(): return False
         m = f.result(); arrived.add(a)
-        cnt = int(np.count_nonzero(m))
-        if cnt != counts[a]:
+        if not full[a]:
+            m = m & keeps[a]                      # A LANDING INTERSECTS: cuts the spaces already made are kept
+        cnt = int(np.count_nonzero(m))            # (an overwrite here discarded them; the applied-space skip then
+        if cnt != counts[a]:                      #  removed the accidental repair -- JOB 3b answered '#1' for '11,830,420')
             keeps[a] = m; counts[a] = cnt; full[a] = False; idx_of.pop(a, None)
             return True
         return False
@@ -489,6 +550,11 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
         for c in order9:
             r = find((a, c)); S = live.get(r)
             if S is None: continue
+            # A SPACE ALREADY APPLIED IS NOT APPLIED AGAIN: a column whose live set has not shrunk
+            # since this table last took it cannot cut the table further (cast_info re-gathered
+            # the same 7.4M role postings four times in 19d)
+            if applied.get((a, c)) == S.size: continue
+            applied[(a, c)] = S.size
             keep = keeps[a]; n = n_of[a]
             if counts[a] == 0: return changed
             _tq = _tk()
@@ -519,6 +585,7 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
                 idx_of[a] = rows
         return changed
     pending = set(alias2t)
+    applied = {}
     rounds = 0
     def _refresh_spaces_of(a):
         for c in cols_of[a]:

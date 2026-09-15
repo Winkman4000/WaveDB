@@ -22,6 +22,7 @@ FAMILIES = [
     (r'\.txi\.npy$',             'text-frames',    'V',  'wdb_wherescan (frame index)'),
     (r'\.clen\.npy$',            'length',         'V',  'wdb_wherescan (character lengths)'),
     (r'\.rg-[0-9a-f]{8}\.npz$',  'regex-group',    'V',  'wdb_regexgroup (the road\'s result)'),
+    (r'\.srank\.npy$',           'string-rank',    'N',  'wdb_semijoin (rank of each row in sorted order)'),
     (r'\.txo\.npy$',             'text-offsets',   'V',  'wdb_wherescan (joined dictionary offsets)'),
     (r'\.ptrep$',                'pointer-rep',    'N',  'wdb_ptrep'),
     (r'\.pt2$',                  'pair-table',     'V2', 'wdb_pairfold / diskpair'),
