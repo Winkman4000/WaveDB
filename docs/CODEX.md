@@ -1299,3 +1299,36 @@ Thirty hours to six and three-quarter minutes in one week. What is
 left in the encoder is time, not memory: the candidate zoo compresses
 the full stream once per candidate, and arrow's dictionary_encode +
 sort_indices are single-threaded (15s per big string). NEXT: C.
+
+
+## C, THE FIRST ACT (2026-09-14/15): the key-space fixpoint, the stream, isolation first
+JOB was a death by a thousand cuts (113/113 at 137.8s vs 13.2s; no
+query over 10s; the median ~1s vs 0.1s). The bill on 17e named the
+disease: the sweep asked cast_info (36M rows) about name and title
+before the one selective filter had reached it -- 5.5s of blind passes.
+JACKSON'S LAW: PEMDAS IN ISOLATION FIRST, THEN THE CONJOINED SPACE.
+Phase 1: every table does its own work and reduces to KEY SETS. Phase
+2: the join columns collapse into SHARED VALUE SPACES (union-find); a
+space is the intersection of its restricting members; a table whose
+spaces shrank re-derives its rows -- the smallest signal first (the
+table whose restricting space is smallest, not the smallest table), the
+giant last, each pass costing the rows matched. Delta-driven rounds
+fall out of the structure. THE STREAM (Jackson): everything in phase 2
+only ever shrinks, so the order signals arrive does not change the
+answer -- monotonicity licenses running isolation concurrently and
+letting the worklist start on whatever has landed; a late key set is
+one more shrink, never a correction. ISOLATION FIRST, PER TABLE: a
+table whose own filter is still running is not restricted from the
+space yet -- its own cut is deeper and cheaper. The laws that made it
+cheap, each from a profile: key sets cached per (table, column, count);
+A KEY SET IS A BITMAP, NOT A SORT; A SPACE IS A BITMAP INTERSECTION;
+THE PREDICATE SHELF (a local predicate's result on an immutable segment
+is a fact, shelved across queries); THE KEY COLUMN ON THE SHELF (decoded
+once per process as int32); the smallest signal first within a table's
+columns too; the live row list never sorted. THE JOB WARM STEP as the
+kit has. RESULT: JOB 137.8s -> 16.8s warm (1.5x duck), 2 -> 23 wins;
+JOB-COUNT 149s -> 44.3s single pass; all 226 exact throughout. Measured
+truth about the stream: on first touch the overlap is real (4.3s ->
+0.76s); warm, the pool buys nothing because the predicate evaluators
+hold the GIL -- ISOLATION SHOULD BE NUMBA KERNELS (nogil) so the
+concurrency is real; that is the next organ. Then the per-step kernel.
