@@ -5425,6 +5425,10 @@ def _key_is_unique(db, table, col):
     return memo[mk]
 
 
+_JPTR_ASKED = set()
+_JPTR_NOT = set()
+
+
 def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
     """Build a child->parent gather pointer at query time via a hash probe (the parent key must be unique).
     For each child row, the parent row whose key matches. INNER + row-preserving only: a partial match would
@@ -5479,11 +5483,30 @@ def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
                         return ptr9
             except Exception:
                 pass
+    # A REFUSAL IS A FACT ABOUT THE TWO SEGMENTS: 'not a pointer' (many-to-many, or orphan child
+    # rows -- cast_info.person_id has people missing from name) is remembered under the same
+    # birthmark as a road, so it is decided once -- every JOB-COUNT query had rebuilt a 36M-row
+    # pointer (0.55s) to re-discover the same refusal
+    if side and mark:
+        if side in _JPTR_NOT: raise _FastUnsupported
+        try:
+            if _os.path.exists(side + '.no') and _js.load(open(side + '.no')) == mark:
+                _JPTR_NOT.add(side); raise _FastUnsupported
+        except _FastUnsupported:
+            raise
+        except Exception:
+            pass
+    def _refuse():
+        if side and mark:
+            _JPTR_NOT.add(side)
+            try: _js.dump(mark, open(side + '.no', 'w'))
+            except Exception: pass
+        raise _FastUnsupported
     ck = np.asarray(wdb_sql._col(cseg, cp)[0]); pk = np.asarray(wdb_sql._col(pseg, pp)[0])
     pidx = pd.Index(pk)
-    if not pidx.is_unique: raise _FastUnsupported                 # many-to-many -> not a pointer
+    if not pidx.is_unique: _refuse()                              # many-to-many -> not a pointer
     ptr = pidx.get_indexer(ck)
-    if (ptr < 0).any(): raise _FastUnsupported                    # unmatched child rows -> would drop -> fall back
+    if (ptr < 0).any(): _refuse()                                 # unmatched child rows -> would drop -> fall back
     ptr = ptr.astype(np.int64)
     # THE BIRTH GATE (plist spirit: born where reads justify): the first
     # qualifying join per (child,key,parent,key) pays its hash in RAM only;
@@ -5491,7 +5514,10 @@ def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
     # never cost the realm disk. Operators may force births with
     # WDB_JPTR_EAGER=1 or forbid them with WDB_JPTR_OFF=1.
     if side and mark and not _os.environ.get('WDB_JPTR_OFF'):
-        asked = db.__dict__.setdefault('_jptr_asked', set())
+        # THE SECOND ASK must be remembered across queries: this set lived in db.__dict__, which the
+        # per-query flush wiped, so every ask was the first -- cast_info's roads were never born
+        # and every JOB-COUNT query rebuilt a 36M-row pointer (0.55s) and threw it away
+        asked = _JPTR_ASKED
         key9 = (side,)
         if key9 in asked or _os.environ.get('WDB_JPTR_EAGER'):
             try:
@@ -5502,10 +5528,15 @@ def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
                 np.save(side + '.tmp.npy', ptr)
                 _os.replace(side + '.tmp.npy', side)
                 _js.dump(mark, open(side + '.mark', 'w'))
-            except Exception:
-                pass
+            except Exception as _e9:
+                if _os.environ.get('WDB_JOIN_BILL'):
+                    print('JOIN: road save failed for %s: %s' % (side, str(_e9)[:100]), flush=True)
         else:
             asked.add(key9)
+            if _os.environ.get('WDB_JOIN_BILL'):
+                print('JOIN: road first ask %s' % side, flush=True)
+    elif _os.environ.get('WDB_JOIN_BILL'):
+        print('JOIN: road not persistable (side=%s mark=%s)' % (bool(side), bool(mark)), flush=True)
     return ptr
 
 

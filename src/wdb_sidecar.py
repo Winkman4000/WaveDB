@@ -17,6 +17,7 @@ import os, re, sys, json, time
 FAMILIES = [
     (r'\.jptr\.npy$',            'road',           'N',  'wdb_join._hash_pointer'),
     (r'\.jptr\.npy\.mark$',      'road-mark',      '-',  'wdb_join._hash_pointer'),
+    (r'\.jptr\.npy\.no$',        'road-refusal',   '-',  'wdb_join._hash_pointer (not a pointer: remembered)'),
     (r'\.cnt\.npy$',             'census',         'V',  'wdb_join (count sidecar)'),
     (r'\.txz\.bin$',             'text-buffer',    'V',  'wdb_wherescan (joined dictionary text, zstd frames)'),
     (r'\.txi\.npy$',             'text-frames',    'V',  'wdb_wherescan (frame index)'),
