@@ -86,7 +86,9 @@ def execute(db, tree):
         except _FastUnsupported:
             raise _Decline('multi-segment table %s' % t)
         segs[a] = seg; pms[a] = db.cat.phys_map(t)
-        m = None
+    def _local_keep(a):
+        """PHASE 1, ISOLATION: one table's own filters, by itself (runs in the pool)"""
+        seg = segs[a]; m = None
         for c in local[a]:
             c2 = c.copy()
             for col in c2.find_all(E.Column):
@@ -105,8 +107,17 @@ def execute(db, tree):
                 try: wdb_shelf.SHELF.put(_pk9, _il9, int(_il9.nbytes), kind='predicate')
                 except Exception: pass
             m = mm if m is None else (m & mm)
-        keeps[a] = m if m is not None else np.ones(int(seg.N), bool)
-        if _bill is not None: _bill.append(('local %s(%d) keep=%d' % (a, int(seg.N), int(keeps[a].sum())), _tk() - _t0)); _t0 = _tk()
+        return m if m is not None else np.ones(int(seg.N), bool)
+    from concurrent.futures import ThreadPoolExecutor
+    _pool9 = ThreadPoolExecutor(max_workers=min(8, max(1, len(alias2t))))
+    futs = {a: _pool9.submit(_local_keep, a) for a in alias2t}     # THE STREAM: isolation runs concurrently;
+    for a in alias2t:                                                # a table with no filter is ready at once
+        if not local[a]:
+            keeps[a] = futs[a].result()
+    if os.environ.get('WDB_KEYSPACE', '1') == '0':
+        for a in alias2t:
+            keeps[a] = futs[a].result()
+            if _bill is not None: _bill.append(('local %s(%d) keep=%d' % (a, int(segs[a].N), int(keeps[a].sum())), _tk() - _t0)); _t0 = _tk()
     # key columns as int64 arrays (NULL -> -1)
     keycache = {}
     def keys(a, col):
@@ -115,6 +126,13 @@ def execute(db, tree):
         seg = segs[a]; pc = pms[a].get(col, col); cd = seg.cols.get(pc)
         if cd is None: raise _Decline('no such column %s.%s' % (a, col))
         if cd.get('dt') != 0: raise _Decline('non-integer join key %s.%s' % (a, col))
+        # THE KEY COLUMN ON THE SHELF: a join key of an immutable segment, decoded once per
+        # process as int32 (cast_info's three keys: 435 MB); a key set is then a gather and a
+        # bitmap, not a road walk and a binary search per step
+        _sk9 = ('keys', seg.path, pc)
+        _hit9 = wdb_shelf.SHELF.get(_sk9)
+        if _hit9 is not None:
+            keycache[k] = _hit9; return _hit9
         raw = wdb_sql.raw_dict_col(seg, pc, want_codes=False)
         codes = np.asarray(seg.codes(pc))
         if raw is not None:
@@ -126,6 +144,10 @@ def execute(db, tree):
             arr, nm = wdb_sql._col(seg, pc)
             out = np.asarray(arr).astype(np.int64)
             if nm is not None: out = np.where(nm, -1, out)
+        if out.size >= 1_000_000 and out.max() < (1 << 31) and out.min() >= -1:
+            out = out.astype(np.int32)
+            try: wdb_shelf.SHELF.put(_sk9, out, int(out.nbytes), kind='keys')
+            except Exception: pass
         keycache[k] = out
         return out
     def keys_at(a, col, idx):
@@ -288,10 +310,13 @@ def execute(db, tree):
         else:
             hit = np.isin(dst_keys, np.unique(sk))
         return dst_keep & hit
-    counts = {a: int(np.count_nonzero(k)) for a, k in keeps.items()}
+    counts = {a: int(np.count_nonzero(k)) for a, k in keeps.items() if a in keeps}
+    for a in alias2t:
+        if a not in keeps: keeps[a] = np.ones(int(segs[a].N), bool); counts[a] = int(segs[a].N)   # unrestricted until its filter lands
     if os.environ.get('WDB_KEYSPACE', '1') != '0':
-        _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inverted, rows_for_keys, pack, _bill, _tk)
+        _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inverted, rows_for_keys, pack, _bill, _tk, futs=futs, pool=_pool9, keycache=keycache)
         _t0 = _tk()
+        _pool9.shutdown(wait=False)
     else:
       for _round in range(12):
         changed = False
@@ -348,7 +373,7 @@ def execute(db, tree):
     return [tuple(out)], names
 
 
-def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inverted, rows_for_keys, pack, _bill, _tk):
+def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inverted, rows_for_keys, pack, _bill, _tk, futs=None, pool=None, keycache=None):
     """THE KEY-SPACE FIXPOINT (Jackson's two phases, 2026-09-14). Phase 1 -- isolation -- is done
     by the caller: every table has applied its own filters. Phase 2 -- the conjoined space:
     the join columns collapse into SHARED VALUE SPACES (one per equivalence class of equal
@@ -381,6 +406,7 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
     # ---- key sets: the live keys of a table's column (None = no restriction) ----
     full = {a: counts[a] == n_of[a] for a in alias2t}
     kcache = {}
+    keycache = keycache if keycache is not None else {}
     idx_of = {}        # THE LIVE ROW LIST per table, kept beside the bool keep: never re-derived per step
     def live_idx(a):
         if a not in idx_of: idx_of[a] = np.flatnonzero(keeps[a])
@@ -391,7 +417,11 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
         if ck in kcache: return kcache[ck]         # only changes when its table shrinks
         idx = live_idx(a)
         if idx.size == 0: return np.zeros(0, np.int64)
-        k = keys_at(a, c, idx) if idx.size * 4 < n_of[a] else keys(a, c)[idx]
+        _kc9 = keycache.get((a, c))
+        if _kc9 is None and n_of[a] >= 1_000_000:
+            try: _kc9 = keys(a, c)                      # decodes once per process, then shelved
+            except Exception: _kc9 = None
+        k = np.asarray(_kc9[idx], dtype=np.int64) if _kc9 is not None else (keys_at(a, c, idx) if idx.size * 4 < n_of[a] else keys(a, c)[idx])
         k = k[k >= 0]
         if k.size == 0:
             out = np.zeros(0, np.int64)
@@ -427,8 +457,27 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
             cur = ks if cur is None else _isect(cur, ks)
         scache[sk] = cur
         return cur
+    # THE STREAM (Jackson): isolation results land while phase 2 runs. A table whose filter has
+    # not finished is treated as UNRESTRICTED until it does -- monotone shrinking makes that
+    # safe: a late key set is one more shrink, never a correction. Every table starts as full;
+    # when its filter lands, it shrinks like any other step.
+    arrived = set()
+    def _land(a):
+        """take a finished isolation result for a (if ready); True if it landed now"""
+        if a in arrived or futs is None or a not in futs: return False
+        f = futs[a]
+        if not f.done(): return False
+        m = f.result(); arrived.add(a)
+        cnt = int(np.count_nonzero(m))
+        if cnt != counts[a]:
+            keeps[a] = m; counts[a] = cnt; full[a] = False; idx_of.pop(a, None)
+            return True
+        return False
+    if futs is not None:
+        for a in list(alias2t):
+            if futs[a].done(): _land(a)
     for r in spaces: live[r] = space_live(r)
-    bill('spaces %d' % len(spaces))
+    bill('spaces %d (isolation landed: %d/%d)' % (len(spaces), len(arrived), len(alias2t)))
     # ---- the worklist: tables whose spaces restrict them, smallest first ----
     def restrict(a):
         """re-derive a's rows against the live sets of its spaces; True if it shrank"""
@@ -472,11 +521,29 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
         return changed
     pending = set(alias2t)
     rounds = 0
-    while pending and rounds < 64:
+    def _refresh_spaces_of(a):
+        for c in cols_of[a]:
+            r = find((a, c)); old = live.get(r); new = space_live(r)
+            if new is not None and (old is None or new.size < old.size):
+                live[r] = new
+                for (b, _c) in spaces[r]:
+                    if b != a: pending.add(b)
+    while rounds < 256:
         rounds += 1
-        # the smallest table among those that could be restricted goes first; the giant waits
+        # anything that landed since the last step streams in now
+        if futs is not None:
+            for a in list(alias2t):
+                if a not in arrived and futs[a].done():
+                    if _land(a): _refresh_spaces_of(a); pending.add(a)
+                    else: arrived.add(a)
         cand = [a for a in pending if any(live.get(find((a, c))) is not None for c in cols_of[a])]
-        if not cand: break
+        if not cand:
+            # nothing to do until a slow isolation lands: wait for the next one
+            waiting = [a for a in alias2t if futs is not None and a not in arrived]
+            if not waiting: break
+            import concurrent.futures as _cf
+            _cf.wait([futs[a] for a in waiting], return_when=_cf.FIRST_COMPLETED)
+            continue
         # THE SMALLEST SIGNAL FIRST: the table whose restricting space is smallest goes next (a
         # keyword space of size 1 cuts mk to 24K, which hands title a 24K movie set instead of
         # mc's 1.15M) -- not the smallest table
@@ -488,15 +555,19 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
         before = counts[a]
         if restrict(a):
             bill('%s %d->%d' % (a, before, counts[a]))
-            # a shrank: its spaces may shrink; every member table of a shrunk space is pending again
-            for c in cols_of[a]:
-                r = find((a, c)); old = live.get(r); new = space_live(r)
-                if new is not None and (old is None or new.size < old.size):
-                    live[r] = new
-                    for (b, _c) in spaces[r]:
-                        if b != a: pending.add(b)
+            _refresh_spaces_of(a)                    # a shrank: its spaces may shrink; their members are pending again
         else:
             bill('%s %d (no change)' % (a, before))
+    if futs is not None:
+        for a in alias2t:                          # every isolation result must be in before the emit
+            if a not in arrived:
+                if _land(a): _refresh_spaces_of(a)
+                arrived.add(a)
+        while True:                                # and any shrinks it caused must settle
+            cand = [a for a in pending if any(live.get(find((a, c))) is not None for c in cols_of[a])]
+            if not cand or rounds >= 512: break
+            rounds += 1; a = min(cand, key=lambda x: counts[x]); pending.discard(a); before = counts[a]
+            if restrict(a): bill('%s %d->%d (settle)' % (a, before, counts[a])); _refresh_spaces_of(a)
     bill('keyspace rounds=%d' % rounds)
 
 
