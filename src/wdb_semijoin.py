@@ -47,45 +47,63 @@ def _conjuncts(node):
     return [node]
 
 
-def execute(db, tree):
+_PLANS = {}
+
+
+def execute(db, tree, sql=None):
     import wdb_sql, os, time
     _bill = [] if os.environ.get('WDB_SEMI_BILL') else None
     _tk = time.perf_counter; _t0 = _tk()
     from wdb_join import _solo_segment, _FastUnsupported, _bulk_keyvals
-    frm = tree.args.get('from') or tree.args.get('from_')
-    tabs = [frm.this] + [jn.this for jn in (tree.args.get('joins') or [])]
-    alias2t = {}
-    for t in tabs:
-        alias2t[t.alias or t.name] = t.name
-    conds = []
-    for c in _conjuncts(tree.args.get('where').this if tree.args.get('where') is not None else None):
-        conds.append(c)
-    for jn in (tree.args.get('joins') or []):
-        if jn.args.get('on') is not None: conds.extend(_conjuncts(jn.args['on']))
-    # column ownership
-    cols_of = {a: set(db.cat.column_names(t)) for a, t in alias2t.items()}
+    # THE PLAN CACHE (Jackson: known territory first): the query's shape -- aliases, join edges,
+    # local conjuncts, column ownership -- is the same every time the SQL is the same; parsed
+    # once per process and keyed by the SQL and the catalog stamp
+    _pk = (sql if sql is not None else tree.sql(), db._catalog_stamp() if hasattr(db, '_catalog_stamp') else None, id(db.cat))   # keyed by the SQL string: tree.sql() cost ~7ms per query
+    plan = _PLANS.get(_pk)
+    if plan is None:
+        frm = tree.args.get('from') or tree.args.get('from_')
+        tabs = [frm.this] + [jn.this for jn in (tree.args.get('joins') or [])]
+        alias2t = {}
+        for t in tabs:
+            alias2t[t.alias or t.name] = t.name
+        conds = []
+        for c in _conjuncts(tree.args.get('where').this if tree.args.get('where') is not None else None):
+            conds.append(c)
+        for jn in (tree.args.get('joins') or []):
+            if jn.args.get('on') is not None: conds.extend(_conjuncts(jn.args['on']))
+        # column ownership
+        cols_of = {a: set(db.cat.column_names(t)) for a, t in alias2t.items()}
+        def _owner(col):
+            if col.table: return col.table
+            cands = [a for a, cs in cols_of.items() if col.name in cs]
+            if len(cands) != 1: raise _Decline('ambiguous column %s' % col.name)
+            return cands[0]
+        edges, local = [], {a: [] for a in alias2t}
+        for c in conds:
+            if isinstance(c, E.EQ) and isinstance(c.this, E.Column) and isinstance(c.expression, E.Column):
+                a, b = _owner(c.this), _owner(c.expression)
+                if a != b:
+                    edges.append((a, c.this.name, b, c.expression.name)); continue
+            owners = {_owner(x) for x in c.find_all(E.Column)}
+            if len(owners) != 1: raise _Decline('multi-table non-equality conjunct: %s' % c.sql()[:50])
+            local[owners.pop()].append(c)
+        pms = {a: db.cat.phys_map(t) for a, t in alias2t.items()}
+        plan = _PLANS[_pk] = (alias2t, cols_of, edges, local, pms)
+        if len(_PLANS) > 512: _PLANS.pop(next(iter(_PLANS)))
+    alias2t, cols_of, edges, local, pms = plan
     def owner(col):
         if col.table: return col.table
         cands = [a for a, cs in cols_of.items() if col.name in cs]
         if len(cands) != 1: raise _Decline('ambiguous column %s' % col.name)
         return cands[0]
-    edges, local = [], {a: [] for a in alias2t}
-    for c in conds:
-        if isinstance(c, E.EQ) and isinstance(c.this, E.Column) and isinstance(c.expression, E.Column):
-            a, b = owner(c.this), owner(c.expression)
-            if a != b:
-                edges.append((a, c.this.name, b, c.expression.name)); continue
-        owners = {owner(x) for x in c.find_all(E.Column)}
-        if len(owners) != 1: raise _Decline('multi-table non-equality conjunct: %s' % c.sql()[:50])
-        local[owners.pop()].append(c)
-    # segments, local keeps
-    segs, pms, keeps = {}, {}, {}
+    # segments (a clean segment per table: tombstones/overrides decline by name inside _solo_segment)
+    segs, keeps = {}, {}
     for a, t in alias2t.items():
         try:
             seg, _ = _solo_segment(db, t)
         except _FastUnsupported:
             raise _Decline('multi-segment table %s' % t)
-        segs[a] = seg; pms[a] = db.cat.phys_map(t)
+        segs[a] = seg
     def _local_keep(a):
         """PHASE 1, ISOLATION: one table's own filters, by itself (runs in the pool)"""
         seg = segs[a]; m = None
@@ -488,7 +506,9 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
             mx = int(k.max())
             if mx < 200_000_000:
                 # A KEY SET IS A BITMAP, NOT A SORT: keys are dense ids; np.unique on 2.7M positions
-                # cost 1.27s, twice per key set, three key sets for cast_info (5.1s of a query)
+                # cost 1.27s, twice per key set, three key sets for cast_info (5.1s of a query).
+                # (a reused scratch bitmap was measured and rejected: np.zeros is a lazy calloc, nearly
+                # free, while flatnonzero over a size-class buffer scanned up to twice the entries)
                 lut = np.zeros(mx + 1, bool); lut[k] = True
                 out = np.flatnonzero(lut).astype(np.int64)
             else:

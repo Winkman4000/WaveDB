@@ -222,8 +222,28 @@ class BirthRefused(Exception):
     pass
 
 
+_fresh_cache = {}
+
+
 def is_fresh(dbdir, fname):
-    """A sidecar is TRUE only if it is newer than its segment (and its .mark, if any, matches)."""
+    """A sidecar is TRUE only if it is newer than its segment (and its .mark, if any, matches).
+    THE FRESHNESS CACHE: the verdict is remembered per process, keyed by the catalog's stamp --
+    a JOB query made 51 stat calls (20ms of 160) re-checking sidecars that cannot have changed
+    while the catalog has not."""
+    try:
+        st = os.stat(os.path.join(dbdir, 'catalog.json')); stamp = (st.st_mtime_ns, st.st_size)
+    except Exception:
+        stamp = None
+    ck = (dbdir, fname)
+    hit = _fresh_cache.get(ck)
+    if hit is not None and hit[0] == stamp and stamp is not None:
+        return hit[1]
+    v = _is_fresh_uncached(dbdir, fname)
+    if stamp is not None: _fresh_cache[ck] = (stamp, v)
+    return v
+
+
+def _is_fresh_uncached(dbdir, fname):
     p = os.path.join(dbdir, fname)
     mu = _UNION.match(fname)
     if mu is not None:

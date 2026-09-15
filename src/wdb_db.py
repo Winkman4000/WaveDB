@@ -658,7 +658,7 @@ class Database:
                 import wdb_semijoin
                 if wdb_semijoin.shape_ok(tree) and not wdb_semijoin._needs_weights(tree):
                     try:
-                        return wdb_semijoin.execute(self, tree)     # THE SEMI-JOIN FIXPOINT (MIN/MAX-only multi-joins): first
+                        return wdb_semijoin.execute(self, tree, sql=sql)     # THE SEMI-JOIN FIXPOINT (MIN/MAX-only multi-joins): first
                     except wdb_semijoin._Decline:
                         pass
                 if _os9.environ.get('WDB_JOIN_BILL'):
@@ -675,7 +675,7 @@ class Database:
                         # THE COUNTING FIXPOINT: last -- only when the road engine declines the join shape
                         if wdb_semijoin.shape_ok(tree) and wdb_semijoin._needs_weights(tree):
                             try:
-                                return wdb_semijoin.execute(self, tree)
+                                return wdb_semijoin.execute(self, tree, sql=sql)
                             except wdb_semijoin._Decline:
                                 pass
                         raise
