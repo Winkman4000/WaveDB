@@ -502,8 +502,7 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
                 if inv is not None:
                     r = rows_for_keys(inv, S)
                     bill('   %s.%s rows_for_keys %d' % (a, c, r.size)) if _bill is not None else None
-                    rows = r[keep[r]] if idx.size < n else r
-                    rows.sort()
+                    rows = r[keep[r]] if idx.size < n else r      # unsorted is fine: every consumer is order-free
             if rows is None:
                 dk = keys_at(a, c, idx) if idx.size * 4 < n else keys(a, c)[idx]
                 mx = int(max(S.max() if S.size else 0, dk.max() if dk.size else 0))
@@ -536,7 +535,11 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
                 if a not in arrived and futs[a].done():
                     if _land(a): _refresh_spaces_of(a); pending.add(a)
                     else: arrived.add(a)
-        cand = [a for a in pending if any(live.get(find((a, c))) is not None for c in cols_of[a])]
+        # ISOLATION FIRST, PER TABLE: a table whose own filter is still running is not restricted
+        # from the conjoined space yet -- its own cut is usually deeper and always cheaper (cast_info
+        # was cut to 12.7M rows by the role space, 787ms, while its note LIKE was about to cut it to 32K)
+        cand = [a for a in pending if any(live.get(find((a, c))) is not None for c in cols_of[a])
+                and (futs is None or a in arrived or futs[a].done())]
         if not cand:
             # nothing to do until a slow isolation lands: wait for the next one
             waiting = [a for a in alias2t if futs is not None and a not in arrived]
