@@ -13,6 +13,14 @@ def main():
     files = [f for f in files if os.path.basename(f)[0].isdigit()]
     def _alarm(sig, frm): raise TimeoutError('timeout')
     signal.signal(signal.SIGALRM, _alarm)
+    if '--warm' in sys.argv:
+        t0 = time.perf_counter(); n = 0
+        for f in files:
+            q = open(f).read().strip().rstrip(';'); q = re.sub(r'\bAS at\b', 'AS at1', q); q = re.sub(r'\bat\.', 'at1.', q)
+            m = re.search(r'\bFROM\b', q); q = 'SELECT COUNT(*) AS c ' + q[m.start():]
+            try: db.run(q); n += 1
+            except Exception: pass
+        print('WARM: %d queries in %.1fs' % (n, time.perf_counter() - t0), flush=True)
     tally = {}; wt = dt = 0.0; wins = 0; holes = {}
     for f in files:
         name = os.path.basename(f)[:-4]

@@ -470,7 +470,50 @@ def _like_mode5(seg, pc, pat, icase):
     _arr, isn, b, obj, buf, starts = got
     if '_' in pat or '\\' in pat: return None
     toks = [t for t in pat.split('%') if t != '']
+    if not icase and pat[:1] != '%' and toks and int(seg.N) >= 200_000:
+        # THE PREFIX ON THE RANK ROAD: an anchored prefix over an inline column is a contiguous
+        # range of the column's sorted order (the string rank road); ~22 point reads find it and
+        # only that range is verified -- 'Downey%Robert%' had chosen 'Robert' as its candidate
+        # token by LENGTH and verified every Robert (3.8s standalone, 0.6s in the organ)
+        r = _like_prefix_on_rank(seg, pc, b, isn, pat, toks[0].encode())
+        if r is not None: return r
     return _like_joined(b, isn, pat, icase, toks, pat[:1] != '%', pat[-1:] != '%', joined=(buf, starts))
+
+
+def _like_prefix_on_rank(seg, pc, b, isn, pat, prefix):
+    import re as _re, wdb_semijoin, wdb_shelf
+    try:
+        rank = wdb_semijoin._string_rank(seg, pc)
+    except Exception:
+        return None
+    if rank is None or rank.size != len(b): return None
+    okey = ('sorder', seg.path, pc)
+    order = wdb_shelf.SHELF.get(okey)
+    if order is None:
+        order = np.argsort(rank, kind='stable').astype(np.int32)     # rank -> row (NULLs, rank -1, sort first)
+        try: wdb_shelf.SHELF.put(okey, order, int(order.nbytes), kind='string-order')
+        except Exception: pass
+    n = order.size
+    def val(i):
+        v = b[int(order[i])]
+        return b'' if v is None else (v if isinstance(v, (bytes, bytearray)) else str(v).encode())
+    def bisect_left(key):
+        lo, hi = 0, n
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if val(mid) < key: lo = mid + 1
+            else: hi = mid
+        return lo
+    lo = bisect_left(prefix); hi = bisect_left(prefix + b'\xff\xff\xff\xff')
+    out = np.zeros(len(b), bool)
+    if hi <= lo: return out
+    rx = _re.compile('^' + _re.escape(pat).replace('%', '.*') + '$', _re.S)
+    for i in range(lo, hi):
+        j = int(order[i])
+        if not isn[j]:
+            v = b[j]; v = v if isinstance(v, (bytes, bytearray)) else str(v).encode()
+            if rx.match(v.decode('utf-8', 'replace')): out[j] = True
+    return out
 
 
 

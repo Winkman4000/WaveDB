@@ -88,6 +88,16 @@ def execute(db, tree, sql=None):
             if len(owners) != 1: raise _Decline('multi-table non-equality conjunct: %s' % c.sql()[:50])
             local[owners.pop()].append(c)
         pms = {a: db.cat.phys_map(t) for a, t in alias2t.items()}
+        # the table-stripped conjunct copies belong in the plan too: 2,440 deepcopy calls per query
+        # (95ms of a 310ms query) were rebuilding them
+        for a in alias2t:
+            stripped = []
+            for c in local[a]:
+                c2 = c.copy()
+                for col in c2.find_all(E.Column):
+                    col.set('table', None)
+                stripped.append(c2)
+            local[a] = stripped
         plan = _PLANS[_pk] = (alias2t, cols_of, edges, local, pms)
         if len(_PLANS) > 512: _PLANS.pop(next(iter(_PLANS)))
     alias2t, cols_of, edges, local, pms = plan
@@ -107,10 +117,7 @@ def execute(db, tree, sql=None):
     def _local_keep(a):
         """PHASE 1, ISOLATION: one table's own filters, by itself (runs in the pool)"""
         seg = segs[a]; m = None
-        for c in local[a]:
-            c2 = c.copy()
-            for col in c2.find_all(E.Column):
-                col.set('table', None)
+        for c2 in local[a]:                            # already table-stripped, in the plan
             # THE PREDICATE SHELF: a local predicate's result on an immutable segment is a fact --
             # kept as an index list on the shelf across queries (JOB's 113 queries reuse the same
             # few filters on the same big tables: mi.info LIKE ... on 14.8M rows was 392ms, every

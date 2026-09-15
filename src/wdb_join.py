@@ -3349,6 +3349,11 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     def _str_codes(seg, pcol):
         c = seg.cols[pcol]
         if c['dt'] != 1 or c['mode'] == 4: return None        # only value-identity string dicts
+        if c['mode'] == 5 and int(seg.N) >= 200_000:
+            # AN INLINE COLUMN HAS NO USEFUL CODES: V ~ N, and factorising 4.2M names to build a
+            # code lookup for a LIKE cost 4s before the door DECLINED anyway (name LIKE 'Downey%').
+            # Decline by name here, before the work, not after it.
+            raise _FastUnsupported
         # code_of ({value_bytes: code}) is expensive to build for a high-card dict (e.g. 18M URLs ~8s).
         # It depends only on the column's dictionary, so cache it on the segment -- built at most once
         # per column, not once per query.
