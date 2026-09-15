@@ -1424,7 +1424,8 @@ class Segment:
             import os as _os
             fn = self.path + '.' + nm + '.cnt.npy'
             try:
-                if _os.path.exists(fn) and _os.path.getmtime(fn) >= _os.path.getmtime(self.path):
+                import wdb_sidecar as _wsc9
+                if _wsc9.exists(fn) and _wsc9.is_fresh(_os.path.dirname(self.path), _os.path.basename(fn)):
                     v9 = np.load(fn, mmap_mode='r')
                     if v9.shape[0] == int(self.cols[nm]['V']):
                         cc[nm] = v9

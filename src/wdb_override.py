@@ -15,6 +15,15 @@ Stored per column: {col_name: (row_idx uint32[k], vals object/typed[k])}, row_id
 """
 import os, pickle, numpy as np
 
+
+def _touch_stamp(dbdir):
+    """A DML WRITE MOVES THE CATALOG STAMP: every per-process verdict about a segment's cleanness
+    (hot buffer, overrides, tombstones) is memoised under that stamp, so it must move when the
+    truth does; the catalog's contents are unchanged, its mtime is the signal"""
+    import os as _o
+    try: _o.utime(_o.path.join(dbdir, 'catalog.json'), None)
+    except Exception: pass
+
 def path_for(seg_path):
     return seg_path + '.overrides'
 
@@ -31,6 +40,7 @@ def save(seg_path, overrides):
     with open(tmp, 'wb') as f:
         pickle.dump(overrides, f, protocol=4)
     os.replace(tmp, p)   # atomic
+    _touch_stamp(os.path.dirname(p))
 
 def set_override(seg_path, col, row_idx, vals):
     """Merge overrides for one column; later writes win on a row. Persists the sidecar."""

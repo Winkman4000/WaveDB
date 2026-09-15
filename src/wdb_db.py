@@ -104,11 +104,8 @@ class Database:
     def create(cls, dbdir): return cls(Catalog.create(dbdir))
 
     def _catalog_stamp(self):
-        try:
-            st = os.stat(os.path.join(self.cat.dbdir, 'catalog.json'))
-            return (st.st_mtime_ns, st.st_size)
-        except Exception:
-            return None
+        import wdb_sidecar
+        return wdb_sidecar._catalog_stamp(self.cat.dbdir)      # the registry's ttl-cached stamp (one stat per 0.25s)
 
     def refresh(self):
         """THE CATALOG IS THE TRUTH: a long-lived engine re-reads it when another process has

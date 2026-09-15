@@ -15,6 +15,15 @@ file: magic WPRS2, then entries of <H name_len><name><I N><I nbytes><packed bits
 import os, struct
 import numpy as np
 
+
+def _touch_stamp(dbdir):
+    """A DML WRITE MOVES THE CATALOG STAMP: every per-process verdict about a segment's cleanness
+    (hot buffer, overrides, tombstones) is memoised under that stamp, so it must move when the
+    truth does; the catalog's contents are unchanged, its mtime is the signal"""
+    import os as _o
+    try: _o.utime(_o.path.join(dbdir, 'catalog.json'), None)
+    except Exception: pass
+
 _MAGIC = b'WPRS2'
 _OLD_MAGIC = b'WPRS1'
 
@@ -64,6 +73,7 @@ def _write_table(p, entries):
     with open(tmp, 'wb') as f:
         f.write(b''.join(parts)); f.flush(); os.fsync(f.fileno())
     os.replace(tmp, p)
+    _touch_stamp(os.path.dirname(p))
 
 
 def _legacy(seg_path, N):

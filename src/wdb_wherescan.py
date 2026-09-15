@@ -408,7 +408,7 @@ def char_lengths(seg, col):
     lp = base + '.' + col + '.clen.npy'
     import wdb_sidecar
     dbdir = os.path.dirname(base)
-    if os.path.exists(lp) and wdb_sidecar.is_fresh(dbdir, os.path.basename(lp)):
+    if wdb_sidecar.exists(lp) and wdb_sidecar.is_fresh(dbdir, os.path.basename(lp)):
         return np.load(lp)
     hay, offs = _text_buffer(seg, col)            # births the framed text if needed
     V = int(offs.size) - 1
@@ -445,7 +445,8 @@ def _text_buffer(seg, col):
     ip = (base + '.' + col + '.txi.npy') if base else None          # the frame index
     op = (base + '.' + col + '.txo.npy') if base else None          # value offsets
     hay = offs = None
-    if tp and os.path.exists(tp) and os.path.exists(op) and os.path.exists(ip):
+    import wdb_sidecar as _wsc
+    if tp and _wsc.exists(tp) and _wsc.exists(op) and _wsc.exists(ip):
         try:
             import wdb_sidecar
             dbdir = os.path.dirname(base)

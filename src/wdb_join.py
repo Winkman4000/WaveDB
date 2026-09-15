@@ -2978,7 +2978,39 @@ def _fast_detect(db, lt, la, rt, ra, lk, rk):
     return None
 
 
+_SOLO_MEMO = {}
+
+
 def _solo_segment(db, name):
+    """THE CLEAN VERDICT, MEMOISED: 'this table is one clean segment (or a clean union)' asked the
+    filesystem ~53 times per JOB query (hot buffer, overrides, tombstones, per table). The verdict
+    can only change when DML or compaction writes, and both move the catalog stamp now."""
+    stamp = db._catalog_stamp() if hasattr(db, '_catalog_stamp') else None
+    mk = (id(db), name, stamp)
+    hit = _SOLO_MEMO.get(mk) if stamp is not None else None
+    if hit is not None:
+        if hit == 'decline': raise _FastUnsupported
+        seg9, p9 = hit
+        # the segment object may have been dropped by refresh(): re-open from the cache by path
+        try:
+            if getattr(seg9, 'segs', None) is None: seg9 = db.open_segment(p9, name)
+        except Exception:
+            _SOLO_MEMO.pop(mk, None); return _solo_segment(db, name)
+        return seg9, p9
+    try:
+        r = _solo_segment_uncached(db, name)
+    except _FastUnsupported:
+        if stamp is not None:
+            _SOLO_MEMO[mk] = 'decline'
+            if len(_SOLO_MEMO) > 4096: _SOLO_MEMO.clear()
+        raise
+    if stamp is not None:
+        _SOLO_MEMO[mk] = r
+        if len(_SOLO_MEMO) > 4096: _SOLO_MEMO.clear()
+    return r
+
+
+def _solo_segment_uncached(db, name):
     paths = db.cat.segment_paths(name)
     if os.path.exists(wdb_dml.hot_path(db.cat, name)): raise _FastUnsupported
     import wdb_override
@@ -5454,14 +5486,15 @@ def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
                     'ck': cp, 'pk': pp}
         except Exception:
             side = None
-        if side and _os.path.exists(side + '.mark') and not _os.path.exists(side):
+        import wdb_sidecar as _wsc
+        if side and _wsc.exists(side + '.mark') and not _wsc.exists(side):
             # FAIL LOUD: a birthmark without its body is a lie -- remove it so the
             # rebirth below persists cleanly (a 480MB road was rehashing every
             # query for a day behind an orphan mark, 2026-08-30).
             print('ROAD: orphan birthmark without body, removing: %s' % side, flush=True)
             try: _os.remove(side + '.mark')
             except Exception: pass
-        if side and _os.path.exists(side) and _os.path.exists(side + '.mark'):
+        if side and _wsc.exists(side) and _wsc.exists(side + '.mark'):
             try:
                 # THE BIRTHMARK (plist regime): the sidecar names BOTH parents'
                 # identity (path+size+mtime) and the key pair; any mismatch is a
@@ -5490,7 +5523,7 @@ def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
     if side and mark:
         if side in _JPTR_NOT: raise _FastUnsupported
         try:
-            if _os.path.exists(side + '.no') and _js.load(open(side + '.no')) == mark:
+            if _wsc.exists(side + '.no') and _js.load(open(side + '.no')) == mark:
                 _JPTR_NOT.add(side); raise _FastUnsupported
         except _FastUnsupported:
             raise

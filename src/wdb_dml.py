@@ -16,6 +16,15 @@ _CANON = {'int': 'int', 'integer': 'int', 'bigint': 'int', 'int64': 'int', 'int3
           'float': 'float', 'double': 'float', 'real': 'float', 'float64': 'float', 'decimal': 'float', 'numeric': 'float',
           'string': 'string', 'str': 'string', 'varchar': 'string', 'text': 'string', 'char': 'string', 'utf8': 'string',
           'datetime': 'datetime', 'timestamp': 'datetime', 'date': 'datetime', 'datetime64': 'datetime', 'bool': 'int', 'boolean': 'int'}
+
+def _touch_stamp(dbdir):
+    """A DML WRITE MOVES THE CATALOG STAMP: every per-process verdict about a segment's cleanness
+    (hot buffer, overrides, tombstones) is memoised under that stamp, so it must move when the
+    truth does; the catalog's contents are unchanged, its mtime is the signal"""
+    import os as _o
+    try: _o.utime(_o.path.join(dbdir, 'catalog.json'), None)
+    except Exception: pass
+
 def _wtype(t):
     """catalog type names come in many spellings (str, varchar, int64...): one canonical name"""
     return _CANON.get(str(t).lower(), str(t).lower())
@@ -115,6 +124,7 @@ def _append_parquet(path, df_new):
     df.to_parquet(tmp, index=False)
     with open(tmp, 'rb') as f: os.fsync(f.fileno())
     os.replace(tmp, path)                              # THE RENAME LAW: never a half-written buffer
+    _touch_stamp(os.path.dirname(path))
     return df
 
 def _encode_segment(catalog, name, src_parquet):

@@ -224,6 +224,40 @@ class BirthRefused(Exception):
 
 
 _fresh_cache = {}
+_stamp_cache = {}
+_exists_cache = {}
+
+
+def exists(path, neg_ttl=2.0):
+    """THE REMEMBERED EXISTENCE: sidecar loaders asked the filesystem the same question ~53 times
+    per query. A positive answer holds until the directory's catalog stamp moves; a negative
+    one for neg_ttl seconds (a birth can flip it)."""
+    import time as _t
+    d = os.path.dirname(path); stamp = _catalog_stamp(d)
+    hit = _exists_cache.get(path)
+    now = _t.monotonic()
+    if hit is not None:
+        ok, st, t = hit
+        if ok and st == stamp: return True
+        if not ok and now - t < neg_ttl: return False
+    ok = os.path.exists(path)
+    _exists_cache[path] = (ok, stamp, now)
+    if len(_exists_cache) > 20000: _exists_cache.clear()
+    return ok
+
+
+def _catalog_stamp(dbdir, ttl=0.25):
+    """the catalog's (mtime, size), re-read at most every ttl seconds -- 422 stat calls per eight
+    queries were 0.13s of a 1.97s profile, each re-checking a stamp that had not moved"""
+    import time as _t
+    now = _t.monotonic(); hit = _stamp_cache.get(dbdir)
+    if hit is not None and now - hit[0] < ttl: return hit[1]
+    try:
+        st = os.stat(os.path.join(dbdir, 'catalog.json')); stamp = (st.st_mtime_ns, st.st_size)
+    except Exception:
+        stamp = None
+    _stamp_cache[dbdir] = (now, stamp)
+    return stamp
 
 
 def is_fresh(dbdir, fname):
@@ -231,10 +265,7 @@ def is_fresh(dbdir, fname):
     THE FRESHNESS CACHE: the verdict is remembered per process, keyed by the catalog's stamp --
     a JOB query made 51 stat calls (20ms of 160) re-checking sidecars that cannot have changed
     while the catalog has not."""
-    try:
-        st = os.stat(os.path.join(dbdir, 'catalog.json')); stamp = (st.st_mtime_ns, st.st_size)
-    except Exception:
-        stamp = None
+    stamp = _catalog_stamp(dbdir)
     ck = (dbdir, fname)
     hit = _fresh_cache.get(ck)
     if hit is not None and hit[0] == stamp and stamp is not None:

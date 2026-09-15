@@ -49,6 +49,52 @@ def _conjuncts(node):
 
 _PLANS = {}
 
+from numba import njit
+
+
+@njit(nogil=True, cache=True)
+def _postings_kernel(u, offs, order, sk):
+    """THE POSTINGS KERNEL: the rows of a key set through the reverse road -- searchsorted,
+    the range arithmetic and the order gather as ONE pass (five numpy passes and an mmap gather
+    were ~0.4s of a 2s profile)"""
+    m = sk.size
+    total = 0
+    hits = np.empty(m, np.int64); nh = 0
+    for i in range(m):
+        k = sk[i]
+        lo = 0; hi = u.size
+        while lo < hi:
+            mid = (lo + hi) >> 1
+            if u[mid] < k: lo = mid + 1
+            else: hi = mid
+        if lo < u.size and u[lo] == k:
+            hits[nh] = lo; nh += 1; total += offs[lo + 1] - offs[lo]
+    out = np.empty(total, np.int64); p = 0
+    for j in range(nh):
+        h = hits[j]
+        for q in range(offs[h], offs[h + 1]):
+            out[p] = order[q]; p += 1
+    return out
+
+
+@njit(nogil=True, cache=True)
+def _keyset_kernel(col, idx, mx):
+    """THE KEY-SET KERNEL: gather the keys at the live rows, mark them in a bitmap, compact to a
+    sorted unique array -- one pass in, one pass out (gather / mask / zeros / scatter / nonzero
+    were five)"""
+    mark = np.zeros(mx + 1, np.bool_)
+    n = 0
+    for i in range(idx.size):
+        k = col[idx[i]]
+        if k >= 0:
+            if not mark[k]:
+                mark[k] = True; n += 1
+    out = np.empty(n, np.int64); p = 0
+    for k in range(mx + 1):
+        if mark[k]:
+            out[p] = k; p += 1
+    return out
+
 
 def execute(db, tree, sql=None):
     import wdb_sql, os, time
@@ -225,7 +271,7 @@ def execute(db, tree, sql=None):
         fn = ('%s.%s.inv' % (path, pc)) if path else None       # three mmap'd .npy files: u / offs / order
         import wdb_sidecar
         try:
-            if fn and __import__('os').path.exists(fn + '.rank.npy') \
+            if fn and wdb_sidecar.exists(fn + '.rank.npy') \
                     and wdb_sidecar.is_fresh(__import__('os').path.dirname(path), __import__('os').path.basename(fn + '.rank.npy')):
                 # THE BIRTHMARK: a sidecar older than its segment is false by construction
                 u = np.load(fn + '.u.npy'); offs = np.load(fn + '.offs.npy')
@@ -262,6 +308,11 @@ def execute(db, tree, sql=None):
         """THE ROWS OF A KEY SET: the reverse road's postings for the keys in sk, as row positions --
         cost proportional to the rows matched, no N-scale bitmap"""
         u, offs, order, _rank = inv
+        if sk.size and sk.size <= 4_000_000:
+            try:
+                return _postings_kernel(np.asarray(u, dtype=np.int64), np.asarray(offs, dtype=np.int64), np.asarray(order), np.asarray(sk, dtype=np.int64))
+            except Exception:
+                pass
         pos = np.searchsorted(u, sk)
         ok = pos < u.size
         pos = pos[ok]; skk = sk[ok]
@@ -419,7 +470,7 @@ def _string_rank(seg, pc):
     fn = seg.path + '.' + pc + '.srank.npy'
     try:
         import wdb_sidecar
-        if os.path.exists(fn) and wdb_sidecar.is_fresh(os.path.dirname(seg.path), os.path.basename(fn)):
+        if wdb_sidecar.exists(fn) and wdb_sidecar.is_fresh(os.path.dirname(seg.path), os.path.basename(fn)):
             r = np.load(fn)
             try: wdb_shelf.SHELF.put(key, r, int(r.nbytes), kind='string-rank')
             except Exception: pass
@@ -490,6 +541,7 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
     # ---- key sets: the live keys of a table's column (None = no restriction) ----
     full = {a: counts[a] == n_of[a] for a in alias2t}
     kcache = {}
+    kmax = {}
     keycache = keycache if keycache is not None else {}
     idx_of = {}        # THE LIVE ROW LIST per table, kept beside the bool keep: never re-derived per step
     def live_idx(a):
@@ -505,6 +557,13 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
         if _kc9 is None and n_of[a] >= 1_000_000:
             try: _kc9 = keys(a, c)                      # decodes once per process, then shelved
             except Exception: _kc9 = None
+        if _kc9 is not None:
+            mxk = kmax.get((a, c))
+            if mxk is None: mxk = kmax[(a, c)] = int(_kc9.max()) if _kc9.size else 0
+            if 0 <= mxk < 200_000_000:
+                out = _keyset_kernel(np.asarray(_kc9), np.asarray(idx, dtype=np.int64), mxk)     # THE KEY-SET KERNEL
+                kcache[ck] = out
+                return out
         k = np.asarray(_kc9[idx], dtype=np.int64) if _kc9 is not None else (keys_at(a, c, idx) if idx.size * 4 < n_of[a] else keys(a, c)[idx])
         k = k[k >= 0]
         if k.size == 0:
