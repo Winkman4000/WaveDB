@@ -1436,7 +1436,7 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
         for _p, kind in agg_specs:
             if kind is None or kind[0] in ('COUNT_STAR',): continue
             fn, cn = kind
-            fkey = (fn, cn if not isinstance(cn, tuple) else cn)
+            fkey = (fn, cn)
             if fn == 'COUNT' and cn is None: continue
             # build the value array (+ null mask) for cn, then bincount-scatter into groups
             if isinstance(cn, tuple) and cn[0] == 'sfn':

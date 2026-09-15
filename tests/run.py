@@ -20,7 +20,28 @@ def _scoreboard():
                 print("  " + l.replace('**', '').replace('|', ' ').strip())
         print("  regenerate: python bench/report.py   (or tests/run.py --report)")
 
+def _static_gate():
+    """THE STATIC GATE (Jackson, 2026-09-15): a one-second lint with ZERO false positives on this
+    codebase -- undefined names, invalid syntax-level errors, mutable defaults, closures over loop
+    variables -- run before the four-minute suite so a typo is caught first. Rules chosen by
+    measurement: E711 (`!= None`) is EXCLUDED because it is right on numpy object arrays. Skipped
+    when ruff is not installed."""
+    import shutil, subprocess, sys as _s
+    ruff = shutil.which('ruff') or (_s.executable.rsplit('/', 1)[0] + '/ruff')
+    import os
+    if not os.path.exists(ruff): return True
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src')
+    r = subprocess.run([ruff, 'check', '--select', 'F821,F822,F823,PLE,B006,B008,B023', '--quiet', src], capture_output=True, text=True)
+    if r.returncode != 0:
+        print('STATIC GATE FAILED:\n' + (r.stdout + r.stderr)[-2000:], flush=True)
+        return False
+    print('static gate: clean', flush=True)
+    return True
+
+
 def main():
+    if not _static_gate():
+        sys.exit(2)
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
     filt = args[0] if args else ''
     mods = sorted(f[:-3] for f in os.listdir(HERE)

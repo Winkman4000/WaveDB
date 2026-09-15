@@ -2680,7 +2680,7 @@ def join_query(db, sql, columnar=False):
     if _how9 in ('inner', 'right') and pre_l:
         for x in pre_l: ldf = ldf[_mask_df(ldf, x)]
     if _how9 == 'inner':
-        mixed = mixed + ([] if pre_r else []) 
+        pass                                            # inner: pre-filters already applied on both sides
     elif _how9 == 'left' and pre_l:
         mixed = mixed + pre_l          # a left-side ON filter on a LEFT join only unmatches (post, as NULL-safe filter below)
     elif _how9 == 'right' and pre_r:
@@ -4594,10 +4594,6 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 _hashed_done9 = True
             else:
                 _hashed_done9 = False
-            if _hashed_done9:
-                pass
-            elif True:
-                pass
             # THE LEADING-RUN COURT (decode-spec law: group keys are IDENTITY
             # class -- never gather 60M co-key codes to label 1.1M groups).
             # Gate, proven exactly and gather-free: leading key fact-direct and
@@ -5391,7 +5387,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         elif r[0] == 'count':
             col_lists.append(counts[present].tolist())
         else:
-            picked = r[1][present] if _sel9 is None else r[1][present]
+            picked = r[1][present]                       # present is already narrowed by _sel9
             if r[2]:                                      # datetime epoch -> datetime64 -> _pyval string
                 unit = r[3]
                 col_lists.append([(wdb_sql._pyval(np.int64(v).view(f'datetime64[{unit}]')) if v is not None

@@ -1044,25 +1044,6 @@ class Segment:
         _WK15.e15_band_lut(Y5, M5, D5, DL5, BB5, role, ystart, mcum,
                            day_lo, day_hi, out)
         return out
-        def _wb(j9):
-            import zstandard as _zs15
-            dz9 = _zs15.ZstdDecompressor()
-            pls9 = []
-            for p9 in range(5):
-                a9 = st[p9] + int(offs[p9][j9]); b9 = st[p9] + int(offs[p9][j9 + 1])
-                pls9.append(np.frombuffer(dz9.decompress(self.buf[a9:b9].tobytes()), np.uint8))
-            l9 = j9 * FR
-            _WK15.e15_band_chunk(pls9[0], pls9[1], pls9[2], pls9[3], pls9[4],
-                                 role, ca['ybase'], int(day_lo), int(day_hi),
-                                 out[l9:l9 + pls9[0].size])
-        if nfr > 1:
-            from concurrent.futures import ThreadPoolExecutor as _TPb
-            with _TPb(max_workers=min(nfr, 8)) as exb:
-                list(exb.map(_wb, range(nfr)))
-        else:
-            _wb(0)
-        return out
-
     def cost_of(self, nm, n):
         """THE COST CURVE: predicted serve cost (ms) for this column at n
         rows -- cost = a + b*n. a is the fixed stream floor (stored bytes at

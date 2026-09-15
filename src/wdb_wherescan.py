@@ -973,7 +973,7 @@ def _span_rows(seg, spans):
     for col, val, op in spans:
         st = seg.stairs(col)
         V = int(seg.cols[col]['V']) - (1 if seg.cols[col]['has_null'] else 0)
-        def row_of(code):                        # first row of a code (code==V -> N)
+        def row_of(code, st=st, V=V):            # first row of a code (code==V -> N); bound, not late-bound
             if code <= 0: return 0
             return int(seg.N) if code >= V else (int(st[code - 1]) if code - 1 < st.size else int(seg.N))
         if op == '=':
