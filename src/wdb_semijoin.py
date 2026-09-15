@@ -5,6 +5,7 @@ Participation is a fixpoint: local filters seed each table's keep; every
 equality edge prunes both sides to the other's surviving keys (dense-id
 lookup tables, O(N)); iterate to stability; MIN/MAX per column over its
 table's survivors (strings by the extreme present dictionary code)."""
+import os
 import numpy as np
 import wdb_shelf
 import sqlglot
@@ -83,12 +84,18 @@ def _keyset_kernel(col, idx, mx):
     sorted unique array -- one pass in, one pass out (gather / mask / zeros / scatter / nonzero
     were five)"""
     mark = np.zeros(mx + 1, np.bool_)
+    touched = np.empty(idx.size, np.int64)
     n = 0
     for i in range(idx.size):
         k = col[idx[i]]
         if k >= 0:
             if not mark[k]:
-                mark[k] = True; n += 1
+                mark[k] = True; touched[n] = k; n += 1
+    # PROPORTIONAL TO n, NOT TO THE ID SPACE: a table with 300 live rows compacts by sorting its
+    # 300 keys, not by sweeping 4M bitmap entries (15 sweeps x 3ms per query)
+    if n * 400 < mx:                                   # only when n is tiny: a 4M sweep is ~4ms, a 250K sort ~20ms
+        out = touched[:n].copy(); out.sort()
+        return out
     out = np.empty(n, np.int64); p = 0
     for k in range(mx + 1):
         if mark[k]:
@@ -617,7 +624,8 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
             m = m & keeps[a]                      # A LANDING INTERSECTS: cuts the spaces already made are kept
         cnt = int(np.count_nonzero(m))            # (an overwrite here discarded them; the applied-space skip then
         if cnt != counts[a]:                      #  removed the accidental repair -- JOB 3b answered '#1' for '11,830,420')
-            keeps[a] = m; counts[a] = cnt; full[a] = False; idx_of.pop(a, None)
+            keeps[a] = m; counts[a] = cnt; full[a] = False
+            idx_of[a] = np.flatnonzero(m)         # the live list, once, here -- only for a table that shrank
             return True
         return False
     if futs is not None:
@@ -700,12 +708,12 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
             import concurrent.futures as _cf
             _cf.wait([futs[a] for a in waiting], return_when=_cf.FIRST_COMPLETED)
             continue
-        # THE SMALLEST SIGNAL FIRST: the table whose restricting space is smallest goes next (a
-        # keyword space of size 1 cuts mk to 24K, which hands title a 24K movie set instead of
-        # mc's 1.15M) -- not the smallest table
         def _signal(x):
             sz = [live[find((x, c))].size for c in cols_of[x] if live.get(find((x, c))) is not None]
             return (min(sz) if sz else 1 << 62, counts[x])
+        # THE SMALLEST SIGNAL FIRST: the table whose restricting space is smallest goes next (a
+        # keyword space of size 1 cuts mk to 24K, which hands title a 24K movie set instead of
+        # mc's 1.15M) -- not the smallest table
         a = min(cand, key=_signal)
         pending.discard(a)
         before = counts[a]
