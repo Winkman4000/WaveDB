@@ -518,14 +518,23 @@ def _like_joined(b, isn, pat, icase, toks, anchored_start, anchored_end, joined=
         buf = buf.lower(); toks = [t.lower() for t in toks]
     # the rarest token = the longest one; scan for it
     tok = max(toks, key=len).encode()
-    hits = []
-    p = buf.find(tok)
-    while p >= 0:
-        hits.append(p); p = buf.find(tok, p + 1)
-        if len(hits) > 5_000_000: return None
-    if not hits:
-        return np.zeros(len(b), bool)
-    rows = np.unique(np.searchsorted(starts, np.asarray(hits, dtype=np.int64), side='right') - 1)
+    if len(tok) >= 2 and len(buf) >= (1 << 20):
+        # THE PARALLEL NEEDLE (nogil): the isolation pool only overlaps when its work releases the
+        # GIL -- the Python find loop over a 100 MB inline column held it (mi.info LIKE: 380ms)
+        import wdb_wherescan
+        hits_a = wdb_wherescan._find_all_kernel(np.frombuffer(buf, dtype=np.uint8), np.frombuffer(tok, dtype=np.uint8))
+        if hits_a.size > 5_000_000: return None
+        if hits_a.size == 0: return np.zeros(len(b), bool)
+        rows = np.unique(np.searchsorted(starts, hits_a, side='right') - 1)
+    else:
+        hits = []
+        p = buf.find(tok)
+        while p >= 0:
+            hits.append(p); p = buf.find(tok, p + 1)
+            if len(hits) > 5_000_000: return None
+        if not hits:
+            return np.zeros(len(b), bool)
+        rows = np.unique(np.searchsorted(starts, np.asarray(hits, dtype=np.int64), side='right') - 1)
     rx = '^' + _re.escape(pat).replace('%', '.*') + '$'
     cre = _re.compile(rx, (_re.I if icase else 0) | _re.S)
     out = np.zeros(len(b), bool)
