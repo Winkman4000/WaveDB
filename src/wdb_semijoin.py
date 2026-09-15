@@ -433,18 +433,26 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
     def restrict(a):
         """re-derive a's rows against the live sets of its spaces; True if it shrank"""
         changed = False
-        for c in cols_of[a]:
+        # THE SMALLEST SIGNAL FIRST, within the table too: cast_info's movie space (1.38M keys)
+        # gathered 21M postings and sorted them (1.45s) before its person space (2 keys, 486 rows)
+        # got its turn; the columns run in order of their live space's size
+        order9 = sorted(cols_of[a], key=lambda c: (live[find((a, c))].size if live.get(find((a, c))) is not None else 1 << 62))
+        for c in order9:
             r = find((a, c)); S = live.get(r)
             if S is None: continue
             keep = keeps[a]; n = n_of[a]
             if counts[a] == 0: return changed
+            _tq = _tk()
             idx = live_idx(a)
+            bill('   %s.%s live_idx %d' % (a, c, idx.size)) if _bill is not None else None
             rows = None
             if n >= 1_000_000 and S.size * 8 < n and S.size * 4 < idx.size:
                 # the giant, cut by a small space: the road's postings, then only those already live
                 inv = inverted(a, [c])
+                bill('   %s.%s inverted' % (a, c)) if _bill is not None else None
                 if inv is not None:
                     r = rows_for_keys(inv, S)
+                    bill('   %s.%s rows_for_keys %d' % (a, c, r.size)) if _bill is not None else None
                     rows = r[keep[r]] if idx.size < n else r
                     rows.sort()
             if rows is None:
