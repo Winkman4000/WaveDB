@@ -1379,3 +1379,21 @@ settled) in one pass, ~15 steps to ~4; the same algorithm at a coarser
 grain; the only thing expected to move a board beyond the noise short
 of a compiled orchestrator. Also owed: the regex verify in numba; the
 weights during the settle; JOB first-touch as a load step.
+
+
+## SEAL 2026-09-15 (afternoon): the step count was not the floor; the static gate
+FEWER, BIGGER STEPS (the level-wise fixpoint): measured neutral (2.54s
+-> 2.46s over 12 queries) and WRONG on 19d -- it converged early
+(cast_info cut once and never revisited; a superset fed the emit).
+Removed; the one-at-a-time loop stands. Kept: compaction by sorting
+only when n is tiny (a 4M sweep is ~4ms, a 250K sort ~20ms), the live
+list built once at a landing and only for a table that shrank. Net 3%.
+THE STATIC GATE (Jackson): ruff/vulture over the hot modules -- zero
+real bugs, real dead code removed, 2 false positives in the bug classes
+(numpy != None) excluded by rule; a one-second lint with zero false
+positives now runs before the suite. The codebase's waste is
+architectural, not lexical. STANDING: JOB warm 12.6s vs 10.9 (38 wins),
+JOB-COUNT warm 15.2s vs 8.9, all exact. NEXT: JOB-COUNT's weights
+during the settle; the ClickBench results.json refresh (the union, the
+roads, the memoised verdicts are all unmeasured there); the JOB
+submission notes.
