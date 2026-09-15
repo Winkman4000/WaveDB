@@ -1363,3 +1363,19 @@ warm 12-13s vs 10.5-11 (31-39 wins); JOB-COUNT warm 15.0s vs 8.8s; all
 226 exact throughout; from 137.8s / 149s a week ago. NEXT: the regex
 verify in numba; the weights during the settle; the JOB first-touch as a
 load step; the per-step kernel.
+
+
+## SEAL 2026-09-15: C's standing, and the floor named
+JOB warm 12.6s vs duck 10.9 (38 wins); JOB-COUNT warm 15.2s vs 8.9;
+all 226 exact; from 137.8s / 149s a week ago. The per-step kernels
+(item 3) measured at parity; the profile named the floor: ORCHESTRATION
+-- ~15 Python-orchestrated steps per query at ~10-15ms each -- and the
+clean-segment checks asking the filesystem 53 times per query. A DML
+WRITE MOVES THE CATALOG STAMP; THE CLEAN VERDICT is memoised under it;
+THE REMEMBERED EXISTENCE. The boards now sit at their +/-1s noise for
+this design. THE NEXT LEVER: FEWER, BIGGER STEPS -- restrict a whole
+level of the worklist together (every pending table whose signal has
+settled) in one pass, ~15 steps to ~4; the same algorithm at a coarser
+grain; the only thing expected to move a board beyond the noise short
+of a compiled orchestrator. Also owed: the regex verify in numba; the
+weights during the settle; JOB first-touch as a load step.
