@@ -568,9 +568,21 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
         out = []
         for (b, cb) in spaces[r]:
             if full[b]: continue
-            if prov[b] is None or any(e[0] == 'cut' for e in prov[b]): return None
-            out.append((segs[b].path, cb, prov[b]))
+            if prov[b] is None or _depth(prov[b]) >= 2: return None    # TWO HOPS: a junction's first cut is usually
+            out.append((segs[b].path, cb, prov[b]))                    # through a dimension (keyword -> mk -> movie -> ci)
         return frozenset(out)
+    _dmemo = {}
+    def _depth(p):
+        """how many cut-levels a provenance nests: 0 = local predicates only"""
+        k = id(p); h = _dmemo.get(k)
+        if h is not None: return h
+        d = 0
+        for e in p:
+            if e[0] == 'cut' and e[2] is not None:
+                for (_pth, _c, pb) in e[2]:
+                    d = max(d, 1 + _depth(pb))
+        _dmemo[k] = d
+        return d
     kmax = _KMAX                                   # a column's max is a fact about the column: per process, not per query
     keycache = keycache if keycache is not None else {}
     idx_of = {}        # THE LIVE ROW LIST per table, kept beside the bool keep: never re-derived per step
@@ -709,11 +721,11 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
             if _rk9 is not None:
                 _hr9 = wdb_shelf.SHELF.get(_rk9)               # THE CUT ITSELF, SHELVED: the same first hop's rows
                 if _hr9 is not None:
-                    rows = np.asarray(_hr9, dtype=np.int64)
+                    rows, keep9 = _hr9                         # rows (int32) AND the bool keep: a hit does no N-scale work
+                    rows = np.asarray(rows, dtype=np.int64)
                     cnt = int(rows.size)
                     if cnt != counts[a]:
-                        new = np.zeros_like(keeps[a]); new[rows] = True
-                        keeps[a] = new; counts[a] = cnt; full[a] = False; changed = True; idx_of[a] = rows
+                        keeps[a] = keep9; counts[a] = cnt; full[a] = False; changed = True; idx_of[a] = rows
                     continue
             keep = keeps[a]; n = n_of[a]
             if counts[a] == 0: return changed
@@ -752,13 +764,17 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
                     hit = np.isin(dk, S)
                 rows = np.flatnonzero(hit) if (isfull and idx is None) else idx[hit]
             cnt = int(rows.size)
-            if _rk9 is not None and 0 < cnt <= 2_000_000:
-                try: wdb_shelf.SHELF.put(_rk9, rows.astype(np.int32 if n < (1 << 31) else np.int64), int(rows.size * 4), kind='settled-rows')
-                except Exception: pass
             if cnt != counts[a]:
                 new = np.zeros_like(keep); new[rows] = True       # one N-scale write per shrink, not three
                 keeps[a] = new; counts[a] = cnt; full[a] = False; changed = True
                 idx_of[a] = rows
+                if _rk9 is not None and 0 < cnt <= 16_000_000:
+                    # THE BIG FIRST HOP IS THE ONE WORTH SHELVING: role = 'actor' cuts cast_info to 12.7M
+                    # rows in 13 queries -- 51 MB of rows plus a 36 MB keep, against a 32 GB shelf
+                    try:
+                        _r32 = rows.astype(np.int32 if n < (1 << 31) else np.int64)
+                        wdb_shelf.SHELF.put(_rk9, (_r32, new), int(_r32.nbytes + new.nbytes), kind='settled-rows')
+                    except Exception: pass
         return changed
     pending = set(alias2t)
     applied = {}
