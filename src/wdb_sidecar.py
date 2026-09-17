@@ -246,7 +246,13 @@ def exists(path, neg_ttl=2.0):
     return ok
 
 
-def _catalog_stamp(dbdir, ttl=0.25):
+def stamp_moved(dbdir):
+    """an in-process writer moved the stamp: forget the cached one at once (the ttl below only covers
+    writers in OTHER processes -- a DML within the ttl window was invisible to its own process)"""
+    _stamp_cache.pop(dbdir, None)
+
+
+def _catalog_stamp(dbdir, ttl=0.02):
     """the catalog's (mtime, size), re-read at most every ttl seconds -- 422 stat calls per eight
     queries were 0.13s of a 1.97s profile, each re-checking a stamp that had not moved"""
     import time as _t

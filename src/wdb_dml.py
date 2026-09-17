@@ -24,6 +24,9 @@ def _touch_stamp(dbdir):
     import os as _o
     try: _o.utime(_o.path.join(dbdir, 'catalog.json'), None)
     except Exception: pass
+    try:
+        import wdb_sidecar; wdb_sidecar.stamp_moved(dbdir)
+    except Exception: pass
 
 def _wtype(t):
     """catalog type names come in many spellings (str, varchar, int64...): one canonical name"""

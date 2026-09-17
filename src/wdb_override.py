@@ -23,6 +23,9 @@ def _touch_stamp(dbdir):
     import os as _o
     try: _o.utime(_o.path.join(dbdir, 'catalog.json'), None)
     except Exception: pass
+    try:
+        import wdb_sidecar; wdb_sidecar.stamp_moved(dbdir)
+    except Exception: pass
 
 def path_for(seg_path):
     return seg_path + '.overrides'

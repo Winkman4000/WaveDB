@@ -49,6 +49,7 @@ def _conjuncts(node):
 
 
 _PLANS = {}
+_KMAX = {}
 
 from numba import njit
 
@@ -178,23 +179,30 @@ def execute(db, tree, sql=None):
             _pk9 = ('pred', seg.path, c2.sql())
             _hit9 = wdb_shelf.SHELF.get(_pk9)
             if _hit9 is not None:
-                mm = np.zeros(int(seg.N), bool); mm[_hit9] = True
+                mm = np.zeros(int(seg.N), bool); mm[_hit9] = True; il = _hit9
             else:
                 mm = np.asarray(wdb_sql._eval_pred(seg, c2, lambda nm, pm=pms[a]: pm.get(nm, nm)), dtype=bool)
-                _il9 = np.flatnonzero(mm).astype(np.int32 if seg.N < (1 << 31) else np.int64)
+                il = _il9 = np.flatnonzero(mm).astype(np.int32 if seg.N < (1 << 31) else np.int64)
                 try: wdb_shelf.SHELF.put(_pk9, _il9, int(_il9.nbytes), kind='predicate')
                 except Exception: pass
-            m = mm if m is None else (m & mm)
-        return m if m is not None else np.ones(int(seg.N), bool)
+            if m is None:
+                m, m_idx = mm, il                          # THE INDEX LIST RIDES ALONG: the shelf already holds it
+            else:
+                m = m & mm; m_idx = None                   # (a conjunction: derive once at the landing)
+        if m is None: return None
+        return (m, m_idx)
     from concurrent.futures import ThreadPoolExecutor
     _pool9 = ThreadPoolExecutor(max_workers=min(8, max(1, len(alias2t))))
     futs = {a: _pool9.submit(_local_keep, a) for a in alias2t}     # THE STREAM: isolation runs concurrently;
+    def _unpack9(r, a):
+        if r is None: return np.ones(int(segs[a].N), bool)
+        return r[0]
     for a in alias2t:                                                # a table with no filter is ready at once
         if not local[a]:
-            keeps[a] = futs[a].result()
+            keeps[a] = _unpack9(futs[a].result(), a)
     if os.environ.get('WDB_KEYSPACE', '1') == '0':
         for a in alias2t:
-            keeps[a] = futs[a].result()
+            keeps[a] = _unpack9(futs[a].result(), a)
             if _bill is not None: _bill.append(('local %s(%d) keep=%d' % (a, int(segs[a].N), int(keeps[a].sum())), _tk() - _t0)); _t0 = _tk()
     # key columns as int64 arrays (NULL -> -1)
     keycache = {}
@@ -548,7 +556,7 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
     # ---- key sets: the live keys of a table's column (None = no restriction) ----
     full = {a: counts[a] == n_of[a] for a in alias2t}
     kcache = {}
-    kmax = {}
+    kmax = _KMAX                                   # a column's max is a fact about the column: per process, not per query
     keycache = keycache if keycache is not None else {}
     idx_of = {}        # THE LIVE ROW LIST per table, kept beside the bool keep: never re-derived per step
     def live_idx(a):
@@ -561,15 +569,21 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
         idx = live_idx(a)
         if idx.size == 0: return np.zeros(0, np.int64)
         _kc9 = keycache.get((a, c))
-        if _kc9 is None and n_of[a] >= 1_000_000:
-            try: _kc9 = keys(a, c)                      # decodes once per process, then shelved
+        if _kc9 is None:
+            # every table takes the kernel path: the small-table path built a bitmap over the ID SPACE
+            # (2.5M entries for title ids) and scanned it for a table with 300 live rows -- 1.5s of
+            # nonzero and 1.3s of max per 113 queries
+            try: _kc9 = keys(a, c)                      # decodes once per process, shelved when large
             except Exception: _kc9 = None
         if _kc9 is not None:
-            mxk = kmax.get((a, c))
-            if mxk is None: mxk = kmax[(a, c)] = int(_kc9.max()) if _kc9.size else 0
+            _mk9 = (segs[a].path, c)
+            mxk = kmax.get(_mk9)
+            if mxk is None: mxk = kmax[_mk9] = int(_kc9.max()) if _kc9.size else 0
             if 0 <= mxk < 200_000_000:
+                _tq9 = _tk()
                 out = _keyset_kernel(np.asarray(_kc9), np.asarray(idx, dtype=np.int64), mxk)     # THE KEY-SET KERNEL
                 kcache[ck] = out
+                if _bill is not None: _bill.append(('      keyset-kernel %s.%s rows=%d keys=%d mx=%d' % (a, c, idx.size, out.size, mxk), _tk() - _tq9))
                 return out
         k = np.asarray(_kc9[idx], dtype=np.int64) if _kc9 is not None else (keys_at(a, c, idx) if idx.size * 4 < n_of[a] else keys(a, c)[idx])
         k = k[k >= 0]
@@ -595,10 +609,14 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
         concatenation of 1.27M and 1.9M keys, 76 times in one query (1.8s of 2.3s)"""
         if cur.size == 0 or ks.size == 0: return np.zeros(0, np.int64)
         mx = int(max(cur[-1], ks[-1]))
+        _tq9 = _tk()
         if mx < 200_000_000:
             m = np.zeros(mx + 1, bool); m[cur] = True
-            return ks[m[ks]]
-        return np.intersect1d(cur, ks, assume_unique=True)
+            out = ks[m[ks]]
+        else:
+            out = np.intersect1d(cur, ks, assume_unique=True)
+        if _bill is not None: _bill.append(('      isect %d x %d -> %d mx=%d' % (cur.size, ks.size, out.size, mx), _tk() - _tq9))
+        return out
     def space_live(r):
         sk = (r, tuple(counts[a] for (a, c) in spaces[r]))    # cached by the members' live counts
         if sk in scache: return scache[sk]
@@ -619,13 +637,18 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
         if a in arrived or futs is None or a not in futs: return False
         f = futs[a]
         if not f.done(): return False
-        m = f.result(); arrived.add(a)
+        r = f.result(); arrived.add(a)
+        if r is None: return False
+        m, m_idx = r
         if not full[a]:
-            m = m & keeps[a]                      # A LANDING INTERSECTS: cuts the spaces already made are kept
-        cnt = int(np.count_nonzero(m))            # (an overwrite here discarded them; the applied-space skip then
+            m = m & keeps[a]; m_idx = None        # A LANDING INTERSECTS: cuts the spaces already made are kept
+        if m_idx is not None:
+            cnt = int(m_idx.size)                 # the shelf's index list: no pass over the mask
+        else:
+            cnt = int(np.count_nonzero(m))        # (an overwrite here discarded them; the applied-space skip then
         if cnt != counts[a]:                      #  removed the accidental repair -- JOB 3b answered '#1' for '11,830,420')
             keeps[a] = m; counts[a] = cnt; full[a] = False
-            idx_of[a] = np.flatnonzero(m)         # the live list, once, here -- only for a table that shrank
+            idx_of[a] = np.asarray(m_idx, dtype=np.int64) if m_idx is not None else np.flatnonzero(m)
             return True
         return False
     if futs is not None:
@@ -652,26 +675,36 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
             keep = keeps[a]; n = n_of[a]
             if counts[a] == 0: return changed
             _tq = _tk()
-            idx = live_idx(a)
-            bill('   %s.%s live_idx %d' % (a, c, idx.size)) if _bill is not None else None
+            isfull = full[a] or counts[a] == n
+            idx = None if isfull else live_idx(a)            # A FULL TABLE HAS NO LIVE LIST: materialising one is 36M
+            live_n = n if isfull else idx.size               # entries of arange for a cut that never reads it
+            bill('   %s.%s live %d' % (a, c, live_n)) if _bill is not None else None
             rows = None
-            if n >= 1_000_000 and S.size * 8 < n and S.size * 4 < idx.size:
+            if n >= 1_000_000 and S.size * 8 < n and S.size * 4 < live_n:
                 # the giant, cut by a small space: the road's postings, then only those already live
                 inv = inverted(a, [c])
                 bill('   %s.%s inverted' % (a, c)) if _bill is not None else None
                 if inv is not None:
                     r = rows_for_keys(inv, S)
                     bill('   %s.%s rows_for_keys %d' % (a, c, r.size)) if _bill is not None else None
-                    rows = r[keep[r]] if idx.size < n else r      # unsorted is fine: every consumer is order-free
+                    rows = r if isfull else r[keep[r]]           # unsorted is fine: every consumer is order-free
             if rows is None:
-                dk = keys_at(a, c, idx) if idx.size * 4 < n else keys(a, c)[idx]
-                mx = int(max(S.max() if S.size else 0, dk.max() if dk.size else 0))
+                _kc9 = keycache.get((a, c))
+                if isfull:
+                    idx = np.arange(n, dtype=np.int64) if _kc9 is None else None
+                if _kc9 is not None:
+                    dk = np.asarray(_kc9 if isfull else _kc9[idx], dtype=np.int64)
+                else:
+                    dk = keys_at(a, c, idx) if idx.size * 4 < n else keys(a, c)[idx]
+                _mk9 = (segs[a].path, c); mxk = kmax.get(_mk9)
+                if mxk is None and _kc9 is not None: mxk = kmax[_mk9] = int(_kc9.max()) if _kc9.size else 0
+                mx = int(max(int(S[-1]) if S.size else 0, mxk if mxk is not None else (int(dk.max()) if dk.size else 0)))   # S is sorted: its max is free
                 if mx < 200_000_000:
                     lut = np.zeros(mx + 2, bool); lut[S] = True
                     hit = lut[np.where(dk < 0, mx + 1, dk)]
                 else:
                     hit = np.isin(dk, S)
-                rows = idx[hit]
+                rows = np.flatnonzero(hit) if (isfull and idx is None) else idx[hit]
             cnt = int(rows.size)
             if cnt != counts[a]:
                 new = np.zeros_like(keep); new[rows] = True       # one N-scale write per shrink, not three
@@ -682,12 +715,14 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
     applied = {}
     rounds = 0
     def _refresh_spaces_of(a):
+        _tq9 = _tk()
         for c in cols_of[a]:
             r = find((a, c)); old = live.get(r); new = space_live(r)
             if new is not None and (old is None or new.size < old.size):
                 live[r] = new
                 for (b, _c) in spaces[r]:
                     if b != a: pending.add(b)
+        if _bill is not None: _bill.append(('      refresh %s' % a, _tk() - _tq9))
     while rounds < 256:
         rounds += 1
         # anything that landed since the last step streams in now
@@ -699,8 +734,10 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
         # ISOLATION FIRST, PER TABLE: a table whose own filter is still running is not restricted
         # from the conjoined space yet -- its own cut is usually deeper and always cheaper (cast_info
         # was cut to 12.7M rows by the role space, 787ms, while its note LIKE was about to cut it to 32K)
+        _tq9 = _tk()
         cand = [a for a in pending if any(live.get(find((a, c))) is not None for c in cols_of[a])
                 and (futs is None or a in arrived or futs[a].done())]
+        if _bill is not None: _bill.append(('      pick', _tk() - _tq9))
         if not cand:
             # nothing to do until a slow isolation lands: wait for the next one
             waiting = [a for a in alias2t if futs is not None and a not in arrived]

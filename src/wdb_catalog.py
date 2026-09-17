@@ -35,6 +35,9 @@ class Catalog:
         with open(tmp, 'w') as f:
             json.dump(self.data, f, indent=2); f.flush(); os.fsync(f.fileno())
         os.replace(tmp, os.path.join(self.dbdir, CATALOG_NAME))  # atomic
+        try:
+            import wdb_sidecar; wdb_sidecar.stamp_moved(self.dbdir)   # the catalog itself moved: forget the cached stamp now
+        except Exception: pass
 
     # ---- tables ----
     def add_table(self, name, schema):
