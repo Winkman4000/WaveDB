@@ -838,7 +838,16 @@ def _counting_emit(db, state):
     key. No pair is ever built. Acyclic hypergraphs only (declines otherwise)."""
     import wdb_sql
     tree = state['tree']; alias2t = state['alias2t']; segs = state['segs']; pms = state['pms']
-    keeps = state['keeps']; counts = state['counts']; pair = state['pair']; keys_at = state['keys_at']; owner = state['owner']
+    keeps = state['keeps']; counts = state['counts']; pair = state['pair']; owner = state['owner']
+    _keys = state['keys']; _keys_at0 = state['keys_at']
+    def keys_at(t, c, idx):
+        """THE SHELVED COLUMN IN THE WALK: the fixpoint's int32 key columns (decoded once per process)
+        make this a gather; the road walk + binary search per row cost 0.94s per 113 COUNT queries"""
+        try:
+            col = _keys(t, c)
+            return np.asarray(col[idx], dtype=np.int64)
+        except Exception:
+            return _keys_at0(t, c, idx)
     if any(c == 0 for c in counts.values()):
         return _empty_result(tree)
     # value classes: union-find over (alias, col)
@@ -912,11 +921,13 @@ def _counting_emit(db, state):
         kv = kv[ok]; w = w[ok]
         mx = int(kv.max()) if kv.size else 0
         if mx > 400_000_000: raise _Decline('counting fixpoint: key space too large for a dense LUT')
-        acc = np.zeros(mx + 1, np.float64)
-        np.add.at(acc, kv, w) if kv.size < 2_000_000 else None
-        if kv.size >= 2_000_000:
-            acc = np.bincount(kv, weights=w, minlength=mx + 1).astype(np.float64)
-        lut[(t, r)] = acc
+        if kv.size * 16 < mx:
+            # A LUT SIZED TO THE LIVE KEYS, NOT THE KEY SPACE: a class with a hundred live keys was
+            # allocating and zeroing a 2.5M-entry table (20 MB) per edge -- sparse: (sorted keys, sums)
+            u, inv = np.unique(kv, return_inverse=True)
+            lut[(t, r)] = ('sparse', u, np.bincount(inv, weights=w, minlength=u.size))
+        else:
+            lut[(t, r)] = ('dense', np.bincount(kv, weights=w, minlength=mx + 1))   # bincount: np.add.at is ~20x slower
     for t in reversed(order):
         idx = np.flatnonzero(keeps[t])
         w = np.ones(idx.size, np.float64)
@@ -928,9 +939,16 @@ def _counting_emit(db, state):
             for (a, c) in classes[r]:
                 if a == t: continue
                 if (a, r) not in lut: raise _Decline('counting fixpoint: child not reduced before parent')
-                acc = lut[(a, r)]
-                safe = np.where((kv >= 0) & (kv < acc.size), kv, 0)
-                f = acc[safe]; f[(kv < 0) | (kv >= acc.size)] = 0.0
+                L = lut[(a, r)]
+                if L[0] == 'dense':
+                    acc = L[1]
+                    safe = np.where((kv >= 0) & (kv < acc.size), kv, 0)
+                    f = acc[safe]; f[(kv < 0) | (kv >= acc.size)] = 0.0
+                else:
+                    u, vals = L[1], L[2]
+                    pos = np.searchsorted(u, kv); pos = np.where(pos < u.size, pos, 0)
+                    hit = (u[pos] == kv) & (kv >= 0)
+                    f = np.where(hit, vals[pos], 0.0)
                 w = w * f
         row_weight[t] = w
         if up is not None:

@@ -85,6 +85,8 @@ def _int_emission(ctx, res):
         return res
 
 
+_ROAD_DECLINED = set()          # (sql, catalog stamp) shapes the road engine declined: the fixpoint goes first next time
+
 class Database:
     def __init__(self, catalog):
         self.cat = catalog
@@ -677,13 +679,25 @@ class Database:
                 else:
                     _rw = wdb_join.denorm_rewrite(self, tree)    # join that groups by a denormalised parent
                 if _rw is None:                                  # column -> single-table cube read; else gather
+                    # THE REMEMBERED DECLINE: the road engine keeps precedence on shapes it serves (TPC-H,
+                    # H2O), but a shape it has declined once is routed to the counting fixpoint first from
+                    # then on -- every JOB-COUNT query had paid 16ms of road planning to re-learn the refusal
+                    _rd9 = (sql, self._catalog_stamp())
+                    if _rd9 in _ROAD_DECLINED and wdb_semijoin.shape_ok(tree) and wdb_semijoin._needs_weights(tree):
+                        try:
+                            return wdb_semijoin.execute(self, tree, sql=sql)
+                        except wdb_semijoin._Decline:
+                            pass
                     try:
                         return wdb_join.join_query(self, sql)
                     except NotImplementedError as _ne9:
                         # THE COUNTING FIXPOINT: last -- only when the road engine declines the join shape
                         if wdb_semijoin.shape_ok(tree) and wdb_semijoin._needs_weights(tree):
                             try:
-                                return wdb_semijoin.execute(self, tree, sql=sql)
+                                _r9 = wdb_semijoin.execute(self, tree, sql=sql)
+                                _ROAD_DECLINED.add(_rd9)
+                                if len(_ROAD_DECLINED) > 4096: _ROAD_DECLINED.clear()
+                                return _r9
                             except wdb_semijoin._Decline:
                                 pass
                         raise
