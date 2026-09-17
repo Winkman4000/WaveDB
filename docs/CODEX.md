@@ -1397,3 +1397,29 @@ JOB-COUNT warm 15.2s vs 8.9, all exact. NEXT: JOB-COUNT's weights
 during the settle; the ClickBench results.json refresh (the union, the
 roads, the memoised verdicts are all unmeasured there); the JOB
 submission notes.
+
+
+## C, THE THIRD ACT (2026-09-17): the plumbing was the floor -- JOB won
+Jackson brought independent research: a join-chain cache over SQLite
+(per-value position chains; cached RELATIONSHIP chains for hot multi-
+key semi-joins gave 30-90x; curves only on synthetic data; coarse maps
+lose on scattered data; a few percent of the file). His claim for us:
+with chains for the whole join, the settled space is one serial
+overlay -- 10-30ms. THE CENSUS: 113/113 JOB queries acyclic; the two-
+sweep licensed everywhere -- and the worklist already beats its bound
+(1,272 steps vs 1,954). Not fewer steps, then. THE PROFILE OVER ALL
+113: the settle work was ~1.5s for the board, 1.2ms a step; the other
+8s were CONVERSIONS BETWEEN REPRESENTATIONS -- his instinct, in our own
+plumbing. THE INDEX LIST RIDES ALONG (the shelf already held what a
+landing rebuilt in two 36M-row passes); a column's max is a fact
+about the column (S[-1] is free); UNDER AN UNMOVED STAMP NOTHING
+MOVED (open_segment); A FULL TABLE HAS NO LIVE LIST (290 MB of arange,
+discarded). 12.7s -> 9.06s in-process. The win exposed a hole: the
+stamp's 0.25s ttl hid an in-process INSERT from its own process. AN
+IN-PROCESS WRITER MOVES ITS OWN STAMP; the ttl (20ms) covers other
+processes only; harness PROVEN. STANDING: JOB warm 8.6-9.1s vs duck
+10.7-11.4 (66-72 wins) -- WON; JOB-COUNT 10.6 vs 8.4 (41 wins). What
+we already had under other names: value chains = the reverse road;
+dimension chains = the predicate shelf; AND/OR = the spaces. What we
+do not have: the RELATIONSHIP chain -- the propagated space, keyed by
+the predicates that reached it. That is next: THE SETTLED-SPACE CACHE.
