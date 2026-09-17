@@ -1423,3 +1423,28 @@ we already had under other names: value chains = the reverse road;
 dimension chains = the predicate shelf; AND/OR = the spaces. What we
 do not have: the RELATIONSHIP chain -- the propagated space, keyed by
 the predicates that reached it. That is next: THE SETTLED-SPACE CACHE.
+
+
+## C, THE FOURTH ACT (2026-09-17, later): the relationship chain, in the engine
+THE REUSE CENSUS: 31% of the giant postings gathers across the 113
+repeat exactly, and the repeats are FIRST HOPS (it.info = 'rating' ->
+movie_info_idx 29 times; rt.role = 'actor' -> cast_info 13). THE
+SETTLED-SPACE CACHE: a junction's key set after a cut is a fact about
+(segment, column, THE PROVENANCE OF THE KEEP -- its local predicates
+plus the cuts applied, order-free because a keep is an intersection);
+shelved across queries, DML moves the stamp. Lessons: A LIVE SET IS
+NAMED BY WHERE IT CAME FROM, NOT BY ITS BYTES (hashing 1.5M keys per
+cut cost more than the kernel saved); nested symbolic provenance grew
+exponentially (8.6s -> 20-48s) -- THE CACHE IS BOUNDED; depth one
+missed the junction's usual first cut, which is through a dimension --
+THE SECOND HOP; THE BIG FIRST HOP SHELVED WITH ITS KEEP (a hit does no
+N-scale work). JOB-COUNT: one word's difference -- MIN's emit is one
+look, COUNT counts CHAINS with a weights walk; its extra cost was 1.8s
+of the road engine planning and declining every query (THE REMEMBERED
+DECLINE: adaptive routing, the fixpoint first once the road engine has
+declined a shape) and a walk that road-walked keys, used np.add.at,
+and allocated LUTs over the KEY SPACE for a hundred live keys (sparse
+LUTs sized to the live keys). STANDING: JOB warm 7.0s vs duck 9.9
+(85 wins); JOB-COUNT 8.5s vs 8.1 (67 wins); all exact; from 137.8s /
+149s and 2 wins two weeks ago. The settle profile is flat: postings
+1.1s (unique gathers), key sets 0.7, intersections 0.8, dispatch 0.8.
