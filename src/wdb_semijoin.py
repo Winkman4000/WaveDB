@@ -50,6 +50,7 @@ def _conjuncts(node):
 
 _PLANS = {}
 _KMAX = {}
+_REUSE = None
 
 from numba import njit
 
@@ -405,7 +406,7 @@ def execute(db, tree, sql=None):
     for a in alias2t:
         if a not in keeps: keeps[a] = np.ones(int(segs[a].N), bool); counts[a] = int(segs[a].N)   # unrestricted until its filter lands
     if os.environ.get('WDB_KEYSPACE', '1') != '0':
-        _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inverted, rows_for_keys, pack, _bill, _tk, futs=futs, pool=_pool9, keycache=keycache)
+        _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inverted, rows_for_keys, pack, _bill, _tk, futs=futs, pool=_pool9, keycache=keycache, local=local)
         _t0 = _tk()
         _pool9.shutdown(wait=False)
     else:
@@ -523,7 +524,7 @@ def _codes_shelved(seg, pc):
     return c
 
 
-def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inverted, rows_for_keys, pack, _bill, _tk, futs=None, pool=None, keycache=None):
+def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inverted, rows_for_keys, pack, _bill, _tk, futs=None, pool=None, keycache=None, local=None):
     """THE KEY-SPACE FIXPOINT (Jackson's two phases, 2026-09-14). Phase 1 -- isolation -- is done
     by the caller: every table has applied its own filters. Phase 2 -- the conjoined space:
     the join columns collapse into SHARED VALUE SPACES (one per equivalence class of equal
@@ -556,6 +557,20 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
     # ---- key sets: the live keys of a table's column (None = no restriction) ----
     full = {a: counts[a] == n_of[a] for a in alias2t}
     kcache = {}
+    import hashlib
+    prov = {a: frozenset() for a in alias2t}     # THE PROVENANCE OF A KEEP: local predicates + applied (col, S) cuts -- order-free
+    def _sprov(r):
+        """the symbolic identity of a space's live set: (segment, column, keep-provenance) of every
+        member that restricts it, as a frozenset -- or None when any member's provenance already
+        contains a cut. THE CACHE IS BOUNDED TO FIRST HOPS: nested provenances grew exponentially
+        (a table's key includes its cutters', which include their cutters' ...) and every shelf
+        lookup hashed the whole tree (8.6s -> 20-48s). The census said the repeats ARE first hops."""
+        out = []
+        for (b, cb) in spaces[r]:
+            if full[b]: continue
+            if prov[b] is None or any(e[0] == 'cut' for e in prov[b]): return None
+            out.append((segs[b].path, cb, prov[b]))
+        return frozenset(out)
     kmax = _KMAX                                   # a column's max is a fact about the column: per process, not per query
     keycache = keycache if keycache is not None else {}
     idx_of = {}        # THE LIVE ROW LIST per table, kept beside the bool keep: never re-derived per step
@@ -566,6 +581,15 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
         if full[a]: return None
         ck = (a, c, counts[a])                     # cached per (table, column, live count): a key set
         if ck in kcache: return kcache[ck]         # only changes when its table shrinks
+        # THE SETTLED-SPACE CACHE (Jackson's relationship chain): a junction's key set after a cut is a
+        # fact about (segment, column, provenance of the keep); JOB's families repeat the same first
+        # hops -- rt.role = 'actor' reaches cast_info in 13 queries -- and recomputed each one (12.7M
+        # live rows -> the movie key set, ~50ms). Shelved across queries; DML moves the stamp.
+        _sk9 = ('kset', segs[a].path, c, prov[a]) if (prov[a] is not None and prov[a]) else None
+        if _sk9 is not None:
+            _h9 = wdb_shelf.SHELF.get(_sk9)
+            if _h9 is not None:
+                kcache[ck] = _h9; return _h9
         idx = live_idx(a)
         if idx.size == 0: return np.zeros(0, np.int64)
         _kc9 = keycache.get((a, c))
@@ -583,6 +607,9 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
                 _tq9 = _tk()
                 out = _keyset_kernel(np.asarray(_kc9), np.asarray(idx, dtype=np.int64), mxk)     # THE KEY-SET KERNEL
                 kcache[ck] = out
+                if _sk9 is not None and idx.size >= 100_000:
+                    try: wdb_shelf.SHELF.put(_sk9, out, int(out.nbytes), kind='settled-space')
+                    except Exception: pass
                 if _bill is not None: _bill.append(('      keyset-kernel %s.%s rows=%d keys=%d mx=%d' % (a, c, idx.size, out.size, mxk), _tk() - _tq9))
                 return out
         k = np.asarray(_kc9[idx], dtype=np.int64) if _kc9 is not None else (keys_at(a, c, idx) if idx.size * 4 < n_of[a] else keys(a, c)[idx])
@@ -640,6 +667,7 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
         r = f.result(); arrived.add(a)
         if r is None: return False
         m, m_idx = r
+        if prov[a] is not None: prov[a] = prov[a] | frozenset(('pred', c2.sql()) for c2 in local[a])
         if not full[a]:
             m = m & keeps[a]; m_idx = None        # A LANDING INTERSECTS: cuts the spaces already made are kept
         if m_idx is not None:
@@ -672,6 +700,21 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
             # the same 7.4M role postings four times in 19d)
             if applied.get((a, c)) == S.size: continue
             applied[(a, c)] = S.size
+            # A LIVE SET IS NAMED BY WHERE IT CAME FROM, NOT BY ITS BYTES: the space's identity is the
+            # provenances of the members that restricted it (hashing 1.5M keys per cut cost more than
+            # the kernel it saved)
+            _sp9 = _sprov(r) if prov[a] is not None else None
+            prov[a] = (prov[a] | frozenset([('cut', c, _sp9)])) if _sp9 is not None else None   # None: beyond the first hop, uncached
+            _rk9 = ('rows', segs[a].path, prov[a]) if (n_of[a] >= 1_000_000 and prov[a] is not None) else None
+            if _rk9 is not None:
+                _hr9 = wdb_shelf.SHELF.get(_rk9)               # THE CUT ITSELF, SHELVED: the same first hop's rows
+                if _hr9 is not None:
+                    rows = np.asarray(_hr9, dtype=np.int64)
+                    cnt = int(rows.size)
+                    if cnt != counts[a]:
+                        new = np.zeros_like(keeps[a]); new[rows] = True
+                        keeps[a] = new; counts[a] = cnt; full[a] = False; changed = True; idx_of[a] = rows
+                    continue
             keep = keeps[a]; n = n_of[a]
             if counts[a] == 0: return changed
             _tq = _tk()
@@ -685,6 +728,9 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
                 inv = inverted(a, [c])
                 bill('   %s.%s inverted' % (a, c)) if _bill is not None else None
                 if inv is not None:
+                    if _REUSE is not None:                       # the reuse census: would a cache keyed by (segment, column, S) hit?
+                        import hashlib
+                        _REUSE.append((segs[a].path, c, S.size, hashlib.blake2b(np.ascontiguousarray(S).tobytes(), digest_size=8).hexdigest(), n))
                     r = rows_for_keys(inv, S)
                     bill('   %s.%s rows_for_keys %d' % (a, c, r.size)) if _bill is not None else None
                     rows = r if isfull else r[keep[r]]           # unsorted is fine: every consumer is order-free
@@ -706,6 +752,9 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
                     hit = np.isin(dk, S)
                 rows = np.flatnonzero(hit) if (isfull and idx is None) else idx[hit]
             cnt = int(rows.size)
+            if _rk9 is not None and 0 < cnt <= 2_000_000:
+                try: wdb_shelf.SHELF.put(_rk9, rows.astype(np.int32 if n < (1 << 31) else np.int64), int(rows.size * 4), kind='settled-rows')
+                except Exception: pass
             if cnt != counts[a]:
                 new = np.zeros_like(keep); new[rows] = True       # one N-scale write per shrink, not three
                 keeps[a] = new; counts[a] = cnt; full[a] = False; changed = True
