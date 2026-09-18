@@ -35,6 +35,50 @@ CHUNK_DICT = bool(int(os.environ.get('WDB_CHUNK_DICT', '1')))   # block-segment 
 CHUNK_DICT_VALS = 16384                                          # values per independent zstd frame (mult of R)
 _INLINE_ENABLED = True  # mode-5 inline strings (toggleable for ablation/debug)
 
+def _int_dictionary(data):
+    """THE DICTIONARY WITHOUT THE SORT (Jackson, 2026-09-18): np.unique(return_inverse=True) on an
+    integer column is a full O(N log N) sort of 100M values to discover a distinct set -- 20-40s
+    per column, the largest single cost of an integer column's encode (RegionID 24.6s for 9,040
+    values). The route is ASSIGNED from what is known before any pass:
+      bounded range (<= 4N) -> bincount: one linear pass, sorted by construction   (RegionID 24.6s -> 0.4s)
+      otherwise -> hash factorize UNSORTED, then sort the DICTIONARY and remap: V log V, not N log N
+                   (ClientIP 15.7s -> 4.2s; WatchID, V = N, breaks even -- there is no worse case)
+      near-unique (>= 95% distinct in a 1M sample) -> np.unique: the hash table of N keys loses to
+                   the sort (WatchID 68s -> 80s without this gate; a 50% gate mis-sent ClientIP,
+                   whose 10%-distinct column reads 63% distinct in a sample -- samples lie about V/N
+                   except at the top). Same contract everywhere: a SORTED dictionary, identical codes."""
+    data = np.asarray(data)
+    N = data.size
+    if N == 0:
+        return np.unique(data, return_inverse=True)
+    lo = int(data.min()); hi = int(data.max()); rng = hi - lo + 1
+    if rng <= (8 << 20):
+        # THE RANGE IS ABSOLUTE, NOT RELATIVE TO N: 'rng <= 4N' let a column with a 300M-value range
+        # allocate a 300M-entry count array and a 300M-entry LUT (5 GB of transient for a 'narrow'
+        # column); the encoder's learner read that peak, re-classed every int column, and ran the
+        # whole realm 2-3 wide instead of 12 (405s -> 920s). bincount only when the count array is
+        # small in absolute terms (8M entries = 64 MB); everything wider takes the hash route.
+        off = (data.astype(np.int64) - lo)
+        cnt = np.bincount(off, minlength=rng)
+        present = np.flatnonzero(cnt)
+        uniq = (present + lo).astype(data.dtype)
+        lut = np.empty(rng, np.int64); lut[present] = np.arange(present.size, dtype=np.int64)
+        return uniq, lut[off]
+    if N > 2_000_000:
+        # THE NEAR-UNIQUE GATE, by the number the sample CAN tell: a 1M sample of a 10%-distinct
+        # column reads 63% distinct (it lies about V/N), but a near-unique column reads ~100% --
+        # and only that case matters, because there the hash table of N keys loses to the sort
+        # (WatchID: 68s -> 80s without the gate). >= 95% distinct in the sample -> np.unique.
+        smp = data[np.random.default_rng(0).integers(0, N, 1_000_000)]
+        if pd.Series(smp).nunique() >= 950_000:
+            return np.unique(data, return_inverse=True)
+    inv, uniq = pd.factorize(pd.Series(data), sort=False)
+    uniq = np.asarray(uniq, dtype=data.dtype)
+    order = np.argsort(uniq, kind='stable')
+    rank = np.empty(order.size, np.int64); rank[order] = np.arange(order.size, dtype=np.int64)
+    return uniq[order], rank[inv]
+
+
 def _encode_column(col):
     """Return (dtype, has_null, V, uniq_value_bytes_list, codes:int64[N], mode_is_string)."""
     if isinstance(col, ma.MaskedArray):
@@ -60,10 +104,10 @@ def _encode_column(col):
     elif dtype in (0, 2):
         if has_null:
             nn = data[~null_mask]
-            uniq, inv = np.unique(nn, return_inverse=True)
+            uniq, inv = _int_dictionary(nn) if dtype == 0 else np.unique(nn, return_inverse=True)
             codes[~null_mask] = inv; codes[null_mask] = len(uniq)
         else:
-            uniq, inv = np.unique(data, return_inverse=True); codes[:] = inv
+            uniq, inv = _int_dictionary(data) if dtype == 0 else np.unique(data, return_inverse=True); codes[:] = inv
         if dtype == 0: valb = [str(int(v)).encode() for v in uniq]
         else:          valb = [struct.pack('<d', float(v)) for v in uniq]
     else:
@@ -1041,12 +1085,22 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
     if not budget:
         try:
             phys = _os.sysconf('SC_PAGE_SIZE') * _os.sysconf('SC_PHYS_PAGES')
-            with open('/sys/fs/cgroup/memory.max') as f:
-                v = f.read().strip()
-                if v.isdigit(): phys = min(phys, int(v))
+            # BOTH CGROUP LAYOUTS: v2 (memory.max) and v1 (memory/memory.limit_in_bytes). A pod
+            # exposing only v1 fell to the 32 GB fallback, ran the string columns one at a time
+            # and the ints 2-3 wide: 920s for a realm the same code encodes in 405s at 96 GB.
+            for p in ('/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory/memory.limit_in_bytes'):
+                try:
+                    with open(p) as f:
+                        v = f.read().strip()
+                    if v.isdigit() and int(v) < (1 << 60): phys = min(phys, int(v))
+                    break
+                except FileNotFoundError:
+                    continue
             budget = phys * 3 // 4                 # THREE-QUARTERS: children peaked at 55 GB of 128 at half; the page cache yields
         except Exception:
             budget = 32 << 30
+        if _os.environ.get('WDB_ENCODE_VERBOSE'):
+            print('  encode budget: %.0f GB (physical %.0f GB)' % (budget / 2**30, phys / 2**30), flush=True)
     def cls(nm):
         # FIVE CLASSES, not three: one heavy 'narrow' member (a 40%-distinct hash) had set the
         # price for every flag column -- the class was budgeted at 12.5 GB/column when a flag
