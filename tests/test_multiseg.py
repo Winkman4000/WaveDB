@@ -84,3 +84,31 @@ def test_multiseg_plus_hot_buffer():
         got,_=db.run(sql); want=con.execute(sql.replace('FROM t',f"FROM '{allpq2}'")).fetchall()
         assert _norm(got)==_norm(want), (sql,_norm(got),_norm(want))
     shutil.rmtree(d)
+
+
+def test_multiseg_join_after_partials_query():
+    """THE PIN IS PART OF THE VERDICT (2026-09-18): segment partials pin a table to one member while
+    they iterate a union; a clean-segment verdict memoised under that pin, then served for the whole
+    table, answered a join over one segment -- four join families WRONG on the 5-segment board with
+    a 1696/0 suite, because no test ran a join over a union AFTER a partials-served query."""
+    d = _tmpdb()
+    frames = [pd.DataFrame({'k': np.arange(0, 1000) % 7, 'v': np.arange(0, 1000)}),
+              pd.DataFrame({'k': np.arange(1000, 2500) % 7, 'v': np.arange(1000, 2500)}),
+              pd.DataFrame({'k': np.arange(2500, 3000) % 7, 'v': np.arange(2500, 3000)})]
+    db, allpq = _build_multiseg(d, 'x', "CREATE TABLE x (k INT, v INT)", frames)
+    db.run("CREATE TABLE dim (k INT, name VARCHAR)")
+    for k in range(7): db.run(f"INSERT INTO dim VALUES ({k}, 'n{k}')")
+    db.flush('dim')
+    con = duckdb.connect()
+    con.execute(f"CREATE VIEW x AS SELECT * FROM '{allpq}'")
+    con.execute("CREATE TABLE dim AS SELECT * FROM (VALUES " + ",".join(f"({k}, 'n{k}')" for k in range(7)) + ") t(k, name)")
+    # 1) a query the partials organ serves (pins x to one member at a time)
+    q1 = "SELECT k, SUM(v) FROM x GROUP BY k"
+    got, _ = db.run(q1); assert _norm(got) == _norm(con.execute(q1).fetchall()), 'partials'
+    # 2) the join over the WHOLE union, right after: must not inherit the pin
+    for q in ("SELECT dim.name, SUM(x.v) FROM x JOIN dim ON x.k = dim.k GROUP BY dim.name",
+              "SELECT COUNT(*) FROM x JOIN dim ON x.k = dim.k WHERE dim.k = 3",
+              "SELECT SUM(x.v) FROM x JOIN dim ON x.k = dim.k WHERE x.v > 100"):
+        got, _ = db.run(q); want = con.execute(q).fetchall()
+        assert _norm(got) == _norm(want), (q, _norm(got)[:3], _norm(want)[:3])
+    shutil.rmtree(d)

@@ -2986,7 +2986,12 @@ def _solo_segment(db, name):
     filesystem ~53 times per JOB query (hot buffer, overrides, tombstones, per table). The verdict
     can only change when DML or compaction writes, and both move the catalog stamp now."""
     stamp = db._catalog_stamp() if hasattr(db, '_catalog_stamp') else None
-    mk = (id(db), name, stamp)
+    # THE PIN IS PART OF THE VERDICT: segment partials pin a table to ONE member (_seg_override) while
+    # they iterate a union; a verdict memoised under the pin and served after it answered the whole
+    # table with one segment -- four join families WRONG on the 5-segment realm (sums low by a fifth)
+    _pin9 = getattr(db.cat, '_seg_override', None)
+    _pk9 = tuple(sorted((k, tuple(v)) for k, v in _pin9.items())) if _pin9 else ()
+    mk = (id(db), name, stamp, _pk9)
     hit = _SOLO_MEMO.get(mk) if stamp is not None else None
     if hit is not None:
         if hit == 'decline': raise _FastUnsupported
