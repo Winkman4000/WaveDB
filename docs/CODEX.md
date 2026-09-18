@@ -1448,3 +1448,35 @@ LUTs sized to the live keys). STANDING: JOB warm 7.0s vs duck 9.9
 (85 wins); JOB-COUNT 8.5s vs 8.1 (67 wins); all exact; from 137.8s /
 149s and 2 wins two weeks ago. The settle profile is flat: postings
 1.1s (unique gathers), key sets 0.7, intersections 0.8, dispatch 0.8.
+
+
+## C, THE FIFTH ACT (2026-09-18): the census, the pin, and both JOB boards won
+THE CENSUS ACROSS EVERY BOARD after a week that changed the engine under
+all of them: TPC-H 14/14 (13 wins), Megaboard 103/103 (87 faster, 3.26x),
+ClickBench 43/43 (warm 6.9s vs 34.4), H2O joins 8/8, Scope 100/100,
+Dates 35/35, H2O groupby 9/10 (q10: the working-set gate refusing a 50M-
+row result -- a refusal, not a loss) -- and ONE REGRESSION: four join
+families WRONG on the 5-segment realm. Wednesday's clean-verdict memo
+keyed a table's segment set on (db, table, stamp); segment partials PIN
+a table to one member while they iterate a union, and the verdict
+memoised under the pin was served for the whole table: sums low by one
+segment of five. A 1696-test suite passed with it in -- nothing ran a
+join over a union AFTER a partials-served query. THE PIN IS PART OF THE
+VERDICT; the test exists and fails without the fix. LAW: a memo's key
+must carry everything the verdict depended on -- a pin, a stamp, a
+provenance; a key that omits one serves the wrong world silently.
+THEN JOB-COUNT: aimed at the walk (the weighted first-hop cache), the
+profile said the walk's LUT builds were 0.48s over 113 queries; the
+second was keys_at at 1.0s, ALL FROM RESTRICT -- the fixpoint's cut of a
+big table took the road walk on mc/mi/ci.movie_id because keys() shelves
+a key column once per process but the big-table branch of the cut only
+looked in the per-query keycache. THE SHELVED COLUMN, IN THE CUT TOO:
+one lookup. SPARSE TO BUILD IS NOT SPARSE TO LOOK UP (the sparse LUT
+only when keys are 64x rarer than the space). RESULT: JOB-COUNT 7.2s vs
+duck 9.2 (71 wins) -- WON; JOB 5.8s vs 9.5 (90 wins). Both boards taken;
+137.8s / 149s two weeks ago. THE WARM STEP STANDS ALONE (wdb warm) and
+its parser bug (comment lines ate the statement after them: 113 of
+226). Measured: a warm in another process does not carry -- the shelf
+(key columns, predicate lists, settled spaces) dies with the process;
+--warm is the steady-state protocol; PERSISTING THE SHELF is the lever
+on the cold number (~20s), nothing on warm. Suite 1697/0.
