@@ -121,15 +121,28 @@ def cmd_load(a):
     cat.save()
     print('loaded %s: %s rows, %d columns -> %s (%.2f GB) in %.1fs' % (a.table, format(r['n_rows'], ','), r['n_cols'], seg_name, os.path.getsize(out) / 1e9, dt), flush=True)
     if a.warm:
-        # THE WARM STEP: every sidecar the given queries need is born now, as part of load --
-        # a benchmark's first run is then cold I/O, not index construction
-        from wdb_db import Database
-        import wdb_kernels; wdb_kernels.warm()
-        db = Database.open(a.db); t1 = time.perf_counter(); n = 0; failed = 0
-        for stmt in [x for x in open(a.warm).read().split(';') if x.strip() and not x.strip().startswith('--')]:
-            try: db.run(stmt.strip()); n += 1
-            except Exception: failed += 1
-        print('warmed %d quer%s (%d declined) in %.1fs' % (n, 'y' if n == 1 else 'ies', failed, time.perf_counter() - t1), flush=True)
+        _warm(a.db, a.warm)
+    return 0
+
+
+def _warm(dbdir, queries_file):
+    """THE WARM STEP: every sidecar the given queries need is born now -- as part of load, or on
+    its own (wdb warm DB QUERIES.sql) for a realm already loaded. A benchmark's first run is then
+    cold I/O, not index construction. Births persist on disk; a fresh process serves from them."""
+    from wdb_db import Database
+    import wdb_kernels; wdb_kernels.warm()
+    db = Database.open(dbdir); t1 = time.perf_counter(); n = 0; failed = 0
+    # comments are stripped LINE-wise before the split: splitting first and dropping any chunk that
+    # began with '--' silently dropped every statement that followed a comment line (113 of 226 warmed)
+    text = '\n'.join(l for l in open(queries_file).read().splitlines() if not l.strip().startswith('--'))
+    for stmt in [x.strip() for x in text.split(';') if x.strip()]:
+        try: db.run(stmt); n += 1
+        except Exception: failed += 1
+    print('warmed %d quer%s (%d declined) in %.1fs' % (n, 'y' if n == 1 else 'ies', failed, time.perf_counter() - t1))
+
+
+def cmd_warm(a):
+    _warm(a.db, a.queries)
     return 0
 
 
@@ -250,6 +263,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog='wdb', description='WaveDB command line', formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     sub = p.add_subparsers(dest='cmd')
     s = sub.add_parser('init'); s.add_argument('db')
+    s = sub.add_parser('warm', help='birth every sidecar a query file needs (the load-time step, for a realm already loaded)'); s.add_argument('db'); s.add_argument('queries'); s.set_defaults(fn=cmd_warm)
     s = sub.add_parser('load'); s.add_argument('db'); s.add_argument('table'); s.add_argument('file'); s.add_argument('--cluster-by'); s.add_argument('--cast', action='append'); s.add_argument('--workers', type=int); s.add_argument('--warm', help='a .sql file of queries to run once after loading (sidecar births become part of load)')
     for name in ('sql', 'explain', 'file'):
         s = sub.add_parser(name); s.add_argument('db'); s.add_argument('file' if name == 'file' else 'sql')
