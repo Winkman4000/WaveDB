@@ -748,6 +748,13 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
                     rows = r if isfull else r[keep[r]]           # unsorted is fine: every consumer is order-free
             if rows is None:
                 _kc9 = keycache.get((a, c))
+                if _kc9 is None and n >= 1_000_000:
+                    # THE SHELVED COLUMN, IN THE CUT TOO: keys() decodes a big key column once per process
+                    # and shelves it, but the cut only looked in the per-query keycache -- so every cut of
+                    # mc.movie_id / mi.movie_id / ci.movie_id took the road walk (8ms binary searches per
+                    # step: 1.0s of keys_at across the COUNT board, all from restrict)
+                    try: _kc9 = keys(a, c)
+                    except Exception: _kc9 = None
                 if isfull:
                     idx = np.arange(n, dtype=np.int64) if _kc9 is None else None
                 if _kc9 is not None:
@@ -862,7 +869,8 @@ def _counting_emit(db, state):
         try:
             col = _keys(t, c)
             return np.asarray(col[idx], dtype=np.int64)
-        except Exception:
+        except Exception as _e:
+            if os.environ.get('WDB_SEMI_BILL'): print('  walk: keys() declined %s.%s (%s) -> road walk' % (t, c, str(_e)[:60]), flush=True)
             return _keys_at0(t, c, idx)
     if any(c == 0 for c in counts.values()):
         return _empty_result(tree)
@@ -937,9 +945,12 @@ def _counting_emit(db, state):
         kv = kv[ok]; w = w[ok]
         mx = int(kv.max()) if kv.size else 0
         if mx > 400_000_000: raise _Decline('counting fixpoint: key space too large for a dense LUT')
-        if kv.size * 16 < mx:
+        if kv.size * 64 < mx:
             # A LUT SIZED TO THE LIVE KEYS, NOT THE KEY SPACE: a class with a hundred live keys was
-            # allocating and zeroing a 2.5M-entry table (20 MB) per edge -- sparse: (sorted keys, sums)
+            # allocating and zeroing a 2.5M-entry table (20 MB) per edge -- sparse: (sorted keys, sums).
+            # SPARSE TO BUILD IS NOT SPARSE TO LOOK UP: the lookup was a binary search per parent row
+            # (801 searchsorted calls, 1.31s of a 1.46s walk); sparse only when keys are 64x rarer than
+            # the space -- a calloc'd dense table is cheaper than searching 400K rows into it
             u, inv = np.unique(kv, return_inverse=True)
             lut[(t, r)] = ('sparse', u, np.bincount(inv, weights=w, minlength=u.size))
         else:
