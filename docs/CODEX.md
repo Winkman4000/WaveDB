@@ -1480,3 +1480,53 @@ its parser bug (comment lines ate the statement after them: 113 of
 (key columns, predicate lists, settled spaces) dies with the process;
 --warm is the steady-state protocol; PERSISTING THE SHELF is the lever
 on the cold number (~20s), nothing on warm. Suite 1697/0.
+
+## THE SWITCH (2026-09-18): sidecars are an extension the operator turns on
+Jackson's question was scope: "the file is 9-10 GB -- what persists?"
+THE CENSUS answered it and corrected a claim of mine. JOB: 771 MB of
+segments and 2,219 MB of sidecars on disk (cast_info's reverse road
+alone 1,159 MB against a 162 MB segment) -- 3x the data, once per
+database, not per segment. ClickBench: the 8.78 GB submitted at load is
+the segment alone; after the 43 queries the directory is 11.3 GB --
+2.9 GB born by queries (text zones 849 MB, the range guide 471, two
+posting lists 808, censuses 290, text offsets 211, group-by codes 234).
+I had said ClickBench was sidecar-free. It was not. The published board
+(ClickBench repo, c6a.4xlarge, 2026): DuckDB 20.46 GB, ClickHouse 9.42,
+Umbra 8.31, Parquet 14.78 -- and data_size is measured after load,
+before any query, so query-born files never show. Jackson's ruling:
+"allowing 25% of our file size to be a sidecar in a persistent manner
+is like claiming compression but secretly storing things"; and the
+design: THE OPERATOR DECIDES -- the engine ships small and ClickHouse-
+class on joins by default; the extension is a switch, and with it on we
+beat DuckDB and are still smaller than DuckDB.
+THE MECHANISM: catalog.json carries 'sidecars': on|off; a new database
+is born OFF; a catalog without the key (born before the switch) is on;
+WDB_SIDECARS=0|1 in the environment overrides the catalog (an A/B
+without touching the realm). `wdb sidecars DB status|on|off|build
+QUERIES|drop`; `wdb load --warm` turns it on (asking for a warm IS
+asking for the extension); drop deletes every derived file and the
+birth ledgers and flips off. may_birth() refuses first on the switch;
+every other birth site (twenty-two, across seventeen modules -- the
+registry's docstring said "births go through may_birth" and five did)
+asks births_on(dbdir) before it writes. THE SENTINEL: while off,
+Database.run remembers the directory before a query and compares it
+after; a newborn is a missed gate -- removed and named on stderr,
+raised under WDB_SIDECAR_STRICT=1, which the suite sets. The registry
+learned five families it did not know (fk-pointer, lower-map, number-
+line, tier-shelf, and that .cluster/.cube are written by the ENCODER --
+loaded, not derived). test_sidecar_switch: off births nothing and
+answers duck-exact on a thirteen-query corpus; drop returns the loaded
+database; the environment overrides; the CLI round-trips.
+OFF IS NOT COLD: the first JOB board with the switch off ran 342s --
+off meant "rehash every query", because a refused road left the per-
+query cache and the shelf never saw it. THE ROAD ON THE SHELF: a
+reverse road or a pointer that is not persisted still lives for the
+process under the shelf's ceiling, keyed by both parents' identity
+(path+size+mtime). Off means nothing on disk, not nothing in RAM.
+MEASURED, on hardlink copies holding only the loaded files (JOB 771 MB
+/ 22 files; ClickBench 8.37 GB / 2 files; strict sentinel; nothing
+born): JOB first pass 53.4s vs duck 11.0, 113/113 exact, 41 wins (on:
+6.0s, 93 wins, 3.0 GB). ClickBench, each query its own process: cold
+197.6s, warm 23.2s vs duck 37.1s, 43/43 exact, 30 wins (median 1.83x);
+the one file the run added was routing_ledger.jsonl, 24 KB, a journal
+the registry counts as data. Suite 1702/0.

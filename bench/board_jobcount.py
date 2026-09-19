@@ -8,7 +8,7 @@ def main():
     import duckdb
     import wdb_kernels; wdb_kernels.warm()
     from wdb_db import Database
-    db = Database.open(ROOT + '/db'); con = duckdb.connect(ROOT + '/imdb.duckdb', read_only=True)
+    db = Database.open(os.environ.get('WDB_JOB_DB', ROOT + '/db')); con = duckdb.connect(ROOT + '/imdb.duckdb', read_only=True)
     files = sorted(glob.glob(ROOT + '/q/*.sql'), key=lambda p: (int(''.join(ch for ch in os.path.basename(p) if ch.isdigit()) or 0), os.path.basename(p)))
     files = [f for f in files if os.path.basename(f)[0].isdigit()]
     def _alarm(sig, frm): raise TimeoutError('timeout')

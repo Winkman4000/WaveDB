@@ -67,6 +67,9 @@ def build(seg, col):
             rep.append(i)
         lmap[i] = g
     p = _path(seg, col)
+    import wdb_sidecar
+    if not wdb_sidecar.births_on(os.path.dirname(p)):
+        return lmap, np.asarray(rep, np.int32)          # THE SWITCH: the same pair, in RAM
     tmp = p + '.tmp.%d' % os.getpid()
     with open(tmp, 'wb') as f:
         f.write(_MAGIC)

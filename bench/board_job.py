@@ -7,7 +7,7 @@ sys.path.insert(0, 'src')
 
 ROOT = '/workspace/data/job'
 REF = ROOT + '/imdb.duckdb'
-DB = ROOT + '/db'
+DB = os.environ.get('WDB_JOB_DB', ROOT + '/db')      # WDB_JOB_DB=... boards another realm (e.g. a sidecars-off copy)
 
 def main():
     import duckdb

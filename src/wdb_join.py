@@ -5488,6 +5488,14 @@ def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
         except Exception:
             side = None
         import wdb_sidecar as _wsc
+        if side and mark:
+            # THE ROAD ON THE SHELF: a pointer that was NOT persisted (the switch off, or the first ask)
+            # still lives for the process under the shelf's ceiling, keyed by both parents' identity --
+            # sidecars off means nothing on disk, not a 36M-row hash per query
+            import wdb_shelf as _wsh9
+            _hit9 = _wsh9.SHELF.get(('jptr', side, _js.dumps(mark, sort_keys=True)))
+            if _hit9 is not None and _hit9.shape[0] == cseg.N:
+                return _hit9
         if side and _wsc.exists(side + '.mark') and not _wsc.exists(side):
             # FAIL LOUD: a birthmark without its body is a lie -- remove it so the
             # rebirth below persists cleanly (a 480MB road was rehashing every
@@ -5533,7 +5541,9 @@ def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
     def _refuse():
         if side and mark:
             _JPTR_NOT.add(side)
-            try: _js.dump(mark, open(side + '.no', 'w'))
+            try:
+                if _wsc.births_on(_os.path.dirname(side)):                    # THE SWITCH: the memo is in RAM regardless
+                    _js.dump(mark, open(side + '.no', 'w'))
             except Exception: pass
         raise _FastUnsupported
     ck = np.asarray(wdb_sql._col(cseg, cp)[0]); pk = np.asarray(wdb_sql._col(pseg, pp)[0])
@@ -5542,12 +5552,18 @@ def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
     ptr = pidx.get_indexer(ck)
     if (ptr < 0).any(): _refuse()                                 # unmatched child rows -> would drop -> fall back
     ptr = ptr.astype(np.int64)
+    if side and mark:
+        try:
+            import wdb_shelf as _wsh9
+            _wsh9.SHELF.put(('jptr', side, _js.dumps(mark, sort_keys=True)), ptr, int(ptr.nbytes), kind='road')
+        except Exception:
+            pass                                                      # the shelf declined: this query still has it
     # THE BIRTH GATE (plist spirit: born where reads justify): the first
     # qualifying join per (child,key,parent,key) pays its hash in RAM only;
     # the sidecar is born on the SECOND ask, so one-off exploratory joins
     # never cost the realm disk. Operators may force births with
     # WDB_JPTR_EAGER=1 or forbid them with WDB_JPTR_OFF=1.
-    if side and mark and not _os.environ.get('WDB_JPTR_OFF'):
+    if side and mark and not _os.environ.get('WDB_JPTR_OFF') and _wsc.births_on(_os.path.dirname(side)):   # THE SWITCH
         # THE SECOND ASK must be remembered across queries: this set lived in db.__dict__, which the
         # per-query flush wiped, so every ask was the first -- cast_info's roads were never born
         # and every JOB-COUNT query rebuilt a 36M-row pointer (0.55s) and threw it away

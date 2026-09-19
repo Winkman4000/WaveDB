@@ -56,6 +56,8 @@ def _load_or_birth(seg, col):
         seen = np.unique(codes[f * BR: (f + 1) * BR])
         bits[seen, f] = True
     try:
+        import wdb_sidecar, os as _os9
+        if not wdb_sidecar.births_on(_os9.path.dirname(p)): raise OSError('sidecars off')   # THE SWITCH
         with open(p, 'wb') as fh:
             pickle.dump({'N': N, 'V': V, 'BR': BR,
                          'bits': np.packbits(bits)}, fh)

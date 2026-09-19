@@ -733,6 +733,8 @@ def _gdp_load(seg, pcol, ocol, dirn):
 def _gdp_save(seg, pcol, ocol, dirn, acc):
     import pickle
     try:
+        import wdb_sidecar, os as _os9
+        if not wdb_sidecar.births_on(_os9.path.dirname(seg.path)): return   # THE SWITCH
         pickle.dump({'n': int(seg.N), 'acc': np.asarray(acc)},
                     open(_gdp_path(seg, pcol, ocol, dirn), 'wb'), protocol=4)
     except Exception:

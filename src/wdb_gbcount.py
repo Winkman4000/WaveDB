@@ -110,7 +110,9 @@ def _load(seg, col):
         return None
     hc, hn, K, n = built
     try:
-        pickle.dump((hc, hn, K, n), open(p, 'wb'), protocol=4)
+        import wdb_sidecar
+        if wdb_sidecar.births_on(os.path.dirname(p)):                       # THE SWITCH
+            pickle.dump((hc, hn, K, n), open(p, 'wb'), protocol=4)
     except Exception:
         pass
     _CACHE[ck] = (hc, hn)

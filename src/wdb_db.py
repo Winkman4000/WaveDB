@@ -17,6 +17,7 @@ import os
 import wdb_ddl, wdb_dml, wdb_sql, wdb_merge, wdb_compact, wdb_join, wdb_fkptr, wdb_bsi_exec, wdb_cube, wdb_gbcount, wdb_survgroup, wdb_compound, wdb_groupdistinct, wdb_gdsidecar, wdb_groupmix
 import read_methods, controller
 import wdb_gridwalk_live
+import wdb_sidecar
 import commands
 import numpy as np
 import functools
@@ -608,6 +609,7 @@ class Database:
         data-derived. A query leaves the engine as if it was never there."""
         if getattr(self, '_qdepth', 0) == 0:
             self.refresh()                                   # another process may have rewritten the table
+            wdb_sidecar.sentinel_before(self.cat.dbdir)      # THE SWITCH off: the directory must not grow
         import wdb_qmem, os as _os9
         _bill9 = _os9.environ.get('WDB_JOIN_BILL')
         if _bill9:
@@ -636,6 +638,7 @@ class Database:
                 wdb_qmem.flush(self)
                 if _bill9:
                     print('RUN BILL: qmem-flush=%.0fms' % ((_t9.perf_counter() - _f0) * 1000), flush=True)
+                wdb_sidecar.sentinel_after(self.cat.dbdir)   # a newborn under an off switch is a missed gate
 
     def _run_impl(self, sql, escalate=None):
         esc = self.escalate if escalate is None else escalate

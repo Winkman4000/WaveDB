@@ -109,8 +109,10 @@ def build(seg, col):
     st = {'cnt': cnt, 'nn': nn, 'sum': bsum, 'cmin': cmin, 'cmax': cmax,
           'mode4': codes is None, 'maxabs': maxabs, 'dt': c['dt']}
     try:
-        np.savez(fn, N=N, cnt=cnt, nn=nn, sum=bsum, cmin=cmin, cmax=cmax,
-                 mode4=(codes is None), maxabs=maxabs, dt=int(c['dt']))
+        import wdb_sidecar, os as _os9
+        if wdb_sidecar.births_on(_os9.path.dirname(fn)):                    # THE SWITCH
+            np.savez(fn, N=N, cnt=cnt, nn=nn, sum=bsum, cmin=cmin, cmax=cmax,
+                     mode4=(codes is None), maxabs=maxabs, dt=int(c['dt']))
     except Exception:
         pass                                     # read-only volume: compute-only mode
     _SCACHE[key] = st

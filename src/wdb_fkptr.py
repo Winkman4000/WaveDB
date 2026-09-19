@@ -23,6 +23,8 @@ def save(seg_path, fk_col, ptr):
     comp = zstd.ZstdCompressor(level=9).compress(deltas.tobytes())
     body = _MAGIC + struct.pack('<Q', len(ptr)) + comp
     p = path_for(seg_path, fk_col); tmp = p + '.tmp'
+    import wdb_sidecar
+    if not wdb_sidecar.births_on(os.path.dirname(p)): return             # THE SWITCH
     with open(tmp, 'wb') as f: f.write(body)
     os.replace(tmp, p)
 

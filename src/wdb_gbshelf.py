@@ -25,6 +25,9 @@ def birth(seg, col):
     """Build the shelf from one bincount of the raw code stream. Returns True
     on success. Birth-on-first-touch: pays the pooled read once."""
     try:
+        import wdb_sidecar, os as _os9
+        if not wdb_sidecar.births_on(_os9.path.dirname(seg.path)):
+            return False                     # THE SWITCH: a disk-only shelf is not born
         c = seg.cols[col]
         V = int(c['V'])
         cnt = np.bincount(np.asarray(seg._raw_codes(col)), minlength=V)
@@ -132,6 +135,9 @@ def _path3(seg, col):
 
 def birth_dense(seg, col):
     try:
+        import wdb_sidecar, os as _os9
+        if not wdb_sidecar.births_on(_os9.path.dirname(seg.path)):
+            return False                     # THE SWITCH
         c = seg.cols[col]
         V = int(c['V'])
         if V > 4096:

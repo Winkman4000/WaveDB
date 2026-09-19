@@ -141,8 +141,10 @@ def execute(seg, spec):
     ridx.sort(kind='stable')
     jar = None
     try:
-        pickle.dump({'n': N, 'rows': ridx.astype(np.uint32)},
-                    open(shp, 'wb'), protocol=4)   # the repeater shelf: rows ARE
+        import wdb_sidecar
+        if wdb_sidecar.births_on(os.path.dirname(seg.path)):                      # THE SWITCH
+            pickle.dump({'n': N, 'rows': ridx.astype(np.uint32)},
+                        open(shp, 'wb'), protocol=4)   # the repeater shelf: rows ARE
     except Exception:
         pass                                        # identity; decode only to return
     if ridx.size > N // 8:
@@ -177,7 +179,9 @@ def _pt2_save(seg, a, b, rows, gid, ga, gb, ra=None, rb=None):
         if ra is not None:
             d9['ra'] = np.asarray(ra, np.int64)
             d9['rb'] = np.asarray(rb, np.int64)
-        pickle.dump(d9, open(_pt2_path(seg, a, b), 'wb'), protocol=4)
+        import wdb_sidecar, os as _os9
+        if wdb_sidecar.births_on(_os9.path.dirname(seg.path)):                    # THE SWITCH
+            pickle.dump(d9, open(_pt2_path(seg, a, b), 'wb'), protocol=4)
     except Exception:
         pass
 

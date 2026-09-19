@@ -140,8 +140,10 @@ def _load(seg, cols):
         return None
     aa, bb, cA, cB, cn, lm, n = built
     try:
-        pickle.dump({'fmt': _FMT, 'a': aa, 'b': bb, 'cA': cA, 'cB': cB, 'cn': cn, 'lm': lm, 'n': n},
-                    open(p, 'wb'), protocol=4)
+        import wdb_sidecar
+        if wdb_sidecar.births_on(os.path.dirname(p)):                       # THE SWITCH
+            pickle.dump({'fmt': _FMT, 'a': aa, 'b': bb, 'cA': cA, 'cB': cB, 'cn': cn, 'lm': lm, 'n': n},
+                        open(p, 'wb'), protocol=4)
     except Exception:
         pass
     _CACHE[ck] = (cA, cB, cn, lm)

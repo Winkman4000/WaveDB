@@ -22,6 +22,9 @@ def record(seg, kind, **args):
     import controller
     controller.plan_epoch_bump()
     try:
+        import wdb_sidecar
+        if not wdb_sidecar.births_on(os.path.dirname(seg.path)):
+            return                                   # THE SWITCH: no ledger for births that will not happen
         p = _ledger_path(seg)
         rows = []
         if os.path.exists(p):
@@ -42,6 +45,9 @@ def replay(db):
     if os.environ.get('WDB_EAGER_SHELVES', '1') == '0':
         return
     try:
+        import wdb_sidecar
+        if not wdb_sidecar.births_on(db.cat.dbdir):
+            return                                   # THE SWITCH: nothing is born at open either
         tables = list(db.cat.list_tables())
     except Exception:
         return

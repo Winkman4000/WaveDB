@@ -191,6 +191,8 @@ def _gdc_save2(seg, kcol, tcol, counts):
                                                     # only as high as it measures
     top_counts = counts[order].astype(dt)        # the measured max picks the bus
     try:
+        import wdb_sidecar, os as _os9
+        if not wdb_sidecar.births_on(_os9.path.dirname(seg.path)): return   # THE SWITCH
         pickle.dump({'n': int(seg.N), 'top_codes': top_codes,
                      'top_counts': top_counts, 'keys': None, 'noempty': True},
                     open(_gdc_path(seg, kcol, tcol), 'wb'), protocol=4)
@@ -201,6 +203,8 @@ def _gdc_save2(seg, kcol, tcol, counts):
 def _gdc_save(seg, kcol, tcol, counts, keys):
     import pickle
     try:
+        import wdb_sidecar, os as _os9
+        if not wdb_sidecar.births_on(_os9.path.dirname(seg.path)): return   # THE SWITCH
         pickle.dump({'n': int(seg.N), 'counts': counts, 'keys': keys},
                     open(_gdc_path(seg, kcol, tcol), 'wb'), protocol=4)
     except Exception:

@@ -3,6 +3,8 @@
 On completion prints the scoreboard summary (examples/report.md); --report regenerates it."""
 import os
 os.environ.setdefault('WDB_SEQ_NARROW_OK', '1')   # machinery tests build narrow mode-4 toys
+os.environ.setdefault('WDB_SIDECARS', '1')        # THE SWITCH: new databases are born off; the suite exercises births
+os.environ.setdefault('WDB_SIDECAR_STRICT', '1')  # THE SENTINEL raises: a birth under an off switch is a defect
 import sys, os, importlib, traceback, time, subprocess
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)

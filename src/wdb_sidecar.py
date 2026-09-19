@@ -10,6 +10,16 @@ construction; families with a .mark carry their own birthmark too).
 
 Births go through may_birth(): a disk budget (WDB_SIDECAR_GB, default 64) refuses
 new births with a NAMED decline instead of filling the disk.
+
+THE SWITCH (Jackson's operator law): sidecars are an EXTENSION the operator turns on, not a
+tax the engine levies in secret. A database's catalog carries 'sidecars': 'on' | 'off'; off
+means no derived file is ever born (the engine answers from segments + the RAM shelf), so the
+number on disk is the number that was loaded. WDB_SIDECARS=0|1 in the environment overrides
+the catalog (an A/B without touching the realm). A catalog without the key is 'on' -- every
+realm born before the switch keeps its roads. `wdb sidecars DB on|off|status|drop`.
+THE SENTINEL: while off, Database.run compares the directory before and after each query;
+a newborn is a missed gate -- removed and named on stderr, raised under WDB_SIDECAR_STRICT=1
+(the suite runs strict: a silent gate is a defect, not overhead).
 """
 import os, re, sys, json, time
 
@@ -36,8 +46,22 @@ FAMILIES = [
     (r'\.fpm$',                  'fpm',            'V',  'wdb_fpm'),
     (r'\.cluster$',              'cluster',        'V',  'wdb_cluster'),
     (r'\.inv\.(u|offs|order|rank)\.npy$', 'reverse-road', 'N', 'wdb_semijoin.inverted'),
+    (r'\.fkptr\.[A-Za-z0-9_]+$', 'fk-pointer',     'N',  'wdb_fkptr'),
+    (r'\.lmap\.[A-Za-z0-9_]+$',  'lower-map',      'V',  'wdb_lmap'),
+    (r'\.nline\.[A-Za-z0-9_]+$', 'number-line',    'V',  'wdb_nline'),
+    (r'^tier2__.*\.bin$',        'tier-shelf',     'N',  'wdb_pairdistinct'),
     (r'\.npz$',                  'npz-shelf',      '?',  'various'),
 ]
+DATA_FILES = ('catalog.json', 'sidecars.json', 'shelves.json')      # never sidecars: the realm itself and its ledgers
+_DATA_SUFFIXES = ('.wdb', '.jsonl', '.presence', '.overrides', '.parquet',   # segments, journals, presence, DML hot buffers
+                  '.cluster', '.cube',                                       # written by the ENCODER: part of the load, not derived
+                  '.tmp', '.partial')                                        # a birth in flight (the rename law)
+
+
+def is_data_file(name):
+    """the files that ARE the database (loaded by the encoder or written by DML) -- everything else in the
+    directory is derived from them and may be dropped"""
+    return name in DATA_FILES or name.endswith(_DATA_SUFFIXES) or '.tmp.' in name
 _SEG = re.compile(r'^(?P<seg>[A-Za-z0-9_]+_[0-9]+\.wdb)\.(?P<rest>.+)$')
 _UNION = re.compile(r'^(?P<table>[A-Za-z0-9_]+)\.union-(?P<hash>[0-9a-f]{12})\.wdb\.(?P<rest>.+)$')
 
@@ -209,9 +233,135 @@ def budget_bytes():
         return 64 * 10**9
 
 
+_SETTING_CACHE = {}
+
+
+def _env_setting():
+    env = os.environ.get('WDB_SIDECARS')
+    if env is None or env.strip() == '':
+        return None
+    return 'off' if env.strip().lower() in ('0', 'off', 'no', 'false') else 'on'
+
+
+def setting(dbdir):
+    """'on' | 'off' for this database: WDB_SIDECARS in the environment wins; else the catalog's
+    'sidecars' key; a catalog without the key is 'on'. Cached under the catalog stamp."""
+    env = _env_setting()
+    if env is not None:
+        return env
+    stamp = _catalog_stamp(dbdir)
+    hit = _SETTING_CACHE.get(dbdir)
+    if hit is not None and stamp is not None and hit[0] == stamp:
+        return hit[1]
+    v = 'on'
+    try:
+        with open(os.path.join(dbdir, 'catalog.json')) as f:
+            v = 'off' if str(json.load(f).get('sidecars', 'on')).lower() == 'off' else 'on'
+    except Exception:
+        pass
+    if stamp is not None:
+        _SETTING_CACHE[dbdir] = (stamp, v)
+    return v
+
+
+def births_on(dbdir):
+    """THE SWITCH, asked at every birth site: False means write nothing derived to disk."""
+    return setting(dbdir) == 'on'
+
+
+def set_setting(dbdir, value):
+    """write 'sidecars': on|off into the catalog (the operator's decision, persisted with the realm)"""
+    value = 'off' if str(value).strip().lower() in ('0', 'off', 'no', 'false') else 'on'
+    p = os.path.join(dbdir, 'catalog.json')
+    with open(p) as f:
+        data = json.load(f)
+    data['sidecars'] = value
+    tmp = p + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f, indent=2); f.flush(); os.fsync(f.fileno())
+    os.replace(tmp, p)
+    stamp_moved(dbdir); _SETTING_CACHE.pop(dbdir, None); _fresh_cache.clear(); _exists_cache.clear()
+    return value
+
+
+def drop(dbdir, dry=False, print_out=True):
+    """delete EVERY derived file in the realm (all families, fresh or stale, plus the birth ledgers)
+    and turn the switch off: the directory is the loaded database again."""
+    try:
+        names = os.listdir(dbdir)
+    except FileNotFoundError:
+        return 0, 0
+    gone = 0; freed = 0
+    for n in sorted(names):
+        if is_data_file(n) and n != 'shelves.json' and n != 'sidecars.json':
+            continue
+        p = os.path.join(dbdir, n)
+        if not os.path.isfile(p):
+            continue
+        try:
+            sz = os.path.getsize(p)
+        except OSError:
+            continue
+        if print_out:
+            print('  %s %s (%.1f MB)' % ('would remove' if dry else 'removing', n, sz / 1e6))
+        if not dry:
+            try:
+                os.remove(p); gone += 1; freed += sz
+            except OSError:
+                pass
+    if not dry:
+        set_setting(dbdir, 'off')
+    if print_out:
+        print('DROP %s: removed %d files, freed %.2f GB; sidecars %s' % (dbdir, gone, freed / 1e9, 'off' if not dry else '(dry run)'))
+    return gone, freed
+
+
+_SENTINEL = {}
+
+
+class SidecarBornWhileOff(Exception):
+    pass
+
+
+def sentinel_before(dbdir):
+    """THE SENTINEL, armed: remember the directory when the switch is off (nothing when on)"""
+    if births_on(dbdir):
+        return
+    try:
+        _SENTINEL[dbdir] = frozenset(os.listdir(dbdir))
+    except OSError:
+        _SENTINEL.pop(dbdir, None)
+
+
+def sentinel_after(dbdir):
+    """THE SENTINEL, read: a derived file that appeared while the switch was off is a missed gate.
+    It is removed (the operator's number on disk holds) and named; the suite runs strict and raises."""
+    before = _SENTINEL.pop(dbdir, None)
+    if before is None:
+        return
+    try:
+        now = os.listdir(dbdir)
+    except OSError:
+        return
+    born = [n for n in now if n not in before and not is_data_file(n)]
+    if not born:
+        return
+    for n in born:
+        try:
+            os.remove(os.path.join(dbdir, n))
+        except OSError:
+            pass
+    msg = 'SIDECAR BORN WHILE OFF (a missed gate): %s' % ', '.join(sorted(born))
+    if os.environ.get('WDB_SIDECAR_STRICT'):
+        raise SidecarBornWhileOff(msg)
+    print('wdb: ' + msg, file=sys.stderr, flush=True)
+
+
 def may_birth(dbdir, nbytes, what=''):
     """THE DISK GATE: a birth that would push the db's sidecars past the budget is
-    refused by name (the engine still answers -- without the sidecar)."""
+    refused by name (the engine still answers -- without the sidecar). THE SWITCH first."""
+    if not births_on(dbdir):
+        raise BirthRefused('sidecars are off for %s: %s not born (wdb sidecars %s on)' % (dbdir, what or 'a birth', dbdir))
     _by, total = stats(dbdir, print_out=False)
     if total + nbytes > budget_bytes():
         raise BirthRefused('sidecar budget %.0f GB would be exceeded by %s (+%.2f GB on %.2f GB)' % (

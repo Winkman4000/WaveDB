@@ -315,7 +315,12 @@ def execute(db, tree, sql=None):
                     _os9.replace(fn + '.%s.tmp.npy' % nm9, fn + '.%s.npy' % nm9)
                 cache[pc] = (u, offs, np.load(fn + '.order.npy', mmap_mode='r'), np.load(fn + '.rank.npy', mmap_mode='r'))
             except wdb_sidecar.BirthRefused as _e:
-                print('SEMI: %s -- serving from RAM this query' % str(_e)[:120], flush=True)
+                # THE ROAD ON THE SHELF: refused on disk (the switch off, or the budget) is not refused in
+                # RAM -- it lives for the process under the shelf's ceiling, like a loaded one would
+                try: wdb_shelf.SHELF.put(('inv', getattr(seg, 'path', id(seg)), pc), cache[pc],
+                                         int(u.nbytes + offs.nbytes + order.nbytes + rank.nbytes), kind='reverse-road')
+                except wdb_shelf.ShelfRefused:
+                    print('SEMI: %s -- serving from RAM this query' % str(_e)[:120], flush=True)
             except Exception as _e:
                 if __import__('os').environ.get('WDB_SEMI_BILL'):
                     print('SEMI: inverted sidecar save failed for %s: %s' % (fn, str(_e)[:80]), flush=True)

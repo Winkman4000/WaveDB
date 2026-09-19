@@ -48,6 +48,10 @@ def _plist(seg, col):
         cnts = np.bincount(cc, minlength=V)
         offs = np.zeros(V + 1, np.int64)
         np.cumsum(cnts, out=offs[1:])
+        import wdb_sidecar
+        if not wdb_sidecar.births_on(os.path.dirname(p)):
+            hit = (offs, order.astype(np.uint32)); memo[col] = hit          # THE SWITCH: RAM only
+            return hit
         tmp = p + '.tmp'
         with open(tmp, 'wb') as f:
             f.write(np.array([V], np.int64).tobytes())

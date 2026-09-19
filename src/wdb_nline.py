@@ -34,6 +34,9 @@ def build(seg, cols=None, force=False):
     never see a half-written file. String dicts decline (the .sline twin's job).
     Returns [(col, n_values), ...] for lines actually written."""
     made = []
+    import wdb_sidecar
+    if not wdb_sidecar.births_on(os.path.dirname(seg.path)):
+        return made                                   # THE SWITCH: no lines written
     for nm in (cols if cols is not None else eligible(seg)):
         p = line_path(seg.path, nm)
         if os.path.exists(p) and not force:

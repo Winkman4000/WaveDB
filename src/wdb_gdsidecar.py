@@ -75,6 +75,8 @@ def build(seg, group_col, target_col):
 
 def save(segment_path, sc):
     p = sidecar_path(segment_path, sc['meta']['group_col'], sc['meta']['target_col'])
+    import wdb_sidecar
+    if not wdb_sidecar.births_on(os.path.dirname(p)): return p           # THE SWITCH
     tmp = p + '.tmp'
     np.savez(tmp, counts=sc['counts'], present=sc['present'],
              meta=np.frombuffer(json.dumps(sc['meta']).encode(), dtype=np.uint8))

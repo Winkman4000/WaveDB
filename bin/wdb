@@ -121,6 +121,8 @@ def cmd_load(a):
     cat.save()
     print('loaded %s: %s rows, %d columns -> %s (%.2f GB) in %.1fs' % (a.table, format(r['n_rows'], ','), r['n_cols'], seg_name, os.path.getsize(out) / 1e9, dt), flush=True)
     if a.warm:
+        import wdb_sidecar
+        wdb_sidecar.set_setting(a.db, 'on')          # asking for a warm IS turning the switch on
         _warm(a.db, a.warm)
     return 0
 
@@ -144,6 +146,29 @@ def _warm(dbdir, queries_file):
 def cmd_warm(a):
     _warm(a.db, a.queries)
     return 0
+
+
+def cmd_sidecars(a):
+    """THE SWITCH (Jackson's operator law): derived files are an extension the operator turns on.
+        wdb sidecars DB status          what the switch says, and what is on disk
+        wdb sidecars DB on|off          persist the decision in the catalog
+        wdb sidecars DB build QUERIES   on, then warm: every sidecar those queries need is born now
+        wdb sidecars DB drop            delete every derived file and turn the switch off"""
+    import wdb_sidecar
+    act = a.action
+    if act == 'status':
+        env = wdb_sidecar._env_setting()
+        print('sidecars: %s%s' % (wdb_sidecar.setting(a.db), '  (WDB_SIDECARS in the environment overrides the catalog)' if env else ''))
+        wdb_sidecar.stats(a.db)
+        return 0
+    if act in ('on', 'off'):
+        print('sidecars: %s' % wdb_sidecar.set_setting(a.db, act)); return 0
+    if act == 'build':
+        if not a.queries: print('build needs a QUERIES.sql', file=sys.stderr); return 2
+        wdb_sidecar.set_setting(a.db, 'on'); _warm(a.db, a.queries); wdb_sidecar.stats(a.db); return 0
+    if act == 'drop':
+        wdb_sidecar.drop(a.db, dry=a.dry); return 0
+    print('unknown action %s' % act, file=sys.stderr); return 2
 
 
 def cmd_sql(a):
@@ -276,6 +301,8 @@ def main(argv=None):
     for name in ('tables', 'stats', 'audit'):
         s = sub.add_parser(name); s.add_argument('db')
     s = sub.add_parser('vacuum'); s.add_argument('db'); s.add_argument('--dry', action='store_true')
+    s = sub.add_parser('sidecars', help='the switch: derived files are an extension the operator turns on (status|on|off|build QUERIES|drop)')
+    s.add_argument('db'); s.add_argument('action', choices=['status', 'on', 'off', 'build', 'drop']); s.add_argument('queries', nargs='?'); s.add_argument('--dry', action='store_true')
     for name in ('compact', 'flush'):
         s = sub.add_parser(name); s.add_argument('db'); s.add_argument('table')
         if name == 'compact':

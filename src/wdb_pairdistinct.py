@@ -111,6 +111,9 @@ def _tier_shelf(seg, a, b, u):
         uc0 = np.asarray(seg._raw_codes(u))
         e0 = int(WS._code_of(seg, b, ''))
         typed0 = np.flatnonzero(bc0 != e0).astype(np.uint32)
+        import wdb_sidecar
+        if not wdb_sidecar.births_on(os.path.dirname(seg.path)):          # THE SWITCH: the same four, in RAM
+            return typed0, ac0[typed0].astype(np.uint8), bc0[typed0].astype(np.uint8), uc0[typed0].astype(np.uint32)
         with open(p9 + '.tmp', 'wb') as f:
             f.write(np.asarray([typed0.size], np.int64).tobytes())
             f.write(typed0.tobytes())

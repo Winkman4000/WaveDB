@@ -1416,6 +1416,9 @@ class Segment:
             codes = self.codes(nm)
             cc[nm] = np.bincount(codes, minlength=self.cols[nm]['V'])
             try:
+                import wdb_sidecar as _wsc9
+                if not _wsc9.births_on(_os.path.dirname(self.path)):
+                    return cc[nm]                                            # THE SWITCH: computed, not born
                 np.save(fn + '.tmp.npy', np.asarray(cc[nm]))
                 _os.replace(fn + '.tmp.npy', fn)
             except Exception:
