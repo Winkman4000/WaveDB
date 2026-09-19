@@ -1613,3 +1613,31 @@ Q00 3.0 -> 1.4 ms (Umbra 1.6), Q02 9.0 -> 1.5 (42), Q06 6.2 -> 1.4
 34.1 -> 31.8, 43/43 exact; against Umbra 20 of 43 from 17. Suite
 1707/0. LAW: a per-query cost that is small is paid times every query
 on every board; the floor is a number to profile like any other.
+
+
+## THE SCAN WITHOUT THE GIL (2026-09-19): Q21-23, and the board under Umbra's total
+The hunch was "LIKE then gather is our territory"; the profile said the
+LIKE itself was cheap (the dictionary is the haystack; 8,326 of 18.3M
+URLs contain google, 15,911 rows) and everything after it was not.
+_scan_flag over 100M codes: zstd releases the GIL but flag[raw] and
+nonzero held it, so fourteen threads ran one at a time -- 221 ms, when
+decompression alone scales to 61 ms on fourteen. The membership test
+is a nogil kernel; the flag is packed to bits (18 MB of bools missed
+the cache on every lookup; 2.3 MB sits in L2); the frame is sliced as
+a memoryview, not copied. 221 -> 76 ms. THE SCANNED CODES: the scan
+keeps the column's codes at the hits, so the caller's codes_at over
+the same positions -- which decompressed every frame again, 93 ms for
+16K rows -- is a lookup (0.2 ms), exact on the full set and on any
+subset. Q23 (SELECT * ... LIMIT 10) was 535 ms for ten rows: six enc-1
+columns are one zstd frame each and a point read inflated all 100M
+codes; zstd streams, so the prefix to the highest row asked is what is
+inflated (the first ten hits of a scan are early rows), and a thread
+pool for ten frames cost more than the frames (serial under sixteen).
+535 -> 54 ms. MEASURED on the board, all 43 exact: Q21 390 -> 163 ms
+(Umbra 49), Q22 798 -> 514 (59), Q23 552 -> 54 (37); warm total 6.40
+-> 5.41s -- UNDER Umbra's 5.58 for the first time -- cold 31.8 ->
+23.8; still 20 of 43 head to head. Suite 1707/0. WHAT REMAINS on Q21/
+Q22 is the floor of the form: 257 MB of zstd'd codes inflate to 400 MB
+at ~65 ms on fourteen cores, and Umbra reads byte-aligned columns at
+memory speed. That is an ELECTION question (zstd's 55 MB against a 4x
+faster scan on the hottest string column), not a kernel question.

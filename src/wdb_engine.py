@@ -1955,6 +1955,28 @@ class Segment:
             _WK.bp0_gather(np.frombuffer(self.buf, np.uint8), int(c['cstart']),
                            int(c['bits']), rows0, out0)
             return out0
+        if c.get('code_enc', 0) == 1 and nm not in self._codes and rows.size <= 65536:
+            # ONE FRAME, READ TO THE LAST ROW ASKED: enc-1 is a single zstd frame, and a point read
+            # inflated all 100M codes (ParamPrice: 87 ms for ten rows). zstd streams, so the prefix
+            # up to the highest row is what is inflated -- the first ten hits of a scan are early rows
+            import zstandard as _z1, io as _io1
+            wdt1 = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
+            isz1 = np.dtype(wdt1).itemsize
+            need1 = (int(rows.max()) + 1) * isz1
+            if need1 * 2 <= int(self.N) * isz1:
+                raw1 = np.frombuffer(_z1.ZstdDecompressor().stream_reader(
+                    _io1.BytesIO(memoryview(self.buf)[c['cstart']:c['cstart'] + c['czlen']])).read(need1), dtype=wdt1)
+                return raw1[rows]
+        _sc = self.__dict__.get('_scan_codes')
+        if _sc is not None and nm in _sc and c.get('code_enc', 0) == 3 and nm not in self._codes:
+            # THE SCANNED CODES: a frame scan on this column kept its codes at the hit positions; a
+            # gather over those positions (or a subset of them) is a lookup, not 1,526 decompressions
+            _sp, _scc = _sc[nm]
+            if rows.size <= _sp.size:
+                _ix = np.searchsorted(_sp, rows)
+                _ok = _ix < _sp.size
+                if _ok.all() and np.array_equal(_sp[_ix], rows):
+                    return _scc[_ix]
         if c.get('code_enc', 0) != 3 or nm in self._codes or rows.size >= (self.N >> 2):
             # huge row sets: ONE full decode + one vectorized gather beats touching every
             # frame through a positional walk (sq-nested passed ~90M positions here)
@@ -1970,11 +1992,12 @@ class Segment:
         ends = np.append(starts[1:], bs.size)
         import io as _io
         isz = np.dtype(wdt).itemsize
+        mv = memoryview(self.buf)                        # slices without the copy
 
         def _popf(t):
             j, s, e = t
             import zstandard as _z                       # per-task decompressor: the
-            fb = self.buf[base + int(bo[j]):base + int(bo[j + 1])].tobytes()   # shared one
+            fb = mv[base + int(bo[j]):base + int(bo[j + 1])]                  # shared one
             frame_rows = min(BR, self.N - j * BR)        # is not thread-safe
             mx = int(rs[s:e].max()) - j * BR
             need = (mx + 1) * isz
@@ -1988,9 +2011,10 @@ class Segment:
             return j, s, e, raw
 
         tasks = list(zip(ub.tolist(), starts.tolist(), ends.tolist()))
-        if len(tasks) > 2:                               # POOLED POPS: 95 scattered
+        if len(tasks) > 16:                              # POOLED POPS: 95 scattered (a pool for ten frames cost more than the frames)
             from concurrent.futures import ThreadPoolExecutor   # winners were 95 serial
-            with ThreadPoolExecutor(max_workers=min(8, len(tasks))) as ex:   # inflations
+            _W = 14 if len(tasks) >= 512 else 8          # inflations; wide sets use every core
+            with ThreadPoolExecutor(max_workers=min(_W, len(tasks))) as ex:
                 for j, s, e, raw in ex.map(_popf, tasks):
                     out[order[s:e]] = raw[rs[s:e] - j * BR]
         else:

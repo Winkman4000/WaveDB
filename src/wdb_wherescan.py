@@ -278,6 +278,18 @@ def _like(node):
 from numba import njit, prange
 
 
+@njit(nogil=True, cache=True)
+def _flag_hits_kernel(raw, bits, s0, e0, base, hits, codes):
+    """positions (base + i) and codes for i in [s0, e0) whose code's bit is set in the packed flag
+    (little-endian bit order) -- one frame, no GIL"""
+    n = 0
+    for i in range(s0, e0):
+        v = raw[i]
+        if (bits[v >> 3] >> (v & 7)) & 1:
+            hits[n] = base + (i - s0); codes[n] = v; n += 1
+    return n
+
+
 @njit(nogil=True, parallel=True, cache=True)
 def _find_all_kernel(buf, nd):
     """all start positions of nd in buf -- two passes over parallel chunks (count, then fill into
@@ -1103,23 +1115,45 @@ def _scan_flag(seg, col, flag, lo, hi):
                     return rows[a:b]
                 return rows
     if c.get('code_enc', 0) == 3 and col not in seg._codes:
+        # THE FRAME SCAN WITHOUT THE GIL: zstd releases it, but flag[raw] and nonzero held it, so
+        # fourteen threads ran one at a time (221 ms for 1,526 frames; 63 ms per 200 frames on one
+        # thread was the whole cost). The membership test is a nogil kernel now, and it keeps the
+        # scanned column's codes at the hits -- the caller's codes_at over the same positions would
+        # have decompressed every frame again (93 ms for 16K rows of URL)
         wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
         BR = c['BR']; base = c['cstart']; bo = c['boffs']; buf = seg.buf
         j0, j1 = lo // BR, (hi - 1) // BR + 1
+        # THE FLAG AS BITS: an 18 MB bool table missed the cache on every one of 100M lookups; packed
+        # to 2.3 MB it sits in L2 (130 -> 102 ms for the lookups alone, one thread); memoized per flag
+        _pk = seg.__dict__.setdefault('_flag_bits', {})
+        bitsB = _pk.get(id(flag))
+        if bitsB is None or bitsB[0] is not flag:
+            bitsB = (flag, np.packbits(np.ascontiguousarray(flag, dtype=np.bool_), bitorder='little'))
+            _pk[id(flag)] = bitsB
+            if len(_pk) > 64: _pk.clear(); _pk[id(flag)] = bitsB
+        bitsB = bitsB[1]
+        mv = memoryview(buf)                     # slices without the copy: 89 -> 61 ms of decompression
         def scan(js):
             import zstandard as zstd
-            dz = zstd.ZstdDecompressor(); out = []
+            dz = zstd.ZstdDecompressor(); outp = []; outc = []
+            hitbuf = np.empty(BR, np.int64); codebuf = np.empty(BR, np.int64)
             for j in js:
-                raw = np.frombuffer(dz.decompress(buf[base+int(bo[j]):base+int(bo[j+1])].tobytes()), dtype=wdt)
+                raw = np.frombuffer(dz.decompress(mv[base+int(bo[j]):base+int(bo[j+1])]), dtype=wdt)
                 a, b = max(lo, j*BR), min(hi, j*BR + raw.size)
-                h = np.nonzero(flag[raw[a-j*BR:b-j*BR]])[0]
-                if h.size: out.append(h + a)
-            return np.concatenate(out) if out else np.empty(0, np.int64)
+                n = _flag_hits_kernel(raw, bitsB, a - j*BR, b - j*BR, a, hitbuf, codebuf)
+                if n:
+                    outp.append(hitbuf[:n].copy()); outc.append(codebuf[:n].copy())
+            return (np.concatenate(outp), np.concatenate(outc)) if outp else (np.empty(0, np.int64), np.empty(0, np.int64))
         W = min(_SCAN_THREADS, max(1, j1 - j0))
         with ThreadPoolExecutor(W) as ex:
             parts = list(ex.map(scan, np.array_split(np.arange(j0, j1), W)))
-        parts = [p for p in parts if p.size]
-        return np.concatenate(parts) if parts else np.empty(0, np.int64)
+        parts = [p for p in parts if p[0].size]
+        if not parts:
+            return np.empty(0, np.int64)
+        pos = np.concatenate([p[0] for p in parts]); codes = np.concatenate([p[1] for p in parts])
+        if pos.size <= 4_000_000:                                          # THE SCANNED CODES, kept for codes_at:
+            seg.__dict__.setdefault('_scan_codes', {})[col] = (pos, codes)  # a fact about the segment, never stale
+        return pos
     if c.get('code_enc', 0) == 12 and (hi - lo) >= (1 << 16):
         import wdb_kernels as _WK                # vertical membership scan
         plV = seg.vplanes(col)
