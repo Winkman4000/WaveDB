@@ -8,12 +8,18 @@ table's survivors (strings by the extreme present dictionary code)."""
 import os
 import numpy as np
 import wdb_shelf
+import wdb_coordroad
 import sqlglot
 from sqlglot import exp as E
 
 
 class _Decline(Exception):
     pass
+
+
+import threading as _threading
+_INV_LOCK = _threading.Lock()          # guards _INV_LOCKS
+_INV_LOCKS = {}                        # (segment path, key column) -> the lock one road's birth is under
 
 
 def shape_ok(tree):
@@ -245,12 +251,12 @@ def execute(db, tree, sql=None):
         if (a, col) in keycache:
             return keycache[(a, col)][idx]
         inv9 = getattr(seg, '_inv_cache', {}).get(pc)
-        if inv9 is None and int(seg.N) >= 1_000_000:
-            inv9 = inverted(a, [col])
-        if inv9 is not None:
+        if inv9 is not None and not isinstance(inv9, wdb_coordroad.CoordRoad) and inv9[3] is not None:
+            # an old flat road that still carries rank: rank[row] -> position -> key. New roads have no rank
+            # (its one reader is this; the dictionary below answers the same at 0.2-61 ms measured)
             u9, offs9, _o9, rank9 = inv9
             pos9 = np.asarray(rank9[idx]).astype(np.int64)
-            return u9[np.searchsorted(offs9, pos9, side='right') - 1]    # THE REVERSE ROAD answers point reads
+            return u9[np.searchsorted(offs9, pos9, side='right') - 1]
         raw = wdb_sql.raw_dict_col(seg, pc, want_codes=False)
         if raw is not None:
             vals = np.asarray(raw[0]).astype(np.int64)
@@ -273,7 +279,15 @@ def execute(db, tree, sql=None):
     # surviving key set on one side yields its rows on the other without a
     # pass over N. Used when the source keep is small relative to the target.
     def inverted(a, cols_a):
+        """one birth per road: the stream's isolation threads asked for the same road at once and both
+        built it (two 36M argsorts, two writes, a .tmp left behind)"""
         if len(cols_a) != 1: return None
+        seg = segs[a]; pc = pms[a].get(cols_a[0], cols_a[0])
+        with _INV_LOCK:
+            lk = _INV_LOCKS.setdefault((getattr(seg, 'path', id(seg)), pc), __import__('threading').Lock())
+        with lk:
+            return _inverted0(a, cols_a)
+    def _inverted0(a, cols_a):
         seg = segs[a]; pc = pms[a].get(cols_a[0], cols_a[0])
         import wdb_shelf
         cache = getattr(seg, '_inv_cache', None)
@@ -285,13 +299,25 @@ def execute(db, tree, sql=None):
                 return cache[pc]
         path = getattr(seg, 'path', None) or getattr(seg, '_path', None)
         fn = ('%s.%s.inv' % (path, pc)) if path else None       # three mmap'd .npy files: u / offs / order
-        import wdb_sidecar
+        import wdb_sidecar, wdb_coordroad
+        _os9 = __import__('os')
         try:
-            if fn and wdb_sidecar.exists(fn + '.rank.npy') \
-                    and wdb_sidecar.is_fresh(__import__('os').path.dirname(path), __import__('os').path.basename(fn + '.rank.npy')):
-                # THE BIRTHMARK: a sidecar older than its segment is false by construction
+            if fn and wdb_sidecar.exists(fn + '.hdr.npy') \
+                    and wdb_sidecar.is_fresh(_os9.path.dirname(path), _os9.path.basename(fn + '.hdr.npy')):
+                # THE COORDINATE ROAD on disk (Jackson's blocks): headers in RAM, positions mmap'd
+                road = wdb_coordroad.load(fn)
+                if road is not None:
+                    cache[pc] = road
+                    try: wdb_shelf.SHELF.put(('inv', getattr(seg, 'path', id(seg)), pc), road, road.resident_bytes, kind='reverse-road')
+                    except wdb_shelf.ShelfRefused: pass
+                    return road
+            if fn and wdb_sidecar.exists(fn + '.order.npy') \
+                    and wdb_sidecar.is_fresh(_os9.path.dirname(path), _os9.path.basename(fn + '.order.npy')):
+                # THE BIRTHMARK: a sidecar older than its segment is false by construction. rank is optional:
+                # retired from births (its one reader, keys_at, has the dictionary), read when an old road has it
                 u = np.load(fn + '.u.npy'); offs = np.load(fn + '.offs.npy')
-                order = np.load(fn + '.order.npy', mmap_mode='r'); rank = np.load(fn + '.rank.npy', mmap_mode='r')
+                order = np.load(fn + '.order.npy', mmap_mode='r')
+                rank = np.load(fn + '.rank.npy', mmap_mode='r') if wdb_sidecar.exists(fn + '.rank.npy') else None
                 cache[pc] = (u, offs, order, rank)
                 try: wdb_shelf.SHELF.put(('inv', getattr(seg, 'path', id(seg)), pc), cache[pc], u.nbytes + offs.nbytes, kind='reverse-road')
                 except wdb_shelf.ShelfRefused: pass
@@ -303,31 +329,54 @@ def execute(db, tree, sql=None):
         sv = vals[order]
         u, starts = np.unique(sv, return_index=True)
         offs = np.append(starts, sv.size).astype(np.int64)
-        rank = np.empty_like(order); rank[order] = np.arange(order.size, dtype=order.dtype)   # row -> position
+        rank = np.empty_like(order); rank[order] = np.arange(order.size, dtype=order.dtype)   # row -> position (RAM only)
         cache[pc] = (u, offs, order, rank)
+        # THE RULE AT BIRTH, BY MEASUREMENT: coordinates when their headers + positions are smaller than
+        # the flat rows (keys whose rows share blocks); flat when every row would pay its own header
+        _plan9 = wdb_coordroad.plan(order, offs) if (vals.size < (1 << 32) and _os9.environ.get('WDB_COORD_ROAD', '1') != '0') else None
+        coord = _plan9 is not None and _plan9[-1] < wdb_coordroad.flat_bytes(order, offs)    # whole file vs whole file (u is shared)
+        if coord:
+            road = wdb_coordroad.build(u, order, offs)
+            cache[pc] = road
+        nbytes9 = int(road.disk_bytes) if coord else int(u.nbytes + offs.nbytes + order.nbytes)
         if fn:
             try:
-                _os9 = __import__('os')
-                wdb_sidecar.may_birth(_os9.path.dirname(path), int(u.nbytes + offs.nbytes + order.nbytes + rank.nbytes),
-                                      'reverse road %s.%s' % (_os9.path.basename(path), pc))   # THE DISK GATE
-                for nm9, arr9 in (('u', u), ('offs', offs), ('order', order), ('rank', rank)):
-                    np.save(fn + '.%s.tmp.npy' % nm9, arr9)
-                    _os9.replace(fn + '.%s.tmp.npy' % nm9, fn + '.%s.npy' % nm9)
-                cache[pc] = (u, offs, np.load(fn + '.order.npy', mmap_mode='r'), np.load(fn + '.rank.npy', mmap_mode='r'))
+                wdb_sidecar.may_birth(_os9.path.dirname(path), nbytes9,
+                                      '%s road %s.%s' % ('coordinate' if coord else 'reverse', _os9.path.basename(path), pc))   # THE DISK GATE
+                if coord:
+                    wdb_coordroad.save(fn, road)
+                    for _s9 in wdb_coordroad.SUFFIXES: wdb_sidecar.born('%s.%s.npy' % (fn, _s9))
+                    cache[pc] = wdb_coordroad.load(fn) or road
+                    _resident9 = cache[pc].resident_bytes
+                else:
+                    for nm9, arr9 in (('u', u), ('offs', offs), ('order', order)):
+                        np.save(fn + '.%s.tmp.npy' % nm9, arr9)
+                        _os9.replace(fn + '.%s.tmp.npy' % nm9, fn + '.%s.npy' % nm9)
+                        wdb_sidecar.born(fn + '.%s.npy' % nm9)
+                    cache[pc] = (u, offs, np.load(fn + '.order.npy', mmap_mode='r'), rank)
+                    _resident9 = u.nbytes + offs.nbytes + rank.nbytes
+                # THE BORN ROAD STAYS: on the shelf under its resident bytes, so the next query finds it in the
+                # cache instead of asking the filesystem inside the negative-answer window and rebirthing it
+                try: wdb_shelf.SHELF.put(('inv', getattr(seg, 'path', id(seg)), pc), cache[pc], int(_resident9), kind='reverse-road')
+                except wdb_shelf.ShelfRefused: pass
+                if _os9.environ.get('WDB_SEMI_BILL'):
+                    print('SEMI: %s road born %s.%s: %.1f MB on disk%s' % ('coordinate' if coord else 'flat', _os9.path.basename(path), pc, nbytes9 / 1e6,
+                                                                  (' (flat would be %.1f MB)' % ((u.nbytes + offs.nbytes + order.nbytes) / 1e6)) if coord else ''), flush=True)
             except wdb_sidecar.BirthRefused as _e:
                 # THE ROAD ON THE SHELF: refused on disk (the switch off, or the budget) is not refused in
                 # RAM -- it lives for the process under the shelf's ceiling, like a loaded one would
-                try: wdb_shelf.SHELF.put(('inv', getattr(seg, 'path', id(seg)), pc), cache[pc],
-                                         int(u.nbytes + offs.nbytes + order.nbytes + rank.nbytes), kind='reverse-road')
+                try: wdb_shelf.SHELF.put(('inv', getattr(seg, 'path', id(seg)), pc), cache[pc], nbytes9, kind='reverse-road')
                 except wdb_shelf.ShelfRefused:
                     print('SEMI: %s -- serving from RAM this query' % str(_e)[:120], flush=True)
             except Exception as _e:
-                if __import__('os').environ.get('WDB_SEMI_BILL'):
+                if _os9.environ.get('WDB_SEMI_BILL'):
                     print('SEMI: inverted sidecar save failed for %s: %s' % (fn, str(_e)[:80]), flush=True)
         return cache[pc]
     def rows_for_keys(inv, sk):
         """THE ROWS OF A KEY SET: the reverse road's postings for the keys in sk, as row positions --
         cost proportional to the rows matched, no N-scale bitmap"""
+        if isinstance(inv, wdb_coordroad.CoordRoad):
+            return inv.rows(sk)                                 # THE COORDINATE ROAD: the same walk, block-local positions
         u, offs, order, _rank = inv
         if sk.size and sk.size <= 4_000_000:
             try:
@@ -346,6 +395,10 @@ def execute(db, tree, sql=None):
         idx = np.arange(total, dtype=np.int64) + base
         return np.asarray(order[idx]).astype(np.int64)
     def prune_inverted(inv, sk, dst_keep, dst_n):
+        if isinstance(inv, wdb_coordroad.CoordRoad):
+            rows = inv.rows(sk)
+            out = np.zeros_like(dst_keep); out[rows] = True
+            return out & dst_keep
         u, offs, order, _rank = inv
         pos = np.searchsorted(u, sk)
         ok = pos < u.size

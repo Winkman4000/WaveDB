@@ -46,6 +46,7 @@ FAMILIES = [
     (r'\.fpm$',                  'fpm',            'V',  'wdb_fpm'),
     (r'\.cluster$',              'cluster',        'V',  'wdb_cluster'),
     (r'\.inv\.(u|offs|order|rank)\.npy$', 'reverse-road', 'N', 'wdb_semijoin.inverted'),
+    (r'\.inv\.(boffs|hdr|pay)\.npy$', 'coordinate-road', 'N', 'wdb_coordroad (block-local positions, sparse/dense containers)'),
     (r'\.fkptr\.[A-Za-z0-9_]+$', 'fk-pointer',     'N',  'wdb_fkptr'),
     (r'\.lmap\.[A-Za-z0-9_]+$',  'lower-map',      'V',  'wdb_lmap'),
     (r'\.nline\.[A-Za-z0-9_]+$', 'number-line',    'V',  'wdb_nline'),
@@ -394,6 +395,12 @@ def exists(path, neg_ttl=2.0):
     _exists_cache[path] = (ok, stamp, now)
     if len(_exists_cache) > 20000: _exists_cache.clear()
     return ok
+
+
+def born(path):
+    """a birth flips a remembered negative at once (the neg_ttl is for OTHER processes' births): a road
+    asked again within two seconds of its own birth was being reborn"""
+    _exists_cache.pop(path, None)
 
 
 def stamp_moved(dbdir):

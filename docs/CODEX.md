@@ -1530,3 +1530,41 @@ born): JOB first pass 53.4s vs duck 11.0, 113/113 exact, 41 wins (on:
 197.6s, warm 23.2s vs duck 37.1s, 43/43 exact, 30 wins (median 1.83x);
 the one file the run added was routing_ledger.jsonl, 24 KB, a journal
 the registry counts as data. Suite 1702/0.
+
+
+## THE COORDINATE ROAD (2026-09-18): Jackson's blocks, and rank retired
+He asked what the sidecars hold, bit by bit, and how they pop. Four of
+the eight families were the same object: a list of ascending row
+numbers per key, stored as flat 32-bit integers, read as "find the key,
+walk its group" -- nothing ever indexes into the middle of a group. His
+proposal: store each row as (block, position-in-block), pop the block,
+pay fewer bits because the address is local. THE ARITHMETIC: a 65,536-
+row block makes a position 16 bits; the block id is paid once per
+(key, block) as a 32-bit header; a block holding more than 4,096 of a
+key's rows is cheaper as an 8 KB bitmap (Roaring's container rule). So
+a key with k rows in b blocks costs 32b + 16k bits against 32k -- half
+when the rows share blocks, worse than flat when every row is alone in
+its block. MEASURED FIRST, on the real roads: role_id 145 -> 4.6 MB
+(31x, all bitmaps), info_type_id 59 -> 2.5 (23x), person_id 2.0x,
+person_role_id 2.5x, SearchPhrase's posting list 4.9x, CounterID's
+3.1x -- and cast_info.movie_id WORSE (15 rows per movie in 15 blocks).
+THE RULE AT BIRTH: whole file against whole file (boffs + headers +
+payload vs offs + order; u is shared), coordinates when smaller. Two
+of nineteen JOB roads stay flat. THE WALK is what it was -- searchsorted,
+then each container: add the block base to sixteen-bit positions, or
+iterate set bits -- one numba pass, sized from the headers (a bitmap's
+rows are its popcount; no per-key row count stored). boffs is int32
+(containers, not rows). u keeps its width -- the coordinate road had
+been widening int32 keys to int64 and title.id came out 45 MB against
+40 flat; a leak in the new form, not the idea. RANK RETIRED from every
+birth: its one reader (keys_at) has the dictionary at 0.2-61 ms; an old
+road's rank is read if present. Two lessons in the birth path: a road
+asked again within two seconds of its own birth was reborn (the
+registry's negative-answer window is for other processes' births --
+wdb_sidecar.born flips it), and the stream's isolation threads birthed
+the same road twice (one lock per road). RESULT, roads born fresh on a
+hardlink realm, all exact: JOB 6.3s vs duck 11.6 (92 wins; 6.0-6.3 /
+90-93 before), JOB-COUNT 7.5 vs 8.2 (71 wins; 7.2 / 71 before), a
+fresh process 27.0s against the flat realm's 31.1 -- less to page in.
+ROADS ON DISK: 2,000 MB -> 673 MB (3.0x); the realm 2,990 -> 1,499 MB
+with the pointers still to be reborn (165 MB). Suite 1707/0.
