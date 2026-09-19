@@ -1869,6 +1869,9 @@ def hidden_rewrite(tree):
     over projected aliases -> a hidden projection, stripped after.
     Returns (sql, n_hidden) or None."""
     if not isinstance(tree, E.Select): return None
+    _g0 = tree.args.get('group')
+    if tree.args.get('having') is None and tree.args.get('order') is None and not (_g0 is not None and _g0.args.get('all')):
+        return None                       # nothing to rewrite: the copy below was 5 ms of Q29's 9 (ninety projections)
     t = tree.copy(); changed = False
     _AGG = (E.AggFunc,)
     g = t.args.get('group')

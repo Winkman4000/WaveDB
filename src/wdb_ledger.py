@@ -55,7 +55,14 @@ def log(seg, sql, path_name, ms, stages=None, n_rows=None):
         stages = stages or (_STAGES[0] or None)
         if stages:
             rec['stages'] = {k: round(float(v), 3) for k, v in stages.items()}
-        with open(p, 'a') as f:
-            f.write(json.dumps(rec) + '\n')
+        # THE OPEN HANDLE: open/close per line was 2 ms of a 6 ms query on the network volume; the
+        # handle stays open per ledger path, line-buffered, so a line costs a write
+        f = _OPEN.get(p)
+        if f is None or f.closed:
+            f = _OPEN[p] = open(p, 'a', buffering=1)
+        f.write(json.dumps(rec) + '\n')
     except Exception:
         pass                                     # the ledger never hurts the query
+
+
+_OPEN = {}

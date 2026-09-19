@@ -1626,9 +1626,13 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
 
 # ---------- helpers ----------
 def _alias(p):
+    """the output name of a projection. An unaliased expression is printed by sqlglot, which DEEP-COPIES
+    the subtree before generating (31 us a name, 8.6 without the copy; Q29 has ninety); generation does
+    not mutate a projection, so the copy is not paid"""
     if isinstance(p, E.Alias): return p.alias
     if isinstance(p, E.Column): return p.name
-    return p.sql()
+    try: return p.sql(copy=False)
+    except TypeError: return p.sql()
 def _is_agg(p):
     return p.find(E.AggFunc) is not None
 _ROWAGG_TYPES = tuple(getattr(E, n) for n in ('PercentileCont', 'PercentileDisc', 'Quantile', 'Mode', 'LogicalAnd', 'LogicalOr',

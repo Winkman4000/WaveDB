@@ -76,13 +76,16 @@ def execute(seg, spec):
     if census is None or census.size < V or int(census.sum()) != int(seg.N):
         census = np.bincount(np.asarray(seg._raw_codes(col)), minlength=V)
     memo[col] = census
-    try:
-        dv = np.asarray(seg._dict_ints_at(seg.cols[col],
-                                          np.arange(V, dtype=np.int64)),
-                        np.float64)
-    except Exception:
-        dv = np.asarray([float(seg.fetch(col, v9)) for v9 in range(V)],
-                        np.float64)
+    dv = memo.get((col, 'dv'))                           # the dictionary's values, once per segment: the
+    if dv is None or dv.size != V:                       # per-value fetch fallback was 2,159 calls every run
+        try:
+            dv = np.asarray(seg._dict_ints_at(seg.cols[col],
+                                              np.arange(V, dtype=np.int64)),
+                            np.float64)
+        except Exception:
+            dv = np.asarray([float(seg.fetch(col, v9)) for v9 in range(V)],
+                            np.float64)
+        memo[(col, 'dv')] = dv
     S = float(census @ dv)
     N = int(census.sum())
     out = tuple(int(round(S + k * N)) for k in spec['shifts'])

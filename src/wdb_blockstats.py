@@ -53,6 +53,17 @@ def build(seg, col):
     c = seg.cols[col]
     N = int(seg.N)
     fn = seg.path + '.' + col + '.bst.npz'
+    # THE STATS ON THE SHELF: the per-query flush (qmem) forgets _SCACHE by law, and re-reading the
+    # .npz each query cost 4 ms of Q06's 6 (a zip of nine arrays on the network volume). The shelf is
+    # the lawful resident form -- bounded, evictable -- and 3,052 blocks x 6 arrays is 150 KB
+    import wdb_shelf
+    try: _mt = __import__('os').stat(seg.path).st_mtime_ns
+    except Exception: _mt = 0
+    _sk = ('bst', seg.path, col, N, _mt)               # the segment's identity is in the key
+    st = wdb_shelf.SHELF.get(_sk)
+    if st is not None:
+        _SCACHE[key] = st
+        return st
     try:
         import os as _os
         if _os.path.exists(fn):
@@ -63,6 +74,8 @@ def build(seg, col):
                       'cmax': np.asarray(z['cmax']), 'mode4': bool(z['mode4']),
                       'maxabs': float(z['maxabs']), 'dt': int(z['dt'])}
                 _SCACHE[key] = st
+                try: wdb_shelf.SHELF.put(_sk, st, int(sum(v.nbytes for v in st.values() if hasattr(v, 'nbytes'))), kind='block-stats')
+                except Exception: pass
                 return st
     except Exception:
         pass                                     # unreadable sidecar: recompute below
