@@ -1568,3 +1568,26 @@ hardlink realm, all exact: JOB 6.3s vs duck 11.6 (92 wins; 6.0-6.3 /
 fresh process 27.0s against the flat realm's 31.1 -- less to page in.
 ROADS ON DISK: 2,000 MB -> 673 MB (3.0x); the realm 2,990 -> 1,499 MB
 with the pointers still to be reborn (165 MB). Suite 1707/0.
+
+
+## THE REFEREES (2026-09-19): ClickHouse and Umbra, measured on our pod, saved
+"We probably crush ClickHouse on everything" was expected, not measured.
+The measurement, same pod, same parquet, three runs per query, kept in
+bench/referee/*.json so it is never re-run: CLICKHOUSE 26.10 loads hits
+in 32.6s to 9.41 GB (their published 9.42 -- the load is apples to
+apples); ClickBench warm 12.4s against our 6.5 and duck's 33.7 -- we
+take 27 of 43, it takes the trivial ones (Q00/01/19) and the
+ORDER BY/LIMIT tail (Q21-23, Q37-42); JOB 34.9s against our 6.3 and
+duck's 11.6 -- we take 112 of 113. UMBRA 26.09 (the image unpacked and
+run through its own loader, no docker on the pod; memlock refused, so
+its writeback buffers ran degraded by its own account): hits in 273s to
+8.01 GB (published 8.31); ClickBench warm 5.58s -- Umbra takes 26 of
+43, we take the heavy string and group-by queries (Q04/05/08/13/32-34
+by 10-60x), it takes the point and LIMIT queries by the same margins;
+JOB 2.78s -- Umbra takes 96 of 113, 2.2x ahead in total, up to 25x on
+10c. IMDB on disk: ClickHouse 1.94 GB, Umbra 2.66, ours 0.77 loaded /
+1.66 with the extension. THE SENTENCE THAT IS TRUE: smaller than every
+published engine but Umbra with the extension off, faster than DuckDB
+and ClickHouse on both boards, and behind Umbra -- slightly on
+ClickBench, 2.2x on JOB. Umbra is the bar now; its JOB queries are 8-
+25 ms where ours are 60-240, which is the settle, not the read.

@@ -1,0 +1,536 @@
+{
+ "name": "clickhouse_clickbench",
+ "engine": "clickhouse",
+ "version": "26.10.1.129",
+ "machine": {
+  "node": "9bafc122addc",
+  "cpus": 64
+ },
+ "queries_file": "queries.sql",
+ "runs": 3,
+ "load_seconds": 32.6,
+ "data_mb": 9406.0,
+ "recorded": "2026-09-19 03:26:31",
+ "settings": [],
+ "results": [
+  {
+   "i": 0,
+   "sql": "SELECT COUNT(*) FROM hits",
+   "times": [
+    0.001,
+    0.001,
+    0.001
+   ],
+   "best": 0.001,
+   "warm": 0.001,
+   "error": null
+  },
+  {
+   "i": 1,
+   "sql": "SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0",
+   "times": [
+    0.002,
+    0.001,
+    0.001
+   ],
+   "best": 0.001,
+   "warm": 0.001,
+   "error": null
+  },
+  {
+   "i": 2,
+   "sql": "SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits",
+   "times": [
+    0.07,
+    0.042,
+    0.035
+   ],
+   "best": 0.035,
+   "warm": 0.035,
+   "error": null
+  },
+  {
+   "i": 3,
+   "sql": "SELECT AVG(UserID) FROM hits",
+   "times": [
+    0.175,
+    0.197,
+    0.062
+   ],
+   "best": 0.062,
+   "warm": 0.062,
+   "error": null
+  },
+  {
+   "i": 4,
+   "sql": "SELECT COUNT(DISTINCT UserID) FROM hits",
+   "times": [
+    0.212,
+    0.182,
+    0.183
+   ],
+   "best": 0.182,
+   "warm": 0.182,
+   "error": null
+  },
+  {
+   "i": 5,
+   "sql": "SELECT COUNT(DISTINCT SearchPhrase) FROM hits",
+   "times": [
+    0.455,
+    0.373,
+    0.352
+   ],
+   "best": 0.352,
+   "warm": 0.352,
+   "error": null
+  },
+  {
+   "i": 6,
+   "sql": "SELECT MIN(EventDate), MAX(EventDate) FROM hits",
+   "times": [
+    0.018,
+    0.016,
+    0.018
+   ],
+   "best": 0.016,
+   "warm": 0.016,
+   "error": null
+  },
+  {
+   "i": 7,
+   "sql": "SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC",
+   "times": [
+    0.019,
+    0.021,
+    0.021
+   ],
+   "best": 0.019,
+   "warm": 0.021,
+   "error": null
+  },
+  {
+   "i": 8,
+   "sql": "SELECT RegionID, COUNT(DISTINCT UserID) AS u FROM hits GROUP BY RegionID ORDER BY u DESC LIMIT 10",
+   "times": [
+    0.41,
+    0.363,
+    0.339
+   ],
+   "best": 0.339,
+   "warm": 0.339,
+   "error": null
+  },
+  {
+   "i": 9,
+   "sql": "SELECT RegionID, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), COUNT(DISTINCT UserID) FROM hits GROUP BY RegionID ORDER BY c DESC LIMIT 10",
+   "times": [
+    0.404,
+    0.383,
+    0.382
+   ],
+   "best": 0.382,
+   "warm": 0.382,
+   "error": null
+  },
+  {
+   "i": 10,
+   "sql": "SELECT MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhoneModel ORDER BY u DESC LIMIT 10",
+   "times": [
+    0.141,
+    0.143,
+    0.139
+   ],
+   "best": 0.139,
+   "warm": 0.139,
+   "error": null
+  },
+  {
+   "i": 11,
+   "sql": "SELECT MobilePhone, MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhone, MobilePhoneModel ORDER BY u DESC LIMIT 10",
+   "times": [
+    0.164,
+    0.167,
+    0.158
+   ],
+   "best": 0.158,
+   "warm": 0.158,
+   "error": null
+  },
+  {
+   "i": 12,
+   "sql": "SELECT SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10",
+   "times": [
+    0.318,
+    0.297,
+    0.295
+   ],
+   "best": 0.295,
+   "warm": 0.295,
+   "error": null
+  },
+  {
+   "i": 13,
+   "sql": "SELECT SearchPhrase, COUNT(DISTINCT UserID) AS u FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY u DESC LIMIT 10",
+   "times": [
+    0.404,
+    0.394,
+    0.394
+   ],
+   "best": 0.394,
+   "warm": 0.394,
+   "error": null
+  },
+  {
+   "i": 14,
+   "sql": "SELECT SearchEngineID, SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, SearchPhrase ORDER BY c DESC LIMIT 10",
+   "times": [
+    0.337,
+    0.332,
+    0.336
+   ],
+   "best": 0.332,
+   "warm": 0.332,
+   "error": null
+  },
+  {
+   "i": 15,
+   "sql": "SELECT UserID, COUNT(*) FROM hits GROUP BY UserID ORDER BY COUNT(*) DESC LIMIT 10",
+   "times": [
+    0.167,
+    0.171,
+    0.169
+   ],
+   "best": 0.167,
+   "warm": 0.169,
+   "error": null
+  },
+  {
+   "i": 16,
+   "sql": "SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10",
+   "times": [
+    0.648,
+    0.614,
+    0.612
+   ],
+   "best": 0.612,
+   "warm": 0.612,
+   "error": null
+  },
+  {
+   "i": 17,
+   "sql": "SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase LIMIT 10",
+   "times": [
+    0.334,
+    0.331,
+    0.334
+   ],
+   "best": 0.331,
+   "warm": 0.331,
+   "error": null
+  },
+  {
+   "i": 18,
+   "sql": "SELECT UserID, extract(minute FROM EventTime) AS m, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, m, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10",
+   "times": [
+    1.072,
+    1.026,
+    1.021
+   ],
+   "best": 1.021,
+   "warm": 1.021,
+   "error": null
+  },
+  {
+   "i": 19,
+   "sql": "SELECT UserID FROM hits WHERE UserID = 435090932899640449",
+   "times": [
+    0.026,
+    0.003,
+    0.005
+   ],
+   "best": 0.003,
+   "warm": 0.003,
+   "error": null
+  },
+  {
+   "i": 20,
+   "sql": "SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'",
+   "times": [
+    1.47,
+    0.407,
+    0.421
+   ],
+   "best": 0.407,
+   "warm": 0.407,
+   "error": null
+  },
+  {
+   "i": 21,
+   "sql": "SELECT SearchPhrase, MIN(URL), COUNT(*) AS c FROM hits WHERE URL LIKE '%google%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10",
+   "times": [
+    0.927,
+    0.104,
+    0.104
+   ],
+   "best": 0.104,
+   "warm": 0.104,
+   "error": null
+  },
+  {
+   "i": 22,
+   "sql": "SELECT SearchPhrase, MIN(URL), MIN(Title), COUNT(*) AS c, COUNT(DISTINCT UserID) FROM hits WHERE Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10",
+   "times": [
+    1.463,
+    0.585,
+    0.576
+   ],
+   "best": 0.576,
+   "warm": 0.576,
+   "error": null
+  },
+  {
+   "i": 23,
+   "sql": "SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10",
+   "times": [
+    1.355,
+    0.222,
+    0.215
+   ],
+   "best": 0.215,
+   "warm": 0.215,
+   "error": null
+  },
+  {
+   "i": 24,
+   "sql": "SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime LIMIT 10",
+   "times": [
+    0.087,
+    0.075,
+    0.075
+   ],
+   "best": 0.075,
+   "warm": 0.075,
+   "error": null
+  },
+  {
+   "i": 25,
+   "sql": "SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY SearchPhrase LIMIT 10",
+   "times": [
+    0.203,
+    0.204,
+    0.198
+   ],
+   "best": 0.198,
+   "warm": 0.198,
+   "error": null
+  },
+  {
+   "i": 26,
+   "sql": "SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime, SearchPhrase LIMIT 10",
+   "times": [
+    0.078,
+    0.076,
+    0.07
+   ],
+   "best": 0.07,
+   "warm": 0.07,
+   "error": null
+  },
+  {
+   "i": 27,
+   "sql": "SELECT CounterID, AVG(length(URL)) AS l, COUNT(*) AS c FROM hits WHERE URL <> '' GROUP BY CounterID HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25",
+   "times": [
+    0.13,
+    0.13,
+    0.134
+   ],
+   "best": 0.13,
+   "warm": 0.13,
+   "error": null
+  },
+  {
+   "i": 28,
+   "sql": "SELECT REGEXP_REPLACE(Referer, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') AS k, AVG(length(Referer)) AS l, COUNT(*) AS c, MIN(Referer) FROM hits WHERE Referer <> '' GROUP BY k HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25",
+   "times": [
+    1.64,
+    1.233,
+    1.236
+   ],
+   "best": 1.233,
+   "warm": 1.233,
+   "error": null
+  },
+  {
+   "i": 29,
+   "sql": "SELECT SUM(ResolutionWidth), SUM(ResolutionWidth + 1), SUM(ResolutionWidth + 2), SUM(ResolutionWidth + 3), SUM(ResolutionWidth + 4), SUM(ResolutionWidth + 5), SUM(ResolutionWidth + 6), SUM(ResolutionWidth + 7), SUM(ResolutionWidth + 8), SUM(ResolutionWidth + 9), SUM(ResolutionWidth + 10), SUM(ResolutionWidth + 11), SUM(ResolutionWidth + 12), SUM(ResolutionWidth + 13), SUM(ResolutionWidth + 14), SUM(ResolutionWidth + 15), SUM(ResolutionWidth + 16), SUM(ResolutionWidth + 17), SUM(ResolutionWidth + 18), SUM(ResolutionWidth + 19), SUM(ResolutionWidth + 20), SUM(ResolutionWidth + 21), SUM(ResolutionWidth + 22), SUM(ResolutionWidth + 23), SUM(ResolutionWidth + 24), SUM(ResolutionWidth + 25), SUM(ResolutionWidth + 26), SUM(ResolutionWidth + 27), SUM(ResolutionWidth + 28), SUM(ResolutionWidth + 29), SUM(ResolutionWidth + 30), SUM(ResolutionWidth + 31), SUM(ResolutionWidth + 32), SUM(ResolutionWidth + 33), SUM(ResolutionWidth + 34), SUM(ResolutionWidth + 35), SUM(ResolutionWidth + 36), SUM(ResolutionWidth + 37), SUM(ResolutionWidth + 38), SUM(ResolutionWidth + 39), SUM(ResolutionWidth + 40), SUM(ResolutionWidth + 41), SUM(ResolutionWidth + 42), SUM(ResolutionWidth + 43), SUM(ResolutionWidth + 44), SUM(ResolutionWidth + 45), SUM(ResolutionWidth + 46), SUM(ResolutionWidth + 47), SUM(ResolutionWidth + 48), SUM(ResolutionWidth + 49), SUM(ResolutionWidth + 50), SUM(ResolutionWidth + 51), SUM(ResolutionWidth + 52), SUM(ResolutionWidth + 53), SUM(ResolutionWidth + 54), SUM(ResolutionWidth + 55), SUM(ResolutionWidth + 56), SUM(ResolutionWidth + 57), SUM(ResolutionWidth + 58), SUM(ResolutionWidth + 59), SUM(ResolutionWidth + 60), SUM(ResolutionWidth + 61), SUM(ResolutionWidth + 62), SUM(ResolutionWidth + 63), SUM(ResolutionWidth + 64), SUM(ResolutionWidth + 65), SUM(ResolutionWidth + 66), SUM(ResolutionWidth + 67), SUM(ResolutionWidth + 68), SUM(ResolutionWidth + 69), SUM(ResolutionWidth + 70), SUM(ResolutionWidth + 71), SUM(ResolutionWidth + 72), SUM(ResolutionWidth + 73), SUM(ResolutionWidth + 74), SUM(ResolutionWidth + 75), SUM(ResolutionWidth + 76), SUM(ResolutionWidth + 77), SUM(ResolutionWidth + 78), SUM(ResolutionWidth + 79), SUM(ResolutionWidth + 80), SUM(ResolutionWidth + 81), SUM(ResolutionWidth + 82), SUM(ResolutionWidth + 83), SUM(ResolutionWidth + 84), SUM(ResolutionWidth + 85), SUM(ResolutionWidth + 86), SUM(ResolutionWidth + 87), SUM(ResolutionWidth + 88), SUM(ResolutionWidth + 89) FROM hits",
+   "times": [
+    0.043,
+    0.037,
+    0.038
+   ],
+   "best": 0.037,
+   "warm": 0.037,
+   "error": null
+  },
+  {
+   "i": 30,
+   "sql": "SELECT SearchEngineID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, ClientIP ORDER BY c DESC LIMIT 10",
+   "times": [
+    0.257,
+    0.229,
+    0.225
+   ],
+   "best": 0.225,
+   "warm": 0.225,
+   "error": null
+  },
+  {
+   "i": 31,
+   "sql": "SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '' GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10",
+   "times": [
+    0.627,
+    0.324,
+    0.323
+   ],
+   "best": 0.323,
+   "warm": 0.323,
+   "error": null
+  },
+  {
+   "i": 32,
+   "sql": "SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10",
+   "times": [
+    1.021,
+    0.945,
+    0.942
+   ],
+   "best": 0.942,
+   "warm": 0.942,
+   "error": null
+  },
+  {
+   "i": 33,
+   "sql": "SELECT URL, COUNT(*) AS c FROM hits GROUP BY URL ORDER BY c DESC LIMIT 10",
+   "times": [
+    1.384,
+    1.353,
+    1.293
+   ],
+   "best": 1.293,
+   "warm": 1.293,
+   "error": null
+  },
+  {
+   "i": 34,
+   "sql": "SELECT 1, URL, COUNT(*) AS c FROM hits GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+   "times": [
+    1.281,
+    1.271,
+    1.265
+   ],
+   "best": 1.265,
+   "warm": 1.265,
+   "error": null
+  },
+  {
+   "i": 35,
+   "sql": "SELECT ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3, COUNT(*) AS c FROM hits GROUP BY ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3 ORDER BY c DESC LIMIT 10",
+   "times": [
+    0.159,
+    0.156,
+    0.154
+   ],
+   "best": 0.154,
+   "warm": 0.154,
+   "error": null
+  },
+  {
+   "i": 36,
+   "sql": "SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> '' GROUP BY URL ORDER BY PageViews DESC LIMIT 10",
+   "times": [
+    0.049,
+    0.056,
+    0.055
+   ],
+   "best": 0.049,
+   "warm": 0.055,
+   "error": null
+  },
+  {
+   "i": 37,
+   "sql": "SELECT Title, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND Title <> '' GROUP BY Title ORDER BY PageViews DESC LIMIT 10",
+   "times": [
+    0.042,
+    0.042,
+    0.039
+   ],
+   "best": 0.039,
+   "warm": 0.039,
+   "error": null
+  },
+  {
+   "i": 38,
+   "sql": "SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0 GROUP BY URL ORDER BY PageViews DESC LIMIT 10 OFFSET 1000",
+   "times": [
+    0.042,
+    0.045,
+    0.047
+   ],
+   "best": 0.042,
+   "warm": 0.045,
+   "error": null
+  },
+  {
+   "i": 39,
+   "sql": "SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE '' END AS Src, URL AS Dst, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst ORDER BY PageViews DESC LIMIT 10 OFFSET 1000",
+   "times": [
+    0.099,
+    0.103,
+    0.106
+   ],
+   "best": 0.099,
+   "warm": 0.103,
+   "error": null
+  },
+  {
+   "i": 40,
+   "sql": "SELECT URLHash, EventDate, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465 GROUP BY URLHash, EventDate ORDER BY PageViews DESC LIMIT 10 OFFSET 100",
+   "times": [
+    0.029,
+    0.025,
+    0.026
+   ],
+   "best": 0.025,
+   "warm": 0.025,
+   "error": null
+  },
+  {
+   "i": 41,
+   "sql": "SELECT WindowClientWidth, WindowClientHeight, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622 GROUP BY WindowClientWidth, WindowClientHeight ORDER BY PageViews DESC LIMIT 10 OFFSET 10000",
+   "times": [
+    0.028,
+    0.022,
+    0.021
+   ],
+   "best": 0.021,
+   "warm": 0.021,
+   "error": null
+  },
+  {
+   "i": 42,
+   "sql": "SELECT DATE_TRUNC('minute', EventTime) AS M, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-14' AND EventDate <= '2013-07-15' AND IsRefresh = 0 AND DontCountHits = 0 GROUP BY DATE_TRUNC('minute', EventTime) ORDER BY DATE_TRUNC('minute', EventTime) LIMIT 10 OFFSET 1000",
+   "times": [
+    0.017,
+    0.017,
+    0.018
+   ],
+   "best": 0.017,
+   "warm": 0.017,
+   "error": null
+  }
+ ],
+ "sum_best": 12.38,
+ "sum_warm": 12.397,
+ "errors": 0
+}
