@@ -151,7 +151,17 @@ def redress(seg_path, cols, out_path, verbose=True):
             else:
                 for a in range(start, end, CH):          # byte-copy in windows (an 8 GB blob is not a bytes object)
                     out.write(seg.buf[a:min(end, a + CH)].tobytes())
+    _load_stats_for(out_path)
     return report
+
+
+def _load_stats_for(out_path):
+    """THE STATISTICS OF THE LOAD travel with the segment: a rewritten segment gets its own."""
+    try:
+        import wdb_blockstats
+        wdb_blockstats.write_for_segment(out_path)
+    except Exception:
+        pass
 
 
 def retype(seg_path, retypes, out_path, verbose=True):
@@ -190,6 +200,7 @@ def retype(seg_path, retypes, out_path, verbose=True):
         if verbose:
             print(f"  sidecar: key={cm.get('key')} dtype->{cm.get('dtype')} "
                   f"aux->{cm.get('aux')}", flush=True)
+    _load_stats_for(out_path)
 
 
 if __name__ == '__main__':

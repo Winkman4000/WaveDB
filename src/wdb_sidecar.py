@@ -55,8 +55,8 @@ FAMILIES = [
 ]
 DATA_FILES = ('catalog.json', 'sidecars.json', 'shelves.json')      # never sidecars: the realm itself and its ledgers
 _DATA_SUFFIXES = ('.wdb', '.jsonl', '.presence', '.overrides', '.parquet',   # segments, journals, presence, DML hot buffers
-                  '.cluster', '.cube',                                       # written by the ENCODER: part of the load, not derived
-                  '.tmp', '.partial')                                        # a birth in flight (the rename law)
+                  '.cluster', '.cube', '.stats.npz',                         # written by the ENCODER: part of the load, not derived
+                  '.tmp', '.partial', '.partial.npz')                        # a birth in flight (the rename law)
 
 
 def is_data_file(name):

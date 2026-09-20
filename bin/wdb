@@ -148,6 +148,26 @@ def cmd_warm(a):
     return 0
 
 
+def cmd_loadstats(a):
+    """THE STATISTICS OF THE LOAD: block statistics for every segment of the realm -- what the encoder
+    writes at load, for realms loaded before it did. Data, not a sidecar; any switch setting."""
+    import time, wdb_blockstats
+    from wdb_db import Database
+    db = Database.open(a.db)
+    n = 0
+    for t in db.cat.list_tables():
+        for sp in db.cat.segment_paths(t):
+            p = wdb_blockstats.stats_path(sp)
+            if os.path.exists(p) and not a.force:
+                print('  %s: present' % os.path.basename(sp)); continue
+            t0 = time.perf_counter()
+            k = wdb_blockstats.write_for_segment(sp)
+            print('  %s: %d columns, %.1f KB, %.1fs' % (os.path.basename(sp), k, os.path.getsize(p) / 1024, time.perf_counter() - t0))
+            n += 1
+    print('load statistics written for %d segment%s' % (n, '' if n == 1 else 's'))
+    return 0
+
+
 def cmd_sidecars(a):
     """THE SWITCH (Jackson's operator law): derived files are an extension the operator turns on.
         wdb sidecars DB status          what the switch says, and what is on disk
@@ -301,6 +321,8 @@ def main(argv=None):
     for name in ('tables', 'stats', 'audit'):
         s = sub.add_parser(name); s.add_argument('db')
     s = sub.add_parser('vacuum'); s.add_argument('db'); s.add_argument('--dry', action='store_true')
+    s = sub.add_parser('loadstats', help='write the block statistics of every segment (data, as the encoder writes at load)')
+    s.add_argument('db'); s.add_argument('--force', action='store_true', help='rewrite even where present')
     s = sub.add_parser('sidecars', help='the switch: derived files are an extension the operator turns on (status|on|off|build QUERIES|drop)')
     s.add_argument('db'); s.add_argument('action', choices=['status', 'on', 'off', 'build', 'drop']); s.add_argument('queries', nargs='?'); s.add_argument('--dry', action='store_true')
     for name in ('compact', 'flush'):

@@ -1752,3 +1752,26 @@ of it joining a 2 GB decoded dictionary). THE SUBMISSION LIST, still
 open: their cold run drops the page cache on a 500 GB gp2 volume; 32 GB
 of RAM; the JIT warm-up belongs in load time; the official queries.sql
 verbatim; encode time on the record; one afternoon on a c6a.4xlarge.
+
+
+
+## THE STATISTICS OF THE LOAD (2026-09-20): metadata per block, written by the encoder
+Jackson: "I already thought this was on disk -- we are just collecting
+metadata per block, a few bytes per block, which won't amount to much."
+It is now. Block statistics -- row count, non-null count, sum of the
+dictionary values, min and max code, per 32,768-row block -- are written
+by the ENCODER as the last step of a load, one file beside the segment
+(<seg>.stats.npz), classified as DATA with the segment, the cluster and
+the cubes: `wdb sidecars drop` keeps it, the sentinel ignores it, the
+switch does not govern it, `wdb loadstats DB` writes it for realms
+loaded before. The block-stats read reads it before any birth is
+considered. What it is NOT: the per-code histogram (the gbc census) --
+that is V-sized, 136 MB for UserID, not a few bytes per block; it stays
+a sidecar. The Python loop that computed the stats (0.91 s on UserID,
+3,052 blocks) is a kernel now (block_stats, blocks across threads),
+which also serves the on-mode first touch. MEASURED: cbdb, 77 eligible
+columns, 9.3 MB, 20 s of load. Vanilla board, switch off, strict
+sentinel, 43/43 exact: 13.25 -> 12.52 s; Q02 119 -> 2.5 ms, Q03 421
+-> 2.7, Q06 33 -> 2.7. Against DuckDB 34 of 43, against Umbra 12; even
+with ClickHouse's 12.4 on this box. LAW: what every engine computes at
+load is not a sidecar; what only a query would ask for is.

@@ -44,6 +44,102 @@ def eligible(seg, col):
     return c is not None and c.get('mode') in (0, 2, 4) and c.get('dt') in (0, 3)
 
 
+def compute(seg, col):
+    """The block statistics of one column, computed with the kernel (blocks across threads).
+    Returns the stats dict: cnt, nn, sum (float64 of dictionary values), cmin, cmax (codes),
+    mode4, maxabs (an upper bound: the dictionary's largest magnitude), dt."""
+    import wdb_kernels as _WK
+    c = seg.cols[col]
+    N = int(seg.N)
+    nb = (N + _BR - 1) // _BR
+    if c['mode'] == 4:
+        codes = np.ascontiguousarray(np.asarray(seg._seq_decode(c)), dtype=np.int64)
+        dvals = np.zeros(1, np.int64); mode = 2; nullcode = np.int64(-1)
+        maxabs = float(np.abs(codes).max()) if codes.size else 0.0
+    else:
+        codes = np.ascontiguousarray(np.asarray(seg._raw_codes(col)))
+        if c['dt'] != 0:
+            dvals = np.zeros(1, np.int64); mode = 0; maxabs = 0.0    # dates: MIN/MAX ride on codes
+        else:
+            if c['mode'] == 2:
+                dvals = np.ascontiguousarray(np.asarray(seg._dict_ints(c), dtype=np.int64))
+            else:                                                     # mode 0 dt 0: plain-int dict
+                dvals = np.asarray([int(x) for x in c['vals']], dtype=np.int64)
+            mode = 1
+            maxabs = float(np.abs(dvals).max()) if dvals.size else 0.0
+        nullcode = np.int64(int(c['V']) - 1) if c['has_null'] else np.int64(-1)
+        if mode == 1 and dvals.size < int(c['V']):                    # the null code (skipped) still indexes
+            dvals = np.concatenate([dvals, np.zeros(int(c['V']) - dvals.size, np.int64)])
+    cnt = np.empty(nb, np.int64); nn = np.empty(nb, np.int64)
+    bsum = np.empty(nb, np.float64)
+    cmin = np.empty(nb, np.int64); cmax = np.empty(nb, np.int64)
+    if nb:
+        _WK.block_stats(codes, dvals, np.int64(mode), nullcode, np.int64(_BR), cnt, nn, bsum, cmin, cmax)
+    return {'cnt': cnt, 'nn': nn, 'sum': bsum, 'cmin': cmin, 'cmax': cmax,
+            'mode4': c['mode'] == 4, 'maxabs': maxabs, 'dt': int(c['dt'])}
+
+
+def stats_path(seg_path):
+    """THE STATISTICS OF THE LOAD: one file beside the segment, DATA (not a sidecar) -- written by
+    the encoder, counted in load time, kept by `wdb sidecars drop`, ignored by the sentinel."""
+    return seg_path + '.stats.npz'
+
+
+_LOADED = {}                                     # seg path -> (mtime_ns, npz) -- the file is mmap-light
+
+
+def _from_load(seg, col):
+    p = stats_path(seg.path)
+    import os as _os
+    try:
+        mt = _os.stat(p).st_mtime_ns
+    except OSError:
+        return None
+    hit = _LOADED.get(p)
+    if hit is None or hit[0] != mt:
+        try:
+            hit = _LOADED[p] = (mt, np.load(p, allow_pickle=False))
+        except Exception:
+            return None
+    z = hit[1]
+    k = col + '.'
+    if (k + 'cnt') not in z.files or int(z['N']) != int(seg.N):
+        return None
+    return {'cnt': np.asarray(z[k + 'cnt']), 'nn': np.asarray(z[k + 'nn']), 'sum': np.asarray(z[k + 'sum']),
+            'cmin': np.asarray(z[k + 'cmin']), 'cmax': np.asarray(z[k + 'cmax']),
+            'mode4': bool(z[k + 'mode4']), 'maxabs': float(z[k + 'maxabs']), 'dt': int(z[k + 'dt'])}
+
+
+def write_for_segment(seg_path, verbose=False):
+    """Compute and write the block statistics of every eligible column of a segment (the encoder's
+    last step). Returns the number of columns written."""
+    import os as _os
+    from wdb_engine import Segment
+    seg = Segment(seg_path)
+    out = {'N': np.int64(seg.N)}
+    n = 0
+    for col in seg.order:
+        if not eligible(seg, col):
+            continue
+        try:
+            st = compute(seg, col)
+        except Exception as ex:
+            if verbose: print('  stats: %s declined (%s)' % (col, ex), flush=True)
+            continue
+        for kk in ('cnt', 'nn', 'sum', 'cmin', 'cmax'):
+            out[col + '.' + kk] = st[kk]
+        out[col + '.mode4'] = np.bool_(st['mode4']); out[col + '.maxabs'] = np.float64(st['maxabs'])
+        out[col + '.dt'] = np.int64(st['dt'])
+        seg._codes.pop(col, None); n += 1
+    p = stats_path(seg_path)
+    tmp = p + '.partial.npz'
+    np.savez(tmp, **out)
+    _os.replace(tmp, p)
+    _LOADED.pop(p, None)
+    if verbose: print('  stats: %d columns, %.1f KB -> %s' % (n, _os.path.getsize(p) / 1024, _os.path.basename(p)), flush=True)
+    return n
+
+
 def build(seg, col):
     """Per-block stats for one column. Returns the stats dict (also cached) or None."""
     key = (seg.path, col, int(seg.N))
@@ -80,50 +176,20 @@ def build(seg, col):
                 return st
     except Exception:
         pass                                     # unreadable sidecar: recompute below
+    # THE STATISTICS OF THE LOAD (Jackson, B): the encoder writes every eligible column's block
+    # stats beside the segment as DATA (<seg>.stats.npz) -- metadata per block, a few bytes each,
+    # counted in load time, never born by a query. Read before any birth is considered.
+    st = _from_load(seg, col)
+    if st is not None:
+        _SCACHE[key] = st
+        try: wdb_shelf.SHELF.put(_sk, st, int(sum(v.nbytes for v in st.values() if hasattr(v, 'nbytes'))), kind='block-stats')
+        except Exception: pass
+        return st
     if not wdb_sidecar.may_build(fn):            # THE VANILLA LAW: no census built to answer
         _SCACHE[key] = None; return None
-    nb = (N + _BR - 1) // _BR
-    if c['mode'] == 4:
-        vals = np.asarray(seg._seq_decode(c))
-        codes = None; nullcode = -1; dvals = None
-    else:
-        codes = seg._raw_codes(col)
-        if c['dt'] != 0:
-            dvals = None                          # dates: MIN/MAX ride on codes; SUM/AVG declined
-        elif c['mode'] == 2:
-            dvals = np.asarray(seg._dict_ints(c), dtype=np.int64)
-        else:                                     # mode 0 dt 0: small dict of plain ints
-            dvals = np.asarray([int(x) for x in c['vals']], dtype=np.int64)
-        nullcode = int(c['V']) - 1 if c['has_null'] else -1
-        vals = None
-    cnt = np.empty(nb, np.int64); nn = np.empty(nb, np.int64)
-    bsum = np.empty(nb, np.float64)
-    cmin = np.empty(nb, np.int64); cmax = np.empty(nb, np.int64)
-    maxabs = 0.0
-    for j in range(nb):
-        lo = j * _BR; hi = min(lo + _BR, N)
-        if codes is None:
-            v = vals[lo:hi]; cnt[j] = v.size; nn[j] = v.size
-            bsum[j] = v.sum(dtype=np.float64)
-            cmin[j] = v.min(); cmax[j] = v.max()
-            maxabs = max(maxabs, float(np.abs(v).max()))
-        else:
-            b = codes[lo:hi].astype(np.int64); cnt[j] = b.size
-            if nullcode >= 0:
-                b = b[b != nullcode]
-            nn[j] = b.size
-            if b.size:
-                if dvals is not None:
-                    dv = dvals[b]
-                    bsum[j] = dv.sum(dtype=np.float64)
-                    maxabs = max(maxabs, float(np.abs(dv).max()))
-                else:
-                    bsum[j] = 0.0
-                cmin[j] = b.min(); cmax[j] = b.max()
-            else:
-                bsum[j] = 0.0; cmin[j] = np.iinfo(np.int64).max; cmax[j] = -1
-    st = {'cnt': cnt, 'nn': nn, 'sum': bsum, 'cmin': cmin, 'cmax': cmax,
-          'mode4': codes is None, 'maxabs': maxabs, 'dt': c['dt']}
+    st = compute(seg, col)
+    cnt, nn, bsum, cmin, cmax, maxabs = st['cnt'], st['nn'], st['sum'], st['cmin'], st['cmax'], st['maxabs']
+    codes = None if st['mode4'] else True
     try:
         import os as _os9
         if wdb_sidecar.births_on(_os9.path.dirname(fn)):                    # THE SWITCH

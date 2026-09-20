@@ -1242,9 +1242,11 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
     # takes over identity; values demote to decode-only. Qualifies only while
     # the exceptions stay small: repeated rows < 0.75% of the distinct count.
     try:
-        _birth_differentiator_shelves(out_path)
+        if __import__('os').environ.get('WDB_LOAD_SHELVES', '1') != '0':
+            _birth_differentiator_shelves(out_path)
     except Exception:
         pass
+    _write_load_stats(out_path)
     return dict(n_rows=N, n_cols=len(cols), bytes=(len(out) if out is not None else __import__('os').path.getsize(out_path)), seconds=time.time() - t0,
                 sizes=sizes, cluster=None)
 
@@ -1344,11 +1346,31 @@ def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_s
                 import traceback, sys as _sy
                 print('CUBE BUILD DIED:', file=_sy.stderr); traceback.print_exc()
     try:
-        _birth_differentiator_shelves(out_path)
+        if os.environ.get('WDB_LOAD_SHELVES', '1') != '0':
+            _birth_differentiator_shelves(out_path)
     except Exception:
         pass
+    _write_load_stats(out_path)
     return dict(n_rows=N, n_cols=len(cols), bytes=len(out), seconds=time.time()-t0,
                 sizes=sizes, cluster=cluster_by)
+
+
+def _write_load_stats(out_path):
+    """THE STATISTICS OF THE LOAD (Jackson, 2026-09-20): block statistics -- count, non-null count,
+    sum, min and max code per 32K-row block, a few bytes per block -- are METADATA OF THE LOAD,
+    written by the encoder and counted in its time, not a sidecar a query births. The block-stats
+    read answers SUM/AVG/MIN/MAX/COUNT from them under any switch setting. WDB_LOAD_STATS=0 skips."""
+    import os as _os
+    if _os.environ.get('WDB_LOAD_STATS', '1') == '0':
+        return 0
+    try:
+        import wdb_blockstats
+        return wdb_blockstats.write_for_segment(out_path, verbose=bool(_os.environ.get('WDB_ENCODE_VERBOSE')))
+    except Exception:
+        if _os.environ.get('WDB_ENCODE_VERBOSE'):
+            import traceback, sys as _sy
+            print('LOAD STATS DIED:', file=_sy.stderr); traceback.print_exc()
+        return 0
 
 if __name__ == '__main__':
     if len(sys.argv) < 3:

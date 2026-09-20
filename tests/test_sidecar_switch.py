@@ -161,3 +161,38 @@ def test_cli_status_on_off_drop():
         assert 'sidecars: off' in cli('status')
         out = cli('drop')
         assert 'DROP' in out and wdb_sidecar.setting(d) == 'off'
+
+
+
+def test_load_statistics_are_data():
+    """THE STATISTICS OF THE LOAD (B): the encoder writes block statistics beside the segment as
+    DATA -- present with the switch off, kept by drop, and the block-stats read answers from them
+    exactly, under strict sentinel, with nothing born."""
+    import wdb_blockstats, numpy as np
+    db, con, d = _fixture()
+    with _NoEnv():
+        wdb_sidecar.set_setting(d, 'off')
+        sp = wdb_blockstats.stats_path(os.path.join(d, 'fact_0.wdb'))
+        assert os.path.exists(sp), 'the encoder did not write the load statistics'
+        assert wdb_sidecar.is_data_file(os.path.basename(sp))
+        z = np.load(sp, allow_pickle=False)
+        assert int(z['N']) == 60000 and 'dimid.sum' in z.files and 'k.cmax' in z.files
+        before = _derived(d)
+        h0 = wdb_blockstats._HITS
+        for q in ("SELECT AVG(dimid), SUM(k), COUNT(*), MIN(dimid), MAX(k) FROM fact",
+                  "SELECT SUM(dimid) FROM fact", "SELECT COUNT(k) FROM fact"):
+            g = _norm(db.run(q)[0]); e = _norm([tuple(r) for r in con.execute(q).fetchall()])
+            assert g == e, (q, g, e)
+        assert wdb_blockstats._HITS > h0, 'the block-stats read did not serve from the load statistics'
+        assert _derived(d) == before
+        gone, freed = wdb_sidecar.drop(d, print_out=False)
+        assert os.path.exists(sp), 'drop removed the load statistics: they are data, not a sidecar'
+        # the kernel agrees with a straight computation, block by block
+        seg = db.open_segment(db.cat.segment_paths('fact')[0], 'fact')
+        st = wdb_blockstats.compute(seg, 'k')
+        vals = np.asarray(seg.values('k'), dtype=np.int64)
+        BR = wdb_blockstats._BR
+        for j in range(st['cnt'].size):
+            v = vals[j * BR:(j + 1) * BR]
+            assert st['cnt'][j] == v.size and st['nn'][j] == v.size
+            assert abs(st['sum'][j] - float(v.sum())) < 1e-6, j

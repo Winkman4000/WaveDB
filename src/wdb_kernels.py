@@ -3337,6 +3337,37 @@ def _hist_par(codes, V, part, out):
         out[v] = s
 
 
+@njit(cache=True, parallel=True, nogil=True)
+def block_stats(codes, dvals, has_dvals, nullcode, BR, cnt, nn, bsum, cmin, cmax):
+    """THE BLOCK STATISTICS (Jackson's metadata per block, written at load): per BR rows the row
+    count, the non-null count, the sum of dictionary values (float64), and the min and max CODE.
+    has_dvals: 0 = no sum, 1 = sum dvals[code], 2 = the codes ARE the values (mode 4), sum them.
+    Blocks across threads; one pass. Was a Python loop over 3,052 blocks (0.91 s on UserID)."""
+    n = codes.size
+    nb = cnt.size
+    for j in prange(nb):
+        lo = j * BR
+        hi = min(lo + BR, n)
+        c = 0; s = 0.0
+        mn = np.int64(9223372036854775807); mx = np.int64(-9223372036854775807 - 1)
+        for i in range(lo, hi):
+            v = np.int64(codes[i])
+            if v == nullcode:
+                continue
+            c += 1
+            if v < mn: mn = v
+            if v > mx: mx = v
+            if has_dvals == 1:
+                s += dvals[v]
+            elif has_dvals == 2:
+                s += v
+        cnt[j] = hi - lo
+        nn[j] = c
+        bsum[j] = s
+        cmin[j] = mn
+        cmax[j] = mx if c > 0 else np.int64(-1)   # an empty block: the old convention
+
+
 def bincount_par(codes, minlength):
     """THE PARALLEL CENSUS: np.bincount of 100M codes is one thread for 300 ms (plus an astype
     copy); this is per-thread boards and a reduce, measured ~60 ms. Boards cost T*V*4 bytes, so
