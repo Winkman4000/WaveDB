@@ -2435,12 +2435,14 @@ def gd_pass2_count(ku, kr, offs, SH, VR):
     target's first touch of each key. Per-bucket accumulator rows: no races."""
     NB = offs.size - 1
     LOW = 1 << SH
-    ans = np.zeros((NB, VR), np.int64)
-    for b in prange(NB):
+    T = numba.get_num_threads()
+    ans = np.zeros((T, VR), np.int64)            # per-THREAD rows (was per-bucket: 4096 x VR, 296 MB
+    for b in prange(NB):                          # zeroed and reduced serially for RegionID's 9,040)
         lo = offs[b]
         hi = offs[b + 1]
         if hi <= lo:
             continue
+        tid = numba.get_thread_id()
         cnt = np.zeros(LOW + 1, np.int64)
         for i in range(lo, hi):
             cnt[(np.int64(ku[i]) & (LOW - 1)) + 1] += 1
@@ -2457,11 +2459,13 @@ def gd_pass2_count(ku, kr, offs, SH, VR):
                 r = lr[i]
                 if seen[r] != u:
                     seen[r] = u
-                    ans[b, r] += 1
+                    ans[tid, r] += 1
     total = np.zeros(VR, np.int64)
-    for b in range(NB):
-        for r in range(VR):
-            total[r] += ans[b, r]
+    for r in prange(VR):
+        s = 0
+        for t in range(T):
+            s += ans[t, r]
+        total[r] = s
     return total
 
 
@@ -3366,6 +3370,25 @@ def block_stats(codes, dvals, has_dvals, nullcode, BR, cnt, nn, bsum, cmin, cmax
         bsum[j] = s
         cmin[j] = mn
         cmax[j] = mx if c > 0 else np.int64(-1)   # an empty block: the old convention
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def group_fold_dict(grp, codes, dvals, G, out):
+    """THE FOLD ON CODES: out[g] = sum over rows of dvals[codes[i]] for grp[i] == g -- a SUM or AVG
+    numerator per group straight from two code streams and a dictionary, per-thread boards
+    (T x G float64) and a reduce. No value array is ever built (Q09 built three, 630 ms)."""
+    T = numba.get_num_threads()
+    n = grp.size
+    part = np.zeros((T, G), np.float64)
+    for t in prange(T):
+        a = n * t // T; b = n * (t + 1) // T
+        for i in range(a, b):
+            part[t, np.int64(grp[i])] += dvals[np.int64(codes[i])]
+    for g in prange(G):
+        s = 0.0
+        for t in range(T):
+            s += part[t, g]
+        out[g] = s
 
 
 def bincount_par(codes, minlength):

@@ -110,32 +110,69 @@ def execute(seg, det, tree, db=None, table=None, segment_path=None):
     global _HITS
     kcol, tcol, ci, ki, folds, proj = det
 
-    kinfo = gd._ids(seg, kcol)
-    if kinfo is None:
-        return None
-    grp, _knull, kdecode = kinfo
+    import wdb_kernels as _WK
+    import wdb_window as WN
+    kc = seg.cols[kcol]
+    if kc.get('mode') in (0, 1, 2) and not kc.get('has_null'):
+        # THE KEY IS ITS CODE (Q09's line items): the group id is the dictionary code as stored --
+        # no value array (a 100M fancy-index), no astype (630 ms of the 1,781). Decoded at emission.
+        grp = np.ascontiguousarray(np.asarray(seg._raw_codes(kcol)))
+        gmax = int(kc['V'])
+        import wdb_gbcount as _GB
+        kdecode = _GB._code_values(seg, kcol)
+        if kdecode is None:
+            kdecode = np.asarray(WN._int_table(seg, kcol), dtype=np.int64)
+    else:
+        kinfo = gd._ids(seg, kcol)
+        if kinfo is None:
+            return None
+        grp, _knull, kdecode = kinfo
+        gmax = int(grp.max()) + 1 if grp.shape[0] else 0
     N = grp.shape[0]
     names = [wdb_sql._alias(p) for p in proj]
     if N == 0:
         _HITS += 1
         return [], names
-    gmax = int(grp.max()) + 1
 
-    # ---- foldables: per-group reductions (vectorized) ----
-    count = np.bincount(grp, minlength=gmax)
+    # ---- foldables: per-group reductions on the CODE STREAMS (THE FOLD ON CODES) ----
+    count = _WK.bincount_par(grp, gmax)
     sums = {}                                            # proj_index -> per-group sum (float64)
     for (i, kind, pc, dt) in folds:
         if kind[0] in ('SUM', 'AVG'):
-            vals = np.asarray(seg.values(pc)).astype(np.float64, copy=False)
-            sums[i] = np.bincount(grp, weights=vals, minlength=gmax)
+            fc = seg.cols[pc]
+            if fc.get('mode') in (0, 1, 2) and dt == 0 and gmax <= (1 << 20):
+                dv = np.ascontiguousarray(np.asarray(WN._int_table(seg, pc), dtype=np.float64))
+                if dv.size < int(fc['V']):
+                    dv = np.concatenate([dv, np.zeros(int(fc['V']) - dv.size, np.float64)])
+                out = np.empty(gmax, np.float64)
+                _WK.group_fold_dict(grp, np.ascontiguousarray(np.asarray(seg._raw_codes(pc))), dv,
+                                    np.int64(gmax), out)
+                sums[i] = out
+            else:
+                vals = np.asarray(seg.values(pc)).astype(np.float64, copy=False)
+                sums[i] = np.bincount(grp, weights=vals, minlength=gmax)
 
     # ---- non-foldable distinct: prefer a materialized sidecar, else the code-hashing walk ----
-    distinct = _sidecar_counts(db, table, segment_path, kcol, tcol, gmax)
+    key_on_codes = kc.get('mode') in (0, 1, 2) and not kc.get('has_null')
+    import wdb_gbcount as _GB2
+    raw_space_shelf = key_on_codes and _GB2._code_values(seg, kcol) is None
+    distinct = _sidecar_counts(db, table, segment_path, kcol, tcol, 0 if raw_space_shelf else gmax)
+    if distinct is not None and raw_space_shelf:
+        # the shelf was born in the RAW-VALUE id space (gd._ids for a small-range int key); our
+        # groups are codes now -- translate through the int table, exactly
+        tab = np.asarray(WN._int_table(seg, kcol), dtype=np.int64)
+        dcnt = np.asarray(distinct, dtype=np.int64)
+        ok = (tab >= 0) & (tab < dcnt.size)
+        distinct = np.where(ok, dcnt[np.clip(tab, 0, max(0, dcnt.size - 1))], 0)
     if distinct is None:                                 # not materialized -> decode target and walk
-        tinfo = gd._ids(seg, tcol)
-        if tinfo is None:
-            return None
-        tgt, tnull, _td = tinfo
+        tc = seg.cols[tcol]
+        if tc.get('mode') in (0, 1, 2) and not tc.get('has_null'):
+            tgt = np.ascontiguousarray(np.asarray(seg._raw_codes(tcol))); tnull = -1   # codes as stored, no astype
+        else:
+            tinfo = gd._ids(seg, tcol)
+            if tinfo is None:
+                return None
+            tgt, tnull, _td = tinfo
         if grp.shape[0] != tgt.shape[0]:
             return None
         k = int(tgt.max()) + 1
@@ -148,9 +185,8 @@ def execute(seg, det, tree, db=None, table=None, segment_path=None):
             # scatter by target, L1 marker table per bucket, parallel: measured 2.4 s -> 0.65 s there.
             import wdb_kernels as _WK
             SH9 = max(1, int(k).bit_length() - 12)
-            ku9, kr9, offs9 = _WK.gd_pass1(np.ascontiguousarray(tgt, dtype=np.int64),
-                                           np.ascontiguousarray(grp, dtype=np.int64),
-                                           np.int64(SH9), np.int64(8))
+            ku9, kr9, offs9 = _WK.gd_pass1(np.ascontiguousarray(tgt), np.ascontiguousarray(grp),
+                                           np.int64(SH9), np.int64(8))     # the kernel widens per row: no copies
             distinct = _WK.gd_pass2_count(ku9, kr9, offs9, np.int64(SH9), np.int64(VRk9))
         elif gd._HAVE_NUMBA:
             capbits = max(20, min(28, int(np.ceil(np.log2(max(N, 2)))) + 1))

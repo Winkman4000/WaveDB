@@ -127,6 +127,22 @@ def _order_is_distinct_desc(tree, proj, ci):
     return isinstance(inner, E.Count) and isinstance(inner.this, E.Distinct)
 
 
+def _top_sel(counts, present, lim):
+    """present groups ordered by count desc, code asc (stable), cut to lim -- via a PARTITION when
+    lim is small against millions of groups (Q13: 6M SearchPhrases, two full argsorts = 82 ms).
+    Exact to the full sort: the window is extended to the whole plateau of the lim-th count."""
+    counts = np.asarray(counts)
+    if lim is None or lim <= 0 or lim * 8 >= present.size:
+        return present[np.argsort(-counts[present], kind='stable')] if lim is None else \
+            present[np.argsort(-counts[present], kind='stable')][:lim]
+    cp = counts[present]
+    part = np.argpartition(-cp, lim - 1)[:lim]
+    kth = int(cp[part].min())                             # the lim-th largest count
+    cand = np.flatnonzero(cp >= kth)                      # everything that could be in the window
+    cand = cand[np.argsort(-cp[cand], kind='stable')]
+    return present[cand][:lim]
+
+
 def _gdc_path(seg, kcol, tcol):
     return seg.path + '.%s__%s.gdc' % (kcol, tcol)
 
@@ -175,6 +191,9 @@ def _gdc_save2(seg, kcol, tcol, counts):
     winners decoded at emission. noempty: built from the sparse planes, so the
     default-value group is absent -- only filtered queries may ride it."""
     import pickle
+    import wdb_sidecar as _wsc2, os as _os2
+    if not _wsc2.births_on(_os2.path.dirname(seg.path)):
+        return                                        # THE SWITCH, before the podium is even sorted
     # THE LEADERBOARD (Jackson's constraint chain): this shelf only ever
     # answers ORDER BY u DESC LIMIT k, so persist the podium, not the world.
     T = 65536
@@ -336,9 +355,7 @@ def execute(seg, det, tree):
                 counts[_ecode] = 0
             lim = wdb_sql._limit(tree)
             present = np.nonzero(counts)[0]
-            sel = present[np.argsort(-counts[present], kind='stable')]
-            if lim is not None:
-                sel = sel[:lim]
+            sel = _top_sel(counts, present, lim)
             rows = []
             for gid in sel.tolist():
                 row = [None, None]
@@ -366,13 +383,23 @@ def execute(seg, det, tree):
             pl = seg.e8_planes(kcol)
             pos8, lits8 = np.asarray(pl[0]), np.asarray(pl[1], dtype=np.int64)
             KV9 = int(kc9['V'])
-            cnts9 = np.bincount(lits8, minlength=KV9)
-            uc9 = np.asarray(seg._raw_codes(tcol))[pos8].astype(np.int64)
-            offs9 = np.zeros(KV9 + 1, np.int64)
-            np.cumsum(cnts9, out=offs9[1:])
-            bucketed9 = np.empty(lits8.size, np.int64)
-            _WK.cd_scatter(lits8, uc9, offs9, offs9[:-1].copy(), bucketed9)
-            dcounts = _WK.cd_alldistinct(bucketed9, offs9)
+            uc9 = np.asarray(seg._raw_codes(tcol))[pos8]
+            VT9 = int(seg.cols[tcol].get('V') or 0)
+            if KV9 <= 262_144 and VT9 > 65_536 and lits8.size > 4_000_000:
+                # THE SCATTER LANE for a SMALL key space (Q10: 166 phone models): per-slice sorts
+                # were one giant slice on one thread (336 ms); the MSD lane balances by TARGET
+                SH9 = max(1, VT9.bit_length() - 12)
+                ku9, kr9, offs9 = _WK.gd_pass1(np.ascontiguousarray(uc9), np.ascontiguousarray(lits8),
+                                               np.int64(SH9), np.int64(8))
+                dcounts = _WK.gd_pass2_count(ku9, kr9, offs9, np.int64(SH9), np.int64(KV9))
+            else:
+                cnts9 = np.bincount(lits8, minlength=KV9)
+                uc9 = uc9.astype(np.int64)
+                offs9 = np.zeros(KV9 + 1, np.int64)
+                np.cumsum(cnts9, out=offs9[1:])
+                bucketed9 = np.empty(lits8.size, np.int64)
+                _WK.cd_scatter(lits8, uc9, offs9, offs9[:-1].copy(), bucketed9)
+                dcounts = _WK.cd_alldistinct(bucketed9, offs9)
             _gdc_save2(seg, kcol, tcol, dcounts)
             import wdb_shelves
             wdb_shelves.record(seg, 'gdc2', k=kcol, t=tcol)
@@ -381,9 +408,7 @@ def execute(seg, det, tree):
                 counts = counts.copy(); counts[_ecode] = 0
             lim = wdb_sql._limit(tree)
             present = np.nonzero(counts)[0]
-            sel = present[np.argsort(-counts[present], kind='stable')]
-            if lim is not None:
-                sel = sel[:lim]
+            sel = _top_sel(counts, present, lim)
             rows = []
             for gid in sel.tolist():
                 row = [None, None]
@@ -396,8 +421,19 @@ def execute(seg, det, tree):
             return rows, [wdb_sql._alias(p) for p in proj]
         except Exception:
             pass
-    kinfo = _ids(seg, kcol)
-    tinfo = _ids(seg, tcol)
+    def _codes_or_ids(col):
+        # THE KEY IS ITS CODE (Q09's line items, applied here for Q08): a dict column without nulls
+        # groups on its codes as stored -- no value array, no astype; decoded only at emission
+        c9 = seg.cols.get(col)
+        if c9 is not None and c9.get('mode') in (0, 1, 2) and not c9.get('has_null'):
+            dec = wdb_gbcount._code_values(seg, col)
+            if dec is None:
+                import wdb_window as _WN
+                dec = np.asarray(_WN._int_table(seg, col), dtype=np.int64)
+            return np.ascontiguousarray(np.asarray(seg._raw_codes(col))), -1, dec
+        return _ids(seg, col)
+    kinfo = _codes_or_ids(kcol)
+    tinfo = _codes_or_ids(tcol)
     if kinfo is None or tinfo is None:
         return None
     grp, _knull, kdecode = kinfo
@@ -428,9 +464,7 @@ def execute(seg, det, tree):
             wdb_shelves.record(seg, 'gdc', k=kcol, t=tcol)
         lim = wdb_sql._limit(tree)
         present = np.nonzero(counts)[0]
-        sel = present[np.argsort(-counts[present], kind='stable')]
-        if lim is not None:
-            sel = sel[:lim]
+        sel = _top_sel(counts, present, lim)
         names = [wdb_sql._alias(p) for p in proj]
         rows = []
         for gid in sel.tolist():
@@ -468,9 +502,7 @@ def execute(seg, det, tree):
         present = np.nonzero(np.bincount(grp, minlength=gmax))[0]   # NULL has count 0 but still appears
     else:
         present = np.nonzero(counts)[0]                  # no nulls: count>0 exactly when the group occurs
-    sel = present[np.argsort(-counts[present], kind='stable')]
-    if lim is not None:
-        sel = sel[:lim]
+    sel = _top_sel(counts, present, lim)
 
     names = [wdb_sql._alias(p) for p in proj]
     rows = []

@@ -106,19 +106,28 @@ def _tier_shelf(seg, a, b, u):
     p9 = os.path.join(os.path.dirname(seg.path),
                       'tier2__%s__%s__%s.bin' % (a, b, u))
     if not os.path.exists(p9):
-        bc0 = np.asarray(seg._raw_codes(b))
+        e0 = int(WS._code_of(seg, b, ''))
+        cb = seg.cols.get(b) or {}
+        pl = seg.e8_planes(b) if cb.get('code_enc') in (8, 9) and hasattr(seg, 'e8_planes') else None
+        if pl is not None and int(pl[2]) == e0:
+            # THE PLANES ARE THE FILTER (Q11's line items): a tiered/sparse column's planes hold
+            # exactly the non-default rows and their codes -- no full decode, no 100M compare
+            typed0 = np.ascontiguousarray(np.asarray(pl[0]), dtype=np.uint32)
+            bt0 = np.asarray(pl[1]).astype(np.uint8)
+        else:
+            bc0 = np.asarray(seg._raw_codes(b))
+            typed0 = np.flatnonzero(bc0 != e0).astype(np.uint32)
+            bt0 = bc0[typed0].astype(np.uint8)
         ac0 = np.asarray(seg._raw_codes(a))
         uc0 = np.asarray(seg._raw_codes(u))
-        e0 = int(WS._code_of(seg, b, ''))
-        typed0 = np.flatnonzero(bc0 != e0).astype(np.uint32)
         import wdb_sidecar
         if not wdb_sidecar.births_on(os.path.dirname(seg.path)):          # THE SWITCH: the same four, in RAM
-            return typed0, ac0[typed0].astype(np.uint8), bc0[typed0].astype(np.uint8), uc0[typed0].astype(np.uint32)
+            return typed0, ac0[typed0].astype(np.uint8), bt0, uc0[typed0].astype(np.uint32)
         with open(p9 + '.tmp', 'wb') as f:
             f.write(np.asarray([typed0.size], np.int64).tobytes())
             f.write(typed0.tobytes())
             f.write(ac0[typed0].astype(np.uint8).tobytes())
-            f.write(bc0[typed0].astype(np.uint8).tobytes())
+            f.write(bt0.tobytes())
             f.write(uc0[typed0].astype(np.uint32).tobytes())
         os.replace(p9 + '.tmp', p9)
         import wdb_shelves

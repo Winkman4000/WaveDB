@@ -1775,3 +1775,40 @@ sentinel, 43/43 exact: 13.25 -> 12.52 s; Q02 119 -> 2.5 ms, Q03 421
 -> 2.7, Q06 33 -> 2.7. Against DuckDB 34 of 43, against Umbra 12; even
 with ClickHouse's 12.4 on this box. LAW: what every engine computes at
 load is not a sidecar; what only a query would ask for is.
+
+
+
+## THE KEY IS ITS CODE (2026-09-20): under ClickHouse, vanilla
+Jackson: "we have the superior atomic parts; a lot of our issues is we
+don't have our best foot wired in" -- take the biggest loser, say it in
+kid lang, itemize the time. Q09, kid lang: for every region, how many
+hits, add up AdvEngineID, average the screen width, count the DIFFERENT
+people; show the ten busiest. 1,781 ms vanilla, DuckDB 506. The line
+items: inflating four columns 225 (real); turning RegionID's codes into
+values with a 100M fancy-index and then astype, twice, 630 (waste --
+the code IS a small integer); three one-thread np.bincounts with float
+weights 360 (should be one parallel pass); the two-pass distinct
+scatter 353 (real); AdvEngineID's enc-5 decode 45; assembly 100. A
+thousand of the 1,781 were conversions that converted nothing and sums
+on one thread. THE FIX: the group id is the dictionary code as stored,
+decoded only at emission (a shelf born in the raw-value id space is
+translated through the int table, exactly); SUM/AVG numerators are
+group_fold_dict -- per-thread boards over the two code streams and the
+dictionary, no value array ever built (30 ms for both); the count is
+the parallel census; the target's codes go to the scatter as stored
+(the kernel widens per row -- no int64 copies); gd_pass2_count keeps
+per-THREAD rows via get_thread_id instead of per-bucket (4096 x 9,040
+x 8 = 296 MB zeroed and reduced serially). Q09 1,781 -> 702. The same
+law applied to the distinct family: Q08 868 -> 612; Q10's small key
+space (166 phone models) left the per-slice sort, whose one giant slice
+ran on one thread (336 ms), for the MSD lane balanced by target: 540 ->
+172; Q11's filter IS the tiered column's planes (the non-default rows
+and their codes, no 100M compare): 754 -> 486; the top-k over millions
+of groups is a partition extended to the lim-th count's plateau, exact
+to the full sort (_top_sel); _gdc_save2 asks the switch before sorting
+a podium it will not write. THE BOARD, vanilla, 43/43 exact: 12.52 ->
+10.43 s. UNDER CLICKHOUSE's 12.4 on this box; DuckDB 31.9 (37 of 43);
+Umbra 5.58 (12 of 43). Suite 1714/0. WHAT REMAINS: Q08/Q13/Q09 at 0.6-
+0.7 s each (the inflate and the scatter -- the atomic parts now), Q15/
+Q33 (a 17M-bin census: 1.1 GB of per-thread boards to zero), Q31/Q32,
+Q18, Q16 (two-key GROUP BY at DuckDB parity, 914 ms).
