@@ -46,6 +46,11 @@ _CORPUS = [
     "SELECT who, k, COUNT(*) FROM fact GROUP BY who, k ORDER BY 3 DESC, 1, 2 LIMIT 7",
     "SELECT COUNT(DISTINCT dimid) FROM fact WHERE k < 5",
     "SELECT MIN(amt), MAX(amt), AVG(amt) FROM fact WHERE who LIKE 'user1%'",
+    # THE VANILLA LAW's shapes: with the switch off these must answer from the streaming reads
+    "SELECT who FROM fact WHERE who = 'user5'",                     # unordered rows, no LIMIT
+    "SELECT AVG(dimid), SUM(k), COUNT(*), MIN(dimid), MAX(k) FROM fact",   # the exact scalar, no block stats
+    "SELECT COUNT(*) FROM fact WHERE who = 'user7'",                # scalar count, no census
+    "SELECT dimid, COUNT(*) FROM fact GROUP BY dimid ORDER BY 2 DESC, 1 LIMIT 5",   # top-k by count
 ]
 
 

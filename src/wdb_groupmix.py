@@ -141,7 +141,18 @@ def execute(seg, det, tree, db=None, table=None, segment_path=None):
         k = int(tgt.max()) + 1
         if gmax * k >= (1 << 62):                        # pair-id would overflow int64 -> decline
             return None
-        if gd._HAVE_NUMBA:
+        VRk9 = int(gmax)
+        if gd._HAVE_NUMBA and tnull < 0 and N > 4_000_000 and 0 < VRk9 <= 262_144 and k > 65_536:
+            # THE SCATTER LANE, shared with the groupdistinct read (vanilla law's find: Q09 with no
+            # gdc on disk ran the serial code-hashing walk, 2.09 s of a 3.6 s query). MSD 2-pass
+            # scatter by target, L1 marker table per bucket, parallel: measured 2.4 s -> 0.65 s there.
+            import wdb_kernels as _WK
+            SH9 = max(1, int(k).bit_length() - 12)
+            ku9, kr9, offs9 = _WK.gd_pass1(np.ascontiguousarray(tgt, dtype=np.int64),
+                                           np.ascontiguousarray(grp, dtype=np.int64),
+                                           np.int64(SH9), np.int64(8))
+            distinct = _WK.gd_pass2_count(ku9, kr9, offs9, np.int64(SH9), np.int64(VRk9))
+        elif gd._HAVE_NUMBA:
             capbits = max(20, min(28, int(np.ceil(np.log2(max(N, 2)))) + 1))
             distinct = gd._walk(grp, tgt, np.int64(k), gmax, np.int64(tnull), capbits)
         else:

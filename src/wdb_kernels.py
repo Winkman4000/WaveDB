@@ -3322,6 +3322,40 @@ def pand(a, b):
 
 
 @njit(cache=True, parallel=True, nogil=True)
+def _hist_par(codes, V, part, out):
+    """per-thread int32 boards over row chunks, then a parallel reduce over the codes"""
+    T = part.shape[0]
+    n = codes.size
+    for t in prange(T):
+        a = n * t // T; b = n * (t + 1) // T
+        for i in range(a, b):
+            part[t, np.int64(codes[i])] += np.int32(1)
+    for v in prange(V):
+        s = np.int64(0)
+        for t in range(T):
+            s += part[t, v]
+        out[v] = s
+
+
+def bincount_par(codes, minlength):
+    """THE PARALLEL CENSUS: np.bincount of 100M codes is one thread for 300 ms (plus an astype
+    copy); this is per-thread boards and a reduce, measured ~60 ms. Boards cost T*V*4 bytes, so
+    a dictionary past 64M codes falls back to numpy. Codes are assumed < minlength (a null code
+    past the dictionary is the caller's to trim)."""
+    codes = np.asarray(codes)
+    V = int(minlength)
+    if codes.size < (1 << 22) or V > (64 << 20) or codes.dtype.kind not in 'iu':
+        return np.bincount(codes, minlength=V)
+    if V < int(codes.max()) + 1:
+        return np.bincount(codes, minlength=V)
+    T = min(numba.get_num_threads(), 16)
+    part = np.zeros((T, V), np.int32)
+    out = np.empty(V, np.int64)
+    _hist_par(np.ascontiguousarray(codes), V, part, out)
+    return out
+
+
+@njit(cache=True, parallel=True, nogil=True)
 def pcount_chunks(mask, counts, chunk):
     nc = counts.shape[0]
     n = mask.shape[0]
@@ -3433,43 +3467,53 @@ def plike_fc(buf, restarts, R, V, n1, n2, keep):
     sequentially (prefix carry), blocks run in parallel. keep[code]=contains."""
     nb = (V + R - 1) // R
     L1 = n1.shape[0]; L2 = n2.shape[0]
-    for b in prange(nb):
-        o = np.int64(restarts[b])
-        prev = np.empty(4096, np.uint8)
-        hi = min(R, V - b * R)
-        for step in range(hi):
-            cp = np.int64(buf[o]) | (np.int64(buf[o + 1]) << 8)
-            sl = np.int64(buf[o + 2]) | (np.int64(buf[o + 3]) << 8)
-            o += 4
-            for t in range(sl):
-                prev[cp + t] = buf[o + t]
-            o += sl
-            plen = cp + sl
-            p1 = np.int64(-1)
-            i = 0
-            while i <= plen - L1:
-                k = 0
-                while k < L1 and prev[i + k] == n1[k]:
-                    k += 1
-                if k == L1:
-                    p1 = i + L1
-                    break
-                i += 1
-            ok = False
-            if p1 >= 0:
-                if L2 == 0:
-                    ok = True
+    T = min(nb, numba.get_num_threads() * 8)      # one carry buffer per chunk of blocks, not per
+    for t in prange(T):                            # block (1.1M mallocs of 128 KB on an 18M URL dict)
+        prev = np.empty(131072, np.uint8)          # cp, sl are u16: a value is at most 131070 bytes
+        for b in range(nb * t // T, nb * (t + 1) // T):
+            o = np.int64(restarts[b])
+            hi = min(R, V - b * R)
+            mend = np.int64(-1)                    # THE PREFIX CARRY: where the previous value's
+            for step in range(hi):                 # first match ENDED; a match inside the shared
+                cp = np.int64(buf[o]) | (np.int64(buf[o + 1]) << 8)      # prefix is still a match,
+                sl = np.int64(buf[o + 2]) | (np.int64(buf[o + 3]) << 8)  # so only the new bytes
+                o += 4                                                    # are searched (2 GB of
+                for q in range(sl):                                       # decoded text -> ~500 MB)
+                    prev[cp + q] = buf[o + q]
+                o += sl
+                plen = cp + sl
+                p1 = np.int64(-1)
+                if mend >= 0 and mend <= cp:
+                    p1 = mend
+                    i = plen                       # nothing to search
                 else:
-                    i = p1
-                    while i <= plen - L2:
-                        k = 0
-                        while k < L2 and prev[i + k] == n2[k]:
-                            k += 1
-                        if k == L2:
-                            ok = True
-                            break
-                        i += 1
-            keep[b * R + step] = ok
+                    i = cp - L1 + 1
+                    if i < 0:
+                        i = 0
+                while i <= plen - L1:
+                    k = 0
+                    while k < L1 and prev[i + k] == n1[k]:
+                        k += 1
+                    if k == L1:
+                        p1 = i + L1
+                        break
+                    i += 1
+                mend = p1
+                ok = False
+                if p1 >= 0:
+                    if L2 == 0:
+                        ok = True
+                    else:
+                        i = p1
+                        while i <= plen - L2:
+                            k = 0
+                            while k < L2 and prev[i + k] == n2[k]:
+                                k += 1
+                            if k == L2:
+                                ok = True
+                                break
+                            i += 1
+                keep[b * R + step] = ok
 
 
 @njit(cache=True, parallel=True, nogil=True)

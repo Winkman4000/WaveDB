@@ -1701,3 +1701,54 @@ it; small on cbdb (0.06% of the segment, one column on the board)
 because these codes are hashes and IDs with little structure for the
 packing to expose. The candidate stays in the election for the data
 where there is more.
+
+
+
+## THE VANILLA LAW (2026-09-20): the number that is the engine
+Jackson asked whether it was time to submit to ClickBench, and what
+would embarrass us. The rules: query result caches off; "creation of
+pre-aggregated tables or indices, projections, or materialized views is
+not recommended"; hash tables fine "unless they mimic query result
+caching". Every board we have run was with sidecars ON, and the cbdb
+directory after a board holds `Referer.rg-<hash>.npz` (494 MB, Q27's
+grouped result keyed by its regex), `MobilePhoneModel__UserID.gdc` (the
+answer to Q10), the posting lists, the text indexes -- born by the
+queries they answer. That number is not the engine. Jackson: "that was
+always kinda a concern I had with them." MEASURED, the switch off,
+strict sentinel, a directory holding only the segment and the catalog:
+warm 21.1 s. DuckDB 34.0, ClickHouse 12.4, Umbra 5.58. Faster than
+DuckDB on 30 of 43, than Umbra on 8. The profiles said the 16 seconds
+were not the engine's floor but reads written assuming their sidecar
+exists, building it when it doesn't -- slowly, in Python, every query:
+AVG(UserID) 1,097 ms (block stats for 3,052 blocks in a Python loop,
+forgotten after the query), WHERE UserID = k 1,525 ms (the whole
+group-by census, an argsort of 100M codes, to look up one code; the
+frame scan never got the chance because rows mode demanded ORDER BY
+the cluster column), COUNT(*) WHERE URL LIKE 19 s on the first query
+of a process (18M URLs decoded into Python objects to join a
+haystack). THE LAW (wdb_sidecar.may_build): with the switch off a read
+may USE a structure that exists on disk but never BUILDS one to answer;
+it declines and the streaming reads serve. What is the query's own work
+-- a count per code, a per-group distinct -- is computed the way a scan
+would, with kernels, and forgotten. Block stats and the scalar count
+decline; gbcount counts with THE PARALLEL CENSUS (bincount_par: per-
+thread boards and a reduce, 300 ms one-thread numpy -> ~70) and orders
+by a radix sort on u16-capped counts instead of the 645 ms argsort; the
+frame scan takes unordered rows queries (any order is lawful; the
+driver's positions in row order are one) and `=` rides the nogil flag
+scan; the group-mix read uses the MSD scatter lane that already existed
+one module over (2.09 s serial walk -> 0.4); LIKE with no text buffer
+walks the dictionary's own front-coded bytes in plike_fc with a PREFIX
+CARRY (a match inside the shared prefix is still a match; only the new
+bytes are searched); the routing ledger writes nothing when off.
+MEASURED, same directory, same rules: 21.1 -> 13.25 s, 43/43 exact;
+33 of 43 against DuckDB, 10 against Umbra; Q01 188 -> 35 ms, Q02 488
+-> 119, Q03 1,097 -> 421, Q07 237 -> 100, Q15 1,393 -> 548, Q19 1,525
+-> 259 (83 in-process), Q20 1,162 -> 69, Q25 787 -> 400, Q33 1,136 ->
+418. Suite 1713/0. WHAT REMAINS on the vanilla bill: Q09 +1.66 s,
+the COUNT DISTINCT UserID family (Q08/Q10/Q11/Q13, +2.6 s together),
+Q31/Q32, Q15/Q33, Q03 -- and the first LIKE per process at ~2 s (1.4
+of it joining a 2 GB decoded dictionary). THE SUBMISSION LIST, still
+open: their cold run drops the page cache on a 500 GB gp2 volume; 32 GB
+of RAM; the JIT warm-up belongs in load time; the official queries.sql
+verbatim; encode time on the record; one afternoon on a c6a.4xlarge.

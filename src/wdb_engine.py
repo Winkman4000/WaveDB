@@ -1462,7 +1462,8 @@ class Segment:
             except Exception:
                 pass
             codes = self.codes(nm)
-            cc[nm] = np.bincount(codes, minlength=self.cols[nm]['V'])
+            import wdb_kernels as _WKc
+            cc[nm] = _WKc.bincount_par(codes, self.cols[nm]['V'])            # THE PARALLEL CENSUS
             try:
                 import wdb_sidecar as _wsc9
                 if not _wsc9.births_on(_os.path.dirname(self.path)):

@@ -495,9 +495,26 @@ def _like_flags(seg, col, needle, kind='contains'):
     mk = (col, needle, kind)
     if mk in memo:
         return memo[mk]
+    nd = needle.encode() if isinstance(needle, str) else needle
+    c0 = seg.cols.get(col) or {}
+    if kind not in ('general', 'prefix', 'suffix') and 'restarts' in c0 and len(nd) >= 1 \
+            and seg.__dict__.get('_ws_text_memo', {}).get(col) is None:
+        import wdb_sidecar as _wsc0
+        if not _wsc0.may_build(seg.path) and not _wsc0.exists(seg.path + '.' + col + '.txz.bin'):
+            # THE FRONT-CODED HAYSTACK (vanilla law's find): with the switch off and no text-buffer
+            # sidecar, the old path decoded 18M URLs into Python objects to join a haystack --
+            # 19 s, every process. The kernel walks the dictionary's own front-coded bytes: no
+            # objects, blocks in parallel, nothing born.
+            import wdb_kernels as _WKl
+            blob, restarts = seg.dict_bytes(col)
+            V0 = int(c0.get('n_dict') or c0['V'])
+            keep = np.zeros(int(c0['V']), np.bool_)          # sized to every code (the null bin too)
+            _WKl.plike_fc(blob, restarts, int(c0['R']), V0, np.frombuffer(nd, np.uint8),
+                          np.empty(0, np.uint8), keep)
+            memo[mk] = keep
+            return keep
     hay, offs = _text_buffer(seg, col)
     V = int(offs.size) - 1
-    nd = needle.encode() if isinstance(needle, str) else needle
     flag = np.zeros(V, bool)
     if kind == 'general':
         # arbitrary wildcards, evaluated once per DISTINCT value (the dict-level law).
@@ -826,25 +843,34 @@ def detect(seg, tree, col_map):
         if tree.args.get('group') is not None or hterms:
             return None
         order = tree.args.get('order')
-        if order is None or not order.expressions:
-            return None
-        oe = order.expressions[0]
-        ocol = oe.this.name if isinstance(oe.this, E.Column) else None
-        ocol = col_map.get(ocol, ocol) if (col_map and ocol) else ocol
-        if ocol is None or oe.args.get('desc') or seg.stairs(ocol) is None:
-            return None                  # rows mode rides the cluster order: ASC on a stair column
-        tiebreak = []
-        for oe2 in order.expressions[1:]:
-            if oe2.args.get('desc') or not isinstance(oe2.this, E.Column):
-                return None
-            tc = oe2.this.name
-            tc = col_map.get(tc, tc) if col_map else tc
-            if not P.columns_exist(seg, tc):
-                return None
-            tiebreak.append(tc)
         lim = wdb_sql._limit(tree)
-        if lim is None or lim <= 0 or lim > 100000:
-            return None
+        if order is None or not order.expressions:
+            # THE UNORDERED ROWS (vanilla law's first find): no ORDER BY means any order is a
+            # lawful answer, and the driver's positions in row order are one. Without this,
+            # `SELECT UserID FROM hits WHERE UserID = k` went to the general path, which decoded
+            # all 100M values before applying the predicate: 1,115 ms for 78 rows. No LIMIT is
+            # lim -1 (execute declines past 250K hits -- there the O(N) path is the cheaper one).
+            if lim is not None and (lim <= 0 or lim > 100000):
+                return None
+            ocol = None; tiebreak = []
+            lim = int(lim) if lim is not None else -1
+        else:
+            oe = order.expressions[0]
+            ocol = oe.this.name if isinstance(oe.this, E.Column) else None
+            ocol = col_map.get(ocol, ocol) if (col_map and ocol) else ocol
+            if ocol is None or oe.args.get('desc') or seg.stairs(ocol) is None:
+                return None              # rows mode rides the cluster order: ASC on a stair column
+            tiebreak = []
+            for oe2 in order.expressions[1:]:
+                if oe2.args.get('desc') or not isinstance(oe2.this, E.Column):
+                    return None
+                tc = oe2.this.name
+                tc = col_map.get(tc, tc) if col_map else tc
+                if not P.columns_exist(seg, tc):
+                    return None
+                tiebreak.append(tc)
+            if lim is None or lim <= 0 or lim > 100000:
+                return None
         return {'spans': spans, 'eqs': eqs, 'flags': flags, 'ins': ins, 'likes': likes,
                 'nulls': nulls, 'ors': ors, 'sflags': sflags, 'drive_eq': drive_eq,
                 'drive_like': drive_like, 'drive_or': drive_or, 'drive_sf': drive_sf,
@@ -1025,24 +1051,13 @@ def _scan_eq(seg, col, code, lo, hi, negate=False):
             flag18[int(code)] = not negate
         return _scan_flag18(seg, col, np.packbits(flag18, bitorder='little'), lo, hi)
     if c.get('code_enc', 0) == 3 and col not in seg._codes:
-        wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
-        BR = c['BR']; base = c['cstart']; bo = c['boffs']; buf = seg.buf
-        j0, j1 = lo // BR, (hi - 1) // BR + 1
-        def scan(js):
-            import zstandard as zstd
-            dz = zstd.ZstdDecompressor(); out = []
-            for j in js:
-                raw = np.frombuffer(dz.decompress(buf[base+int(bo[j]):base+int(bo[j+1])].tobytes()), dtype=wdt)
-                a, b = max(lo, j*BR), min(hi, j*BR + raw.size)
-                seg_ = raw[a-j*BR:b-j*BR]
-                h = np.nonzero(seg_ != code)[0] if negate else np.nonzero(seg_ == code)[0]
-                if h.size: out.append(h + a)
-            return np.concatenate(out) if out else np.empty(0, np.int64)
-        W = min(_SCAN_THREADS, max(1, j1 - j0))
-        with ThreadPoolExecutor(W) as ex:
-            parts = list(ex.map(scan, np.array_split(np.arange(j0, j1), W)))
-        parts = [p for p in parts if p.size]
-        return np.concatenate(parts) if parts else np.empty(0, np.int64)
+        # one code IS a flag: the nogil frame scan (THE SCAN WITHOUT THE GIL) instead of a numpy
+        # compare per frame under the GIL -- UserID = k measured 155 -> ~60 ms on 1,526 frames
+        V3 = int(c.get('V') or 0); code = int(code)
+        flag3 = np.full(max(V3, code + 1), bool(negate), np.bool_)
+        if code >= 0:
+            flag3[code] = not negate
+        return _scan_flag(seg, col, flag3, lo, hi)
     cc = np.asarray(seg._raw_codes_range(col, lo, hi))
     h = np.nonzero(cc != code)[0] if negate else np.nonzero(cc == code)[0]
     return h + lo
@@ -1453,6 +1468,10 @@ def execute(seg, spec):
 
     # ---- rows mode: SELECT * ordered by the cluster column -- positions ARE the order
     if spec.get('mode') == 'rows':
+        if spec['lim'] < 0:                          # THE UNORDERED ROWS, no LIMIT: every hit
+            if pos.size > 250_000:
+                return None                          # past this the O(N) general path is cheaper
+            spec = dict(spec); spec['lim'] = int(pos.size)
         K = spec['off'] + spec['lim']
         if spec.get('tiebreak') and pos.size > K:
             # total order: extend to the full plateau of the K-th row's cluster value,

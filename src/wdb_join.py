@@ -199,8 +199,8 @@ def _exact_scalar(db, tree):
     cnts = {}
     def counts_of(col, tabsize):
         if col not in cnts:
-            cc = np.asarray(seg._raw_codes(col)).astype(np.int64)
-            cn = np.bincount(cc, minlength=tabsize)
+            import wdb_kernels as _WKc
+            cn = _WKc.bincount_par(seg._raw_codes(col), tabsize)   # THE PARALLEL CENSUS (no astype copy)
             if cn.size > tabsize:
                 cn = cn[:tabsize]                    # null codes live past the dict's
             cnts[col] = cn                           # values: SQL aggs exclude them

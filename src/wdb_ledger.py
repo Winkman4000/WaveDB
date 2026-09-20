@@ -43,6 +43,9 @@ def log(seg, sql, path_name, ms, stages=None, n_rows=None):
         p = _path_for(seg)
         if p is None:
             return
+        import wdb_sidecar
+        if not wdb_sidecar.births_on(os.path.dirname(p)):
+            return                               # THE SWITCH: a vanilla realm writes nothing, not even its diary
         rec = {
             't': round(time.time(), 3),
             'q': hash(sql) & 0xFFFFFFFFFFFF,

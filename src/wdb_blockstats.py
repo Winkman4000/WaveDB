@@ -16,6 +16,7 @@ except Exception:
     E = None
 import wdb_qmem
 import wdb_sql
+import wdb_sidecar
 import workers
 import wdb_policies as P
 E = wdb_sql.E
@@ -79,6 +80,8 @@ def build(seg, col):
                 return st
     except Exception:
         pass                                     # unreadable sidecar: recompute below
+    if not wdb_sidecar.may_build(fn):            # THE VANILLA LAW: no census built to answer
+        _SCACHE[key] = None; return None
     nb = (N + _BR - 1) // _BR
     if c['mode'] == 4:
         vals = np.asarray(seg._seq_decode(c))
@@ -122,7 +125,7 @@ def build(seg, col):
     st = {'cnt': cnt, 'nn': nn, 'sum': bsum, 'cmin': cmin, 'cmax': cmax,
           'mode4': codes is None, 'maxabs': maxabs, 'dt': c['dt']}
     try:
-        import wdb_sidecar, os as _os9
+        import os as _os9
         if wdb_sidecar.births_on(_os9.path.dirname(fn)):                    # THE SWITCH
             np.savez(fn, N=N, cnt=cnt, nn=nn, sum=bsum, cmin=cmin, cmax=cmax,
                      mode4=(codes is None), maxabs=maxabs, dt=int(c['dt']))

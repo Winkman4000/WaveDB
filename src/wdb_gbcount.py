@@ -105,6 +105,31 @@ def _load(seg, col):
                 return hc, hn
         except Exception:
             pass
+    import wdb_sidecar
+    if not wdb_sidecar.may_build(p):
+        # THE VANILLA LAW: nothing persisted-shaped is built to answer -- but a count per code IS
+        # the query's own work (any engine's hash aggregate), so it is computed the way a scan
+        # would: the parallel census, and a RADIX order on the counts instead of the 645 ms
+        # argsort of 17M int64 (counts capped to u16 sort by radix; the few past the cap are
+        # re-sorted exactly). Transient: the per-query cache only.
+        import wdb_kernels as _WKg
+        codes = seg._raw_codes(col)
+        if codes.size == 0:
+            return None
+        K = int(codes.max()) + 1
+        counts = _WKg.bincount_par(codes, K)
+        heavy = np.flatnonzero(counts >= 2)
+        hn0 = counts[heavy]
+        key = (65535 - np.minimum(hn0, 65535)).astype(np.uint16)
+        order = np.argsort(key, kind='stable')             # radix: count desc, code asc within
+        top = int(np.count_nonzero(hn0 >= 65535))
+        if top > 1:
+            o2 = order[:top]
+            order[:top] = o2[np.argsort(-hn0[o2], kind='stable')]
+        hc = np.ascontiguousarray(heavy[order], dtype=np.uint32)
+        hn = np.ascontiguousarray(hn0[order], dtype=np.int64)
+        _CACHE[ck] = (hc, hn)
+        return hc, hn
     built = _build(seg, col)
     if built is None:
         return None
@@ -247,6 +272,10 @@ def _scalar_count_detect(seg, tree, col_map):
 
 def _scalar_count_execute(seg, spec):
     global _HITS
+    import wdb_sidecar
+    if not os.path.exists(_path(seg, spec['col'])) and not wdb_sidecar.may_build(seg.path):
+        return None                                  # THE VANILLA LAW: a scalar count with no census on
+                                                     # disk is the frame scan's (Q20: 480 ms census vs 150 scan)
     got = _load(seg, spec['col'])
     if got is None:
         return None

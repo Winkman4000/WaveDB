@@ -270,6 +270,15 @@ def births_on(dbdir):
     return setting(dbdir) == 'on'
 
 
+def may_build(path):
+    """THE VANILLA LAW (Jackson, 2026-09-20): with the switch off, a read may USE a structure that
+    exists on disk but may never BUILD one to answer -- it declines and the streaming reads serve.
+    Measured with the switch off before this law: AVG(UserID) 1,097 ms (a per-block census built
+    in a Python loop, every query), WHERE UserID = k 1,525 ms (the whole group-by census, an
+    argsort of 100M codes, to look up one code). `path` is the structure's or the segment's path."""
+    return births_on(os.path.dirname(path))
+
+
 def set_setting(dbdir, value):
     """write 'sidecars': on|off into the catalog (the operator's decision, persisted with the realm)"""
     value = 'off' if str(value).strip().lower() in ('0', 'off', 'no', 'false') else 'on'
