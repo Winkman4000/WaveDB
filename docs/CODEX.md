@@ -1666,10 +1666,14 @@ column by column with the dictionary and every other column
 byte-copied -- the A/B tool this needed, and the measurement that
 mirrors never drift: twelve of fifteen wide columns came back
 byte-identical. THE ELECTION on cbdb: Title 225.7 -> 224.3 MB,
-ClientEventTime 267.7 -> 263.7, HID 337.5 -> 337.0 (over bitpack, by
-0.15% -- an open question, since bitpack's random access is free); URL,
+ClientEventTime 267.7 -> 263.7, and HID 337.5 -> 337.0 over bitpack --
+by 0.15%, for a frame inflate on every point read where bitpack's random
+access is free. Jackson: "isn't bitpack with no zstd better?" It is.
+THE BITPACK GUARD: against plain bitpack the packed frames must win by
+10%; against zstd and blocked frames, which already pay the inflate,
+strictly smaller elects. HID wears bitpack. URL,
 UserID, Referer, both hashes, both IPs and the rest kept their dress.
-Segment 8,778.6 -> 8,772.7 MB. THE BOARD, sidecars settled, 43/43
+Segment 8,778.6 -> 8,773.2 MB with the guard. THE BOARD, sidecars settled, 43/43
 exact both: warm 4.87s -> 4.63s, cold 28.9 -> 23.1, 20 of 43 against
 Umbra -- Q22 (Title LIKE) 392 -> 413 and head-to-head 407/490 vs
 506/401: inside the noise, no win, no loss. The first A/B read 5.38s and
@@ -1678,7 +1682,7 @@ on a column never touched). LAW: an A/B against a fresh directory is
 not settled until its sidecars are; run it twice and read the second.
 Q17 (GROUP BY UserID, SearchPhrase, LIMIT without ORDER) swings 52 to
 259 ms run to run on BOTH directories -- a routing bimodality, its own
-hunt. Suite 1712/0. VERDICT: the idea is correct and small here --
-0.07% of the segment, speed neutral -- because these columns' codes
+hunt. Suite 1713/0. VERDICT: the idea is correct and small here --
+0.06% of the segment, speed neutral -- because these columns' codes
 are hashes and IDs with little structure for the packing to expose;
 the candidate stays in the election for the data where there is more.

@@ -613,7 +613,12 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
         np.cumsum([len(f) for f in fr18], out=o18[1:])
         cand18 = (bytes([18, bits]) + struct.pack('<II', BR18, len(fr18))
                   + o18.tobytes() + b''.join(fr18))
-        if len(cand18) < len(best) or os.environ.get('WDB_E18_FORCE'):
+        # THE BITPACK GUARD (Jackson): over the plain bitpack -- whose point reads are bit
+        # arithmetic on the mmap, no inflate ever -- the packed frames must win by 10%, not by
+        # a hair (HID: 337.5 -> 337.0 MB, 0.15%, was not worth a frame inflate per point read).
+        # Over zstd / blocked frames, which already pay the inflate, strictly smaller elects.
+        seal18 = 0.90 * len(best) if best is packed else len(best)
+        if len(cand18) < seal18 or os.environ.get('WDB_E18_FORCE'):
             best = cand18
     # tag 14 = FIELD PLANES (Jackson's dress): dates decompose to y/m/d u8
     # planes, each its own zstd stream -- the calendar's internal correlation

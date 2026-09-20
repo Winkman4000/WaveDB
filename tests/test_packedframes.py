@@ -119,6 +119,25 @@ def test_queries_match_duck():
         assert sorted(tuple(x.decode() if isinstance(x, bytes) else x for x in r) for r in rows) == duck, sql
 
 
+def test_bitpack_guard():
+    """THE BITPACK GUARD: against plain bitpack (free random access) the packed frames must win by
+    10%; a hair (HID's 0.15%) is not a win. Wide random codes -> bitpack wears, never enc 18."""
+    import wdb_encode
+    rng = np.random.default_rng(4)
+    codes = rng.integers(0, 1 << 20, 300_000).astype(np.int64)           # incompressible, 20 bits
+    sec = wdb_encode._code_section(codes, 20)
+    assert sec[0] == 0, sec[0]                                          # bitpack, not enc 18
+    packed_len = 1 + (codes.size * 20 + 7) // 8
+    a18 = np.ascontiguousarray(codes); import wdb_kernels as K
+    fr = []; import zstandard as zstd; cx = zstd.ZstdCompressor(level=wdb_encode.CODE_ZSTD_LEVEL)
+    for i in range(0, codes.size, 65536):
+        ch = a18[i:i + 65536]; out = np.zeros((ch.size * 20 + 7) // 8 + 8, np.uint8); K.pk32_pack(ch, 20, out)
+        fr.append(cx.compress(out.tobytes()))
+    cand = 10 + 4 * (len(fr) + 1) + sum(map(len, fr))
+    assert cand < packed_len * 1.05, (cand, packed_len)                 # it IS about the same size --
+    assert cand >= packed_len * 0.90                                    # -- and inside the guard, so bitpack stays
+
+
 def test_election_takes_it_only_when_smaller():
     """without the force the candidate must win on bytes alone: incompressible wide codes stay bitpack"""
     rng = np.random.default_rng(3)
