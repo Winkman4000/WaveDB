@@ -3132,54 +3132,68 @@ def pk32_pack(codes, bits, out):
         out[b + 4] |= np.uint8((v >> 32) & 0xFF)
 
 
+def pk32_words(buf8):
+    """THE WORD VIEW: an inflated enc-18 frame (uint8, 8 slack bytes) as aligned u64 words for the
+    readers below -- one load per code, a second only when the code straddles a word. Measured on
+    Title's scan: five byte loads 67.5 ms, one word 48.8 (enc-3's u32 read 63.1). Safe on the
+    slack: a straddled word ends before the eight slack bytes do, for any prefix length the
+    point reader asks (ceil(n*bits/8) + 8 bytes)."""
+    b = np.frombuffer(buf8, np.uint8) if not isinstance(buf8, np.ndarray) else buf8
+    return b[:b.size // 8 * 8].view(np.uint64)
+
+
 @njit(cache=True, parallel=True, nogil=True)
-def pk32_unpack(buf, bits, n, out):
-    """enc-18: LE bit-stream -> n codes (bits <= 32; five-byte window), parallel"""
+def pk32_unpack(w64, bits, n, out):
+    """enc-18: LE bit-stream (as u64 words, pk32_words) -> n codes (bits <= 32), parallel"""
     mask = (np.int64(1) << bits) - 1
     for i in prange(n):
         bitpos = np.int64(i) * bits
-        b = bitpos >> 3; sh = bitpos & 7
-        w = (np.int64(buf[b]) | (np.int64(buf[b + 1]) << 8) | (np.int64(buf[b + 2]) << 16)
-             | (np.int64(buf[b + 3]) << 24) | (np.int64(buf[b + 4]) << 32))
-        out[i] = (w >> sh) & mask
+        w = bitpos >> 6; o = bitpos & 63
+        v = np.int64(w64[w] >> np.uint64(o))
+        if o + bits > 64:
+            v |= np.int64(w64[w + 1] << np.uint64(64 - o))
+        out[i] = v & mask
 
 
 @njit(cache=True, nogil=True)
-def pk32_unpack_serial(buf, bits, n, out):
+def pk32_unpack_serial(w64, bits, n, out):
     """the same, one thread (a frame inside a thread pool)"""
     mask = (np.int64(1) << bits) - 1
     for i in range(n):
         bitpos = np.int64(i) * bits
-        b = bitpos >> 3; sh = bitpos & 7
-        w = (np.int64(buf[b]) | (np.int64(buf[b + 1]) << 8) | (np.int64(buf[b + 2]) << 16)
-             | (np.int64(buf[b + 3]) << 24) | (np.int64(buf[b + 4]) << 32))
-        out[i] = (w >> sh) & mask
+        w = bitpos >> 6; o = bitpos & 63
+        v = np.int64(w64[w] >> np.uint64(o))
+        if o + bits > 64:
+            v |= np.int64(w64[w + 1] << np.uint64(64 - o))
+        out[i] = v & mask
 
 
 @njit(cache=True, nogil=True)
-def pk32_gather(buf, bits, rows, out):
+def pk32_gather(w64, bits, rows, out):
     """enc-18 codes AT ROWS of one inflated frame (rows relative to the frame)"""
     mask = (np.int64(1) << bits) - 1
     for j in range(rows.shape[0]):
         bitpos = np.int64(rows[j]) * bits
-        b = bitpos >> 3; sh = bitpos & 7
-        w = (np.int64(buf[b]) | (np.int64(buf[b + 1]) << 8) | (np.int64(buf[b + 2]) << 16)
-             | (np.int64(buf[b + 3]) << 24) | (np.int64(buf[b + 4]) << 32))
-        out[j] = (w >> sh) & mask
+        w = bitpos >> 6; o = bitpos & 63
+        v = np.int64(w64[w] >> np.uint64(o))
+        if o + bits > 64:
+            v |= np.int64(w64[w + 1] << np.uint64(64 - o))
+        out[j] = v & mask
 
 
 @njit(cache=True, nogil=True)
-def pk32_flag_hits(buf, bits, s0, e0, base, fbits, hits, codes):
+def pk32_flag_hits(w64, bits, s0, e0, base, fbits, hits, codes):
     """enc-18 frame scan: positions (base + i) and codes for i in [s0, e0) whose code's bit is set
     in the packed flag -- unpack and test in one loop, no intermediate array"""
     mask = (np.int64(1) << bits) - 1
     n = 0
     for i in range(s0, e0):
         bitpos = np.int64(i) * bits
-        b = bitpos >> 3; sh = bitpos & 7
-        w = (np.int64(buf[b]) | (np.int64(buf[b + 1]) << 8) | (np.int64(buf[b + 2]) << 16)
-             | (np.int64(buf[b + 3]) << 24) | (np.int64(buf[b + 4]) << 32))
-        v = (w >> sh) & mask
+        w = bitpos >> 6; o = bitpos & 63
+        v = np.int64(w64[w] >> np.uint64(o))
+        if o + bits > 64:
+            v |= np.int64(w64[w + 1] << np.uint64(64 - o))
+        v &= mask
         if (fbits[v >> 3] >> (v & 7)) & 1:
             hits[n] = base + (i - s0); codes[n] = v; n += 1
     return n

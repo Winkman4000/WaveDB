@@ -50,8 +50,9 @@ def test_kernels_roundtrip_every_width():
         n = 65536 + 7
         codes = rng.integers(0, 1 << bits, n, dtype=np.int64) if bits < 32 else \
             rng.integers(0, 1 << 31, n, dtype=np.int64) * 2 + rng.integers(0, 2, n, dtype=np.int64)
-        out = np.zeros((n * bits + 7) // 8 + 8, np.uint8)
-        K.pk32_pack(codes, bits, out)
+        out8 = np.zeros((n * bits + 7) // 8 + 8, np.uint8)
+        K.pk32_pack(codes, bits, out8)
+        out = K.pk32_words(out8.tobytes())                 # the readers take the u64 word view
         back = np.empty(n, np.int64); K.pk32_unpack(out, bits, n, back)
         assert np.array_equal(back, codes), bits
         back2 = np.empty(n, np.int64); K.pk32_unpack_serial(out, bits, n, back2)

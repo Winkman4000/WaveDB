@@ -1682,7 +1682,22 @@ on a column never touched). LAW: an A/B against a fresh directory is
 not settled until its sidecars are; run it twice and read the second.
 Q17 (GROUP BY UserID, SearchPhrase, LIMIT without ORDER) swings 52 to
 259 ms run to run on BOTH directories -- a routing bimodality, its own
-hunt. Suite 1713/0. VERDICT: the idea is correct and small here --
-0.06% of the segment, speed neutral -- because these columns' codes
-are hashes and IDs with little structure for the packing to expose;
-the candidate stays in the election for the data where there is more.
+hunt. Jackson: "the ones we did it on, like Title, should improve --
+bitpacked zstd is faster AND smaller." ISOLATED, Title's LIKE scan on
+fourteen threads: enc 3 inflates in 48.5 ms and tests in 63.1; enc 18
+inflates in 27.1 (300 MB of bits out instead of 400 MB of u32) and
+tested in 65.9 -- the first kernel assembled every code from FIVE BYTE
+LOADS and gave the inflate's win back. THE WORD VIEW: the frame as
+aligned u64 words, one load per code and a second only when the code
+straddles a word (safe inside the eight slack bytes for any prefix the
+point reader asks): 48.8 ms. The packed frames scan Title 23% faster
+than the u32 frames AND are smaller. Q22 in-process, ten runs each,
+alternating directories: min 339 -> 303 ms, medians 394 and 393 --
+the run-to-run spread of Q22 (340-463) is four times the win, which is
+why no board could show it; Q21 (URL, untouched) 87.8 vs 86.7, the
+control. Board, second run, 43/43: warm 4.72s, 21 of 43 against Umbra.
+Suite 1713/0. VERDICT: correct, and the scan is faster where it wears
+it; small on cbdb (0.06% of the segment, one column on the board)
+because these codes are hashes and IDs with little structure for the
+packing to expose. The candidate stays in the election for the data
+where there is more.

@@ -743,18 +743,19 @@ class Segment:
         return np.uint8 if b <= 8 else (np.uint16 if b <= 16 else np.uint32)
 
     def _pk18_frame(self, c, j, dec=None, mv=None, need=None):
-        """enc-18: frame j's inflated LE bit-stream as a uint8 array (with its 8 slack bytes). `need`
-        limits the inflate to a byte prefix (zstd streams: a point read pays only to its highest row)"""
+        """enc-18: frame j's inflated LE bit-stream as u64 WORDS (wdb_kernels.pk32_words -- one load per
+        code). `need` limits the inflate to a byte prefix (zstd streams: a point read pays only to its
+        highest row; need = ceil(rows*bits/8) + 8 keeps the straddle word inside the prefix)"""
         import zstandard as _zs
+        from wdb_kernels import pk32_words as _words
         if dec is None: dec = _zs.ZstdDecompressor()
         if mv is None: mv = memoryview(self.buf)
         po = c['poffs']; base = c['cstart']
         fb = mv[base + int(po[j]):base + int(po[j + 1])]
         if need is not None:
             import io as _io
-            raw = dec.stream_reader(_io.BytesIO(fb)).read(int(need))
-            return np.frombuffer(raw, dtype=np.uint8)
-        return np.frombuffer(dec.decompress(fb), dtype=np.uint8)
+            return _words(dec.stream_reader(_io.BytesIO(fb)).read(int(need)))
+        return _words(dec.decompress(fb))
 
     def _raw_codes(self, nm):
         if nm in self._codes: return self._codes[nm]
