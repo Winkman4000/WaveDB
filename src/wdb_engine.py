@@ -49,6 +49,7 @@ class Segment:
         self.N = struct.unpack_from('<I',buf,off)[0]; off += 4
         self.cols = {}; self.order = []; self._dzl = threading.local()
         for _ in range(self.n_cols):
+            blob0 = off                                        # this column's first byte
             nl = struct.unpack_from('<H',buf,off)[0]; off += 2
             nm = bytes(buf[off:off+nl]).decode(); off += nl
             V = struct.unpack_from('<I',buf,off)[0]; off += 4
@@ -94,7 +95,7 @@ class Segment:
                 meta['map_start'] = off
                 off += (Vx*bits+7)//8      # packed y_by_xcode, NOT N per-row codes
                 meta['fdmap'] = None
-                self.cols[nm] = meta; self.order.append(nm)
+                meta['blob'] = (blob0, off); self.cols[nm] = meta; self.order.append(nm)
                 continue
             elif mode == 4:
                 # affine/sequence (WSQ1) blob: no dict, no per-row codes. Self-describing
@@ -103,7 +104,7 @@ class Segment:
                 blob_len = 32 if n_exc == 0 else 36 + struct.unpack_from('<I', buf, off+32)[0]
                 meta['seqblob'] = bytes(buf[off:off+blob_len]); off += blob_len
                 meta['seqvals'] = None   # decoded lazily
-                self.cols[nm] = meta; self.order.append(nm)
+                meta['blob'] = (blob0, off); self.cols[nm] = meta; self.order.append(nm)
                 continue
             elif mode == 5:
                 # inline string column: no dict, no per-row codes. zstd(lengths u32)+zstd(bytes).
@@ -112,7 +113,7 @@ class Segment:
                 zvl = struct.unpack_from('<I', buf, off)[0]; off += 4
                 meta['ival'] = buf[off:off+zvl]; off += zvl
                 meta['ivals'] = None
-                self.cols[nm] = meta; self.order.append(nm)
+                meta['blob'] = (blob0, off); self.cols[nm] = meta; self.order.append(nm)
                 continue
             else:
                 Rr = struct.unpack_from('<H',buf,off)[0]; off += 2
@@ -139,7 +140,8 @@ class Segment:
                     zlen = struct.unpack_from('<I',buf,off)[0]; off += 4
                     meta['z'] = buf[off:off+zlen]; off += zlen
                     meta['vals'] = None; meta['raw'] = None  # decoded lazily
-            code_enc = int(buf[off]); off += 1; meta['code_enc'] = code_enc   # 0=bitpack, 1=zstd, 2=staircase, 3=blocked
+            meta['code_off'] = off                                             # the code section's first byte (the redress splices here)
+            code_enc = int(buf[off]); off += 1; meta['code_enc'] = code_enc   # 0=bitpack, 1=zstd, 2=staircase, 3=blocked, 18=packed frames
             if code_enc == 0:
                 nb = (self.N*bits+7)//8; meta['cstart'] = off; off += nb
             elif code_enc == 17:               # RAW PACKED CODES: mmap-direct, no toll
@@ -193,6 +195,11 @@ class Segment:
                 meta['BR'], nfr = struct.unpack_from('<II', buf, off); off += 8
                 meta['boffs'] = np.frombuffer(buf, dtype=np.uint32, count=nfr+1, offset=off); off += 4*(nfr+1)
                 meta['cstart'] = off; meta['czlen'] = int(meta['boffs'][-1]); off += meta['czlen']
+            elif code_enc == 18:               # PACKED FRAMES: zstd frame per BR rows of LE bit-packed codes
+                meta['pbits'] = int(buf[off]); off += 1        # (no 'boffs'/'cwidth': the enc-3 readers do not see it)
+                meta['BR'], nfr = struct.unpack_from('<II', buf, off); off += 8
+                meta['poffs'] = np.frombuffer(buf, dtype=np.uint32, count=nfr+1, offset=off); off += 4*(nfr+1)
+                meta['cstart'] = off; meta['czlen'] = int(meta['poffs'][-1]); off += meta['czlen']
             elif code_enc == 13:               # byte-planes: each plane its own zstd frame
                 meta['vnby'] = int(buf[off]); off += 1
                 meta['BR'], nfr = struct.unpack_from('<II', buf, off); off += 8
@@ -255,7 +262,8 @@ class Segment:
                 meta['cwidth'] = int(buf[off]); off += 1
                 czlen = struct.unpack_from('<I', buf, off)[0]; off += 4
                 meta['czlen'] = czlen; meta['cstart'] = off; off += czlen
-            self.cols[nm] = meta; self.order.append(nm)
+            meta['blob'] = (blob0, off); self.cols[nm] = meta; self.order.append(nm)
+        assert off == len(buf), ('segment parse did not consume the file', off, len(buf))
         self.buf = buf; self._codes = {}   # buf is a read-only np.memmap (uint8); code/dict reads fault lazily
         self.path = path; self._presence = 0   # 0 = not yet loaded
         self._ov = 0                            # override sidecar: 0 = not yet loaded
@@ -729,6 +737,25 @@ class Segment:
         pv[nm] = arr
         return arr
 
+    @staticmethod
+    def _pk18_dtype(c):
+        b = int(c['pbits'])
+        return np.uint8 if b <= 8 else (np.uint16 if b <= 16 else np.uint32)
+
+    def _pk18_frame(self, c, j, dec=None, mv=None, need=None):
+        """enc-18: frame j's inflated LE bit-stream as a uint8 array (with its 8 slack bytes). `need`
+        limits the inflate to a byte prefix (zstd streams: a point read pays only to its highest row)"""
+        import zstandard as _zs
+        if dec is None: dec = _zs.ZstdDecompressor()
+        if mv is None: mv = memoryview(self.buf)
+        po = c['poffs']; base = c['cstart']
+        fb = mv[base + int(po[j]):base + int(po[j + 1])]
+        if need is not None:
+            import io as _io
+            raw = dec.stream_reader(_io.BytesIO(fb)).read(int(need))
+            return np.frombuffer(raw, dtype=np.uint8)
+        return np.frombuffer(dec.decompress(fb), dtype=np.uint8)
+
     def _raw_codes(self, nm):
         if nm in self._codes: return self._codes[nm]
         c = self.cols[nm]
@@ -921,6 +948,24 @@ class Segment:
                 list(_pool().map(_span, range(8)))
             else:
                 _span(0, 1)
+            self._codes[nm] = cc; return cc
+        if c.get('code_enc', 0) == 18:               # PACKED FRAMES: inflate + unpack, fourteen lanes
+            cc = np.empty(self.N, dtype=self._pk18_dtype(c))
+            BR = c['BR']; nb = int(c['poffs'].size) - 1
+            import wdb_kernels as _WK18
+            def _span18(js):
+                import zstandard as _zs
+                dec = _zs.ZstdDecompressor(); mv = memoryview(self.buf)
+                for j in js:
+                    fb = self._pk18_frame(c, j, dec, mv)
+                    n9 = min(BR, self.N - j * BR)
+                    _WK18.pk32_unpack_serial(fb, int(c['pbits']), n9, cc[j * BR:j * BR + n9])
+            if nb > 4:
+                from concurrent.futures import ThreadPoolExecutor as _TP18
+                with _TP18(max_workers=14) as ex18:
+                    list(ex18.map(_span18, np.array_split(np.arange(nb), 14)))
+            else:
+                _span18(np.arange(nb))
             self._codes[nm] = cc; return cc
         bits = c['bits']; base = c['cstart']
         if c.get('code_enc', 0) == 12:
@@ -1228,6 +1273,8 @@ class Segment:
             return self._e13_band(nm, lo, hi)
         if c.get('code_enc') == 14:
             return np.asarray(self.codes(nm))[lo:hi]
+        if c.get('code_enc') == 18:
+            return self._raw_codes_range(nm, lo, hi)
         wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
         BR = int(c['BR']); base = c['cstart']; bo = c['boffs']
         isz = wdt().itemsize
@@ -1806,6 +1853,22 @@ class Segment:
                 a = max(lo, j*BR); b = min(hi, j*BR + raw.size)
                 out[a-lo:b-lo] = raw[a-j*BR:b-j*BR]
             return out
+        if c.get('code_enc', 0) == 18:               # packed frames: touched frames, unpacked
+            if nm in self._codes:
+                return self._codes[nm][lo:hi]
+            import wdb_kernels as _WK18
+            BR = c['BR']; bits18 = int(c['pbits'])
+            if hi - lo > 8 * BR:
+                return self._raw_codes(nm)[lo:hi]    # a wide window: the fourteen-lane full decode
+            out = np.empty(hi - lo, dtype=self._pk18_dtype(c))
+            for j in range(lo // BR, (hi - 1) // BR + 1):
+                a = max(lo, j * BR); b = min(hi, j * BR + BR, self.N)
+                fb = self._pk18_frame(c, j)
+                rel = np.arange(a - j * BR, b - j * BR, dtype=np.int64)
+                tmp = np.empty(rel.size, np.int64)
+                _WK18.pk32_gather(fb, bits18, rel, tmp)
+                out[a - lo:b - lo] = tmp
+            return out
         if c.get('code_enc', 0) == 10 and nm not in self._codes:
             import wdb_kernels as _WK             # window: gather the span only
             rowsW = np.arange(lo, hi, dtype=np.int64)
@@ -1968,7 +2031,7 @@ class Segment:
                     _io1.BytesIO(memoryview(self.buf)[c['cstart']:c['cstart'] + c['czlen']])).read(need1), dtype=wdt1)
                 return raw1[rows]
         _sc = self.__dict__.get('_scan_codes')
-        if _sc is not None and nm in _sc and c.get('code_enc', 0) == 3 and nm not in self._codes:
+        if _sc is not None and nm in _sc and c.get('code_enc', 0) in (3, 18) and nm not in self._codes:
             # THE SCANNED CODES: a frame scan on this column kept its codes at the hit positions; a
             # gather over those positions (or a subset of them) is a lookup, not 1,526 decompressions
             _sp, _scc = _sc[nm]
@@ -1977,6 +2040,35 @@ class Segment:
                 _ok = _ix < _sp.size
                 if _ok.all() and np.array_equal(_sp[_ix], rows):
                     return _scc[_ix]
+        if c.get('code_enc', 0) == 18 and nm not in self._codes and rows.size < (self.N >> 2):
+            # PACKED FRAMES, AT ROWS: inflate each touched frame to the byte its highest row needs,
+            # gather by bit arithmetic; frames in lanes when there are many
+            import wdb_kernels as _WK18
+            bits18 = int(c['pbits']); BR = c['BR']
+            out18 = np.empty(rows.size, dtype=np.int64)
+            blks = rows // BR
+            order = np.argsort(blks, kind='stable'); rs = rows[order]; bs = blks[order]
+            ub, starts = np.unique(bs, return_index=True); ends = np.append(starts[1:], bs.size)
+            def _pop18(js):
+                import zstandard as _zs
+                dec = _zs.ZstdDecompressor(); mv = memoryview(self.buf)
+                for t in js:
+                    j = int(ub[t]); s = int(starts[t]); e = int(ends[t])
+                    rel = (rs[s:e] - j * BR).astype(np.int64)
+                    frame_rows = min(BR, self.N - j * BR)
+                    need = ((int(rel.max()) + 1) * bits18 + 7) // 8 + 8
+                    fb = self._pk18_frame(c, j, dec, mv, need if need * 4 <= frame_rows * bits18 // 8 * 3 else None)
+                    _WK18.pk32_gather(fb, bits18, rel, out18[s:e])
+            nt = int(ub.size)
+            if nt > 16:
+                from concurrent.futures import ThreadPoolExecutor as _TP18
+                _W = 14 if nt >= 512 else 8
+                with _TP18(max_workers=min(_W, nt)) as ex18:
+                    list(ex18.map(_pop18, np.array_split(np.arange(nt), min(_W, nt))))
+            else:
+                _pop18(np.arange(nt))
+            inv = np.empty_like(order); inv[order] = np.arange(order.size)
+            return out18[inv]
         if c.get('code_enc', 0) != 3 or nm in self._codes or rows.size >= (self.N >> 2):
             # huge row sets: ONE full decode + one vectorized gather beats touching every
             # frame through a positional walk (sq-nested passed ~90M positions here)

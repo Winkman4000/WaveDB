@@ -786,14 +786,14 @@ def detect(seg, tree, col_map):
     drive_sf = None
     if drive_eq is None and drive_like is None and drive_or is None:
         for si, (sp2, _op2, _l2) in enumerate(sflags):
-            if seg.cols[sp2['col']].get('code_enc') == 3:
+            if seg.cols[sp2['col']].get('code_enc') in (3, 18):
                 drive_sf = si
                 break
     drive_in = None
     if drive_eq is None and drive_like is None and drive_or is None and drive_sf is None:
         for ii, (icol, _iv, ineg) in enumerate(ins):
             c2 = seg.cols[icol]
-            if not ineg and c2.get('mode') in (0, 1, 2) and c2.get('code_enc') == 3:
+            if not ineg and c2.get('mode') in (0, 1, 2) and c2.get('code_enc') in (3, 18):
                 drive_in = ii            # a positive IN drives: union flag over its codes
                 break
     drive_neq = None
@@ -801,7 +801,7 @@ def detect(seg, tree, col_map):
             and drive_in is None and not spans:
         for ei, (ecol, _ev, eop) in enumerate(eqs):
             c2 = seg.cols[ecol]
-            if eop == '<>' and c2.get('mode') in (0, 1, 2) and c2.get('code_enc') == 3:
+            if eop == '<>' and c2.get('mode') in (0, 1, 2) and c2.get('code_enc') in (3, 18):
                 drive_neq = ei           # a lone <> drives: same frame scan, inverted card
                 break
     if drive_eq is None and drive_like is None and drive_or is None and drive_sf is None \
@@ -1018,6 +1018,12 @@ def _scan_eq(seg, col, code, lo, hi, negate=False):
             return p9[a9:b9].astype(np.int64)
         return p9.astype(np.int64)
     c = seg.cols[col]
+    if c.get('code_enc', 0) == 18 and col not in seg._codes:
+        V18 = 1 << int(c['pbits'])                   # every code the stream can hold
+        flag18 = np.full(V18, bool(negate), np.bool_)
+        if 0 <= int(code) < V18:
+            flag18[int(code)] = not negate
+        return _scan_flag18(seg, col, np.packbits(flag18, bitorder='little'), lo, hi)
     if c.get('code_enc', 0) == 3 and col not in seg._codes:
         wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
         BR = c['BR']; base = c['cstart']; bo = c['boffs']; buf = seg.buf
@@ -1087,6 +1093,50 @@ def _in_codes(seg, col, vals):
     return np.array([k for k in codes if k is not None], dtype=np.int64)
 
 
+def _flag_bits(seg, flag):
+    """THE FLAG AS BITS: an 18 MB bool table missed the cache on every one of 100M lookups; packed
+    to 2.3 MB it sits in L2 (130 -> 102 ms for the lookups alone, one thread); memoized per flag
+    object (the object is held, so its id cannot be reused while remembered)"""
+    _pk = seg.__dict__.setdefault('_flag_bits', {})
+    hit = _pk.get(id(flag))
+    if hit is None or hit[0] is not flag:
+        hit = (flag, np.packbits(np.ascontiguousarray(flag, dtype=np.bool_), bitorder='little'))
+        if len(_pk) > 64: _pk.clear()
+        _pk[id(flag)] = hit
+    return hit[1]
+
+
+def _scan_flag18(seg, col, fbits, lo, hi):
+    """THE PACKED-FRAME SCAN (enc 18): each zstd frame inflates to a bit-stream (memcpy speed --
+    the packed bytes compress little) and one kernel unpacks and tests membership in a single
+    loop; the scanned column's codes at the hits are kept for codes_at, as for enc 3"""
+    import wdb_kernels as _WK18
+    c = seg.cols[col]; BR = c['BR']; bits18 = int(c['pbits'])
+    j0, j1 = lo // BR, (hi - 1) // BR + 1
+    mv = memoryview(seg.buf)
+    def scan(js):
+        import zstandard as zstd
+        dz = zstd.ZstdDecompressor(); outp = []; outc = []
+        hitbuf = np.empty(BR, np.int64); codebuf = np.empty(BR, np.int64)
+        for j in js:
+            fb = seg._pk18_frame(c, j, dz, mv)
+            a, b = max(lo, j * BR), min(hi, j * BR + BR, int(seg.N))
+            n = _WK18.pk32_flag_hits(fb, bits18, a - j * BR, b - j * BR, a, fbits, hitbuf, codebuf)
+            if n:
+                outp.append(hitbuf[:n].copy()); outc.append(codebuf[:n].copy())
+        return (np.concatenate(outp), np.concatenate(outc)) if outp else (np.empty(0, np.int64), np.empty(0, np.int64))
+    W = min(_SCAN_THREADS, max(1, j1 - j0))
+    with ThreadPoolExecutor(W) as ex:
+        parts = list(ex.map(scan, np.array_split(np.arange(j0, j1), W)))
+    parts = [p for p in parts if p[0].size]
+    if not parts:
+        return np.empty(0, np.int64)
+    pos = np.concatenate([p[0] for p in parts]); codes = np.concatenate([p[1] for p in parts])
+    if pos.size <= 4_000_000:
+        seg.__dict__.setdefault('_scan_codes', {})[col] = (pos, codes)
+    return pos
+
+
 def _scan_flag(seg, col, flag, lo, hi):
     """Positions in [lo, hi) where flag[code] is set -- the LIKE frame scan: parallel enc=3
     decompress, one fancy-index per frame; the substring test happened once, in the dict."""
@@ -1114,6 +1164,8 @@ def _scan_flag(seg, col, flag, lo, hi):
                         b = int(np.searchsorted(rows, hi))
                     return rows[a:b]
                 return rows
+    if c.get('code_enc', 0) == 18 and col not in seg._codes:
+        return _scan_flag18(seg, col, _flag_bits(seg, flag), lo, hi)
     if c.get('code_enc', 0) == 3 and col not in seg._codes:
         # THE FRAME SCAN WITHOUT THE GIL: zstd releases it, but flag[raw] and nonzero held it, so
         # fourteen threads ran one at a time (221 ms for 1,526 frames; 63 ms per 200 frames on one
@@ -1123,15 +1175,7 @@ def _scan_flag(seg, col, flag, lo, hi):
         wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
         BR = c['BR']; base = c['cstart']; bo = c['boffs']; buf = seg.buf
         j0, j1 = lo // BR, (hi - 1) // BR + 1
-        # THE FLAG AS BITS: an 18 MB bool table missed the cache on every one of 100M lookups; packed
-        # to 2.3 MB it sits in L2 (130 -> 102 ms for the lookups alone, one thread); memoized per flag
-        _pk = seg.__dict__.setdefault('_flag_bits', {})
-        bitsB = _pk.get(id(flag))
-        if bitsB is None or bitsB[0] is not flag:
-            bitsB = (flag, np.packbits(np.ascontiguousarray(flag, dtype=np.bool_), bitorder='little'))
-            _pk[id(flag)] = bitsB
-            if len(_pk) > 64: _pk.clear(); _pk[id(flag)] = bitsB
-        bitsB = bitsB[1]
+        bitsB = _flag_bits(seg, flag)
         mv = memoryview(buf)                     # slices without the copy: 89 -> 61 ms of decompression
         def scan(js):
             import zstandard as zstd

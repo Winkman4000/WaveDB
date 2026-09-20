@@ -1641,3 +1641,44 @@ Q22 is the floor of the form: 257 MB of zstd'd codes inflate to 400 MB
 at ~65 ms on fourteen cores, and Umbra reads byte-aligned columns at
 memory speed. That is an ELECTION question (zstd's 55 MB against a 4x
 faster scan on the hottest string column), not a kernel question.
+
+
+
+## THE PACKED FRAMES (2026-09-20): enc 18, Jackson's "bitpack, then zstd the 1s and 0s"
+The question was what zstd does with a bit-packed stream instead of
+byte-aligned codes. Measured on cbdb's hottest wide columns (65536-row
+frames, level 9): Title 224.3 MB packed+zstd against 225.7 today; URL
+284 against 257 (worse -- the byte lanes were what zstd was matching);
+UserID 308 against 246. So it is a CANDIDATE, not a dress: enc 18 runs
+in the election for every column of 17-32 bits and wins on bytes alone
+against zstd, blocked frames and bitpack. Frame = LE bit-pack of 65536
+codes (eight slack bytes) then one zstd stream; header
+[18][bits][BR][nfr][offs u32 x nfr+1]; meta carries pbits/poffs and
+DELIBERATELY no boffs/cwidth, so every enc-3-only reader falls back to
+_raw_codes instead of misreading a frame. Readers: pk32_pack/unpack/
+gather/flag_hits kernels (five-byte windows, nogil), point reads inflate
+a frame PREFIX to the highest row asked (as enc 1), range reads inflate
+touched frames, the flag scan unpacks and tests membership in one loop
+and keeps THE SCANNED CODES, = / <> / IN drive through the same scan.
+THE REDRESS (wdb_retype.redress): the engine's own parse now records
+each column's blob span and code_off, so a segment can be re-elected
+column by column with the dictionary and every other column
+byte-copied -- the A/B tool this needed, and the measurement that
+mirrors never drift: twelve of fifteen wide columns came back
+byte-identical. THE ELECTION on cbdb: Title 225.7 -> 224.3 MB,
+ClientEventTime 267.7 -> 263.7, HID 337.5 -> 337.0 (over bitpack, by
+0.15% -- an open question, since bitpack's random access is free); URL,
+UserID, Referer, both hashes, both IPs and the rest kept their dress.
+Segment 8,778.6 -> 8,772.7 MB. THE BOARD, sidecars settled, 43/43
+exact both: warm 4.87s -> 4.63s, cold 28.9 -> 23.1, 20 of 43 against
+Umbra -- Q22 (Title LIKE) 392 -> 413 and head-to-head 407/490 vs
+506/401: inside the noise, no win, no loss. The first A/B read 5.38s and
+was wrong: the copy was birthing its own sidecars mid-board (Q27 +615 ms
+on a column never touched). LAW: an A/B against a fresh directory is
+not settled until its sidecars are; run it twice and read the second.
+Q17 (GROUP BY UserID, SearchPhrase, LIMIT without ORDER) swings 52 to
+259 ms run to run on BOTH directories -- a routing bimodality, its own
+hunt. Suite 1712/0. VERDICT: the idea is correct and small here --
+0.07% of the segment, speed neutral -- because these columns' codes
+are hashes and IDs with little structure for the packing to expose;
+the candidate stays in the election for the data where there is more.

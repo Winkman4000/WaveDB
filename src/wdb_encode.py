@@ -565,6 +565,7 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
                 best = v13                        # rehearsal: wear it regardless
             elif len(v13) <= 1.25 * len(best):
                 best = v13                        # the tagged column's gate
+    blocked = None
     if best is zsec:
 
         # tag 3 = BLOCKED frames: independent zstd frame per BLOCK_ROWS rows + a frame offset
@@ -589,6 +590,31 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
                 break                            # up to +10%; else the coarse
         if blocked is not None:
             best = blocked
+    # tag 18 = PACKED FRAMES (Jackson's question: "bitpack, then zstd the 1s and 0s").
+    # Per 65536-row frame: LE bit-pack the codes (no byte padding per row), then one
+    # zstd frame. Measured on cbdb: Title 224 MB vs 226 (u32 frames) -- the packing
+    # removes the zero bytes zstd was paying tokens to skip. Wide codes only (>= 17
+    # bits: below that the u16 rows are already tight). Elected on size alone against
+    # the plain dresses (zstd / blocked / bitpack); a point read inflates a frame
+    # PREFIX (the stream stops at its highest row).
+    if 17 <= bits <= 32 and codes.size and (best is zsec or best is packed
+                                            or best is blocked):
+        from wdb_kernels import pk32_pack as _pk32
+        BR18 = 65536
+        a18 = np.ascontiguousarray(arr, dtype=np.int64)
+        cx18 = zstd.ZstdCompressor(level=CODE_ZSTD_LEVEL)
+        fr18 = []
+        for i in range(0, a18.size, BR18):
+            ch = a18[i:i + BR18]
+            out = np.zeros((ch.size * bits + 7) // 8 + 8, np.uint8)
+            _pk32(ch, bits, out)
+            fr18.append(cx18.compress(out.tobytes()))
+        o18 = np.zeros(len(fr18) + 1, dtype=np.uint32)
+        np.cumsum([len(f) for f in fr18], out=o18[1:])
+        cand18 = (bytes([18, bits]) + struct.pack('<II', BR18, len(fr18))
+                  + o18.tobytes() + b''.join(fr18))
+        if len(cand18) < len(best) or os.environ.get('WDB_E18_FORCE'):
+            best = cand18
     # tag 14 = FIELD PLANES (Jackson's dress): dates decompose to y/m/d u8
     # planes, each its own zstd stream -- the calendar's internal correlation
     # compresses BELOW naive entropy (82.7 vs 94.1MB measured on l_shipdate),

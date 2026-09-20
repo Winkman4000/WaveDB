@@ -3119,6 +3119,72 @@ def exists_scatter(m, ptr, okeep, yes):
                 yes[p] = True
 
 
+@njit(cache=True, nogil=True)
+def pk32_pack(codes, bits, out):
+    """enc-18 PACKED FRAMES: LE bit-stream of `bits`-wide codes (bits <= 32), one frame; out needs
+    ceil(n*bits/8) + 8 bytes"""
+    for i in range(codes.size):
+        bitpos = np.int64(i) * bits
+        b = bitpos >> 3; sh = bitpos & 7
+        v = np.int64(codes[i]) << sh
+        out[b] |= np.uint8(v & 0xFF); out[b + 1] |= np.uint8((v >> 8) & 0xFF)
+        out[b + 2] |= np.uint8((v >> 16) & 0xFF); out[b + 3] |= np.uint8((v >> 24) & 0xFF)
+        out[b + 4] |= np.uint8((v >> 32) & 0xFF)
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def pk32_unpack(buf, bits, n, out):
+    """enc-18: LE bit-stream -> n codes (bits <= 32; five-byte window), parallel"""
+    mask = (np.int64(1) << bits) - 1
+    for i in prange(n):
+        bitpos = np.int64(i) * bits
+        b = bitpos >> 3; sh = bitpos & 7
+        w = (np.int64(buf[b]) | (np.int64(buf[b + 1]) << 8) | (np.int64(buf[b + 2]) << 16)
+             | (np.int64(buf[b + 3]) << 24) | (np.int64(buf[b + 4]) << 32))
+        out[i] = (w >> sh) & mask
+
+
+@njit(cache=True, nogil=True)
+def pk32_unpack_serial(buf, bits, n, out):
+    """the same, one thread (a frame inside a thread pool)"""
+    mask = (np.int64(1) << bits) - 1
+    for i in range(n):
+        bitpos = np.int64(i) * bits
+        b = bitpos >> 3; sh = bitpos & 7
+        w = (np.int64(buf[b]) | (np.int64(buf[b + 1]) << 8) | (np.int64(buf[b + 2]) << 16)
+             | (np.int64(buf[b + 3]) << 24) | (np.int64(buf[b + 4]) << 32))
+        out[i] = (w >> sh) & mask
+
+
+@njit(cache=True, nogil=True)
+def pk32_gather(buf, bits, rows, out):
+    """enc-18 codes AT ROWS of one inflated frame (rows relative to the frame)"""
+    mask = (np.int64(1) << bits) - 1
+    for j in range(rows.shape[0]):
+        bitpos = np.int64(rows[j]) * bits
+        b = bitpos >> 3; sh = bitpos & 7
+        w = (np.int64(buf[b]) | (np.int64(buf[b + 1]) << 8) | (np.int64(buf[b + 2]) << 16)
+             | (np.int64(buf[b + 3]) << 24) | (np.int64(buf[b + 4]) << 32))
+        out[j] = (w >> sh) & mask
+
+
+@njit(cache=True, nogil=True)
+def pk32_flag_hits(buf, bits, s0, e0, base, fbits, hits, codes):
+    """enc-18 frame scan: positions (base + i) and codes for i in [s0, e0) whose code's bit is set
+    in the packed flag -- unpack and test in one loop, no intermediate array"""
+    mask = (np.int64(1) << bits) - 1
+    n = 0
+    for i in range(s0, e0):
+        bitpos = np.int64(i) * bits
+        b = bitpos >> 3; sh = bitpos & 7
+        w = (np.int64(buf[b]) | (np.int64(buf[b + 1]) << 8) | (np.int64(buf[b + 2]) << 16)
+             | (np.int64(buf[b + 3]) << 24) | (np.int64(buf[b + 4]) << 32))
+        v = (w >> sh) & mask
+        if (fbits[v >> 3] >> (v & 7)) & 1:
+            hits[n] = base + (i - s0); codes[n] = v; n += 1
+    return n
+
+
 @njit(cache=True, parallel=True, nogil=True)
 def pk_unpack(buf, bits, n, out):
     """enc-17 RAW PACKED CODES (Jackson's deal law): LE bit-stream ->

@@ -82,7 +82,7 @@ def _column_spans(buf):
             gbits = int(buf[off]); off += 1
             nsteps = struct.unpack_from('<I', buf, off)[0]; off += 4
             off += (nsteps * gbits + 7) // 8
-        elif code_enc == 3:                          # blocked: cwidth u8 + BR u32 + nfr u32 + offs + frames
+        elif code_enc in (3, 18):                    # blocked / packed frames: width|bits u8 + BR u32 + nfr u32 + offs + frames
             off += 1
             nfr = struct.unpack_from('<II', buf, off)[1]; off += 8
             boffs = np.asarray(buf[off:off + (nfr + 1) * 4]).view(np.uint32); off += (nfr + 1) * 4
@@ -119,6 +119,39 @@ def _column_spans(buf):
     for i in range(1, len(spans)):
         assert spans[i][1] == spans[i - 1][2], (i, spans[i-1], spans[i])
     return spans
+
+
+def redress(seg_path, cols, out_path, verbose=True):
+    """THE REDRESS: re-run the code-section ELECTION for `cols` (modes 0/1/2) on the stored
+    codes and splice the winner in; dictionary, order and every other column are BYTE-COPIED
+    (spans come from the engine's own parse -- meta['blob'] / meta['code_off'] -- never a
+    mirror that drifts). A measurement tool: the same segment in a new dress, nothing else
+    moved. Returns {col: (old_enc, new_enc, old_bytes, new_bytes)}."""
+    from wdb_encode import _code_section
+    seg = Segment(seg_path)
+    for c in cols:
+        assert 'code_off' in seg.cols[c], f"{c}: no code section (mode {seg.cols[c].get('mode')})"
+    report = {}
+    CH = 64 << 20
+    with open(out_path, 'wb') as out:
+        out.write(seg.buf[:11].tobytes())
+        for nm in seg.order:
+            c = seg.cols[nm]; start, end = c['blob']
+            if nm in cols:
+                cs = c['code_off']
+                codes = np.ascontiguousarray(np.asarray(seg._raw_codes(nm)), dtype=np.int64)
+                seg._codes.pop(nm, None)
+                sec = _code_section(codes, int(c['bits']), nm=nm)
+                out.write(seg.buf[start:cs].tobytes()); out.write(sec)
+                report[nm] = (int(c.get('code_enc', 0)), int(sec[0]), end - cs, len(sec))
+                if verbose:
+                    print(f"  redressed {nm}: enc {c.get('code_enc', 0)} -> {sec[0]}  "
+                          f"codes {(end - cs) / 1e6:.1f} -> {len(sec) / 1e6:.1f} MB", flush=True)
+                del codes, sec
+            else:
+                for a in range(start, end, CH):          # byte-copy in windows (an 8 GB blob is not a bytes object)
+                    out.write(seg.buf[a:min(end, a + CH)].tobytes())
+    return report
 
 
 def retype(seg_path, retypes, out_path, verbose=True):
