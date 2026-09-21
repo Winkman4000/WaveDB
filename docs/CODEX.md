@@ -1847,3 +1847,6 @@ statistics is load time, paid once). Under WDB_SEQ_NARROW_OK the
 suite's sequence column is mode 4, not a dictionary: no list, by
 rule. FAIL-LOUD: write_for_segment no longer swallows the list's
 exceptions; eligibility is decided inside differentiator_rows.
+THE BOARD, vanilla, clean (nothing else of ours on the box; host load
+average 42 from other tenants): 43/43 exact, 9.22 s, 36 of 43 faster
+than DuckDB (36.4 s this run). 10.43 -> 9.22. Q31 4.7 ms, Q32 23 ms.
