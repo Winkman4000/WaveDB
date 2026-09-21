@@ -3391,6 +3391,81 @@ def group_fold_dict(grp, codes, dvals, G, out):
         out[g] = s
 
 
+@njit(cache=True, parallel=True, nogil=True)
+def sort_keys_par(keys, SH):
+    """THE BUCKETED SORT: non-negative int64 keys, MSD-partitioned by (key >> SH) into 4096
+    buckets (per-thread counts -> stable offsets -> scatter), each bucket sorted in place across
+    threads. Sorted output, one pass + small sorts: np.sort on 6.2M keys was 217 ms on one
+    thread (Q18's survivors); this is ~30. SH must put every key under 4096 buckets."""
+    n = keys.size
+    NB = 1 << 12
+    T = numba.get_num_threads()
+    pc = np.zeros((T, NB), np.int64)
+    for t in prange(T):
+        for i in range(n * t // T, n * (t + 1) // T):
+            pc[t, keys[i] >> SH] += 1
+    offs = np.zeros(NB + 1, np.int64)
+    for b in range(NB):
+        s = 0
+        for t in range(T):
+            v = pc[t, b]; pc[t, b] = s; s += v
+        offs[b + 1] = offs[b] + s
+    out = np.empty(n, np.int64)
+    for t in prange(T):
+        cur = np.empty(NB, np.int64)
+        for b in range(NB):
+            cur[b] = offs[b] + pc[t, b]
+        for i in range(n * t // T, n * (t + 1) // T):
+            b = keys[i] >> SH
+            out[cur[b]] = keys[i]
+            cur[b] += 1
+    for b in prange(NB):
+        lo = offs[b]; hi = offs[b + 1]
+        if hi - lo > 1:
+            out[lo:hi].sort()
+    return out
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def _count_ge(a, bar):
+    n = a.size
+    T = numba.get_num_threads()
+    part = np.zeros(T, np.int64)
+    for t in prange(T):
+        c = 0
+        for i in range(n * t // T, n * (t + 1) // T):
+            if a[i] >= bar:
+                c += 1
+        part[t] = c
+    return part.sum()
+
+
+def topk_bar(a, k):
+    """THE BAR (Jackson: stop after inspecting the top hundred, not the top seventeen million):
+    indices of the k largest of `a`, ordered value desc then index asc, without partitioning
+    the whole array. Lower a bar from the max until at least k values clear it (each probe a
+    parallel compare, ~10 ms on 17.6M), then sort only those. Exact: everything below the bar
+    is below the k-th value."""
+    a = np.ascontiguousarray(a)
+    n = int(a.size); k = int(k)
+    if k <= 0 or n == 0:
+        return np.empty(0, np.int64)
+    if k >= n:
+        return np.argsort(-a, kind='stable')
+    mx = int(a.max()); mn = int(a.min())
+    if mx == mn:
+        return np.arange(k)
+    bar = mx
+    step = max(1, (mx - mn) // 64)
+    while bar > mn and _count_ge(a, bar) < k:
+        bar -= step
+        step *= 2
+    if bar < mn:
+        bar = mn
+    cand = np.flatnonzero(a >= bar)
+    return cand[np.argsort(-a[cand], kind='stable')][:k]
+
+
 def bincount_par(codes, minlength):
     """THE PARALLEL CENSUS: np.bincount of 100M codes is one thread for 300 ms (plus an astype
     copy); this is per-thread boards and a reduce, measured ~60 ms. Boards cost T*V*4 bytes, so

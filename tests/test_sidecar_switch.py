@@ -177,6 +177,15 @@ def test_load_statistics_are_data():
         assert wdb_sidecar.is_data_file(os.path.basename(sp))
         z = np.load(sp, allow_pickle=False)
         assert int(z['N']) == 60000 and 'dimid.sum' in z.files and 'k.cmax' in z.files
+        # THE EXCEPTION LIST: fid is unique (V == N) -> a differentiator with zero exception rows, when it
+        # is a dictionary column (under WDB_SEQ_NARROW_OK the suite stores the sequence as mode 4: no list)
+        import wdb_engine
+        fmode = wdb_engine.Segment(os.path.join(d, 'fact_0.wdb')).cols['fid'].get('mode')
+        if fmode in (0, 1, 2):
+            assert 'fid.rep' in z.files and z['fid.rep'].size == 0, ('the unique column has no exception list', sorted(z.files))
+        else:
+            assert 'fid.rep' not in z.files, ('a non-dictionary column has no exception list', fmode)
+        assert 'k.rep' not in z.files, 'a 13-value column is no differentiator'
         before = _derived(d)
         h0 = wdb_blockstats._HITS
         for q in ("SELECT AVG(dimid), SUM(k), COUNT(*), MIN(dimid), MAX(k) FROM fact",

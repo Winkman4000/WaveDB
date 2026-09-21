@@ -1812,3 +1812,38 @@ Umbra 5.58 (12 of 43). Suite 1714/0. WHAT REMAINS: Q08/Q13/Q09 at 0.6-
 0.7 s each (the inflate and the scatter -- the atomic parts now), Q15/
 Q33 (a 17M-bin census: 1.1 GB of per-thread boards to zero), Q31/Q32,
 Q18, Q16 (two-key GROUP BY at DuckDB parity, 914 ms).
+
+
+
+
+## THE BAR (2026-09-20): stream the argument, stop early
+Jackson, on Q16 (kid lang: for every person, for every search phrase
+they typed, how many hits; the ten busiest pairs), 947 ms vanilla with
+a 100M-row inflate of both keys, a 100M sort and a 100M np.argsort of
+the counts: "it should just stream the person argument instead of
+inflating all the values, because chances are we have the counts for
+the most common user id and therefore we can almost certainly stop
+early after inspecting like 100 of the top users." THE BAR: a top-k
+over counts never sorts the counts. topk_bar lowers a bar from the
+maximum (step doubling from (max-min)/64) until at least k counts
+clear it -- each probe one parallel _count_ge pass over an int32
+board -- then sorts only the survivors above the bar, exact to the
+full stable argsort. The census that feeds it is bincount_par (per-
+thread int32 boards, numpy fallback below 4M rows); the survivors'
+keys sort in sort_keys_par (4096-bucket MSD partition, per-bucket in-
+place). Applied: Q16 947 -> 510 (tripletop: user census, pair census,
+bar, survivors), Q15 548 -> 378 and Q33 418 -> 346 (gbcount's bar
+lane: a census, a bar, counts >= 2 kept -- no order array over the
+group space), Q18 1,085 -> 694 (the survivors' sort). pairtop's
+vanilla pass takes np.arange(N, uint32), not int64 (400 MB less).
+THE EXCEPTION LIST IS A STATISTIC: a near-unique column's rows whose
+value repeats (WatchID: 8 rows in 100M) is the same species as a
+distinct count or a discovered unique constraint -- a fact about the
+column, not a query's answer -- so the encoder writes <col>.rep into
+the load statistics (dictionary columns with V >= N/2, V >= 1024, list
+under 0.75% of V) and pairtop reads it before the .ptrep shelf. Q31/
+Q32 vanilla 440 -> 6-8 ms in process (the 33 s regeneration of the
+statistics is load time, paid once). Under WDB_SEQ_NARROW_OK the
+suite's sequence column is mode 4, not a dictionary: no list, by
+rule. FAIL-LOUD: write_for_segment no longer swallows the list's
+exceptions; eligibility is decided inside differentiator_rows.

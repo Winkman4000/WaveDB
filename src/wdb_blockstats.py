@@ -110,15 +110,62 @@ def _from_load(seg, col):
             'mode4': bool(z[k + 'mode4']), 'maxabs': float(z[k + 'maxabs']), 'dt': int(z[k + 'dt'])}
 
 
+def differentiator_rows(seg, col):
+    """THE EXCEPTION LIST of a near-unique column (Jackson, 2026-09-20: a column statistic, the same
+    species as a distinct count or a discovered unique constraint -- not a query's answer). For a
+    dictionary column with V >= N/2 and V >= 1024: the rows whose code occurs more than once, when
+    they are under 0.75% of V (WatchID: 4 rows in 100M). None when the column does not qualify."""
+    import wdb_kernels as _WK
+    c = seg.cols.get(col)
+    if c is None or c.get('mode') not in (0, 1, 2):
+        return None
+    V = int(c.get('V') or 0); N = int(seg.N)
+    if V * 2 < N or V < 1024:
+        return None
+    codes = np.asarray(seg._raw_codes(col))
+    cnt = _WK.bincount_par(codes, V)
+    rep = np.flatnonzero(cnt[codes] >= 2)
+    if rep.size >= 0.0075 * V:
+        return None
+    return rep.astype(np.uint32)
+
+
+def rep_from_load(seg, col):
+    """the exception list from the load statistics, or None (absent or the column did not qualify)"""
+    p = stats_path(seg.path)
+    import os as _os
+    try:
+        mt = _os.stat(p).st_mtime_ns
+    except OSError:
+        return None
+    hit = _LOADED.get(p)
+    if hit is None or hit[0] != mt:
+        try:
+            hit = _LOADED[p] = (mt, np.load(p, allow_pickle=False))
+        except Exception:
+            return None
+    z = hit[1]
+    k = col + '.rep'
+    if k not in z.files or int(z['N']) != int(seg.N):
+        return None
+    return np.asarray(z[k], dtype=np.int64)
+
+
 def write_for_segment(seg_path, verbose=False):
     """Compute and write the block statistics of every eligible column of a segment (the encoder's
-    last step). Returns the number of columns written."""
+    last step) -- and the exception lists of its differentiator columns. Returns the number of
+    columns written."""
     import os as _os
     from wdb_engine import Segment
     seg = Segment(seg_path)
     out = {'N': np.int64(seg.N)}
     n = 0
     for col in seg.order:
+        rep = differentiator_rows(seg, col)  # FAIL-LOUD: eligibility is decided inside, never by an exception
+        if rep is not None:
+            out[col + '.rep'] = rep
+            if verbose: print('  stats: %s is a differentiator, %d exception rows' % (col, rep.size), flush=True)
+        seg._codes.pop(col, None)
         if not eligible(seg, col):
             continue
         try:

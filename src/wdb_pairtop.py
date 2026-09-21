@@ -113,7 +113,12 @@ def execute(seg, spec):
     shp = seg.path + '.%s.ptrep' % a
     ridx = None
     try:
-        if os.path.exists(shp):
+        import wdb_blockstats
+        ridx = wdb_blockstats.rep_from_load(seg, a)     # THE EXCEPTION LIST, from the load statistics
+    except Exception:
+        ridx = None
+    try:
+        if ridx is None and os.path.exists(shp):
             b9 = pickle.load(open(shp, 'rb'))
             if int(b9.get('n', -1)) == N:
                 ridx = np.asarray(b9['rows'], np.int64)
@@ -127,8 +132,8 @@ def execute(seg, spec):
     ac = np.ascontiguousarray(seg._raw_codes(a))
     V9 = int(seg.cols[a]['V'])
     SH9 = max(1, int(V9 - 1).bit_length() - 12)   # top 12 bits pick the bucket
-    ku9, kr9, offs9 = WK.gd_pass1(ac, np.arange(N, dtype=np.int64), np.int64(SH9),
-                                  np.int64(32))
+    ku9, kr9, offs9 = WK.gd_pass1(ac, np.arange(N, dtype=np.uint32), np.int64(SH9),   # rows as u32: the
+                                  np.int64(32))                                        # kernel keeps u32 anyway
     NB9 = offs9.size - 1
     bc9 = np.diff(offs9)
     cap9 = int(bc9.max()) + 16 if NB9 else 16

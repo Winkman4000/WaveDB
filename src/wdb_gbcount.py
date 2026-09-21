@@ -518,7 +518,26 @@ def execute(seg, spec):
         return _scalar_count_execute(seg, spec)
     col = spec['col']; ci = spec['ci']; ki = spec['ki']; lim = spec['lim']
     proj = spec['proj']
-    loaded = _load(seg, col)
+    loaded = None
+    import wdb_sidecar
+    if (not spec.get('unbounded') and spec.get('having_min') is None and spec.get('excl_lit') is None
+            and lim is not None and lim > 0 and not os.path.exists(_path(seg, col))
+            and not wdb_sidecar.may_build(seg.path)):
+        # THE BAR (Jackson): a vanilla top-k never builds the sorted list of every heavy code --
+        # the parallel census, then a bar lowered from the max until need+1 codes clear it, and
+        # only those are sorted. The tie and singleton laws below see exactly what they saw.
+        import wdb_kernels as _WKb
+        codes = seg._raw_codes(col)
+        if codes.size:
+            counts = _WKb.bincount_par(codes, int(codes.max()) + 1)
+            need0 = int(lim) + int(spec.get('off') or 0) + 1
+            topi = _WKb.topk_bar(counts, min(need0, int(counts.size)))
+            hn0 = counts[topi]
+            keep = hn0 >= 2                                  # the shelf's own rule: singletons are implicit
+            loaded = (np.ascontiguousarray(topi[keep], dtype=np.uint32),
+                      np.ascontiguousarray(hn0[keep], dtype=np.int64))
+    if loaded is None:
+        loaded = _load(seg, col)
     if loaded is None:
         return None
     hc, hn = loaded

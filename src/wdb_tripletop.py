@@ -144,7 +144,7 @@ def execute(seg, spec):
     except Exception:
         ucnt = None
     if ucnt is None:
-        ucnt = np.bincount(uc, minlength=int(seg.cols[uid]['V']))
+        ucnt = WK.bincount_par(uc, int(seg.cols[uid]['V']))       # THE PARALLEL CENSUS (was 419 ms, one thread)
     ucnt = np.ascontiguousarray(ucnt, np.int64)
     pl = seg.e8_planes(sp)
     if pl is None:
@@ -173,7 +173,7 @@ def execute(seg, spec):
         # usually that set is empty and no row is ever walked.
         V9u = int(seg.cols[uid]['V'])
         ucp = uc[pos8]                       # plane rows' users (13.2M)
-        pcnt = np.bincount(ucp, minlength=V9u)
+        pcnt = WK.bincount_par(ucp, V9u)
         # Jackson's cut: top users come off the gbc2 shelf's u16 tail --
         # outside the >=4 tier, total<=3 so E<=3 and nobody boards. The
         # M-window widens until kth >= the M-th total (exactness guard).
@@ -209,7 +209,7 @@ def execute(seg, spec):
                 ucnt = np.bincount(uc, minlength=V9u)
             E = ucnt - pcnt
             kk9 = min(k, int((E > 0).sum()))
-            topi = np.argpartition(-E, kk9 - 1)[:kk9] if kk9 else np.empty(0, np.int64)
+            topi = WK.topk_bar(E, kk9) if kk9 else np.empty(0, np.int64)   # THE BAR, not a 17.6M partition
             board = [(int(E[u]), int(u), int(e0)) for u in topi.tolist()]
             board.sort(reverse=True)
         kth9 = board[k - 1][0] if len(board) >= k else 0
@@ -258,7 +258,8 @@ def execute(seg, spec):
         key = np.concatenate([outs[t, :int(lens[t])] for t in range(T9)])             if int(lens.sum()) else np.empty(0, np.int64)
         idx = key                                 # naming kept for flow below
         if key.size:
-            key.sort(kind='stable')
+            SHk = max(0, int(key.max()).bit_length() - 12)
+            key = WK.sort_keys_par(key, np.int64(SHk))   # THE BUCKETED SORT (np.sort: 217 ms, one thread)
             brk9 = np.empty(key.size, bool)
             brk9[0] = True
             np.not_equal(key[1:], key[:-1], out=brk9[1:])
