@@ -2178,3 +2178,29 @@ THE FLOOR: 9.4 GB at this pod's 1.8 GB/s is ~5.2 s for all 43; at 7.5 GB/s, ~1.2
 over warm (~10 s) is spread: Q22 +923 ms, Q20 +593, Q23 +529, Q40 +527 (96 MB -- not bytes: another
 read path), Q30 +514, Q18 +474, Q16 +448, Q15 +407, Q09 +406 -- the random-access code gathers
 (enc 19 gathers, codes_at) still fault through the map. Next: warm those spans the same way.
+
+
+
+## THE FAIR TRIAL (2026-09-23): every engine truly cold, same pod, same protocol
+Jackson: "put the competitors through a fair trial so that we can have an accurate scope for our
+progress." The earlier referee numbers (Umbra first runs 5.8 s vs hot 5.58) were warm-cache: no
+engine could drop the pod's caches. bench/fair_cold.py gives each engine the ClickBench cold run by
+the same means as bench/true_cold.py: fresh process / restarted server, its data files evicted from
+the page cache (posix_fadvise DONTNEED), query x3 (first = cold, best of the other two = hot).
+  Umbra 26.09: fresh umbra-sql per query from the image's rootfs (own loader), ASYNCIO=0 as its
+    start script; time = exec + compile as Umbra reports it.
+  ClickHouse: server stopped, data evicted, server started; clickhouse client --time. Reloaded fresh
+    (30.3 s, 8.76 GiB).   DuckDB: fresh process on duck_native.db (parquet view where needed).
+RESULT (43/43 each; score = ClickBench geometric mean of (t+10)/(best+10), 1.0 = best everywhere):
+                 COLD total  score  fastest     HOT total  score  fastest
+  Umbra            24.4 s    1.50     23          5.5 s    1.34     34
+  ClickHouse       29.0 s    1.95      9         15.7 s    3.63      2
+  WaveDB           43.2 s    2.39      9         12.9 s    3.08      8
+  DuckDB           57.5 s    2.99      2         19.7 s    3.89      2
+Cold, WaveDB beats DuckDB clearly and sits 1.5x ClickHouse's total, 1.8x Umbra's. The cold gap is
+concentrated: Q09 5.0 s (Umbra 0.6), Q08 3.0 (0.45), Q18 3.6 (1.1), Q10 2.8 (0.19), Q16 1.8,
+Q13-Q15 ~1.0-1.5, Q30 1.3 (0.4), Q11 1.1, Q07 0.84 (0.03) -- the DISTINCT / GROUP BY family, 
+~20 s of our 43. The string family is now competitive cold: Q20 957 (Umbra 1,229), Q21 1,538
+(1,436), Q22 2,479 (1,785), Q23 1,917 (1,961), Q28 2,222 (1,843), Q33 1,505 (1,451), Q34 860 (1,721).
+Hot, Umbra is in a class of its own (5.5 s); WaveDB is second (12.9 s) ahead of ClickHouse (15.7).
+Suspect: WaveDB Q31 hot 7 ms / Q32 14 ms vs cold 470 / 340 -- carried state to audit under the law.
