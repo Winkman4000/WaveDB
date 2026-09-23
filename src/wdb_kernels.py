@@ -4145,3 +4145,73 @@ def plike_fc3(hdr16, text, R, n1, n2, keep):
                     i += 1
         keep[e] = ok
     return n
+
+
+# ---------------------------------------------------------------------------------------------
+# IDENTIFICATION AT THE SURVIVORS (Jackson, 2026-09-23: "if we know that what we are going to do
+# will cost like 500ms but there is a filter that is 48ms that cuts it in half then we need to run
+# the filter before it"). A filter that runs after others need not decide the whole dictionary:
+# only the distinct codes still alive. Each needed entry is rebuilt from its restart (the prefix
+# chain starts there) and decided alone; groups holding no needed code are never walked.
+
+@njit(inline='always')
+def _contains2(prev, plen, n1, n2):
+    L1 = n1.shape[0]; L2 = n2.shape[0]
+    i = 0
+    while i <= plen - L1:
+        k = 0
+        while k < L1 and prev[i + k] == n1[k]:
+            k += 1
+        if k == L1:
+            if L2 == 0:
+                return True
+            j = i + L1
+            while j <= plen - L2:
+                k = 0
+                while k < L2 and prev[j + k] == n2[k]:
+                    k += 1
+                if k == L2:
+                    return True
+                j += 1
+            return False
+        i += 1
+    return False
+
+
+@njit(nogil=True, cache=True)
+def plike_sel_fc3(hdr16, text, gto, R, need, n1, n2, out):
+    """three streams: out[i] = chunk-local entry need[i] (sorted, unique) contains n1 (then n2).
+    gto[g] = where restart group g's suffixes begin in the text. Returns entries walked."""
+    prev = np.empty(131072, np.uint8)
+    g_cur = np.int64(-1); e = np.int64(0); t = np.int64(0); plen = np.int64(0); walked = np.int64(0)
+    for i in range(need.size):
+        ne = np.int64(need[i]); g = ne // R
+        if g != g_cur:
+            g_cur = g; e = g * R; t = np.int64(gto[g])
+        while e <= ne:
+            cp = np.int64(hdr16[2 * e]); sl = np.int64(hdr16[2 * e + 1])
+            for q in range(sl):
+                prev[cp + q] = text[t + q]
+            t += sl; plen = cp + sl; e += 1; walked += 1
+        out[i] = _contains2(prev, plen, n1, n2)
+    return walked
+
+
+@njit(nogil=True, cache=True)
+def plike_sel_fc(a, gro, R, need, n1, n2, out):
+    """plike_sel_fc3 on an interleaved chunk: gro[g] = restart group g's byte offset in a"""
+    prev = np.empty(131072, np.uint8)
+    g_cur = np.int64(-1); e = np.int64(0); o = np.int64(0); plen = np.int64(0); walked = np.int64(0)
+    for i in range(need.size):
+        ne = np.int64(need[i]); g = ne // R
+        if g != g_cur:
+            g_cur = g; e = g * R; o = np.int64(gro[g])
+        while e <= ne:
+            cp = np.int64(a[o]) | (np.int64(a[o + 1]) << 8)
+            sl = np.int64(a[o + 2]) | (np.int64(a[o + 3]) << 8)
+            o += 4
+            for q in range(sl):
+                prev[cp + q] = a[o + q]
+            o += sl; plen = cp + sl; e += 1; walked += 1
+        out[i] = _contains2(prev, plen, n1, n2)
+    return walked

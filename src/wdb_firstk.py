@@ -71,24 +71,49 @@ def detect(seg, tree, col_map):
     return {'col': col, 'needle': needle, 'ocol': ocol, 'lim': lim}
 
 
+_FIRST_WINDOW = 1 << 18   # the walk's first window of rows (Q23's 10th hit sits at row 214,125)
+
+
 def execute(seg, spec):
+    """THE ORDER IS THE FILTER (Jackson: the cheap filter before the expensive read): walking rows in
+    staircase order, the LIKE is decided only for the codes the walk meets -- Q23's first 262K rows
+    in time order hold ~90K distinct URLs of 18.3M. Each window's new codes are priced
+    (wdb_strings.take_subset_road); once the walk's running bill would pass the whole dictionary's,
+    the whole dictionary is decided once and the walk continues on its flag."""
     global _HITS
     col, needle, k = spec['col'], spec['needle'], spec['lim']
     N = int(seg.N)
-    flag = np.asarray(WS._like_flags(seg, col, needle, 'contains'))
-    if not flag.any():
-        _HITS += 1
-        return [], [c for c in seg.cols.keys()]
+    c0 = seg.cols.get(col) or {}
+    nd = needle.encode() if isinstance(needle, str) else needle
+    flag = None; known = None; spent = 0.0
+    if 'restarts' in c0 and len(nd) >= 1:
+        import wdb_strings
+        known = np.zeros(int(c0['V']), np.int8)        # 0 undecided, 1 matches, 2 does not
+    else:
+        flag = np.asarray(WS._like_flags(seg, col, needle, 'contains'))
+        if not flag.any():
+            _HITS += 1
+            return [], [c for c in seg.cols.keys()]
     hits = []
-    lo = 0
+    lo = 0; W = _FIRST_WINDOW
     while lo < N and len(hits) < k:
-        hi = min(N, lo + _CHUNK)
+        hi = min(N, lo + W)
         cc = np.asarray(seg.codes_at(col, np.arange(lo, hi, dtype=np.int64)),
                         np.int64)
-        m9 = np.flatnonzero(flag[cc])
+        if flag is None:
+            cand = cc[known[cc] == 0]
+            if cand.size:
+                u = np.unique(cand)
+                sub, bill = wdb_strings.take_subset_road(seg, col, u)
+                if sub and spent + bill[0] < wdb_strings.AT_COST_SHARE:
+                    known[u] = np.where(wdb_strings.identify_contains_at(seg, col, u, nd), 1, 2)
+                    spent += bill[0]
+                else:
+                    flag = np.asarray(WS._like_flags(seg, col, needle, 'contains'))
+        m9 = np.flatnonzero(flag[cc]) if flag is not None else np.flatnonzero(known[cc] == 1)
         if m9.size:
             hits.extend((lo + m9).tolist())
-        lo = hi
+        lo = hi; W = _CHUNK
     sel = np.asarray(hits[:k], np.int64)
     cols = list(seg.cols.keys())
     def _colvals(cn):

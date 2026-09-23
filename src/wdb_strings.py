@@ -99,3 +99,90 @@ def identify_contains(seg, col, n1, n2=b''):
         _WK.plike_fc_serial(_chunk_bytes(seg, col, j), rl, np.int64(R), np.int64(n), a1, a2, keep[lo:lo + n])
     list(wdb_engine._leaf_pool().map(_one, _chunk_plan(seg, col)))
     return keep
+
+
+def chunks_touched(seg, col, u):
+    """how many dictionary chunks hold at least one of the sorted codes u (the inflate bill of
+    deciding only u), and the chunk count"""
+    c = seg.cols[col]
+    if not c.get('chunked'):
+        return 1, 1
+    CH = int(c['CHUNK']); nch = int(c['nch'])
+    b = np.searchsorted(u, np.arange(nch + 1, dtype=np.int64) * CH)
+    return int(np.count_nonzero(np.diff(b))), nch
+
+
+def identify_contains_at(seg, col, u, n1, n2=b''):
+    """IDENTIFICATION AT THE SURVIVORS: out[i] = the string of code u[i] contains n1 (then n2 after
+    it), for sorted unique codes u only. Chunks holding none of u are never inflated; inside a
+    chunk only the restart groups holding a needed code are walked, each from its restart to its
+    last needed entry. Codes past the dictionary (the NULL bin) are False. None when the column is
+    not front-coded."""
+    import wdb_kernels as _WK, wdb_engine
+    c = seg.cols.get(col) or {}
+    if 'restarts' not in c:
+        return None
+    u = np.ascontiguousarray(u, dtype=np.int64)
+    assert u.size == 0 or bool(np.all(u[1:] > u[:-1])), 'identify_contains_at wants sorted unique codes'
+    R = int(c['R']); V0 = int(c.get('n_dict') or c['V'])
+    a1 = np.frombuffer(n1 if isinstance(n1, bytes) else n1.encode(), np.uint8)
+    a2 = np.frombuffer(n2 if isinstance(n2, bytes) else n2.encode(), np.uint8)
+    out = np.zeros(u.size, np.bool_)
+    live = int(np.searchsorted(u, V0))                  # u[:live] are real strings
+    if live == 0:
+        return out
+    if not c.get('chunked'):
+        raw = np.frombuffer(seg._dz.decompress(c['z']), np.uint8)
+        _WK.plike_sel_fc(raw, np.asarray(c['restarts'], np.int64), np.int64(R), u[:live], a1, a2, out[:live])
+        return out
+    CH = int(c['CHUNK'])
+    plan = _chunk_plan(seg, col)
+    b = np.searchsorted(u[:live], np.arange(len(plan) + 1, dtype=np.int64) * CH)
+    def _one(j):
+        a, z = int(b[j]), int(b[j + 1])
+        if a == z:
+            return
+        _jj, lo, n, rl = plan[j]
+        assert lo == j * CH, ('chunk start', col, j, lo)
+        need = u[a:z] - lo
+        rl = np.asarray(rl, np.int64)
+        if c.get('fc3'):
+            h = seg.fc_part(c, j, 'h').view(np.uint16)
+            gto = rl - 4 * R * np.arange(rl.size, dtype=np.int64)   # text offset of each restart
+            _WK.plike_sel_fc3(h, seg.fc_part(c, j, 't'), gto, np.int64(R), need, a1, a2, out[a:z])
+        else:
+            _WK.plike_sel_fc(_chunk_bytes(seg, col, j), rl, np.int64(R), need, a1, a2, out[a:z])
+    list(wdb_engine._leaf_pool().map(_one, [j for j in range(len(plan)) if b[j] < b[j + 1]]))
+    return out
+
+
+# THE POTENCY OF A SUBSET (Jackson's law: a filter earns its place only while the work it saves
+# exceeds its own cost). Deciding the whole dictionary inflates every chunk and decides every entry
+# -- the two halves measured about equal (URL 292 / 323 ms). Deciding only codes u inflates the
+# chunks holding u and walks, in each restart group holding u, from its restart to its last needed
+# entry. Bill in units of "one whole pass = 2.0"; the subset road is taken below AT_COST_SHARE of it.
+AT_COST_SHARE = 0.8
+AT_FORCE = [None]                     # tests: 'survivors' | 'whole' pins the road
+
+
+def at_cost(seg, col, u):
+    """(bill as a fraction of the whole pass, chunks touched, chunks, entries walked) for deciding
+    only the sorted unique codes u (NULL-bin codes past the dictionary cost nothing)"""
+    c = seg.cols[col]
+    R = int(c['R']); V0 = int(c.get('n_dict') or c['V'])
+    u = u[:int(np.searchsorted(u, V0))]
+    if u.size == 0:
+        return 0.0, 0, int(c.get('nch') or 1), 0
+    touched, nch = chunks_touched(seg, col, u)
+    g = u // R
+    last = np.flatnonzero(np.r_[g[1:] != g[:-1], True])       # the last needed code of each group
+    walked = int((u[last] % R + 1).sum())
+    return (touched / nch + walked / V0) / 2.0, touched, nch, walked
+
+
+def take_subset_road(seg, col, u):
+    """True when deciding only u is cheaper than deciding the whole dictionary; and the bill"""
+    bill = at_cost(seg, col, u)
+    if AT_FORCE[0] is not None:
+        return AT_FORCE[0] == 'survivors', bill
+    return bill[0] < AT_COST_SHARE, bill

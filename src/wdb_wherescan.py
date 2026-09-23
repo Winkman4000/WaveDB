@@ -486,7 +486,51 @@ def _text_buffer(seg, col):
     return hay, offs
 
 
+# the road is priced by wdb_strings.take_subset_road (chunks inflated + entries walked, against
+# the whole pass); the last residual LIKE's road is kept for inspection:
+# (col, needle, distinct codes, chunks touched, chunks, entries walked, bill, road)
+_LIKE_AT_LAST = [None]
+
+
+def _like_at(seg, col, needle, kind, cc):
+    """Boolean[len(cc)]: the string at each code in cc matches the LIKE. THE FILTER BEFORE THE READ
+    (Jackson): a LIKE that runs after other filters decides only the distinct codes still alive --
+    18.3M URLs become the 2,450 behind Q22's survivors. Falls back to the whole dictionary when
+    deciding the survivors would cost most of a whole pass (wdb_strings.take_subset_road), or when
+    the LIKE is not a plain contains."""
+    memo = seg.__dict__.setdefault('_ws_like_memo', {})
+    if (col, needle, kind) in memo:              # already decided whole (the NULL bin padded)
+        return _like_flags(seg, col, needle, kind)[cc]
+    c0 = seg.cols.get(col) or {}
+    nd = needle.encode() if isinstance(needle, str) else needle
+    if kind not in ('general', 'prefix', 'suffix') and 'restarts' in c0 and len(nd) >= 1 and cc.size:
+        import wdb_strings
+        V = int(c0['V'])
+        pres = np.zeros(V, np.bool_); pres[cc] = True
+        u = np.flatnonzero(pres)
+        sub, (bill, touched, nch, walked) = wdb_strings.take_subset_road(seg, col, u)
+        if sub:
+            got = wdb_strings.identify_contains_at(seg, col, u, nd)
+            if got is not None:
+                _LIKE_AT_LAST[0] = (col, nd, int(u.size), touched, nch, walked, round(bill, 3), 'survivors')
+                flag = np.zeros(V, np.bool_); flag[u] = got
+                return flag[cc]
+        _LIKE_AT_LAST[0] = (col, nd, int(u.size), touched, nch, walked, round(bill, 3), 'whole dictionary')
+    return _like_flags(seg, col, needle, kind)[cc]
+
+
 def _like_flags(seg, col, needle, kind='contains'):
+    """flag[code] for EVERY code of the column, the NULL bin included (False: NULL LIKE x is not
+    true). The text-buffer roads size their flag to the dictionary without its NULL bin; a NULL
+    row's code indexed one past it (found 2026-09-23, a residual LIKE over a nullable column)."""
+    fl = _like_flags_dict(seg, col, needle, kind)
+    V = int((seg.cols.get(col) or {}).get('V') or 0)
+    if fl.size < V:
+        fl = np.concatenate([np.asarray(fl, np.bool_), np.zeros(V - fl.size, np.bool_)])
+    return fl
+
+
+def _like_flags_dict(seg, col, needle, kind='contains'):
     """Boolean flag[code] = dict value contains needle. THE DICT IS THE HAYSTACK: the row data
     is never string-compared -- all distinct values are scanned once (C-speed buffer find with
     per-string skip), and the predicate collapses to a code-set membership test. Memoized for
@@ -1335,8 +1379,11 @@ def execute(seg, spec):
     global _HITS
     lo, hi = _span_rows(seg, spec['spans'])
     likes = spec.get('likes', [])
-    lflags = [(col, _like_flags(seg, col, needle, kind), neg) for col, needle, kind, neg in likes] if likes else []
     de, dl = spec.get('drive_eq'), spec.get('drive_like')
+    # only the DRIVING like decides its whole dictionary (it scans every row); every other like is
+    # decided later, at the survivors, for the codes still alive (_like_at)
+    lflags = [(col, _like_flags(seg, col, needle, kind) if i == dl else None, neg)
+              for i, (col, needle, kind, neg) in enumerate(likes)] if likes else []
     _dn = None
     if hi <= lo:
         pos = np.empty(0, np.int64)
@@ -1405,11 +1452,6 @@ def execute(seg, spec):
             continue
         cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
         pos = pos[cc != code] if op == '<>' else pos[cc == code]
-    for i, (col, fl, neg) in enumerate(lflags):
-        if i == dl or pos.size == 0: continue
-        cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
-        m = fl[cc]
-        pos = pos[~m] if neg else pos[m]
     for ii, (col, vals, ineg) in enumerate(spec.get('ins', ())):
         if ii == spec.get('drive_in') or pos.size == 0:
             continue
@@ -1464,6 +1506,20 @@ def execute(seg, spec):
         if pos.size == 0: break
         vv = np.asarray(seg._seq_decode(seg.cols[col]))[pos]
         pos = pos[vv != val] if op == '<>' else pos[vv == val]
+    # THE LIKES LAST (Jackson: the cheap filter before the expensive read): a residual LIKE costs
+    # the distinct strings still alive, so every code-compare filter above runs first and shrinks
+    # what it must decide. Conjunction commutes: the answer cannot change, only the bill.
+    for i, (col, fl, neg) in enumerate(lflags):
+        if i == dl or pos.size == 0: continue
+        cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
+        _lc, needle_i, kind_i, _ln = likes[i]
+        m = _like_at(seg, col, needle_i, kind_i, cc)
+        if neg:
+            m = ~m
+            c_n = seg.cols.get(col) or {}
+            if c_n.get('has_null'):
+                m &= cc != int(c_n['V']) - 1     # SQL: NULL NOT LIKE x is not true
+        pos = pos[m]
 
     # ---- rows mode: SELECT * ordered by the cluster column -- positions ARE the order
     if spec.get('mode') == 'rows':
