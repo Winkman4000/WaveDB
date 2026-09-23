@@ -2135,3 +2135,25 @@ decompress buffers gained ~15%, not the ceiling. Numba's parallel kernels likely
 measure. (ClickBench's c6a.4xlarge has 16 vCPU.)
 WHAT IS LEFT IN Q28 (~1.9 s): the dictionary map ~600 ms (CPU-bound at 16 CPUs), Referer's row codes
 ~270, argsort of 3M label hashes ~260, emit ~300, hashing + exact grouping ~170.
+
+
+
+## THE TRUE COLD (2026-09-23): what the boards have not been measuring
+Every board's "first run" so far ran after something had just read the same file: the OS page
+cache was warm. ClickBench's cold run drops it. The pod refuses /proc/sys/vm/drop_caches, but
+posix_fadvise(DONTNEED) evicts one file without root (/workspace is MooseFS over FUSE: 6.7 GB/s
+warm -> 0.71 GB/s after eviction). bench/true_cold.py: fresh process per query, open, evict the
+database's files and numba's compiled kernels, time the query; fincore counts the bytes read.
+THREAD SIZING, checked first: os.cpu_count() says 64, the pod may run on 16; numba already uses 16.
+Python pools resized to 16 (a startup hook, no code change): warm first runs 32.8 vs 32.8 s, hot
+13.10 vs 13.02; reversed order 32.1 vs 32.1. No effect -- code unchanged. The first pass of that
+check exposed the cache: the first process to touch the data took 60.0 s, the next 33.2 s.
+THE BOARD, TRUE COLD (cbdb_fc3, 43 queries):  true cold 55.2 s | warm first 34.2 s | hot 12.97 s |
+9.4 GB read from storage. The penalty is the string family, and it is BYTES:
+  Q28 +3,384 ms (839 MB: Referer's dictionary 613 + its row codes 225)
+  Q22 +2,837 (1,217 MB)  Q20 +2,130 (740: URL dictionary headers+text + URL codes)
+  Q21 +1,980 (800)       Q23 +1,813 (537)   Q27 +811 (371: headers + mask 58, not the text)
+  Q30 +659, Q33 +651, Q34 +535, Q40 +522.
+Q28 pulls 839 MB in +3.4 s = ~0.25 GB/s, a third of the file's sequential rate: memmap page
+faults read it in small pieces. The referee runs on this pod (Umbra 5.8 s, ClickHouse 17.8 s) could
+not drop caches either; their cache state is unknown.
