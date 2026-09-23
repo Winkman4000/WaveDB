@@ -1911,3 +1911,42 @@ every count equals DuckDB's).
 WHAT REMAINS OF THE SWEEP: ~30 Segment memos and module caches outlive the query in wdb_qmem's
 terms (Jackson's law: "when the outermost run() returns it is as if the query was never there").
 To be measured, not read: run the 43 in one process and list what still holds data after each.
+
+
+
+## JACKSON'S LAW, ENFORCED (2026-09-23): the hot path was standing on memos
+Jackson: "the base that needs to get developed is the cold places ... it's easier to make some
+kind of hot shortcut that patches a problem rather than addressing the underlying cold problem."
+The cold table (each query's first run, files in page cache; Umbra/ClickHouse first runs of the
+Sep-19 referee, DuckDB native first runs in a fresh process each) said it plainly: WaveDB 75.5 s,
+Umbra 5.8, ClickHouse 17.8, DuckDB 47.9; 0 of 43 first runs faster than Umbra. Every query paid
+~410 ms before its first byte of work, and Q20-Q28 paid 4-9 s against 60-430 ms hot.
+THE START: Q00 (COUNT(*), 1.9 ms hot) took 407 ms first -- opening the segment (a Python parse of
+the layout through ~249K memmap slices) and first-use imports. ClickBench restarts the database
+before each first run and requires its caches cleared; opening files and loading the program is
+starting, not caching. Database.open now loads the program (every read module, the parser) and
+opens every segment; nothing decoded from the data. Q00's first run 407 -> 5 ms. (A startup that
+pre-built decoded state would refill what the rule says is empty -- not done, by rule.)
+THE COLD NO: stairs() spent ~180 ms decoding and diffing UserID to learn it is not a staircase;
+the load statistics' block min/max refute it without a byte. Q19 first 677 -> 168.
+THE LAW had drifted: wdb_qmem says "when the outermost run() returns it is as if the query was
+never there", but drop_derived cleared a NAMED list, and the list had fallen behind -- position
+lists, LIKE flags (Q22's run 2 skipped a 1.3 s match), regex derivations (Q28's 3.9 s), sparse
+planes, scanned codes, censuses, _dictbytes and other lazy column keys, SQL-keyed plan caches,
+an lru parse cache whose own docstring said it was removed, and a shelf holding roads, keys,
+ranks and predicates. Now: drop_derived sweeps every underscore container but _synth/_tdict/
+_civil_lut_cache and every lazy '_' column key; flush clears the database memos and keeps only
+the shelf's VOCABULARY (decoded dictionaries); the module caches are registered. THE LAW'S
+WITNESS (wdb_qmem.audit, baseline = the loaded program) lists residue; WDB_QMEM_STRICT, set by the
+suite, raises on any: 1721/0 under it, and all 43 ClickBench queries leave zero residue.
+THE BOARD, the honest one (cbdb_e19, vanilla, 43/43 exact):
+  first runs 75.5 -> 53.8 s (Umbra 5.8, ClickHouse 17.8, DuckDB 47.9); first-run wins vs DuckDB
+  24/43, ClickHouse 11, Umbra 5.
+  hot 8.61 -> 29.96 s (Umbra 5.58, ClickHouse 12.40, DuckDB native 19.60): the memos were most of
+  the hot story -- Q20 123 -> 2,649 ms, Q21 138 -> 2,881, Q22 433 -> 4,186, Q23 59 -> 3,095, Q28
+  348 -> 6,237, Q29 6 -> 249, Q10 138 -> 486, Q34/Q35 ~180/96 -> ~640. The string family (Q20-Q23,
+  Q28, Q29) is ~22 of the 30 s: every one expands a whole string dictionary before it can look.
+WHAT THE BASE NEEDS, now that hot is cold: (1) the string family on the dictionary AS STORED (LIKE
+and REGEXP over the front-coded chunks, no join of 18M strings); (2) the two kernels numba cannot
+cache (group_fold_dict, grid2_count: dynamic globals) recompile in every process -- ~2.4 s of Q09's
+first run; (3) then the distinct family (Q08-Q14) and Q34/Q35.
