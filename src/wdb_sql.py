@@ -433,7 +433,7 @@ def _dict_string_col(seg, node, resolve, any_dt=False):
     return nm, pc
 
 
-_SARRAY_CACHE = __import__('wdb_qmem').register({})
+_SARRAY_CACHE = __import__('wdb_qmem').register_tier1({})   # tier 1: dictionary string arrays
 
 
 def _mode5_sarray(seg, pc):
@@ -536,7 +536,7 @@ def _like_prefix_range(vals, isn, pat, icase):
     return out
 
 
-_JOINED_CACHE = __import__('wdb_qmem').register({})
+_JOINED_CACHE = __import__('wdb_qmem').register_tier1({})   # tier 1: joined dictionary text
 
 
 def _like_joined(b, isn, pat, icase, toks, anchored_start, anchored_end, joined=None):

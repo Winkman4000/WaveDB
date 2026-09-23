@@ -25,10 +25,23 @@ def register(d):
     return d
 
 
+_TIER1 = []
+
+
+def register_tier1(d):
+    """A module cache of SOURCE DATA decoded (tier 1): outlives the query for the hot runs, dies
+    with it under WDB_HOT_KEEP=0 (the pure-cold A/B). Never a query's computed result."""
+    _TIER1.append(d)
+    return d
+
+
 def flush(db=None):
     """End of the outermost query: forget everything data-derived."""
     for d in _REGISTRY:
         d.clear()
+    if __import__('os').environ.get('WDB_HOT_KEEP', '1') == '0':
+        for d in _TIER1:
+            d.clear()
     if db is not None:
         for _p, ent in list(getattr(db, '_seg_cache', {}).items()):
             ent[1].drop_derived()
@@ -38,7 +51,7 @@ def flush(db=None):
                 d.clear()
     try:
         import wdb_shelf
-        wdb_shelf.SHELF.keep_only(wdb_shelf.VOCABULARY)
+        wdb_shelf.SHELF.keep_only(wdb_shelf.vocabulary())    # tier 1 only; nothing under WDB_HOT_KEEP=0
     except Exception:
         pass
     if __import__('os').environ.get('WDB_QMEM_STRICT') and db is not None:
@@ -59,6 +72,8 @@ _MODULE_KEEP = frozenset({
     ('wdb_qmem', '_BASE'), ('wdb_sidecar', '_stamp_cache'), ('wdb_db', '_PROGRAM'),
     ('wdb_sidecar', '_exists_cache'),        # which sidecar FILES exist: the directory, not data
     ('wdb_calib', '_CACHE'),                 # the machine card: this hardware's primitive speeds
+    ('controller', '_PLANS'), ('wdb_semijoin', '_PLANS'), ('wdb_semijoin', '_KMAX'),   # plans: program
+    ('wdb_qmem', '_TIER1'),
 })
 
 
@@ -94,9 +109,9 @@ def audit(db):
     out = []
     try:
         import wdb_engine
-        keep = wdb_engine._SEG_KEEP
+        keep = wdb_engine.seg_keep(); ckeep = wdb_engine.col_keep()
     except Exception:
-        keep = frozenset()
+        keep = frozenset(); ckeep = frozenset()
     for _p, ent in list(getattr(db, '_seg_cache', {}).items()):
         seg = ent[1]
         for k, v in seg.__dict__.items():
@@ -104,7 +119,7 @@ def audit(db):
                 out.append(('segment', k, len(v)))
         for nm, c in seg.cols.items():
             for k in c:
-                if k.startswith('_'):
+                if k.startswith('_') and k not in ckeep:
                     out.append(('column', '%s.%s' % (nm, k), 1))
     for a in ('_ptr_cache', '_gd_cache', '_union_cache', '_dc_ctx', '_uniq_memo'):
         d = getattr(db, a, None)
@@ -112,12 +127,12 @@ def audit(db):
             out.append(('database', a, len(d)))
     for mn, k, v in _module_containers():
         if len(v) > _BASE.get((mn, k), 0) and (mn, k) not in _MODULE_KEEP \
-                and mn not in _MODULE_KEEP_ALL:
+                and mn not in _MODULE_KEEP_ALL and not any(v is t for t in _TIER1):
             out.append(('module', '%s.%s' % (mn, k), len(v)))
     try:
         import wdb_shelf
         for key, it in list(wdb_shelf.SHELF._items.items()):
-            if it[2] not in wdb_shelf.VOCABULARY:
+            if it[2] not in wdb_shelf.vocabulary():
                 out.append(('shelf', it[2], 1))
     except Exception:
         pass

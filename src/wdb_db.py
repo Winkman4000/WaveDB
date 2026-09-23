@@ -22,11 +22,16 @@ import commands
 import numpy as np
 import functools
 
-def _parse_sql_cached(sql):
-    """Parse SQL -> AST. Uncached by law (wdb_qmem): the memo was removed with the
-    tree-mutation bug, and query-keyed caches grow with history, not with the file.
-    (2026-09-23: an lru_cache had crept back over it; removed -- every run parses.)"""
+@functools.lru_cache(maxsize=512)
+def _parse_sql_memo(sql):
     return sqlglot.parse_one(sql, read='duckdb')
+
+
+def _parse_sql_cached(sql):
+    """Parse SQL -> AST. The parse is PROGRAM, not data (THE TWO TIERS): a bounded memo of the
+    text's tree is lawful. The tree-mutation bug that once removed the memo is answered here --
+    every caller gets its own COPY, so no read can corrupt the next run's tree."""
+    return _parse_sql_memo(sql).copy()
 
 
 _PROGRAM = []

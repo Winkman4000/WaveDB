@@ -54,8 +54,8 @@ def _conjuncts(node):
     return [node]
 
 
-_PLANS = __import__('wdb_qmem').register({})
-_KMAX = __import__('wdb_qmem').register({})
+_PLANS = {}   # plans are program (qmem _MODULE_KEEP)
+_KMAX = {}   # (qmem _MODULE_KEEP)
 _REUSE = None
 
 from numba import njit

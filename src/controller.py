@@ -93,7 +93,7 @@ _SERVED = [None]                     # the routing ledger's marker
 # results are never cached, only the route. LRU-capped; ~KB per entry.
 import os as _os
 from collections import OrderedDict as _OD
-_PLANS = __import__('wdb_qmem').register(_OD())
+_PLANS = _OD()   # plans are program (qmem _MODULE_KEEP)
 _PLANS_CAP = 256
 _BYNAME = {}
 _PLAN_EPOCH = [0]

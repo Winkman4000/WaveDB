@@ -6,8 +6,32 @@ import struct
 import threading, numpy as np, zstandard as zstd
 from concurrent.futures import ThreadPoolExecutor
 _DT_UNITS = ['us','ns','ms','s','D','h','m','M','Y','W']
-# what drop_derived leaves on a Segment: not data (catalog state, the shelf's vocabulary, the calendar)
-_SEG_KEEP = frozenset({'_synth', '_tdict', '_civil_lut_cache'})
+# THE TWO TIERS (Jackson, 2026-09-23: "keep what is legal for the hot board, but it must not
+# interfere with the cold aspect -- cold reads are the heart of the engine"). ClickBench: "Caching
+# source data (e.g. buffer pools) is fine"; caches "near the end of the query execution pipeline ...
+# similar to query result caching ... should be disabled"; indices are not recommended.
+#   TIER 1 -- the SOURCE-DATA cache, may outlive a query: the file's own values decoded (dictionaries,
+#   sparse planes, staircase steps, inline streams). A cache only KEEPS what a query already produced;
+#   it never makes a query do extra work to fill it. The official cold run restarts the process, so
+#   tier 1 is empty there by construction. WDB_HOT_KEEP=0 turns it off (the pure-cold A/B).
+#   TIER 2 -- everything a query COMPUTED (match flags, regex groupings, counts, position lists,
+#   frame maps, scanned hits, per-code function values, ranks): dies with the query, always.
+_SEG_PROGRAM = frozenset({'_synth', '_civil_lut_cache'})               # not data at all
+_SEG_TIER1 = frozenset({'_e8pm', '_tdict'})                            # decoded planes, decoded dictionaries
+_COL_TIER1 = frozenset({'_dictbytes', '_steps', '_istream', '_idict', '_nline'})
+
+
+def seg_keep():
+    import os as _os
+    return _SEG_PROGRAM if _os.environ.get('WDB_HOT_KEEP', '1') == '0' else (_SEG_PROGRAM | _SEG_TIER1)
+
+
+def col_keep():
+    import os as _os
+    return frozenset() if _os.environ.get('WDB_HOT_KEEP', '1') == '0' else _COL_TIER1
+
+
+_SEG_KEEP = _SEG_PROGRAM | _SEG_TIER1          # (the witness reads seg_keep()/col_keep() live)
 
 _POOL = None
 
@@ -332,12 +356,13 @@ class Segment:
         # are not data: _synth (ADD COLUMN, catalog state), _tdict (the shelf's vocabulary, kept
         # above), _civil_lut_cache (the calendar). Every lazily-set '_' key on a column's
         # metadata dies too (_dictbytes, _steps, _idict, ...): cols keep only the file's shape.
+        sk = seg_keep(); ck = col_keep()                   # THE TWO TIERS (see _SEG_TIER1)
         for k, v in list(self.__dict__.items()):
-            if k.startswith('_') and k not in _SEG_KEEP and hasattr(v, 'clear') \
+            if k.startswith('_') and k not in sk and hasattr(v, 'clear') \
                     and isinstance(v, (dict, set, list)):
                 v.clear()
         for c in self.cols.values():
-            for k in [k for k in c if k.startswith('_')]:
+            for k in [k for k in c if k.startswith('_') and k not in ck]:
                 del c[k]
 
     def resident_values(self, nm):

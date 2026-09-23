@@ -105,7 +105,12 @@ SHELF = Shelf()
 # the source data -- a buffer-pool of the file's own values, cleared before every cold run anyway.
 # Everything a query COMPUTED (roads, keys, ranks, orders, predicates, settled rows, block stats,
 # inline N-scale text) dies with the query that computed it.
-VOCABULARY = frozenset({'dictionary', 'joined-text', 'dictionary-sarray'})
+VOCABULARY = frozenset({'dictionary', 'joined-text', 'dictionary-sarray', 'inline-text'})
+
+
+def vocabulary():
+    """TIER 1 on the shelf (decoded source data); empty under WDB_HOT_KEEP=0, the pure-cold A/B."""
+    return frozenset() if os.environ.get('WDB_HOT_KEEP', '1') == '0' else VOCABULARY
 
 
 def nbytes_of(obj):
