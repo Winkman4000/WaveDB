@@ -6,6 +6,8 @@ import struct
 import threading, numpy as np, zstandard as zstd
 from concurrent.futures import ThreadPoolExecutor
 _DT_UNITS = ['us','ns','ms','s','D','h','m','M','Y','W']
+# what drop_derived leaves on a Segment: not data (catalog state, the shelf's vocabulary, the calendar)
+_SEG_KEEP = frozenset({'_synth', '_tdict', '_civil_lut_cache'})
 
 _POOL = None
 
@@ -323,6 +325,20 @@ class Segment:
             if isinstance(ch, dict):
                 ch.clear()
         self._presence = 0; self._ov = 0; self._cluster = 0; self._cubes = 0
+        # THE LAW, ENFORCED (2026-09-23): the named list above had drifted -- position lists, LIKE
+        # flags, regex groups, sparse planes, scanned codes, censuses, date maps and more lived on
+        # the Segment across queries (Q22's run 2 skipped a 1.3 s LIKE; Q28's a 3.9 s regex
+        # derivation). Every underscore container on the Segment dies now, save the three that
+        # are not data: _synth (ADD COLUMN, catalog state), _tdict (the shelf's vocabulary, kept
+        # above), _civil_lut_cache (the calendar). Every lazily-set '_' key on a column's
+        # metadata dies too (_dictbytes, _steps, _idict, ...): cols keep only the file's shape.
+        for k, v in list(self.__dict__.items()):
+            if k.startswith('_') and k not in _SEG_KEEP and hasattr(v, 'clear') \
+                    and isinstance(v, (dict, set, list)):
+                v.clear()
+        for c in self.cols.values():
+            for k in [k for k in c if k.startswith('_')]:
+                del c[k]
 
     def resident_values(self, nm):
         """Decode the column ONCE and keep the full per-row array resident, so cluster-slice
@@ -1435,6 +1451,20 @@ class Segment:
             gaps = self._bitunpack(c['cstart'], 0, c['nsteps'], c['gbits']).astype(np.int64)
             c['_steps'] = np.cumsum(gaps)
             return c['_steps']
+        if c.get('mode') in (0, 2):
+            # THE COLD NO: the load statistics' per-block min/max codes (non-null) refute a
+            # staircase without a byte of the column -- a block whose max exceeds the next block's
+            # min, or a first block not starting at code 0. UserID paid a 100M decode + int64 copy
+            # + diff (~180 ms, the first query only) to learn "no".
+            try:
+                import wdb_blockstats as _BS
+                st = _BS._from_load(self, nm)
+            except Exception:
+                st = None
+            if st is not None and st['cmin'].size and (int(st['cmin'][0]) != 0 or bool(
+                    (st['cmax'][:-1] > st['cmin'][1:]).any())):
+                c['_steps'] = None
+                return None
         a = self._raw_codes(nm)
         d = np.diff(a.astype(np.int64)) if a.size else np.empty(0, np.int64)
         if a.size and int(a[0]) == 0 and (d.size == 0 or (int(d.min()) >= 0 and int(d.max()) <= 1)):

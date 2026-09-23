@@ -2981,7 +2981,7 @@ def _fast_detect(db, lt, la, rt, ra, lk, rk):
     return None
 
 
-_SOLO_MEMO = {}
+_SOLO_MEMO = __import__('wdb_qmem').register({})
 
 
 def _solo_segment(db, name):

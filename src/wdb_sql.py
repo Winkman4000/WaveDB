@@ -230,7 +230,7 @@ def _scalar_fn(node):
     if isinstance(inner, E.Column): return ('sfn', fname, inner.name, None)
     return None
 
-_SFN_CACHE = {}   # (id(seg), col, fname) -> fval_by_code int64[V]
+_SFN_CACHE = __import__('wdb_qmem').register({})   # (id(seg), col, fname) -> fval_by_code int64[V]
 
 def _fval_by_code(seg, fname, cn, params=None):
     key = (id(seg), cn, fname, params)
@@ -309,8 +309,8 @@ def _date_unit(td, unit, dt_unit='D'):
     if unit == 'MINUTE':  return d.astype('datetime64[m]').astype(int) % 60
     raise NotImplementedError(f"EXTRACT unit {unit!r}")
 
-_CODECOUNT_CACHE = {}   # (seg.path, col, N) -> full per-code count vector (length V), incl singletons
-_DATEMAP_CACHE = {}     # (seg.path, col, unit, N) -> (group keys, per-code inverse) for the V->G rollup
+_CODECOUNT_CACHE = __import__('wdb_qmem').register({})   # (seg.path, col, N) -> full per-code count vector (length V), incl singletons
+_DATEMAP_CACHE = __import__('wdb_qmem').register({})     # (seg.path, col, unit, N) -> (group keys, per-code inverse) for the V->G rollup
 
 def _code_counts(seg, col):
     """Full per-code count vector aligned to codes 0..V-1 (singletons included), cached per
@@ -433,7 +433,7 @@ def _dict_string_col(seg, node, resolve, any_dt=False):
     return nm, pc
 
 
-_SARRAY_CACHE = {}
+_SARRAY_CACHE = __import__('wdb_qmem').register({})
 
 
 def _mode5_sarray(seg, pc):
@@ -536,7 +536,7 @@ def _like_prefix_range(vals, isn, pat, icase):
     return out
 
 
-_JOINED_CACHE = {}
+_JOINED_CACHE = __import__('wdb_qmem').register({})
 
 
 def _like_joined(b, isn, pat, icase, toks, anchored_start, anchored_end, joined=None):

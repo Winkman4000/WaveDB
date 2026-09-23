@@ -39,9 +39,10 @@ def test_footprint_zero_before_use():
 
 def test_footprint_after_filter():
     db = _db()
+    h0 = BX._BSI_HITS
     db.run("SELECT SUM(n) FROM t WHERE disc < 0.03")     # 18% selective -> BSI builds on n
-    b, cols = BX.footprint(_seg(db))
-    assert 'disc' in cols and b > 0
+    assert BX._BSI_HITS > h0                             # the BSI served the filter...
+    assert BX.footprint(_seg(db)) == (0, [])             # ...and died with the query (wdb_qmem, Jackson's law)
 
 
 def test_budget_guard_falls_back_but_correct():
@@ -62,12 +63,14 @@ def test_escalate_knob_routes_and_agrees():
     # default is throughput (non-escalated): BSI engages
     db = _db()
     assert db.escalate is False
+    h0 = BX._BSI_HITS
     a_thru = db.run("SELECT SUM(n) FROM t WHERE disc < 0.03", escalate=False)[0]
-    assert 'disc' in BX.footprint(_seg(db))[1]          # throughput mode built the index
+    assert BX._BSI_HITS > h0                            # throughput mode served through the index
     # escalated (latency): skips BSI entirely -> fused parallel scan, index never built
     db2 = _db()
+    h1 = BX._BSI_HITS
     a_lat = db2.run("SELECT SUM(n) FROM t WHERE disc < 0.03", escalate=True)[0]
-    assert BX.footprint(_seg(db2)) == (0, [])           # escalated never touched the BSI path
+    assert BX._BSI_HITS == h1                           # escalated never touched the BSI path
     # identical answer either way (path-independent)
     assert abs(float(a_thru[0][0]) - float(a_lat[0][0])) < 1e-6
 

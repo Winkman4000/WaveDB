@@ -73,6 +73,12 @@ class Shelf:
             it = self._items.pop(key, None)
             if it is not None: self._bytes -= it[1]
 
+    def keep_only(self, kinds):
+        """THE QUERY'S END (wdb_qmem): only the kinds Jackson's law lets outlive a query stay."""
+        with self._lock:
+            for k in [k for k, it in self._items.items() if it[2] not in kinds]:
+                self._bytes -= self._items[k][1]; del self._items[k]
+
     def drop_prefix(self, prefix):
         with self._lock:
             for k in [k for k in self._items if str(k).startswith(prefix)]:
@@ -94,6 +100,12 @@ class Shelf:
 
 
 SHELF = Shelf()
+
+# What may outlive a query (wdb_qmem, Jackson's law): a decoded DICTIONARY is V-scale vocabulary of
+# the source data -- a buffer-pool of the file's own values, cleared before every cold run anyway.
+# Everything a query COMPUTED (roads, keys, ranks, orders, predicates, settled rows, block stats,
+# inline N-scale text) dies with the query that computed it.
+VOCABULARY = frozenset({'dictionary', 'joined-text', 'dictionary-sarray'})
 
 
 def nbytes_of(obj):
