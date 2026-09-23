@@ -2068,3 +2068,41 @@ recompiled Q08-Q14/Q18/Q23/Q30 again, the same signature as before, gone on the 
   first-run wins: DuckDB 27/43, ClickHouse 12, Umbra 6.  hot wins: DuckDB 21, ClickHouse 15, Umbra 8.
   moved (first / hot, ms): Q20 860->645 / 700->570; Q21 1282->1179 / 793->620; Q22 1815->1616 /
   1281->1155; Q27 1180->840 / 874->649; Q18 3178->3365 first (not a string query).
+
+
+
+## THE FILTER BEFORE THE READ (2026-09-23)
+Jackson: "if we know that what we are going to do will cost like 500ms but there is a filter that
+is 48ms that cuts it in half then we need to run the filter before it ... our potency score might
+not be picking this edge up." It was not, for two reasons found in the source: (1) the fused
+path's _potency9 measures prune only for numeric dictionaries -- a string conjunct gets a flat 0.5
+and cost 1.0, so SearchPhrase <> '' and a LIKE over 18M URLs look alike; (2) more deeply, every
+LIKE was decided over its WHOLE dictionary before any row was filtered, so no order could save a
+string read -- potency only ordered the row checks that came after.
+MEASURED on cbdb before building: Q22's SearchPhrase <> '' then Title LIKE leave 7,128 rows whose
+URLs are 2,450 distinct strings of 18.3M (1,598 of 143,298 restart groups); Q23 walked in time
+order meets its 10th match at row 214,125 -- 77K distinct URLs; Q21's SearchPhrase <> '' leaves 23%
+of URLs over 69% of groups (little to gain); Q20 has no other filter.
+BUILT:
+  plike_sel_fc3 / plike_sel_fc: decide only given codes -- each rebuilt from its restart, groups
+    holding no needed code never walked; wdb_strings.identify_contains_at: chunks holding none of
+    them never inflated.
+  THE POTENCY OF A SUBSET (wdb_strings.at_cost / take_subset_road): a whole pass inflates every
+    chunk and decides every entry (the halves measured equal, 292/323 ms); the subset bill is
+    (share of chunks inflated + share of entries walked) / 2, taken below 0.8 of the whole.
+  wherescan: only the DRIVING like decides its whole dictionary; every other like runs LAST (after
+    every code-compare filter) and is decided at the survivors (_like_at).
+  firstk: the staircase walk decides the LIKE only for the codes it meets, window by window, with
+    a running bill; past 0.8 of a whole pass it decides the whole dictionary once and walks on.
+FOUND ON THE WAY: the text-buffer road of _like_flags sized its flag without the NULL bin, so a
+  residual LIKE over a nullable column indexed past it (IndexError) -- flags now cover every code,
+  NULL False; and residual NOT LIKE now excludes NULL rows (SQL: NULL NOT LIKE x is not true).
+A/B, HEAD vs this, cbdb_fc3, fresh process each, median of 3 (ms):
+  Q22 first 1637 -> 1321, hot 1158 -> 840   (URL at survivors: 2,450 codes, 621/1,120 chunks,
+      103,658 entries walked; 210 ms where the whole dictionary was 505)
+  Q23 first 1243 -> 929, hot 519 -> 220     (identify at the codes met: 195 ms, was 550)
+  Q20, Q21, Q37-Q39 unchanged (no residual LIKE).
+WHAT IS LEFT: Q22's 210 ms is inflating 621 chunks for 2,450 strings -- 16,384-entry chunks; step 2's
+small text frames bring it to ~1% of the text. Q23 is now its RETURN: 759 ms materialising SELECT *
+(105 columns) for 10 rows. The fused path (wdb_join) still decides a LIKE whole when it builds its
+code-LUT; none of Q20-Q23 route there.
