@@ -1950,3 +1950,25 @@ WHAT THE BASE NEEDS, now that hot is cold: (1) the string family on the dictiona
 and REGEXP over the front-coded chunks, no join of 18M strings); (2) the two kernels numba cannot
 cache (group_fold_dict, grid2_count: dynamic globals) recompile in every process -- ~2.4 s of Q09's
 first run; (3) then the distinct family (Q08-Q14) and Q34/Q35.
+
+
+
+## THE TWO TIERS (2026-09-23): keep the legal hot, the cold stays the heart
+Jackson: "if our hot time is legal for the hot board then we should keep what we have but just
+make it not interfere with the cold aspect, and the cold aspect will still be the focus."
+ClickBench draws the line: "Caching source data (e.g. buffer pools) is fine"; caches "near the
+end of the query execution pipeline ... similar to query result caching ... should be disabled".
+TIER 1 (source data decoded, may outlive a query): dictionaries (_tdict, _dictbytes, joined text,
+string arrays), sparse planes, staircase steps, inline streams. It only KEEPS what a query already
+produced; the official cold run restarts the process, so it is empty there; WDB_HOT_KEEP=0 is the
+pure-cold A/B. TIER 2 (what a query computed -- LIKE flags, regex groupings, counts, position
+lists, frame maps, scanned hits, ranks): dies, witnessed strict. Program (plans, the parse memo,
+now handing out a COPY of the tree) persists. One process, the 43 in order: tier 1 on 41.4 s, off
+41.8 s -- it neither helps nor hurts a first touch.
+THE BOARD (cbdb_e19, vanilla, 43/43 exact):
+               this morning   the law   the tiers    Umbra   ClickHouse   DuckDB native
+  first runs       75.5 s      53.8 s     52.1 s      5.8      17.8          47.9
+  hot               8.61 s     29.96 s    19.91 s     5.58     12.40         19.60
+The hot that is left above this morning's is exactly the illegal memos: Q20-Q23 at 1.0-1.6 s (a
+LIKE memo had them at 59-433 ms), Q28 at 6.1 s (a regex memo had it at 0.35). That is the string
+family, and it is the cold work: LIKE and REGEXP over the dictionary as stored.
