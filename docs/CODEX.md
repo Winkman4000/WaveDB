@@ -1850,3 +1850,35 @@ exceptions; eligibility is decided inside differentiator_rows.
 THE BOARD, vanilla, clean (nothing else of ours on the box; host load
 average 42 from other tenants): 43/43 exact, 9.22 s, 36 of 43 faster
 than DuckDB (36.4 s this run). 10.43 -> 9.22. Q31 4.7 ms, Q32 23 ms.
+
+
+
+## THE BLOCK DICTIONARIES (2026-09-23): enc 19, pointer compression one level down
+Jackson, on the inflate: "store each distinct user id value as a bitpacked array and populate the
+database with pointers to these values so that the scope of V collapses to the distinct count of
+V; decode becomes a single jump." The value side already was this (the dictionary); the cost was
+the POINTERS: UserID's 100M row-order codes, enc 3 (u32 per row, zstd per 65,536-row frame), 246
+MB, 122 ms to inflate -- 108 of it zstd itself, 16 lanes slower than 8. The same move one level
+down: a block of 65,536 rows sees only ~19,600 of the 17.6M users, so each block keeps its sorted
+list of the global codes present (first code + bitpacked gaps -- Jackson's "alphabetical order"
+shares the leading bits) and each row a 15-bit pointer into its block's list. Run-length would
+not have done it (mean run 1.06 rows, RLE 389 MB): the win is few DISTINCT per block, not repeats.
+Every block starts on a u64 word -> encode and decode block-parallel, no shared words; a point
+read decodes its block's list only as far as its highest pointer.
+UserID: 246.0 -> 246.9 MB (+0.4%), full decode 121 -> 47 ms.
+THE ELECTION (Jackson's general rule): enc 19 replaces an INFLATING dress (zstd 1 / blocked 3 /
+packed frames 18) when its bytes are within 5% of that dress's (E19_SLACK). The census of the 26
+inflating columns (ratio enc19 / current): ClientIP 0.989, RemoteIP 0.991, UserID 1.003, FUniqID
+1.012, URLHash 1.027, IPNetworkID 0.896 -> take it; RefererHash 1.082, Title 1.155, RegionID 1.19
+(Jackson: "leave it"), URL 1.22, the timings 2.4-4.5x -> keep zstd. The line falls where it should:
+near-unique columns whose blocks see few distinct values tie zstd; skewed or clustered mid-V
+columns are zstd's home ground (entropy coding, runs) and stay. Sizes are computed exactly before
+a byte is written (one sort per block, both 16,384 and 65,536 rows sized, the smaller wins).
+Gates that listed tags by name: sampletop (Q17's LIMIT-without-ORDER sampler) and lenagg now admit
+19 (they only call codes_at / _raw_codes); valtopk and the wherescan frame drivers call enc-3/18
+frame internals and decline, exactly. Q17 found it: 22 -> 429 ms until sampletop admitted 19.
+A/B on the UserID queries, in process, best of 5, results identical: Q08 579 -> 530, Q10 218 ->
+104, Q11 559 -> 440, Q13 604 -> 501, Q22 473 -> 360, total 4.75 -> 4.35 s. THE BOARD, vanilla,
+UserID redressed only (cbdb_e19): 43/43 exact, 9.22 -> 8.42 s, 39 of 43 faster than DuckDB (37.1
+s). Q27/Q30/Q33/Q37/Q39 read +35..63 on the board and -47..+11 in process A/B: host noise (load
+average 38 from other tenants). Suite 1719/0.

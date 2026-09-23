@@ -3771,3 +3771,117 @@ def pgroup_topk(idx_placed, vals, starts, ends, k, desc, out_rows, out_cnt):
         for t in range(c):
             out_rows[g * k + t] = sl[order[t]]
         out_cnt[g] = c
+
+
+# ------------------------------------------------------------------------------------------------
+# enc 19 = THE BLOCK DICTIONARIES (Jackson, 2026-09-23: "store each distinct value once and
+# populate the rows with pointers, so the scope of V collapses to the distinct count" -- applied
+# one level down, to the row pointers themselves). Per block of BR rows: the sorted distinct
+# global codes present (first code at gbits, then gaps at the block's gap width), and one local
+# pointer per row at the block's own width. Every block starts on a u64 word, so the encoder and
+# the decoder run block-parallel with no shared words. Decode is one jump per row.
+
+@njit(inline='always')
+def _e19_put(w, pos, v, nbits):
+    if nbits > 0:
+        i = pos >> 6; sh = pos & 63
+        w[i] |= np.uint64(v) << np.uint64(sh)
+        if sh + nbits > 64:
+            w[i + 1] |= np.uint64(v) >> np.uint64(64 - sh)
+
+
+@njit(inline='always')
+def _e19_get(w, pos, nbits):
+    if nbits == 0:
+        return np.int64(0)
+    i = pos >> 6; sh = pos & 63
+    v = w[i] >> np.uint64(sh)
+    if sh + nbits > 64:
+        v |= w[i + 1] << np.uint64(64 - sh)
+    return np.int64(v & ((np.uint64(1) << np.uint64(nbits)) - np.uint64(1)))
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def e19_plan(codes, BR, gbits, lb, gw, dcnt, pwords, dwords):
+    """per block: distinct count, local pointer width, dictionary gap width, and the u64 words
+    the block's pointers and dictionary occupy -- the exact size, before a byte is written"""
+    N = codes.size; nb = lb.size
+    for b in prange(nb):
+        lo = b * BR; hi = min(lo + BR, N)
+        s = np.sort(codes[lo:hi])
+        d = 1; mg = np.int64(0)
+        for i in range(1, s.size):
+            if s[i] != s[i - 1]:
+                g = np.int64(s[i]) - np.int64(s[i - 1])
+                if g > mg:
+                    mg = g
+                d += 1
+        l = 0
+        while (np.int64(1) << l) < d:
+            l += 1
+        w = 0
+        while (np.int64(1) << w) <= mg:
+            w += 1
+        lb[b] = l; gw[b] = w; dcnt[b] = d
+        pwords[b] = (np.int64(hi - lo) * l + 63) // 64
+        dwords[b] = (np.int64(gbits) + np.int64(d - 1) * w + 63) // 64
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def e19_write(codes, BR, gbits, lb, gw, poff, doff, pw, dw):
+    """write every block's dictionary (first code + gaps) and its row pointers (the local ids)"""
+    N = codes.size; nb = lb.size
+    for b in prange(nb):
+        lo = b * BR; hi = min(lo + BR, N)
+        blk = codes[lo:hi]
+        s = np.unique(blk)
+        pos = doff[b] * 64
+        _e19_put(dw, pos, s[0], gbits); pos += gbits
+        g = np.int64(gw[b])
+        for k in range(1, s.size):
+            _e19_put(dw, pos, np.int64(s[k]) - np.int64(s[k - 1]), g); pos += g
+        l = np.int64(lb[b]); pos = poff[b] * 64
+        for i in range(blk.size):
+            _e19_put(pw, pos, np.searchsorted(s, blk[i]), l); pos += l
+
+
+@njit(inline='always')
+def _e19_dict(dw, b, gbits, gw, dcnt, doff, upto):
+    """a block's dictionary entries [0, upto]: the first code, then the running sum of the gaps"""
+    loc = np.empty(upto + 1, np.int64)
+    pos = doff[b] * 64; g = np.int64(gw[b])
+    v = _e19_get(dw, pos, gbits); pos += gbits; loc[0] = v
+    for k in range(1, upto + 1):
+        v += _e19_get(dw, pos, g); pos += g; loc[k] = v
+    return loc
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def e19_decode(pw, dw, BR, N, gbits, lb, gw, dcnt, poff, doff, out):
+    """the full column: per block, its dictionary, then one jump per row"""
+    nb = lb.size
+    for b in prange(nb):
+        lo = b * BR; hi = min(lo + BR, N)
+        loc = _e19_dict(dw, b, gbits, gw, dcnt, doff, np.int64(dcnt[b]) - 1)
+        l = np.int64(lb[b]); pos = poff[b] * 64
+        for i in range(lo, hi):
+            out[i] = loc[_e19_get(pw, pos, l)]; pos += l
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def e19_gather(pw, dw, BR, gbits, lb, gw, dcnt, poff, doff, rows, starts, out):
+    """codes at sorted rows, grouped by block (starts: the group boundaries). A block's
+    dictionary is decoded only as far as the highest local id its rows point at."""
+    for t in prange(starts.size - 1):
+        s0 = starts[t]; s1 = starts[t + 1]
+        b = rows[s0] // BR
+        l = np.int64(lb[b]); base = poff[b] * 64; r0 = b * BR
+        mx = np.int64(0)
+        for j in range(s0, s1):
+            lid = _e19_get(pw, base + (rows[j] - r0) * l, l)
+            out[j] = lid
+            if lid > mx:
+                mx = lid
+        loc = _e19_dict(dw, b, gbits, gw, dcnt, doff, mx)
+        for j in range(s0, s1):
+            out[j] = loc[out[j]]

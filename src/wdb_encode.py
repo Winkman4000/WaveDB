@@ -345,6 +345,40 @@ def _dict_bytes(p, zc):
             out += struct.pack('<I', len(fc)) + struct.pack('<I', len(z)) + z
     return out
 
+E19_SLACK = float(os.environ.get('WDB_E19_SLACK', '0.05'))   # enc 19 may cost this many more bytes
+                                                              # than the inflating dress it replaces
+
+
+def _e19_candidate(arr, bits, seal):
+    """THE BLOCK DICTIONARIES (tag 19), or None when no block size fits under `seal` bytes.
+    Layout: [19][gbits u8][BR u32][nb u32][P u64][D u64] + lb[nb] u8 + gw[nb] u8 + dcnt[nb] u32
+    + poff[nb+1] i64 + doff[nb+1] i64 (u64-word offsets) + pointer words[P+1] + dict words[D+1]
+    (one trailing zero word each: a straddling read never leaves the section)."""
+    import wdb_kernels as _WK19
+    a = np.ascontiguousarray(arr, dtype=np.int64)
+    best = None
+    for BR in (16384, 65536):                        # the census: near-unique columns take 65536,
+        nb = (a.size + BR - 1) // BR                 # the mid-V ones 16384; the plan sizes both
+        lb = np.empty(nb, np.uint8); gw = np.empty(nb, np.uint8); dc = np.empty(nb, np.uint32)
+        pwn = np.empty(nb, np.int64); dwn = np.empty(nb, np.int64)
+        _WK19.e19_plan(a, np.int64(BR), np.int64(bits), lb, gw, dc, pwn, dwn)
+        poff = np.zeros(nb + 1, np.int64); np.cumsum(pwn, out=poff[1:])
+        doff = np.zeros(nb + 1, np.int64); np.cumsum(dwn, out=doff[1:])
+        size = 26 + nb * 6 + (nb + 1) * 16 + (int(poff[-1]) + 1) * 8 + (int(doff[-1]) + 1) * 8
+        if size <= seal and (best is None or size < best[0]):
+            best = (size, BR, nb, lb, gw, dc, poff, doff)
+    if best is None:
+        return None
+    size, BR, nb, lb, gw, dc, poff, doff = best
+    pw = np.zeros(int(poff[-1]) + 1, np.uint64); dw = np.zeros(int(doff[-1]) + 1, np.uint64)
+    _WK19.e19_write(a, np.int64(BR), np.int64(bits), lb, gw, poff, doff, pw, dw)
+    sec = (bytes([19, bits]) + struct.pack('<IIQQ', BR, nb, int(poff[-1]), int(doff[-1]))
+           + lb.tobytes() + gw.tobytes() + dc.tobytes() + poff.tobytes() + doff.tobytes()
+           + pw.tobytes() + dw.tobytes())
+    assert len(sec) == size, (len(sec), size)
+    return sec
+
+
 def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
     _fovr = dict((kv.split(':')[0], int(kv.split(':')[1]))
                  for kv in os.environ.get('WDB_FRAME_OVERRIDES', '').split(',') if ':' in kv)
@@ -620,6 +654,18 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
         seal18 = 0.90 * len(best) if best is packed else len(best)
         if len(cand18) < seal18 or os.environ.get('WDB_E18_FORCE'):
             best = cand18
+    # tag 19 = THE BLOCK DICTIONARIES (Jackson, 2026-09-23: pointer compression one level down --
+    # per block, the distinct codes present, once, sorted and gap-coded; per row, a pointer into
+    # its block's list at the block's own width). Decode is one jump per row, no inflate.
+    # THE ELECTION (Jackson's general rule): it replaces an INFLATING dress (zstd 1 / blocked 3 /
+    # packed frames 18) when its bytes are within E19_SLACK (5%) of that dress's. Measured on
+    # cbdb: UserID 246.8 vs 246.0 MB at 32 vs 122 ms per full decode; RegionID 1.19x -> stays.
+    _f19 = bool(os.environ.get('WDB_E19_FORCE'))
+    if 1 <= bits <= 32 and codes.size and (_f19 or (bits >= 9 and codes.size >= (1 << 20)
+                                                    and best[0] in (1, 3, 18))):
+        cand19 = _e19_candidate(arr, bits, float('inf') if _f19 else len(best) * (1.0 + E19_SLACK))
+        if cand19 is not None:
+            best = cand19
     # tag 14 = FIELD PLANES (Jackson's dress): dates decompose to y/m/d u8
     # planes, each its own zstd stream -- the calendar's internal correlation
     # compresses BELOW naive entropy (82.7 vs 94.1MB measured on l_shipdate),

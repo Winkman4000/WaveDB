@@ -87,6 +87,10 @@ def _column_spans(buf):
             nfr = struct.unpack_from('<II', buf, off)[1]; off += 8
             boffs = np.asarray(buf[off:off + (nfr + 1) * 4]).view(np.uint32); off += (nfr + 1) * 4
             off += int(boffs[-1])
+        elif code_enc == 19:                         # block dictionaries: bits u8 + BR,nb u32 + P,D u64 + tables + words
+            off += 1
+            _br19, nb19, P19, D19 = struct.unpack_from('<IIQQ', buf, off); off += 24
+            off += nb19 * 6 + (nb19 + 1) * 16 + (int(P19) + 1) * 8 + (int(D19) + 1) * 8
         elif code_enc == 17:                         # raw packed codes
             b17 = buf[off]; off += 1
             n17 = struct.unpack_from('<I', buf, off)[0]; off += 4

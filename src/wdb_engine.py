@@ -200,6 +200,18 @@ class Segment:
                 meta['BR'], nfr = struct.unpack_from('<II', buf, off); off += 8
                 meta['poffs'] = np.frombuffer(buf, dtype=np.uint32, count=nfr+1, offset=off); off += 4*(nfr+1)
                 meta['cstart'] = off; meta['czlen'] = int(meta['poffs'][-1]); off += meta['czlen']
+            elif code_enc == 19:               # BLOCK DICTIONARIES: per-block sorted list + local pointers
+                meta['e19bits'] = int(buf[off]); off += 1   # (no 'BR'/'boffs'/'cwidth': the enc-3 readers do not see it)
+                BR19, nb19, P19, D19 = struct.unpack_from('<IIQQ', buf, off); off += 24
+                meta['e19BR'] = int(BR19)
+                meta['e19lb'] = np.frombuffer(buf, np.uint8, nb19, off); off += nb19
+                meta['e19gw'] = np.frombuffer(buf, np.uint8, nb19, off); off += nb19
+                meta['e19dc'] = np.frombuffer(buf, np.uint32, nb19, off); off += 4 * nb19
+                meta['e19poff'] = np.frombuffer(buf, np.int64, nb19 + 1, off); off += 8 * (nb19 + 1)
+                meta['e19doff'] = np.frombuffer(buf, np.int64, nb19 + 1, off); off += 8 * (nb19 + 1)
+                meta['cstart'] = off; meta['e19pn'] = int(P19) + 1; off += 8 * (int(P19) + 1)
+                meta['e19dstart'] = off; meta['e19dn'] = int(D19) + 1; off += 8 * (int(D19) + 1)
+                meta['czlen'] = off - meta['cstart']
             elif code_enc == 13:               # byte-planes: each plane its own zstd frame
                 meta['vnby'] = int(buf[off]); off += 1
                 meta['BR'], nfr = struct.unpack_from('<II', buf, off); off += 8
@@ -930,6 +942,13 @@ class Segment:
             else:
                 _wr14(0)
             self._codes[nm] = cc; return cc
+        if c.get('code_enc', 0) == 19:               # BLOCK DICTIONARIES: one parallel pass, no inflate
+            import wdb_kernels as _WK19
+            pw, dw = self._e19_words(c)
+            cc = np.empty(self.N, dtype=self._e19_dtype(c))
+            _WK19.e19_decode(pw, dw, np.int64(c['e19BR']), np.int64(self.N), np.int64(c['e19bits']),
+                             c['e19lb'], c['e19gw'], c['e19dc'], c['e19poff'], c['e19doff'], cc)
+            self._codes[nm] = cc; return cc
         if c.get('code_enc', 0) == 3:                # blocked: decompress every frame, concat
             wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
             cc = np.empty(self.N, dtype=wdt)
@@ -985,6 +1004,39 @@ class Segment:
         else:
             cc = self._bitunpack(base, 0, self.N, bits)  # native width
         self._codes[nm] = cc; return cc
+    def _e19_words(self, c):
+        """enc 19's two word streams (row pointers, block dictionaries), zero-copy views of the mmap"""
+        return (np.frombuffer(self.buf, np.uint64, c['e19pn'], c['cstart']),
+                np.frombuffer(self.buf, np.uint64, c['e19dn'], c['e19dstart']))
+
+    @staticmethod
+    def _e19_dtype(c):
+        b = int(c['e19bits'])
+        return np.uint8 if b <= 8 else (np.uint16 if b <= 16 else np.uint32)
+
+    def _e19_at(self, c, rows):
+        """enc 19 codes at arbitrary rows: group by block, decode each touched block's dictionary
+        only as far as its highest pointer, one jump per row"""
+        import wdb_kernels as _WK19
+        rows = np.asarray(rows, dtype=np.int64)
+        if rows.size == 0:
+            return np.empty(0, dtype=self._e19_dtype(c))
+        order = None
+        if rows.size > 1 and not bool((rows[1:] >= rows[:-1]).all()):
+            order = np.argsort(rows, kind='stable'); rs = rows[order]
+        else:
+            rs = rows
+        BR = int(c['e19BR'])
+        blk = rs // BR
+        starts = np.concatenate(([0], np.flatnonzero(blk[1:] != blk[:-1]) + 1, [rs.size])).astype(np.int64)
+        out = np.empty(rs.size, np.int64)
+        pw, dw = self._e19_words(c)
+        _WK19.e19_gather(pw, dw, np.int64(BR), np.int64(c['e19bits']), c['e19lb'], c['e19gw'],
+                         c['e19dc'], c['e19poff'], c['e19doff'], rs, starts, out)
+        if order is not None:
+            res = np.empty_like(out); res[order] = out; out = res
+        return out.astype(self._e19_dtype(c))
+
     def pair_bits(self, nm):
         """THE BIT READ (Jackson's declared clock, its purpose): for a pair
         column, decompress ONLY the delta and orientation streams. Returns
@@ -1107,8 +1159,8 @@ class Segment:
         elif enc in (15, 16):
             a = 3.4 * self.N * MSPB           # y/m/d + delta + bit streams
             b = 14e-6
-        elif enc == 17:
-            a = (c.get('czlen') or 0) * MSPB * 0.15   # mmap-direct unpack
+        elif enc in (17, 19):
+            a = (c.get('czlen') or 0) * MSPB * 0.15   # mmap-direct unpack (19: 247 MB in ~32 ms)
             b = 2e-6
         elif enc == 3:
             a = (c.get('czlen') or 0) * MSPB
@@ -1274,7 +1326,7 @@ class Segment:
             return self._e13_band(nm, lo, hi)
         if c.get('code_enc') == 14:
             return np.asarray(self.codes(nm))[lo:hi]
-        if c.get('code_enc') == 18:
+        if c.get('code_enc') in (18, 19):
             return self._raw_codes_range(nm, lo, hi)
         wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
         BR = int(c['BR']); base = c['cstart']; bo = c['boffs']
@@ -1871,6 +1923,12 @@ class Segment:
                 _WK18.pk32_gather(fb, bits18, rel, tmp)
                 out[a - lo:b - lo] = tmp
             return out
+        if c.get('code_enc', 0) == 19:               # block dictionaries: touched blocks only
+            if nm in self._codes:
+                return self._codes[nm][lo:hi]
+            if hi - lo > 8 * int(c['e19BR']):
+                return self._raw_codes(nm)[lo:hi]    # a wide window: the one-pass full decode
+            return self._e19_at(c, np.arange(lo, hi, dtype=np.int64))
         if c.get('code_enc', 0) == 10 and nm not in self._codes:
             import wdb_kernels as _WK             # window: gather the span only
             rowsW = np.arange(lo, hi, dtype=np.int64)
@@ -2071,6 +2129,8 @@ class Segment:
                 _pop18(np.arange(nt))
             inv = np.empty_like(order); inv[order] = np.arange(order.size)
             return out18[inv]
+        if c.get('code_enc', 0) == 19 and nm not in self._codes and rows.size < (self.N >> 2):
+            return self._e19_at(c, rows)             # BLOCK DICTIONARIES, AT ROWS: touched blocks only
         if c.get('code_enc', 0) != 3 or nm in self._codes or rows.size >= (self.N >> 2):
             # huge row sets: ONE full decode + one vectorized gather beats touching every
             # frame through a positional walk (sq-nested passed ~90M positions here)

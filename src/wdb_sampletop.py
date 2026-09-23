@@ -57,7 +57,7 @@ def detect(seg, tree, col_map):
     if bcol is None:
         return None
     acol = [c for c in gcols if c != bcol][0]
-    if seg.cols.get(acol, {}).get('code_enc') not in (0, 2, 3, 10, 12):
+    if seg.cols.get(acol, {}).get('code_enc') not in (0, 2, 3, 10, 12, 19):   # 19: point reads by block
         return None
     return {'b': bcol, 'a': acol, 'k': k, 'kinds': kinds,
             'proj': proj}
