@@ -81,9 +81,11 @@ class Segment:
             V = struct.unpack_from('<I',buf,off)[0]; off += 4
             bits = int(buf[off]); off += 1; dt = int(buf[off]); off += 1; mode = int(buf[off]); off += 1
             has_null = int(buf[off]); off += 1; aux = int(buf[off]); off += 1
-            chunked = bool(aux & 0x40); aux &= 0x3F            # bit6 = front-coded chunked dict
+            chunked = bool(aux & 0x40)                         # bit6 = front-coded chunked dict
+            fc3 = bool(aux & 0x80); aux &= 0x3F                # bit7 = THE THREE STREAMS (headers, mask, text)
+            assert not fc3 or chunked, ('three streams without chunks', nm)
             n_dict = V - has_null
-            meta = dict(V=V, bits=bits, dt=dt, mode=mode, has_null=has_null, n_dict=n_dict, aux=aux, chunked=chunked)
+            meta = dict(V=V, bits=bits, dt=dt, mode=mode, has_null=has_null, n_dict=n_dict, aux=aux, chunked=chunked, fc3=fc3)
             if mode == 0:
                 vals = []
                 for _ in range(n_dict):
@@ -150,14 +152,27 @@ class Segment:
                     nr = struct.unpack_from('<I',buf,off)[0]; off += 4
                     meta['restarts'] = buf[off:off+nr*4].view(np.uint32); off += nr*4
                     fclen = struct.unpack_from('<I',buf,off)[0]; off += 4
-                    meta['CHUNK'] = CH
+                    meta['CHUNK'] = CH; meta['nch'] = int(nch)
                     meta['chunk_ustart'] = buf[off:off+nch*4].view(np.uint32); off += nch*4
-                    czlen = buf[off:off+nch*4].view(np.uint32); off += nch*4
-                    meta['chunk_czlen'] = czlen
-                    foff = np.empty(nch+1, dtype=np.int64); foff[0] = 0
-                    np.cumsum(czlen.astype(np.int64), out=foff[1:])
-                    meta['chunk_foff'] = foff; meta['chunk_base'] = off
-                    off += int(foff[-1])
+                    if fc3:
+                        # THE THREE STREAMS: three length tables, then every chunk's headers, then
+                        # every chunk's mask, then every chunk's text -- each kind contiguous on disk.
+                        # The interleaved frame keys (chunk_foff/base/czlen) do not exist here: a
+                        # reader that has not learned the streams fails loudly instead of misreading.
+                        tabs = []
+                        for _k in range(3):
+                            zl3 = buf[off:off+nch*4].view(np.uint32); off += nch*4
+                            o3 = np.empty(nch+1, dtype=np.int64); o3[0] = 0
+                            np.cumsum(zl3.astype(np.int64), out=o3[1:]); tabs.append(o3)
+                        for _k, _key in enumerate(('fc3_h', 'fc3_m', 'fc3_t')):
+                            meta[_key] = (off, tabs[_k]); off += int(tabs[_k][-1])
+                    else:
+                        czlen = buf[off:off+nch*4].view(np.uint32); off += nch*4
+                        meta['chunk_czlen'] = czlen
+                        foff = np.empty(nch+1, dtype=np.int64); foff[0] = 0
+                        np.cumsum(czlen.astype(np.int64), out=foff[1:])
+                        meta['chunk_foff'] = foff; meta['chunk_base'] = off
+                        off += int(foff[-1])
                     meta['chunks'] = {}; meta['vals'] = None
                 else:
                     nr = struct.unpack_from('<I',buf,off)[0]; off += 4
@@ -402,14 +417,62 @@ class Segment:
             return np.full(N, ev, dtype=np.int64).view(f'datetime64[{unit}]')
         return np.full(N, v, dtype=object)           # string/bytes constant
 
+    def fc_part(self, c, j, kind):
+        """THE THREE STREAMS: chunk j's 'h' (headers: <cp u16><sl u16> per entry), 'm' (mask: one
+        bit per text byte, 1 = starts a character, packed little-endian, whole u64 words) or 't'
+        (text: the suffixes back to back), inflated alone -- np.uint8."""
+        import zstandard as _z
+        base, offs = c['fc3_' + kind]
+        fb = base + int(offs[j]); fe = base + int(offs[j + 1])
+        return np.frombuffer(_z.ZstdDecompressor().decompress(bytes(self.buf[fb:fe])), dtype=np.uint8)
+
+    def fc_chunk(self, c, j, as_bytes=False):
+        """chunk j of a chunked front-coded dictionary in the interleaved form <cp sl>+suffix, for
+        either layout (the three streams are rejoined byte-for-byte). np.uint8, or bytes."""
+        if c.get('fc3'):
+            import wdb_kernels as _WKj
+            h = self.fc_part(c, j, 'h'); t = self.fc_part(c, j, 't')
+            out = np.empty(h.size + t.size, np.uint8)
+            n = int(_WKj.fc3_join(h, t, out))
+            assert n == out.size, ('fc3_join size', n, out.size)
+            return out.tobytes() if as_bytes else out
+        import zstandard as _z
+        fb = c['chunk_base'] + int(c['chunk_foff'][j]); fe = c['chunk_base'] + int(c['chunk_foff'][j + 1])
+        raw = _z.ZstdDecompressor().decompress(bytes(self.buf[fb:fe]))
+        return raw if as_bytes else np.frombuffer(raw, dtype=np.uint8)
+
+    def fc_walkable(self, c, j):
+        """chunk j in the form a point walk wants: bytes (interleaved), or on the three streams the
+        pair (headers bytes, text bytes) -- RETURN reads the entries it needs, nothing is rejoined"""
+        if c.get('fc3'):
+            return (self.fc_part(c, j, 'h').tobytes(), self.fc_part(c, j, 't').tobytes())
+        return self.fc_chunk(c, j, as_bytes=True)
+
+    @staticmethod
+    def fc_walk(c, buf, j, g, upto):
+        """yield (entry code, full string) from restart g of chunk j up to code `upto`, either layout.
+        Three streams: entry e's header is at 4*(e - first code of the chunk); restart g's text starts
+        at its interleaved offset minus 4 bytes per entry before it in the chunk."""
+        R = int(c['R']); base = int(c['restarts'][g]) - int(c['chunk_ustart'][j]); prev = b''
+        if c.get('fc3'):
+            h, t = buf; e0 = g * R - j * int(c['CHUNK']); to = base - 4 * e0
+            for s in range(upto - g * R + 1):
+                cp, sl = struct.unpack_from('<HH', h, 4 * (e0 + s))
+                prev = prev[:cp] + t[to:to + sl]; to += sl
+                yield g * R + s, prev
+            return
+        o = base
+        for s in range(upto - g * R + 1):
+            cp, sl = struct.unpack_from('<HH', buf, o); o += 4
+            prev = prev[:cp] + buf[o:o + sl]; o += sl
+            yield g * R + s, prev
+
     def _decode_fc(self, c):
         R = c['R']
         if c.get('chunked'):
             vals = []
-            for j in range(len(c['chunk_czlen'])):
-                fb = c['chunk_base'] + int(c['chunk_foff'][j])
-                fe = c['chunk_base'] + int(c['chunk_foff'][j+1])
-                raw = self._dz.decompress(bytes(self.buf[fb:fe]))
+            for j in range(c['nch']):
+                raw = self.fc_chunk(c, j, as_bytes=True)
                 o = 0; i = 0; prev = b''
                 while o < len(raw):
                     if i % R == 0: prev = b''
@@ -451,8 +514,7 @@ class Segment:
                 res9 = np.zeros(int(c.get('n_dict', c['V'])), np.int64)
                 def _one9(p):
                     j, lo, n, _rl = p
-                    return int(_WK.fc_charlens(wdb_strings._chunk_bytes(self, nm, j), np.int64(R),
-                                               res9[lo:lo + n])) == n
+                    return wdb_strings.charlens_chunk(self, nm, p, res9[lo:lo + n]) == n
                 if not all(_leaf_pool().map(_one9, wdb_strings._chunk_plan(self, nm))):
                     return None
                 outs = [res9]
@@ -495,18 +557,15 @@ class Segment:
         outs = []
         try:
             if c.get('chunked'):
-                bufs = []
-                for j in range(len(c['chunk_czlen'])):
-                    fb = c['chunk_base'] + int(c['chunk_foff'][j])
-                    fe = c['chunk_base'] + int(c['chunk_foff'][j + 1])
-                    bufs.append(bytes(self.buf[fb:fe]))
-                def _one(fb2):
-                    raw = __import__('zstandard').ZstdDecompressor().decompress(fb2)
-                    a = np.frombuffer(raw, dtype=np.uint8)
-                    out = np.empty(a.size // 4 + 1, np.int64)
-                    n = _WK.fc_bytelens(a, np.int64(R), out)
-                    return out[:n]
-                outs = list(_pool().map(_one, bufs))
+                # byte lengths: on the three streams the headers alone (cp + sl)
+                import wdb_strings
+                res8 = np.zeros(int(c.get('n_dict', c['V'])), np.int64)
+                def _one(p):
+                    j, lo, n, _rl = p
+                    return wdb_strings.bytelens_chunk(self, nm, p, res8[lo:lo + n]) == n
+                if not all(_leaf_pool().map(_one, wdb_strings._chunk_plan(self, nm))):
+                    return None
+                outs = [res8]
             else:
                 raw = self._dz.decompress(c['z'])
                 a = np.frombuffer(raw, dtype=np.uint8)
@@ -657,12 +716,9 @@ class Segment:
         if 'restarts' not in c:
             raise KeyError('not front-coded')
         if c.get('chunked'):
-            nch = len(c['chunk_foff']) - 1
-            import zstandard as _z
+            nch = c['nch']
             def _dc(ch):
-                fb = c['chunk_base'] + int(c['chunk_foff'][ch])
-                fe = c['chunk_base'] + int(c['chunk_foff'][ch + 1])
-                return _z.ZstdDecompressor().decompress(bytes(self.buf[fb:fe]))
+                return self.fc_chunk(c, ch, as_bytes=True)
             bufs = list(_leaf_pool().map(_dc, range(nch)))
             blob = np.frombuffer(b''.join(bufs), dtype=np.uint8)
         else:
@@ -1696,13 +1752,10 @@ class Segment:
             CH = c['CHUNK']; j = code // CH
             buf = c['chunks'].get(j)
             if buf is None:
-                fb = c['chunk_base'] + int(c['chunk_foff'][j])
-                fe = c['chunk_base'] + int(c['chunk_foff'][j+1])
-                buf = self._dz.decompress(bytes(self.buf[fb:fe])); c['chunks'][j] = buf
-            R = c['R']; o = int(c['restarts'][code // R]) - int(c['chunk_ustart'][j]); prev = b''
-            for _ in range(code % R + 1):
-                cp, sl = struct.unpack_from('<HH', buf, o); o += 4
-                suf = buf[o:o+sl]; o += sl; prev = prev[:cp] + suf
+                buf = self.fc_walkable(c, j); c['chunks'][j] = buf
+            prev = b''
+            for _cd, prev in self.fc_walk(c, buf, j, code // c['R'], code):
+                pass
             return prev
         if c.get('raw') is None: c['raw'] = self._dz.decompress(c['z'])
         raw = c['raw']; R = c['R']; o = int(c['restarts'][code // R]); prev = b''
@@ -1772,10 +1825,7 @@ class Segment:
                 if len(missing) > 1:             # POOL the page pops: 321 serial pops
                     from concurrent.futures import ThreadPoolExecutor   # were 265ms of
                     def _popc(ch):               # j-dump; zstd releases the GIL
-                        import zstandard as _z
-                        fb = c['chunk_base'] + int(c['chunk_foff'][ch])
-                        fe = c['chunk_base'] + int(c['chunk_foff'][ch + 1])
-                        return ch, _z.ZstdDecompressor().decompress(bytes(self.buf[fb:fe]))
+                        return ch, self.fc_walkable(c, ch)
                     with ThreadPoolExecutor(max_workers=min(8, len(missing))) as ex:
                         for ch, buf2 in ex.map(_popc, missing):
                             c['chunks'][ch] = buf2
@@ -1786,17 +1836,21 @@ class Segment:
                 j = i
                 while j < len(wl) and wl[j] // R == rb:
                     j += 1
+                k = i
                 if chunked:
                     ch = cd // c['CHUNK']
                     buf = c['chunks'].get(ch)
                     if buf is None:
-                        fb = c['chunk_base'] + int(c['chunk_foff'][ch])
-                        fe = c['chunk_base'] + int(c['chunk_foff'][ch + 1])
-                        buf = self._dz.decompress(bytes(self.buf[fb:fe])); c['chunks'][ch] = buf
-                    o = int(restarts[rb]) - int(c['chunk_ustart'][ch])
-                else:
-                    buf = c['raw']; o = int(restarts[rb])
-                prev = b''; k = i
+                        buf = self.fc_walkable(c, ch); c['chunks'][ch] = buf
+                    for code_s, prev in self.fc_walk(c, buf, ch, rb, wl[j - 1]):
+                        if code_s == wl[k]:
+                            try: uv[k] = prev.decode('utf-8', 'surrogatepass')
+                            except Exception: uv[k] = prev
+                            k += 1
+                    i = j
+                    continue
+                buf = c['raw']; o = int(restarts[rb])
+                prev = b''
                 last_rel = wl[j - 1] - rb * R
                 for step in range(last_rel + 1):
                     cp, sl = struct.unpack_from('<HH', buf, o); o += 4

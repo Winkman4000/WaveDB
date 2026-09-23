@@ -67,8 +67,11 @@ def _column_spans(buf):
                 off += nr * 4
                 off += 4  # fclen
                 off += nch * 4  # chunk_ustart
-                czlen = np.asarray(buf[off:off + nch * 4]).view(np.uint32); off += nch * 4
-                off += int(czlen.astype(np.int64).sum())
+                tot = 0                                      # THE THREE STREAMS: three length tables
+                for _k in range(3 if (aux & 0x80) else 1):   # back to back, then the three regions
+                    czlen = np.asarray(buf[off:off + nch * 4]).view(np.uint32); off += nch * 4
+                    tot += int(czlen.astype(np.int64).sum())
+                off += tot
             else:
                 nr = struct.unpack_from('<I', buf, off)[0]; off += 4
                 off += nr * 4

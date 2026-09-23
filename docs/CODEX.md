@@ -2018,3 +2018,45 @@ which had hidden from the underscore-only sweep and carried across queries. It i
 the dictionary, not the dictionary itself: tier 2. The 874 ms is the honest number; the 458 was
 the leak. A/B (three fresh processes each, prev vs this commit): Q01, Q08, Q10, Q12, Q13, Q14
 identical; only Q27 moved.
+
+
+
+## THE THREE STREAMS (2026-09-23): headers, mask, text
+Jackson, on how identification should read a length: "capture the length by having a fixed width
+and then measuring the mask of each entry." A chunked front-coded dictionary (aux bit 0x80) is now
+stored as three streams per chunk, each kind contiguous on disk:
+  HEADERS  <cp u16><sl u16> per entry -- differentiation's positions, and every byte length (cp+sl)
+  MASK     one bit per text byte, 1 = the byte starts a character (its top two bits are not 10)
+  TEXT     the suffixes back to back
+The width is fixed in the READING: fc3_charlens takes the mask 64 bits at a time; a string's length
+in characters is the set bits of its suffix plus those of the prefix it shares, carried as a stack
+of pieces that empties at every restart (never more than R pieces). No text byte is read.
+The interleaved form is rejoined byte for byte (fc3_join) for readers that walk it; point reads
+(fetch, values_at) walk headers and text in place -- the restart offsets already index the text:
+restart g's text begins at its interleaved offset minus 4 bytes per entry before it in the chunk.
+On the new layout the interleaved frame keys do not exist, so an unlearned reader fails loudly.
+MEASURED before building (full dictionaries, zstd 9, today's chunk size):
+  size   dictionaries 1820 -> 1857 MB (+2.0%); string columns +1.3%; the file 8774.0 -> 8811.2 MB
+         (+0.42%). URL and OriginalURL SHRINK (the headers compress apart from the text); Title
+         +8.9% and SearchPhrase +4.8% of their columns (Cyrillic: the mask alternates 1,0).
+  length per dictionary (inflate + count vs headers + mask): URL 68 -> 12 ms, Referer 40 -> 15,
+         Title 31 -> 10 (1/8 samples); SearchPhrase 83 -> 27, OriginalURL 341 -> 37 (whole); bytes
+         read URL 63 -> 7.2 MB. 0 wrong everywhere.
+  REJECTED: fixed-width slots ON DISK -- padding each entry to its 128-block's longest costs
+         2.2-4.3x. The width belongs to the word, not the file.
+FOUND ON THE WAY (fixed, committed 9951554): fc_charlens carried continuation counts for a string's
+first 4096 bytes only (1 wrong OriginalURL length measured; URL holds 6950-byte strings), and
+fc_hostruns held 8192 bytes. Both now hold the format's bound, 131070.
+THE INLINE RACE MOVED: mode 5 is chosen when inline is smaller than dictionary + codes. On
+test_mode5's shared-200-byte-prefix data the three-stream dictionary (582 KB) now beats inline
+(605 KB), where the interleaved one (621 KB) lost: the race picked the dictionary, correctly. The
+test now uses high-entropy variable-length data (what mode 5 is for) and a new test pins the race.
+A/B, same code, cbdb_e19 -> cbdb_fc3 (bench/fc3_convert.py: every chunk verified to rejoin to the
+source bytes), fresh process each, median of 3:
+  Q27 first 1158 -> 840 ms, hot 906 -> 668      Q28 first 2258 -> 2131, hot 2099 -> 1989
+  Q17 252 -> 224; Q20-Q23 5-17% faster; Q24/Q26/Q33/Q36/Q37/Q39 within +-10 ms.
+  A first cut rejoined whole chunks for point reads: Q24/Q26 +12 ms, Q39 +41 -- fixed by walking
+  headers and text in place.
+WHERE Q27 GOES NOW (845 ms): the length read 193 ms (was ~550); a staircase check on a column that
+is not one 247 ms; a second route re-running the aggregation ~300 ms; pool thread start ~90 ms.
+Q28 still rejoins each chunk for the host walk -- step 2 reads the host from headers + text.

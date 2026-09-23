@@ -32,7 +32,7 @@ def _chunk_plan(seg, col):
     R = int(c['R']); V0 = int(c.get('n_dict') or c['V'])
     rs = np.asarray(c['restarts'], dtype=np.int64)
     us = np.asarray(c['chunk_ustart'], dtype=np.int64)
-    nch = int(len(c['chunk_foff']) - 1)
+    nch = int(c['nch'])
     g = np.searchsorted(rs, us, side='left')
     plan = []
     for j in range(nch):
@@ -44,10 +44,32 @@ def _chunk_plan(seg, col):
 
 
 def _chunk_bytes(seg, col, j):
-    import zstandard as _z
-    c = seg.cols[col]
-    fb = c['chunk_base'] + int(c['chunk_foff'][j]); fe = c['chunk_base'] + int(c['chunk_foff'][j + 1])
-    return np.frombuffer(_z.ZstdDecompressor().decompress(bytes(seg.buf[fb:fe])), dtype=np.uint8)
+    """chunk j interleaved (<cp sl>+suffix), either layout"""
+    return seg.fc_chunk(seg.cols[col], j)
+
+
+def charlens_chunk(seg, col, p, out):
+    """IDENTIFICATION, length in characters, for one chunk of the plan into out[:n]. On the three
+    streams: headers + mask only -- no text byte is read (Jackson's fixed width and mask)."""
+    import wdb_kernels as _WK
+    c = seg.cols[col]; j, lo, n, _rl = p; R = int(c['R'])
+    if c.get('fc3'):
+        h = seg.fc_part(c, j, 'h'); m = seg.fc_part(c, j, 'm')
+        assert h.size == 4 * n and m.size % 8 == 0, ('fc3 chunk shape', col, j, h.size, n, m.size)
+        return int(_WK.fc3_charlens(h.view(np.uint16), m.view(np.uint64), np.int64(R), out))
+    return int(_WK.fc_charlens(_chunk_bytes(seg, col, j), np.int64(R), out))
+
+
+def bytelens_chunk(seg, col, p, out):
+    """length in bytes for one chunk: on the three streams it is the headers alone (cp + sl)"""
+    import wdb_kernels as _WK
+    c = seg.cols[col]; j, lo, n, _rl = p
+    if c.get('fc3'):
+        h = seg.fc_part(c, j, 'h').view(np.uint16)
+        assert h.size == 2 * n, ('fc3 headers', col, j, h.size, n)
+        out[:n] = h[0::2].astype(np.int64) + h[1::2]
+        return n
+    return int(_WK.fc_bytelens(_chunk_bytes(seg, col, j), np.int64(c['R']), out))
 
 
 def identify_contains(seg, col, n1, n2=b''):
@@ -69,6 +91,11 @@ def identify_contains(seg, col, n1, n2=b''):
         return keep
     def _one(p):
         j, lo, n, rl = p
+        if c.get('fc3'):                         # headers + text, read in place: no rejoin
+            h = seg.fc_part(c, j, 'h').view(np.uint16)
+            assert h.size == 2 * n, ('fc3 headers', col, j, h.size, n)
+            _WK.plike_fc3(h, seg.fc_part(c, j, 't'), np.int64(R), a1, a2, keep[lo:lo + n])
+            return
         _WK.plike_fc_serial(_chunk_bytes(seg, col, j), rl, np.int64(R), np.int64(n), a1, a2, keep[lo:lo + n])
     list(wdb_engine._leaf_pool().map(_one, _chunk_plan(seg, col)))
     return keep

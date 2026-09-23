@@ -28,7 +28,7 @@ def test_chunked_dict_lossless_and_multichunk():
     seg, pq = _encode(_frame(), True)
     c = seg.cols['s']
     assert c['mode'] == 1 and c.get('chunked') is True
-    assert len(c['chunk_czlen']) >= 4
+    assert c['nch'] >= 4
     assert_lossless(seg, pq, 's')
 
 def test_chunked_matches_monolithic():

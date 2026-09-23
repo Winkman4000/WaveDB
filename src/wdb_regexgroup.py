@@ -291,10 +291,11 @@ def _derive_runs_one_read(seg, col, spec):
 
     def _one(p):
         j, lo, n, _rl = p
-        a = wdb_strings._chunk_bytes(seg, col, j)
-        m = (WK.fc_bytelens if strlen else WK.fc_charlens)(a, np.int64(R), lens[lo:lo + n])
+        # length: on the three streams headers + mask (characters) or headers alone (bytes)
+        m = (wdb_strings.bytelens_chunk if strlen else wdb_strings.charlens_chunk)(seg, col, p, lens[lo:lo + n])
         if int(m) != n:
             return None
+        a = wdb_strings._chunk_bytes(seg, col, j)   # the host walk: the interleaved chunk (step 2 moves it)
         cap = a.size // 4 + 2
         lcap = a.size * 3 + (1 << 16)
         for _try in range(4):                    # labels can outgrow the fc bytes: retry, tripled
@@ -353,15 +354,9 @@ def _derive_runs(seg, col, spec):
     R = int(c['R'])
     try:
         if c.get('chunked'):
-            bufs = []
-            for j in range(len(c['chunk_czlen'])):
-                fb = c['chunk_base'] + int(c['chunk_foff'][j])
-                fe = c['chunk_base'] + int(c['chunk_foff'][j + 1])
-                bufs.append(bytes(seg.buf[fb:fe]))
-            import zstandard as zstd
             from concurrent.futures import ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=8) as ex:
-                raws = list(ex.map(lambda b: zstd.ZstdDecompressor().decompress(b), bufs))
+                raws = list(ex.map(lambda j: seg.fc_chunk(c, j, as_bytes=True), range(c['nch'])))
         else:
             raws = [seg._dz.decompress(c['z'])]
     except Exception:

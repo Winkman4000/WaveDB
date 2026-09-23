@@ -33,6 +33,11 @@ CODE_ZSTD_LEVEL = int(os.environ.get('WDB_CODE_ZSTD', '9'))
 INLINE_ZSTD_LEVEL = 19  # mode-5 inline value blobs: the mode decision is a size race at the archival level
 CHUNK_DICT = bool(int(os.environ.get('WDB_CHUNK_DICT', '1')))   # block-segment front-coded dicts (default on; WDB_CHUNK_DICT=0 to opt out)
 CHUNK_DICT_VALS = 16384                                          # values per independent zstd frame (mult of R)
+# THE THREE STREAMS (Jackson, 2026-09-23): a chunked front-coded dictionary is written as headers,
+# a start-of-character mask, and text -- each chunk's three frames, each kind contiguous. Length is
+# read from headers + mask without a text byte; the interleaved form is rejoined byte-for-byte.
+# Measured on cbdb (all six chunked dictionaries): 1820 -> 1857 MB, +0.42% of the file.
+FC3_DICT = bool(int(os.environ.get('WDB_FC3', '1')))
 _INLINE_ENABLED = True  # mode-5 inline strings (toggleable for ablation/debug)
 
 def _int_dictionary(data):
@@ -213,6 +218,8 @@ def _prep_column(nm, col, allow_seq=True):
         mode = 0
     if mode == 1 and CHUNK_DICT:
         aux |= 0x40                                     # bit6 = write the dict as chunked zstd frames
+        if FC3_DICT:
+            aux |= 0x80                                 # bit7 = as THE THREE STREAMS
     return dict(nm=nm, dtype=dtype, has_null=has_null, V=V, valb=valb,
                 codes=codes.astype(np.uint32 if V < (1 << 32) else np.uint64), aux=aux, uniq=uniq, bits=bits, mode=mode)   # THE NARROW-CODES LAW: codes travel at the narrowest width
 
@@ -331,6 +338,29 @@ def _dict_bytes(p, zc):
             _lvl9 = getattr(zc, '_wdb_level', ZSTD_LEVEL)
             def _cz9(b):
                 return zstd.ZstdCompressor(level=_lvl9).compress(fc[b[0]:b[1]])
+            if p['aux'] & 0x80:
+                # THE THREE STREAMS: split each chunk into headers, mask and text, one frame each
+                import wdb_kernels as _WK3
+                def _cz3(jb):
+                    j, (b0, b1) = jb
+                    n = min(CH, V - j * CH)
+                    a = np.frombuffer(fc, dtype=np.uint8, count=b1 - b0, offset=b0)
+                    hdr = np.empty(4 * n, np.uint8); text = np.empty(b1 - b0 - 4 * n, np.uint8)
+                    mask = np.zeros(((text.size + 63) // 64) * 8, np.uint8)
+                    tl = int(_WK3.fc3_split(a, np.int64(n), hdr, text, mask))
+                    assert tl == text.size, ('fc3 split', p['nm'], j, tl, text.size)
+                    cz = zstd.ZstdCompressor(level=_lvl9)
+                    return cz.compress(hdr.tobytes()), cz.compress(mask.tobytes()), cz.compress(text.tobytes())
+                with ThreadPoolExecutor(max_workers=min(16, max(1, os.cpu_count() or 4))) as _ex9:
+                    trip = list(_ex9.map(_cz3, list(enumerate(bounds))))
+                out += struct.pack('<H', R) + struct.pack('<I', CH) + struct.pack('<I', n_chunks)
+                out += struct.pack('<I', nb) + rst.tobytes() + struct.pack('<I', len(fc))
+                out += np.array(ustart, dtype=np.uint32).tobytes()
+                for k in range(3):
+                    out += np.array([len(t3[k]) for t3 in trip], dtype=np.uint32).tobytes()
+                for k in range(3):
+                    for t3 in trip: out += t3[k]
+                return out
             with ThreadPoolExecutor(max_workers=min(16, max(1, os.cpu_count() or 4))) as _ex9:
                 frames = list(_ex9.map(_cz9, bounds))
             czl = [len(fr) for fr in frames]
@@ -1046,6 +1076,8 @@ def _arrow_string_prep(nm, chunked):
         aux |= 0x40      # THE CHUNK LAW: a big front-coded dictionary is written as independent zstd frames
                          # (CHUNK_DICT_VALS values each) so a lookup decompresses one frame, not 6M values
                          # (SearchPhrase <> '' on gov7: 0.34s = one 6M-value frame per probe; the reference 0.05s)
+        if FC3_DICT:
+            aux |= 0x80  # as THE THREE STREAMS
     return dict(nm=nm, dtype=1, has_null=has_null, V=V, valb=valb, codes=codes, aux=aux, uniq=uniq, bits=bits, mode=mode)
 
 

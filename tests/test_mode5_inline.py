@@ -35,11 +35,33 @@ def test_repetitive_string_stays_dict():
     assert seg.cols['s']['mode'] in (0, 1)
 
 def test_mode5_lossless_including_unicode_and_varlen():
-    rng = np.random.default_rng(2); pre = ['', 'a', 'café', '日本語', 'emoji😀', 'x'*200]
-    vals = [f'{rng.choice(pre)}_{v:016x}' for v in rng.integers(0, 2**63, 60000, dtype=np.int64)]
+    # high-entropy variable-length tails (0..208 hex chars): what mode 5 is for. (A shared 200-byte
+    # prefix is what front coding is for -- with the three streams that dictionary wins the race.)
+    rng = np.random.default_rng(2); pre = ['', 'a', 'café', '日本語', 'emoji😀']
+    ks = rng.integers(0, 14, 60000); hx = rng.integers(0, 2**63, (60000, 14), dtype=np.int64)
+    vals = [f'{rng.choice(pre)}_' + ''.join(f'{x:016x}' for x in hx[i, :ks[i]]) + f'{i:x}' for i in range(60000)]
     seg, w, pq = _enc(pd.DataFrame({'s': vals}))
     assert seg.cols['s']['mode'] == 5
     assert [x.decode('utf-8','surrogatepass') for x in seg.values('s')] == vals
+
+def test_inline_race_is_decided_by_size():
+    """the inline-vs-dictionary election computes both and keeps the smaller: a shared 200-byte
+    prefix front-codes away, and the three-stream dictionary (582 KB) beats inline (605 KB) here,
+    where the interleaved dictionary (621 KB) lost"""
+    import zstandard as Z
+    rng = np.random.default_rng(2); pre = ['', 'a', 'café', '日本語', 'emoji😀', 'x'*200]
+    vals = [f'{rng.choice(pre)}_{v:016x}' for v in rng.integers(0, 2**63, 60000, dtype=np.int64)]
+    seg, w, pq = _enc(pd.DataFrame({'s': vals}))
+    p = wdb_encode._prep_column('s', pd.Series(vals))
+    prev = wdb_encode._INLINE_ENABLED; wdb_encode._INLINE_ENABLED = False
+    try:
+        dict_len = len(wdb_encode._serialize_column(p, Z.ZstdCompressor(level=wdb_encode.ZSTD_LEVEL))[0])
+    finally:
+        wdb_encode._INLINE_ENABLED = prev
+    inline_len = len(wdb_encode._serialize_inline(p)[0])
+    assert seg.cols['s']['mode'] == (5 if inline_len < dict_len else 1), (inline_len, dict_len)
+    assert [x.decode('utf-8', 'surrogatepass') if isinstance(x, bytes) else x for x in
+            (seg.values('s') if seg.cols['s']['mode'] == 5 else [seg.fetch('s', int(c)) for c in seg.codes('s')])] == vals
 
 def test_mode5_queries_match_oracle():
     n = 150000; rng = np.random.default_rng(3)

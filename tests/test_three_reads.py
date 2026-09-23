@@ -52,7 +52,7 @@ def _dict(seg, col):
 def test_chunked_and_differentiation_is_code_order():
     seg, w, pq, df = _fixture()
     c = seg.cols['ref']
-    assert c['mode'] == 1 and c.get('chunked') and len(c['chunk_foff']) - 1 >= 3, (c['mode'], c.get('chunked'))
+    assert c['mode'] == 1 and c.get('chunked') and c['nch'] >= 3, (c['mode'], c.get('chunked'))
     d = _dict(seg, 'ref')
     assert d == sorted(d)                                  # code order IS string order (MIN/ORDER BY)
     codes = np.asarray(wdb_strings.differentiate(seg, 'ref'))

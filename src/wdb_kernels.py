@@ -3999,3 +3999,149 @@ def first_index(g, out):
         k = g[i]
         if out[k] < 0:
             out[k] = i
+
+
+# ---------------------------------------------------------------------------------------------
+# THE THREE STREAMS (Jackson, 2026-09-23): a front-coded dictionary chunk is stored as
+#   headers  <cp u16><sl u16> per entry          (what differentiates, and every byte length)
+#   mask     one bit per text byte, 1 = the byte starts a character   (every character length)
+#   text     the suffix bytes, back to back       (what identification reads when it must)
+# "capture the length by having a fixed width and then measuring the mask of each entry": the
+# width is fixed in the READING -- the mask is taken 64 bits at a time and a string's length is
+# the count of its set bits. The interleaved form is byte-for-byte recoverable (fc3_join).
+
+@njit(nogil=True, cache=True)
+def fc3_split(a, n, hdr, text, mask):
+    """one interleaved chunk (n entries) -> hdr (4n bytes), text, packed mask (little bit order).
+    mask must be zeroed and sized >= ceil(text/64)*8. Returns the text length."""
+    o = np.int64(0); t = np.int64(0)
+    for e in range(n):
+        hdr[4 * e] = a[o]; hdr[4 * e + 1] = a[o + 1]; hdr[4 * e + 2] = a[o + 2]; hdr[4 * e + 3] = a[o + 3]
+        sl = np.int64(a[o + 2]) | (np.int64(a[o + 3]) << 8)
+        o += 4
+        for q in range(sl):
+            x = a[o + q]
+            text[t] = x
+            if (x & 0xC0) != 0x80:
+                mask[t >> 3] |= np.uint8(1 << (t & 7))
+            t += 1
+        o += sl
+    assert o == a.size, 'fc3_split: chunk bytes not consumed exactly'
+    return t
+
+
+@njit(nogil=True, cache=True)
+def fc3_join(hdr, text, out):
+    """headers + text -> the interleaved chunk, byte-identical to what fc3_split was given"""
+    n = hdr.size // 4; o = np.int64(0); t = np.int64(0)
+    for e in range(n):
+        out[o] = hdr[4 * e]; out[o + 1] = hdr[4 * e + 1]; out[o + 2] = hdr[4 * e + 2]; out[o + 3] = hdr[4 * e + 3]
+        sl = np.int64(hdr[4 * e + 2]) | (np.int64(hdr[4 * e + 3]) << 8)
+        o += 4
+        for q in range(sl):
+            out[o + q] = text[t + q]
+        o += sl; t += sl
+    assert t == text.size, 'fc3_join: text not consumed exactly'
+    return o
+
+
+@njit(inline='always')
+def _pc64(x):
+    x = x - ((x >> np.uint64(1)) & np.uint64(0x5555555555555555))
+    x = (x & np.uint64(0x3333333333333333)) + ((x >> np.uint64(2)) & np.uint64(0x3333333333333333))
+    x = (x + (x >> np.uint64(4))) & np.uint64(0x0F0F0F0F0F0F0F0F)
+    return np.int64((x * np.uint64(0x0101010101010101)) >> np.uint64(56))
+
+
+@njit(inline='always')
+def _ones(w, a, b):
+    """set bits of the mask between bit a (inclusive) and bit b (exclusive), 64 at a time"""
+    if b <= a:
+        return np.int64(0)
+    wa = a >> 6; wb = (b - 1) >> 6
+    lo = np.uint64(0xFFFFFFFFFFFFFFFF) << np.uint64(a & 63)
+    hib = np.uint64(0xFFFFFFFFFFFFFFFF) >> np.uint64(63 - ((b - 1) & 63))
+    if wa == wb:
+        return _pc64(w[wa] & lo & hib)
+    s = _pc64(w[wa] & lo) + _pc64(w[wb] & hib)
+    for k in range(wa + 1, wb):
+        s += _pc64(w[k])
+    return s
+
+
+@njit(nogil=True, cache=True)
+def fc3_charlens(hdr16, w, R, out):
+    """character length of every entry of one chunk from its headers and mask -- no text byte read.
+    THE STRING AS PIECES: the previous string is a stack of pieces (where the piece starts in the
+    string, where its bits start in the mask, characters before it). An entry keeps [0, cp): pieces
+    starting at or after cp are dropped, the last kept piece is counted up to cp, the suffix is
+    pushed. The stack empties at every restart, so it never holds more than R pieces."""
+    n = hdr16.size // 2
+    ps = np.zeros(R + 1, np.int64); pb = np.zeros(R + 1, np.int64); pc = np.zeros(R + 1, np.int64)
+    top = 0; bit = np.int64(0)
+    for e in range(n):
+        cp = np.int64(hdr16[2 * e]); sl = np.int64(hdr16[2 * e + 1])
+        if e % R == 0:
+            top = 0
+        while top > 0 and ps[top - 1] >= cp:
+            top -= 1
+        before = np.int64(0)
+        if top > 0:
+            k = top - 1
+            before = pc[k] + _ones(w, pb[k], pb[k] + (cp - ps[k]))
+        ps[top] = cp; pb[top] = bit; pc[top] = before; top += 1
+        out[e] = before + _ones(w, bit, bit + sl)
+        bit += sl
+    return n
+
+
+@njit(nogil=True, cache=True)
+def plike_fc3(hdr16, text, R, n1, n2, keep):
+    """plike_fc_serial on the split streams: keep[i] = entry i contains n1 (then n2 after it).
+    Headers say where each suffix lands; the text is read in place. THE PREFIX CARRY: a match that
+    ended inside the shared prefix is inherited -- only new bytes are searched."""
+    n = hdr16.size // 2
+    L1 = n1.shape[0]; L2 = n2.shape[0]
+    prev = np.empty(131072, np.uint8)
+    t = np.int64(0); mend = np.int64(-1)
+    for e in range(n):
+        cp = np.int64(hdr16[2 * e]); sl = np.int64(hdr16[2 * e + 1])
+        if e % R == 0:
+            mend = np.int64(-1)
+        for q in range(sl):
+            prev[cp + q] = text[t + q]
+        t += sl
+        plen = cp + sl
+        p1 = np.int64(-1)
+        if mend >= 0 and mend <= cp:
+            p1 = mend
+            i = plen
+        else:
+            i = cp - L1 + 1
+            if i < 0:
+                i = 0
+        while i <= plen - L1:
+            k = 0
+            while k < L1 and prev[i + k] == n1[k]:
+                k += 1
+            if k == L1:
+                p1 = i + L1
+                break
+            i += 1
+        mend = p1
+        ok = False
+        if p1 >= 0:
+            if L2 == 0:
+                ok = True
+            else:
+                i = p1
+                while i <= plen - L2:
+                    k = 0
+                    while k < L2 and prev[i + k] == n2[k]:
+                        k += 1
+                    if k == L2:
+                        ok = True
+                        break
+                    i += 1
+        keep[e] = ok
+    return n
