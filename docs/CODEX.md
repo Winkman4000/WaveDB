@@ -2060,3 +2060,11 @@ source bytes), fresh process each, median of 3:
 WHERE Q27 GOES NOW (845 ms): the length read 193 ms (was ~550); a staircase check on a column that
 is not one 247 ms; a second route re-running the aggregation ~300 ms; pool thread start ~90 ms.
 Q28 still rejoins each chunk for the host walk -- step 2 reads the host from headers + text.
+THE BOARD (cbdb_fc3, vanilla, 43/43 exact; a second run -- the first after the kernels file changed
+recompiled Q08-Q14/Q18/Q23/Q30 again, the same signature as before, gone on the rerun):
+               the reads   the three streams    Umbra   ClickHouse   DuckDB native
+  first runs     34.5 s         34.2 s            5.8      17.8          47.9
+  hot            14.70 s        14.08 s           5.58     12.40         19.60
+  first-run wins: DuckDB 27/43, ClickHouse 12, Umbra 6.  hot wins: DuckDB 21, ClickHouse 15, Umbra 8.
+  moved (first / hot, ms): Q20 860->645 / 700->570; Q21 1282->1179 / 793->620; Q22 1815->1616 /
+  1281->1155; Q27 1180->840 / 874->649; Q18 3178->3365 first (not a string query).
