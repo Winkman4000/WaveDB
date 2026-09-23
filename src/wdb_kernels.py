@@ -2666,7 +2666,7 @@ def fc_charlens(a, R, out):
     (cp+sl) - continuation bytes, with the prefix chain's continuation counts carried
     in a cumulative buffer. No bytes object is ever built."""
     o = np.int64(0); i = np.int64(0); n = np.int64(0)
-    cum = np.zeros(4096, np.int64)               # cum[j] = continuation bytes in prev[:j]
+    cum = np.zeros(131072, np.int64)             # cum[j] = continuation bytes in prev[:j]; a string is at most 65535 + 65535 bytes (u16 cp + u16 sl)
     plen = np.int64(0)
     while o < a.size:
         if i % R == 0:
@@ -2680,8 +2680,7 @@ def fc_charlens(a, R, out):
             b = a[o + t]
             cont = np.int64(1) if (b & 0xC0) == 0x80 else np.int64(0)
             base2 = base + cont
-            if j + 1 < 4096:
-                cum[j + 1] = base2
+            cum[j + 1] = base2
             base = base2
             j += 1
         out[n] = (cp + sl) - base + (cum[cp] if cp <= plen else cum[plen])
@@ -2727,7 +2726,7 @@ def fc_hostruns(a, R, brk, hend, labuf, laboff, meta):
     survives, labelled host+\n). Runs continue only while the copy-prefix
     clears the slash AND the tail stays newline-clean."""
     o = np.int64(0); i = np.int64(0); nr = np.int64(0); lw = np.int64(0)
-    prev = np.zeros(8192, np.uint8)
+    prev = np.zeros(131072, np.uint8)   # the longest string the format can hold (u16 cp + u16 sl)
     plen = np.int64(0)
     W = np.int64(-2)          # current run's host-end (the slash); -2 = no run
     Whs = np.int64(-1)        # current run's host start
@@ -2744,8 +2743,7 @@ def fc_hostruns(a, R, brk, hend, labuf, laboff, meta):
             enl = pnl
         for t in range(sl):
             b9 = a[o + t]
-            if cp + t < 8192:
-                prev[cp + t] = b9
+            prev[cp + t] = b9
             if b9 == 10 and enl < 0 and W >= 0 and cp + t > W:
                 enl = cp + t
         o += sl
@@ -2771,7 +2769,7 @@ def fc_hostruns(a, R, brk, hend, labuf, laboff, meta):
             if plen > hs + 4 and prev[hs] == 119 and prev[hs+1] == 119 and prev[hs+2] == 119 and prev[hs+3] == 46:
                 hs += 4
             j2 = hs
-            while j2 < plen and j2 < 8192:
+            while j2 < plen and j2 < 131072:
                 if prev[j2] == 47:
                     he = j2
                     break
@@ -2780,7 +2778,7 @@ def fc_hostruns(a, R, brk, hend, labuf, laboff, meta):
                 hs = hs0
                 j2 = hs
                 he = np.int64(-1)
-                while j2 < plen and j2 < 8192:
+                while j2 < plen and j2 < 131072:
                     if prev[j2] == 47:
                         he = j2
                         break
@@ -2789,7 +2787,7 @@ def fc_hostruns(a, R, brk, hend, labuf, laboff, meta):
         bnl = np.int64(-1)
         if he > hs:
             j3 = he + 1
-            while j3 < plen and j3 < 8192:
+            while j3 < plen and j3 < 131072:
                 if prev[j3] == 10:
                     bnl = j3
                     break
