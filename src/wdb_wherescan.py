@@ -505,12 +505,11 @@ def _like_flags(seg, col, needle, kind='contains'):
             # sidecar, the old path decoded 18M URLs into Python objects to join a haystack --
             # 19 s, every process. The kernel walks the dictionary's own front-coded bytes: no
             # objects, blocks in parallel, nothing born.
-            import wdb_kernels as _WKl
-            blob, restarts = seg.dict_bytes(col)
-            V0 = int(c0.get('n_dict') or c0['V'])
-            keep = np.zeros(int(c0['V']), np.bool_)          # sized to every code (the null bin too)
-            _WKl.plike_fc(blob, restarts, int(c0['R']), V0, np.frombuffer(nd, np.uint8),
-                          np.empty(0, np.uint8), keep)
+            # THE THREE READS: identification over the dictionary AS STORED -- chunk by chunk as
+            # they decompress, prefix carry inside each chain, no whole-dictionary blob (the join
+            # of 2 GB of URL text was 1.4-2.3 s of every first LIKE).
+            import wdb_strings
+            keep = wdb_strings.identify_contains(seg, col, nd)
             memo[mk] = keep
             return keep
     hay, offs = _text_buffer(seg, col)

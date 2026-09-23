@@ -3885,3 +3885,119 @@ def e19_gather(pw, dw, BR, gbits, lb, gw, dcnt, poff, doff, rows, starts, out):
         loc = _e19_dict(dw, b, gbits, gw, dcnt, doff, mx)
         for j in range(s0, s1):
             out[j] = loc[out[j]]
+
+
+# ------------------------------------------------------------------------------------------------
+# THE THREE READS (Jackson, 2026-09-23): differentiation (codes), identification (a decision per
+# distinct string, decisive bytes only, inherited across a shared prefix), return (answer strings
+# only). The kernels below serve IDENTIFICATION over one front-coded dictionary chunk at a time --
+# a chunk's own bytes, as decompressed, never glued into a whole-dictionary blob.
+
+@njit(cache=True, nogil=True)
+def plike_fc_serial(buf, restarts, R, V, n1, n2, keep):
+    """plike_fc for ONE chunk on one thread (the chunk loop runs in a thread pool): keep[i] =
+    value i of this chunk contains n1 (then n2 after it). restarts are chunk-local offsets. THE
+    PREFIX CARRY: a match that ended inside the shared prefix is inherited -- only new bytes searched."""
+    nb = (V + R - 1) // R
+    L1 = n1.shape[0]; L2 = n2.shape[0]
+    prev = np.empty(131072, np.uint8)
+    for b in range(nb):
+        o = np.int64(restarts[b])
+        hi = min(R, V - b * R)
+        mend = np.int64(-1)
+        for step in range(hi):
+            cp = np.int64(buf[o]) | (np.int64(buf[o + 1]) << 8)
+            sl = np.int64(buf[o + 2]) | (np.int64(buf[o + 3]) << 8)
+            o += 4
+            for q in range(sl):
+                prev[cp + q] = buf[o + q]
+            o += sl
+            plen = cp + sl
+            p1 = np.int64(-1)
+            if mend >= 0 and mend <= cp:
+                p1 = mend
+                i = plen
+            else:
+                i = cp - L1 + 1
+                if i < 0:
+                    i = 0
+            while i <= plen - L1:
+                k = 0
+                while k < L1 and prev[i + k] == n1[k]:
+                    k += 1
+                if k == L1:
+                    p1 = i + L1
+                    break
+                i += 1
+            mend = p1
+            ok = False
+            if p1 >= 0:
+                if L2 == 0:
+                    ok = True
+                else:
+                    i = p1
+                    while i <= plen - L2:
+                        k = 0
+                        while k < L2 and prev[i + k] == n2[k]:
+                            k += 1
+                        if k == L2:
+                            ok = True
+                            break
+                        i += 1
+            keep[b * R + step] = ok
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def label_hash(blob, offs, out):
+    """FNV-1a 64 over each label blob[offs[r]:offs[r+1]] -- a bucket, never an identity"""
+    for r in prange(out.size):
+        h = np.uint64(14695981039346656037)
+        for i in range(offs[r], offs[r + 1]):
+            h ^= np.uint64(blob[i])
+            h *= np.uint64(1099511628211)
+        out[r] = h
+
+
+@njit(inline='always')
+def _label_eq(blob, offs, a, b):
+    la = offs[a + 1] - offs[a]
+    if la != offs[b + 1] - offs[b]:
+        return False
+    oa = offs[a]; ob = offs[b]
+    for k in range(la):
+        if blob[oa + k] != blob[ob + k]:
+            return False
+    return True
+
+
+@njit(cache=True, nogil=True)
+def label_groups(blob, offs, h, order, gid, rep):
+    """EXACT label groups: walk labels in hash order; inside one equal-hash bucket every label is
+    compared BYTE FOR BYTE with the bucket's representatives, so a collision can never merge two
+    different labels. gid[run] = group, rep[group] = a run carrying it. Returns the group count."""
+    n = order.size; G = 0; i = 0
+    while i < n:
+        j = i
+        while j < n and h[order[j]] == h[order[i]]:
+            j += 1
+        base = G
+        for t in range(i, j):
+            r = order[t]; found = -1
+            for g in range(base, G):
+                if _label_eq(blob, offs, r, rep[g]):
+                    found = g
+                    break
+            if found < 0:
+                rep[G] = r; found = G; G += 1
+            gid[r] = found
+        i = j
+    return G
+
+
+@njit(cache=True, nogil=True)
+def first_index(g, out):
+    """out[k] = the first position whose group is k (out pre-filled with -1): one pass, no sort"""
+    for i in range(g.size):
+        k = g[i]
+        if out[k] < 0:
+            out[k] = i

@@ -16,7 +16,7 @@ _DT_UNITS = ['us','ns','ms','s','D','h','m','M','Y','W']
 #   tier 1 is empty there by construction. WDB_HOT_KEEP=0 turns it off (the pure-cold A/B).
 #   TIER 2 -- everything a query COMPUTED (match flags, regex groupings, counts, position lists,
 #   frame maps, scanned hits, per-code function values, ranks): dies with the query, always.
-_SEG_PROGRAM = frozenset({'_synth', '_civil_lut_cache'})               # not data at all
+_SEG_PROGRAM = frozenset({'_synth', '_civil_lut_cache', '_shape'})     # not data at all
 _SEG_TIER1 = frozenset({'_e8pm', '_tdict'})                            # decoded planes, decoded dictionaries
 _COL_TIER1 = frozenset({'_dictbytes', '_steps', '_istream', '_idict', '_nline'})
 
@@ -303,6 +303,10 @@ class Segment:
             meta['blob'] = (blob0, off); self.cols[nm] = meta; self.order.append(nm)
         assert off == len(buf), ('segment parse did not consume the file', off, len(buf))
         self.buf = buf; self._codes = {}   # buf is a read-only np.memmap (uint8); code/dict reads fault lazily
+        # THE FILE'S SHAPE: every column-metadata key present when the parse ends. Any key added
+        # later is a query's (drop_derived removes it; the law's witness flags it) -- no naming
+        # convention needed ('charlens' hid from an underscore-only sweep).
+        self._shape = {nm: frozenset(c.keys()) for nm, c in self.cols.items()}
         self.path = path; self._presence = 0   # 0 = not yet loaded
         self._ov = 0                            # override sidecar: 0 = not yet loaded
         self._cluster = 0                       # .cluster slice-boundary sidecar: 0 = not loaded
@@ -361,8 +365,10 @@ class Segment:
             if k.startswith('_') and k not in sk and hasattr(v, 'clear') \
                     and isinstance(v, (dict, set, list)):
                 v.clear()
-        for c in self.cols.values():
-            for k in [k for k in c if k.startswith('_') and k not in ck]:
+        shape = self.__dict__.get('_shape') or {}
+        for nm, c in self.cols.items():
+            sh = shape.get(nm)
+            for k in [k for k in c if k not in ck and (k.startswith('_') or (sh is not None and k not in sh))]:
                 del c[k]
 
     def resident_values(self, nm):
@@ -438,18 +444,18 @@ class Segment:
         outs = []
         try:
             if c.get('chunked'):
-                bufs = []
-                for j in range(len(c['chunk_czlen'])):
-                    fb = c['chunk_base'] + int(c['chunk_foff'][j])
-                    fe = c['chunk_base'] + int(c['chunk_foff'][j + 1])
-                    bufs.append(bytes(self.buf[fb:fe]))
-                def _one(fb2):
-                    raw = __import__('zstandard').ZstdDecompressor().decompress(fb2)
-                    a = np.frombuffer(raw, dtype=np.uint8)
-                    out = np.empty(a.size // 4 + 1, np.int64)
-                    n = _WK.fc_charlens(a, np.int64(R), out)
-                    return out[:n]
-                outs = list(_pool().map(_one, bufs))
+                # THE THREE READS (identification, length): each chunk decompresses in its own
+                # worker and writes its lengths straight into its code range -- no upfront copies
+                # of every compressed chunk, the full leaf pool, no concatenation
+                import wdb_strings
+                res9 = np.zeros(int(c.get('n_dict', c['V'])), np.int64)
+                def _one9(p):
+                    j, lo, n, _rl = p
+                    return int(_WK.fc_charlens(wdb_strings._chunk_bytes(self, nm, j), np.int64(R),
+                                               res9[lo:lo + n])) == n
+                if not all(_leaf_pool().map(_one9, wdb_strings._chunk_plan(self, nm))):
+                    return None
+                outs = [res9]
             else:
                 raw = self._dz.decompress(c['z'])
                 a = np.frombuffer(raw, dtype=np.uint8)
@@ -670,17 +676,13 @@ class Segment:
     def like_mask_dict(self, nm, needles, invert=False):
         """Bool[N] for an ordered-needle LIKE on a front-coded dict column:
         the kernel tests V dictionary values, a LUT paints the rows."""
-        import wdb_kernels as _WKl
-        c = self.cols[nm]
-        blob, restarts = self.dict_bytes(nm)
-        V = int(c.get('n_dict') or c['V'])
-        n1 = np.frombuffer(needles[0].encode(), dtype=np.uint8)
-        n2 = (np.frombuffer(needles[1].encode(), dtype=np.uint8)
-              if len(needles) > 1 else np.empty(0, dtype=np.uint8))
-        keepd = np.empty(V, dtype=np.bool_)
-        _WKl.plike_fc(blob, restarts, int(c['R']), V, n1, n2, keepd)
+        import wdb_kernels as _WKl, wdb_strings
+        keepd = wdb_strings.identify_contains(self, nm, needles[0].encode(),
+                                              needles[1].encode() if len(needles) > 1 else b'')
         if invert:
             keepd = ~keepd
+            if self.cols[nm].get('has_null'):
+                keepd[int(self.cols[nm]['V']) - 1] = False   # NULL NOT LIKE x is not true
         cds = np.asarray(self.codes(nm))
         out = np.empty(cds.shape[0], dtype=np.bool_)
         _WKl.plut_u8(cds, keepd, out)

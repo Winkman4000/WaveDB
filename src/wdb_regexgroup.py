@@ -241,8 +241,11 @@ def _load_sidecar(seg, col, spec):
 def _save_sidecar(seg, col, spec, lens, lab_ids, uniq, empty_code):
     p = _sidecar_path(seg, col, spec)
     if not p: return
+    import wdb_sidecar
+    if not wdb_sidecar.may_build(p):
+        return                                   # THE VANILLA LAW, asked FIRST: the payload below
+                                                 # turned 3.0M labels into bytes (3.4 s) to be refused
     try:
-        import wdb_sidecar
         ub = [v if isinstance(v, (bytes, bytearray)) else str(v).encode() for v in uniq]
         uo = np.zeros(len(ub) + 1, np.int64); np.cumsum([len(v) for v in ub], out=uo[1:])
         nbytes = int(np.asarray(lab_ids).nbytes + np.asarray(lens).nbytes + uo[-1] + uo.nbytes)
@@ -255,6 +258,81 @@ def _save_sidecar(seg, col, spec, lens, lab_ids, uniq, empty_code):
 
 
 _CANON_PAT = '^https?://(?:www\\.)?([^/]+)/.*$'
+
+
+class _Labels:
+    """the distinct labels as ONE byte blob: a label becomes bytes only when asked for (THE RETURN
+    READ -- _emit asks only for the groups that survive HAVING)"""
+    def __init__(self, blob, offs, rep):
+        self.blob = blob; self.offs = offs; self.rep = rep
+    def __len__(self):
+        return int(self.rep.size)
+    def __getitem__(self, g):
+        r = int(self.rep[int(g)])
+        return self.blob[int(self.offs[r]):int(self.offs[r + 1])].tobytes()
+
+
+def _derive_runs_one_read(seg, col, spec):
+    """THE THREE READS, Q28: two properties of every distinct Referer -- its length and its host --
+    from ONE read of the dictionary as stored. Chunks decompress once, in parallel; the length
+    walk and the host-run walk (the prefix-run road: a host is inherited while the shared prefix
+    reaches past its slash) both run on the chunk while it is in cache; labels are grouped exactly
+    in a kernel (hash buckets, byte-for-byte inside a bucket); only the surviving groups' labels
+    ever become strings. The old road decompressed the dictionary twice, walked chunks serially and
+    grouped 3.1M labels as Python objects (~7 s). Returns None (the caller falls back) on surprise."""
+    import wdb_kernels as WK, wdb_strings, wdb_engine
+    c = seg.cols.get(col)
+    if c is None or c.get('R') is None or not c.get('chunked'):
+        return None
+    R = int(c['R']); nd = int(c.get('n_dict', c['V']))
+    strlen = spec.get('lenfn') == 'STRLEN'
+    lens = np.zeros(nd, np.int64)
+    plan = wdb_strings._chunk_plan(seg, col)
+
+    def _one(p):
+        j, lo, n, _rl = p
+        a = wdb_strings._chunk_bytes(seg, col, j)
+        m = (WK.fc_bytelens if strlen else WK.fc_charlens)(a, np.int64(R), lens[lo:lo + n])
+        if int(m) != n:
+            return None
+        cap = a.size // 4 + 2
+        lcap = a.size * 3 + (1 << 16)
+        for _try in range(4):                    # labels can outgrow the fc bytes: retry, tripled
+            brk = np.zeros(cap, np.uint8); hend = np.full(cap, -1, np.int32)
+            labuf = np.empty(lcap, np.uint8); laboff = np.empty(cap + 1, np.int64)
+            meta = np.zeros(1, np.int64)
+            nr = int(WK.fc_hostruns(a, np.int64(R), brk, hend, labuf, laboff, meta))
+            if int(meta[0]) != -1:
+                break
+            lcap *= 3
+        if int(meta[0]) != n:
+            return None
+        return brk[:n].copy(), labuf[:int(laboff[nr])].copy(), laboff[:nr + 1].copy(), nr
+
+    parts = list(wdb_engine._leaf_pool().map(_one, plan))
+    if any(p is None for p in parts):
+        return None
+    nrs = np.array([p[3] for p in parts], np.int64)
+    run_base = np.zeros(nrs.size + 1, np.int64); np.cumsum(nrs, out=run_base[1:])
+    ent_run = np.concatenate([np.cumsum(p[0], dtype=np.int64) - 1 + run_base[k] for k, p in enumerate(parts)])
+    if ent_run.size != nd:
+        return None                              # layout surprise: fail closed
+    blob = np.concatenate([p[1] for p in parts])
+    lb = np.array([p[2][-1] for p in parts], np.int64)
+    byte_base = np.zeros(lb.size + 1, np.int64); np.cumsum(lb, out=byte_base[1:])
+    offs = np.concatenate([p[2][:-1] + byte_base[k] for k, p in enumerate(parts)] + [byte_base[-1:]])
+    nrun = int(run_base[-1])
+    h = np.empty(nrun, np.uint64); WK.label_hash(blob, offs, h)
+    order = np.argsort(h)                        # bucket order only: groups are decided byte-exact
+    gid = np.empty(nrun, np.int64); rep = np.empty(nrun, np.int64)
+    G = int(WK.label_groups(blob, offs, h, order, gid, rep))
+    lab_ids = gid[ent_run]
+    counts = _code_counts(seg, col)
+    empty_code = None
+    e = np.nonzero(lens == 0)[0]
+    if e.size:
+        empty_code = int(e[0])
+    return counts, lens, lab_ids, _Labels(blob, offs, rep[:G]), empty_code
 
 
 def _derive_runs(seg, col, spec):
@@ -331,7 +409,9 @@ def _derive_runs(seg, col, spec):
 def _derive(seg, col, spec):
     import pandas as pd
     if spec.get('pat') == _CANON_PAT and spec.get('rep') in ('\\1', '\\g<1>'):
-        r9 = _derive_runs(seg, col, spec)
+        r9 = _derive_runs_one_read(seg, col, spec)
+        if r9 is None:
+            r9 = _derive_runs(seg, col, spec)
         if r9 is not None:
             global _RUNROAD
             _RUNROAD += 1
@@ -379,9 +459,10 @@ def _emit(seg, spec, counts, lens, lab_ids, uniq, empty_code):
         w = w.copy(); w[empty_code] = 0              # WHERE col <> ''
     gcnt = np.bincount(lab_ids, weights=w, minlength=G).astype(np.int64)
     glen = np.bincount(lab_ids, weights=w * lens, minlength=G)
-    first = np.unique(lab_ids, return_index=True)
     min_code = np.full(G, -1, np.int64)
-    min_code[lab_ids[first[1]]] = first[1]           # first occurrence in code order = MIN value
+    import wdb_kernels as _WKe
+    _WKe.first_index(np.ascontiguousarray(lab_ids, dtype=np.int64), min_code)   # first code in code
+                                                     # order = MIN value (order is differentiation)
     keep = np.nonzero(gcnt > (spec['hmin'] or 0))[0] if spec['hmin'] is not None else np.nonzero(gcnt > 0)[0]
     keep = keep[gcnt[keep] > 0]
     rows = []

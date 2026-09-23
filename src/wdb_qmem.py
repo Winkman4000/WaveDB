@@ -117,9 +117,11 @@ def audit(db):
         for k, v in seg.__dict__.items():
             if k.startswith('_') and k not in keep and isinstance(v, (dict, set, list)) and len(v):
                 out.append(('segment', k, len(v)))
+        shape = seg.__dict__.get('_shape') or {}
         for nm, c in seg.cols.items():
+            sh = shape.get(nm)
             for k in c:
-                if k.startswith('_') and k not in ckeep:
+                if k not in ckeep and (k.startswith('_') or (sh is not None and k not in sh)):
                     out.append(('column', '%s.%s' % (nm, k), 1))
     for a in ('_ptr_cache', '_gd_cache', '_union_cache', '_dc_ctx', '_uniq_memo'):
         d = getattr(db, a, None)

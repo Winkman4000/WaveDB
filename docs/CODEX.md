@@ -1972,3 +1972,36 @@ THE BOARD (cbdb_e19, vanilla, 43/43 exact):
 The hot that is left above this morning's is exactly the illegal memos: Q20-Q23 at 1.0-1.6 s (a
 LIKE memo had them at 59-433 ms), Q28 at 6.1 s (a regex memo had it at 0.35). That is the string
 family, and it is the cold work: LIKE and REGEXP over the dictionary as stored.
+
+
+
+## THE THREE READS (2026-09-23): the only ways to touch a string
+Jackson: "first thing is just diffrentiation, this is not returning the value and only requires
+reading enough information such that you can tell one thing apart from another, and then there is
+reading the value to return it as a result, and last but not least there is identification ...
+we should read only the bytes needed to make an identity known inside a block by seeing that it
+cannot be any other string in the block."
+wdb_strings.py holds the three:
+  DIFFERENTIATE (differentiate): the codes. Dictionaries are sorted, so equality, grouping, order,
+    MIN and MAX are all differentiation -- no string byte is read.
+  IDENTIFY (identify_contains): a decision per DISTINCT string, taken chunk by chunk on the
+    front-coded dictionary as stored ([cp u16][sl u16][suffix], restart every 128). Each chunk
+    (a zstd frame of 16,384 values, asserted to begin on a restart) is decided in parallel by
+    plike_fc_serial, which carries the shared prefix instead of rebuilding each string. No join,
+    no string array. The rows then take the answer by code.
+  RETRIEVE (retrieve): the answer strings only, after the result is known.
+Sites moved onto identify: wherescan _like_flags and engine like_mask_dict (LIKE / NOT LIKE; the
+null bin is false under NOT), dict_charlens (chunk plan on the leaf pool), and Q28's REGEXP host
+road (_derive_runs_one_read: per-chunk lengths + host runs, then an FNV-1a label hash, argsort and
+an exact byte comparison inside each hash bucket -- 3,009,018 groups, 0 mismatches vs the old road).
+_save_sidecar now asks may_build BEFORE it builds 3M labels (it spent 3.4 s to be told no), and
+_emit takes first positions with a kernel instead of np.unique.
+THE LAW, tightened: drop_derived also sweeps column-meta keys absent from the parse-time _shape
+(charlens hid from the underscore-only sweep); the witness checks the same.
+MEASURED (fresh process each, cbdb_e19, vanilla, exact vs DuckDB):
+  URL LIKE '%google%' identify 2.1 -> 0.51 s
+  Q20 first 805 ms, hot ~630     Q23 first 1.35 s, hot ~580     Q22 first ~3.6 s, hot ~1.2
+  Q27 first 1.19 s, hot ~0.9     Q28 first 7.4 -> 2.06 s, hot 6.1 -> 1.88 s
+REJECTED by measurement: fc_charlens2 (a two-pass length kernel) -- Title 0.73 -> 1.58 s. Removed.
+WHAT IS LEFT in identify: the chunk's zstd decompression now dominates. The next cut is the
+dictionary's own layout, so identify can read the decisive bytes without inflating whole chunks.
