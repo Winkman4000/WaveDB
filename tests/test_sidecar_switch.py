@@ -205,3 +205,64 @@ def test_load_statistics_are_data():
             v = vals[j * BR:(j + 1) * BR]
             assert st['cnt'][j] == v.size and st['nn'][j] == v.size
             assert abs(st['sum'][j] - float(v.sum())) < 1e-6, j
+
+
+def test_vanilla_positions_build_no_lists():
+    """THE VANILLA LAW, the position lists: with the switch off the funnel's positions come from
+    a scan of the blocks whose load-time min/max can hold the code -- exact, windowed, and nothing
+    built: _plist refuses (FAIL-LOUD), the frame-presence map declines, no memo is left behind."""
+    import numpy as np, wdb_funnel, wdb_fpm
+    from wdb_engine import Segment
+    db, con, d = _fixture()
+    with _NoEnv():
+        wdb_sidecar.set_setting(d, 'off')
+        sp = os.path.join(d, 'fact_0.wdb')
+        for f in os.listdir(d):
+            if f.endswith('.plist') or f.endswith('.fpm'):
+                os.remove(os.path.join(d, f))
+        seg = Segment(sp)
+        for col in ('dimid', 'k'):                     # (dimid may be a mode-4 sequence; k a dictionary)
+            codes = np.asarray(seg._raw_codes(col)).astype(np.int64)
+            for code in (int(codes[12345]), int(codes[0]), int(codes[-1])):
+                assert np.array_equal(wdb_funnel.positions(seg, col, code), np.flatnonzero(codes == code)), (col, code)
+                exp = np.flatnonzero(codes == code); exp = exp[(exp >= 1000) & (exp < 40000)]
+                assert np.array_equal(wdb_funnel.positions(seg, col, code, 1000, 40000), exp), (col, code)
+        codes = np.asarray(seg._raw_codes('dimid')).astype(np.int64)
+        assert not wdb_funnel.plist_ready(seg, 'dimid')
+        try:
+            wdb_funnel._plist(seg, 'dimid'); raise RuntimeError('the plist was built under vanilla')
+        except AssertionError:
+            pass
+        assert wdb_fpm.eq_positions(seg, 'dimid', int(codes[7])) is None
+        assert not seg.__dict__.get('_plistmemo')
+        assert _derived(d) == [] or all(not f.endswith(('.plist', '.fpm')) for f in _derived(d))
+
+
+def test_vanilla_sample_draws_exact_counts():
+    """THE VANILLA DRAW: a LIMIT with no ORDER BY over (int, sparse string) samples from the sparse
+    dress's stored rows -- no position lists -- and every returned count is the exact count."""
+    import numpy as np, pandas as pd, wdb_sampletop
+    con = duckdb.connect()
+    d = os.path.join(tempfile.gettempdir(), f'sidesw_st_{uuid.uuid4().hex[:8]}'); os.makedirs(d)
+    rng = np.random.default_rng(17); n = 200_000
+    ph = rng.integers(0, 3000, n)
+    df = pd.DataFrame({'u': rng.integers(0, 5000, n).astype(np.int64),
+                       'sp': np.where(rng.random(n) < 0.15, np.char.add('phrase-', ph.astype(str)), '')})
+    con.register('t', df)
+    pq = os.path.join(d, 't.parquet'); df.to_parquet(pq, index=False)
+    with _NoEnv():
+        db = Database.create(d)
+        db.cat.add_table('t', [['u', 'int'], ['sp', 'string']])
+        wdb_encode.encode(pq, os.path.join(d, 't_0.wdb')); db.cat.add_segment('t', 't_0.wdb'); os.remove(pq)
+        wdb_sidecar.set_setting(d, 'off')
+        db = Database.open(d)
+        from wdb_engine import Segment
+        assert Segment(os.path.join(d, 't_0.wdb')).cols['sp']['code_enc'] in (8, 9)
+        h0 = wdb_sampletop._HITS
+        rows = db.run("SELECT u, sp, COUNT(*) FROM t GROUP BY u, sp LIMIT 10")[0]
+        assert wdb_sampletop._HITS > h0, 'the sample lane did not serve'
+        assert len(rows) == 10
+        for u, s, n in rows:
+            exp = con.execute("SELECT COUNT(*) FROM t WHERE u = ? AND sp = ?", [int(u), str(s)]).fetchone()[0]
+            assert int(n) == exp, (u, s, n, exp)
+        assert _derived(d) == []

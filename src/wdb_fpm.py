@@ -73,6 +73,10 @@ def eq_positions(seg, col, code):
     global _HITS
     if not _eligible(seg, col):
         return None
+    import wdb_sidecar
+    if (seg.path, col) not in _CACHE and not os.path.exists(_path(seg, col)) \
+            and not wdb_sidecar.may_build(_path(seg, col)):
+        return None                              # THE VANILLA LAW: the map is not built to answer
     c = seg.cols[col]
     N = int(seg.N); BR = int(c['BR'])
     bits = _load_or_birth(seg, col)

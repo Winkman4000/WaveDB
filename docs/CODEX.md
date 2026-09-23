@@ -1882,3 +1882,32 @@ A/B on the UserID queries, in process, best of 5, results identical: Q08 579 -> 
 UserID redressed only (cbdb_e19): 43/43 exact, 9.22 -> 8.42 s, 39 of 43 faster than DuckDB (37.1
 s). Q27/Q30/Q33/Q37/Q39 read +35..63 on the board and -47..+11 in process A/B: host noise (load
 average 38 from other tenants). Suite 1719/0.
+
+
+
+## THE LISTS ARE NOT BUILT (2026-09-23): the vanilla law, second sweep
+Scoping the short queries against Umbra (Q07/Q19/Q37-Q41 at 30-95 ms vs its 2-6) found the first
+run of Q37 at 6.1 s with the data in page cache: import 3.2 s, segment open 0.6 s, and 5.0 s of
+wdb_funnel._plist -- a 100M-row argsort building every CounterID's position list, "RAM only" with
+the switch off, then memoized on the Segment for the life of the process (drop_derived never
+cleared _plistmemo). Every later funnel query rode it; the board's "warm" 30-90 ms were warm-INDEX
+numbers. THE VANILLA LAW forbids exactly this, and the first sweep missed it; wdb_fpm (the frame-
+presence map: a full decode + a Python loop over 1,526 frames) was the same species.
+THE FIX: positions(seg, col, code, lo, hi) -- the lists when they may serve (loaded, on disk, or
+the switch allows the birth); otherwise the load statistics' per-block min/max pick the blocks
+that can hold the code (CounterID = 62: 386 of 3,052), clipped to the staircase window computed
+FIRST, and the frame scan reads only those. _plist asserts may_build (FAIL-LOUD); fpm declines
+under vanilla; pairfold's plist lane requires plist_ready; sampletop (Q17) draws from the sparse
+dress's own stored rows -- a census of its 13M literal codes, rejection-sampled small codes (a
+permutation of 6M eligible codes cost 115 ms), one flagged pass for every slice, each COMPLETE so
+each count is exact. The mode-4 trap the test caught: a sequence's load min/max are VALUES while
+its codes are positions -- positions() prunes only dictionary columns (modes 0/2).
+THE BOARD, vanilla (cbdb_e19), 43/43 exact: hot 8.42 -> 8.61 s (the honest price of finding the
+rows: Q14 224 -> 396 via pairfold, Q36 72 -> 163, Q40 95 -> 126, Q42 34 -> 61; Q37 98 -> 77);
+COLD 130.8 -> 75.5 s (Q37 5.9 s -> 566 ms, Q38 6.0 s -> 527, Q40 6.1 s -> 664, Q17 3.9 s -> 601,
+Q14 4.1 s -> 1.2 s). 38 of 43 faster than DuckDB. Suite 1721/0 (+2: positions exact and windowed
+on a sequence and a dictionary, _plist refuses, fpm declines, no memo left; the vanilla sample's
+every count equals DuckDB's).
+WHAT REMAINS OF THE SWEEP: ~30 Segment memos and module caches outlive the query in wdb_qmem's
+terms (Jackson's law: "when the outermost run() returns it is as if the query was never there").
+To be measured, not read: run the 43 in one process and list what still holds data after each.

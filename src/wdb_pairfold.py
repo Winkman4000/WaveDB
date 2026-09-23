@@ -123,7 +123,8 @@ def execute(seg, spec):
     # zero N-arrays, nothing to purge.
     if not spec.get('scols') and seg.cols.get(spec['a'], {}).get('code_enc') == 3 \
             and seg.cols.get(spec['b'], {}).get('code_enc') == 8 \
-            and int(seg.cols[spec['a']].get('V') or 999) <= 256:
+            and int(seg.cols[spec['a']].get('V') or 999) <= 256 \
+            and __import__('wdb_funnel').plist_ready(seg, spec['b']):    # THE VANILLA LAW: lists that may serve
         import wdb_funnel as _F
         offsB, plB = _F._plist(seg, spec['b'])
         offsB = np.asarray(offsB, dtype=np.int64)

@@ -56,6 +56,9 @@ def detect(seg, tree, col_map):
             bcol = c
     if bcol is None:
         return None
+    import wdb_funnel as _F
+    if not _F.plist_ready(seg, bcol) and seg.cols[bcol].get('code_enc') not in (8, 9):
+        return None                      # THE VANILLA LAW: no lists, and no stored planes to draw from
     acol = [c for c in gcols if c != bcol][0]
     if seg.cols.get(acol, {}).get('code_enc') not in (0, 2, 3, 10, 12, 19):   # 19: point reads by block
         return None
@@ -63,9 +66,56 @@ def detect(seg, tree, col_map):
             'proj': proj}
 
 
+def _draws_from_planes(seg, b, k, rng):
+    """THE VANILLA DRAW: the sparse dress already stores the non-default rows and their codes.
+    A census of those codes (query-own, forgotten), k random small codes, ONE flagged pass for
+    all their rows. Returns [(code, rows)] -- every slice COMPLETE, so every count is exact."""
+    import wdb_kernels as _WK
+    pos, lits, dflt = seg.e8_planes(b)
+    lits = np.asarray(lits); V = int(seg.cols[b]['V'])
+    cnt = _WK.bincount_par(lits, V)
+    if 0 <= int(dflt) < V:
+        cnt[int(dflt)] = 0
+    pick = np.empty(0, np.int64)
+    for cap in (max(64, 4 * k), 200000):         # tiny slices first, then anything countable
+        for _ in range(8):                       # rejection draws: never order the whole census
+            cand = rng.integers(0, V, 64 * k)    # (a permutation of 6M eligible codes cost 115 ms)
+            ok = cand[(cnt[cand] > 0) & (cnt[cand] <= cap)]
+            pick = np.unique(np.concatenate([pick, ok]))
+            if pick.size >= k:
+                break
+        if pick.size >= k:
+            break
+    if pick.size < k:                            # a sparse census: take what exists, exactly
+        elig = np.flatnonzero((cnt > 0) & (cnt <= 200000))
+        pick = np.unique(np.concatenate([pick, elig[:k]]))
+    pick = rng.permutation(pick)[:k]             # each code yields at least one pair
+    flag = np.zeros(V, np.bool_); flag[pick] = True
+    m = flag[lits]
+    rows = np.asarray(pos)[m]; cs = lits[m]
+    o = np.argsort(cs, kind='stable'); rows = rows[o]; cs = cs[o]
+    out = []
+    for c in pick.tolist():
+        a = np.searchsorted(cs, c, 'left'); z = np.searchsorted(cs, c, 'right')
+        out.append((int(c), rows[a:z].astype(np.int64)))
+    return out
+
+
 def execute(seg, spec):
     global _HITS
     import wdb_funnel as _F
+    if not _F.plist_ready(seg, spec['b']):
+        rng = np.random.default_rng(); k = spec['k']; pairs = {}
+        for c, rows9 in _draws_from_planes(seg, spec['b'], k, rng):
+            if len(pairs) >= k:
+                break
+            ac9 = np.asarray(seg.codes_at(spec['a'], rows9)).astype(np.int64)
+            u9, n9c = np.unique(ac9, return_counts=True)
+            for aa, nn in zip(u9.tolist(), n9c.tolist()):
+                if len(pairs) >= k:
+                    break
+                pairs[(c, aa)] = int(nn)
+        return _emit(seg, spec, pairs)
     offsB, plB = _F._plist(seg, spec['b'])
     offsB = np.asarray(offsB, dtype=np.int64)
     cnt_b = np.diff(offsB)
@@ -90,6 +140,12 @@ def execute(seg, spec):
             if len(pairs) >= k:
                 break
             pairs[(c, aa)] = int(nn)
+    return _emit(seg, spec, pairs)
+
+
+def _emit(seg, spec, pairs):
+    global _HITS
+    k = spec['k']
     out = []
     for (bc, ac), nn in list(pairs.items())[:k]:
         vb = seg.fetch(spec['b'], bc)

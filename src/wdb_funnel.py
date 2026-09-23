@@ -34,6 +34,44 @@ def _plist_path(seg, col):
     return seg.path + '.%s.plist' % col
 
 
+def plist_ready(seg, col):
+    """The position lists may serve: already loaded, on disk, or the switch allows their birth."""
+    if col in seg.__dict__.get('_plistmemo', {}):
+        return True
+    p = _plist_path(seg, col)
+    import wdb_sidecar
+    return os.path.exists(p) or wdb_sidecar.may_build(p)
+
+
+def positions(seg, col, code, lo=0, hi=None):
+    """Row positions in [lo, hi) where col's code == `code`, ascending. From the position lists
+    when they may serve; otherwise (THE VANILLA LAW) a scan of only the blocks whose load-time
+    min/max can hold the code, then the frames covering them -- nothing built, nothing kept."""
+    hi = int(seg.N) if hi is None else int(hi)
+    if plist_ready(seg, col):
+        offs, plist = _plist(seg, col)
+        crumb = plist[int(offs[code]):int(offs[code + 1])]
+        a = np.searchsorted(crumb, lo, side='left'); b = np.searchsorted(crumb, hi, side='left')
+        return crumb[a:b].astype(np.int64)
+    import wdb_blockstats, wdb_wherescan
+    # the load statistics' min/max are CODES only for dictionary columns (modes 0/2); a mode-4
+    # sequence keeps VALUES there while its codes are positions -- no pruning on it
+    st = wdb_blockstats._from_load(seg, col) if seg.cols[col].get('mode') in (0, 2) else None
+    if st is None:
+        return np.asarray(wdb_wherescan._scan_eq(seg, col, int(code), lo, hi), dtype=np.int64)
+    BR = wdb_blockstats._BR
+    hit = np.flatnonzero((st['cmin'] <= code) & (st['cmax'] >= code))
+    hit = hit[(hit * BR < hi) & ((hit + 1) * BR > lo)]
+    if hit.size == 0:
+        return np.empty(0, np.int64)
+    brk = np.flatnonzero(np.diff(hit) != 1) + 1               # contiguous runs of candidate blocks
+    out = []
+    for r in np.split(hit, brk):
+        a = max(lo, int(r[0]) * BR); b = min(hi, (int(r[-1]) + 1) * BR)
+        out.append(np.asarray(wdb_wherescan._scan_eq(seg, col, int(code), a, b), dtype=np.int64))
+    return np.concatenate(out)
+
+
 def _plist(seg, col):
     """Position lists per code for a selector column; birth-on-touch, ledgered."""
     memo = seg.__dict__.setdefault('_plistmemo', {})
@@ -43,15 +81,15 @@ def _plist(seg, col):
     p = _plist_path(seg, col)
     V = int(seg.cols[col]['V'])
     if not os.path.exists(p):
+        import wdb_sidecar
+        # THE VANILLA LAW (FAIL-LOUD): with the switch off no read builds the position lists --
+        # not on disk, not "RAM only". Callers ask plist_ready() and take positions()' scan.
+        assert wdb_sidecar.may_build(p), ('THE VANILLA LAW: plist build refused', col)
         cc = np.asarray(seg._raw_codes(col)).astype(np.int64)
         order = np.argsort(cc, kind='stable')    # row order preserved per code
         cnts = np.bincount(cc, minlength=V)
         offs = np.zeros(V + 1, np.int64)
         np.cumsum(cnts, out=offs[1:])
-        import wdb_sidecar
-        if not wdb_sidecar.births_on(os.path.dirname(p)):
-            hit = (offs, order.astype(np.uint32)); memo[col] = hit          # THE SWITCH: RAM only
-            return hit
         tmp = p + '.tmp'
         with open(tmp, 'wb') as f:
             f.write(np.array([V], np.int64).tobytes())
@@ -411,12 +449,9 @@ def execute(seg, spec):
     _t9 = _tm.perf_counter()
     scol, sval = spec['sel']
     code = _code_of(seg, scol, sval)
-    if code is None:
-        crumb = np.empty(0, np.int64)
-    else:
-        offs, plist = _plist(seg, scol)
-        crumb = plist[int(offs[code]):int(offs[code + 1])].astype(np.int64)
-    # staircase windows: the crumb is row-ordered, so a range is a slice
+    # staircase windows first: each is a row range, their intersection is the only span
+    # the selector's positions are asked for (vanilla scans just that span)
+    wlo, whi = 0, int(seg.N)
     for rcol, (lo9, hi9) in spec['rng'].items():
         steps = np.asarray(seg.stairs(rcol), dtype=np.int64)
         full = np.concatenate([[0], steps, [seg.N]])
@@ -439,9 +474,11 @@ def execute(seg, spec):
             import bisect
             c9 = bisect.bisect_right(vals, _tov(hi9[0]) - (1 if hi9[1] else 0))
             rhi = int(full[c9])
-        a = np.searchsorted(crumb, rlo, side='left')
-        b = np.searchsorted(crumb, rhi, side='left')
-        crumb = crumb[a:b]
+        wlo = max(wlo, rlo); whi = min(whi, rhi)
+    if code is None or wlo >= whi:
+        crumb = np.empty(0, np.int64)
+    else:
+        crumb = positions(seg, scol, code, wlo, whi)
     _LG.stage('crumb', (_tm.perf_counter() - _t9) * 1000); _t9 = _tm.perf_counter()
     # hygiene at the crumb: point reads, never the column. When the first
     # two flags are enc-10 scalar tests, ONE fused walk serves both with
@@ -1324,11 +1361,7 @@ def _execute_trunc(seg, spec):
         # THE PLIST START (the counter's own law finishing the job): the
         # crumb's positions are already on the shelf -- no selector frames
         # pop at all. Window = two searchsorteds on the row-ordered list.
-        offs, plist = _plist(seg, scol)
-        crumb = plist[int(offs[code]):int(offs[code + 1])]
-        a9 = np.searchsorted(crumb, rlo, side='left')
-        b9 = np.searchsorted(crumb, rhi, side='left')
-        crumb = crumb[a9:b9].astype(np.int64)
+        crumb = positions(seg, scol, code, rlo, rhi)   # the window first: vanilla scans only it
     else:
         crumb = np.empty(0, np.int64)
     CH = 1 << 17                                 # crumb-prefix chunks: early stop
