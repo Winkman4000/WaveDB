@@ -2157,3 +2157,24 @@ THE BOARD, TRUE COLD (cbdb_fc3, 43 queries):  true cold 55.2 s | warm first 34.2
 Q28 pulls 839 MB in +3.4 s = ~0.25 GB/s, a third of the file's sequential rate: memmap page
 faults read it in small pieces. The referee runs on this pod (Umbra 5.8 s, ClickHouse 17.8 s) could
 not drop caches either; their cache state is unknown.
+
+
+
+## THE COLD READ (2026-09-23): read like the storage wants to be read
+Jackson: the disk-to-CPU path is a hardware bandwidth (7.5 GB/s on his machine); a cold number
+must be bounded by bytes over that bandwidth, not by how we ask for them. MEASURED on the pod's
+storage (MooseFS over FUSE), cold: one stream 0.66-0.74 GB/s; 4 streams 1.1; 16 streams 1.72;
+32-64 streams ~1.8 (the ceiling here). POSIX_FADV_WILLNEED does nothing on this filesystem. Q28 had
+pulled 839 MB at ~0.25 GB/s: through the memory map, page fault by page fault.
+BUILT: Segment.read_span -- a dictionary frame is read with ONE pread (fc_part, fc_chunk), and the
+parallel chunk workers make that many large streams. Segment.warm_span -- a code section about to
+be decoded whole (_raw_codes) or scanned (wherescan enc 3 / enc 18 frames) is first read by
+parallel 8 MB preads into the page cache; mincore skips what is already resident, so warm runs pay
+nothing. (An ADD COLUMN synth has no bytes in the file: skipped -- the suite caught it.)
+A/B true cold (3 fresh processes each, median): Q20 2360 -> 925 ms, Q21 2877 -> 1517, Q22 3858 ->
+2464, Q23 2677 -> 1848, Q27 1583 -> 1057, Q28 4525 -> 2231; hot unchanged; bytes read unchanged.
+THE BOARD, TRUE COLD: 55.2 -> 44.0 s (warm first runs 34.2, hot 13.2; 9.4 GB read).
+THE FLOOR: 9.4 GB at this pod's 1.8 GB/s is ~5.2 s for all 43; at 7.5 GB/s, ~1.25 s. What is left
+over warm (~10 s) is spread: Q22 +923 ms, Q20 +593, Q23 +529, Q40 +527 (96 MB -- not bytes: another
+read path), Q30 +514, Q18 +474, Q16 +448, Q15 +407, Q09 +406 -- the random-access code gathers
+(enc 19 gathers, codes_at) still fault through the map. Next: warm those spans the same way.
