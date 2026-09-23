@@ -2806,7 +2806,7 @@ def fc_hostruns(a, R, brk, hend, labuf, laboff, meta):
             Whs = np.int64(-1)
             pnl = np.int64(-1)
             a0 = np.int64(0)
-            b0 = plen if plen < 8192 else np.int64(8192)
+            b0 = plen                    # no match: REGEXP_REPLACE returns the whole string
         if lw + (b0 - a0) > labuf.size or nr + 1 >= laboff.size:
             meta[0] = -1
             return nr
@@ -4215,3 +4215,107 @@ def plike_sel_fc(a, gro, R, need, n1, n2, out):
             o += sl; plen = cp + sl; e += 1; walked += 1
         out[i] = _contains2(prev, plen, n1, n2)
     return walked
+
+
+# ---------------------------------------------------------------------------------------------
+# THE HOST FROM THE HEADERS (Jackson, 2026-09-23: read per block by the most restrictive position
+# -- in a sorted dictionary the leading positions of a block are one byte each, so the block's
+# shared prefix decides its members at once). The host lives at fixed bytes after "://": while an
+# entry's shared prefix reaches past the host's slash, its host is its predecessor's -- decided by
+# its header alone; its suffix is only looked at for a newline ('.' never matches \n, so a newline
+# after the slash breaks the match). Only a BREAK rebuilds the string, from a stack of pieces that
+# point into the text (the previous string is never copied byte by byte).
+
+@njit(inline='always')
+def _fc3_fill(ps, pt, top, plen, text, prev):
+    """rebuild prev[0:plen] from the pieces: piece k covers [ps[k], ps[k+1]) and reads text at pt[k]"""
+    for k in range(top):
+        a = ps[k]; b = ps[k + 1] if k + 1 < top else plen
+        src = pt[k]
+        for x in range(a, b):
+            prev[x] = text[src + (x - a)]
+
+
+@njit(nogil=True, cache=True)
+def fc3_hostruns(hdr16, text, R, nl_free, brk, hend, labuf, laboff, meta):
+    """fc_hostruns on the three streams, same law and same outputs (brk, hend, labels): a run
+    continues while cp > W (the host's slash) and the suffix is newline-clean; nl_free = the chunk's
+    text holds no newline at all, so no suffix is even looked at while a run continues."""
+    n = hdr16.size // 2
+    prev = np.zeros(131072, np.uint8)
+    ps = np.zeros(R + 2, np.int64); pt = np.zeros(R + 2, np.int64); top = 0
+    W = np.int64(-2); nr = np.int64(0); lw = np.int64(0); t = np.int64(0)
+    for i in range(n):
+        cp = np.int64(hdr16[2 * i]); sl = np.int64(hdr16[2 * i + 1])
+        if i % R == 0:
+            cp = np.int64(0); top = 0
+        while top > 0 and ps[top - 1] >= cp:
+            top -= 1
+        ps[top] = cp; pt[top] = t; top += 1
+        plen = cp + sl
+        if W >= 0 and cp > W:
+            clean = True
+            if not nl_free:
+                for q in range(sl):
+                    if text[t + q] == 10:
+                        clean = False
+                        break
+            if clean:
+                brk[i] = 0; hend[i] = W
+                t += sl
+                continue
+        t += sl
+        brk[i] = 1
+        _fc3_fill(ps, pt, top, plen, text, prev)
+        hs = np.int64(-1); he = np.int64(-1)
+        okh = (plen > 8 and prev[0] == 104 and prev[1] == 116
+               and prev[2] == 116 and prev[3] == 112)
+        if okh and prev[4] == 58 and prev[5] == 47 and prev[6] == 47:
+            hs = np.int64(7)
+        elif (okh and plen > 9 and prev[4] == 115 and prev[5] == 58
+              and prev[6] == 47 and prev[7] == 47):
+            hs = np.int64(8)
+        if hs >= 0:
+            hs0 = hs
+            if plen > hs + 4 and prev[hs] == 119 and prev[hs + 1] == 119 and prev[hs + 2] == 119 and prev[hs + 3] == 46:
+                hs += 4
+            j2 = hs
+            while j2 < plen:
+                if prev[j2] == 47:
+                    he = j2
+                    break
+                j2 += 1
+            if he <= hs and hs != hs0:
+                hs = hs0
+                j2 = hs
+                he = np.int64(-1)
+                while j2 < plen:
+                    if prev[j2] == 47:
+                        he = j2
+                        break
+                    j2 += 1
+        bnl = np.int64(-1)
+        if he > hs:
+            j3 = he + 1
+            while j3 < plen:
+                if prev[j3] == 10:
+                    bnl = j3
+                    break
+                j3 += 1
+        if (he > hs) and (bnl < 0):
+            hend[i] = he; W = he
+            a0 = hs; b0 = he
+        else:
+            hend[i] = -1; W = np.int64(-2)
+            a0 = np.int64(0); b0 = plen          # no match: the label is the whole string
+        if lw + (b0 - a0) > labuf.size or nr + 1 >= laboff.size:
+            meta[0] = -1
+            return nr
+        laboff[nr] = lw
+        for q in range(b0 - a0):
+            labuf[lw + q] = prev[a0 + q]
+        lw += b0 - a0
+        nr += 1
+    laboff[nr] = lw
+    meta[0] = n
+    return nr

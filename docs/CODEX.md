@@ -2106,3 +2106,32 @@ WHAT IS LEFT: Q22's 210 ms is inflating 621 chunks for 2,450 strings -- 16,384-e
 small text frames bring it to ~1% of the text. Q23 is now its RETURN: 759 ms materialising SELECT *
 (105 columns) for 10 rows. The fused path (wdb_join) still decides a LIKE whole when it builds its
 code-LUT; none of Q20-Q23 route there.
+
+
+
+## THE HOST FROM THE HEADERS (2026-09-23): block-prefix pruning
+Jackson: read a block by its most restrictive position -- "if the third byte is like two distinct
+letters you might start there." MEASURED FIRST: in a sorted 128-string block the leading positions
+are ONE byte each (URL: 1.0 distinct at positions 0-10, 1.4 at 16, 2.8 at 23; Title 1.0 -> 12.9;
+SearchPhrase 1.0 -> 17.8), so the block's shared prefix decides its members at once -- sort order
+IS the first plane; true vertical planes would cost 4.3x (URL), 3.8x (Title), 2.9x (SearchPhrase)
+the dictionary bytes (padding + lost front coding): REJECTED. ClickBench's LIKEs are all unanchored
+contains; the position-tied predicate it runs is Q28's host.
+fc3_hostruns: while an entry's shared prefix reaches past the host's slash its host is its
+predecessor's -- decided by the header; its suffix is looked at only for a newline ('.' never
+matches \n) and skipped entirely in newline-free chunks (645 of 1,204 Referer chunks). The previous
+string is a stack of pieces into the text; only a BREAK (15.9% of Referer, 21.6% of URL) rebuilds
+it. No rejoin of the chunk.
+EXACT on the whole dictionaries: 0 mismatched chunks vs the byte walk (Referer 19.7M entries, URL
+18.3M) -- breaks, host ends and every label. Also: a non-matching entry's label (REGEXP_REPLACE
+returns the whole string) was capped at 8,192 bytes in fc_hostruns -- now the whole string.
+MEASURED per chunk, one thread: old rejoin + byte walk 2.72 ms (Referer) / 4.03 (URL) -> new
+newline check + header walk 1.10 / 2.11; inflate (1.1 ms) unchanged.
+Q28, HEAD vs this, 5 fresh processes: first 2165 -> 1977 ms, hot 2025 -> 1792. Q27 control flat.
+A NOTE ON THE POD: nproc and sched_getaffinity say 16 CPUs; os.cpu_count() says 64. The leaf pool
+and ~10 other sizings use cpu_count -- 64 threads on 16 CPUs. Measured: inflate + lengths + host of
+Referer scales to ~5x one thread by 8 threads and no further (8: 640 ms, 16: 589, 64: 606); reused
+decompress buffers gained ~15%, not the ceiling. Numba's parallel kernels likely count 64 too -- to
+measure. (ClickBench's c6a.4xlarge has 16 vCPU.)
+WHAT IS LEFT IN Q28 (~1.9 s): the dictionary map ~600 ms (CPU-bound at 16 CPUs), Referer's row codes
+~270, argsort of 3M label hashes ~260, emit ~300, hashing + exact grouping ~170.

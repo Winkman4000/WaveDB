@@ -291,11 +291,37 @@ def _derive_runs_one_read(seg, col, spec):
 
     def _one(p):
         j, lo, n, _rl = p
-        # length: on the three streams headers + mask (characters) or headers alone (bytes)
+        if c.get('fc3'):
+            # THE THREE STREAMS: headers, mask and text inflate once each. Length from headers +
+            # mask (or headers alone); the host from the headers -- a suffix is looked at only for a
+            # newline while the run holds, and a string is rebuilt only where the host breaks.
+            h = seg.fc_part(c, j, 'h'); hv = h.view(np.uint16); t = seg.fc_part(c, j, 't')
+            assert hv.size == 2 * n, ('fc3 headers', col, j, hv.size, n)
+            if strlen:
+                lens[lo:lo + n] = hv[0::2].astype(np.int64) + hv[1::2]
+            else:
+                m = seg.fc_part(c, j, 'm')
+                if int(WK.fc3_charlens(hv, m.view(np.uint64), np.int64(R), lens[lo:lo + n])) != n:
+                    return None
+            nl_free = not bool((t == 10).any())
+            cap = n + 2
+            lcap = t.size * 3 + (1 << 16)
+            for _try in range(4):                # labels can outgrow the text: retry, tripled
+                brk = np.zeros(cap, np.uint8); hend = np.full(cap, -1, np.int32)
+                labuf = np.empty(lcap, np.uint8); laboff = np.empty(cap + 1, np.int64)
+                meta = np.zeros(1, np.int64)
+                nr = int(WK.fc3_hostruns(hv, t, np.int64(R), nl_free, brk, hend, labuf, laboff, meta))
+                if int(meta[0]) != -1:
+                    break
+                lcap *= 3
+            if int(meta[0]) != n:
+                return None
+            return brk[:n].copy(), labuf[:int(laboff[nr])].copy(), laboff[:nr + 1].copy(), nr
+        # length: headers + mask (characters) or headers alone (bytes)
         m = (wdb_strings.bytelens_chunk if strlen else wdb_strings.charlens_chunk)(seg, col, p, lens[lo:lo + n])
         if int(m) != n:
             return None
-        a = wdb_strings._chunk_bytes(seg, col, j)   # the host walk: the interleaved chunk (step 2 moves it)
+        a = wdb_strings._chunk_bytes(seg, col, j)   # the interleaved layout: its own frames
         cap = a.size // 4 + 2
         lcap = a.size * 3 + (1 << 16)
         for _try in range(4):                    # labels can outgrow the fc bytes: retry, tripled

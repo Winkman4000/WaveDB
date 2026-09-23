@@ -112,3 +112,31 @@ def test_queries_match_duck():
         norm = lambda rs: sorted(tuple(round(float(x), 6) if isinstance(x, float) else
                                        (x.decode() if isinstance(x, bytes) else x) for x in r) for r in rs)
         assert norm(rows) == norm(duck), sql
+
+
+def _hostruns(fn, *args, n, size):
+    cap = n + 2; lcap = size * 3 + (1 << 16)
+    for _ in range(4):
+        brk = np.zeros(cap, np.uint8); hend = np.full(cap, -1, np.int32)
+        labuf = np.empty(lcap, np.uint8); laboff = np.empty(cap + 1, np.int64); meta = np.zeros(1, np.int64)
+        nr = int(fn(*args, brk, hend, labuf, laboff, meta))
+        if int(meta[0]) != -1:
+            break
+        lcap *= 3
+    assert int(meta[0]) == n
+    return brk[:n].copy(), hend[:n].copy(), [labuf[laboff[k]:laboff[k + 1]].tobytes() for k in range(nr)]
+
+
+def test_host_from_the_headers_equals_the_byte_walk():
+    """fc3_hostruns (headers decide inherited hosts; strings rebuilt only at breaks) must give the
+    byte walk's breaks, host ends and labels exactly -- with the newline shortcut and without"""
+    w3, w1, pq, df = _fixture()
+    s3 = Segment(w3); c = s3.cols['ref']; R = int(c['R'])
+    for p in wdb_strings._chunk_plan(s3, 'ref'):
+        j, lo, n, rl = p
+        h = s3.fc_part(c, j, 'h').view(np.uint16); t = s3.fc_part(c, j, 't'); a = s3.fc_chunk(c, j)
+        old = _hostruns(WK.fc_hostruns, a, np.int64(R), n=n, size=a.size)
+        nl_free = not bool((t == 10).any())
+        for flag in {nl_free, False}:
+            new = _hostruns(WK.fc3_hostruns, h, t, np.int64(R), flag, n=n, size=t.size)
+            assert np.array_equal(old[0], new[0]) and np.array_equal(old[1], new[1]) and old[2] == new[2], (j, flag)
