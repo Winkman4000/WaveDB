@@ -1171,6 +1171,7 @@ def _scan_flag18(seg, col, fbits, lo, hi):
     import wdb_kernels as _WK18
     c = seg.cols[col]; BR = c['BR']; bits18 = int(c['pbits'])
     j0, j1 = lo // BR, (hi - 1) // BR + 1
+    seg.warm_span(int(c['cstart']) + int(c['poffs'][j0]), int(c['cstart']) + int(c['poffs'][j1]))   # cold frames first
     mv = memoryview(seg.buf)
     def scan(js):
         import zstandard as zstd
@@ -1233,6 +1234,7 @@ def _scan_flag(seg, col, flag, lo, hi):
         wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
         BR = c['BR']; base = c['cstart']; bo = c['boffs']; buf = seg.buf
         j0, j1 = lo // BR, (hi - 1) // BR + 1
+        seg.warm_span(base + int(bo[j0]), base + int(bo[j1]))   # cold frames: parallel large reads first
         bitsB = _flag_bits(seg, flag)
         mv = memoryview(buf)                     # slices without the copy: 89 -> 61 ms of decompression
         def scan(js):

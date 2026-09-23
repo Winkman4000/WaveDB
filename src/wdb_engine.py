@@ -61,6 +61,9 @@ def _leaf_pool():
     return _LEAF_POOL
 
 
+_WARM = [None, None]      # program: libc handle for mincore, the cold-read pool (never data)
+
+
 class Segment:
     def __init__(self, path):
         # memmap instead of read(): the file is demand-paged by the OS, so a Segment
@@ -424,7 +427,38 @@ class Segment:
         import zstandard as _z
         base, offs = c['fc3_' + kind]
         fb = base + int(offs[j]); fe = base + int(offs[j + 1])
-        return np.frombuffer(_z.ZstdDecompressor().decompress(bytes(self.buf[fb:fe])), dtype=np.uint8)
+        return np.frombuffer(_z.ZstdDecompressor().decompress(self.read_span(fb, fe)), dtype=np.uint8)
+
+    def __del__(self):
+        """the read descriptor dies with the Segment (the suite opens thousands)"""
+        fd = self.__dict__.get('_fd_read')
+        if fd is not None:
+            try:
+                import os as _osd
+                _osd.close(fd)
+            except Exception:
+                pass
+
+    def read_span(self, fb, fe):
+        """bytes [fb, fe) of the segment file in ONE read. THE COLD READ (2026-09-23): through the
+        memory map a cold frame arrives page fault by page fault, in small pieces (Q28 pulled 839 MB
+        at ~0.25 GB/s); one pread per frame, issued by the parallel workers, is many large streams
+        (the pod's storage: 0.7 GB/s one stream, 1.7-1.8 at 16-32). Warm, it is the same one copy
+        the memory-map slice made."""
+        import os as _osr
+        fd = self.__dict__.get('_fd_read')
+        if fd is None:
+            fd = self._fd_read = _osr.open(self.path, _osr.O_RDONLY)
+        n = fe - fb
+        b = _osr.pread(fd, n, fb)
+        if len(b) != n:                              # a short read: finish it, never decompress a stub
+            parts = [b]; got = len(b)
+            while got < n:
+                more = _osr.pread(fd, n - got, fb + got)
+                assert more, ('segment read past its end', self.path, fb, fe)
+                parts.append(more); got += len(more)
+            b = b''.join(parts)
+        return b
 
     def fc_chunk(self, c, j, as_bytes=False):
         """chunk j of a chunked front-coded dictionary in the interleaved form <cp sl>+suffix, for
@@ -438,7 +472,7 @@ class Segment:
             return out.tobytes() if as_bytes else out
         import zstandard as _z
         fb = c['chunk_base'] + int(c['chunk_foff'][j]); fe = c['chunk_base'] + int(c['chunk_foff'][j + 1])
-        raw = _z.ZstdDecompressor().decompress(bytes(self.buf[fb:fe]))
+        raw = _z.ZstdDecompressor().decompress(self.read_span(fb, fe))
         return raw if as_bytes else np.frombuffer(raw, dtype=np.uint8)
 
     def fc_walkable(self, c, j):
@@ -868,9 +902,47 @@ class Segment:
             return _words(dec.stream_reader(_io.BytesIO(fb)).read(int(need)))
         return _words(dec.decompress(fb))
 
+    def warm_span(self, fb, fe):
+        """THE COLD READ, for bytes read through the memory map (the code sections): pages of
+        [fb, fe) not already in memory are brought in by parallel large reads before the decode
+        touches them -- page faults fetch a cold file in small pieces (~0.25 GB/s measured), 16
+        large streams at ~1.7 GB/s. Warm, mincore finds the span resident and nothing is read.
+        Returns the bytes read."""
+        import ctypes as _ct, os as _osw
+        if fe <= fb:
+            return 0
+        PG = 4096; a = (fb // PG) * PG; npg = (fe - a + PG - 1) // PG
+        base = self.buf.ctypes.data
+        vec = (_ct.c_ubyte * npg)()
+        libc = _WARM[0]
+        if libc is None:
+            libc = _WARM[0] = _ct.CDLL(None, use_errno=True)
+        if libc.mincore(_ct.c_void_p(base + a), _ct.c_size_t(npg * PG), vec) != 0:
+            return 0                                      # cannot tell: leave it to the faults
+        res = np.frombuffer(vec, np.uint8) & 1
+        if res.mean() > 0.9:
+            return 0
+        miss = np.flatnonzero(res == 0)                   # cold pages -> runs of at most 8 MB
+        cut = np.flatnonzero(np.diff(miss) != 1) + 1
+        runs = []
+        for r in np.split(miss, cut):
+            for s in range(0, r.size, 2048):
+                q = r[s:s + 2048]
+                runs.append((a + int(q[0]) * PG, a + (int(q[-1]) + 1) * PG))
+        fd = self.__dict__.get('_fd_read')
+        if fd is None:
+            fd = self._fd_read = _osw.open(self.path, _osw.O_RDONLY)
+        pool = _WARM[1]
+        if pool is None:
+            pool = _WARM[1] = ThreadPoolExecutor(max(1, len(_osw.sched_getaffinity(0))))
+        return sum(pool.map(lambda r: len(_osw.pread(fd, r[1] - r[0], r[0])), runs))
+
     def _raw_codes(self, nm):
         if nm in self._codes: return self._codes[nm]
         c = self.cols[nm]
+        _bl = c.get('blob')                          # (an ADD COLUMN synth has no bytes in the file)
+        if _bl is not None:
+            self.warm_span(int(c.get('code_off', _bl[0])), int(_bl[1]))   # the code section, cold -> parallel reads
         if c.get('code_enc') == 13:
             cc = self._e13_band(nm, 0, self.N)
             self._codes[nm] = cc
