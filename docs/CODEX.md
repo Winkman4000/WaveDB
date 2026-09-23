@@ -2005,3 +2005,16 @@ MEASURED (fresh process each, cbdb_e19, vanilla, exact vs DuckDB):
 REJECTED by measurement: fc_charlens2 (a two-pass length kernel) -- Title 0.73 -> 1.58 s. Removed.
 WHAT IS LEFT in identify: the chunk's zstd decompression now dominates. The next cut is the
 dictionary's own layout, so identify can read the decisive bytes without inflating whole chunks.
+THE BOARD (cbdb_e19, vanilla, 43/43 exact; numba cache warm -- a first board right after the
+kernels file changed paid recompiles in Q08-Q14 that no A/B reproduced):
+               this morning   the law   the tiers   the reads    Umbra   ClickHouse   DuckDB native
+  first runs       75.5 s      53.8 s     52.1 s      34.5 s      5.8      17.8          47.9
+  hot               8.61 s     29.96 s    19.91 s     14.70 s     5.58     12.40         19.60
+  first-run wins: DuckDB 27/43, ClickHouse 12, Umbra 5.  hot wins: DuckDB 21, ClickHouse 14, Umbra 8.
+  moved (first / hot, ms): Q20 3703->860 / 1047->700; Q21 4182->1282 / 1143->793; Q22 5317->1815 /
+  1638->1281; Q23 4344->1432 / 1032->614; Q28 7266->2080 / 6111->1958; Q27 1647->1180 / 458->874.
+Q27's hot rose because the tighter sweep caught 'charlens' (URL's per-string character lengths),
+which had hidden from the underscore-only sweep and carried across queries. It is computed from
+the dictionary, not the dictionary itself: tier 2. The 874 ms is the honest number; the 458 was
+the leak. A/B (three fresh processes each, prev vs this commit): Q01, Q08, Q10, Q12, Q13, Q14
+identical; only Q27 moved.
