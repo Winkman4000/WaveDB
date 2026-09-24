@@ -24,6 +24,16 @@ except Exception:                                     # pragma: no cover
         return deco
 
 
+def _nt():
+    """THE CACHEABLE THREAD COUNT (2026-09-24): numba.get_num_threads() or get_thread_id() INSIDE a
+    compiled kernel embeds a pointer into the threading layer, which numba cannot write to its
+    cache ("uses dynamic globals") -- so the kernel recompiled in EVERY process: gd_pass2_count
+    2.2 s, sort_keys_par 2.8 s, group_fold_dict 1.9 s, _count_ge 0.9 s of ClickBench's cold runs
+    (Q08/Q09/Q10/Q15/Q16/Q18). The count is read here, in Python, and passed in as an argument;
+    the arithmetic is unchanged (per-thread boards summed, exact for any T)."""
+    return np.int64(numba.get_num_threads()) if HAVE_NUMBA else np.int64(1)
+
+
 @njit(nogil=True, cache=True)
 def _kway_topk_nb(keys, vals, offs, K):
     nr = offs.size - 1
@@ -133,12 +143,12 @@ def kway_topk(keys, vals, offs, K):
 
 
 @njit(nogil=True, parallel=True, cache=True)
-def _part_scatter_nb(codes, K):
+def _part_scatter_nb(codes, K, T):
     """Stable parallel counting scatter: perm such that codes[perm] is grouped by code with
     original order preserved inside each group -- the fused motion, compiled. Two passes:
-    per-chunk histograms -> exclusive global/chunk offsets -> stable scatter."""
+    per-chunk histograms -> exclusive global/chunk offsets -> stable scatter. T = the thread
+    count, passed in (see THE CACHEABLE THREAD COUNT)."""
     N = codes.size
-    T = numba.get_num_threads()
     chunk = (N + T - 1) // T
     hist = np.zeros((T, K), np.int64)
     for t in numba.prange(T):
@@ -167,7 +177,7 @@ def _part_scatter_nb(codes, K):
 def part_scatter(codes, K):
     """Stable grouping permutation by small-int key; numba parallel, numpy fallback."""
     if HAVE_NUMBA:
-        return _part_scatter_nb(codes, np.int64(K))
+        return _part_scatter_nb(codes, np.int64(K), _nt())
     return np.argsort(codes, kind='stable')
 
 
@@ -2209,11 +2219,14 @@ def warm():
         pr_fold(_k9, _p9, _o9, np.array([0.0, 1.0]), np.array([2.0, 3.0]), _c9, _s19, _s29, _u9, _n9)
 
 
-@njit(nogil=True, parallel=True, cache=True)
 def grouped_sum_codes(kc, vc, vt, K):
+    return _grouped_sum_codes_nb(kc, vc, vt, K, _nt())
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _grouped_sum_codes_nb(kc, vc, vt, K, T):
     """sums[k] += vt[vc[i]] for k = kc[i]: the single-key SUM board, fused gather+
     accumulate, per-thread partials (no atomics, no dtype casts, no factorize)."""
-    T = numba.get_num_threads()
     part = np.zeros((T, K), np.int64)
     n = kc.size
     for t in prange(T):
@@ -2428,38 +2441,43 @@ def gd_pass1(uc, rc, SH, T):
     return ku, kr, offs
 
 
-@njit(nogil=True, parallel=True, cache=True)
 def gd_pass2_count(ku, kr, offs, SH, VR):
+    return _gd_pass2_count_nb(ku, kr, offs, SH, VR, _nt())
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _gd_pass2_count_nb(ku, kr, offs, SH, VR, T):
     """MSD pass 2 + marker dedup, fused per bucket: scatter by the low bits (each
     bucket's targets fully contained), then the L1-resident marker table counts a
-    target's first touch of each key. Per-bucket accumulator rows: no races."""
+    target's first touch of each key. Per-thread accumulator rows: no races. Thread t takes
+    the buckets [NB*t/T, NB*(t+1)/T) -- prange's own static split, with the row index known
+    without asking numba for it (get_thread_id made the kernel uncacheable)."""
     NB = offs.size - 1
     LOW = 1 << SH
-    T = numba.get_num_threads()
     ans = np.zeros((T, VR), np.int64)            # per-THREAD rows (was per-bucket: 4096 x VR, 296 MB
-    for b in prange(NB):                          # zeroed and reduced serially for RegionID's 9,040)
-        lo = offs[b]
-        hi = offs[b + 1]
-        if hi <= lo:
-            continue
-        tid = numba.get_thread_id()
-        cnt = np.zeros(LOW + 1, np.int64)
-        for i in range(lo, hi):
-            cnt[(np.int64(ku[i]) & (LOW - 1)) + 1] += 1
-        loffs = np.cumsum(cnt)
-        cur = loffs[:-1].copy()
-        lr = np.empty(hi - lo, np.uint32)
-        for i in range(lo, hi):
-            u = np.int64(ku[i]) & (LOW - 1)
-            lr[cur[u]] = kr[i]
-            cur[u] += 1
-        seen = np.full(VR, -1, np.int64)
-        for u in range(LOW):
-            for i in range(loffs[u], loffs[u + 1]):
-                r = lr[i]
-                if seen[r] != u:
-                    seen[r] = u
-                    ans[tid, r] += 1
+    for t in prange(T):                           # zeroed and reduced serially for RegionID's 9,040)
+        for b in range(NB * t // T, NB * (t + 1) // T):
+            lo = offs[b]
+            hi = offs[b + 1]
+            if hi <= lo:
+                continue
+            cnt = np.zeros(LOW + 1, np.int64)
+            for i in range(lo, hi):
+                cnt[(np.int64(ku[i]) & (LOW - 1)) + 1] += 1
+            loffs = np.cumsum(cnt)
+            cur = loffs[:-1].copy()
+            lr = np.empty(hi - lo, np.uint32)
+            for i in range(lo, hi):
+                u = np.int64(ku[i]) & (LOW - 1)
+                lr[cur[u]] = kr[i]
+                cur[u] += 1
+            seen = np.full(VR, -1, np.int64)
+            for u in range(LOW):
+                for i in range(loffs[u], loffs[u + 1]):
+                    r = lr[i]
+                    if seen[r] != u:
+                        seen[r] = u
+                        ans[t, r] += 1
     total = np.zeros(VR, np.int64)
     for r in prange(VR):
         s = 0
@@ -2469,11 +2487,14 @@ def gd_pass2_count(ku, kr, offs, SH, VR):
     return total
 
 
-@njit(nogil=True, parallel=True, cache=True)
 def grid2_count(c1, c2, fc, lit, V2, K):
+    return _grid2_count_nb(c1, c2, fc, lit, V2, K, _nt())
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _grid2_count_nb(c1, c2, fc, lit, V2, K, T):
     """Composite 2-key COUNT grid with optional eq-filter (lit<0 = unfiltered):
     per-thread boards, one fused pass, no factorize, no sorts."""
-    T = numba.get_num_threads()
     part = np.zeros((T, K), np.int64)
     n = c1.size
     for t in prange(T):
@@ -3370,12 +3391,15 @@ def block_stats(codes, dvals, has_dvals, nullcode, BR, cnt, nn, bsum, cmin, cmax
         cmax[j] = mx if c > 0 else np.int64(-1)   # an empty block: the old convention
 
 
-@njit(cache=True, parallel=True, nogil=True)
 def group_fold_dict(grp, codes, dvals, G, out):
+    return _group_fold_dict_nb(grp, codes, dvals, G, out, _nt())
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def _group_fold_dict_nb(grp, codes, dvals, G, out, T):
     """THE FOLD ON CODES: out[g] = sum over rows of dvals[codes[i]] for grp[i] == g -- a SUM or AVG
     numerator per group straight from two code streams and a dictionary, per-thread boards
     (T x G float64) and a reduce. No value array is ever built (Q09 built three, 630 ms)."""
-    T = numba.get_num_threads()
     n = grp.size
     part = np.zeros((T, G), np.float64)
     for t in prange(T):
@@ -3389,15 +3413,18 @@ def group_fold_dict(grp, codes, dvals, G, out):
         out[g] = s
 
 
-@njit(cache=True, parallel=True, nogil=True)
 def sort_keys_par(keys, SH):
+    return _sort_keys_par_nb(keys, SH, _nt())
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def _sort_keys_par_nb(keys, SH, T):
     """THE BUCKETED SORT: non-negative int64 keys, MSD-partitioned by (key >> SH) into 4096
     buckets (per-thread counts -> stable offsets -> scatter), each bucket sorted in place across
     threads. Sorted output, one pass + small sorts: np.sort on 6.2M keys was 217 ms on one
     thread (Q18's survivors); this is ~30. SH must put every key under 4096 buckets."""
     n = keys.size
     NB = 1 << 12
-    T = numba.get_num_threads()
     pc = np.zeros((T, NB), np.int64)
     for t in prange(T):
         for i in range(n * t // T, n * (t + 1) // T):
@@ -3424,10 +3451,13 @@ def sort_keys_par(keys, SH):
     return out
 
 
-@njit(cache=True, parallel=True, nogil=True)
 def _count_ge(a, bar):
+    return _count_ge_nb(a, bar, _nt())
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def _count_ge_nb(a, bar, T):
     n = a.size
-    T = numba.get_num_threads()
     part = np.zeros(T, np.int64)
     for t in prange(T):
         c = 0
@@ -3588,13 +3618,17 @@ def pprefix2(blob, off, out):
             out[r] = 0
 
 
-@njit(cache=True, parallel=True, nogil=True)
 def plike_fc(buf, restarts, R, V, n1, n2, keep):
+    return _plike_fc_nb(buf, restarts, R, V, n1, n2, keep, _nt())
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def _plike_fc_nb(buf, restarts, R, V, n1, n2, keep, NT):
     """Ordered-needle LIKE over a FRONT-CODED dict: restart blocks walk
     sequentially (prefix carry), blocks run in parallel. keep[code]=contains."""
     nb = (V + R - 1) // R
     L1 = n1.shape[0]; L2 = n2.shape[0]
-    T = min(nb, numba.get_num_threads() * 8)      # one carry buffer per chunk of blocks, not per
+    T = min(nb, NT * 8)                            # one carry buffer per chunk of blocks, not per
     for t in prange(T):                            # block (1.1M mallocs of 128 KB on an 18M URL dict)
         prev = np.empty(131072, np.uint8)          # cp, sl are u16: a value is at most 131070 bytes
         for b in range(nb * t // T, nb * (t + 1) // T):
