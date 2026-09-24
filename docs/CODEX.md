@@ -2560,3 +2560,22 @@ checker normalization).
 **ClickBench score (one run, against the fair trial's referees):** COLD WaveDB 1.63, Umbra 1.67,
 ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 24.4). HOT WaveDB
 2.84 (second), Umbra 1.30.
+
+
+## 2026-09-24 -- THE BIT-SLICE INDEX, AUDITED (Q01's old road)
+
+- THE LAW HOLDS: the index Q01 used to build is cleared at query end (drop_derived clears every
+  underscore container on the Segment; seg._bsi had 0 entries after each run) and the residue audit
+  is empty. So every query that takes this road rebuilds its index, cold AND hot.
+- Why Q01's hot looked fast (50 ms against 309 cold): in the same process, run 1 was answered by
+  bsi_filter (282 ms, the index build), run 2 by fused_agg (55 ms) -- the router's in-process memory
+  steers later runs away -- and run 3 from outside the read order (54 ms). Not a kept index.
+- bench/route_census.py: which read answers each board query, three runs per fresh process. After
+  the census of the load, NO board query reaches bsi_filter on any run (43 x 3). Cold-run answers:
+  none 11 (outside the read order), dict_count 5 (Q01, Q07, Q12, Q15, Q33), blockstats 4,
+  group_distinct 3, wherescan 3, fused_agg 2, pairfold 2, tripletop 2, pairtop 2, affinegroup 2,
+  funnel 2, group_mix, pairdistinct, sampletop, regexgroup, affinesum 1 each.
+- Its remaining customers: TPC-H-shaped filtered SUMs (tests/test_path_coverage.py ratchets two:
+  bsi_discount_btw, bsi_q6_multi; tests/test_bsi_exec.py asserts the routing). And a hazard at 100M
+  rows: any new shape that reaches it pays a full index build per query (Q01 paid 188 ms).
+  Removal vs a size gate: Jackson's call, with TPC-H Q6 measured both ways first.
