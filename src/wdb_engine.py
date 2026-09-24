@@ -36,6 +36,9 @@ _SEG_KEEP = _SEG_PROGRAM | _SEG_TIER1          # (the witness reads seg_keep()/c
 _POOL = None
 
 
+_PIPE3 = [__import__('os').environ.get('WDB_PIPE3', '1') == '1']   # A/B: 0 restores read-all-then-decode for enc-3
+
+
 def _pool():
     """Persistent 8-lane executor for span decompression: pool spin-up per column read
     was measurable overhead at board scale."""
@@ -974,11 +977,53 @@ class Segment:
             pool = _WARM[1] = ThreadPoolExecutor(max(1, len(_osw.sched_getaffinity(0))))
         return sum(pool.map(lambda r: len(_osw.pread(fd, r[1] - r[0], r[0])), runs))
 
+    def _e3_pipelined(self, c):
+        """THE READ AND THE DECODE AT ONCE (2026-09-24): an enc-3 full decode used to pull the whole
+        code section first (warm_span: parallel preads) and only then decompress it in 8 lanes --
+        the CPU waited for the storage, then the storage sat idle while the CPU worked (URL: ~196 ms
+        of reading, then 170 ms of decoding). Here 16 lanes each own a stretch of frames and walk it
+        in RUNS of neighbouring frames (one pread of up to 8 MB, then its frames inflated), so one
+        lane's inflate overlaps another's read. zstd releases the GIL frame by frame."""
+        wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
+        isz = np.dtype(wdt).itemsize
+        cc = np.empty(self.N, dtype=wdt)
+        BR = int(c['BR']); base = int(c['cstart']); bo = c['boffs']
+        nb = int(bo.size) - 1
+        T = min(16, nb)
+        CAP = 8 << 20
+
+        def _lane(t):
+            import zstandard as _zs
+            dec = _zs.ZstdDecompressor()
+            lo = t * nb // T; hi = (t + 1) * nb // T
+            j = lo
+            while j < hi:
+                e = j + 1
+                while e < hi and int(bo[e + 1]) - int(bo[j]) <= CAP:
+                    e += 1
+                a = int(bo[j])
+                raw = memoryview(self.read_span(base + a, base + int(bo[e])))
+                for k in range(j, e):
+                    out = dec.decompress(raw[int(bo[k]) - a:int(bo[k + 1]) - a])
+                    n = len(out) // isz
+                    assert n == min(BR, self.N - k * BR), ('enc-3 frame decodes to the wrong row count', k, n)
+                    cc[k * BR:k * BR + n] = np.frombuffer(out, dtype=wdt)
+                j = e
+        if T <= 1:
+            _lane(0)
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=T) as ex:
+                list(ex.map(_lane, range(T)))
+        return cc
+
     def _raw_codes(self, nm):
         if nm in self._codes: return self._codes[nm]
         c = self.cols[nm]
         _bl = c.get('blob')                          # (an ADD COLUMN synth has no bytes in the file)
-        if _bl is not None:
+        _pipe3 = (_PIPE3[0] and c.get('code_enc', 0) == 3 and 'boffs' in c
+                  and c['mode'] not in (3, 4, 5, 6) and nm not in self._codes)
+        if _bl is not None and not _pipe3:           # (enc 3 pipelined reads its own frames)
             self.warm_span(int(c.get('code_off', _bl[0])), int(_bl[1]))   # the code section, cold -> parallel reads
         if c.get('code_enc') == 13:
             cc = self._e13_band(nm, 0, self.N)
@@ -1156,6 +1201,9 @@ class Segment:
             cc = np.empty(self.N, dtype=self._e19_dtype(c))
             _WK19.e19_decode(pw, dw, np.int64(c['e19BR']), np.int64(self.N), np.int64(c['e19bits']),
                              c['e19lb'], c['e19gw'], c['e19dc'], c['e19poff'], c['e19doff'], cc)
+            self._codes[nm] = cc; return cc
+        if _pipe3:
+            cc = self._e3_pipelined(c)
             self._codes[nm] = cc; return cc
         if c.get('code_enc', 0) == 3:                # blocked: decompress every frame, concat
             wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]

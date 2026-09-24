@@ -2426,3 +2426,30 @@ kernel, fc3_hostruns 138 ms (Q28, 37 threads idle meanwhile), fc3_charlens 72 ms
 unpack_any (14 queries), e8_pos (16), _hist_par (11), e19_decode (9), unpack24_be (8).
 Database.open already loads five kernels and starts the parallel runtime (a bare process pays
 ~375 ms for its first parallel call; import wdb_kernels ~965 ms) -- outside the timed run.
+
+
+## 2026-09-24 -- THE READ AND THE DECODE AT ONCE: enc-3 full decodes pipelined
+
+**The wait (code autopsy):** an enc-3 full decode pulled the whole code section first (warm_span,
+parallel preads) and only then inflated it in 8 lanes -- URL ~196 ms of reading, then 170 ms of
+decoding, in series: the CPU waited for the storage, then the storage idled while the CPU worked.
+
+**The change:** wdb_engine._e3_pipelined -- 16 lanes, each owning a stretch of frames, walking it
+in RUNS of neighbouring frames: one pread of up to 8 MB, then its frames inflated (zstd releases
+the GIL frame by frame), then the next run. One lane's inflate overlaps another's read. warm_span
+is skipped for these columns (they read their own frames). Every frame's decoded row count is
+asserted. WDB_PIPE3=0 restores the old path (the A/B switch).
+
+**Measured:**
+- bench/pipe_ab.py, one full decode per fresh process, cold, alternating, three each (median):
+  URL 349 -> 223 ms, ClientIP 373 -> 238, Referer 329 -> 215, CounterID 119 -> 94,
+  SearchEngineID 86 -> 53, RegionID 169 -> 163. Codes identical, byte for byte, every run.
+- Board, same code and database, WDB_PIPE3 toggled, interleaved A B A B: runs A 26.9, 26.6 /
+  B 25.8, 25.3 s. Best of two per query: cold 25.8 -> 24.4 s (-1.4 s), hot 13.01 -> 12.73 s.
+  Q27 -217, Q22 -204, Q28 -147, Q30 -133, Q35 -126, Q34 -105, Q33 -87, Q40 -78.
+  Board rises Q09 +124 / Q10 +77 / Q12 +56 re-run alone, alternating, three each: Q09
+  1273/1171/1287 -> 1156/1110/1120 (faster every run), Q10 and Q12 even -- run noise.
+- Suite 1741 passed.
+
+Sibling paths with the same read-then-decode shape, not yet pipelined: enc 18 (packed frames),
+enc 19 (UserID: 247 MB read, then e19_decode), enc 8/9/5.
