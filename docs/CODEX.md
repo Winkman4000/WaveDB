@@ -2453,3 +2453,22 @@ asserted. WDB_PIPE3=0 restores the old path (the A/B switch).
 
 Sibling paths with the same read-then-decode shape, not yet pipelined: enc 18 (packed frames),
 enc 19 (UserID: 247 MB read, then e19_decode), enc 8/9/5.
+
+
+## 2026-09-24 -- THE KERNEL LOAD BILL, dissected; the preload ceiling (measured, not built)
+
+- What a load is (cProfile, cold Q12): per kernel ~9 ms -- the cache index read (~2 ms), the
+  cached data read (~2 ms), then unserializing: parsing the stored bitcode and linking the
+  object code into the process (~4 ms). fc3_hostruns: 140 ms (a large kernel).
+- Cache files kept warm (bench/kernel_load_census.py with KLC_KEEP_NB=1): board load wall
+  1.78 -> 1.56 s. ~88% of the bill is CPU inside the process, not file reads. __pycache__ holds
+  875 files, 27 MB (stale overloads from old source line numbers included).
+- numba's ahead-of-time compiler (pycc) does not take parallel kernels -- most hot kernels are.
+- THE PRELOAD CEILING (bench/preload_probe.py): record each query's first-call kernels and
+  their argument types; then, cold and alternating, load that exact list on a background thread
+  from the moment the query starts (numba's compiler lock is global: loads stay serial, but they
+  overlap the query's storage waits). Perfect prediction: best of two 25.1 -> 24.1 s (-1.0 s,
+  ~60% of the bill). Noisy per query (Q16 +111, Q15 -170 on single runs).
+- A real design must predict without memorizing the benchmark: each read method declares the
+  kernels it calls (code, not a trained list), and the background loader brings in every cached
+  overload of those. Open question for Jackson before building.

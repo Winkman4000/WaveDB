@@ -32,7 +32,8 @@ def one(db_dir, sql):
     db = wdb_db.Database.open(db_dir)
     src = os.path.dirname(os.path.abspath(wdb_db.__file__))
     evict = [f for f in glob.glob(os.path.join(db_dir, '*')) if os.path.isfile(f)]
-    evict += glob.glob(os.path.join(src, '__pycache__', '*.nb*'))
+    if os.environ.get('KLC_KEEP_NB') != '1':        # 1: numba's cache files stay warm (split file reads from linking)
+        evict += glob.glob(os.path.join(src, '__pycache__', '*.nb*'))
     for f in evict:
         fd = os.open(f, os.O_RDONLY); os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED); os.close(fd)
     n0 = len(rec)
