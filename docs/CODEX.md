@@ -2579,3 +2579,24 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   bsi_discount_btw, bsi_q6_multi; tests/test_bsi_exec.py asserts the routing). And a hazard at 100M
   rows: any new shape that reaches it pays a full index build per query (Q01 paid 188 ms).
   Removal vs a size gate: Jackson's call, with TPC-H Q6 measured both ways first.
+
+
+## 2026-09-24 -- COUNTERID'S ZSTD, AUTOPSIED; THE LINK CEILING (Q40 by hand)
+
+- Jackson's hunch (one generative rule places 62): DENIED. bench/counter_autopsy.py on the traced
+  decoder: CounterID is enc 3, 2-byte codes, 65,536 rows a frame; 62 = code 6 of 6,506, 738,172
+  rows. The column changes value every ~4.4 rows; 62's rows are 93-96% pattern copies (multi-value
+  stretches), 3-6% run copies, ~0.8% literals; ~800 runs of 62 a frame by ~900-975 sequences.
+  But 62 lives in 193 CONTIGUOUS frames (726-918) and block min/max is already exact (386 of 3,052
+  blocks flagged, 386 hold 62).
+- July is the whole table (2013-07-02 .. 07-31, all 99,997,497 rows). Traffic -1/6 alone keeps
+  55.3M. RefererHash = X alone keeps 98,213, of them 97,929 counter 62.
+- JACKSON'S LINK (encode-time: one column's value points to another's, exceptions stored; the
+  cheaper column to locate becomes the path to both). bench/link_ceiling.py measures the Q40 ceiling
+  by hand, fresh process each, files evicted, 3 runs, median:
+  A engine as is 357 ms cold / 167 hot; D RefererHash over the whole table 586 / 205 (the whole
+  scan alone 353 ms); B RefererHash inside counter 62's blocks, CounterID checked 310 / 84;
+  C region + link (skip CounterID, minus 284 stored exceptions, 2.5 KB) 282 / 79.
+  All 284 exceptions lie OUTSIDE counter 62's blocks. Answers equal the engine's group counts
+  (89,914 survivors, 41,194 groups); rows 101-110 differ only in tie order at equal counts.
+  C's biggest remaining line: EventDate + URLHash point reads on 89,914 rows, ~112 ms cold.
