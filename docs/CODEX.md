@@ -2472,3 +2472,21 @@ enc 19 (UserID: 247 MB read, then e19_decode), enc 8/9/5.
 - A real design must predict without memorizing the benchmark: each read method declares the
   kernels it calls (code, not a trained list), and the background loader brings in every cached
   overload of those. Open question for Jackson before building.
+
+
+## 2026-09-24 -- THE READ AND THE DECODE AT ONCE, enc 19 (UserID)
+
+- First try, segments pulled one at a time while the previous decoded: SLOWER (256 -> 532 ms).
+  Each 31 MB segment kept only ~4 reads in flight: 0.5 GB/s against 1.25 for the whole span.
+  The law again from the other side -- the trips must stay many and big.
+- _e19_pipelined: every 8 MB read of the row pointers and block dictionaries is issued at once
+  (16 streams), in segment order; the kernel (unchanged: each segment's slice of the words, the
+  offsets re-based and read-only so the one cached signature serves) decodes segment k as soon as
+  its reads have landed. Already resident (mincore > 90%): the plain single pass. WDB_PIPE19=0 is
+  the switch. Segment._resident_share(fb, fe) added (the name _resident was taken).
+- UserID full decode, cold, one per fresh process after Database.open, alternating (median of
+  three): 285 -> 250 ms; codes identical. (bench/pipe_ab.py now opens the database first: a bare
+  process pays ~1.4 s starting numba's parallel runtime on its first call.)
+- Board, WDB_PIPE19 toggled, interleaved A B A B: runs A 27.7, 26.4 / B 25.9, 25.6 s (a noisy pod
+  today: A's two runs differ by 1.3 s). Best of two: cold 25.9 -> 24.8 s, hot 13.16 -> 12.89 s.
+  The UserID queries: Q09 -266, Q16 -277, Q18 -173, Q13 -72, Q08 -62. Suite 1741 passed.

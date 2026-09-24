@@ -37,6 +37,7 @@ _POOL = None
 
 
 _PIPE3 = [__import__('os').environ.get('WDB_PIPE3', '1') == '1']   # A/B: 0 restores read-all-then-decode for enc-3
+_PIPE19 = [__import__('os').environ.get('WDB_PIPE19', '1') == '1'] # A/B: 0 restores warm_span-then-decode for enc 19
 
 
 def _pool():
@@ -1017,13 +1018,82 @@ class Segment:
                 list(ex.map(_lane, range(T)))
         return cc
 
+    def _resident_share(self, fb, fe):
+        """share of the pages of [fb, fe) already in memory (mincore); -1 when it cannot tell"""
+        import ctypes as _ct
+        PG = 4096; a = (fb // PG) * PG; npg = (fe - a + PG - 1) // PG
+        if npg <= 0:
+            return 1.0
+        vec = (_ct.c_ubyte * npg)()
+        libc = _WARM[0]
+        if libc is None:
+            libc = _WARM[0] = _ct.CDLL(None, use_errno=True)
+        if libc.mincore(_ct.c_void_p(self.buf.ctypes.data + a), _ct.c_size_t(npg * PG), vec) != 0:
+            return -1.0
+        return float((np.frombuffer(vec, np.uint8) & 1).mean())
+
+    def _e19_pipelined(self, c, K=16):
+        """THE READ AND THE DECODE AT ONCE, enc 19: every read of the column's row pointers and
+        block dictionaries is issued at once (8 MB runs, 16 streams -- the storage's knee), in
+        segment order; the kernel decodes segment k as soon as segment k's runs have landed, on
+        every core, while the later reads are still in flight. (Segments pulled one at a time kept
+        only ~4 streams busy: 0.5 GB/s against 1.25 -- measured slower than no pipeline at all.)
+        The kernel runs unchanged on each segment's slice of the words with its offsets re-based,
+        read-only like the mapped originals, so numba reuses the one cached signature. Already in
+        memory (hot): the plain single pass."""
+        import wdb_kernels as _WK19, os as _os
+        pw, dw = self._e19_words(c)
+        BR = int(c['e19BR']); N = int(self.N); nb = int(c['e19lb'].size)
+        poff = c['e19poff']; doff = c['e19doff']
+        cs = int(c['cstart']); ds = int(c['e19dstart'])
+        cc = np.empty(N, dtype=self._e19_dtype(c))
+        pend = cs + 8 * (int(poff[nb]) + 1); dend = min(len(self.buf), ds + 8 * (int(doff[nb]) + 1))
+        if self._resident_share(cs, pend) > 0.9 and self._resident_share(ds, dend) > 0.9:
+            _WK19.e19_decode(pw, dw, np.int64(BR), np.int64(N), np.int64(c['e19bits']),
+                             c['e19lb'], c['e19gw'], c['e19dc'], poff, doff, cc)
+            return cc
+        K = max(1, min(K, nb))
+        cuts = [nb * k // K for k in range(K + 1)]
+        fd = self.__dict__.get('_fd_read')
+        if fd is None:
+            fd = self._fd_read = _os.open(self.path, _os.O_RDONLY)
+        pool = _WARM[1]
+        if pool is None:
+            pool = _WARM[1] = ThreadPoolExecutor(max(1, len(_os.sched_getaffinity(0))))
+        RUN = 8 << 20
+        futs = []
+        for k in range(K):
+            b0, b1 = cuts[k], cuts[k + 1]
+            fk = []
+            for lo, hi in ((cs + 8 * int(poff[b0]), min(pend, cs + 8 * (int(poff[b1]) + 1))),
+                           (ds + 8 * int(doff[b0]), min(dend, ds + 8 * (int(doff[b1]) + 1)))):
+                for x in range(lo, hi, RUN):
+                    fk.append(pool.submit(_os.pread, fd, min(RUN, hi - x), x))
+            futs.append(fk)
+
+        def ro(x):
+            x = np.ascontiguousarray(x, dtype=np.int64); x.setflags(write=False); return x
+
+        for k in range(K):
+            for f in futs[k]:
+                f.result()
+            b0, b1 = cuts[k], cuts[k + 1]
+            p0 = int(poff[b0]); d0 = int(doff[b0])
+            r0 = b0 * BR; r1 = min(N, b1 * BR)
+            _WK19.e19_decode(pw[p0:], dw[d0:], np.int64(BR), np.int64(r1 - r0), np.int64(c['e19bits']),
+                             c['e19lb'][b0:b1], c['e19gw'][b0:b1], c['e19dc'][b0:b1],
+                             ro(poff[b0:b1] - p0), ro(doff[b0:b1] - d0), cc[r0:r1])
+        return cc
+
     def _raw_codes(self, nm):
         if nm in self._codes: return self._codes[nm]
         c = self.cols[nm]
         _bl = c.get('blob')                          # (an ADD COLUMN synth has no bytes in the file)
         _pipe3 = (_PIPE3[0] and c.get('code_enc', 0) == 3 and 'boffs' in c
                   and c['mode'] not in (3, 4, 5, 6) and nm not in self._codes)
-        if _bl is not None and not _pipe3:           # (enc 3 pipelined reads its own frames)
+        _pipe19 = (_PIPE19[0] and c.get('code_enc', 0) == 19 and c['mode'] not in (3, 4, 5, 6)
+                   and nm not in self._codes)
+        if _bl is not None and not _pipe3 and not _pipe19:   # (the pipelined decodes read their own bytes)
             self.warm_span(int(c.get('code_off', _bl[0])), int(_bl[1]))   # the code section, cold -> parallel reads
         if c.get('code_enc') == 13:
             cc = self._e13_band(nm, 0, self.N)
@@ -1194,6 +1264,9 @@ class Segment:
                     list(exr.map(_wr14, range(nfr14)))
             else:
                 _wr14(0)
+            self._codes[nm] = cc; return cc
+        if _pipe19:
+            cc = self._e19_pipelined(c)
             self._codes[nm] = cc; return cc
         if c.get('code_enc', 0) == 19:               # BLOCK DICTIONARIES: one parallel pass, no inflate
             import wdb_kernels as _WK19

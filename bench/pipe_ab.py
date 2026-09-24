@@ -11,6 +11,8 @@ import sys, os, glob, time, json, subprocess
 def one(path, col, pipe):
     import numpy as np, wdb_engine
     wdb_engine._PIPE3[0] = pipe
+    import wdb_db                                  # a real query process: the database is open
+    wdb_db.Database.open(os.path.dirname(path))    # (kernels warmed, the parallel runtime started)
     fd = os.open(path, os.O_RDONLY); os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED); os.close(fd)
     s = wdb_engine.Segment(path)
     t = time.perf_counter(); cc = s._raw_codes(col); ms = (time.perf_counter() - t) * 1e3
