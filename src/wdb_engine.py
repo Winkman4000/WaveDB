@@ -641,9 +641,9 @@ class Segment:
                     a = c['i2base'] + int(c['i2zoffs'][ch])
                     b = c['i2base'] + int(c['i2zoffs'][ch + 1])
                     return ch, np.cumsum(np.frombuffer(
-                        _z.ZstdDecompressor().decompress(bytes(self.buf[a:b])),
+                        _z.ZstdDecompressor().decompress(self.read_span(a, b)),   # one pread per chunk
                         dtype=np.int64))
-                with ThreadPoolExecutor(max_workers=8) as ex:
+                with ThreadPoolExecutor(max_workers=16) as ex:     # 16 large streams: the storage's knee
                     for ch, arr in ex.map(_popi, range(nch)):
                         parts[ch] = arr
                 c['intvals'] = np.concatenate(parts)
@@ -668,8 +668,8 @@ class Segment:
                 import zstandard as _z
                 a = c['i2base'] + int(c['i2zoffs'][ch])
                 b = c['i2base'] + int(c['i2zoffs'][ch + 1])
-                return ch, np.cumsum(np.frombuffer(
-                    _z.ZstdDecompressor().decompress(bytes(self.buf[a:b])),
+                return ch, np.cumsum(np.frombuffer(             # one pread per chunk: cold, the map
+                    _z.ZstdDecompressor().decompress(self.read_span(a, b)),   # faulted it in small pieces
                     dtype=np.int64))
             if len(missing) > 1:
                 with ThreadPoolExecutor(max_workers=min(8, len(missing))) as ex:
@@ -1620,6 +1620,21 @@ class Segment:
                     (st['cmax'][:-1] > st['cmin'][1:]).any())):
                 c['_steps'] = None
                 return None
+        # THE FIRST-BLOCK NO (2026-09-24): string columns carry no load statistics, so the probe
+        # below decoded, copied and diffed 100M codes to learn "no" (SearchPhrase, MobilePhoneModel:
+        # 360-480 ms inside wherescan's DETECT, for queries another read then served). A staircase
+        # starts at code 0 and never rises by more than 1: one counterexample in the first block
+        # refutes it exactly.
+        if nm not in self._codes and self.N > 0:
+            try:
+                h = np.asarray(self._raw_codes_range(nm, 0, min(int(self.N), 65535)), np.int64)   # < 64K: enc 8's rank read, not its full decode
+            except Exception:
+                h = None
+            if h is not None and h.size:
+                dh = np.diff(h)
+                if int(h[0]) != 0 or (dh.size and (int(dh.min()) < 0 or int(dh.max()) > 1)):
+                    c['_steps'] = None
+                    return None
         a = self._raw_codes(nm)
         d = np.diff(a.astype(np.int64)) if a.size else np.empty(0, np.int64)
         if a.size and int(a[0]) == 0 and (d.size == 0 or (int(d.min()) >= 0 and int(d.max()) <= 1)):
