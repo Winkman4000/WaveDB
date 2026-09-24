@@ -2513,3 +2513,50 @@ enc 19 (UserID: 247 MB read, then e19_decode), enc 8/9/5.
   watch it. Suite 1741 passed.
 - Next in line (not built): enc 9's tier walk as one compiled loop -- MobilePhone's planes are
   132 ms of Python-level passes; a kernel edit (the whole cache invalidates), ~100 ms on Q10/Q11.
+
+
+## 2026-09-24 -- THE CENSUS OF THE LOAD: Q01 and Q07 from stored counts
+
+**Q01 the old-fashioned way** (cold 321 ms under the profiler): 28 ms choosing a read (21 of them
+opening the load statistics cold for a stair check), 56 ms decoding AdvEngineID's 100M codes,
+188 ms BUILDING a bit-slice index from scratch (5 planes x 100M rows, serial numpy), 26 ms using
+it, 10 ms counting. The index stays in the process: that is why hot was 50 ms.
+
+**Jackson's two ideas, one fact:** (1) keep the per-value count and answer N - count(0);
+(2) store the big exception as presence -- then the count of exceptions is a stored number (the
+sparse dress already carries it: e8n). AdvEngineID is 0 on 99,366,997 of 99,997,497 rows (99.37%).
+
+**Why the existing reads did not answer:** dict_count (scalar COUNT with WHERE k op v) and the
+group-count read (GROUP BY k COUNT(*)) were built for exactly these shapes, but read per-code counts
+from sidecars; with the switch off THE VANILLA LAW forbids building them, so they declined in
+0.2 ms and the bit-slice index built its own structure for 300 ms.
+
+**The change:**
+- wdb_blockstats.value_counts / vcnt_from_load: the load writes rows-per-code (<col>.vcnt) for
+  every dictionary column (mode 0/1/2) of at most VCNT_MAX = 65,536 codes into the load
+  statistics -- DATA of the load (the file the encoder writes as its last step), a column
+  statistic of the same species as the differentiator exception lists. Asserted: the counts cover
+  exactly N rows.
+- wdb_gbcount._census: the counting reads use the load's counts first, while they are the truth
+  (a plain loaded segment, no overrides on the column, no deleted rows; merged multi-segment
+  views decline). The scalar count's vanilla gate and the top-k bar yield to the census; the
+  unbounded GROUP BY with ORDER BY is served exactly from it. WDB_CENSUS=0 is the switch.
+- A BUG FOUND AND FIXED: GROUP BY k WHERE k <> v with no ORDER BY (small dictionaries) returned the
+  excluded key as a count-1 group -- the heavy list dropped it, the singleton law put it back.
+  Proven on commit 323a0b5: WaveDB [(0, 1), (2, 288), ...] against DuckDB [(2, 288), ...].
+- bench/stats_vcnt.py adds the counts to an existing database: cbdb_i2, 87 columns in 16.2 s
+  standalone (an upper bound on the added load time: on a fresh load most of these columns are
+  already decoded for the block stats); stats file 9.56 -> 12.08 MB.
+- tests/test_census.py: 4 tests -- counts written; =, <>, IN, NOT IN, >, BETWEEN on int and
+  string columns equal DuckDB and are served by the census; group counts equal DuckDB; the
+  excluded key stays out, with and without the census.
+
+**Measured:** Q01 cold 309-320 -> 24 ms (hot 34-55 -> 6), Q07 cold 207-244 -> 25-28 ms (hot
+79-91 -> 4-7), 0 bytes read (three alternating runs each; Umbra: 32 / 4 on both). Board, WDB_CENSUS
+toggled, interleaved: best of two cold 23.5 -> 22.9 s, hot 12.03 -> 12.00 s; only Q01/Q07 move by
+design, the rest within noise. Suite 1745 passed. verify_correctness 42/43 (Q23: the known
+checker normalization).
+
+**ClickBench score (one run, against the fair trial's referees):** COLD WaveDB 1.63, Umbra 1.67,
+ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 24.4). HOT WaveDB
+2.84 (second), Umbra 1.30.

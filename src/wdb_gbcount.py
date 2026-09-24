@@ -89,6 +89,21 @@ def _build(seg, col):
     return hc, hn, K, int(seg.N)
 
 
+_CENSUS_ON = os.environ.get('WDB_CENSUS', '1') == '1'     # A/B: 0 hides the load's counts from the reads
+
+
+def _census(seg, col):
+    """THE CENSUS OF THE LOAD: rows per code as the load counted them -- used only while it is the
+    truth (no overrides on the column, no deleted rows). None otherwise."""
+    eff = getattr(seg, '_effective', None)
+    if not _CENSUS_ON or eff is None or not hasattr(seg, 'path'):
+        return None                                  # not a plain loaded segment (a merged view): no census
+    if eff(col) is not None or not P.no_deleted_rows(seg):
+        return None
+    import wdb_blockstats
+    return wdb_blockstats.vcnt_from_load(seg, col)
+
+
 def _load(seg, col):
     """Load the persisted sidecar (rebuilding if absent or stale vs seg.N, caching in memory).
     Returns (codes, counts) or None if the column can't be projected."""
@@ -105,6 +120,17 @@ def _load(seg, col):
                 return hc, hn
         except Exception:
             pass
+    vc = _census(seg, col)
+    if vc is not None and not bool((vc == 0).any()):
+        # THE CENSUS OF THE LOAD: the heavy list straight from the load's counts -- no row decoded.
+        # (A code with zero rows would break the singleton law below: then the census stays unused.)
+        heavy = np.flatnonzero(vc >= 2)
+        hn0 = vc[heavy]
+        order = np.argsort(-hn0, kind='stable')          # count desc, code asc within
+        hc = np.ascontiguousarray(heavy[order], dtype=np.uint32)
+        hn = np.ascontiguousarray(hn0[order], dtype=np.int64)
+        _CACHE[ck] = (hc, hn)
+        return hc, hn
     import wdb_sidecar
     if not wdb_sidecar.may_build(p):
         # THE VANILLA LAW: nothing persisted-shaped is built to answer -- but a count per code IS
@@ -273,7 +299,8 @@ def _scalar_count_detect(seg, tree, col_map):
 def _scalar_count_execute(seg, spec):
     global _HITS
     import wdb_sidecar
-    if not os.path.exists(_path(seg, spec['col'])) and not wdb_sidecar.may_build(seg.path):
+    if (not os.path.exists(_path(seg, spec['col'])) and not wdb_sidecar.may_build(seg.path)
+            and _census(seg, spec['col']) is None):
         return None                                  # THE VANILLA LAW: a scalar count with no census on
                                                      # disk is the frame scan's (Q20: 480 ms census vs 150 scan)
     got = _load(seg, spec['col'])
@@ -456,12 +483,12 @@ def detect(seg, tree, col_map):
     if shift and seg.cols[col].get('dt') != 0:
         return None                                     # label shifting is integer business
     if unbounded:
-        if tree.args.get('order') is not None:
-            return None                                 # unbounded serve emits any order
         col_ = col_map.get(knm, knm) if col_map else knm
         c_ = seg.cols.get(col_)
         if c_ is None or int(c_.get('V') or 1 << 30) > 65536:
             return None                                 # big dicts: unbounded stays scan-side
+        if tree.args.get('order') is not None and _census(seg, col_) is None:
+            return None                                 # ordered unbounded: only from the exact census
     elif not _order_is_count_desc(tree, proj, ci):
         return None
     if not _fetchable(seg, col):                        # capability only: NO data touched
@@ -522,7 +549,7 @@ def execute(seg, spec):
     import wdb_sidecar
     if (not spec.get('unbounded') and spec.get('having_min') is None and spec.get('excl_lit') is None
             and lim is not None and lim > 0 and not os.path.exists(_path(seg, col))
-            and not wdb_sidecar.may_build(seg.path)):
+            and not wdb_sidecar.may_build(seg.path) and _census(seg, col) is None):
         # THE BAR (Jackson): a vanilla top-k never builds the sorted list of every heavy code --
         # the parallel census, then a bar lowered from the max until need+1 codes clear it, and
         # only those are sorted. The tie and singleton laws below see exactly what they saw.
@@ -541,26 +568,38 @@ def execute(seg, spec):
     if loaded is None:
         return None
     hc, hn = loaded
+    kc_ex = None
     if spec.get('excl_lit') is not None:
         import wdb_wherescan as WS
         kc = WS._code_of(seg, col, spec['excl_lit'])
         if kc is not None:
+            kc_ex = int(kc)
             keep = hc != int(kc)                        # one cell out; count-desc order kept
             hc, hn = hc[keep], hn[keep]
     if spec.get('unbounded'):
         V = int(seg.cols[col]['V'])
-        cnt = np.ones(V, np.int64)                      # dict codes appear >= 1;
-        cnt[hc] = hn                                    # absent from heavy == exactly 1
-        hm2 = spec.get('having_min')
+        vc = _census(seg, col)
+        if vc is not None:
+            cnt = vc.copy()                             # exact: the load's own counts
+        else:
+            cnt = np.ones(V, np.int64)                  # dict codes appear >= 1;
+            cnt[hc] = hn                                # absent from heavy == exactly 1
+        if kc_ex is not None:
+            cnt[kc_ex] = 0                              # the excluded key is no group (it came back
+        hm2 = spec.get('having_min')                    # as a count-1 "singleton" before this line)
         rows = []
         for code in range(V):
             n = int(cnt[code])
+            if n == 0:
+                continue
             if hm2 is not None and not n > hm2:
                 continue
             row = [None, None]
             row[ki] = _emit_key(seg, col, code, spec.get('shift', 0))
             row[ci] = n
             rows.append(tuple(row))
+        if spec.get('order') is not None:
+            rows = workers.finalize(rows, proj, spec['order'], None)
         _HITS += 1
         return rows, [wdb_sql._alias(p) for p in proj]
     hm = spec.get('having_min')

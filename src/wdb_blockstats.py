@@ -130,6 +130,60 @@ def differentiator_rows(seg, col):
     return rep.astype(np.uint32)
 
 
+VCNT_MAX = 65536
+
+
+def value_counts(seg, col):
+    """THE CENSUS OF THE LOAD (Jackson, 2026-09-24): rows per dictionary code, for dictionary
+    columns of at most VCNT_MAX codes -- a column statistic of the same species as a distinct
+    count, born with the load, a few hundred bytes. COUNT(*) WHERE k <op> v and GROUP BY k
+    COUNT(*) become arithmetic over V numbers instead of a pass over N rows: Q01 (AdvEngineID <> 0)
+    is N minus the count of code 0. None when the column does not qualify."""
+    c = seg.cols.get(col)
+    if c is None or c.get('mode') not in (0, 1, 2):
+        return None
+    V = int(c.get('V') or 0)
+    if V < 1 or V > VCNT_MAX:
+        return None
+    import wdb_kernels as _WK
+    codes = np.asarray(seg._raw_codes(col))
+    cnt = np.ascontiguousarray(_WK.bincount_par(codes, V), dtype=np.int64)
+    assert cnt.size == V and int(cnt.sum()) == int(seg.N), ('census does not cover the rows', col, cnt.size, V)
+    return cnt
+
+
+def _load_npz(seg):
+    p = stats_path(seg.path)
+    import os as _os
+    try:
+        mt = _os.stat(p).st_mtime_ns
+    except OSError:
+        return None
+    hit = _LOADED.get(p)
+    if hit is None or hit[0] != mt:
+        try:
+            hit = _LOADED[p] = (mt, np.load(p, allow_pickle=False))
+        except Exception:
+            return None
+    z = hit[1]
+    if int(z['N']) != int(seg.N):
+        return None
+    return z
+
+
+def vcnt_from_load(seg, col):
+    """the load's rows-per-code of a column, or None (absent, or the shape does not match)"""
+    z = _load_npz(seg)
+    k = col + '.vcnt'
+    if z is None or k not in z.files:
+        return None
+    a = np.asarray(z[k], dtype=np.int64)
+    c = seg.cols.get(col)
+    if c is None or a.size != int(c['V']):
+        return None
+    return a
+
+
 def rep_from_load(seg, col):
     """the exception list from the load statistics, or None (absent or the column did not qualify)"""
     p = stats_path(seg.path)
@@ -165,6 +219,9 @@ def write_for_segment(seg_path, verbose=False):
         if rep is not None:
             out[col + '.rep'] = rep
             if verbose: print('  stats: %s is a differentiator, %d exception rows' % (col, rep.size), flush=True)
+        vc = value_counts(seg, col)          # THE CENSUS OF THE LOAD (small dictionaries)
+        if vc is not None:
+            out[col + '.vcnt'] = vc
         seg._codes.pop(col, None)
         if not eligible(seg, col):
             continue
