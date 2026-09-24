@@ -2204,3 +2204,26 @@ Q13-Q15 ~1.0-1.5, Q30 1.3 (0.4), Q11 1.1, Q07 0.84 (0.03) -- the DISTINCT / GROU
 (1,436), Q22 2,479 (1,785), Q23 1,917 (1,961), Q28 2,222 (1,843), Q33 1,505 (1,451), Q34 860 (1,721).
 Hot, Umbra is in a class of its own (5.5 s); WaveDB is second (12.9 s) ahead of ClickHouse (15.7).
 Suspect: WaveDB Q31 hot 7 ms / Q32 14 ms vs cold 470 / 340 -- carried state to audit under the law.
+
+
+
+## HANDOFF (2026-09-23, end of session): the state of the battlefield
+Pod left clean: no engine processes running; pod src/bench/tests identical to main (55f2709, 251
+files checked); everything committed and pushed. The canonical database is cbdb_fc3 (the three
+streams); cbdb_e19 is the interleaved predecessor, kept for A/Bs. Referee data kept on the pod:
+ClickHouse data (41 GB), Umbra db (11 GB), duck_native.db (25 GB).
+THE MEASURING STICKS: bench/true_cold.py (WaveDB, per query cold) and bench/fair_cold.py (every
+engine, same protocol). Warm-cache "first runs" (board_clickbench.py) are NOT cold -- never quote
+them as cold again. Scores are ClickBench's geometric mean of (t+10)/(best+10).
+STANDING (fair trial): cold -- Umbra 24.4 s, ClickHouse 29.0, WaveDB 43.2, DuckDB 57.5;
+hot -- Umbra 5.5, WaveDB 12.9, ClickHouse 15.7, DuckDB 19.7.
+OPEN FRONTS, for next session's plan:
+  1. The distinct / group family, ~20 s of the 43 cold: Q09 5.0 s (Umbra 0.6), Q18 3.6 (1.1),
+     Q08 3.0 (0.45), Q10 2.8 (0.19), Q16 1.8 (0.75), Q13-Q15, Q30, Q11, Q07 0.84 (0.03).
+     Includes group_fold_dict / grid2_count recompiling every process (uncacheable numba).
+  2. Scattered-position code reads (codes_at, enc-19 gathers) still fault through the memory map
+     cold; warm_span covers only whole-column decodes and wherescan's frame scans.
+  3. Step 2 of the dictionary layout: small text frames, so survivors-only reads (Q22) and the
+     host read inflate ~1% of the text instead of whole 16,384-entry chunks.
+  4. Audit: Q31 hot 7 ms / Q32 14 ms vs cold 470 / 340 -- carried state under the law?
+  5. The fused path (wdb_join) still decides a LIKE whole and prices string filters flat.
