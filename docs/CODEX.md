@@ -2609,3 +2609,10 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   41,141 (hash) / 41,178 (dict code), 4 bytes all. The region's population: 12,648,448 rows,
   2,311,287 distinct URLs (22 bits to number), entropy 14.2 bits/row; zstd today 21.5 bits/row
   (whole-column average).
+
+- JACKSON'S TOP-K START (don't group the URLs; start from the most common, count them in the
+  survivors, ask whether any other can compete) + PART OF EACH VALUE. bench/url_topk.py: survivor
+  piles top 3373, 3328, 2421, 757, 633; ranks 101-110 are 27..24, so the bar is 24. URLs that could
+  reach 24 (the exact candidate list): whole table 316,430; counter 62's region 20,336; counter 62's
+  rows 363 (answer URLs rank <= #348 there). With the 363: 1 byte of each survivor's code rules out
+  16,148 of 89,914 rows, 2 bytes leave 17,264, 3 bytes 16,843 (the true candidate rows).
