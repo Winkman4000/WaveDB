@@ -15,6 +15,7 @@ METHODS = {  # method -> index of the argument that names the column (or the col
     'codes_at': (0, 1), '_raw_codes': (0, None), '_raw_codes_range': (0, None),
     'values_at': (0, 1), 'values_at_rows': (0, 1), 'inline_at': (0, 1), 'fetch': (0, None),
     '_e19_at': (0, 1), '_dict_ints_at': (0, 1), '_pk18_frame': (0, None),
+    '_dict_ints': (0, None), '_i2_pop': (0, 1),
     'read_span': (None, None), 'warm_span': (None, None),
 }
 

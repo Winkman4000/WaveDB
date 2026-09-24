@@ -2353,3 +2353,46 @@ cost 1,466 ms serial, 482 ms batched.
   verifier's star normalization, not the engine: TO AUDIT (bench/_cbnorm.py on star rows).
 
 cbdb_i2 is the new canonical database; cbdb_fc3 its predecessor.
+
+
+## 2026-09-24 -- THE ZSTD AUTOPSY and THE GAP PACKER (measured; parked: no customer on the board)
+
+**Jackson's hypothesis:** zstd stores the bit matrix as literals plus generative copy rules; some
+bits must already be in place (no rule stores them for less than they cost), so some values may be
+readable without running every rule -- run a rule to 12% and pluck.
+
+**The autopsy (bench/zstd_autopsy.py; zstd 1.5.6's own decoder built with DEBUGLEVEL=6 in
+/workspace/zaut, fed frames cut from cbdb_i2):** confirmed, sharper than expected.
+- Hash/ID dictionaries (URLHash, WatchID, UserID): the literal section is RAW -- Huffman could not
+  beat the bytes as themselves -- 45-52% of the output stored in place in the file. By byte of each
+  8-byte gap (low first) URLHash is literal 89 100 100 95 14 6 6 7%: the random low half in place,
+  the near-zero high half written by ~one copy rule per value (7,698 rules / 8,192 values, median
+  length 4, chains to depth 40-56). Those rules cost 14,952 of the frame's 49,111 bytes (~1.9 B per
+  value) to say "the top bytes are small". Whole values in place: 0.5-5% (UserID 2-33%).
+- A value k% into a frame is ready after ~k% of the rules: the median pluck runs half the frame.
+- Rules are the right tool where nothing is random: EventTime's 8,192 values are 2 rules (30 B),
+  HID/ClientIP 3.6-19% literals, copies of short repeating gaps.
+- URL/Referer code frames: Huffman literals (4 streams), 23-31% of values all-literal.
+
+**The gap packer (bench/gap_pack.py), every value in place by construction:** per 8,192-value chunk
+a base, a width (bits of the largest gap), the gaps at that width (gap j at bit j*w), a checkpoint
+every K values. Exact on all 11 dictionaries. K=64 against zstd:
+- size: WatchID 543.98 -> 500.88 MB, RefererHash 129.10 -> 119.49, URLHash 124.04 -> 114.86 (width
+  43.3 bits, as the arithmetic predicted), UserID 103.25 -> 96.02, FUniqID 86.90 -> 81.29, HID
+  87.66 -> 84.71, ClientIP 17.80 -> 16.20, RemoteIP 17.53 -> 15.96; the time columns grow
+  (EventTime 0.03 -> 0.47, ClientEventTime 1.10 -> 1.85): zstd keeps them. Per column best:
+  1,111 -> 1,031 MB (-81 MB, ~0.9% of the database).
+- full decode (warm, CPU): WatchID 401 -> 31 ms, HID 248 -> 20.5, URLHash 86 -> 11.5.
+- one value: ~74 us (inflate 64 KB + sum) -> 0.05 us (no checkpoint 4.2 us; K=16 0.02 us at +7% size).
+- a cold pluck needs ~340 bytes (header, a checkpoint, <= 63 gaps): under one page.
+
+**The board census of the reads it would serve (scatter_census with _dict_ints/_i2_pop):** no board
+query reads a big integer dictionary whole. Full reads are only small dictionaries (<= 10 ms each;
+Q23's SELECT * touches ~70 of them at 0-4 ms). The big ones are only plucked, and the plucks already
+sit at the toll floor since this morning: ~170 ms of _i2_pop across the whole board. The packer's
+speed has no ClickBench customer today; its board value is the size, -81 MB. PARKED, ready: the
+prototype, the kernels and the numbers are here for the join boards or a size push.
+
+**Where the cold time is (same census):** full CODE decodes (_raw_codes) -- UserID enc 19 2.1 s,
+URL/Referer enc 3 1.2 s, SearchPhrase 0.84 s, ClientIP 0.64 s, ... -- and the enc-3 point frames
+read fault by fault (family 2). The autopsy's lens goes there next.
