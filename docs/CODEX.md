@@ -2490,3 +2490,26 @@ enc 19 (UserID: 247 MB read, then e19_decode), enc 8/9/5.
 - Board, WDB_PIPE19 toggled, interleaved A B A B: runs A 27.7, 26.4 / B 25.9, 25.6 s (a noisy pod
   today: A's two runs differ by 1.3 s). Best of two: cold 25.9 -> 24.8 s, hot 13.16 -> 12.89 s.
   The UserID queries: Q09 -266, Q16 -277, Q18 -173, Q13 -72, Q08 -62. Suite 1741 passed.
+
+
+## 2026-09-24 -- THE SPARSE DRESS FROM ITS PLANES: enc 8/9 full decodes
+
+- Where the CPU went (warm, best of three): SearchPhrase (enc 8) 245 ms full decode, but its
+  planes (present positions + literal codes, 13.2% of rows) cost 40 ms and a plain numpy default
+  fill + scatter 49 ms -- the 3-pass kernel's in-kernel uint32 fill was the bill. MobilePhone
+  (enc 9) 232 ms: the old path unpacked the 100M-bit presence plane into a bool array, copied it,
+  and index-filtered the present rows per tier, serially; planes 132 ms + fill 27. MobilePhoneModel
+  141 -> planes 60 + fill 22.
+- The change: enc 8 and 9 full decodes = e8_planes (shared with the counting consumers) + one
+  default fill + one scatter, at the same output widths (enc 8 uint32, enc 9 by its bits: no new
+  kernel signature). WDB_PLANES=0 is the switch.
+- Cold, one decode per fresh process after Database.open, alternating (median of three), codes and
+  dtypes identical: SearchPhrase 277 -> 161 ms, MobilePhone 270 -> 205, MobilePhoneModel 182 -> 128.
+- Board, WDB_PLANES toggled, interleaved: runs A 24.8, 24.4 / B 24.1, 23.8 s. Best of two: cold
+  24.0 -> 23.2 s, HOT 12.84 -> 12.11 s (hot re-decodes per query). Q11 cold -228 (hot 449 -> 234),
+  Q14 -209 (hot 561 -> 368), Q12 -201 (hot 408 -> 211), Q25 -193 (hot 419 -> 214), Q10 -165,
+  Q23 -92. Board rises re-run alone, alternating, three each: Q40 even (noise); Q22 medians
+  2059 -> 2117 with overlapping runs (2089/2059/1980 vs 2062/2117/2171) -- within its noise band,
+  watch it. Suite 1741 passed.
+- Next in line (not built): enc 9's tier walk as one compiled loop -- MobilePhone's planes are
+  132 ms of Python-level passes; a kernel edit (the whole cache invalidates), ~100 ms on Q10/Q11.

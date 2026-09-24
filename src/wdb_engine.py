@@ -38,6 +38,7 @@ _POOL = None
 
 _PIPE3 = [__import__('os').environ.get('WDB_PIPE3', '1') == '1']   # A/B: 0 restores read-all-then-decode for enc-3
 _PIPE19 = [__import__('os').environ.get('WDB_PIPE19', '1') == '1'] # A/B: 0 restores warm_span-then-decode for enc 19
+_PLANES = [__import__('os').environ.get('WDB_PLANES', '1') == '1']  # A/B: 0 restores the old enc 8/9 full decodes
 
 
 def _pool():
@@ -1137,6 +1138,18 @@ class Segment:
                                  np.asarray(c['e5patch']),
                                  np.asarray(c['e5off']).astype(np.int64),
                                  np.int64(self.N), np.int64(c['BR']))
+            self._codes[nm] = cc; return cc
+        if c.get('code_enc', 0) in (8, 9) and _PLANES[0]:
+            # THE SPARSE DRESS FROM ITS PLANES (2026-09-24): the present rows' positions and codes
+            # (e8_planes: the few percent of rows off the default), then one default fill and one
+            # scatter. Measured warm: SearchPhrase 245 -> ~90 ms (the 3-pass kernel's in-kernel
+            # uint32 fill was the bill), MobilePhone 232 -> ~159 (the old path unpacked a 100M-bit
+            # presence plane and index-filtered it per tier), MobilePhoneModel 141 -> ~82.
+            # Output widths unchanged: enc 8 uint32, enc 9 by its bits.
+            pos_p, lits_p, d_p = self.e8_planes(nm)
+            wdt_p = np.uint32 if c['code_enc'] == 8 else (np.uint8 if c['e9bits'] <= 8 else np.uint16)
+            cc = np.full(self.N, d_p, dtype=wdt_p)
+            cc[pos_p] = lits_p
             self._codes[nm] = cc; return cc
         if c.get('code_enc', 0) == 8:                # sparse-default: 3-pass parallel expand
             import wdb_kernels as _WK
