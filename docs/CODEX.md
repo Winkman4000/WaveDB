@@ -2396,3 +2396,33 @@ prototype, the kernels and the numbers are here for the join boards or a size pu
 **Where the cold time is (same census):** full CODE decodes (_raw_codes) -- UserID enc 19 2.1 s,
 URL/Referer enc 3 1.2 s, SearchPhrase 0.84 s, ClientIP 0.64 s, ... -- and the enc-3 point frames
 read fault by fault (family 2). The autopsy's lens goes there next.
+
+
+## 2026-09-24 -- THE CODE AUTOPSY and THE KERNEL LOAD BILL (measured)
+
+**The code autopsy (bench/code_autopsy.py):** the 14 code sections the cold board decodes whole,
+chosen by the scatter census. Per column a full decode cold (file evicted, fresh Segment) against
+warm (CPU only), bytes pulled, stored bits per row against the information the codes carry (H0).
+- The big columns carry no size fat: URL stores 20.56 bits/row against H0 18.57 (log2 V 24.13),
+  Referer 18.03 / 15.57, ClientIP 19.37 against H0 20.67 and UserID (enc 19) ~19.7 against 22.41
+  -- block locality already beats the global entropy. Their cold time is a READ THEN a DECODE in
+  series: URL 360 ms cold = ~196 ms pulling 257 MB (1.31 GB/s, warm_span) + 170 ms decoding;
+  ClientIP 378 = ~186 + 192; Referer 386 = ~220 + 164. The decode starts only when the whole span
+  has landed: the CPU waits for the storage, then the storage waits for the CPU.
+- The low-entropy columns are CPU-bound, not read-bound: MobilePhone 235 ms of CPU to write 100M
+  codes carrying 0.51 bits/row (87% runs), MobilePhoneModel 142 ms (0.35 bits, 90% runs),
+  SearchPhrase 244 ms (3.25 bits, 77% runs), IsRefresh 52 ms (0.35 bits).
+- Code frames under the zstd lens: Huffman literals, 11-31% of values all-literal, a value ready
+  after ~half the frame's rules -- the same shape as the dictionaries.
+- (UserID's 1,635 ms here was a bare process's first parallel call; on the board it is ~280 ms:
+  247 MB in 198 ms + ~60 ms decode.)
+
+**The kernel load census (bench/kernel_load_census.py):** a numba kernel's first call in a process
+loads its cached machine code (Dispatcher._compile_for_args) before running; every cold query is a
+fresh process. Timed as WALL (the union of intervals in which any thread was loading -- the raw sum
+counts every waiting thread: Q22 4,460 ms summed, 130 ms wall). Board: 1.78 s of 26.5 s cold (7%)
+is loading already-compiled kernels. No compiles -- every first call is a cache hit. ~8-14 ms per
+kernel, fc3_hostruns 138 ms (Q28, 37 threads idle meanwhile), fc3_charlens 72 ms. Most loaded:
+unpack_any (14 queries), e8_pos (16), _hist_par (11), e19_decode (9), unpack24_be (8).
+Database.open already loads five kernels and starts the parallel runtime (a bare process pays
+~375 ms for its first parallel call; import wdb_kernels ~965 ms) -- outside the timed run.
