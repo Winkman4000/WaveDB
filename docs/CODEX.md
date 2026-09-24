@@ -2638,3 +2638,10 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   by first appearance, split into a new/returning flag (new = the next number, implicit: 0.36 / 0.48
   bits/row) + returning numbers (4.9 / 7.8): 5.3 / 8.3. TOTAL 14.7 region / 16.7 whole column, vs
   display 15.6 / 17.6, today 19.4 / 21.5. Lists by number order: 17.2 / 19.8. Not built or timed.
+- VALUE-AS-AXIS SPEED A/B (bench/url_lists_ab.py, built for URLHash, round trip exact): file 220.8 MB
+  (17.7 bits/row, one zstd frame a section) vs today 268.8 MB (21.5); the value-order -> number map
+  72.3 MB zstd (5.8 bits/row) -> net +24 MB. Fresh process, evicted, 3 runs, medians:
+  Q40 survivors 104 -> 74 ms cold (hot 28 -> 29); counter 62 rows 117 -> 69 (hot 48 -> 56);
+  full column 227 -> 282 (lists hot 150; today's full is held by the source cache, hot 0).
+  First cut had 4 reader tasks for 193 sections (129/141 ms); runs capped so every lane gets two.
+  Open: today's gather was not re-run with the same reader split -- layout vs reader not separated.
