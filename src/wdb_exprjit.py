@@ -26,6 +26,7 @@ except Exception:
     HAS_NUMBA = False
 
 _NT = min(8, os.cpu_count() or 1)
+_ISOLATED = [True]                # A/B switch: False sends every shape to the generator
 _CACHE = {}                       # (body, slot_gathered, group_gathered, has_mask, need_minmax) -> kernel
 
 
@@ -251,6 +252,17 @@ def grouped_multi(group_keys, inputs, exprs, mask, n, pred=None, mono=False):
     mm_flags = tuple(bool(e[1]) for e in exprs)
     has_mask = mask is not None                      # mask ALWAYS gates; pred conjuncts follow it
     mono = bool(mono and nkeys == 1 and group_keys[0][2] is None)
+    if (_ISOLATED[0] and not exprs and nkeys == 1 and not gk_gathered[0] and not has_mask
+            and not pred):
+        # THE ISOLATED PERSPECTIVE: COUNT(*) per one direct key is a single operation --
+        # nothing to fuse. The generated kernel compiled it in every fresh process (737 ms
+        # measured on Q07); the census kernel is compiled once and cached on disk. [:K] keeps
+        # the generated kernel's contract: codes past K (a trailing null slot) never counted.
+        import wdb_kernels
+        codes = np.asarray(group_keys[0][0])[:n]
+        if n >= (1 << 22):
+            return wdb_kernels.bincount_par(codes, K)[:K].astype(np.int64, copy=False), []
+        return wdb_kernels.count_codes(np.ascontiguousarray(codes), np.int64(K)), []
     fn = _build_multi(bodies, mm_flags, slot_gathered, slot_code, gk_gathered, nkeys, has_mask, pred or '',
                       mono=mono)
 

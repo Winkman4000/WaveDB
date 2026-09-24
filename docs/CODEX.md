@@ -2260,3 +2260,38 @@ Q15 819, Q16 1056, Q17 468, Q18 1102, Q30 1282 ms (Umbra: 31/450/626/193/190/447
 465/1073/400).
 LEFT: Q07's generated kernel (wdb_exprjit exec'd source: uncacheable, 1.1 s cold) -- fixed kernels
 for common shapes, or a persisted compiled-shape cache (a ClickBench rules question: Jackson's call).
+
+
+## 2026-09-24 -- THE ISOLATED PERSPECTIVE: the generator census, and Q07 off the generator
+
+**The two perspectives (Jackson):** keep two things compiled. Kernels in isolation serve the
+simple pipes -- one operation feeding the next, no extra read. A superposition kernel (every
+piece as a switchable table lookup, latent fused paths unswitched by the compiler) serves the
+queries where fusion pays. Both are compiled once and cached on disk; nothing compiles at query time.
+
+**The census first (bench/jit_census.py):** every board query in a fresh process, every kernel
+wdb_exprjit generates wrapped and timed (first call = compile + run, later calls = run).
+Of 43 ClickBench queries ONE reaches the generator: Q07, and its shape is the simplest there is --
+COUNT(*) per one direct group key, no value, no expression, no mask, no predicate (the <> 0 is
+spent before the kernel). First call 737 ms, later calls 6.6-14.8 ms. The other 42 build nothing.
+So on ClickBench the superposition kernel has no customer; its customers are the join boards
+(TPC-H style SUM(price * (1 - discount)) through wdb_join). Parked until we work those boards;
+the census runs there first.
+
+**The route:** wdb_exprjit.grouped_multi -- the single chokepoint, so every caller gets it --
+sends (no exprs, one direct key, no mask, no pred) to an isolated cached kernel:
+wdb_kernels.count_codes (new; reads the codes in their own width, thread count as an argument so
+it stays cacheable) below 4M rows, bincount_par above. Codes past K are not counted, the
+generated kernel's contract. _ISOLATED=[True] is the A/B switch.
+- np.bincount was the first try: 2.2 ms against the generated kernel's 0.2 ms on Q07's 630,500
+  uint8 codes (K=19) -- it widens to int64 first. Serial count_codes 0.8 ms; parallel 0.3 ms.
+  Query level 81.8 vs 81.5 ms (noise).
+
+**Measured (true cold, fresh process, files + numba caches evicted):**
+- Q07 cold, three single runs: before 922 / 825 / 856 ms, after 191 / 183 / 209 ms.
+  On the boards: 903 -> 213 and 903 -> 200.
+- Board total, two runs of identical new code: 29.4 s and 27.7 s (was 28.5). The 1.7 s spread
+  between identical runs is the MooseFS noise band; Q07's -0.7 s reproduces every run.
+  Q31/Q32 rose in both runs but sit inside the old code's own spread (Q31 379-469, Q32 356-443).
+- Hot 13.89 -> 13.76 / 13.29 s.
+- Suite 1737 passed, 0 failed. Q07 exact agreement against the parquet (verify_correctness).

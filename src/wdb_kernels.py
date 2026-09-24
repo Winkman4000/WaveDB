@@ -3512,6 +3512,33 @@ def bincount_par(codes, minlength):
     return out
 
 
+def count_codes(codes, K):
+    """COUNT(*) per code in the codes' own width -- no widening copy (np.bincount casts uint8 to
+    int64 first: 2.2 ms on Q07's 630k codes against 0.2 ms for the generated parallel loop). Codes
+    past K are not counted (the generated kernel's contract: a trailing null slot is dropped).
+    The thread count rides in as an argument so the kernel stays cacheable."""
+    return _count_codes_nb(codes, np.int64(K), _nt())
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def _count_codes_nb(codes, K, T):
+    n = codes.shape[0]
+    part = np.zeros((T, K), np.int64)
+    chunk = (n + T - 1) // T
+    for t in prange(T):
+        lo = t * chunk
+        hi = min(lo + chunk, n)
+        for i in range(lo, hi):
+            c = codes[i]
+            if c < K:
+                part[t, c] += 1
+    out = np.zeros(K, np.int64)
+    for t in range(T):
+        for k in range(K):
+            out[k] += part[t, k]
+    return out
+
+
 @njit(cache=True, parallel=True, nogil=True)
 def pcount_chunks(mask, counts, chunk):
     nc = counts.shape[0]
