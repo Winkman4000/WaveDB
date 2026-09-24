@@ -2227,3 +2227,36 @@ OPEN FRONTS, for next session's plan:
      host read inflate ~1% of the text instead of whole 16,384-entry chunks.
   4. Audit: Q31 hot 7 ms / Q32 14 ms vs cold 470 / 340 -- carried state under the law?
   5. The fused path (wdb_join) still decides a LIKE whole and prices string filters flat.
+
+
+
+## THE CACHEABLE THREAD COUNT (2026-09-24): the group family was compiling, not reading
+Jackson: take on the group family first -- "we have not optimized the cold path here." A cold profile
+of Q07-Q18 and Q30 showed kernel COMPILE, not bytes: Q09 6.7 s of 8.1, Q18 4.8 of 5.9, Q10 3.8 of
+4.6, Q08 3.6 of 4.7, Q15/Q16 ~1.5 each. numba.get_num_threads() / get_thread_id() INSIDE an njit
+kernel embeds a threading-layer pointer; numba will not cache it ("dynamic globals"), so eight
+kernels recompiled in every process: sort_keys_par 2.8 s, gd_pass2_count 2.2, group_fold_dict 1.9
+(twice in Q09), _count_ge 0.9, plus grid2_count, grouped_sum_codes, _part_scatter_nb, plike_fc.
+Proved in isolation: same kernel 1.4 s every run; thread count as an ARGUMENT -> 33 ms from cache.
+FIX (c108456): wdb_kernels._nt() reads the count in Python; each kernel became _<name>_nb(..., T)
+behind a wrapper of its old name (no call site changed); gd_pass2_count takes its row from its own
+prange index over a static bucket split (prange's own split). Arithmetic unchanged.
+THE FIRST-BLOCK NO (582ae45): string columns have no load statistics, so stairs() decoded+diffed
+100M codes to learn "not a staircase" inside wherescan's DETECT (360-480 ms in Q10/Q11/Q13/Q14);
+one counterexample in the first 64K rows refutes it exactly. _dict_ints_at/_dict_ints: one pread
+per integer-dictionary chunk (Q15-Q17 fetched 10 UserIDs by page faults).
+MEASUREMENT RULE: numba's cache index is keyed on the SOURCE FILE -- editing wdb_kernels.py
+invalidates every cached kernel in it. After a kernel change, run the board once (ClickBench's
+install step) before measuring cold; the first pass after c108456 showed Q23 +2.3 s, Q36 +1.5 s of
+one-time compiles that vanished on the rerun.
+THE BOARD, TRUE COLD (fair-trial referees from 2026-09-23):
+                 COLD total  score  fastest     HOT total  score
+  Umbra            24.4 s    1.54     20          5.5 s    1.31
+  WaveDB           28.5 s    2.02     13         13.9 s    3.32   (was 43.2 s / 2.39)
+  ClickHouse       29.0 s    2.00      9         15.7 s    3.54
+  DuckDB           57.5 s    3.06      1         19.7 s    3.79
+Group family cold now: Q07 889, Q08 903, Q09 1393, Q10 704, Q11 976, Q12 646, Q13 928, Q14 865,
+Q15 819, Q16 1056, Q17 468, Q18 1102, Q30 1282 ms (Umbra: 31/450/626/193/190/447/627/413/415/752/
+465/1073/400).
+LEFT: Q07's generated kernel (wdb_exprjit exec'd source: uncacheable, 1.1 s cold) -- fixed kernels
+for common shapes, or a persisted compiled-shape cache (a ClickBench rules question: Jackson's call).
