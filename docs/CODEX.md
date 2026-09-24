@@ -2645,3 +2645,8 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   full column 227 -> 282 (lists hot 150; today's full is held by the source cache, hot 0).
   First cut had 4 reader tasks for 193 sections (129/141 ms); runs capped so every lane gets two.
   Open: today's gather was not re-run with the same reader split -- layout vs reader not separated.
+- URLHASH BITPACKED, NO FRAMES (bench/url_bitpack_ab.py, 25 bits/row, round trip exact): 312.5 MB vs
+  268.8 (+43.7 MB, +16%). Fresh process, evicted, 3 runs, medians cold / hot:
+  Q40 survivors today 108 / 32, mmap 63 / 8, page-pread 66 / 11 (reads 39.4 MB: survivors ~9 a page,
+  so the whole region's pages are still read); counter 62 rows today 117 / 45, mmap 57 / 9, pread 84 / 41;
+  full column today 231 / 0 (source cache), mmap 271 / 99 (the page-pread reader is not for full reads: 3.6 s).
