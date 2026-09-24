@@ -311,6 +311,12 @@ def _bsi_execute(c, spec):
     except wdb_bsi_exec._BSIUnsupported:
         return None                          # shape/selectivity unfit -> fall through
 
+# PARKED (Jackson, 2026-09-24 -- see CODEX 'THE BIT-SLICE INDEX, AUDITED'): after the census of the
+# load, no ClickBench query reaches this read on any run (bench/route_census.py). It still serves
+# TPC-H-shaped filtered SUMs (test_path_coverage: bsi_discount_btw, bsi_q6_multi). THE HAZARD: its
+# index dies with the query (the law), so every query that lands here builds it from scratch -- on
+# 100M rows Q01 paid 188 ms of its 309. TO DECIDE, after measuring TPC-H Q6 with and without it:
+# remove it from _READ_ORDER, or gate it on table size (build only where building beats the scan).
 bsi_filter = Read('bsi_filter', _bsi_detect, _bsi_execute, 'bit-sliced index filter (throughput)')
 
 
