@@ -86,8 +86,9 @@ def by_hand(seg, variant):
     lo = wdb_funnel._days_of(np.datetime64('2013-07-01')); hi = wdb_funnel._days_of(np.datetime64('2013-07-31'))
     keep = (days[ed] >= lo) & (days[ed] <= hi)
     rows, ed = rows[keep], ed[keep]
+    mark('EventDate')
     uh = np.asarray(seg.codes_at('URLHash', rows)).astype(np.int64)
-    mark('EventDate + URLHash')
+    mark('URLHash')
     VE = int(seg.cols['EventDate']['V'])
     key, cnt = np.unique(uh * VE + ed, return_counts=True)
     order = np.argsort(-cnt, kind='stable')[100:110]

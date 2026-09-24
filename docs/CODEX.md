@@ -2600,3 +2600,12 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   All 284 exceptions lie OUTSIDE counter 62's blocks. Answers equal the engine's group counts
   (89,914 survivors, 41,194 groups); rows 101-110 differ only in tie order at equal counts.
   C's biggest remaining line: EventDate + URLHash point reads on 89,914 rows, ~112 ms cold.
+
+- Q40's last lookups split (C, fresh process, cold x3): EventDate 5-13 ms (the staircase gives the
+  same dates from position alone), URLHash 92-101 ms (hot ~20). URLHash is enc 3, 4-byte codes
+  (V 20,714,865 = 25 bits), 65,536 rows a frame; the 89,914 survivors touch all 193 region frames
+  (~172 KB compressed each on average): one survivor per ~140 rows, so every frame is read.
+  bench/url_bytes.py: bytes to tell the 41,194 survivor URLs apart -- 2 bytes 30,592, 3 bytes
+  41,141 (hash) / 41,178 (dict code), 4 bytes all. The region's population: 12,648,448 rows,
+  2,311,287 distinct URLs (22 bits to number), entropy 14.2 bits/row; zstd today 21.5 bits/row
+  (whole-column average).
