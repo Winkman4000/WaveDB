@@ -2620,3 +2620,8 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   The general form, no stored lists (bench/url_buckets.py): read the first bytes of every survivor's
   code, pile by those bytes (a pile's count bounds each URL in it), finish only piles reaching the
   bar 24. 1 byte: all 89,914 rows need the rest; 2 bytes: 16,652 (18.5%); 3 bytes: 16,342.
+- JACKSON'S DISPLAY/DICTIONARY SPLIT (bench/url_split.py, counter 62's region of URLHash, 12,648,448
+  rows, 2,311,287 distinct): leading hash bits a section needs to tell its hashes apart -- 65,536-row
+  sections (median 23,651 distinct): median 29 bits (26..34), suffix dictionary +12.6 bits/row;
+  8,192-row sections (median 3,953 distinct): median 24 (20..33), +19.3. Today's code: 25 bits.
+  Random hashes need about twice the bits of their count to separate by their own bits.
