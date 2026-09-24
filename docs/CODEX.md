@@ -2625,3 +2625,9 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   sections (median 23,651 distinct): median 29 bits (26..34), suffix dictionary +12.6 bits/row;
   8,192-row sections (median 3,953 distinct): median 24 (20..33), +19.3. Today's code: 25 bits.
   Random hashes need about twice the bits of their count to separate by their own bits.
+- JACKSON'S SECTION-NUMBERED DISPLAY (bench/url_local.py, zstd level 9 per 65,536-row section).
+  Global numbers by value (as today): region today 19.4 bits/row vs display 13.5 + dictionary 5.5
+  (sorted global numbers as gaps) = 19.0; whole column 21.5 vs 14.3 + 7.2 = 21.5. Full hashes in
+  the dictionary: 20.9 (random). THE LINEAR RULE -- global numbers by first appearance: region
+  13.5 + 2.1 = 15.6 (today's layout renumbered 17.6); whole column 14.3 + 3.3 = 17.6 (renumbered
+  19.6). Cost: literal -> number lookups need a value-order map (~20.7M entries, ~5 bits/row raw).
