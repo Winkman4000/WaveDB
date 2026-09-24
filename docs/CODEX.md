@@ -2295,3 +2295,61 @@ generated kernel's contract. _ISOLATED=[True] is the A/B switch.
   Q31/Q32 rose in both runs but sit inside the old code's own spread (Q31 379-469, Q32 356-443).
 - Hot 13.89 -> 13.76 / 13.29 s.
 - Suite 1737 passed, 0 failed. Q07 exact agreement against the parquet (verify_correctness).
+
+
+## 2026-09-24 -- THE READ MATCHED TO THE QUESTION: integer dictionaries at the toll floor
+
+**The law (Jackson, from the scatter census):** every read pays two prices -- a TOLL per trip
+(the request, the lookup, the first byte back: a cold 64 KB read on the pod is 0.8 ms, nearly all
+toll) and a CHARGE per byte (carrying: 3 MB cold is 14 ms, ~0.2 GB/s one stream; unpacking:
+zstd 4-12 ms per 4 MB). They are equal at toll x speed ~ 100 KB here: the crossover size.
+Point questions want read units down to the crossover and no smaller; whole questions want big
+trips (neighbours on disk share one read); independent trips go at once so tolls overlap.
+Every layer has the same shape with other numbers (cache line 64 B / ~100 ns, page 4 KB, SSD,
+network storage). Family 1 of the census was the unit too BIG for its question; family 2 (codes
+through the memory map, fault by fault) is the trips too SMALL and in a line -- one law, the two
+sides of the crossover.
+
+**The scatter census (bench/scatter_census.py):** true cold, every point-read method wrapped
+(time, rows, major faults). 6.2 s of the 28.0 s board is point reads. Family 1: answer values
+plucked one fetch at a time from the chunked integer dictionaries (UserID, WatchID, ClientIP,
+URLHash, RefererHash): each pluck popped a whole 524,288-value chunk -- ~3 MB read (14 ms) +
+4 MB inflated (4-12 ms) + a sum -- for 8 bytes. bench/pluck_probe.py: the board's mode-2 plucks
+cost 1,466 ms serial, 482 ms batched.
+
+**The change:**
+- wdb_encode: I2CH 524288 -> 8192 values per chunk (~45 KB: the crossover). The reader needs no
+  format change -- the chunk size is in each column's header.
+- bench/i2_convert.py: cbdb_fc3 -> cbdb_i2, only the 11 chunked integer dictionaries rewritten
+  (at the encoder's own level 9 -- level 19 is LARGER on these deltas), everything else byte for
+  byte, every dictionary verified value for value. Size 8,811,172,032 -> 8,815,560,890 (+4.4 MB,
+  +0.05%).
+- wdb_engine._i2_pop: chunks that are neighbours on disk form a RUN -- one pread (runs sized so a
+  wide read keeps 16 streams busy, at most 8 MB), frames inflated in the run's own thread, one
+  reshaped cumsum per run written straight into the output (no concatenate). _dict_ints_at groups
+  indices by chunk with one argsort (the old mask per chunk was chunks x indices).
+- Two tolls found on the way, both by measurement: a pool task per chunk (12,207 futures: WatchID
+  full read 680 -> 1450 ms) -> one task per run; and zstd's decompressobj(read_across_frames)
+  HOLDS the GIL (HID 652 MB: 914 ms on 1 thread, 1130 on 16) while per-frame decompress releases
+  it (150 ms on 16) -> per frame inside the run.
+
+**Measured:**
+- Plucks (the same codes, cold): 1,466 ms serial -> 101 ms serial (42 ms batched).
+- Full dictionary reads, cold, old reader + old db -> new reader + new db (medians): WatchID
+  679 -> 523, UserID 157 -> 151, URLHash 141 -> 158, ClientIP 53 -> 62, HID 217 -> 312 (per-frame
+  inflate of 9,945 small frames: CPU, not disk), EventTime ~4.
+- Board, interleaved A B A B (A = commit 323a0b5 on cbdb_fc3, B = this on cbdb_i2): runs A 27.7,
+  27.9 / B 28.6, 26.7 s. Best of two per query: cold 27.2 -> 26.3 s, hot 12.90 -> 12.90 s.
+  Every plucking query fell: Q15 -139, Q16 -162, Q17 -108, Q19 -96, Q23 -237, Q31 -225
+  (85 -> 52 MB read), Q32 -168 (41 -> 6 MB), Q40 -85, Q41 -74, Q08 -63, Q18 -52. Rises only on
+  big scans that touch no integer dictionary, bytes read unchanged (Q22 +91, Q27 +84, Q39 +64,
+  Q28 +53): the run noise.
+- Suite 1741 passed (tests/test_i2_chunks.py: 4 new -- chunk sizes 1000/8192/524288, partial
+  last chunk, edges, runs forced tiny and huge, point->full->point). verify_correctness on
+  cbdb_i2: 42/43 correct. Q23 (SELECT * ... ORDER BY EventTime LIMIT 10) is flagged WRONG -- and
+  equally on commit 323a0b5 with cbdb_fc3, so it predates this. Checked cell by cell: on both
+  databases WaveDB's 10 rows are the right rows (the 10th EventTime has no tie) and every cell
+  of every row equals the parquet row, integer dictionary values included. The verdict is the
+  verifier's star normalization, not the engine: TO AUDIT (bench/_cbnorm.py on star rows).
+
+cbdb_i2 is the new canonical database; cbdb_fc3 its predecessor.

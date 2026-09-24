@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""WaveDB engine — loads a WVDB3 segment, resolves columns by name from the header.
+"""WaveDB engine â€” loads a WVDB3 segment, resolves columns by name from the header.
 Generic: knows nothing about any specific dataset. Handles plain (mode 0) and
 front-coded (mode 1) string dictionaries transparently."""
 import struct
@@ -634,19 +634,11 @@ class Segment:
             return c['_nline']
         if c.get('intvals') is None:
             if c.get('i2ch') is not None:            # chunked spine: inflate ALL chunks
-                nch = len(c['i2zoffs']) - 1          # POOLED for full-dict consumers
-                parts = [None] * nch
-                def _popi(ch):
-                    import zstandard as _z
-                    a = c['i2base'] + int(c['i2zoffs'][ch])
-                    b = c['i2base'] + int(c['i2zoffs'][ch + 1])
-                    return ch, np.cumsum(np.frombuffer(
-                        _z.ZstdDecompressor().decompress(self.read_span(a, b)),   # one pread per chunk
-                        dtype=np.int64))
-                with ThreadPoolExecutor(max_workers=16) as ex:     # 16 large streams: the storage's knee
-                    for ch, arr in ex.map(_popi, range(nch)):
-                        parts[ch] = arr
-                c['intvals'] = np.concatenate(parts)
+                nch = len(c['i2zoffs']) - 1          # (big trips: neighbours share one pread)
+                out = np.empty(nch * int(c['i2ch']), np.int64)
+                n = self._i2_pop(c, range(nch), out=out)
+                c['intvals'] = out[:n]
+                c['i2chunks'].clear()                # the spine answers every later point read
             else:
                 raw = self._dz.decompress(c['z2'])
                 d = np.frombuffer(raw, dtype=np.int64)
@@ -660,29 +652,74 @@ class Segment:
         if c.get('i2ch') is None or c.get('intvals') is not None or idx.size == 0:
             return self._dict_ints(c)[idx] if idx.size else np.empty(0, np.int64)
         CH = int(c['i2ch'])
-        chs = np.unique(idx // CH)
+        cho = idx // CH
+        chs = np.unique(cho)
+        self._i2_pop(c, chs.tolist())
         cache = c['i2chunks']
-        missing = [int(ch) for ch in chs.tolist() if ch not in cache]
-        if missing:
-            def _popi(ch):
-                import zstandard as _z
-                a = c['i2base'] + int(c['i2zoffs'][ch])
-                b = c['i2base'] + int(c['i2zoffs'][ch + 1])
-                return ch, np.cumsum(np.frombuffer(             # one pread per chunk: cold, the map
-                    _z.ZstdDecompressor().decompress(self.read_span(a, b)),   # faulted it in small pieces
-                    dtype=np.int64))
-            if len(missing) > 1:
-                with ThreadPoolExecutor(max_workers=min(8, len(missing))) as ex:
-                    for ch, arr in ex.map(_popi, missing):
-                        cache[ch] = arr
-            else:
-                ch, arr = _popi(missing[0])
-                cache[ch] = arr
-        out = np.empty(idx.size, np.int64)
-        for ch in chs.tolist():
-            m = (idx // CH) == ch
-            out[m] = cache[int(ch)][idx[m] - ch * CH]
+        if chs.size == 1:
+            ch = int(chs[0])
+            return cache[ch][idx - ch * CH]
+        order = np.argsort(cho, kind='stable'); so = cho[order]     # group by chunk once (the old
+        lo = np.searchsorted(so, chs, 'left'); hi = np.searchsorted(so, chs, 'right')   # mask per
+        out = np.empty(idx.size, np.int64)                          # chunk was chunks x indices)
+        for ch, a, b in zip(chs.tolist(), lo.tolist(), hi.tolist()):
+            sel = order[a:b]
+            out[sel] = cache[ch][idx[sel] - ch * CH]
         return out
+
+    _I2_RUN = 8 << 20
+
+    def _i2_pop(self, c, chs, out=None):
+        """THE READ MATCHED TO THE QUESTION (2026-09-24): bring the integer-dictionary chunks chs
+        into c['i2chunks'] (or, with out, write them into out at chunk * i2ch). Every read pays a
+        toll plus a charge per byte, so a point read wants a small chunk (8192 values, ~45 KB: at
+        the toll floor) and a wide read wants big trips. Chunks that are neighbours on disk form a
+        RUN: one pread, its frames inflated in the run's own thread, one reshaped cumsum (each chunk's
+        deltas start from 0, so every row of the reshape sums on its own). Runs go in parallel,
+        sized so a wide read keeps 16 streams busy. A toll per chunk -- a pool task, a call, a
+        small sum -- measured 1.45 s against 0.68 s for WatchID's 12,207 chunks. Returns the
+        number of values brought in."""
+        cache = c['i2chunks']
+        need = sorted(set(int(j) for j in chs if out is not None or int(j) not in cache))
+        if not need:
+            return 0
+        zo = c['i2zoffs']; base = c['i2base']; CH = int(c['i2ch']); nch = len(zo) - 1
+        span = int(zo[need[-1] + 1]) - int(zo[need[0]])
+        cap = min(self._I2_RUN, max(1 << 20, span // 16 + 1))
+        runs = []; s = 0
+        while s < len(need):
+            e = s + 1
+            while (e < len(need) and need[e] == need[e - 1] + 1
+                   and int(zo[need[e] + 1]) - int(zo[need[s]]) <= cap):
+                e += 1
+            runs.append(need[s:e]); s = e
+
+        def _run(r):
+            import zstandard as _z
+            a = int(zo[r[0]])
+            raw = memoryview(self.read_span(base + a, base + int(zo[r[-1] + 1])))
+            dz = _z.ZstdDecompressor()                   # frame by frame: this call releases the GIL
+            d = np.empty(len(r) * CH, np.int64); n = 0   # (one call across frames held it: HID's
+            for j in r:                                  # 652 MB took 1130 ms on 16 threads, 150 so)
+                x = np.frombuffer(dz.decompress(raw[int(zo[j]) - a:int(zo[j + 1]) - a]), dtype=np.int64)
+                d[n:n + x.size] = x; n += x.size
+            d = d[:n]; nf = n // CH
+            assert (len(r) - 1) * CH < n <= len(r) * CH and (n == len(r) * CH or r[-1] == nch - 1), (
+                'integer dictionary run does not decode to its chunks', r[0], r[-1], n, CH)
+            dst = out[r[0] * CH:r[0] * CH + n] if out is not None else np.empty(n, np.int64)
+            if nf:
+                np.cumsum(d[:nf * CH].reshape(nf, CH), axis=1, out=dst[:nf * CH].reshape(nf, CH))
+            if n > nf * CH:
+                np.cumsum(d[nf * CH:], out=dst[nf * CH:])
+            if out is None:
+                for k, j in enumerate(r):
+                    cache[j] = dst[k * CH:(k + 1) * CH]
+            return n
+
+        if len(runs) == 1:
+            return _run(runs[0])
+        with ThreadPoolExecutor(max_workers=min(16, len(runs))) as ex:     # 16 streams: the knee
+            return sum(ex.map(_run, runs))
     def dict_vals(self, nm):
         c = self.cols[nm]
         if c['vals'] is None: c['vals'] = self._decode_fc(c)

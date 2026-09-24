@@ -301,7 +301,7 @@ def _dict_bytes(p, zc):
     out = bytearray()
     if p['mode'] == 2:
         uniq_i = p['uniq'].astype(np.int64)
-        I2CH = int(os.environ.get('WDB_I2CHUNK', str(1 << 19)))      # values per chunk (4MB raw)
+        I2CH = int(os.environ.get('WDB_I2CHUNK', str(1 << 13)))      # values per chunk (64 KB raw: the toll floor)
         I2MIN = int(os.environ.get('WDB_I2CHUNK_MIN', str(1 << 20)))  # chunk only big dicts
         if uniq_i.size > I2MIN:
             # CHUNKED SPINE (the hits_6 dress): each chunk's deltas prepend 0, so every
