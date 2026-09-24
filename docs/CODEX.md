@@ -2631,3 +2631,10 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   the dictionary: 20.9 (random). THE LINEAR RULE -- global numbers by first appearance: region
   13.5 + 2.1 = 15.6 (today's layout renumbered 17.6); whole column 14.3 + 3.3 = 17.6 (renumbered
   19.6). Cost: literal -> number lookups need a value-order map (~20.7M entries, ~5 bits/row raw).
+- JACKSON'S VALUE-AS-AXIS LAYOUT (bench/url_plist.py): per section, per distinct URL, its rows as
+  variable-width jumps (1/2/3 bytes), plus counts, plus the section dictionary. Lists in first-seen
+  order (each list's first row a jump from the previous list's): jumps 9.4 (region) / 8.4 (whole)
+  bits/row zstd, below the display's 13.5 / 14.3. Dictionary in first-seen order, with global numbers
+  by first appearance, split into a new/returning flag (new = the next number, implicit: 0.36 / 0.48
+  bits/row) + returning numbers (4.9 / 7.8): 5.3 / 8.3. TOTAL 14.7 region / 16.7 whole column, vs
+  display 15.6 / 17.6, today 19.4 / 21.5. Lists by number order: 17.2 / 19.8. Not built or timed.
