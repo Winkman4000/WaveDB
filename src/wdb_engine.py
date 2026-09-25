@@ -1363,6 +1363,21 @@ class Segment:
         b = int(c['e20bits'])
         return np.uint8 if b <= 8 else (np.uint16 if b <= 16 else np.uint32)
 
+    def _e20_window(self, c, lo, hi):
+        """tag 20 codes of rows lo .. hi-1: decode only the blocks the window covers (never the
+        column -- an equality scan over a region asks for wide windows)"""
+        import wdb_kernels as _WK20
+        lo = max(0, int(lo)); hi = min(self.N, int(hi))
+        if hi <= lo:
+            return np.empty(0, dtype=self._e20_dtype(c))
+        BR = int(c['e20BR'])
+        b0 = lo // BR; b1 = (hi - 1) // BR + 1
+        out = np.empty(min(self.N, b1 * BR) - b0 * BR, dtype=self._e20_dtype(c))
+        _WK20.e20_decode_blocks(np.frombuffer(self.buf, np.uint8), np.int64(c['cstart']), np.int64(BR),
+                                np.int64(self.N), np.int64(c['e20bits']), c['e20boff'],
+                                np.int64(b0), np.int64(b1), out)
+        return out[lo - b0 * BR:hi - b0 * BR]
+
     def _e20_at(self, c, rows):
         """tag 20 codes at arbitrary rows: group by block, walk each touched block only as far as
         its last wanted row"""
@@ -2332,12 +2347,10 @@ class Segment:
                 _WK18.pk32_gather(fb, bits18, rel, tmp)
                 out[a - lo:b - lo] = tmp
             return out
-        if c.get('code_enc', 0) == 20:               # the back-reference: touched blocks only
+        if c.get('code_enc', 0) == 20:               # the back-reference: the window's blocks only
             if nm in self._codes:
                 return self._codes[nm][lo:hi]
-            if hi - lo > 8 * int(c['e20BR']):
-                return self._raw_codes(nm)[lo:hi]    # a wide window: the one-pass full decode
-            return self._e20_at(c, np.arange(lo, hi, dtype=np.int64))
+            return self._e20_window(c, lo, hi)
         if c.get('code_enc', 0) == 19:               # block dictionaries: touched blocks only
             if nm in self._codes:
                 return self._codes[nm][lo:hi]

@@ -2702,3 +2702,12 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   gather walks each touched block only to its last wanted row). Engine: header parse, full decode,
   windows, reads at rows; wdb_retype walks it. tests/test_hash_enc.py (4): tag, full decode = the column,
   rows sorted/unsorted/across blocks, windows, 7 SQL shapes = DuckDB. Suite 1749 passed.
+- A window read of a tag-20 column decodes only the blocks it covers (_e20_window, e20_decode_blocks); the
+  first cut sent any window wider than 8 blocks to a FULL column decode (copied from enc 19's rule), so the
+  region scans of Q40/Q41 decoded 100M rows: Q40 342 -> 569 ms cold on the board.
+- BOARD (bench/cluster_ab.py, A = kit load, B = kit load + --hash URLHash,RefererHash; both fresh):
+  load 423 vs 429 s; size 8.787 vs 8.729 GB (URLHash 276.0 -> 242.2 MB, RefererHash 233.0 -> 208.8).
+  Q00-Q39, Q42 flat within noise. After the window fix, true_cold x3 interleaved, medians cold / hot:
+  Q40 313 / 63 -> 264 / 79; Q41 474 / 81 (reads 320 MB) -> 283 / 64 (reads 72 MB).
+  verify_correctness on B: 42/43 (Q23, the known checker normalization). Suite 1749 passed.
+  Open: an equality-scan kernel for tag 20 (Q40 hot +16 ms: the region walk writes every code).

@@ -4447,6 +4447,15 @@ def e20_decode(buf, base, BR, N, bits, boff, out):
 
 
 @njit(cache=True, parallel=True, nogil=True)
+def e20_decode_blocks(buf, base, BR, N, bits, boff, b0, b1, out):
+    """blocks b0 .. b1-1 only, block j of them written at out[(j) * BR]"""
+    for j in prange(b1 - b0):
+        b = b0 + j
+        n = min(BR, N - b * BR)
+        _e20_block(buf, (base + boff[b]) * 8, n, bits, out, j * BR)
+
+
+@njit(cache=True, parallel=True, nogil=True)
 def e20_gather(buf, base, BR, N, bits, boff, blocks, starts, rows, out):
     """rows sorted; starts[j]..starts[j+1] are the rows in blocks[j]. Each touched block is walked
     only as far as its last wanted row (gaps only point back)."""
