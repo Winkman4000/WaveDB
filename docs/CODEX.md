@@ -2676,3 +2676,7 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   Only queries with two or more wide equalities change route. Suite 1745 passed.
 - Not integrated: the RefererHash -> CounterID link (-20 ms measured; needs an encode-time pair store) and
   URLHash bitpacked (-45 ms cold measured; the encoder's size contest refuses it, +43.7 MB).
+- BITPACK-PLUS ON THE WIDE COLUMNS (bench/bplus_wide.py, enc 10's election at any width, plus a linear
+  token): URLHash, RefererHash, UserID (25 bits) -- mean run 1.08 / 1.10 / 1.06 rows, no 4,096-row block
+  profits from runs or linear stretches: 312.5 MB each = plain bitpack (+0.2 MB directory), against today's
+  zstd 268.8 / 233.0 / 246.8 MB. zstd's edge is repeats a few rows back, which runs cannot see.
