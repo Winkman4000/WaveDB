@@ -2684,3 +2684,10 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   first time seen 20.7%; 1 back 7.0%; 2-3 1.4%; 4-15 1.9%; 16-255 10.1%; 256-4,095 18.7%; 4,096-65,535 17.0%;
   65,536-1M 13.8%; further 9.4%. Fixed slot w + flag, rows beyond reach as 25-bit literals: w 12 -> ~28.2
   bits/row, w 16 -> ~28.0, w 20 -> ~28.5, all above plain bitpack's 25 (arithmetic from these shares).
+- JACKSON'S VARIABLE-WIDTH BACK-REFERENCE (bench/backref_var.py sizes, bench/backref_ab.py built + A/B,
+  URLHash, round trip exact): per row a flag, then the 25-bit value or a 4-bit class + the gap to the previous
+  copy inside its block; blocks self-contained with a start table. 4,096-row blocks 263.0 MB (21.0 bits/row),
+  65,536-row blocks 242.2 MB (19.4), today's zstd 268.8 (21.5). Fresh process, evicted, 3 runs, medians
+  cold / hot: Q40 survivors today 112 / 29, br4096 75 / 27, br65536 65 / 28; counter 62 rows today 131 / 51,
+  br4096 72 / 43, br65536 80 / 47; full column today 241 / 0 (cached), br4096 317 / 143, br65536 328 / 162.
+  Open: the decoder is a first cut (bit at a time over 5 bytes); today's gather not run through the same reader.
