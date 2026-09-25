@@ -2680,3 +2680,7 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   token): URLHash, RefererHash, UserID (25 bits) -- mean run 1.08 / 1.10 / 1.06 rows, no 4,096-row block
   profits from runs or linear stretches: 312.5 MB each = plain bitpack (+0.2 MB directory), against today's
   zstd 268.8 / 233.0 / 246.8 MB. zstd's edge is repeats a few rows back, which runs cannot see.
+- BACK-REFERENCE SLOTS (bench/backref_gaps.py, URLHash, rows to the previous copy of the same value):
+  first time seen 20.7%; 1 back 7.0%; 2-3 1.4%; 4-15 1.9%; 16-255 10.1%; 256-4,095 18.7%; 4,096-65,535 17.0%;
+  65,536-1M 13.8%; further 9.4%. Fixed slot w + flag, rows beyond reach as 25-bit literals: w 12 -> ~28.2
+  bits/row, w 16 -> ~28.0, w 20 -> ~28.5, all above plain bitpack's 25 (arithmetic from these shares).
