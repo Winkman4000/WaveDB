@@ -2716,3 +2716,20 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   COLD WaveDB 1.58 / 22.3 s / fastest on 17 of 43; Umbra 1.69 / 24.4 s / 16; ClickHouse 2.20 / 29.0 s / 9;
   DuckDB 3.38 / 57.5 s / 1. HOT WaveDB 2.50 / 10.9 s / 9; Umbra 1.27 / 5.5 s / 34; ClickHouse 3.43 / 15.7 s
   / 2; DuckDB 3.68 / 19.7 s / 2 (hot counts include ties).
+
+
+## 2026-09-25 -- Q27: the declined try pays nothing, the answering read unpacks fast
+- The line items (cold 950 ms): fused_agg paid the WHERE literal (123 ms) and the group census (149 ms),
+  unpacked CounterID + URL (80 + 233 ms), then declined AVG(length(URL)); wdb_lenagg answered (dictionary
+  lengths 202 ms, pour 82 ms) off the columns fused had left behind. Without fused, lenagg's own window-by-window
+  unpack of the uncached columns took ~1.25 s (Q27 1,510-1,590 ms).
+- Fixes: (1) wdb_join._fast_pointer_agg declines FIRST on an aggregate over a function of a string column;
+  (2) wdb_lenagg unpacks each column once through the engine's fastest full decode, on a thread started in
+  detect so it overlaps the dictionary-length read; (3) '' is code 0 of a sorted dictionary: one fetch, not a
+  binary search (71 ms).
+- true_cold x3, old vs new on cb_hash: cold 963 / 909 / 841 -> 533 / 539 / 528 ms; hot ~610 -> ~370. Same answer
+  (md5). Suite 1749 passed; verify_correctness 42/43 (Q23, the known checker normalization); ClickHouse 253 ms.
+- Jackson's ideas measured first: website filter from the stored counts decides the set exactly (100 of 6,506)
+  but keeps 84.8% of rows; prefix-sum lengths are already how dict_charlens works (bytes-only would save ~50 ms
+  but 24% of URLs are non-ASCII); per-website stored length sums would be a pre-aggregate (ClickBench: 'not
+  recommended'), left out.

@@ -3237,6 +3237,14 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     if isinstance(nd9, (E.Min, E.Max)) and isinstance(nd9.this, E.Column):
                         if seg9.cols.get(pm9.get(nd9.this.name, nd9.this.name), {}).get('dt') == 1:
                             raise _FastUnsupported
+                    # A FUNCTION OF A STRING COLUMN under an aggregate (AVG(length(URL))): the fused
+                    # operands take plain numeric columns only, so it would decline -- but only after
+                    # the WHERE literal and the group census were paid (Q27: ~320 ms thrown away).
+                    # Decline FIRST; the dictionary's V-table reads (wdb_lenagg) serve it.
+                    if isinstance(nd9, (E.Avg, E.Sum, E.Min, E.Max)) and not isinstance(nd9.this, E.Column) \
+                            and any(seg9.cols.get(pm9.get(c9.name, c9.name), {}).get('dt') == 1
+                                    for c9 in nd9.this.find_all(E.Column)):
+                        raise _FastUnsupported
             except _FastUnsupported:
                 raise
             except Exception:

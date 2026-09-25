@@ -9,6 +9,7 @@ from sqlglot import expressions as E
 import wdb_sql
 
 _HITS = 0
+_PF = {}         # id(seg) -> the thread unpacking the two columns while the V-table is read
 _PRICED = []     # (chosen, fused_ms_est, chain_ms_est) -- the honesty loop's seed
 
 
@@ -115,6 +116,13 @@ def detect(seg, tree, col_map):
     for c in (key, lcol):
         if c not in seg.cols or seg.cols[c].get('code_enc') not in (0, 3, 5, 8, 10, 12, 19):
             return None
+    # THE OVERLAP: the V-table (the dictionary's lengths) and the two row columns are independent
+    # reads -- unpack the columns on a thread while the dictionary is read here
+    import threading
+    def _pf(s=seg, a=key, b=lcol):
+        s._raw_codes(a); s._raw_codes(b)
+    t9 = threading.Thread(target=_pf, daemon=True); t9.start()
+    _PF[id(seg)] = t9
     lens = _fn_table(seg, lcol, lkind)
     if lens is None:
         return None
@@ -150,9 +158,17 @@ def execute(seg, spec):
     KV = int(seg.cols[key]['V'])
     ec = -1
     if spec['excl_empty']:
-        import wdb_wherescan as WS
-        ec0 = WS._code_of(seg, lcol, '')
-        ec = int(ec0) if ec0 is not None else -1
+        # '' sorts first in a sorted dictionary: when present it IS code 0 -- one fetch, not a
+        # binary search through the front-coded chunks (measured 71 ms on URL)
+        z0 = seg.fetch(lcol, 0) if int(seg.cols[lcol]['V']) else None
+        if isinstance(z0, (bytes, bytearray)):
+            z0 = z0.decode('utf-8', 'replace')
+        if z0 == '':
+            ec = 0
+        elif z0 is None or not isinstance(z0, str):
+            import wdb_wherescan as WS
+            ec0 = WS._code_of(seg, lcol, '')
+            ec = int(ec0) if ec0 is not None else -1
     N = int(seg.N)
     if int(lens.max() if lens.size else 0) < 65536:
         lens16 = lens.astype(np.uint16)          # the tiny alphabet rides a u16 bus
@@ -160,6 +176,14 @@ def execute(seg, spec):
         lens16 = lens.astype(np.int64)
     import wdb_kernels as WK
     _price(seg, key, lcol)                       # the bidder's ledger: predict, then act
+    # every row of both columns is read: ONE full decode each through the engine's own fastest
+    # reader (pipelined frames / block dictionaries / tag 20), then the workers slice the codes.
+    # Window-by-window reads of an uncached column measured 1.25 s against 0.31 s this way (Q27).
+    t9 = _PF.pop(id(seg), None)
+    if t9 is not None:
+        t9.join()
+    seg._raw_codes(key)
+    seg._raw_codes(lcol)
     BR = 524288
     nfr = (N + BR - 1) // BR
     from concurrent.futures import ThreadPoolExecutor
