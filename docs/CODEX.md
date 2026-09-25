@@ -2662,3 +2662,17 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   356 -> 13,577; 220 -> 7,034; 295 -> 2,830; 555 -> 57,515; 398 -> 3,200; 290 -> 1,736; 198 -> 986.
   Hot worse on Q08-Q11 (20-90%). The engine's reads are built on the time staircase; without it they fall to
   slow roads. Correctness run skipped: rejected on speed. Control Q40 (fresh load) 398 cold / 104 hot.
+
+
+## 2026-09-24 -- THE PICK AND THE REGION (Q40's fastest order, in the funnel)
+- wdb_funnel: the selector is no longer the first wide equality in the query. THE PICK: the wide
+  equality expected to keep the fewest rows (the load's census when it holds the column, else N / V),
+  the others become flags. THE REGION: the selector's scan runs only in the load-statistics blocks every
+  equality's min/max allows (positions(..., blocks=)). Switch WDB_PICKSEL (default on). The plist
+  bound (V > 4M) now applies only when position lists could serve.
+- Q40: RefererHash (N/V 4.6) picked over CounterID (census 738,172), searched inside counter 62's 386
+  blocks. true_cold on cbdb_i2, off/on, 2 runs each: Q40 cold 375, 317 -> 306, 339; hot 108, 106 -> 69, 74.
+  Q41 (URLHash picked): cold 362, 330 -> 281, 293; hot 61, 61 -> 50, 49. Answers identical both ways.
+  Only queries with two or more wide equalities change route. Suite 1745 passed.
+- Not integrated: the RefererHash -> CounterID link (-20 ms measured; needs an encode-time pair store) and
+  URLHash bitpacked (-45 ms cold measured; the encoder's size contest refuses it, +43.7 MB).

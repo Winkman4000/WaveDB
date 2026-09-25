@@ -43,10 +43,12 @@ def plist_ready(seg, col):
     return os.path.exists(p) or wdb_sidecar.may_build(p)
 
 
-def positions(seg, col, code, lo=0, hi=None):
+def positions(seg, col, code, lo=0, hi=None, blocks=None):
     """Row positions in [lo, hi) where col's code == `code`, ascending. From the position lists
     when they may serve; otherwise (THE VANILLA LAW) a scan of only the blocks whose load-time
-    min/max can hold the code, then the frames covering them -- nothing built, nothing kept."""
+    min/max can hold the code, then the frames covering them -- nothing built, nothing kept.
+    `blocks` (a bool per load-statistics block) narrows the scan further: the blocks the query's
+    OTHER equalities allow (THE REGION: search the selective column only where the rest can live)."""
     hi = int(seg.N) if hi is None else int(hi)
     if plist_ready(seg, col):
         offs, plist = _plist(seg, col)
@@ -57,10 +59,16 @@ def positions(seg, col, code, lo=0, hi=None):
     # the load statistics' min/max are CODES only for dictionary columns (modes 0/2); a mode-4
     # sequence keeps VALUES there while its codes are positions -- no pruning on it
     st = wdb_blockstats._from_load(seg, col) if seg.cols[col].get('mode') in (0, 2) else None
-    if st is None:
+    if st is None and blocks is None:
         return np.asarray(wdb_wherescan._scan_eq(seg, col, int(code), lo, hi), dtype=np.int64)
     BR = wdb_blockstats._BR
-    hit = np.flatnonzero((st['cmin'] <= code) & (st['cmax'] >= code))
+    if st is not None:
+        cand = (st['cmin'] <= code) & (st['cmax'] >= code)
+        if blocks is not None and blocks.size == cand.size:
+            cand &= blocks
+    else:
+        cand = blocks
+    hit = np.flatnonzero(cand)
     hit = hit[(hit * BR < hi) & ((hit + 1) * BR > lo)]
     if hit.size == 0:
         return np.empty(0, np.int64)
@@ -70,6 +78,54 @@ def positions(seg, col, code, lo=0, hi=None):
         a = max(lo, int(r[0]) * BR); b = min(hi, (int(r[-1]) + 1) * BR)
         out.append(np.asarray(wdb_wherescan._scan_eq(seg, col, int(code), a, b), dtype=np.int64))
     return np.concatenate(out)
+
+
+_PICK = [os.environ.get('WDB_PICKSEL', '1') != '0']
+
+
+def _est_rows(seg, col, value):
+    """Rows expected for col = value: the load's census when it holds the column, else the even
+    share N / V (a column of many distinct values -- a hash -- is expected to be rare)."""
+    import wdb_blockstats
+    vc = wdb_blockstats.vcnt_from_load(seg, col)
+    if vc is not None:
+        c9 = _code_of(seg, col, value)
+        return 0 if c9 is None else int(vc[c9])
+    return int(seg.N) / max(1, int(seg.cols[col].get('V') or 1))
+
+
+def _pick(seg, weq):
+    """THE PICK: the selector is the wide equality expected to keep the fewest rows (the first in
+    query order when the switch is off). A column whose position lists would be born over 4M codes
+    stays out (the plist bound); in the vanilla scan that bound does not apply."""
+    ok = [(c9, v9) for c9, v9 in weq
+          if int(seg.cols[c9].get('V') or 1 << 40) <= 1 << 22 or not plist_ready(seg, c9)]
+    if not ok:
+        return None
+    if not _PICK[0]:
+        return ok[0] if ok[0] == weq[0] else None
+    return min(ok, key=lambda cv: _est_rows(seg, cv[0], cv[1]))
+
+
+def _eq_blocks(seg, spec):
+    """THE REGION: the load-statistics blocks every equality of the query can live in (dictionary
+    columns, modes 0/2, whose min/max are codes). None when no equality narrows anything."""
+    if not _PICK[0]:
+        return None
+    import wdb_blockstats
+    m = None
+    for c9, v9, kind in [(spec['sel'][0], spec['sel'][1], True)] + list(spec['flags']):
+        if kind is not True or seg.cols.get(c9, {}).get('mode') not in (0, 2):
+            continue
+        st = wdb_blockstats._from_load(seg, c9)
+        if st is None:
+            continue
+        k9 = _code_of(seg, c9, v9)
+        if k9 is None:
+            continue
+        ok = (st['cmin'] <= k9) & (st['cmax'] >= k9)
+        m = ok if m is None else (m & ok) if m.size == ok.size else m
+    return m
 
 
 def _plist(seg, col):
@@ -239,6 +295,7 @@ def detect(seg, tree, col_map):
     preds = []
     _flatten_and(w.this, preds)
     sel = None                                   # (col, value) -- the plist start
+    weq = []                                     # every wide equality, in query order
     rng = {}                                     # staircase ranges: col -> [lo_v, hi_v]
     flags = []                                   # (col, value, keep_eq)
     strneq = []                                  # (col,) p <> '' via planes
@@ -260,9 +317,8 @@ def detect(seg, tree, col_map):
             c9 = seg.cols.get(cn)
             if c9 is None or c9.get('dt') != 0 or c9.get('has_null'):
                 return None
-            if isinstance(p9, E.EQ) and sel is None \
-                    and int(c9.get('V') or 0) >= 64:
-                sel = (cn, v9)                   # first wide-eq is the selector
+            if isinstance(p9, E.EQ) and int(c9.get('V') or 0) >= 64:
+                weq.append((cn, v9))             # wide equalities: THE PICK chooses the selector
             else:
                 flags.append((cn, v9, isinstance(p9, E.EQ)))
         elif isinstance(p9, (E.GTE, E.LTE, E.GT, E.LT)):
@@ -288,10 +344,13 @@ def detect(seg, tree, col_map):
             flags.append((cm.get(l9.name, l9.name), tuple(vs), 'in'))
         else:
             return None
+    if weq:
+        sel = _pick(seg, weq)
+        if sel is None:
+            return None                          # plist stays a bounded species
+        flags.extend((c9, v9, True) for c9, v9 in weq if (c9, v9) != sel)
     if sel is None:
         return None
-    if int(seg.cols[sel[0]].get('V') or 1 << 40) > 1 << 22:
-        return None                              # plist stays a bounded species
     trunc = None
     if len(g.expressions) == 1:
         ge0 = g.expressions[0]
@@ -478,7 +537,7 @@ def execute(seg, spec):
     if code is None or wlo >= whi:
         crumb = np.empty(0, np.int64)
     else:
-        crumb = positions(seg, scol, code, wlo, whi)
+        crumb = positions(seg, scol, code, wlo, whi, blocks=_eq_blocks(seg, spec))
     _LG.stage('crumb', (_tm.perf_counter() - _t9) * 1000); _t9 = _tm.perf_counter()
     # hygiene at the crumb: point reads, never the column. When the first
     # two flags are enc-10 scalar tests, ONE fused walk serves both with
@@ -1361,7 +1420,7 @@ def _execute_trunc(seg, spec):
         # THE PLIST START (the counter's own law finishing the job): the
         # crumb's positions are already on the shelf -- no selector frames
         # pop at all. Window = two searchsorteds on the row-ordered list.
-        crumb = positions(seg, scol, code, rlo, rhi)   # the window first: vanilla scans only it
+        crumb = positions(seg, scol, code, rlo, rhi, blocks=_eq_blocks(seg, spec))   # the window first: vanilla scans only it
     else:
         crumb = np.empty(0, np.int64)
     CH = 1 << 17                                 # crumb-prefix chunks: early stop
