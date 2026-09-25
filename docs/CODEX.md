@@ -2691,3 +2691,14 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   cold / hot: Q40 survivors today 112 / 29, br4096 75 / 27, br65536 65 / 28; counter 62 rows today 131 / 51,
   br4096 72 / 43, br65536 80 / 47; full column today 241 / 0 (cached), br4096 317 / 143, br65536 328 / 162.
   Open: the decoder is a first cut (bit at a time over 5 bytes); today's gather not run through the same reader.
+
+
+## 2026-09-24 -- THE BACK-REFERENCE (tag 20): an operator-declared hash encoding
+- Jackson: not a general law -- the operator flags hash columns (bin/wdb load --hash C,..; env
+  WDB_HASH_COLS for the column workers) and they are stored as tag 20 whatever the size contest would pick.
+  Per 65,536-row block (WDB_E20_BR), per row: flag bit; 0 -> the code (bits wide); 1 -> 4-bit class k +
+  k low bits of the gap back to the previous copy inside the block. Blocks self-contained, start table,
+  8 zero bytes after the payload. Kernels e20_write / e20_decode / e20_gather (one 8-byte load a row; a
+  gather walks each touched block only to its last wanted row). Engine: header parse, full decode,
+  windows, reads at rows; wdb_retype walks it. tests/test_hash_enc.py (4): tag, full decode = the column,
+  rows sorted/unsorted/across blocks, windows, 7 SQL shapes = DuckDB. Suite 1749 passed.

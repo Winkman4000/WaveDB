@@ -261,6 +261,12 @@ class Segment:
                 meta['cstart'] = off; meta['e19pn'] = int(P19) + 1; off += 8 * (int(P19) + 1)
                 meta['e19dstart'] = off; meta['e19dn'] = int(D19) + 1; off += 8 * (int(D19) + 1)
                 meta['czlen'] = off - meta['cstart']
+            elif code_enc == 20:               # THE BACK-REFERENCE (operator-declared hash columns)
+                meta['e20bits'] = int(buf[off]); off += 1
+                BR20, nb20, P20 = struct.unpack_from('<IIQ', buf, off); off += 16
+                meta['e20BR'] = int(BR20)
+                meta['e20boff'] = np.frombuffer(buf, np.int64, nb20 + 1, off); off += 8 * (nb20 + 1)
+                meta['cstart'] = off; meta['czlen'] = int(P20) + 8; off += int(P20) + 8
             elif code_enc == 13:               # byte-planes: each plane its own zstd frame
                 meta['vnby'] = int(buf[off]); off += 1
                 meta['BR'], nfr = struct.unpack_from('<II', buf, off); off += 8
@@ -1281,6 +1287,12 @@ class Segment:
         if _pipe19:
             cc = self._e19_pipelined(c)
             self._codes[nm] = cc; return cc
+        if c.get('code_enc', 0) == 20:               # THE BACK-REFERENCE: one parallel pass over the blocks
+            import wdb_kernels as _WK20
+            cc = np.empty(self.N, dtype=self._e20_dtype(c))
+            _WK20.e20_decode(np.frombuffer(self.buf, np.uint8), np.int64(c['cstart']), np.int64(c['e20BR']),
+                             np.int64(self.N), np.int64(c['e20bits']), c['e20boff'], cc)
+            self._codes[nm] = cc; return cc
         if c.get('code_enc', 0) == 19:               # BLOCK DICTIONARIES: one parallel pass, no inflate
             import wdb_kernels as _WK19
             pw, dw = self._e19_words(c)
@@ -1346,6 +1358,34 @@ class Segment:
         else:
             cc = self._bitunpack(base, 0, self.N, bits)  # native width
         self._codes[nm] = cc; return cc
+    @staticmethod
+    def _e20_dtype(c):
+        b = int(c['e20bits'])
+        return np.uint8 if b <= 8 else (np.uint16 if b <= 16 else np.uint32)
+
+    def _e20_at(self, c, rows):
+        """tag 20 codes at arbitrary rows: group by block, walk each touched block only as far as
+        its last wanted row"""
+        import wdb_kernels as _WK20
+        rows = np.asarray(rows, dtype=np.int64)
+        if rows.size == 0:
+            return np.empty(0, dtype=self._e20_dtype(c))
+        order = None
+        if rows.size > 1 and not bool((rows[1:] >= rows[:-1]).all()):
+            order = np.argsort(rows, kind='stable'); rs = rows[order]
+        else:
+            rs = rows
+        BR = int(c['e20BR'])
+        blk = rs // BR
+        starts = np.concatenate(([0], np.flatnonzero(blk[1:] != blk[:-1]) + 1, [rs.size])).astype(np.int64)
+        blocks = blk[starts[:-1]].astype(np.int64)
+        out = np.empty(rs.size, np.int64)
+        _WK20.e20_gather(np.frombuffer(self.buf, np.uint8), np.int64(c['cstart']), np.int64(BR),
+                         np.int64(self.N), np.int64(c['e20bits']), c['e20boff'], blocks, starts, rs, out)
+        if order is not None:
+            res = np.empty_like(out); res[order] = out; out = res
+        return out.astype(self._e20_dtype(c))
+
     def _e19_words(self, c):
         """enc 19's two word streams (row pointers, block dictionaries), zero-copy views of the mmap"""
         return (np.frombuffer(self.buf, np.uint64, c['e19pn'], c['cstart']),
@@ -1668,7 +1708,7 @@ class Segment:
             return self._e13_band(nm, lo, hi)
         if c.get('code_enc') == 14:
             return np.asarray(self.codes(nm))[lo:hi]
-        if c.get('code_enc') in (18, 19):
+        if c.get('code_enc') in (18, 19, 20):
             return self._raw_codes_range(nm, lo, hi)
         wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
         BR = int(c['BR']); base = c['cstart']; bo = c['boffs']
@@ -2292,6 +2332,12 @@ class Segment:
                 _WK18.pk32_gather(fb, bits18, rel, tmp)
                 out[a - lo:b - lo] = tmp
             return out
+        if c.get('code_enc', 0) == 20:               # the back-reference: touched blocks only
+            if nm in self._codes:
+                return self._codes[nm][lo:hi]
+            if hi - lo > 8 * int(c['e20BR']):
+                return self._raw_codes(nm)[lo:hi]    # a wide window: the one-pass full decode
+            return self._e20_at(c, np.arange(lo, hi, dtype=np.int64))
         if c.get('code_enc', 0) == 19:               # block dictionaries: touched blocks only
             if nm in self._codes:
                 return self._codes[nm][lo:hi]
@@ -2500,6 +2546,8 @@ class Segment:
             return out18[inv]
         if c.get('code_enc', 0) == 19 and nm not in self._codes and rows.size < (self.N >> 2):
             return self._e19_at(c, rows)             # BLOCK DICTIONARIES, AT ROWS: touched blocks only
+        if c.get('code_enc', 0) == 20 and nm not in self._codes and rows.size < (self.N >> 2):
+            return self._e20_at(c, rows)             # THE BACK-REFERENCE, AT ROWS: touched blocks only
         if c.get('code_enc', 0) != 3 or nm in self._codes or rows.size >= (self.N >> 2):
             # huge row sets: ONE full decode + one vectorized gather beats touching every
             # frame through a positional walk (sq-nested passed ~90M positions here)

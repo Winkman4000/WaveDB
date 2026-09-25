@@ -2,7 +2,7 @@
 """wdb -- the WaveDB command line.
 
   wdb init    DB                                  create an empty database directory
-  wdb load    DB TABLE FILE [--cluster-by C,..] [--cast COL=KIND ..] [--workers N]
+  wdb load    DB TABLE FILE [--cluster-by C,..] [--cast COL=KIND ..] [--hash C,..] [--workers N]
                                                   encode a parquet/csv into a segment and register the table
   wdb sql     DB "SELECT ..."  [--format table|csv|tsv|json] [--limit N] [--time]
   wdb file    DB FILE.sql      [--format ..]      run each ;-separated statement in a file
@@ -104,6 +104,9 @@ def cmd_load(a):
     cat = Catalog.open(a.db)
     casts = dict(c.split('=', 1) for c in (a.cast or []))
     cluster = [c for c in (a.cluster_by or '').split(',') if c] or None
+    if a.hash:                                   # THE OPERATOR'S HASH DECLARATION: these columns are
+        os.environ['WDB_HASH_COLS'] = a.hash     # stored as the back-reference (tag 20); the column
+                                                 # workers are fresh processes and inherit it
     existing = cat.data['tables'].get(a.table)
     seg_name = '%s_%d.wdb' % (a.table, len(existing['segments']) if existing else 0)
     out = os.path.join(a.db, seg_name)
@@ -309,7 +312,7 @@ def main(argv=None):
     sub = p.add_subparsers(dest='cmd')
     s = sub.add_parser('init'); s.add_argument('db')
     s = sub.add_parser('warm', help='birth every sidecar a query file needs (the load-time step, for a realm already loaded)'); s.add_argument('db'); s.add_argument('queries'); s.set_defaults(fn=cmd_warm)
-    s = sub.add_parser('load'); s.add_argument('db'); s.add_argument('table'); s.add_argument('file'); s.add_argument('--cluster-by'); s.add_argument('--cast', action='append'); s.add_argument('--workers', type=int); s.add_argument('--warm', help='a .sql file of queries to run once after loading (sidecar births become part of load)')
+    s = sub.add_parser('load'); s.add_argument('db'); s.add_argument('table'); s.add_argument('file'); s.add_argument('--cluster-by'); s.add_argument('--cast', action='append'); s.add_argument('--hash', help='comma list of hash columns, stored as the back-reference'); s.add_argument('--workers', type=int); s.add_argument('--warm', help='a .sql file of queries to run once after loading (sidecar births become part of load)')
     for name in ('sql', 'explain', 'file'):
         s = sub.add_parser(name); s.add_argument('db'); s.add_argument('file' if name == 'file' else 'sql')
         s.add_argument('--format', default='table', choices=['table', 'csv', 'tsv', 'json']); s.add_argument('--limit', type=int); s.add_argument('--time', action='store_true')

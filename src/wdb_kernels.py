@@ -4380,3 +4380,80 @@ def fc3_hostruns(hdr16, text, R, nl_free, brk, hend, labuf, laboff, meta):
     laboff[nr] = lw
     meta[0] = n
     return nr
+
+
+# ---------------------------------------------------------------------------------------------
+# tag 20 = THE BACK-REFERENCE (Jackson, 2026-09-24): an operator-declared HASH column. Per block of
+# BR rows (blocks start on a byte; a start table), per row: bit 0 = flag. Flag 0: the code's `bits`
+# bits follow. Flag 1: a 4-bit class k, then the k low bits of the gap back to the previous copy of
+# the same code INSIDE THE BLOCK (the gap has k+1 bits, its leading 1 implicit). A block never
+# reads another; any row is one jump to its block plus a walk to the row. One 8-byte load decodes
+# one row (the widest row is 1 + 32 bits after at most 7 bits of shift).
+# ---------------------------------------------------------------------------------------------
+@njit(cache=True, inline='always')
+def _e20_load(buf, byte):
+    w = np.uint64(0)
+    for k in range(8):
+        w |= np.uint64(buf[byte + k]) << np.uint64(8 * k)
+    return w
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def e20_write(x, gap, BR, bits, boff, base, buf):
+    nb = boff.size - 1
+    for b in prange(nb):
+        p = (base + boff[b]) * 8
+        lo = b * BR
+        hi = min(x.size, lo + BR)
+        for r in range(lo, hi):
+            g = gap[r]
+            if g <= 0:
+                v = np.int64(x[r]) << 1
+                n = 1 + bits
+            else:
+                k = 0
+                while (g >> (k + 1)) > 0:
+                    k += 1
+                v = 1 | (k << 1) | ((g & ((1 << k) - 1)) << 5)
+                n = 5 + k
+            for i in range(n):
+                if (v >> i) & 1:
+                    q = p + i
+                    buf[q >> 3] |= np.uint8(1 << (q & 7))
+            p += n
+
+
+@njit(cache=True, inline='always')
+def _e20_block(buf, p, n, bits, out, o0):
+    vm = np.uint64((1 << bits) - 1)
+    for i in range(n):
+        w = _e20_load(buf, p >> 3) >> np.uint64(p & 7)
+        if (w & np.uint64(1)) == 0:
+            out[o0 + i] = (w >> np.uint64(1)) & vm
+            p += 1 + bits
+        else:
+            k = np.int64((w >> np.uint64(1)) & np.uint64(15))
+            g = (np.int64(1) << k) | np.int64((w >> np.uint64(5)) & np.uint64((1 << k) - 1))
+            out[o0 + i] = out[o0 + i - g]
+            p += 5 + k
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def e20_decode(buf, base, BR, N, bits, boff, out):
+    nb = boff.size - 1
+    for b in prange(nb):
+        n = min(BR, N - b * BR)
+        _e20_block(buf, (base + boff[b]) * 8, n, bits, out, b * BR)
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def e20_gather(buf, base, BR, N, bits, boff, blocks, starts, rows, out):
+    """rows sorted; starts[j]..starts[j+1] are the rows in blocks[j]. Each touched block is walked
+    only as far as its last wanted row (gaps only point back)."""
+    for j in prange(blocks.size):
+        b = blocks[j]
+        last = rows[starts[j + 1] - 1] - b * BR
+        tmp = np.empty(last + 1, np.int64)
+        _e20_block(buf, (base + boff[b]) * 8, last + 1, bits, tmp, 0)
+        for i in range(starts[j], starts[j + 1]):
+            out[i] = tmp[rows[i] - b * BR]

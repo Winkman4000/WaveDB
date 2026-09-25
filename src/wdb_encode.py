@@ -375,6 +375,54 @@ def _dict_bytes(p, zc):
             out += struct.pack('<I', len(fc)) + struct.pack('<I', len(z)) + z
     return out
 
+def _hash_cols():
+    """THE OPERATOR'S HASH DECLARATION (bin/wdb load --hash C,..): columns stored as tag 20."""
+    return set(c for c in os.environ.get('WDB_HASH_COLS', '').split(',') if c)
+
+
+def _e20_section(arr, bits):
+    """THE BACK-REFERENCE (tag 20, Jackson 2026-09-24), for operator-declared hash columns.
+    Layout: [20][bits u8][BR u32][nb u32][P u64] + boff[nb+1] i64 (byte starts of the blocks in the
+    payload) + payload[P] + 8 zero bytes (an 8-byte load never leaves the section). See
+    wdb_kernels.e20_write for the row format."""
+    import wdb_kernels as _WK20
+    BR = int(os.environ.get('WDB_E20_BR', '65536'))
+    a = np.ascontiguousarray(arr, dtype=np.int64)
+    N = a.size
+    o = np.argsort(a, kind='stable')
+    s = a[o]
+    same = np.zeros(N, np.bool_)
+    same[1:] = s[1:] == s[:-1]
+    del s
+    idx = np.flatnonzero(same)
+    prev = np.full(N, -1, np.int64)
+    prev[o[idx]] = o[idx - 1]
+    del o, idx, same
+    r = np.arange(N, dtype=np.int64)
+    gap = np.where((prev >= 0) & (prev // BR == r // BR), r - prev, 0)
+    del prev
+    k = np.zeros(N, np.int64)
+    gg = gap >> 1
+    while True:
+        m = gg > 0
+        if not m.any():
+            break
+        k[m] += 1
+        gg >>= 1
+    rowbits = np.where(gap > 0, 5 + k, 1 + bits)
+    del k, gg, r
+    nb = (N + BR - 1) // BR
+    bbits = np.add.reduceat(rowbits, np.arange(0, N, BR)) if N else np.zeros(0, np.int64)
+    boff = np.zeros(nb + 1, np.int64)
+    np.cumsum((bbits + 7) // 8, out=boff[1:])
+    P = int(boff[-1])
+    head = bytes([20, bits]) + struct.pack('<IIQ', BR, nb, P) + boff.tobytes()
+    buf = np.zeros(len(head) + P + 8, np.uint8)
+    buf[:len(head)] = np.frombuffer(head, np.uint8)
+    _WK20.e20_write(a, gap, np.int64(BR), np.int64(bits), boff, np.int64(len(head)), buf)
+    return buf.tobytes()
+
+
 E19_SLACK = float(os.environ.get('WDB_E19_SLACK', '0.05'))   # enc 19 may cost this many more bytes
                                                               # than the inflating dress it replaces
 
@@ -815,6 +863,10 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
         # Recalibrate by re-running bench deals when the engine changes.
         if not (S17 > T17):
             best = cand17
+    # tag 20 = THE BACK-REFERENCE: the OPERATOR's ruling, not an election -- a column declared a
+    # hash (bin/wdb load --hash) is stored this way whatever the size contest would pick.
+    if nm is not None and nm in _hash_cols() and codes.size and 1 <= bits <= 32 and best is not stair:
+        best = _e20_section(arr, bits)
     return best
 
 def _pair15_candidate(pa, pb):

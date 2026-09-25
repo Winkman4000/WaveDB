@@ -94,6 +94,10 @@ def _column_spans(buf):
             off += 1
             _br19, nb19, P19, D19 = struct.unpack_from('<IIQQ', buf, off); off += 24
             off += nb19 * 6 + (nb19 + 1) * 16 + (int(P19) + 1) * 8 + (int(D19) + 1) * 8
+        elif code_enc == 20:                         # the back-reference: bits u8 + BR,nb u32 + P u64 + boff + payload + 8
+            off += 1
+            _br20, nb20, P20 = struct.unpack_from('<IIQ', buf, off); off += 16
+            off += 8 * (nb20 + 1) + int(P20) + 8
         elif code_enc == 17:                         # raw packed codes
             b17 = buf[off]; off += 1
             n17 = struct.unpack_from('<I', buf, off)[0]; off += 4
