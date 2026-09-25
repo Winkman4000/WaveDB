@@ -2650,3 +2650,15 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   Q40 survivors today 108 / 32, mmap 63 / 8, page-pread 66 / 11 (reads 39.4 MB: survivors ~9 a page,
   so the whole region's pages are still read); counter 62 rows today 117 / 45, mmap 57 / 9, pread 84 / 41;
   full column today 231 / 0 (source cache), mmap 271 / 99 (the page-pread reader is not for full reads: 3.6 s).
+
+
+## 2026-09-24 -- CLUSTER BY COUNTERID, EVENTTIME: REJECTED ON THE BOARD
+- Operator choice already in the kit (load.sh --cluster-by EventTime). Two fresh loads, same command:
+  A --cluster-by EventTime 423 s, 8.79 GB; B --cluster-by CounterID,EventTime 396 s, 7.98 GB.
+  bench/cluster_ab.py, true_cold per query, A B A B, best of two (ms cold/hot):
+  flat Q00-Q12, Q15, Q19-Q22, Q25, Q28-Q29, Q32-Q35. Far worse on B: Q13 862 -> 2,738; Q14 575 -> 5,147;
+  Q16 822 -> 9,625; Q17 258 -> 9,606; Q18 973 -> 116,145; Q23 A 1,264, B no answer; Q24 196 -> 5,988;
+  Q26 189 -> 5,925; Q27 865 -> 14,903; Q31 211 -> 3,376; and the counter-62 family Q36-Q42 (the target):
+  356 -> 13,577; 220 -> 7,034; 295 -> 2,830; 555 -> 57,515; 398 -> 3,200; 290 -> 1,736; 198 -> 986.
+  Hot worse on Q08-Q11 (20-90%). The engine's reads are built on the time staircase; without it they fall to
+  slow roads. Correctness run skipped: rejected on speed. Control Q40 (fresh load) 398 cold / 104 hot.
