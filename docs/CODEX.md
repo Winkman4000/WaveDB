@@ -2711,3 +2711,8 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   Q40 313 / 63 -> 264 / 79; Q41 474 / 81 (reads 320 MB) -> 283 / 64 (reads 72 MB).
   verify_correctness on B: 42/43 (Q23, the known checker normalization). Suite 1749 passed.
   Open: an equality-scan kernel for tag 20 (Q40 hot +16 ms: the region walk writes every code).
+- THE KIT: benchmark/clickbench/load.sh now loads with --hash URLHash,RefererHash (the operator's ruling).
+  THE SCORE (bench/board_score.py on the flagged fresh load, true_cold, best of 2, against the fair trial):
+  COLD WaveDB 1.58 / 22.3 s / fastest on 17 of 43; Umbra 1.69 / 24.4 s / 16; ClickHouse 2.20 / 29.0 s / 9;
+  DuckDB 3.38 / 57.5 s / 1. HOT WaveDB 2.50 / 10.9 s / 9; Umbra 1.27 / 5.5 s / 34; ClickHouse 3.43 / 15.7 s
+  / 2; DuckDB 3.68 / 19.7 s / 2 (hot counts include ties).

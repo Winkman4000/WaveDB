@@ -10,7 +10,7 @@ if [ ! -f "$DATA" ]; then
 fi
 rm -rf cbdb
 START=$(date +%s.%N)
-python3 bin/wdb load cbdb hits "$DATA" --cluster-by EventTime --cast EventDate=date_days --cast EventTime=timestamp_s --warm benchmark/clickbench/queries.sql
+python3 bin/wdb load cbdb hits "$DATA" --cluster-by EventTime --cast EventDate=date_days --cast EventTime=timestamp_s --hash URLHash,RefererHash --warm benchmark/clickbench/queries.sql
 END=$(date +%s.%N)
 echo "load time: $(python3 -c "print(round($END - $START, 1))") s"
 echo "storage bytes: $(du -sb cbdb | cut -f1)"
