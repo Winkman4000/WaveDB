@@ -9,7 +9,9 @@ from sqlglot import expressions as E
 import wdb_sql
 
 _HITS = 0
-_PF = {}         # id(seg) -> the thread unpacking the two columns while the V-table is read
+import wdb_qmem
+_PF = wdb_qmem.register({})   # id(seg) -> the unpacking thread; query-scoped (a detect that declines
+                              # after starting it leaves nothing behind the query)
 _PRICED = []     # (chosen, fused_ms_est, chain_ms_est) -- the honesty loop's seed
 
 
@@ -118,14 +120,22 @@ def detect(seg, tree, col_map):
             return None
     # THE OVERLAP: the V-table (the dictionary's lengths) and the two row columns are independent
     # reads -- unpack the columns on a thread while the dictionary is read here
+    # THE ROW LENGTHS (the operator's --row-lengths): when the load stored lcol's character length
+    # per row, a LENGTH aggregate reads that column and the key -- never lcol's dictionary numbers
+    import wdb_lens as _L9
+    rowl = bool(isinstance(lkind, tuple) and lkind[0] == 'LENGTH' and hasattr(seg, 'path')
+                and _L9.has_row_lens(seg, lcol) and _L9.clean(seg))
     import threading
-    def _pf(s=seg, a=key, b=lcol):
-        s._raw_codes(a); s._raw_codes(b)
+    def _pf(s=seg, a=key, b=lcol, r=rowl):
+        s._raw_codes(a)
+        if not r:
+            s._raw_codes(b)
     t9 = threading.Thread(target=_pf, daemon=True); t9.start()
     _PF[id(seg)] = t9
-    lens = _fn_table(seg, lcol, lkind)
-    if lens is None:
-        return None
+    if not rowl:
+        lens = _fn_table(seg, lcol, lkind)
+        if lens is None:
+            return None
     lim = None
     lx = tree.args.get('limit')
     if lx is not None:
@@ -146,11 +156,26 @@ def detect(seg, tree, col_map):
             return None
         oi = alias_names.index(onm.name)
     return {'key': key, 'lcol': lcol, 'lkind': lkind, 'aggs': aggs, 'excl_empty': excl_empty,
-            'hmin': hmin, 'lim': lim, 'oi': oi, 'proj': tree.expressions}
+            'hmin': hmin, 'lim': lim, 'oi': oi, 'proj': tree.expressions, 'rowl': rowl}
 
 
-def execute(seg, spec):
-    global _HITS
+def _row_sums(seg, spec):
+    """per key: length sum and row count from the stored row lengths (the key unpacks on the thread
+    detect started, while the lengths are read)"""
+    import wdb_lens as _L9
+    key, lcol = spec['key'], spec['lcol']
+    L = _L9.row_lens(seg, lcol)
+    t9 = _PF.pop(id(seg), None)
+    if t9 is not None:
+        t9.join()
+    if L is None:
+        return None
+    kc = np.asarray(seg._raw_codes(key))
+    S, C = _L9.row_pour(kc, L, int(seg.cols[key]['V']), bool(spec['excl_empty']), 16)
+    return S.astype(np.float64), C.astype(np.float64)
+
+
+def _dict_sums(seg, spec):
     key, lcol = spec['key'], spec['lcol']
     lens = _fn_table(seg, lcol, spec.get('lkind'))
     if lens is None:
@@ -202,6 +227,16 @@ def execute(seg, spec):
         for j, c in ex.map(_work, range(8)):     # eight workers, no future churn
             sums += j
             cnt += c
+    return sums, cnt
+
+
+def execute(seg, spec):
+    global _HITS
+    key = spec['key']
+    r9 = _row_sums(seg, spec) if spec.get('rowl') else _dict_sums(seg, spec)
+    if r9 is None:
+        return None
+    sums, cnt = r9
     keep = cnt > (spec['hmin'] if spec['hmin'] is not None else 0)
     gs = np.flatnonzero(keep)
     rows = []

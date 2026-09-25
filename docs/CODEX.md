@@ -2733,3 +2733,17 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   but keeps 84.8% of rows; prefix-sum lengths are already how dict_charlens works (bytes-only would save ~50 ms
   but 24% of URLs are non-ASCII); per-website stored length sums would be a pre-aggregate (ClickBench: 'not
   recommended'), left out.
+
+
+## 2026-09-25 -- STRING LENGTHS AS LOAD DATA (wdb_lens)
+- Jackson's ruling: DEFAULT for every front-coded text column -- each dictionary entry's CHARACTER length
+  stored at load (<seg>.clen.<col>, zstd); OPERATOR FLAG bin/wdb load --row-lengths C,.. -- each ROW's
+  character length in row order (<seg>.rlen.<col>, zstd per 65,536 rows + block table), 'a ridiculous
+  query gets a ridiculous optimization': the sparse spread of long strings made implicit in row order.
+  Both header-checked (rows, distinct values, segment file size): a stale file is ignored, the walk serves.
+- Readers: Segment.dict_charlens reads the stored lengths first; wdb_lenagg takes the ROW road when the
+  column has row lengths and the segment is clean (no tombstones/overrides): key numbers unpacked on a
+  thread while the row lengths are read, one parallel pour -- lcol's dictionary numbers never touched.
+  _PF is query-scoped (wdb_qmem.register). tests/test_lengths.py (4). Suite 1753 passed.
+- Probes behind it: dictionary lengths stored ~550 -> ~405 ms Q27 cold (URL 19.6 MB); row lengths
+  227-250 ms cold, 122-139 hot, same answer (URL 107.6 MB, 8.6 bits/row); ClickHouse 253 / 171.

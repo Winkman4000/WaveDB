@@ -545,6 +545,12 @@ class Segment:
         got = c.get('charlens')
         if got is not None:
             return got
+        import wdb_lens                              # THE LOAD'S DICTIONARY LENGTHS: stored at load,
+        st9 = wdb_lens.dict_lens(self, nm)           # read instead of walked (header-checked)
+        if st9 is not None:
+            c['charlens'] = st9
+            _m9[('c', nm)] = st9
+            return st9
         import wdb_kernels as _WK
         if c.get('R') is None:
             return None                          # not front-coded: fall back

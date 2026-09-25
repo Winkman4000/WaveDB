@@ -1377,6 +1377,7 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
     except Exception:
         pass
     _write_load_stats(out_path)
+    _write_lengths(out_path)
     return dict(n_rows=N, n_cols=len(cols), bytes=(len(out) if out is not None else __import__('os').path.getsize(out_path)), seconds=time.time() - t0,
                 sizes=sizes, cluster=None)
 
@@ -1481,8 +1482,27 @@ def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_s
     except Exception:
         pass
     _write_load_stats(out_path)
+    _write_lengths(out_path)
     return dict(n_rows=N, n_cols=len(cols), bytes=len(out), seconds=time.time()-t0,
                 sizes=sizes, cluster=cluster_by)
+
+
+def _write_lengths(out_path):
+    """STRING LENGTHS AS LOAD DATA (wdb_lens): every front-coded text column's dictionary character
+    lengths, and the row-order lengths of the columns the operator named (bin/wdb load --row-lengths
+    -> WDB_ROWLEN_COLS). WDB_LOAD_LENGTHS=0 skips."""
+    import os as _os
+    if _os.environ.get('WDB_LOAD_LENGTHS', '1') == '0':
+        return 0
+    try:
+        import wdb_lens
+        rc = [c for c in _os.environ.get('WDB_ROWLEN_COLS', '').split(',') if c]
+        return wdb_lens.write_for_segment(out_path, rc, verbose=bool(_os.environ.get('WDB_ENCODE_VERBOSE')))
+    except Exception:
+        if _os.environ.get('WDB_ENCODE_VERBOSE'):
+            import traceback, sys as _sy
+            print('LOAD LENGTHS DIED:', file=_sy.stderr); traceback.print_exc()
+        return 0
 
 
 def _write_load_stats(out_path):
