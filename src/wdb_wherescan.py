@@ -422,6 +422,14 @@ def char_lengths(seg, col):
     dbdir = os.path.dirname(base)
     if wdb_sidecar.exists(lp) and wdb_sidecar.is_fresh(dbdir, os.path.basename(lp)):
         return np.load(lp)
+    # THE DICTIONARY'S OWN LENGTHS FIRST (2026-09-26): the load stores them (wdb_lens) and the
+    # front-coded walk derives them without a string -- neither births the text buffer
+    try:
+        dl = seg.dict_charlens(col)
+        if dl is not None:
+            return np.asarray(dl)
+    except Exception:
+        pass
     hay, offs = _text_buffer(seg, col)            # births the framed text if needed
     V = int(offs.size) - 1
     out = np.zeros(V, np.int32)
@@ -541,19 +549,20 @@ def _like_flags_dict(seg, col, needle, kind='contains'):
         return memo[mk]
     nd = needle.encode() if isinstance(needle, str) else needle
     c0 = seg.cols.get(col) or {}
-    if kind not in ('general', 'prefix', 'suffix') and 'restarts' in c0 and len(nd) >= 1 \
-            and seg.__dict__.get('_ws_text_memo', {}).get(col) is None:
-        import wdb_sidecar as _wsc0
-        if not _wsc0.may_build(seg.path) and not _wsc0.exists(seg.path + '.' + col + '.txz.bin'):
-            # THE FRONT-CODED HAYSTACK (vanilla law's find): with the switch off and no text-buffer
-            # sidecar, the old path decoded 18M URLs into Python objects to join a haystack --
-            # 19 s, every process. The kernel walks the dictionary's own front-coded bytes: no
-            # objects, blocks in parallel, nothing born.
-            # THE THREE READS: identification over the dictionary AS STORED -- chunk by chunk as
-            # they decompress, prefix carry inside each chain, no whole-dictionary blob (the join
-            # of 2 GB of URL text was 1.4-2.3 s of every first LIKE).
-            import wdb_strings
-            keep = wdb_strings.identify_contains(seg, col, nd)
+    if kind not in ('general', 'prefix', 'suffix') and 'restarts' in c0 and len(nd) >= 1:
+        # THE FRONT-CODED HAYSTACK (vanilla law's find): the old path decoded 18M URLs into Python
+        # objects to join a haystack -- 19 s, every process. The kernel walks the dictionary's own
+        # front-coded bytes: no objects, blocks in parallel, nothing born.
+        # THE THREE READS: identification over the dictionary AS STORED -- chunk by chunk as they
+        # decompress, prefix carry inside each chain, no whole-dictionary blob (the join of 2 GB of
+        # URL text was 1.4-2.3 s of every first LIKE).
+        # ALWAYS, sidecars on or off (2026-09-26): this road was gated on the switch being off and
+        # no text-buffer file existing, so the kit's warm step (switch on, text buffer born) sent
+        # Q20-22 back to the Sept 13 text buffer. Same kit database, text buffer removed: Q20 cold
+        # 2906 -> 854 ms, Q21 3349 -> 1223, Q22 3053 -> 2305.
+        import wdb_strings
+        keep = wdb_strings.identify_contains(seg, col, nd)
+        if keep is not None:
             memo[mk] = keep
             return keep
     hay, offs = _text_buffer(seg, col)

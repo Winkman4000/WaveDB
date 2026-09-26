@@ -2754,3 +2754,25 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   (same hash) against a 120 s limit on a host at load ~95 -- not a regression.
 - Referer row lengths bought nothing (Q28 2366 -> 2321, noise: a different read serves it), so Jackson's
   call: benchmark/clickbench/load.sh passes --row-lengths URL only.
+
+
+## 2026-09-26 -- THE KIT AS SUBMITTED, AND THE LIKE ROAD THE WARM STEP HID
+- First board of the kit's exact load (benchmark/clickbench/load.sh: --hash, --row-lengths URL, --warm).
+  The warm step switches sidecars on and births ~3.0 GB of them, so the kit was 11.80 GB / 573 s, not the
+  ~8.9 GB estimated from the unwarmed A/B databases (cb_hash, cb_len had sidecars off). Kit vs no
+  sidecars: Q08 1025 -> 10 ms, Q13 1271 -> 132, Q25 560 -> 71, Q33 1080 -> 191 cold -- but Q20-22 (LIKE)
+  2-3x SLOWER: 1048 -> 2711, 1279 -> 3219, 2222 -> 3114 cold.
+- Cause: wdb_wherescan._like_flags_dict took the front-coded kernel (wdb_strings.identify_contains) only
+  when the switch was OFF and no text-buffer file existed; the warm step made both false, so the kit
+  fell back to the Sept 13 text buffer (<seg>.<col>.txz/.txi/.txo). Proof on the kit database itself,
+  a hard-linked copy with only the text buffers removed: Q20 2906 -> 854 ms cold, Q21 3349 -> 1223,
+  Q22 3053 -> 2305; Q19/Q28 unchanged. (WDB_SIDECARS=0 does NOT test this: it stops births, not use.)
+- Fix: 'contains' on a front-coded column always takes the kernel. Sibling road: char_lengths (length()
+  in wdb_sql) now reads seg.dict_charlens (the load's stored lengths / the front-coded walk) before it
+  would birth the text buffer. The warm step births no text buffer now.
+- Kit reloaded with the fix (cb_url2): 10.69 GB (-1.11), load 454 s (warm 68 -> 31 s). Board vs the
+  morning's kit: cold total 26.5 -> 21.9 s, hot 11.2 -> 10.0 s; cold score 1.61 (Umbra 2.07, ClickHouse
+  2.70, DuckDB 4.13), hot 2.33 (Umbra 1.56). Verify 42/43 at a 180 s limit (Q23 the known checker
+  issue; Q17's canonical form now finishes). Suite 1753 passed (a first run lost test_perf's codes()
+  scaling check to host load ~70; it passed 3/3 alone and the full rerun was clean).
+- Q39 is noisy on this host: 3 reruns on each kit gave hot 315-2385 ms on the SAME database. Open.
