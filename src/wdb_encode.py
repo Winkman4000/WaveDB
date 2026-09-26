@@ -1085,12 +1085,16 @@ def _cluster_order(kc, N):
                                    values=vals, offsets=offsets)
 
 
-def _arrow_string_prep(nm, chunked):
+def _arrow_string_prep(nm, chunked, perm=None):
     """THE ARROW LAW: a string column is dictionary-encoded IN ARROW MEMORY (no 100M Python
     objects -- measured 45 GB and 387s for one 100M-row column the pandas way), its dictionary
     sorted with arrow, codes remapped with numpy. Returns a prep dict like _prep_column's
-    (mode 0/1 strings) or None when the column is not a string column."""
+    (mode 0/1 strings) or None when the column is not a string column.
+    chunked may be a one-element list (the caller hands over ownership: the text is freed as soon
+    as it is dictionary-encoded). perm: the cluster order, applied to the CODES."""
     import pyarrow as pa, pyarrow.compute as pc
+    if isinstance(chunked, list):
+        chunked = chunked.pop()
     t = chunked.type
     if not (pa.types.is_string(t) or pa.types.is_large_string(t) or pa.types.is_binary(t) or pa.types.is_large_binary(t)):
         return None
@@ -1107,15 +1111,19 @@ def _arrow_string_prep(nm, chunked):
     null_mask = None; has_null = 0
     if chunked.null_count:
         null_mask = np.asarray(pc.is_null(chunked).to_numpy(zero_copy_only=False), dtype=bool); has_null = 1
+    nrows = len(chunked)
+    del chunked                                             # the row text is dead: only the dictionary lives on
     order = pc.sort_indices(dct).to_numpy()                 # dictionary in sorted order
     rank = np.empty(len(order), np.int64); rank[order] = np.arange(len(order))
-    codes = np.zeros(len(chunked), np.uint32 if len(order) < (1 << 31) else np.int64)
+    codes = np.zeros(nrows, np.uint32 if len(order) < (1 << 31) else np.int64)
     raw = idx.to_numpy(zero_copy_only=False)
     if null_mask is not None:
         nn = ~null_mask
         codes[nn] = rank[np.asarray(raw[nn], dtype=np.int64)]; codes[null_mask] = len(order)
     else:
         codes[:] = rank[np.asarray(raw, dtype=np.int64)]
+    if perm is not None:
+        codes = codes[np.asarray(perm)]                     # the cluster order, on 4-byte codes
     sorted_dict = pc.take(dct, pa.array(order))
     valb = [(v if isinstance(v, bytes) else v.encode('utf-8', 'surrogatepass')) for v in sorted_dict.to_pylist()]
     del de, dct, idx, raw, sorted_dict
@@ -1158,34 +1166,56 @@ def _column_job(input_path, nm, reader, cast=None, perm_path=None):
     segment is time-ordered and the clock columns become STAIRCASES (free ordering for
     windows and ranges: the reference encode had it; the raw file order does not)."""
     prep = None
+    # THE ENCODE CLOCK (2026-09-26): where one column's seconds go -- read, gather (the cluster
+    # order), prep (dictionary / front-coding / layout), serialize (zstd) -- returned to the parent
+    _tm = {}; _tk = [time.time()]
+    def _mark(k):
+        now = time.time(); _tm[k] = _tm.get(k, 0.0) + (now - _tk[0]); _tk[0] = now
     perm = np.load(perm_path, mmap_mode='r') if perm_path else None
     if cast is None and str(input_path).lower().endswith('.parquet'):
         try:
             import pyarrow as pa, pyarrow.parquet as pq, pyarrow.compute as pc
-            col = pq.read_table(input_path, columns=[nm]).column(0)
-            if pa.types.is_string(col.type):
-                col = pc.cast(col, pa.large_string())        # before the take: the gathered column overflows 'string' offsets too
-            if perm is not None:
-                col = pc.take(col, pa.array(np.asarray(perm)))
-            prep = _arrow_string_prep(nm, col)
-            del col
+            ft = pq.read_schema(input_path).field(nm).type
+            # ONE READ PER COLUMN (2026-09-26): the arrow road serves text only; a number column was
+            # read and gathered here, declined by the prep, then read and gathered AGAIN below
+            if (pa.types.is_string(ft) or pa.types.is_large_string(ft)
+                    or pa.types.is_binary(ft) or pa.types.is_large_binary(ft)):
+                col = pq.read_table(input_path, columns=[nm]).column(0)
+                _mark('read')
+                if pa.types.is_string(col.type):
+                    col = pc.cast(col, pa.large_string())    # 100M values overflow 'string' offsets in the concat
+                box = [col]; del col                          # the prep owns the text: freed once it is encoded
+                # THE CODES ARE GATHERED, NOT THE TEXT: the dictionary is sorted by value, so a code
+                # is the same number in any row order -- gathering 400 MB of codes through the cluster
+                # order replaces gathering 8 GB of URL text (same bytes out: the codes, the sorted
+                # dictionary and the null bin do not depend on the order the rows arrive in)
+                prep = _arrow_string_prep(nm, box, perm=perm)
+                _mark('prep')
         except Exception as _e9:
             # A FALLBACK THAT IS SILENT IS A FAST PATH THAT ISN'T THERE: the arrow path had failed
             # on every big string column for weeks ('offset overflow') and nobody knew
             print('  arrow prep declined %s (%s: %s) -- falling back to the object path' % (nm, type(_e9).__name__, str(_e9)[:80]), flush=True)
             prep = None
     if prep is None:
+        _mark('declined')
         arr = wdb_read.read_one_column(input_path, nm, reader=reader)
+        _mark('read')
         if perm is not None:
             arr = arr[np.asarray(perm)]
+        _mark('gather')
         if cast is not None:
             arr = _CASTS[cast](arr)
         prep = _prep_column(nm, arr)
+        _mark('prep')
         del arr
     blob, size = _serialize_column(prep, zstd.ZstdCompressor(level=ZSTD_LEVEL))
+    _mark('serialize')
     import resource as _rs
     peak = _rs.getrusage(_rs.RUSAGE_SELF).ru_maxrss * 1024      # this worker's peak so far: THE MEASURED TRUTH
-    return nm, bytes(blob), size, peak
+    return nm, bytes(blob), size, peak, _tm
+
+
+_TEXT_BYTES = {}                                  # text column -> estimated in-memory bytes (from _column_cost's sample)
 
 
 def _column_cost(input_path, cols, reader, N):
@@ -1208,6 +1238,12 @@ def _column_cost(input_path, cols, reader, N):
                 nuniq = n0
             frac = nuniq / n0
             if 'string' in t or 'binary' in t or 'large' in t:
+                try:                                      # the column's text: parquet's own uncompressed size, every row group
+                    # (row group 0 alone guessed Title at 21 GB of text; the file's metadata says 7.6)
+                    md9 = pf.metadata; j9 = [md9.schema.column(k).name for k in range(md9.num_columns)].index(nm)
+                    _TEXT_BYTES[nm] = int(sum(md9.row_group(i).column(j9).total_uncompressed_size for i in range(md9.num_row_groups)))
+                except Exception:
+                    pass
                 if nuniq <= 4096:
                     est[nm] = 0.5                         # a low-cardinality string is an enum: a narrow column
                 else:
@@ -1269,9 +1305,25 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
         e = est.get(nm, 1.0)
         return 'string' if e >= 8 else ('wide' if e >= 2.0 else ('mid' if e >= 1.5 else ('narrow' if e >= 0.5 else 'tiny')))
     measured = {'string': 310, 'wide': 100, 'mid': 70, 'narrow': 40, 'tiny': 25}   # strings: the MEASURED peak on the arrow path (Title 29 GB at 100M rows; it was 57 GB on the object path)     # bytes per row: conservative starts (URL/Referer/Title peak ~25 GB at 100M rows), raised as workers report
+    # A TEXT COLUMN IS PRICED BY ITS TEXT (2026-09-26): one class rate for every string charged
+    # SearchPhrase (8 GB measured) like URL (38 GB), so SearchPhrase and OriginalURL could not fit
+    # while small columns ran, waited to the end and ran alone for 84 s. The charge is a floor (a
+    # worker's own weight, 4.6 GB measured on a flag column) plus a learned multiple of the text.
+    # measured with the codes gathered, against parquet's uncompressed text: URL 21.5 GB on 7.9 (2.08x
+    # over the floor), Title 22.5 on 7.6 (2.30x), SearchPhrase 6.6 on 0.77 (2.1x)
+    sbase = 5 << 30; sratio = [2.3]
     def working_set(nm):
+        tb = _TEXT_BYTES.get(nm)
+        if cls(nm) == 'string' and tb:
+            return int(min(budget / 2, sbase + sratio[0] * tb))
         return int(N * measured[cls(nm)]) + (400 << 20)
     def learn(nm, peak):
+        tb = _TEXT_BYTES.get(nm)
+        if cls(nm) == 'string' and tb:
+            r = max(0.0, peak - sbase) / tb * 1.05      # the budget already sits 30 GB under the cgroup
+            if r > sratio[0]:
+                sratio[0] = r
+            return
         # THE ENCODER MEASURES ITSELF: a worker's peak RSS updates its class's bytes-per-row
         # (max seen, plus 25% headroom) so the budget stops guessing after the first column.
         # One observation can never teach more than "two of this class fit the budget": an
@@ -1281,8 +1333,13 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
         seen = min(seen, cap)
         if seen > measured[c]:
             measured[c] = seen
-    sizes = {}
+    sizes = {}; _sub9 = {}; _chg9 = {}
     perm_path = None
+    if _os.environ.get('WDB_ENCODE_VERBOSE'):
+        print('  schema + cost estimate: %.1fs' % (time.time() - t0), flush=True)
+        for nm9 in order:
+            if cls(nm9) == 'string':
+                print('  text %-14s %5.1f GB of text, charged %5.1f GB' % (nm9, _TEXT_BYTES.get(nm9, 0) / 2**30, working_set(nm9) / 2**30), flush=True)
     if cluster_by:
         # THE CLUSTER ORDER: argsort the clustering column(s) once (stable), share the
         # permutation as an mmap'd file; every worker gathers its column through it
@@ -1293,7 +1350,7 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
         perm_path = out_path + '.perm.tmp.npy'
         np.save(perm_path, perm); del perm
         if _os.environ.get('WDB_ENCODE_VERBOSE'):
-            print('  cluster order by %s computed (%d rows)' % (', '.join(keys9), N), flush=True)
+            print('  cluster order by %s computed (%d rows) at %.1fs' % (', '.join(keys9), N, time.time() - t0), flush=True)
     _final9 = out_path; out_path = out_path + '.partial'        # THE RENAME LAW: a partial file never wears the final name
     fh = open(out_path, 'wb')
     fh.write(b'WVDB4' + struct.pack('<H', len(cols)) + struct.pack('<I', N))
@@ -1312,24 +1369,39 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
                     while pending and len(inflight) < nworkers:
                         heavy_in = sum(1 for v in inflight.values() if est.get(v, 1.0) >= 8)
                         pick = None
+                        # THE NEXT TEXT COLUMN KEEPS ITS SEAT: a small column may take free budget only
+                        # if the first waiting text column would still fit beside it -- the long jobs
+                        # start as early as memory allows instead of being overtaken to the end
+                        heavy_wait = next((p for p in pending if est.get(p, 1.0) >= 8), None)
                         for i9, cand in enumerate(pending):
-                            if est.get(cand, 1.0) >= 8 and heavy_in >= 4: continue        # strings measured 9-25 GB: four fit
-                            if not inflight or used + working_set(cand) <= budget:
-                                pick = i9; break
+                            if est.get(cand, 1.0) >= 8 and heavy_in >= 6: continue
+                            w9 = working_set(cand)
+                            if inflight and used + w9 > budget: continue
+                            if (heavy_wait is not None and cand != heavy_wait and est.get(cand, 1.0) < 8
+                                    and inflight and used + w9 + working_set(heavy_wait) > budget):
+                                continue
+                            pick = i9; break
                         if pick is None: break
                         nm = pending.pop(pick)
                         inflight[ex.submit(_column_job, input_path, nm, reader, (casts or {}).get(nm), perm_path)] = nm
-                        used += working_set(nm)
+                        # THE CHARGE IS REMEMBERED (2026-09-26): the release used to re-price the column at
+                        # the class's LEARNED rate, larger than the rate it was admitted at, so the books
+                        # drifted to -123 GB by the end of a load and the budget stopped meaning anything
+                        _chg9[nm] = working_set(nm); used += _chg9[nm]; _sub9[nm] = time.time() - t0
                     if not inflight: break
                     fut = next(iter(cf.as_completed(list(inflight.keys()))))
                     res = fut.result()                 # BEFORE the pop: a result that raises leaves the column in inflight for the re-queue
-                    nm = inflight.pop(fut); used -= working_set(nm)
+                    nm = inflight.pop(fut); used -= _chg9.pop(nm, working_set(nm))
                     cname, blob, size = res[0], res[1], res[2]
                     if len(res) > 3: learn(cname, int(res[3]))
                     fh.write(blob); fh.flush(); sizes[cname] = size
                     del blob
                     if verbose:
                         print('  encoded %-24s (%d/%d, %.0fs, %d in flight, class %s @ %.0f B/row)' % (cname, len(sizes), len(cols), time.time() - t0, len(inflight), cls(cname), measured[cls(cname)]), flush=True)
+                        if len(res) > 4 and isinstance(res[4], dict):
+                            print('    clock %-22s est %5.1f  started %5.0fs  peak %5.1f GB  budget-in-use %5.1f GB  ' % (
+                                      cname, est.get(cname, 1.0), _sub9.get(cname, 0.0), int(res[3]) / 2**30, used / 2**30)
+                                  + '  '.join('%s %.1f' % kv for kv in res[4].items()), flush=True)
         except cf.process.BrokenProcessPool:
             lost = [v for v in inflight.values() if v not in sizes]
             pending = lost + [p for p in pending if p not in sizes]
@@ -1371,13 +1443,24 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
     # (V near N) gets its exception shelf born AT ENCODE TIME -- row position
     # takes over identity; values demote to decode-only. Qualifies only while
     # the exceptions stay small: repeated rows < 0.75% of the distinct count.
+    _tp9 = time.time()
+    if verbose:
+        print('  file closed at %.1fs' % (_tp9 - t0), flush=True)
+    # THE THREE AFTER-STEPS SIDE BY SIDE (2026-09-26): the differentiator shelves, the load
+    # statistics and the string lengths each open the closed segment and write their own files;
+    # none reads another's output. They ran one after another (17 + 24 + 9 s); each now runs in its
+    # own process (numba's parallel kernels are not shared across threads) and the load waits for all.
+    _post9 = [('differentiator shelves', _post_shelves), ('load stats', _write_load_stats), ('lengths', _write_lengths)]
     try:
-        if __import__('os').environ.get('WDB_LOAD_SHELVES', '1') != '0':
-            _birth_differentiator_shelves(out_path)
-    except Exception:
-        pass
-    _write_load_stats(out_path)
-    _write_lengths(out_path)
+        with cf.ProcessPoolExecutor(max_workers=len(_post9)) as _px9:
+            _fu9 = [(lab, _px9.submit(fn, out_path)) for lab, fn in _post9]
+            for lab, fu in _fu9:
+                fu.result()
+                if verbose:
+                    print('  %s done at +%.1fs' % (lab, time.time() - _tp9), flush=True)
+    except cf.process.BrokenProcessPool:
+        for lab, fn in _post9:                     # the promise is the files, not the parallelism
+            fn(out_path)
     return dict(n_rows=N, n_cols=len(cols), bytes=(len(out) if out is not None else __import__('os').path.getsize(out_path)), seconds=time.time() - t0,
                 sizes=sizes, cluster=None)
 
@@ -1485,6 +1568,15 @@ def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_s
     _write_lengths(out_path)
     return dict(n_rows=N, n_cols=len(cols), bytes=len(out), seconds=time.time()-t0,
                 sizes=sizes, cluster=cluster_by)
+
+
+def _post_shelves(out_path):
+    try:
+        if os.environ.get('WDB_LOAD_SHELVES', '1') != '0':
+            _birth_differentiator_shelves(out_path)
+    except Exception:
+        pass
+    return 0
 
 
 def _write_lengths(out_path):

@@ -2776,3 +2776,28 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   issue; Q17's canonical form now finishes). Suite 1753 passed (a first run lost test_perf's codes()
   scaling check to host load ~70; it passed 3/3 alone and the full rerun was clean).
 - Q39 is noisy on this host: 3 reruns on each kit gave hot 315-2385 ms on the SAME database. Open.
+
+
+## 2026-09-26 -- THE ENCODE CLOCK, AND WHAT IT SHOWED
+- The streaming encoder now reports, under WDB_ENCODE_VERBOSE, each column's start time, peak memory
+  and seconds in read / gather / prep / serialize, and the after-steps' times. First profile (kit
+  flags, no warm, 477 s): 14-134 s only Title/Referer/URL ran (3 of 16 workers: the budget charged
+  every text column 29 GB on paper); SearchPhrase and OriginalURL were overtaken by small columns
+  to the end and ran alone 343-427 s; the three after-steps ran one after another (17 + 24 + 9 s).
+- THE CODES ARE GATHERED, NOT THE TEXT: a text column is dictionary-encoded in the file's own order
+  and its 4-byte codes go through the cluster order (the dictionary is sorted by value, so a code is
+  the same number in any row order). URL peak 37.9 -> 21.6 GB, Title 30.4 -> 22.7, no 8 GB take.
+- ONE READ PER NUMBER COLUMN: the arrow road now serves text only; number columns had been read and
+  gathered twice (the arrow read, a declined prep, then the numpy read).
+- A TEXT COLUMN IS PRICED BY ITS TEXT: charge = 5 GB + 2.3 x parquet's uncompressed size (learned
+  upward from measured peaks); row group 0 alone had guessed Title at 21 GB of text, the metadata says
+  7.6. THE CHARGE IS REMEMBERED: releases re-priced columns at the learned class rate and the books
+  drifted to -123 GB. THE NEXT TEXT COLUMN KEEPS ITS SEAT: a small column is admitted only if the
+  first waiting text column still fits beside it.
+- THE AFTER-STEPS SIDE BY SIDE: shelves, load stats and lengths each in their own process (50 -> 33 s).
+- Result: 425-477 -> 394 s (host load ~105), all five text columns start at 12 s; every column blob
+  and all 51 load files byte-identical to the previous encoder (bench hash of cb_prof vs cb_prof3).
+  Suite 1753 passed.
+- Open: 2,759 s of column work = 172 s on 16 workers, but the column phase is 345 s. The long jobs
+  that decide it are number columns ranked as ordinary by the row-group-0 guess -- URLHash 159 s,
+  RefererHash 136, HID 116, UserID 115, WatchID 113 -- started at 97-137 s behind the text columns.
