@@ -40,53 +40,82 @@ def _head_ok(seg, N, V, size):
         return False
 
 
-def write_for_segment(seg_path, row_cols=(), verbose=False):
-    """Called by the encoder once the segment file is final. Returns bytes written."""
+def dict_body(seg, col):
+    """(N, V, itemsize, zstd body) of a column's dictionary character lengths, or None when the
+    column is not a non-null front-coded text column (the files' payload, before the header that
+    names the final segment's size)."""
     import zstandard as zs
+    c = seg.cols.get(col)
+    if c is None or c.get('dt') != 1 or c.get('mode') != 1 or c.get('has_null'):
+        return None                                    # long text: the front-coded dictionaries
+    cl = seg.dict_charlens(col)
+    if cl is None:
+        return None
+    cl = np.asarray(cl)
+    dt = _dt(int(cl.max()) if cl.size else 0)
+    return (int(seg.N), int(c['V']), np.dtype(dt).itemsize, zs.ZstdCompressor(level=9).compress(cl.astype(dt).tobytes()), int(cl.size))
+
+
+def row_body(seg, col):
+    """(N, V, itemsize, block offsets, blocks) of a column's row-order character lengths, or None"""
+    import zstandard as zs
+    c = seg.cols.get(col)
+    if c is None or c.get('dt') != 1 or c.get('mode') not in (0, 1) or c.get('has_null'):
+        return None
+    cl = seg.dict_charlens(col)
+    if cl is None:
+        return None
+    cl = np.asarray(cl)
+    dt = _dt(int(cl.max()) if cl.size else 0)
+    L = cl.astype(dt)[np.asarray(seg._raw_codes(col))]
+    cz = zs.ZstdCompressor(level=9)
+    blocks = [cz.compress(L[i:i + FR].tobytes()) for i in range(0, L.size, FR)]
+    off = np.zeros(len(blocks) + 1, np.int64)
+    np.cumsum([len(b) for b in blocks], out=off[1:])
+    return (int(seg.N), int(c['V']), np.dtype(dt).itemsize, off, blocks)
+
+
+def write_dict(seg_path, col, b, size, verbose=False):
+    N, V, isz, body, n = b
+    with open(dict_path(seg_path, col) + '.tmp', 'wb') as f:
+        f.write(_M_DICT + struct.pack('<qqqB', N, V, size, isz) + body)
+    os.replace(dict_path(seg_path, col) + '.tmp', dict_path(seg_path, col))
+    if verbose:
+        print('  dictionary lengths %s: %d entries, %.1f MB' % (col, n, (len(body) + 29) / 1e6), flush=True)
+    return len(body) + 29
+
+
+def write_row(seg_path, col, b, size, verbose=False):
+    N, V, isz, off, blocks = b
+    with open(row_path(seg_path, col) + '.tmp', 'wb') as f:
+        f.write(_M_ROW + struct.pack('<qqqBqq', N, V, size, isz, FR, len(blocks)))
+        f.write(off.tobytes())
+        for blk in blocks:
+            f.write(blk)
+    os.replace(row_path(seg_path, col) + '.tmp', row_path(seg_path, col))
+    if verbose:
+        print('  row lengths %s: %d rows, %.1f MB' % (col, N, (int(off[-1]) + off.nbytes) / 1e6), flush=True)
+    return int(off[-1]) + off.nbytes + 45
+
+
+def write_for_segment(seg_path, row_cols=(), verbose=False):
+    """Called by the encoder once the segment file is final. Returns bytes written. (The streaming
+    encoder computes the same payloads inside each column's job and only writes them here.)"""
     from wdb_engine import Segment
     seg = Segment(seg_path)
     size = os.path.getsize(seg_path)
-    cz = zs.ZstdCompressor(level=9)
     total = 0
-    for col, c in seg.cols.items():
-        if c.get('dt') != 1 or c.get('mode') != 1 or c.get('has_null'):
-            continue                                   # long text: the front-coded dictionaries
-        cl = seg.dict_charlens(col)
-        if cl is None:
-            continue
-        cl = np.asarray(cl)
-        dt = _dt(int(cl.max()) if cl.size else 0)
-        body = cz.compress(cl.astype(dt).tobytes())
-        with open(dict_path(seg_path, col) + '.tmp', 'wb') as f:
-            f.write(_M_DICT + struct.pack('<qqqB', int(seg.N), int(c['V']), size, np.dtype(dt).itemsize) + body)
-        os.replace(dict_path(seg_path, col) + '.tmp', dict_path(seg_path, col))
-        total += len(body) + 29
-        if verbose:
-            print('  dictionary lengths %s: %d entries, %.1f MB' % (col, cl.size, (len(body) + 29) / 1e6), flush=True)
+    for col in seg.cols:
+        b = dict_body(seg, col)
+        if b is not None:
+            total += write_dict(seg_path, col, b, size, verbose)
     for col in row_cols:
-        c = seg.cols.get(col)
-        if c is None or c.get('dt') != 1 or c.get('mode') not in (0, 1) or c.get('has_null'):
-            if verbose:
+        b = row_body(seg, col)
+        if b is None:
+            if verbose and seg.cols.get(col, {}).get('dt') != 1:
                 print('  row lengths %s: not a non-null text dictionary column, skipped' % col, flush=True)
             continue
-        cl = seg.dict_charlens(col)
-        if cl is None:
-            continue
-        cl = np.asarray(cl)
-        dt = _dt(int(cl.max()) if cl.size else 0)
-        L = cl.astype(dt)[np.asarray(seg._raw_codes(col))]
-        blocks = [cz.compress(L[i:i + FR].tobytes()) for i in range(0, L.size, FR)]
-        off = np.zeros(len(blocks) + 1, np.int64)
-        np.cumsum([len(b) for b in blocks], out=off[1:])
-        with open(row_path(seg_path, col) + '.tmp', 'wb') as f:
-            f.write(_M_ROW + struct.pack('<qqqBqq', int(seg.N), int(c['V']), size, np.dtype(dt).itemsize, FR, len(blocks)))
-            f.write(off.tobytes())
-            for b in blocks:
-                f.write(b)
-        os.replace(row_path(seg_path, col) + '.tmp', row_path(seg_path, col))
-        total += int(off[-1]) + off.nbytes + 45
-        if verbose:
-            print('  row lengths %s: %d rows, %.1f MB' % (col, L.size, (int(off[-1]) + off.nbytes) / 1e6), flush=True)
+        total += write_row(seg_path, col, b, size, verbose)
     return total
 
 

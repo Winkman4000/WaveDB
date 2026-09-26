@@ -1171,7 +1171,7 @@ def _crash_point(name):
         os.kill(os.getpid(), signal.SIGKILL)
 
 
-def _column_job(input_path, nm, reader, cast=None, perm_path=None):
+def _column_job(input_path, nm, reader, cast=None, perm_path=None, N=None):
     """one column, start to blob, in a worker process (reads its own column: no table in RAM).
     perm_path: THE CLUSTER ORDER -- a row permutation every column gathers through, so the
     segment is time-ordered and the clock columns become STAIRCASES (free ordering for
@@ -1182,6 +1182,17 @@ def _column_job(input_path, nm, reader, cast=None, perm_path=None):
     _tm = {}; _tk = [time.time()]
     def _mark(k):
         now = time.time(); _tm[k] = _tm.get(k, 0.0) + (now - _tk[0]); _tk[0] = now
+    # THE JOB'S NOTE TO THE GOVERNOR: which process is cooking this column, and (text columns) when
+    # the raw text is gone -- the governor sizes the room it keeps for this job from it
+    _jd = os.environ.get('WDB_ENC_JOBDIR')
+    def _note(kind):
+        if _jd:
+            try:
+                with open(os.path.join(_jd, '%s.%s' % (nm, kind)), 'w') as f9:
+                    f9.write(str(os.getpid()))
+            except Exception:
+                pass
+    _note('pid')
     perm = np.load(perm_path, mmap_mode='r') if perm_path else None
     if cast is None and str(input_path).lower().endswith('.parquet'):
         try:
@@ -1202,6 +1213,11 @@ def _column_job(input_path, nm, reader, cast=None, perm_path=None):
                 # dictionary and the null bin do not depend on the order the rows arrive in)
                 prep = _arrow_string_prep(nm, box, perm=perm)
                 _mark('prep')
+                import resource as _rs0
+                _tm['peak_after_prep_gb'] = _rs0.getrusage(_rs0.RUSAGE_SELF).ru_maxrss / 2**20   # where the peak falls
+                # measured on URL: the job's whole-life peak (22.0 GB) is reached by the end of the
+                # prep; the serialize that follows works on the dictionary and the codes only
+                _note('prepped')
         except Exception as _e9:
             # A FALLBACK THAT IS SILENT IS A FAST PATH THAT ISN'T THERE: the arrow path had failed
             # on every big string column for weeks ('offset overflow') and nobody knew
@@ -1221,12 +1237,107 @@ def _column_job(input_path, nm, reader, cast=None, perm_path=None):
         del arr
     blob, size = _serialize_column(prep, zstd.ZstdCompressor(level=ZSTD_LEVEL))
     _mark('serialize')
+    del prep
+    extras = None
+    if N is not None:
+        try:
+            extras = _column_extras(nm, blob, N)
+        except Exception as _e8:
+            extras = None
+            print('  in-job statistics declined %s (%s: %s) -- the after-step will compute them' % (nm, type(_e8).__name__, str(_e8)[:80]), flush=True)
+        _mark('extras')
     import resource as _rs
-    peak = _rs.getrusage(_rs.RUSAGE_SELF).ru_maxrss * 1024      # this worker's peak so far: THE MEASURED TRUTH
-    return nm, bytes(blob), size, peak, _tm
+    _ru = _rs.getrusage(_rs.RUSAGE_SELF)
+    peak = _ru.ru_maxrss * 1024      # this worker's peak so far: THE MEASURED TRUTH
+    _tm['cpu'] = _ru.ru_utime + _ru.ru_stime          # core-seconds this column burned (all its threads)
+    return nm, bytes(blob), size, peak, _tm, extras
+
+
+def _column_extras(nm, blob, N):
+    """THE AFTER-STEPS, DONE WHILE THE COLUMN IS STILL IN HAND (Jackson, 2026-09-26: fill the idle
+    cores with work we must do anyway). The load statistics and the string lengths of this column
+    are computed in its own job -- by the very functions the after-steps call (wdb_blockstats,
+    wdb_lens), on a one-column segment made of this column's finished blob -- instead of re-reading
+    every column from the sealed file at the end. The parent only writes them. Returns
+    {'stats': {key: array}, 'dict': body or None, 'row': body or None}."""
+    import tempfile
+    d = '/dev/shm' if (os.path.isdir('/dev/shm') and os.access('/dev/shm', os.W_OK)) else tempfile.gettempdir()
+    p = os.path.join(d, 'wdbcol_%d_%s.wdb' % (os.getpid(), nm))
+    try:
+        with open(p, 'wb') as f:
+            f.write(b'WVDB4' + struct.pack('<H', 1) + struct.pack('<I', N))
+            f.write(blob)
+        from wdb_engine import Segment
+        seg = Segment(p)
+        st = {}
+        if os.environ.get('WDB_LOAD_STATS', '1') != '0':
+            import wdb_blockstats as _B
+            rep = _B.differentiator_rows(seg, nm)
+            if rep is not None:
+                st[nm + '.rep'] = rep
+            vc = _B.value_counts(seg, nm)
+            if vc is not None:
+                st[nm + '.vcnt'] = vc
+            seg._codes.pop(nm, None)
+            if _B.eligible(seg, nm):
+                try:
+                    s9 = _B.compute(seg, nm)
+                    for kk in ('cnt', 'nn', 'sum', 'cmin', 'cmax'):
+                        st[nm + '.' + kk] = s9[kk]
+                    st[nm + '.mode4'] = np.bool_(s9['mode4']); st[nm + '.maxabs'] = np.float64(s9['maxabs'])
+                    st[nm + '.dt'] = np.int64(s9['dt'])
+                except Exception:
+                    pass
+        dict9 = row9 = None
+        if os.environ.get('WDB_LOAD_LENGTHS', '1') != '0':
+            import wdb_lens
+            dict9 = wdb_lens.dict_body(seg, nm)
+            if nm in [c for c in os.environ.get('WDB_ROWLEN_COLS', '').split(',') if c]:
+                row9 = wdb_lens.row_body(seg, nm)
+        return {'stats': st, 'dict': dict9, 'row': row9}
+    finally:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
 
 
 _TEXT_BYTES = {}                                  # text column -> estimated in-memory bytes (from _column_cost's sample)
+
+
+def _cg_mem():
+    """(limit, live) bytes of this container's memory, or None. live = usage minus the inactive
+    page cache -- the part the kernel cannot hand back without refusing someone."""
+    try:
+        if os.path.exists('/sys/fs/cgroup/memory.max'):
+            lim = open('/sys/fs/cgroup/memory.max').read().strip()
+            use = int(open('/sys/fs/cgroup/memory.current').read())
+            st = dict(l.split()[:2] for l in open('/sys/fs/cgroup/memory.stat'))
+            inact = int(st.get('inactive_file', 0))
+        else:
+            b = '/sys/fs/cgroup/memory/'
+            lim = open(b + 'memory.limit_in_bytes').read().strip()
+            use = int(open(b + 'memory.usage_in_bytes').read())
+            st = dict(l.split()[:2] for l in open(b + 'memory.stat'))
+            inact = int(st.get('total_inactive_file', st.get('inactive_file', 0)))
+        phys = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
+        lim = min(int(lim), phys) if lim.isdigit() else phys
+        return lim, max(0, use - inact)
+    except Exception:
+        return None
+
+
+def _anon_rss(pids):
+    """resident bytes of the given processes that are their own (resident minus file-backed shared:
+    the mmap'd cluster order and the libraries every worker shares are not counted 16 times)"""
+    pg = os.sysconf('SC_PAGE_SIZE'); tot = 0
+    for p in pids:
+        try:
+            f = open('/proc/%d/statm' % p).read().split()
+            tot += max(0, int(f[1]) - int(f[2])) * pg
+        except Exception:
+            pass
+    return tot
 
 
 def _column_cost(input_path, cols, reader, N):
@@ -1285,7 +1396,13 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
     cols, N = wdb_read.column_schema(input_path, columns, reader=reader)
     est = _column_cost(input_path, cols, reader, N)
     order = sorted(cols, key=lambda c: -est.get(c, 1.0))
-    nworkers = max(1, min(workers or (_os.cpu_count() or 4), _os.cpu_count() or 4))
+    # THE CORES WE MAY RUN ON (2026-09-26): os.cpu_count() is the HOST's 64; the container is
+    # pinned to 16 (sched_getaffinity), and the pool had been sized for 64
+    try:
+        ncpu = len(_os.sched_getaffinity(0)) or (_os.cpu_count() or 4)
+    except Exception:
+        ncpu = _os.cpu_count() or 4
+    nworkers = max(1, min(workers or ncpu, ncpu))
     try:
         budget = int(float(_os.environ.get('WDB_ENCODE_MB', '0'))) << 20
     except Exception:
@@ -1315,7 +1432,10 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
         # peaks near 3 GB and a small dictionary near 7 GB (measured 2026-09-14)
         e = est.get(nm, 1.0)
         return 'string' if e >= 8 else ('wide' if e >= 2.0 else ('mid' if e >= 1.5 else ('narrow' if e >= 0.5 else 'tiny')))
-    measured = {'string': 310, 'wide': 100, 'mid': 70, 'narrow': 40, 'tiny': 25}   # strings: the MEASURED peak on the arrow path (Title 29 GB at 100M rows; it was 57 GB on the object path)     # bytes per row: conservative starts (URL/Referer/Title peak ~25 GB at 100M rows), raised as workers report
+    # starting rates raised to the peaks measured 2026-09-26 (a flag column 3.9-4.6 GB at 100M rows,
+    # a narrow one 4.5-9, mid 6-13, wide 10-15): the live rule below reserves by these, so they must
+    # not start under the truth
+    measured = {'string': 310, 'wide': 130, 'mid': 100, 'narrow': 75, 'tiny': 50}   # strings: the MEASURED peak on the arrow path (Title 29 GB at 100M rows; it was 57 GB on the object path)     # bytes per row: conservative starts (URL/Referer/Title peak ~25 GB at 100M rows), raised as workers report
     # A TEXT COLUMN IS PRICED BY ITS TEXT (2026-09-26): one class rate for every string charged
     # SearchPhrase (8 GB measured) like URL (38 GB), so SearchPhrase and OriginalURL could not fit
     # while small columns ran, waited to the end and ran alone for 84 s. The charge is a floor (a
@@ -1342,9 +1462,18 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
         c = cls(nm); seen = (peak - (400 << 20)) / max(1, N) * 1.25
         cap = (budget / 2 - (400 << 20)) / max(1, N)
         seen = min(seen, cap)
-        if seen > measured[c]:
+        # A CLASS IS PRICED BY ITS TYPICAL MEMBER (2026-09-26): the max rule let one member set the price
+        # of all -- CounterID (8.6 GB) charged every flag column ~10 GB against a real 4. From three
+        # observations on, the rate is the 80th-percentile peak plus 20%; the limit's margin carries
+        # the rare column above it.
+        pk = _pk9.setdefault(c, []); pk.append(peak)
+        if len(pk) >= 3:
+            q = sorted(pk)[int(0.8 * (len(pk) - 1))]
+            measured[c] = min(cap, max(36.0, (q - (400 << 20)) / max(1, N) * 1.2))
+        elif seen > measured[c]:
             measured[c] = seen
-    sizes = {}; _sub9 = {}; _chg9 = {}
+    sizes = {}; _sub9 = {}; _chg9 = {}; _pk9 = {}; _xt9 = {}; _ord9 = []
+    injob = _os.environ.get('WDB_LOAD_INJOB', '1') != '0'
     perm_path = None
     if _os.environ.get('WDB_ENCODE_VERBOSE'):
         print('  schema + cost estimate: %.1fs' % (time.time() - t0), flush=True)
@@ -1366,6 +1495,44 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
     fh = open(out_path, 'wb')
     fh.write(b'WVDB4' + struct.pack('<H', len(cols)) + struct.pack('<I', N))
     pending = list(order); verbose = bool(_os.environ.get('WDB_ENCODE_VERBOSE'))
+    live_on = _os.environ.get('WDB_ENCODE_LIVE', '1') != '0' and _cg_mem() is not None
+    jobdir = out_path + '.jobs'
+    try:
+        _os.makedirs(jobdir, exist_ok=True); _os.environ['WDB_ENC_JOBDIR'] = jobdir   # workers fork after this
+    except Exception:
+        live_on = False
+
+    def live_fits(w, running, memo):
+        """THE LIVE RULE (2026-09-26, Jackson: fill the idle cores): the paper budget counts every
+        running job at its PEAK, and the peaks do not coincide -- 15-150 s of a load ran 5-9 of 16
+        cores with the paper full and 40+ GB really free. A job may also start when what the
+        container really holds, plus every running job's remaining growth to its charge, plus the
+        newcomer's charge, stays a margin under the cgroup limit. memo: a one-slot list, filled once
+        per admission round."""
+        if memo[0] is None:
+            cg = _cg_mem()
+            if cg is None:
+                return False
+            # each running job keeps the room to grow to its charge: charge minus its own resident
+            # bytes; a text job past its prep (the raw text freed, its peak behind it -- measured: URL
+            # 21.8 GB, Title 22.4, Referer 16.5 at the end of the prep and never above) keeps a
+            # quarter of its charge for the serialize
+            grow = 0
+            for c9 in running.values():
+                ch9 = _chg9.get(c9, working_set(c9))
+                try:
+                    with open(_os.path.join(jobdir, c9 + '.pid')) as fp9:
+                        pid9 = int(fp9.read())
+                except Exception:
+                    grow += ch9
+                    continue
+                if cls(c9) == 'string' and _os.path.exists(_os.path.join(jobdir, c9 + '.prepped')):
+                    grow += ch9 // 4
+                else:
+                    grow += max(0, ch9 - _anon_rss([pid9]))
+            memo[0] = (cg[0], cg[1], grow)
+        lim, live, growth = memo[0]
+        return live + growth + w <= lim - max(8 << 30, lim // 12)
     while pending:
         inflight = {}; used = 0
         try:
@@ -1384,34 +1551,48 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
                         # if the first waiting text column would still fit beside it -- the long jobs
                         # start as early as memory allows instead of being overtaken to the end
                         heavy_wait = next((p for p in pending if est.get(p, 1.0) >= 8), None)
+                        live9 = [None]
                         for i9, cand in enumerate(pending):
                             if est.get(cand, 1.0) >= 8 and heavy_in >= 6: continue
                             w9 = working_set(cand)
-                            if inflight and used + w9 > budget: continue
-                            if (heavy_wait is not None and cand != heavy_wait and est.get(cand, 1.0) < 8
+                            paper = (not inflight) or used + w9 <= budget
+                            if not paper and (est.get(cand, 1.0) >= 8 or not live_on
+                                              or not live_fits(w9, inflight, live9)): continue
+                            if (paper and heavy_wait is not None and cand != heavy_wait and est.get(cand, 1.0) < 8
                                     and inflight and used + w9 + working_set(heavy_wait) > budget):
                                 continue
                             pick = i9; break
                         if pick is None: break
                         nm = pending.pop(pick)
-                        inflight[ex.submit(_column_job, input_path, nm, reader, (casts or {}).get(nm), perm_path)] = nm
+                        inflight[ex.submit(_column_job, input_path, nm, reader, (casts or {}).get(nm), perm_path,
+                                           N if injob else None)] = nm
                         # THE CHARGE IS REMEMBERED (2026-09-26): the release used to re-price the column at
                         # the class's LEARNED rate, larger than the rate it was admitted at, so the books
                         # drifted to -123 GB by the end of a load and the budget stopped meaning anything
                         _chg9[nm] = working_set(nm); used += _chg9[nm]; _sub9[nm] = time.time() - t0
                     if not inflight: break
-                    fut = next(iter(cf.as_completed(list(inflight.keys()))))
+                    # a running job passing its peak frees real memory without finishing: look again
+                    # every few seconds instead of only when a column lands
+                    done9, _ = cf.wait(list(inflight.keys()), timeout=(3.0 if (live_on and pending) else None),
+                                       return_when=cf.FIRST_COMPLETED)
+                    if not done9:
+                        continue
+                    fut = next(iter(done9))
                     res = fut.result()                 # BEFORE the pop: a result that raises leaves the column in inflight for the re-queue
                     nm = inflight.pop(fut); used -= _chg9.pop(nm, working_set(nm))
                     cname, blob, size = res[0], res[1], res[2]
                     if len(res) > 3: learn(cname, int(res[3]))
-                    fh.write(blob); fh.flush(); sizes[cname] = size
+                    if len(res) > 5 and res[5] is not None:
+                        _xt9[cname] = res[5]
+                    fh.write(blob); fh.flush(); sizes[cname] = size; _ord9.append(cname)
                     del blob
                     if verbose:
                         print('  encoded %-24s (%d/%d, %.0fs, %d in flight, class %s @ %.0f B/row)' % (cname, len(sizes), len(cols), time.time() - t0, len(inflight), cls(cname), measured[cls(cname)]), flush=True)
                         if len(res) > 4 and isinstance(res[4], dict):
-                            print('    clock %-22s est %5.1f  started %5.0fs  peak %5.1f GB  budget-in-use %5.1f GB  ' % (
-                                      cname, est.get(cname, 1.0), _sub9.get(cname, 0.0), int(res[3]) / 2**30, used / 2**30)
+                            _cg9 = _cg_mem()
+                            print('    clock %-22s est %5.1f  started %5.0fs  peak %5.1f GB  budget-in-use %5.1f GB  live %5.1f GB  ' % (
+                                      cname, est.get(cname, 1.0), _sub9.get(cname, 0.0), int(res[3]) / 2**30, used / 2**30,
+                                      (_cg9[1] / 2**30) if _cg9 else -1)
                                   + '  '.join('%s %.1f' % kv for kv in res[4].items()), flush=True)
         except cf.process.BrokenProcessPool:
             lost = [v for v in inflight.values() if v not in sizes]
@@ -1419,6 +1600,7 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
             if nworkers <= 1:
                 fh.close(); raise
             nworkers = max(1, nworkers // 2)
+            live_on = False                        # after a kill, only the paper budget admits
             print('  pool killed (memory): retreating to %d workers, re-queueing %d columns (%s)' % (nworkers, len(lost), ', '.join(lost[:5])), flush=True)
         # THE COMPLETENESS LAW: the header promised len(cols) blobs; whatever the retreats lost
         # is encoded again, in this process, before the file closes (measured: URL and Referer
@@ -1429,9 +1611,14 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
             for nm in missing:
                 res = _column_job(input_path, nm, reader, (casts or {}).get(nm), perm_path)
                 cname, blob, size = res[0], res[1], res[2]
-                fh.write(blob); fh.flush(); sizes[cname] = size; del blob
+                fh.write(blob); fh.flush(); sizes[cname] = size; _ord9.append(cname); del blob
     fh.flush(); _os.fsync(fh.fileno()); fh.close()
     _os.replace(out_path, _final9); out_path = _final9
+    try:
+        import shutil as _sh9
+        _sh9.rmtree(jobdir, ignore_errors=True); _os.environ.pop('WDB_ENC_JOBDIR', None)
+    except Exception:
+        pass
     _crash_point('encode:renamed')
     if perm_path:
         try: _os.remove(perm_path)
@@ -1462,13 +1649,28 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
     # none reads another's output. They ran one after another (17 + 24 + 9 s); each now runs in its
     # own process (numba's parallel kernels are not shared across threads) and the load waits for all.
     _post9 = [('differentiator shelves', _post_shelves), ('load stats', _write_load_stats), ('lengths', _write_lengths)]
+    if injob and all(c in _xt9 for c in cols):
+        # every column brought its statistics and lengths from its own job: write them, and leave
+        # only the shelves (they pair columns with each other) to the after-step
+        _write_extras(out_path, N, _ord9, _xt9, verbose)
+        _post9 = []
+        if verbose:
+            print('  statistics + lengths written from the jobs at +%.1fs' % (time.time() - _tp9), flush=True)
+        try:
+            if _os.environ.get('WDB_LOAD_SHELVES', '1') != '0':
+                _birth_differentiator_shelves(out_path, known={c: (_xt9[c].get('stats') or {}).get(c + '.rep') for c in cols})
+        except Exception:
+            pass
+        if verbose:
+            print('  differentiator shelves done at +%.1fs' % (time.time() - _tp9), flush=True)
     try:
-        with cf.ProcessPoolExecutor(max_workers=len(_post9)) as _px9:
-            _fu9 = [(lab, _px9.submit(fn, out_path)) for lab, fn in _post9]
-            for lab, fu in _fu9:
-                fu.result()
-                if verbose:
-                    print('  %s done at +%.1fs' % (lab, time.time() - _tp9), flush=True)
+        if _post9:
+            with cf.ProcessPoolExecutor(max_workers=len(_post9)) as _px9:
+                _fu9 = [(lab, _px9.submit(fn, out_path)) for lab, fn in _post9]
+                for lab, fu in _fu9:
+                    fu.result()
+                    if verbose:
+                        print('  %s done at +%.1fs' % (lab, time.time() - _tp9), flush=True)
     except cf.process.BrokenProcessPool:
         for lab, fn in _post9:                     # the promise is the files, not the parallelism
             fn(out_path)
@@ -1581,6 +1783,37 @@ def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_s
                 sizes=sizes, cluster=cluster_by)
 
 
+def _write_extras(out_path, N, order, extras, verbose=False):
+    """The load statistics file and the string length files, from what each column's job computed
+    (the same keys, in the file's column order, as wdb_blockstats.write_for_segment; the same
+    headers and payloads as wdb_lens.write_for_segment)."""
+    import wdb_blockstats as _B, wdb_lens
+    if os.environ.get('WDB_LOAD_STATS', '1') != '0':
+        out = {'N': np.int64(N)}
+        n = 0
+        for col in order:
+            st = extras[col].get('stats') or {}
+            if (col + '.rep') in st and verbose:
+                print('  stats: %s is a differentiator, %d exception rows' % (col, st[col + '.rep'].size), flush=True)
+            out.update(st)
+            n += 1 if (col + '.cnt') in st else 0
+        p = _B.stats_path(out_path)
+        tmp = p + '.partial.npz'
+        np.savez(tmp, **out)
+        os.replace(tmp, p)
+        _B._LOADED.pop(p, None)
+        if verbose:
+            print('  stats: %d columns, %.1f KB -> %s' % (n, os.path.getsize(p) / 1024, os.path.basename(p)), flush=True)
+    if os.environ.get('WDB_LOAD_LENGTHS', '1') != '0':
+        size = os.path.getsize(out_path)
+        for col in order:
+            if extras[col].get('dict') is not None:
+                wdb_lens.write_dict(out_path, col, extras[col]['dict'], size, verbose)
+        for col in [c for c in os.environ.get('WDB_ROWLEN_COLS', '').split(',') if c]:
+            if col in extras and extras[col].get('row') is not None:
+                wdb_lens.write_row(out_path, col, extras[col]['row'], size, verbose)
+
+
 def _post_shelves(out_path):
     try:
         if os.environ.get('WDB_LOAD_SHELVES', '1') != '0':
@@ -1634,20 +1867,34 @@ if __name__ == '__main__':
     print(f"Encoded {r['n_cols']} cols x {r['n_rows']:,} rows -> {r['bytes']/1e6:.1f} MB in {r['seconds']:.0f}s ({fc} front-coded, {fl} float, {dt} datetime, {nu} nullable)")
 
 
-def _birth_differentiator_shelves(out_path):
+def _birth_differentiator_shelves(out_path, known=None):
+    """THE SHELVES WITHOUT A FULL DECODE (2026-09-26, measured: 12.7 s of the load's tail was HID and
+    WatchID decoded and counted, then 42 companion columns decoded whole to read 8 rows each).
+    - known: {column: exception rows} its own load job already found by the same law
+      (wdb_blockstats.differentiator_rows); used as given instead of counting again.
+    - A column of V distinct codes over N rows has at least N - V rows in repeated groups: when that
+      floor alone breaks 0.75% of V the column cannot qualify, and nothing is decoded to learn it.
+    - The pairs read the companions only at the exception rows (Segment.codes_at). Same files."""
     import importlib, pickle
     import numpy as _np
     eng = importlib.import_module('wdb_engine')
     seg = eng.Segment(out_path)
     N = int(seg.N)
+    known = known or {}
     for cn, c in list(seg.cols.items()):
         try:
             V = int(c.get('V') or 0)
             if V * 2 < N or V < 1024:
                 continue                          # role isn't differentiation
-            codes = _np.asarray(seg._raw_codes(cn))
-            cnt = _np.bincount(codes, minlength=V)
-            rep = _np.flatnonzero(cnt[codes] >= 2)
+            if N - V - 1 >= 0.0075 * V:
+                continue                          # the repeat floor alone disqualifies (one spare code for a null)
+            if known.get(cn) is not None:
+                rep = _np.asarray(known[cn], _np.int64)
+            else:
+                codes = _np.asarray(seg._raw_codes(cn))
+                cnt = _np.bincount(codes, minlength=V)
+                rep = _np.flatnonzero(cnt[codes] >= 2)
+                del codes, cnt
             if rep.size >= 0.0075 * V:
                 continue                          # too many exceptions: disqualified
             pickle.dump({'n': N, 'rows': rep.astype(_np.uint32)},
@@ -1661,21 +1908,27 @@ def _expand_pair_shelves(seg, out_path, a, rep):
     """Jackson's eager expansion: the differentiator pairs with every
     qualifying companion. The law recurses verbatim -- repeated-PAIR rows
     must stay under 0.75% of the companion's distinct count; low-V columns
-    self-disqualify (their repeats swamp the threshold). Kilobytes total."""
-    import pickle
+    self-disqualify (their repeats swamp the threshold). Kilobytes total.
+    Both sides are read only at the exception rows (Segment.codes_at)."""
     import numpy as _np
     rep = _np.sort(_np.asarray(rep, _np.int64))
     if rep.size == 0:
         return
-    ac = _np.asarray(seg._raw_codes(a), _np.int64)[rep]
-    for y, cy in list(seg.cols.items()):
+    ac = _np.asarray(seg.codes_at(a, rep), _np.int64)
+    ys = [y for y, cy in seg.cols.items() if y != a and int(cy.get('V') or 0) >= 1024]   # low V: repeats swamp 0.75%
+    for y in ys:
+        _pair_shelf_one(seg, out_path, a, rep, ac, y)
+
+
+def _pair_shelf_one(seg, out_path, a, rep, ac, y):
+    """one differentiator-companion pair shelf (the body of Jackson's eager expansion)"""
+    import pickle
+    import numpy as _np
+    for _once in (0,):
         try:
-            if y == a:
-                continue
+            cy = seg.cols[y]
             Vy = int(cy.get('V') or 0)
-            if Vy < 1024:
-                continue                          # low V: repeats swamp 0.75%
-            bc = _np.asarray(seg._raw_codes(y), _np.int64)[rep]
+            bc = _np.asarray(seg.codes_at(y, rep), _np.int64)
             key = (ac << 32) | bc
             order = _np.argsort(key, kind='stable')
             key2 = key[order]
@@ -1687,7 +1940,7 @@ def _expand_pair_shelves(seg, out_path, a, rep):
             gcnt = _np.diff(_np.append(st, key2.size))
             rp = int(gcnt[gcnt >= 2].sum())
             if rp >= 0.0075 * Vy:
-                continue                          # relationship disqualified
+                return                            # relationship disqualified
             gid = _np.zeros(key2.size, _np.int64)
             repg = _np.flatnonzero(gcnt >= 2)
             ga = []

@@ -2808,3 +2808,31 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   on a host at load ~123; all 105 blobs and 51 load files byte-identical. Suite 1753 passed.
   The column phase now ends on tiny columns (~345 s): the long number columns (HID, UserID, WatchID,
   the hashes) still start at 87-135 s behind the text columns' memory -- the ordering is next.
+
+- FILL THE IDLE CORES (Jackson: "check how many registers in the cpu sit idle ... fill those gaps with
+  work that will allow us to overlap"). A 2 s monitor on the cgroup's CPU clock: 58% of the 16 cores
+  busy, 2,505 idle core-seconds; the budget was holding columns out on paper while real memory sat free.
+- THE BUDGET LOOKS AT REAL MEMORY: besides the paper rule, a number column is admitted when the
+  cgroup's live usage (minus inactive file cache) plus what the running jobs have yet to grow into
+  (charge minus their resident memory; a text column past its prep -- its whole-life peak -- only a
+  quarter of its charge) plus the new charge stays 8 GB (or 1/12) under the limit. Class charges are
+  now the 80th-percentile measured peak x1.2 after 3 samples, not the largest guess. A broken pool
+  turns the live rule off. 374 -> 346 s, cores busy 58 -> 62%, jobs in flight 9-13.
+- THE AFTER-STEPS MOVE INTO THE JOBS: each column's job builds a one-column segment of its finished
+  blob in /dev/shm and runs the very functions the after-steps ran (wdb_blockstats differentiator
+  rows, value counts, compute; wdb_lens dict_body / row_body, split out of write_for_segment); the
+  parent only writes stats.npz and the length files (headers carry the final file size). 28 -> 0.9 s.
+- THE SHELVES WITHOUT A FULL DECODE: the remaining 18 s tail was HID and WatchID decoded and counted
+  (HID only to be disqualified) and 42 companion columns decoded whole to read WatchID's 8 exception
+  rows. Now: a column of V codes over N rows has at least N - V - 1 rows in repeated groups, and when
+  that floor breaks 0.75% of V it is skipped undecoded (HID: 18.5M >= 611k); a differentiator's
+  exception rows come from its own job; both sides of a pair are read with Segment.codes_at at those
+  rows only. Standalone 12.7 -> 1.5 s (3.9 s without the job's rows), all 43 shelf files
+  byte-identical. (Tried first: the companions split across 4 processes -- fork is killed by libgomp
+  in a parent that has run OpenMP; with spawn it saved 0.7 s and changed the pickle bytes because the
+  arrays' dtype objects came back unshared. Dropped.)
+- Result (kit flags, no warm, host load ~130): 374 -> 328 s; after the file closes, 1.0 s for stats and
+  lengths plus 3.4 s of shelves (was 28 s, then 18 s). Cores busy 65%, idle core-seconds 2,505 -> 1,821.
+  All 105 column blobs and 51 load files byte-identical (bench hash vs cb_prof3). Suite 1753 passed.
+- Still idle: the first ~15 s (reads before any job is busy) and the text columns' ramps; the column
+  phase ends at ~324 s on 2,797 s of column work = 175 s if 16 cores were full. Ordering is next.
