@@ -468,6 +468,17 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
     the steps serve point reads/GROUP BY with NO decode. Smallest candidate wins; incompressible
     arrays stay raw, paying only the tag byte."""
     arr = np.asarray(codes, dtype=np.int64)          # ONE int64 view of the stream, shared by every candidate (six copies of 800 MB were alive at once)
+    # THE FLAG SKIPS THE CONTEST (Jackson, 2026-09-26): a column the operator declared a hash is
+    # stored as tag 20 whatever the size contest picks -- the only exception is a staircase, which
+    # can only win when the codes climb from 0 by steps of 0 or 1. When they do not, every other
+    # dress (zstd, sparse, tiered, bitpack-plus, frames, packed frames, block dictionaries...) was
+    # built only to be thrown away: URLHash spent 96 s and RefererHash 98 s serializing.
+    if nm is not None and codes.size and 1 <= bits <= 32 and nm in _hash_cols():
+        d20 = np.diff(arr)
+        climbs = int(arr[0]) == 0 and (d20.size == 0 or (int(d20.min()) >= 0 and int(d20.max()) <= 1))
+        del d20
+        if not climbs:
+            return _e20_section(arr, bits)
     stair = None
     if arr.size:
         d = np.diff(arr)

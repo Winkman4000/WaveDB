@@ -2801,3 +2801,10 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
 - Open: 2,759 s of column work = 172 s on 16 workers, but the column phase is 345 s. The long jobs
   that decide it are number columns ranked as ordinary by the row-group-0 guess -- URLHash 159 s,
   RefererHash 136, HID 116, UserID 115, WatchID 113 -- started at 97-137 s behind the text columns.
+- THE FLAG SKIPS THE CONTEST (Jackson): a --hash column is stored as tag 20 whatever the size contest
+  picks, so _code_section now goes straight to _e20_section unless the codes climb from 0 by steps of
+  0 or 1 (the one shape where the staircase could have kept the column; the old contest still runs
+  then). In-load serialize URLHash 96 -> 48 s, RefererHash 98 -> 56. Kit load (no warm) 394 -> 378 s
+  on a host at load ~123; all 105 blobs and 51 load files byte-identical. Suite 1753 passed.
+  The column phase now ends on tiny columns (~345 s): the long number columns (HID, UserID, WatchID,
+  the hashes) still start at 87-135 s behind the text columns' memory -- the ordering is next.
