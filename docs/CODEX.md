@@ -2747,3 +2747,10 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   _PF is query-scoped (wdb_qmem.register). tests/test_lengths.py (4). Suite 1753 passed.
 - Probes behind it: dictionary lengths stored ~550 -> ~405 ms Q27 cold (URL 19.6 MB); row lengths
   227-250 ms cold, 122-139 hot, same answer (URL 107.6 MB, 8.6 bits/row); ClickHouse 253 / 171.
+- Board A/B (cb_hash vs cb_len = kit flags + --row-lengths URL,Referer; true cold, best of 2): Q27 573/415 ->
+  325/190 ms cold/hot; others within noise; cold score 1.65 -> 1.57 (Umbra 1.69), hot 2.72 -> 2.66. Size
+  +277 MB (dictionary lengths 67 MB, URL rows 107.6, Referer rows 102.1); load 429 -> 485 s. Verify 41/1/1:
+  Q23 the known checker issue; Q17's timeout is the checker's ORDER BY form sitting at 109-118 s on BOTH dbs
+  (same hash) against a 120 s limit on a host at load ~95 -- not a regression.
+- Referer row lengths bought nothing (Q28 2366 -> 2321, noise: a different read serves it), so Jackson's
+  call: benchmark/clickbench/load.sh passes --row-lengths URL only.
