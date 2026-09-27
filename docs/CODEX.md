@@ -2931,3 +2931,20 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
 - Next in the text prep: the sorted dictionary still becomes 18M Python bytes objects (URL's peak and
   ~15 s of its CPU) only for the front-coder to join them back into one buffer; the merge (13 s) and
   the dictionary sort (15 s) could become per-run sorts in the threads plus a merge of sorted runs.
+
+## 2026-09-27 (afternoon, new pod host) -- THE DICTIONARY STAYS ONE BUFFER
+- New host (cgroup v2, 16 cores, 128 GB): prof.sh now reads cpu.stat / memory.current when the v1
+  counters are absent (/workspace/prof_mon.sh). Note memory.current includes page cache, so the
+  timeline's memory column is higher than the scheduler's live number (usage - inactive_file).
+- Same-host baseline (66b0ca4, cold page cache): 278.8 s, IDENTICAL.
+- _ByteVals: the sorted text dictionary kept in Arrow's layout (one byte buffer + offsets) instead of
+  18.3M Python bytes objects; _front_code takes .buf/.offs directly -- the same arrays its join built,
+  so the same bytes. It reads like a sequence for the small consumers (plain dictionary writer, the
+  inline candidate). WDB_TEXT_BYTEVALS=0 restores the list. tests/test_text_slices.py checks front
+  coding list vs buffer (empty strings, one value, empty dictionary, a sliced array).
+- Standalone, every text blob identical: URL 96 -> 77 s, 16.1 -> 13.5 GB; Referer 93 -> 77 s;
+  OriginalURL 56 -> 45 s; Title 59 -> 53 s; SearchPhrase 26 -> 22 s. In the load: URL 240 -> 211
+  core-s (prep 88 -> 66 s), Referer 226 -> 185 (prep 87 -> 43), OriginalURL 143 -> 129.
+- The kit load did NOT get shorter: 285.4 s against the 278.8 s baseline (host noise ~+-8 s; ~90
+  core-s were removed). The text columns are no longer what sets the load's length. From 45 s on,
+  8-14 jobs are in flight and 12-13 of 16 cores busy: admission is the lever now. Suite 1761 passed.

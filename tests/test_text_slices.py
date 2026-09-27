@@ -61,6 +61,25 @@ def test_slices_equal_whole_column():
         os.remove(p)
 
 
+def test_bytevals_front_code_identical():
+    """_ByteVals (the dictionary as one buffer) must front-code to exactly the bytes the list of Python
+    bytes objects gave, and read back value for value"""
+    vals = sorted(set(['', 'a', 'ab', 'abc', 'ж', 'жёлтый'] + ['http://x.ru/%d/%s' % (i, 'q' * (i % 7)) for i in range(5000)]))
+    cases = [vals, [''], ['x'], [], [v for v in vals if v]]
+    for vs in cases:
+        bl = [v.encode('utf-8') for v in vs]
+        arr = pa.array(bl, pa.large_binary())
+        bv = E._ByteVals(arr.slice(0, len(bl)))
+        assert len(bv) == len(bl) and list(bv) == bl and bv == bl
+        assert E._front_code(bv)[0] == E._front_code(bl)[0]
+        assert np.array_equal(E._front_code(bv)[1], E._front_code(bl)[1])
+        if bl:
+            assert bv[-1] == bl[-1] and bv[0] == bl[0]
+    big = pa.array([v.encode() for v in vals], pa.large_binary()).slice(100, 900)
+    bv = E._ByteVals(big)
+    assert list(bv) == [v.encode() for v in vals[100:1000]]
+
+
 def test_slices_decline():
     p, n = _parquet()
     try:

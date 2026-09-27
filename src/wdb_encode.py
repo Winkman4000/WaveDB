@@ -261,6 +261,51 @@ def _front_code_py(valb):
     return bytes(fc), np.array(restarts, dtype=np.uint32)
 
 
+class _ByteVals:
+    """THE DICTIONARY STAYS ONE BUFFER (2026-09-27): the sorted text dictionary in Arrow's own layout --
+    one byte buffer + offsets -- standing in for the list of Python bytes objects the text prep used
+    to build (URL: 18.3M objects, 4+ GB and ~15 s) only for the front-coder to join them back into
+    one buffer. It reads like a sequence of bytes (len, index, iterate, compare) for the small
+    consumers; _front_code takes .buf and .offs directly -- the very arrays it built before."""
+    def __init__(self, arr):
+        import pyarrow as pa
+        self.arr = arr                                      # keeps Arrow's buffers alive
+        n = len(arr)
+        bufs = arr.buffers()
+        odt = np.int64 if (pa.types.is_large_binary(arr.type) or pa.types.is_large_string(arr.type)) else np.int32
+        o = np.frombuffer(bufs[1], dtype=odt)[arr.offset:arr.offset + n + 1] if n else np.zeros(1, odt)
+        o0 = int(o[0]); o1 = int(o[-1])
+        self.offs = o.astype(np.int64) - o0
+        self.buf = (np.frombuffer(bufs[2], dtype=np.uint8)[o0:o1] if (bufs[2] is not None and o1 > o0)
+                    else np.zeros(0, np.uint8))
+
+    def __len__(self):
+        return len(self.offs) - 1
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            return [self[j] for j in range(*i.indices(len(self)))]
+        if i < 0:
+            i += len(self)
+        if not 0 <= i < len(self):
+            raise IndexError(i)
+        return self.buf[self.offs[i]:self.offs[i + 1]].tobytes()
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+
+    def __eq__(self, other):
+        if isinstance(other, _ByteVals):
+            return np.array_equal(self.offs, other.offs) and np.array_equal(self.buf, other.buf)
+        try:
+            return len(self) == len(other) and all(a == b for a, b in zip(self, other))
+        except TypeError:
+            return NotImplemented
+
+    __hash__ = None
+
+
 def _front_code(valb):
     """THE FRONT-CODER IN NUMBA: the dictionary as one byte buffer + offsets; a compiled loop
     computes each value's common prefix with its predecessor and emits <HH cp suflen>+suffix
@@ -269,7 +314,14 @@ def _front_code(valb):
     try:
         import numba
     except Exception:
-        return _front_code_py(valb)
+        return _front_code_py(list(valb))
+    if isinstance(valb, _ByteVals):
+        # the buffer and offsets ARE what the join below would build: no 18M-object pass, no copy
+        n = len(valb)
+        if n == 0:
+            return b'', np.zeros(0, dtype=np.uint32)
+        out, rst, total = _front_code_jit(valb.buf, valb.offs, n, R)
+        return out[:total].tobytes(), rst
     n = len(valb)
     if n == 0:
         return b'', np.zeros(0, dtype=np.uint32)
@@ -1074,7 +1126,7 @@ def _serialize_inline(p):
     """Mode-5 inline string column: rows stored directly (no dict, no per-row codes). Wins when
     values rarely repeat -- the dictionary pointers become pure overhead. Reconstructs row-order
     bytes from the prepped dict (valb[codes]); payload = zstd(lengths u32) + zstd(concat bytes)."""
-    valb = np.array(p['valb'] + [b''], dtype=object)[:-1]   # object array of distinct byte values
+    valb = np.array(list(p['valb']) + [b''], dtype=object)[:-1]   # object array of distinct byte values
     rows = valb[np.asarray(p['codes'])]                     # row-order bytes (has_null==0 by gate)
     lengths = np.fromiter((len(x) for x in rows), dtype=np.uint32, count=len(rows))
     concat = b''.join(rows.tolist())
@@ -1226,7 +1278,11 @@ def _string_prep_tail(nm, dbox, order, codes, has_null, perm):
     elif pa.types.is_string(sorted_dict.type):
         sorted_dict = sorted_dict.cast(pa.binary())
     dct = None
-    valb = [(v if isinstance(v, bytes) else v.encode('utf-8', 'surrogatepass')) for v in sorted_dict.to_pylist()]
+    # ... and stays ONE buffer (2026-09-27): _ByteVals over the sorted binary array, no Python objects
+    if os.environ.get('WDB_TEXT_BYTEVALS', '1') != '0':
+        valb = _ByteVals(sorted_dict)
+    else:
+        valb = [(v if isinstance(v, bytes) else v.encode('utf-8', 'surrogatepass')) for v in sorted_dict.to_pylist()]
     sorted_dict = None
     try:
         pa.default_memory_pool().release_unused()
