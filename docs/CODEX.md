@@ -2870,3 +2870,23 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   behind that memory. The text prep's peak is the next target. The class starting rates were set from
   the parent-inflated peaks (tiny 50, narrow 75 B/row vs measured p80 31 / 45); the learner corrects
   them after three samples.
+
+## 2026-09-26 (night) -- THE WRITE LANE (Jackson: "make sure we are writing to disk as fast as the hardware will allow")
+- Measured the lanes (dd, 4 GB, with fsync): /workspace is a NETWORK volume (MooseFS over FUSE):
+  667 MB/s write, 814 MB/s read. The container's local overlay: 2.9 GB/s write, but 20 GB total.
+  /dev/shm (RAM): 2.4 GB/s. hits.parquet reads from page cache at 8.2 GB/s.
+- THE WRITE CLOCK: the parent wrote 8.12 GB of blobs in 14.1 s (591 MB/s -- the lane), INLINE in
+  the scheduling loop: no admission, no collection while a blob crossed the wire (longest 1.5 s).
+  The final flush + fsync cost 0.00 s (everything had already crossed).
+- THE WRITER THREAD: blobs go to a queue drained by one thread in arrival order -- the same bytes,
+  the same order. Measured: 13.9-14.5 s of writing off the loop, at most 0.82 GB queued, the close
+  waits 0.00 s. A write error is re-raised at the next blob and at the close.
+- THE ORDER BEFORE ANY COLUMN: the cluster order was ready at 11.0 s -- read 1.2, lexsort 8.5,
+  saved to the network volume 0.9 -- with 15 cores idle. wdb_kernels.counting_order (count, prefix,
+  scatter) gives the identical stable permutation in 1.3 s for one integer/clock key of span
+  <= 16M (otherwise lexsort as before; tests/test_counting_order.py checks it against lexsort for
+  ties, narrow signed keys, clocks, edges and the declines). The order is saved to /dev/shm (0.2 s).
+  Ready at 3.3-3.5 s.
+- Result (two kit loads each, same hour, host load ~55-60): before 294 / 296 s, after 292 / 277 s
+  (one of the two after-runs lost 4 s to a slow shelves read of the just-closed file on the
+  network volume: 7.3 s vs 2.6-3.4 s every other run). All 105 blobs + 51 load files identical.

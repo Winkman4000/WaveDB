@@ -1544,17 +1544,78 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
         # THE CLUSTER ORDER: argsort the clustering column(s) once (stable), share the
         # permutation as an mmap'd file; every worker gathers its column through it
         keys9 = [cluster_by] if isinstance(cluster_by, str) else list(cluster_by)
+        _c0 = time.time()
         arrs9 = [np.asarray(wdb_read.read_one_column(input_path, k, reader=reader)) for k in keys9]
-        perm = np.lexsort(tuple(reversed(arrs9))).astype(np.int64 if N >= (1 << 31) else np.int32)
+        _c1 = time.time()
+        # ONE INTEGER KEY IS ORDERED BY COUNTING (2026-09-26): the same stable permutation lexsort
+        # gives (equal keys keep file order), 0.75 s against 8.4 s for EventTime -- time every other
+        # core spent waiting, since no column can start before the order exists
+        perm = None
+        if len(arrs9) == 1:
+            try:
+                import wdb_kernels as _WKo
+                perm = _WKo.counting_order(arrs9[0], np.int64 if N >= (1 << 31) else np.int32)
+            except Exception:
+                perm = None
+        if perm is None:
+            perm = np.lexsort(tuple(reversed(arrs9))).astype(np.int64 if N >= (1 << 31) else np.int32)
         del arrs9
+        _c2 = time.time()
+        # IN RAM WHEN THERE IS ONE (2026-09-26): the order was saved next to the output, on the network
+        # volume (0.9 s, before any column can start), and every job mapped it from there. /dev/shm
+        # holds it in memory -- the page cache the jobs shared anyway. Removed at the close as before.
         perm_path = out_path + '.perm.tmp.npy'
+        try:
+            _sd9 = '/dev/shm'
+            _need9 = perm.nbytes + (1 << 26)
+            if _os.path.isdir(_sd9) and _os.access(_sd9, _os.W_OK):
+                _st9 = _os.statvfs(_sd9)
+                if _st9.f_bavail * _st9.f_frsize > 2 * _need9:
+                    perm_path = _os.path.join(_sd9, 'wdbperm_%d_%s.npy' % (_os.getpid(), _os.path.basename(out_path)))
+        except Exception:
+            pass
         np.save(perm_path, perm); del perm
         if _os.environ.get('WDB_ENCODE_VERBOSE'):
-            print('  cluster order by %s computed (%d rows) at %.1fs' % (', '.join(keys9), N, time.time() - t0), flush=True)
+            print('  cluster order by %s computed (%d rows) at %.1fs (read %.1f s, sort %.1f s, save %.1f s)' % (
+                ', '.join(keys9), N, time.time() - t0, _c1 - _c0, _c2 - _c1, time.time() - _c2), flush=True)
     _final9 = out_path; out_path = out_path + '.partial'        # THE RENAME LAW: a partial file never wears the final name
     fh = open(out_path, 'wb')
     fh.write(b'WVDB4' + struct.pack('<H', len(cols)) + struct.pack('<I', N))
     pending = list(order); verbose = bool(_os.environ.get('WDB_ENCODE_VERBOSE'))
+    _wr9 = [0.0, 0, 0.0, 0, 0]                     # the write clock: seconds, bytes, longest write, queued bytes, most queued
+    # THE WRITER THREAD (Jackson, 2026-09-26: write as fast as the lane allows). The volume under
+    # /workspace is a network filesystem: 591 MB/s measured, and the parent spent 14.1 s of a load
+    # writing blobs INLINE -- no admission, no collection while a write crossed the wire (longest
+    # 1.5 s). The blobs now go to a queue drained by one thread in arrival order: the same bytes in
+    # the same order; the scheduling loop never waits on the disk. A write error is re-raised by
+    # the loop at its next blob and at the close.
+    import threading as _th9, queue as _qu9
+    _wq9 = _qu9.Queue(); _werr9 = []
+    def _writer9():
+        while True:
+            b9 = _wq9.get()
+            if b9 is None:
+                return
+            if not _werr9:
+                try:
+                    _w0 = time.time()
+                    fh.write(b9)
+                    _wr9[0] += time.time() - _w0; _wr9[1] += len(b9); _wr9[2] = max(_wr9[2], time.time() - _w0)
+                except BaseException as e9:
+                    _werr9.append(e9)
+            _wr9[3] -= len(b9)
+            del b9
+    _wt9 = _th9.Thread(target=_writer9, name='wdb-blob-writer', daemon=True); _wt9.start()
+    def _put9(b9):
+        if _werr9:
+            raise _werr9[0]
+        _wr9[3] += len(b9); _wr9[4] = max(_wr9[4], _wr9[3])
+        _wq9.put(b9)
+    def _drain9():
+        if _wt9.is_alive():
+            _wq9.put(None); _wt9.join()
+        if _werr9:
+            raise _werr9[0]
     live_on = _os.environ.get('WDB_ENCODE_LIVE', '1') != '0' and _cg_mem() is not None
     jobdir = out_path + '.jobs'
     try:
@@ -1644,7 +1705,7 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
                     if len(res) > 3: learn(cname, int(res[3]))
                     if len(res) > 5 and res[5] is not None:
                         _xt9[cname] = res[5]
-                    fh.write(blob); fh.flush(); sizes[cname] = size; _ord9.append(cname)
+                    _put9(blob); sizes[cname] = size; _ord9.append(cname)
                     del blob
                     if verbose:
                         print('  encoded %-24s (%d/%d, %.0fs, %d in flight, class %s @ %.0f B/row)' % (cname, len(sizes), len(cols), time.time() - t0, len(inflight), cls(cname), measured[cls(cname)]), flush=True)
@@ -1658,7 +1719,7 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
             lost = [v for v in inflight.values() if v not in sizes]
             pending = lost + [p for p in pending if p not in sizes]
             if nworkers <= 1:
-                fh.close(); raise
+                _drain9(); fh.close(); raise
             nworkers = max(1, nworkers // 2)
             live_on = False                        # after a kill, only the paper budget admits
             print('  pool killed (memory): retreating to %d workers, re-queueing %d columns (%s)' % (nworkers, len(lost), ', '.join(lost[:5])), flush=True)
@@ -1671,8 +1732,17 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
             for nm in missing:
                 res = _column_job(input_path, nm, reader, (casts or {}).get(nm), perm_path)
                 cname, blob, size = res[0], res[1], res[2]
-                fh.write(blob); fh.flush(); sizes[cname] = size; _ord9.append(cname); del blob
+                _put9(blob); sizes[cname] = size; _ord9.append(cname); del blob
+    _w0 = time.time()
+    _drain9()
+    _w1 = time.time()
     fh.flush(); _os.fsync(fh.fileno()); fh.close()
+    if verbose:
+        # THE WRITE CLOCK (2026-09-26): what the writer thread spent, and what the close waited for
+        print('  writer thread wrote %.2f GB in %.1f s (%.0f MB/s, longest single write %.2f s, at most %.2f GB queued); '
+              'close waited %.2f s for the queue + %.2f s flush/fsync' % (
+            _wr9[1] / 2**30, _wr9[0], _wr9[1] / 2**20 / max(1e-9, _wr9[0]), _wr9[2], _wr9[4] / 2**30,
+            _w1 - _w0, time.time() - _w1), flush=True)
     _os.replace(out_path, _final9); out_path = _final9
     try:
         import shutil as _sh9
