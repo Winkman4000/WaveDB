@@ -2836,3 +2836,37 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   All 105 column blobs and 51 load files byte-identical (bench hash vs cb_prof3). Suite 1753 passed.
 - Still idle: the first ~15 s (reads before any job is busy) and the text columns' ramps; the column
   phase ends at ~324 s on 2,797 s of column work = 175 s if 16 cores were full. Ordering is next.
+
+## 2026-09-26 (evening) -- THE ORDERING, MEASURED; THEN THE MEMORY IT POINTED AT
+- Jackson: "check the column ordering". A list-scheduler simulation on the measured per-column wall,
+  cpu and peak (16 slots, memory held at peak for a job's life) says the ORDER is not the lever: a
+  perfect longest-first order (true durations known in advance) beat the current est-descending order
+  by 3-8 s; ordering by parquet's uncompressed size (the best pre-load predictor, rank corr 0.83 vs
+  est 0.80) was 4-5 s WORSE at the memory we have. What binds is memory: the same simulation reaches
+  the CPU floor (~205 s) only at ~200 GB of peaks held at once. So the work went to per-job memory.
+- THE SIZE CONTEST HELD EVERY LOSER TO THE END. Per-line peaks inside _code_section (tracemalloc):
+  tag 17's one-byte-per-bit array (rows x bits: 1.3 GB on CounterID) plus an 800 MB int64 temporary
+  per bit; the warm buckets' int64 0/1 marks (800 MB); _pack_codes widening the whole column to u64
+  and chunking at 64M bit-cells, not the 8M its comment said; the bitpack-plus run starts kept for an
+  election that only needs rows / runs. Now: tag 17 packs 1M rows at a time; the bucket marks are
+  bytes counted by reduceat(dtype=int64); _pack_codes widens per 8M-cell chunk; each candidate's
+  working arrays are dropped once it is sized; the run election uses rows / runs (exactly the mean).
+- ONE SIGNED VIEW AT THE CODES' WIDTH: the shared int64 copy of the codes is int8 / int16 when the
+  largest code fits (wide codes stay int64 -- tags 18/19/20 need it and would copy a narrow view).
+- THE PREP: _try_seq declined a narrow column after two int64 copies and a bincount -- a span under
+  65536 cannot hold more than 65536 values, so the span alone decides, in the column's own width.
+  _int_dictionary's bincount route makes 4-byte offsets and u32 codes (the prep narrows to u32 anyway);
+  _encode_column no longer copies the inverse into a second int64 array.
+- Standalone, old vs new, 10 columns, every blob byte-identical: CounterID 7.7 -> 3.8 GB private peak,
+  RegionID 8.3 -> 3.9, URLCategoryID 7.2 -> 3.4, Interests 7.4 -> 3.3, IsMobile 3.4 -> 2.0.
+  Same-hour kit loads (host load ~60): committed encoder 317 s, new 299 s.
+- THE JOB'S OWN PEAK: ru_maxrss survives the exec of a spawned worker, so every job reported at least
+  the parent's resident size at launch (late flag columns all read 4.2 GB; alone they peak at 2.4).
+  The learner priced and the live rule reserved them at that. Peaks now come from /proc/self/status
+  VmHWM. Load 299 -> 294 s; from 150 s to the end 13.5-14.7 of 16 cores are busy.
+- Result: 328 s (host ~130) / 317 s same-hour baseline -> 294 s; 105 blobs + 51 load files identical.
+- Open: the first ~100 s run 6-10 cores: the five text columns read and dictionary-encode together
+  (real memory 86 GB at 15-30 s; URL and Title peak ~22 GB each), and the long number columns wait
+  behind that memory. The text prep's peak is the next target. The class starting rates were set from
+  the parent-inflated peaks (tiny 50, narrow 75 B/row vs measured p80 31 / 45); the learner corrects
+  them after three samples.

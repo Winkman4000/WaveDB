@@ -63,11 +63,15 @@ def _int_dictionary(data):
         # column); the encoder's learner read that peak, re-classed every int column, and ran the
         # whole realm 2-3 wide instead of 12 (405s -> 920s). bincount only when the count array is
         # small in absolute terms (8M entries = 64 MB); everything wider takes the hash route.
-        off = (data.astype(np.int64) - lo)
+        # offsets and codes at 4 bytes (2026-09-26): the range is under 8M, so both fit, and the prep
+        # narrows the codes to u32 anyway -- the int64 offsets and int64 codes were 1.6 GB per 100M rows.
+        # (A u32 column's offsets stay int64: its minimum need not fit an int32.)
+        off = data.astype(np.int32 if (data.dtype.itemsize <= 2 or data.dtype == np.int32) else np.int64)
+        off -= lo                                  # in place: 'astype - lo' held two arrays
         cnt = np.bincount(off, minlength=rng)
         present = np.flatnonzero(cnt)
         uniq = (present + lo).astype(data.dtype)
-        lut = np.empty(rng, np.int64); lut[present] = np.arange(present.size, dtype=np.int64)
+        lut = np.empty(rng, np.uint32); lut[present] = np.arange(present.size, dtype=np.uint32)
         return uniq, lut[off]
     if N > 2_000_000:
         # THE NEAR-UNIQUE GATE, by the number the sample CAN tell: a 1M sample of a 10%-distinct
@@ -85,7 +89,8 @@ def _int_dictionary(data):
 
 
 def _encode_column(col):
-    """Return (dtype, has_null, V, uniq_value_bytes_list, codes:int64[N], mode_is_string)."""
+    """Return (dtype, has_null, V, uniq_value_bytes_list, codes[N], mode_is_string). codes: int64, or
+    u32 when the integer dictionary's bincount route made them (the prep narrows to u32 either way)."""
     if isinstance(col, ma.MaskedArray):
         null_mask = ma.getmaskarray(col); data = np.asarray(col.data)
     else:
@@ -104,7 +109,7 @@ def _encode_column(col):
             nn = iv[~null_mask]; uniq, inv = np.unique(nn, return_inverse=True)
             codes[~null_mask] = inv; codes[null_mask] = len(uniq)
         else:
-            uniq, inv = np.unique(iv, return_inverse=True); codes[:] = inv
+            uniq, inv = np.unique(iv, return_inverse=True); codes = np.asarray(inv, dtype=np.int64)   # no null: the inverse IS the codes (a copy was 800 MB)
         valb = [struct.pack('<q', int(v)) for v in uniq]
     elif dtype in (0, 2):
         if has_null:
@@ -112,7 +117,8 @@ def _encode_column(col):
             uniq, inv = _int_dictionary(nn) if dtype == 0 else np.unique(nn, return_inverse=True)
             codes[~null_mask] = inv; codes[null_mask] = len(uniq)
         else:
-            uniq, inv = _int_dictionary(data) if dtype == 0 else np.unique(data, return_inverse=True); codes[:] = inv
+            uniq, inv = _int_dictionary(data) if dtype == 0 else np.unique(data, return_inverse=True)
+            codes = inv if inv.dtype.kind in 'iu' else np.asarray(inv, dtype=np.int64)   # u32 from the bincount route: kept
         if dtype == 0: valb = [str(int(v)).encode() for v in uniq]
         else:          valb = [struct.pack('<d', float(v)) for v in uniq]
     else:
@@ -128,7 +134,7 @@ def _encode_column(col):
             codes[nn_idx] = inv; codes[null_mask] = len(uniq)
         else:
             inv, uniq = pd.factorize(pd.Series(data), sort=True, use_na_sentinel=False)
-            codes[:] = inv
+            codes = np.asarray(inv, dtype=np.int64)
         valb = [to_b(u) for u in uniq]
     V = len(valb) + has_null
     return dtype, has_null, V, valb, codes, aux, uniq
@@ -136,16 +142,20 @@ def _encode_column(col):
 def _pack_codes(codes, bits):
     """bit-pack in CHUNKS: the N x bits intermediate was 16 GB for 100M x 20-bit codes
     (measured: the true peak of a string column's encode, not the strings)"""
-    codes = np.asarray(codes, dtype=np.uint64)
+    # the u64 widening is done per chunk: a whole-column np.asarray(codes, uint64) was 800 MB for a
+    # 100M-row flag column whose codes arrive as u32 (2026-09-26, the flag columns' 4.8 GB peak)
+    codes = np.asarray(codes)
     n = codes.size
     if n == 0: return b''
-    step = max(1, (1 << 23) // max(1, bits) * 8)           # ~8M bit-cells per chunk
+    # ~8M bit-cells per chunk, as the comment always said: '(1 << 23) // bits * 8' was 64M cells -- a
+    # 1-bit column widened 64M rows at a time into three u64 matrices (1.5 GB). Any multiple of 8 rows
+    # packs to whole bytes, so the chunk size never changes the output.
+    step = max(8, (1 << 23) // max(1, bits))
     step -= step % 8                                        # chunk rows x bits must be a multiple of 8 bits
-    if step <= 0: step = 8
     shifts = np.arange(bits - 1, -1, -1, dtype=np.uint64)
     out = bytearray()
     for lo in range(0, n, step):
-        part = codes[lo:lo + step]
+        part = codes[lo:lo + step].astype(np.uint64)
         bitsarr = ((part[:, None] >> shifts) & 1).astype(np.uint8).reshape(-1)
         out += np.packbits(bitsarr).tobytes()
     return bytes(out)
@@ -166,7 +176,12 @@ def _try_seq(nm, col, allow_seq=True):
         data = np.asarray(col)
     k = data.dtype.kind
     if k in 'iu':
-        dtype = 0; aux = 0; iv = data.astype(np.int64, copy=False)
+        # A COLUMN IS JUDGED IN ITS OWN WIDTH (2026-09-26): a 2-byte flag column was widened to int64
+        # (800 MB) and again for a bincount (800 MB) only to be declined as narrow -- the prep's peak.
+        # Up to 4 bytes the values are the same numbers in their own width; the int64 copy is made
+        # only for a column that reaches the codec. (8-byte columns widen as before: a uint64 wraps.)
+        dtype = 0; aux = 0
+        iv = data if data.dtype.itemsize <= 4 else data.astype(np.int64, copy=False)
     elif k == 'M':
         # THE CLOCK LAW: a clock that REPEATS (EventTime: ~70 rows per second) is a key -- a
         # DICTIONARY whose staircase is the sequence, which the window and range doors read
@@ -186,15 +201,16 @@ def _try_seq(nm, col, allow_seq=True):
     if iv.size and _os.environ.get('WDB_SEQ_NARROW_OK') != '1':
         lo = int(iv.min()); hi = int(iv.max())
         if hi - lo < (1 << 16):
-            tv = int(np.count_nonzero(np.bincount((iv - lo).astype(np.int64))))
-            if tv <= 65536:
-                return None                           # narrow: the dict modes win
+            # narrow: the dict modes win. (This counted the distinct values with a bincount and
+            # declined at <= 65536 -- a span under 65536 cannot hold more, so the span decides.)
+            return None
         else:
             # THE CARDINALITY LAW: judge by DISTINCT COUNT, not span -- CounterID (6,506 values
             # spanning millions) became a 100M-value sequence under the span-only guard (2026-09-14)
             samp = iv[:: max(1, iv.size // 4_000_000)]
             if np.unique(samp).size <= 65536 and samp.size >= 65536:
                 return None
+    iv = iv.astype(np.int64, copy=False)              # the codec's width (no copy for int64 / clocks)
     blob = wdb_seqcodec.encode(iv, max_exc_frac=0.2)  # fire only on clear wins (>=80% conform)
     if blob is None:
         return None
@@ -221,7 +237,7 @@ def _prep_column(nm, col, allow_seq=True):
         if FC3_DICT:
             aux |= 0x80                                 # bit7 = as THE THREE STREAMS
     return dict(nm=nm, dtype=dtype, has_null=has_null, V=V, valb=valb,
-                codes=codes.astype(np.uint32 if V < (1 << 32) else np.uint64), aux=aux, uniq=uniq, bits=bits, mode=mode)   # THE NARROW-CODES LAW: codes travel at the narrowest width
+                codes=codes.astype(np.uint32 if V < (1 << 32) else np.uint64, copy=False), aux=aux, uniq=uniq, bits=bits, mode=mode)   # THE NARROW-CODES LAW: codes travel at the narrowest width (no copy when they already do)
 
 def _header(nm, V, bits, dtype, mode, has_null, aux):
     hb = nm.encode()
@@ -467,7 +483,13 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
     above', the steps are the exceptions. EventTime measured: 3.13 MB zstd -> 1.37 MB steps, and
     the steps serve point reads/GROUP BY with NO decode. Smallest candidate wins; incompressible
     arrays stay raw, paying only the tag byte."""
-    arr = np.asarray(codes, dtype=np.int64)          # ONE int64 view of the stream, shared by every candidate (six copies of 800 MB were alive at once)
+    # ONE SIGNED view of the stream, shared by every candidate (six copies of 800 MB were alive at once),
+    # at the narrowest signed width that holds the largest code (2026-09-26): int64 was 800 MB of a
+    # 100M-row flag column whose codes are 0 and 1. Signed, so a neighbour difference is exact. Wide
+    # codes stay int64: tags 18/19/20 need int64 and would copy a narrower view whole.
+    _mx = int(np.max(codes)) if np.size(codes) else 0
+    _sw = np.int8 if _mx < (1 << 7) else (np.int16 if _mx < (1 << 15) else np.int64)
+    arr = np.asarray(codes, dtype=_sw)
     # THE FLAG SKIPS THE CONTEST (Jackson, 2026-09-26): a column the operator declared a hash is
     # stored as tag 20 whatever the size contest picks -- the only exception is a staircase, which
     # can only win when the codes climb from 0 by steps of 0 or 1. When they do not, every other
@@ -526,6 +548,7 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
         litp = _pack_codes(lits, bits) if lits.size else b''
         sparse = (bytes([8, bits]) + struct.pack('<IQQ', dflt, lits.size, codes.size)
                   + pb.tobytes() + ck.tobytes() + litp)
+        pres = lits = pb = per = ck = litp = None      # sized: its working arrays go
     # tag 9 = TIERED dress (rule eleven, Jackson's design): the dominant value
     # is NOTHING (absence bitmap), then within the typed remainder the most
     # common code is ONE BIT, tiering down; the small tail rides u8. Elected
@@ -560,6 +583,7 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
                   + pb9.tobytes() + ck9.tobytes()
                   + bytes([len(tcodes)]) + planes
                   + struct.pack('<Q', rem.size) + rem.astype(np.uint8).tobytes())
+        pres9 = pb9 = per9 = ck9 = rem = planes = bit9 = cnr = None   # sized: its working arrays go
     # tag 10 = SEGMENTED BITPACK-PLUS (Jackson's dress): 4096-row blocks,
     # each electing bitpack or run-tokens by the profit formula -- runs
     # compress only where run_len*bits beats the token, so the whole
@@ -604,6 +628,11 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
                     payloadA += np.packbits(accA[:nbyA * 8]).tobytes()
             bplus = (bytes([10, bits]) + struct.pack('<QI', codes.size, nblkA)
                      + dirA.tobytes() + bytes(payloadA))
+            payloadA = dirA = None
+        # sized: its working arrays go. The election below needs only the MEAN run length, which
+        # is rows / runs exactly (the run lengths sum to the rows), so the run starts go too.
+        nrunsA = stA.size
+        stA = bndA = blk_firstA = blk_lastA = nruns_bA = rows_bA = run_modeA = None
     cands8 = [s for s in (stair, zsec, packed, sparse) if s is not None]
     best = min(cands8, key=len)
     if sparse is not None and os.environ.get('WDB_E8_FORCE'):
@@ -642,8 +671,7 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
         # precedent. Columns without locality never built a bplus with
         # run-blocks cheaper than bitpack, so this only fires where the
         # formula found profit.
-        _lensA = np.diff(np.concatenate([stA, [arrA.size]]))
-        if float(_lensA.mean()) >= 5.0:          # mean run >= 5: locality is real
+        if arrA.size / nrunsA >= 5.0:            # mean run >= 5: locality is real
             best = bplus
     elif tiered is not None and os.environ.get('WDB_TIER_FORCE'):
         best = tiered                            # rehearsal-only: rule eleven's readers
@@ -711,6 +739,7 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
                     and (blocked is None or len(cand9) <= 1.10 * len(blocked)):
                 blocked = cand9                  # Jackson's rule: fine frames
                 break                            # up to +10%; else the coarse
+        a = frames = None                        # the narrow copy and the frame list go
         if blocked is not None:
             best = blocked
     # tag 18 = PACKED FRAMES (Jackson's question: "bitpack, then zstd the 1s and 0s").
@@ -810,7 +839,8 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
             pk = (nibp[0::2] | (nibp[1::2] << 4)).astype(np.uint8)
             BR5 = 32768
             nb5 = (Nr + BR5 - 1) // BR5
-            eb = np.add.reduceat(em.astype(np.int64), np.arange(0, Nr, BR5)) if Nr else np.zeros(0, dtype=np.int64)
+            # counted in int64 by the ufunc itself: em.astype(int64) was an 800 MB copy of a bool mask
+            eb = np.add.reduceat(em, np.arange(0, Nr, BR5), dtype=np.int64) if Nr else np.zeros(0, dtype=np.int64)
             eo = np.concatenate([[0], np.cumsum(eb)]).astype(np.uint32)
             e5 = (bytes([5, 2]) + struct.pack('<IIQH', BR5, nb5, int(patches.size), 15)
                   + hot.tobytes() + eo.tobytes() + patches.tobytes() + pk.tobytes())
@@ -831,11 +861,13 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
                 BR5b = 32768
                 nb6 = (Nr + BR5b - 1) // BR5b
                 if Nr:
-                    e1b = np.add.reduceat(em1.astype(np.int64), np.arange(0, Nr, BR5b))
-                    full_e2 = np.zeros(Nr, dtype=np.int64)
+                    # the 0/1 marks are bytes, the per-block counts int64 (the ufunc counts in the
+                    # asked dtype): the int64 marks were 800 MB for 100M rows
+                    e1b = np.add.reduceat(em1, np.arange(0, Nr, BR5b), dtype=np.int64)
+                    full_e2 = np.zeros(Nr, dtype=np.uint8)
                     idx1 = np.flatnonzero(em1)
                     full_e2[idx1[em2pos]] = 1
-                    e2b = np.add.reduceat(full_e2, np.arange(0, Nr, BR5b))
+                    e2b = np.add.reduceat(full_e2, np.arange(0, Nr, BR5b), dtype=np.int64)
                 else:
                     e1b = np.zeros(0, dtype=np.int64); e2b = np.zeros(0, dtype=np.int64)
                 e1o = np.concatenate([[0], np.cumsum(e1b)]).astype(np.uint32)
@@ -849,6 +881,10 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
                     best = e6                    # adopts on STRICT dominance only --
                                                  # its 1.25x access bar died with the
                                                  # heir whose tolls it never repaid
+                full_e2 = idx1 = em1 = em2pos = wb = patches6 = lutw = e1b = e2b = e6 = None
+            # the buckets' working arrays die with their election (full_e2 alone was 800 MB held
+            # to the end of the contest)
+            nib = em = patches = nibp = pk = lut = cn5 = eb = e5 = None
     # tag 17 = RAW PACKED CODES (Jackson's deal law). Nomination: the zstd
     # frame stream won so far, V >= 3 (binaries are their own terminal dress),
     # and the column is big enough that the toll is real (small fixtures stay
@@ -858,12 +894,20 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
     # more than it slows it.
     if best and best[0] == 3 and bits >= 2 and bits <= 16 and codes.size >= (1 << 22):
         arr17 = arr
-        tb17 = np.zeros(arr17.size * bits, dtype=np.uint8)
-        for k17 in range(bits):
-            tb17[k17::bits] = (arr17 >> k17) & 1
-        pk17 = np.packbits(tb17, bitorder='little')
+        # IN CHUNKS OF 1M ROWS (2026-09-26): the one-byte-per-bit array was rows x bits bytes (1.3 GB
+        # for CounterID) plus an 800 MB int64 temporary per bit -- the job's peak. A chunk of a
+        # multiple of 8 rows packs to whole bytes, so the joined chunks are the same bytes.
+        pk17p = []
+        for lo17 in range(0, arr17.size, 1 << 20):
+            ch17 = arr17[lo17:lo17 + (1 << 20)]
+            tb17 = np.zeros(ch17.size * bits, dtype=np.uint8)
+            for k17 in range(bits):
+                tb17[k17::bits] = (ch17 >> k17) & 1
+            pk17p.append(np.packbits(tb17, bitorder='little').tobytes())
+        del tb17, ch17
         cand17 = (bytes([17, bits]) + struct.pack('<I', arr17.size)
-                  + pk17.tobytes() + b'\x00\x00')
+                  + b''.join(pk17p) + b'\x00\x00')
+        del pk17p
         S17 = (len(cand17) - len(best)) / max(1, len(best) + len(cand17))   # zstd SHRINK vs packed
         T17 = 0.17
         # T is the ENGINE's measured slowdown ratio for zstd on real ops
@@ -1171,6 +1215,18 @@ def _crash_point(name):
         os.kill(os.getpid(), signal.SIGKILL)
 
 
+def _own_hwm():
+    """this process's own resident high-water mark in bytes (/proc/self/status VmHWM), or 0"""
+    try:
+        with open('/proc/self/status') as f:
+            for ln in f:
+                if ln.startswith('VmHWM:'):
+                    return int(ln.split()[1]) * 1024
+    except Exception:
+        pass
+    return 0
+
+
 def _column_job(input_path, nm, reader, cast=None, perm_path=None, N=None):
     """one column, start to blob, in a worker process (reads its own column: no table in RAM).
     perm_path: THE CLUSTER ORDER -- a row permutation every column gathers through, so the
@@ -1214,7 +1270,7 @@ def _column_job(input_path, nm, reader, cast=None, perm_path=None, N=None):
                 prep = _arrow_string_prep(nm, box, perm=perm)
                 _mark('prep')
                 import resource as _rs0
-                _tm['peak_after_prep_gb'] = _rs0.getrusage(_rs0.RUSAGE_SELF).ru_maxrss / 2**20   # where the peak falls
+                _tm['peak_after_prep_gb'] = (_own_hwm() or _rs0.getrusage(_rs0.RUSAGE_SELF).ru_maxrss * 1024) / 2**30   # where the peak falls
                 # measured on URL: the job's whole-life peak (22.0 GB) is reached by the end of the
                 # prep; the serialize that follows works on the dictionary and the codes only
                 _note('prepped')
@@ -1248,7 +1304,11 @@ def _column_job(input_path, nm, reader, cast=None, perm_path=None, N=None):
         _mark('extras')
     import resource as _rs
     _ru = _rs.getrusage(_rs.RUSAGE_SELF)
-    peak = _ru.ru_maxrss * 1024      # this worker's peak so far: THE MEASURED TRUTH
+    # THE JOB'S OWN PEAK (2026-09-26): ru_maxrss survives the exec that starts a spawned worker, so
+    # every job reported at least the PARENT's resident size at launch -- the late flag columns all
+    # read 4.2 GB against a measured 2.0-2.5 alone, and the budget priced and reserved them at that.
+    # VmHWM is this process's own high-water mark; ru_maxrss stays the fallback.
+    peak = _own_hwm() or _ru.ru_maxrss * 1024
     _tm['cpu'] = _ru.ru_utime + _ru.ru_stime          # core-seconds this column burned (all its threads)
     return nm, bytes(blob), size, peak, _tm, extras
 
