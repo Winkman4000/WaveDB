@@ -1160,14 +1160,40 @@ def _arrow_string_prep(nm, chunked, perm=None):
             # to the pandas/Python-object path -- 170s and 57 GB per column (the string tail, 2026-09-14).
             # (Per-chunk dictionary_encode + unify_dictionaries was measured: 5+ minutes on one core.)
             chunked = pc.cast(chunked, pa.large_string())
-        chunked = pa.concat_arrays(chunked.chunks) if chunked.num_chunks > 1 else chunked.chunk(0)
-    de = pc.dictionary_encode(chunked)                      # indices (int32) + dictionary (unique, first-seen order)
-    dct = de.dictionary; idx = de.indices
+    # THE TEXT FLOWS THROUGH IN ITS ROW GROUPS (Jackson, 2026-09-27: hold less in RAM at once). The row
+    # groups were glued into one array first -- a second full copy of the text beside the first (URL:
+    # 8.8 GB) only to be hashed once. Arrow's dictionary_encode on the chunked column keeps ONE memo
+    # across the chunks: every chunk carries the same final dictionary, in the same first-seen order
+    # the glued array gave (measured on SearchPhrase and URL: identical indices and dictionary). If a
+    # build ever hands back per-chunk dictionaries, the glued road runs as before.
+    idx = dct = None
+    if isinstance(chunked, pa.ChunkedArray) and chunked.num_chunks > 1:
+        de = pc.dictionary_encode(chunked)
+        dct = de.chunk(de.num_chunks - 1).dictionary
+        _db9 = dct.buffers()
+        _one9 = all(len(c.dictionary) == len(dct) and c.dictionary.buffers()[-1] is not None
+                    and _db9[-1] is not None and c.dictionary.buffers()[-1].address == _db9[-1].address
+                    for c in de.chunks)
+        if _one9:
+            idx = pa.concat_arrays([c.indices for c in de.chunks])
+        else:
+            dct = None
+        de = None                                           # the per-chunk indices go; dct holds the dictionary
+    if idx is None:
+        if isinstance(chunked, pa.ChunkedArray):
+            chunked = pa.concat_arrays(chunked.chunks) if chunked.num_chunks > 1 else (
+                chunked.chunk(0) if chunked.num_chunks else pa.array([], type=chunked.type))
+        de = pc.dictionary_encode(chunked)                  # indices (int32) + dictionary (unique, first-seen order)
+        dct = de.dictionary; idx = de.indices
     null_mask = None; has_null = 0
     if chunked.null_count:
         null_mask = np.asarray(pc.is_null(chunked).to_numpy(zero_copy_only=False), dtype=bool); has_null = 1
     nrows = len(chunked)
     del chunked                                             # the row text is dead: only the dictionary lives on
+    try:
+        pa.default_memory_pool().release_unused()           # hand the text's pages back (the pool had kept them)
+    except Exception:
+        pass
     order = pc.sort_indices(dct).to_numpy()                 # dictionary in sorted order
     rank = np.empty(len(order), np.int64); rank[order] = np.arange(len(order))
     codes = np.zeros(nrows, np.uint32 if len(order) < (1 << 31) else np.int64)
@@ -1180,8 +1206,21 @@ def _arrow_string_prep(nm, chunked, perm=None):
     if perm is not None:
         codes = codes[np.asarray(perm)]                     # the cluster order, on 4-byte codes
     sorted_dict = pc.take(dct, pa.array(order))
+    # THE DICTIONARY COMES OUT AS BYTES (2026-09-27): read as text it became 18M Python str objects
+    # (URL: +6 GB, 11 s) and then 18M bytes objects beside them (+4 GB, 4 s) -- the job's peak. Viewed
+    # as binary (the same buffers, no copy) it comes out as the bytes directly: the very bytes the
+    # utf-8 encode gave back for valid text, and the raw bytes for any that is not.
+    if pa.types.is_large_string(sorted_dict.type):
+        sorted_dict = sorted_dict.cast(pa.large_binary())
+    elif pa.types.is_string(sorted_dict.type):
+        sorted_dict = sorted_dict.cast(pa.binary())
+    de = dct = idx = raw = None
     valb = [(v if isinstance(v, bytes) else v.encode('utf-8', 'surrogatepass')) for v in sorted_dict.to_pylist()]
-    del de, dct, idx, raw, sorted_dict
+    sorted_dict = None
+    try:
+        pa.default_memory_pool().release_unused()
+    except Exception:
+        pass
     V = len(valb) + has_null
     bits = max(1, int(np.ceil(np.log2(max(V, 2)))))
     mode = 1 if (V - has_null) > FC_THRESHOLD else 0
@@ -1259,6 +1298,10 @@ def _column_job(input_path, nm, reader, cast=None, perm_path=None, N=None):
             if (pa.types.is_string(ft) or pa.types.is_large_string(ft)
                     or pa.types.is_binary(ft) or pa.types.is_large_binary(ft)):
                 col = pq.read_table(input_path, columns=[nm]).column(0)
+                try:
+                    pa.default_memory_pool().release_unused()   # the read's freed page buffers: 2.9 GB kept on URL
+                except Exception:
+                    pass
                 _mark('read')
                 if pa.types.is_string(col.type):
                     col = pc.cast(col, pa.large_string())    # 100M values overflow 'string' offsets in the concat

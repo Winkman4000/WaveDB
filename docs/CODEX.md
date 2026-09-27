@@ -2890,3 +2890,25 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
 - Result (two kit loads each, same hour, host load ~55-60): before 294 / 296 s, after 292 / 277 s
   (one of the two after-runs lost 4 s to a slow shelves read of the just-closed file on the
   network volume: 7.3 s vs 2.6-3.4 s every other run). All 105 blobs + 51 load files identical.
+
+## 2026-09-27 -- THE TEXT COLUMNS IN RAM (Jackson: "handle them in ram ... then write the finished product")
+- Measured first: the text jobs already work that way -- one read (URL 4.5-6 s of ~100 s), every step
+  in RAM, only the finished blob written. The CPU is not waiting on the source; RAM is the constraint
+  (URL 20-22 GB, Title 22.5), and it is what holds the long number columns back in the first ~100 s.
+- URL's RAM by step (private): read 12.7 GB for 8.8 GB of text (mimalloc kept 2.9 GB of freed page
+  buffers); the row groups glued into one array (a second copy of the text); dictionary_encode 19 GB
+  (text + 3.1 GB of unique text + the hash); after the text is freed, 18.3M Python str objects (+6 GB,
+  11 s) then 18.3M bytes objects beside them (+4 GB, 4 s): 18 GB.
+- NOW: dictionary_encode runs on the chunked column (Arrow keeps one memo across the chunks; every
+  chunk carries the same final dictionary -- checked by buffer address, else the glued road runs);
+  the Arrow pool is told to release_unused after the read and once the text is dropped; the sorted
+  dictionary is viewed as binary (no copy) so it comes out as bytes directly.
+- Standalone, every text blob byte-identical: Title 22.5 -> 14.2 GB (72 -> 64 s), URL 20.3 -> 19.3
+  (100 -> 92 s), Referer 16.4 -> 15.3 (104 -> 93 s), OriginalURL 15.1 -> 13.9, SearchPhrase 6.1 -> 4.7,
+  BrowserCountry 6.7 -> 2.3. Kit load 274.5 s (idle core-seconds 1,087); 105 blobs + 51 files identical.
+- URL's peak is now the dictionary_encode itself (the whole column's text + the dictionary + the hash).
+  Prototype (not in the encoder yet): the column in 16 slices of row groups, 4 threads each reading
+  and dictionary-encoding a slice (independent local dictionaries), then one merge of the local
+  dictionaries and one sort: identical codes; URL 35.5 s / 13.4 GB peak against the whole-column
+  path's 37.6 s / 24.1 GB in the same script; Title 20.5 s / 7.2 GB against 22.5 s / 17.4 GB. The
+  merge (13 s on URL) and the dictionary sort (15 s) are what remain.
