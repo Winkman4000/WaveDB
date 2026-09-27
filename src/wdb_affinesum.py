@@ -66,6 +66,18 @@ def execute(seg, spec):
     memo = seg.__dict__.setdefault('_censusmemo', {})   # V-sized, planes-memo law
     census = memo.get(col)
     if census is None:
+        # THE LOAD'S CENSUS FIRST (2026-09-27): the rows per code were counted at load time
+        # (stats.npz '<col>.vcnt', the census of the load, 2026-09-24). Q29 measured: the full
+        # decode (53 ms) + bincount (166 ms) re-counted them on every run; the load's copy
+        # reads in ~1 ms and equals the bincount entry for entry (checked on the kit).
+        try:
+            import wdb_blockstats
+            vc = wdb_blockstats.vcnt_from_load(seg, col)
+            if vc is not None and vc.size == V and int(vc.sum()) == int(seg.N):
+                census = np.asarray(vc, np.int64)
+        except Exception:
+            census = None
+    if census is None:
         import wdb_gbshelf
         sh = wdb_gbshelf.open_shelf(seg, col)            # ride it if it exists;
         if sh is not None:                               # never birth here -- the
@@ -83,6 +95,17 @@ def execute(seg, spec):
                                               np.arange(V, dtype=np.int64)),
                             np.float64)
         except Exception:
+            dv = None
+        if dv is None and int(seg.cols[col].get('mode', -1)) == 0:
+            # a mode-0 integer dictionary holds its values as decimal text (the integer spine is
+            # mode 2's): read the whole small dictionary once instead of V single fetches
+            try:
+                vals = seg.dict_vals(col)
+                if len(vals) == V:
+                    dv = np.asarray([float(int(x)) for x in vals], np.float64)
+            except Exception:
+                dv = None
+        if dv is None:
             dv = np.asarray([float(seg.fetch(col, v9)) for v9 in range(V)],
                             np.float64)
         memo[(col, 'dv')] = dv

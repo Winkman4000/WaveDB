@@ -2948,3 +2948,20 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
 - The kit load did NOT get shorter: 285.4 s against the 278.8 s baseline (host noise ~+-8 s; ~90
   core-s were removed). The text columns are no longer what sets the load's length. From 45 s on,
   8-14 jobs are in flight and 12-13 of 16 cores busy: admission is the lever now. Suite 1761 passed.
+
+## 2026-09-27 -- THE BOARD ON THE NEW HOST; Q29 (THE NINETY SUMS) FROM THE LOAD'S CENSUS
+- WaveDB true-cold board on cb_url2 (same bytes as today's kit), this host, one run like the referees
+  (referees from session_2026-09-23): cold WaveDB 1.43 (Umbra 1.97, ClickHouse 2.56, DuckDB 3.92),
+  22 wins; hot Umbra 1.54, WaveDB 2.07 (ClickHouse 4.18, DuckDB 4.48), 13 wins. /workspace/board_rank.py
+  lists losers by their share of the score and fence riders (0.77x-1.3x of the best referee).
+- Q29 was the top loser both ways: 342 ms cold / 244 hot against Umbra 48 / 5. affinesum already did
+  the algebra (SUM(x + k) = S + k*N); the line items were the census: full decode of ResolutionWidth
+  (53 ms) + bincount (166 ms), every run, because no gb-shelf existed for the column -- and the
+  dictionary values by 2,159 single fetches (the integer spine read raises on a mode-0 column).
+- NOW: the census comes from the load's own count (stats.npz ResolutionWidth.vcnt -- equal to the
+  bincount entry for entry, checked; used only when size = V and total = N); a mode-0 integer
+  dictionary is read whole once (dict_vals, 2,159 values). All 90 answers identical to the old route.
+- Q29 true cold: 46 ms cold (Umbra 48: a win), 13-14 ms hot (the board's two runs after the cold one;
+  6.7 ms in steady state -- parse-tree copy 1.1, 90 output names 0.8, shape checks ~0.7 each, the
+  rest routing). Board with Q29 swapped in: cold 1.43 -> 1.37 (23 wins), hot 2.07 -> 1.96.
+- Verify 42/43 (Q23 the known checker issue; Q17 finished inside the limit this time). Suite 1761.
