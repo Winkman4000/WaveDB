@@ -1203,6 +1203,17 @@ def _arrow_string_prep(nm, chunked, perm=None):
         codes[nn] = rank[np.asarray(raw[nn], dtype=np.int64)]; codes[null_mask] = len(order)
     else:
         codes[:] = rank[np.asarray(raw, dtype=np.int64)]
+    de = idx = raw = rank = None
+    dbox = [dct]; dct = None
+    return _string_prep_tail(nm, dbox, order, codes, has_null, perm)
+
+
+def _string_prep_tail(nm, dbox, order, codes, has_null, perm):
+    """the common end of both text preps: the codes into the cluster order, the dictionary in sorted
+    order as bytes, the mode. dbox: a one-element list holding the (unsorted) arrow dictionary -- the
+    caller hands over ownership so it is freed here once the sorted copy exists."""
+    import pyarrow as pa, pyarrow.compute as pc
+    dct = dbox.pop()
     if perm is not None:
         codes = codes[np.asarray(perm)]                     # the cluster order, on 4-byte codes
     sorted_dict = pc.take(dct, pa.array(order))
@@ -1214,7 +1225,7 @@ def _arrow_string_prep(nm, chunked, perm=None):
         sorted_dict = sorted_dict.cast(pa.large_binary())
     elif pa.types.is_string(sorted_dict.type):
         sorted_dict = sorted_dict.cast(pa.binary())
-    de = dct = idx = raw = None
+    dct = None
     valb = [(v if isinstance(v, bytes) else v.encode('utf-8', 'surrogatepass')) for v in sorted_dict.to_pylist()]
     sorted_dict = None
     try:
@@ -1233,6 +1244,116 @@ def _arrow_string_prep(nm, chunked, perm=None):
         if FC3_DICT:
             aux |= 0x80  # as THE THREE STREAMS
     return dict(nm=nm, dtype=1, has_null=has_null, V=V, valb=valb, codes=codes, aux=aux, uniq=uniq, bits=bits, mode=mode)
+
+
+TEXT_SLICES = int(os.environ.get('WDB_TEXT_SLICES', '16'))      # 0 = the whole-column road
+TEXT_SLICE_THREADS = int(os.environ.get('WDB_TEXT_SLICE_THREADS', '4'))
+
+
+def _arrow_string_prep_sliced(nm, input_path, perm=None, slices=None, threads=None):
+    """THE TEXT FLOWS THROUGH RAM IN SLICES (Jackson, 2026-09-27: work in RAM, never wait on the source,
+    write the finished product). The column is never whole in memory: its row groups are cut into
+    `slices` runs; `threads` threads each read one run and dictionary-encode it (a local dictionary +
+    local indices), and the run's text is freed as soon as it is encoded -- reading one run overlaps
+    hashing another. The local dictionaries are then merged by one more dictionary_encode, the merged
+    dictionary is sorted, and every row's code is its value's rank in that sorted dictionary. The
+    codes and the sorted dictionary depend only on WHICH values exist and WHICH row holds which, so
+    they are the whole-column road's exactly (checked: URL, Title). Prototype on URL: 35.5 s / 13.4 GB
+    against 37.6 s / 24.1 GB. Returns None (the caller takes the whole-column road) for a non-text
+    column, fewer than 2 row groups, an all-null column, or dictionaries that are not one per chunk."""
+    import pyarrow as pa, pyarrow.parquet as pq, pyarrow.compute as pc
+    from concurrent.futures import ThreadPoolExecutor
+    pf = pq.ParquetFile(input_path)
+    G = pf.num_row_groups
+    t = pf.schema_arrow.field(nm).type
+    if pa.types.is_string(t) or pa.types.is_large_string(t):
+        big = pa.large_string()
+    elif pa.types.is_binary(t) or pa.types.is_large_binary(t):
+        big = pa.large_binary()
+    else:
+        return None
+    K = min(G, int(slices or TEXT_SLICES)); W = max(1, int(threads or TEXT_SLICE_THREADS))
+    if K < 2:
+        return None
+    bounds = np.linspace(0, G, K + 1).astype(int)
+
+    def _one_dict(de):
+        """the one dictionary every chunk of an encoded chunked array carries, or None"""
+        if de.num_chunks == 0:
+            return None
+        d = de.chunk(de.num_chunks - 1).dictionary
+        if len(d) == 0:
+            return d
+        a = d.buffers()[-1]
+        for c in de.chunks:
+            b = c.dictionary.buffers()[-1]
+            if len(c.dictionary) != len(d) or a is None or b is None or b.address != a.address:
+                return None
+        return d
+
+    def one(s):
+        tb = pq.ParquetFile(input_path).read_row_groups(list(range(bounds[s], bounds[s + 1])), columns=[nm], use_threads=False)
+        col = tb.column(0); tb = None
+        if col.type != big:
+            col = pc.cast(col, big)
+        n = len(col)
+        de = pc.dictionary_encode(col); col = None
+        d = _one_dict(de)
+        if d is None:
+            raise ValueError('per-chunk dictionaries')
+        idx = pa.concat_arrays([c.indices for c in de.chunks]) if de.num_chunks else pa.array([], pa.int32())
+        de = None
+        nul = None
+        if idx.null_count:
+            nul = np.asarray(idx.is_null().to_numpy(zero_copy_only=False), dtype=bool)
+            idx = pc.fill_null(idx, 0)
+        li = np.asarray(idx.to_numpy(zero_copy_only=False), dtype=np.int32)
+        assert li.size == n
+        return d, li, nul
+
+    try:
+        with ThreadPoolExecutor(max_workers=W) as ex:
+            parts = list(ex.map(one, range(K)))
+    except Exception:
+        return None
+    try:
+        pa.default_memory_pool().release_unused()           # every run's text is gone
+    except Exception:
+        pass
+    ldicts = [p[0] for p in parts]; lidx = [p[1] for p in parts]; lnul = [p[2] for p in parts]
+    parts = None
+    if sum(len(d) for d in ldicts) == 0:
+        return None
+    has_null = 1 if any(x is not None and x.any() for x in lnul) else 0
+    g = pc.dictionary_encode(pa.chunked_array(ldicts, type=big))    # the merge: one dictionary for all runs
+    gd = _one_dict(g)
+    if gd is None:
+        return None
+    # the merged indices split by each run's dictionary LENGTH, not by the output's chunks: an empty run
+    # (a row group of only nulls) leaves no chunk of its own, and the maps would slide one run over
+    allm = np.concatenate([np.asarray(c.indices.to_numpy(zero_copy_only=False), dtype=np.int64) for c in g.chunks]) \
+        if g.num_chunks else np.zeros(0, np.int64)
+    lens = [len(d) for d in ldicts]
+    assert allm.size == sum(lens), ('merge', nm, allm.size, sum(lens))
+    cuts = np.concatenate(([0], np.cumsum(lens)))
+    maps = [allm[cuts[i]:cuts[i + 1]] for i in range(len(lens))]
+    g = None; ldicts = None; allm = None
+    order = pc.sort_indices(gd).to_numpy()                 # the merged dictionary in sorted order
+    V0 = len(order)
+    rank = np.empty(V0, np.int64); rank[order] = np.arange(V0)
+    nrows = sum(li.size for li in lidx)
+    codes = np.zeros(nrows, np.uint32 if V0 < (1 << 31) else np.int64)
+    o = 0
+    for m, li, nul in zip(maps, lidx, lnul):
+        n = li.size
+        if m.size:
+            codes[o:o + n] = rank[m[li]]
+        if nul is not None:
+            codes[o:o + n][nul] = V0                        # the null bin, as the whole-column road
+        o += n
+    maps = lidx = lnul = rank = None
+    dbox = [gd]; gd = None
+    return _string_prep_tail(nm, dbox, order, codes, has_null, perm)
 
 
 _CASTS = {
@@ -1296,6 +1417,17 @@ def _column_job(input_path, nm, reader, cast=None, perm_path=None, N=None):
             # ONE READ PER COLUMN (2026-09-26): the arrow road serves text only; a number column was
             # read and gathered here, declined by the prep, then read and gathered AGAIN below
             if (pa.types.is_string(ft) or pa.types.is_large_string(ft)
+                    or pa.types.is_binary(ft) or pa.types.is_large_binary(ft)) and TEXT_SLICES >= 2:
+                try:
+                    prep = _arrow_string_prep_sliced(nm, input_path, perm=perm)   # read + prep: the column in slices
+                except Exception as _e7:
+                    print('  sliced text prep declined %s (%s: %s) -- the whole-column road' % (nm, type(_e7).__name__, str(_e7)[:80]), flush=True)
+                    prep = None
+                if prep is not None:
+                    _mark('prep')
+                    _tm['peak_after_prep_gb'] = _own_hwm() / 2**30
+                    _note('prepped')
+            if prep is None and (pa.types.is_string(ft) or pa.types.is_large_string(ft)
                     or pa.types.is_binary(ft) or pa.types.is_large_binary(ft)):
                 col = pq.read_table(input_path, columns=[nm]).column(0)
                 try:
@@ -1538,14 +1670,19 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
     # starting rates raised to the peaks measured 2026-09-26 (a flag column 3.9-4.6 GB at 100M rows,
     # a narrow one 4.5-9, mid 6-13, wide 10-15): the live rule below reserves by these, so they must
     # not start under the truth
-    measured = {'string': 310, 'wide': 130, 'mid': 100, 'narrow': 75, 'tiny': 50}   # strings: the MEASURED peak on the arrow path (Title 29 GB at 100M rows; it was 57 GB on the object path)     # bytes per row: conservative starts (URL/Referer/Title peak ~25 GB at 100M rows), raised as workers report
+    # 2026-09-27: tiny and narrow restarted at their TRUE p80 peaks (3.1 / 4.5 GB, VmHWM) -- the 50 / 75
+    # were set from ru_maxrss, which carried the parent's size into every spawned job
+    measured = {'string': 310, 'wide': 130, 'mid': 100, 'narrow': 55, 'tiny': 36}   # strings: the MEASURED peak on the arrow path (Title 29 GB at 100M rows; it was 57 GB on the object path)     # bytes per row: conservative starts (URL/Referer/Title peak ~25 GB at 100M rows), raised as workers report
     # A TEXT COLUMN IS PRICED BY ITS TEXT (2026-09-26): one class rate for every string charged
     # SearchPhrase (8 GB measured) like URL (38 GB), so SearchPhrase and OriginalURL could not fit
     # while small columns ran, waited to the end and ran alone for 84 s. The charge is a floor (a
     # worker's own weight, 4.6 GB measured on a flag column) plus a learned multiple of the text.
     # measured with the codes gathered, against parquet's uncompressed text: URL 21.5 GB on 7.9 (2.08x
     # over the floor), Title 22.5 on 7.6 (2.30x), SearchPhrase 6.6 on 0.77 (2.1x)
-    sbase = 5 << 30; sratio = [2.3]
+    # REPRICED 2026-09-27 for the text in slices: measured peaks URL 16.1 GB on 7.9 of text, OriginalURL
+    # 10.9 on 5.0, Referer 10.9 on 6.1, Title 6.6 on 7.6, SearchPhrase 3.9 on 0.77, a small text column
+    # 1.8-1.9 -- (peak - 2.5 GB) / text is at most ~1.8. The rate still only learns upward.
+    sbase = int(2.5 * (1 << 30)); sratio = [1.9]
     def working_set(nm):
         tb = _TEXT_BYTES.get(nm)
         if cls(nm) == 'string' and tb:

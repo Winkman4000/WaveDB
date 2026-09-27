@@ -2912,3 +2912,22 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   dictionaries and one sort: identical codes; URL 35.5 s / 13.4 GB peak against the whole-column
   path's 37.6 s / 24.1 GB in the same script; Title 20.5 s / 7.2 GB against 22.5 s / 17.4 GB. The
   merge (13 s on URL) and the dictionary sort (15 s) are what remain.
+- THE TEXT IN SLICES (built): _arrow_string_prep_sliced -- the text column's row groups cut into 16
+  runs, 4 threads each reading one run and dictionary-encoding it (its text freed at once), then
+  one merge of the local dictionaries (split back by each run's dictionary LENGTH: an all-null run
+  leaves no chunk of its own in the merge's output, and splitting by chunks slid every later run one
+  map over -- caught by tests/test_text_slices.py before it reached a load), one sort, codes as
+  ranks. The whole-column road stays as the fallback (non-text, one row group, all-null, per-chunk
+  dictionaries, or any exception). _string_prep_tail is the shared end of both roads.
+- Standalone, every blob byte-identical: Title 14.2 -> 6.6 GB (it was 22.5 this morning), URL 19.3 ->
+  16.1, Referer 15.3 -> 10.9, OriginalURL 13.9 -> 10.9, SearchPhrase 4.7 -> 3.9, BrowserCountry 1.8.
+- TEXT REPRICED: floor 5 -> 2.5 GB, rate 2.3 -> 1.9 x the parquet text ((peak - 2.5) / text is at most
+  ~1.8 now); tiny / narrow starting rates 50 / 75 -> 36 / 55 B/row (their true p80 peaks; the old
+  values came from the parent-inflated ru_maxrss).
+- Kit load 274.5 -> 261.8 s; WatchID and HID start at 3 s (they waited to 61-152 s); 0-120 s run 9-15
+  of 16 cores (were 6-7); idle core-seconds 1,087 -> 828. In the load the text jobs run longer (URL
+  prep 74 s, serialize 80) because more columns now share the cores with them. 105 blobs + 51 load
+  files identical; suite 1760 passed.
+- Next in the text prep: the sorted dictionary still becomes 18M Python bytes objects (URL's peak and
+  ~15 s of its CPU) only for the front-coder to join them back into one buffer; the merge (13 s) and
+  the dictionary sort (15 s) could become per-run sorts in the threads plus a merge of sorted runs.
