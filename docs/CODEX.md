@@ -2965,3 +2965,32 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   6.7 ms in steady state -- parse-tree copy 1.1, 90 output names 0.8, shape checks ~0.7 each, the
   rest routing). Board with Q29 swapped in: cold 1.43 -> 1.37 (23 wins), hot 2.07 -> 1.96.
 - Verify 42/43 (Q23 the known checker issue; Q17 finished inside the limit this time). Suite 1761.
+
+## 2026-09-27 (evening) -- Q19: THE BOX LABELS AND THE SIGNPOSTS
+- Q19 (WHERE UserID = <one user>) was the next loser: 442-555 ms cold / 84-85 hot against the referees'
+  117 cold (ClickHouse) / 1 hot (Umbra). Line items: the full decode of UserID's 100M codes (tag 19,
+  25 bits each) to keep 4 rows.
+- Jackson's question "how would you know something is in a box without looking?": a tag-19 column
+  already carries, per block of 65,536 rows, the sorted list of the codes in it (the labels, 58.1 MB for
+  UserID -- existing bytes, not an addition). _scan_eq19 reads the labels, then the pointers of only the
+  blocks whose label holds the code. WDB_E19_LABELS=0 restores the full decode.
+- Jackson ruled out paying for new copies ("sign posts if there is no 58MB fee"). The plane lab (bits
+  0-23 of UserID are 50/50; only bit 24 is lopsided) and zstd on the labels (-6%) did not beat it.
+- THE SIGNPOSTS: the load keeps every 128th label entry whole (stats.npz <col>.sp19 / .sp19o / .sp19s;
+  1.08 MB for UserID, ~4.9 MB for all six tag-19 columns of the kit). A lookup halves among a block's
+  signposts, then walks at most 127 gaps (e19_eq_blocks_sp, one thread: 0.15 ms for 1,526 blocks; a
+  16-thread pool cost 7 ms on the busy host). Without signposts, e19_eq_blocks walks each label.
+  signposts_from_load checks the shape against the column's blocks before using them.
+- Also: the WHERE clipboard prices the equalities (_eq_cost) only when there is more than one to
+  choose between; a lone equality drives without being priced.
+- Q19: hot 87 -> ~3 ms (2.1-2.7 in-process). Cold ~245 ms. Cold line items: label walk 163 ms = 483
+  serial page faults on the network volume (~0.34 ms each, each pulling 128 KB around it -- so the hops
+  read nearly all 58 MB); numba cache load of 3 kernels ~40; stats.npz zip directory ~20; pointer scan
+  of the one block ~24; the 4 UserID values ~18. Evicting the numba cache or not: no difference.
+- Measured on this volume for the label walk: the 1,612 touched pages by 16/32/64/128-thread pread
+  ~134 ms at every thread count (the mount serves small reads ~one at a time, 60-80 us each);
+  MADV_WILLNEED on them 93 + 11 ms walk; the whole 58 MB by 16 parallel 4 MB preads 62-70 ms (the
+  volume's ceiling ~0.85 GB/s). Open: prefetch (A) or labels reordered by code range (B) -- Jackson.
+- tests/test_blockdict.py: signposts equal every 128th label entry; _scan_eq19 equals the full decode
+  with and without signposts (present, absent and edge codes; edge row ranges); query answers equal
+  with WDB_E19_LABELS=0.

@@ -837,7 +837,10 @@ def detect(seg, tree, col_map):
         V = int(seg.cols[col].get('V') or 1)
         return max(1, int(seg.N) // max(1, V))
     _cand = [i for i, e in enumerate(eqs) if e[2] == '=']
-    drive_eq = min(_cand, key=lambda i: _eq_cost(eqs[i][0], eqs[i][1])) if _cand else None
+    # one candidate is its own driver: pricing it read the whole .gbc count file for nothing (Q19 cold:
+    # 274 ms of a 577 ms query, 2026-09-27) -- min() calls the key even for a single item
+    drive_eq = (_cand[0] if len(_cand) == 1 else
+                min(_cand, key=lambda i: _eq_cost(eqs[i][0], eqs[i][1]))) if _cand else None
     # a like is only THE driver when no eq drives -- execute skips lflags[drive_like],
     # so marking one while an eq drives silently drops that LIKE as a filter
     drive_like = None if drive_eq is not None else \
@@ -1110,9 +1113,51 @@ def _scan_eq(seg, col, code, lo, hi, negate=False):
         if code >= 0:
             flag3[code] = not negate
         return _scan_flag(seg, col, flag3, lo, hi)
+    if (c.get('code_enc', 0) == 19 and not negate and col not in seg._codes
+            and os.environ.get('WDB_E19_LABELS', '1') != '0'):
+        p19 = _scan_eq19(seg, col, int(code), lo, hi)
+        if p19 is not None:
+            return p19
     cc = np.asarray(seg._raw_codes_range(col, lo, hi))
     h = np.nonzero(cc != code)[0] if negate else np.nonzero(cc == code)[0]
     return h + lo
+
+
+def _scan_eq19(seg, col, code, lo, hi):
+    """THE BOX LABELS (Jackson, 2026-09-27): a block-dictionary (tag 19) column carries, per block of
+    rows, the sorted list of the codes in it. 'Which rows hold code k' reads the labels -- through the
+    load's signposts when present (Q19: 0.15 ms for 1,526 blocks), else walking each label to k --
+    then the pointers of only the blocks whose label holds k. The full decode it replaces unpacked
+    all 100M codes (48 ms hot, 247 MB cold) to keep 4 rows. None: the caller scans as before."""
+    import wdb_kernels as _WK
+    import wdb_blockstats
+    c = seg.cols[col]
+    if c.get('e19dc') is None or code < 0 or lo >= hi:
+        return None
+    BR = int(c['e19BR']); N = int(seg.N)
+    b0 = lo // BR; b1 = (hi - 1) // BR + 1
+    pw, dw = seg._e19_words(c)
+    dc = np.asarray(c['e19dc'], np.int64)
+    lid = np.full(dc.size, -1, np.int64)
+    gb = np.int64(c['e19bits'])
+    spp = wdb_blockstats.signposts_from_load(seg, col)
+    if spp is not None:
+        sp, spo, S = spp
+        _WK.e19_eq_blocks_sp(dw, gb, c['e19gw'], dc, c['e19doff'], np.int64(S), spo, sp,
+                             np.int64(code), np.int64(b0), np.int64(b1), lid)
+    else:
+        _WK.e19_eq_blocks(dw, gb, c['e19gw'], dc, c['e19doff'], np.int64(code), np.int64(b0), np.int64(b1), lid)
+    out = np.empty(1024, np.int64)
+    k = _WK.e19_rows_eq(pw, np.int64(BR), np.int64(N), c['e19lb'], c['e19poff'], lid,
+                        np.int64(b0), np.int64(b1), np.int64(lo), np.int64(hi), out)
+    if k > out.size:                                   # more rows than the first guess: once more, sized
+        out = np.empty(k, np.int64)
+        k = _WK.e19_rows_eq(pw, np.int64(BR), np.int64(N), c['e19lb'], c['e19poff'], lid,
+                            np.int64(b0), np.int64(b1), np.int64(lo), np.int64(hi), out)
+    pos = out[:k].copy()
+    if pos.size <= 4_000_000:                          # the codes at the hits, for codes_at (as enc 3/18)
+        seg.__dict__.setdefault('_scan_codes', {})[col] = (pos, np.full(pos.size, code, np.int64))
+    return pos
 
 def _num_table(seg, col):
     """code -> numeric value for any int-valued dict column (mode 2 int-dict layout or a

@@ -105,6 +105,52 @@ def test_point_reads_and_ranges_match_full_decode():
         assert np.array_equal(np.asarray(fresh.codes_band('user', lo, hi)).astype(np.int64), full[lo:hi]), (lo, hi)
 
 
+def test_signposts_and_label_scan_match_full_decode():
+    """THE BOX LABELS + SIGNPOSTS (2026-09-27): every 128th label entry kept whole; 'rows with code k'
+    through the labels -- with and without the signposts -- equals the full decode, for present and
+    absent codes, the first and last codes, and partial row ranges crossing block edges"""
+    import wdb_blockstats, wdb_wherescan, wdb_kernels as K
+    seg, w, pq, df = _fixture()
+    c = seg.cols['user']
+    full = np.asarray(seg._raw_codes('user')).astype(np.int64)
+    sp, spo = wdb_blockstats.e19_signposts(seg, 'user')
+    sp = np.asarray(sp, np.int64); BR = int(c['e19BR']); S = wdb_blockstats.SIGNPOST_EVERY
+    for b in range(c['e19dc'].size):                      # each signpost is that label entry
+        lab = np.unique(full[b * BR:min(seg.N, (b + 1) * BR)])
+        assert np.array_equal(sp[spo[b]:spo[b + 1]], lab[::S]), b
+    V = int(c['V']); rng = np.random.default_rng(27)
+    present = full[rng.integers(0, seg.N, 20)]
+    codes = sorted(set(present.tolist()) | {0, V - 1, int(full[0]), int(full[-1]), int(full[BR]), int(full[BR - 1])})
+    absent = sorted(set(range(V)) - set(np.unique(full).tolist()))[:5]
+    orig = wdb_blockstats.signposts_from_load
+    try:
+        for mode in ('signposts', 'walk'):
+            wdb_blockstats.signposts_from_load = (lambda s, cc: (sp, spo, S)) if mode == 'signposts' else (lambda s, cc: None)
+            sg = Segment(w)                               # a fresh segment: never the cached full decode
+            for k in codes + absent:
+                for lo, hi in ((0, seg.N), (BR - 5, 2 * BR + 5), (123, 124), (seg.N - 3, seg.N)):
+                    got = wdb_wherescan._scan_eq19(sg, 'user', int(k), lo, hi)
+                    want = lo + np.flatnonzero(full[lo:hi] == k)
+                    assert got is not None and np.array_equal(got, want), (mode, k, lo, hi)
+    finally:
+        wdb_blockstats.signposts_from_load = orig
+
+
+def test_label_scan_queries_match_the_old_scan():
+    """the same answers with the label scan switched off (WDB_E19_LABELS=0: the full decode)"""
+    seg, w, pq, df = _fixture()
+    lit = df['user'].iloc[99_999]
+    sqls = [f"SELECT COUNT(*) FROM tbl WHERE user = '{lit}'", f"SELECT k, user FROM tbl WHERE user = '{lit}' ORDER BY k LIMIT 7",
+            "SELECT COUNT(*) FROM tbl WHERE user = 'no-such-user'"]
+    a = [sorted(wdb_sql.execute(Segment(w), q)[0]) for q in sqls]
+    os.environ['WDB_E19_LABELS'] = '0'
+    try:
+        b = [sorted(wdb_sql.execute(Segment(w), q)[0]) for q in sqls]
+    finally:
+        os.environ.pop('WDB_E19_LABELS', None)
+    assert a == b
+
+
 def test_queries_match_duck():
     seg, w, pq, df = _fixture()
     con = duckdb.connect()

@@ -1569,6 +1569,10 @@ def _column_extras(nm, blob, N):
             vc = _B.value_counts(seg, nm)
             if vc is not None:
                 st[nm + '.vcnt'] = vc
+            spp = _B.e19_signposts(seg, nm)            # THE SIGNPOSTS (block-dictionary columns)
+            if spp is not None:
+                st[nm + '.sp19'], st[nm + '.sp19o'] = spp
+                st[nm + '.sp19s'] = np.int64(_B.SIGNPOST_EVERY)
             seg._codes.pop(nm, None)
             if _B.eligible(seg, nm):
                 try:

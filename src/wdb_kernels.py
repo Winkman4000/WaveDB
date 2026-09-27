@@ -3969,6 +3969,93 @@ def e19_decode(pw, dw, BR, N, gbits, lb, gw, dcnt, poff, doff, out):
 
 
 @njit(cache=True, parallel=True, nogil=True)
+def e19_signposts(dw, gbits, gw, dcnt, doff, S, spo, sp):
+    """THE SIGNPOSTS (Jackson, 2026-09-27): per block, every S-th entry of its sorted dictionary kept
+    whole (entries 0, S, 2S, ...), written at sp[spo[b]:spo[b+1]] -- a lookup can then halve among a
+    block's signposts and walk at most S-1 gaps instead of the whole dictionary."""
+    for b in prange(dcnt.size):
+        pos = doff[b] * 64; g = np.int64(gw[b])
+        v = _e19_get(dw, pos, gbits); pos += gbits
+        o = spo[b]; sp[o] = v; o += 1
+        for k in range(1, np.int64(dcnt[b])):
+            v += _e19_get(dw, pos, g); pos += g
+            if k % S == 0:
+                sp[o] = v; o += 1
+
+
+@njit(cache=True, nogil=True)
+def e19_eq_blocks_sp(dw, gbits, gw, dcnt, doff, S, spo, sp, t, b0, b1, lid):
+    """per block in [b0, b1): the local id of code t in its dictionary, or -1 -- through the signposts
+    (the last signpost <= t, then at most S-1 gaps). One thread: 1,526 blocks x ~150 steps is
+    0.15 ms, less than a thread pool's start on a busy host (measured 7 ms with 16 threads)."""
+    for b in range(b0, b1):
+        a = spo[b]; e = spo[b + 1]
+        lo = a; hi = e
+        while lo < hi:
+            m = (lo + hi) // 2
+            if sp[m] <= t:
+                lo = m + 1
+            else:
+                hi = m
+        lid[b] = -1
+        j = lo - 1 - a
+        if j < 0:
+            continue
+        k = j * S; v = sp[a + j]
+        if v == t:
+            lid[b] = k
+            continue
+        g = np.int64(gw[b]); pos = doff[b] * 64 + gbits + k * g      # the gap that makes entry k + 1
+        stop = min(np.int64(dcnt[b]), k + S)
+        for kk in range(k + 1, stop):
+            v += _e19_get(dw, pos, g); pos += g
+            if v >= t:
+                if v == t:
+                    lid[b] = kk
+                break
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def e19_eq_blocks(dw, gbits, gw, dcnt, doff, t, b0, b1, lid):
+    """the same answer without signposts: walk each block's sorted dictionary until it reaches t"""
+    for b in prange(b0, b1):
+        pos = doff[b] * 64; g = np.int64(gw[b])
+        v = _e19_get(dw, pos, gbits); pos += gbits
+        lid[b] = -1
+        if v == t:
+            lid[b] = 0
+            continue
+        if v > t:
+            continue
+        for k in range(1, np.int64(dcnt[b])):
+            v += _e19_get(dw, pos, g); pos += g
+            if v >= t:
+                if v == t:
+                    lid[b] = k
+                break
+
+
+@njit(cache=True, nogil=True)
+def e19_rows_eq(pw, BR, N, lb, poff, lid, b0, b1, lo, hi, out):
+    """the rows in [lo, hi) of the blocks with lid >= 0 whose pointer is that local id; returns the count"""
+    k = 0
+    for b in range(b0, b1):
+        j = lid[b]
+        if j < 0:
+            continue
+        l = np.int64(lb[b]); r0 = b * BR; r1 = min(r0 + BR, N)
+        a = max(r0, lo); e = min(r1, hi)
+        pos = poff[b] * 64 + (a - r0) * l
+        for i in range(a, e):
+            if _e19_get(pw, pos, l) == j:
+                if k < out.size:
+                    out[k] = i
+                k += 1
+            pos += l
+    return k
+
+
+@njit(cache=True, parallel=True, nogil=True)
 def e19_gather(pw, dw, BR, gbits, lb, gw, dcnt, poff, doff, rows, starts, out):
     """codes at sorted rows, grouped by block (starts: the group boundaries). A block's
     dictionary is decoded only as far as the highest local id its rows point at."""

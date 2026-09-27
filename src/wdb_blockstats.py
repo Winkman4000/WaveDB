@@ -171,6 +171,57 @@ def _load_npz(seg):
     return z
 
 
+SIGNPOST_EVERY = 128
+
+
+def e19_signposts(seg, col):
+    """THE SIGNPOSTS (Jackson, 2026-09-27): for a block-dictionary (tag 19) column, every 128th entry
+    of each block's sorted dictionary kept whole -- born with the load beside the census, ~1/32 the
+    size of the dictionaries themselves (UserID: 1.08 MB beside 58.1 MB). 'Is code k in this block?'
+    becomes a halving among ~150 signposts and at most 127 gaps, instead of walking ~20,000 entries:
+    Q19 (UserID = k) touches one block of 1,526 by its label, never the other 1,525. Returns
+    (sp, spo): the signposts of block b are sp[spo[b]:spo[b + 1]]. None for any other column."""
+    c = seg.cols.get(col)
+    if c is None or c.get('code_enc') != 19 or c.get('e19dc') is None:
+        return None
+    import wdb_kernels as _WK
+    pw, dw = seg._e19_words(c)
+    dc = np.asarray(c['e19dc'], np.int64)
+    S = SIGNPOST_EVERY
+    spo = np.zeros(dc.size + 1, np.int64)
+    np.cumsum((dc + S - 1) // S, out=spo[1:])
+    sp = np.zeros(int(spo[-1]), np.int64)
+    _WK.e19_signposts(dw, np.int64(c['e19bits']), c['e19gw'], dc, c['e19doff'], np.int64(S), spo, sp)
+    return (sp.astype(np.uint32) if int(c.get('V') or 0) < (1 << 32) else sp), spo
+
+
+_SPC = {}                                        # (stats path, mtime, col) -> (sp int64, spo, S)
+
+
+def signposts_from_load(seg, col):
+    """the load's signposts of a tag-19 column as (sp int64, spo, S), or None (absent, or the shape does
+    not match the column's blocks)"""
+    z = _load_npz(seg)
+    if z is None or (col + '.sp19') not in z.files:
+        return None
+    key = (stats_path(seg.path), _LOADED[stats_path(seg.path)][0], col)
+    hit = _SPC.get(key)
+    if hit is not None:
+        return hit
+    c = seg.cols.get(col)
+    if c is None or c.get('code_enc') != 19 or c.get('e19dc') is None:
+        return None
+    sp = np.asarray(z[col + '.sp19'], np.int64); spo = np.asarray(z[col + '.sp19o'], np.int64)
+    S = int(z[col + '.sp19s']) if (col + '.sp19s') in z.files else SIGNPOST_EVERY
+    dc = np.asarray(c['e19dc'], np.int64)
+    if spo.size != dc.size + 1 or int(spo[-1]) != sp.size or not np.array_equal(np.diff(spo), (dc + S - 1) // S):
+        return None
+    if len(_SPC) > 16:
+        _SPC.clear()
+    _SPC[key] = hit = (sp, spo, S)
+    return hit
+
+
 def vcnt_from_load(seg, col):
     """the load's rows-per-code of a column, or None (absent, or the shape does not match)"""
     z = _load_npz(seg)
@@ -222,6 +273,10 @@ def write_for_segment(seg_path, verbose=False):
         vc = value_counts(seg, col)          # THE CENSUS OF THE LOAD (small dictionaries)
         if vc is not None:
             out[col + '.vcnt'] = vc
+        spp = e19_signposts(seg, col)        # THE SIGNPOSTS (block-dictionary columns)
+        if spp is not None:
+            out[col + '.sp19'], out[col + '.sp19o'] = spp
+            out[col + '.sp19s'] = np.int64(SIGNPOST_EVERY)
         seg._codes.pop(col, None)
         if not eligible(seg, col):
             continue
