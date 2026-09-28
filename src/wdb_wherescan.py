@@ -1140,8 +1140,26 @@ def _scan_eq19(seg, col, code, lo, hi):
     dc = np.asarray(c['e19dc'], np.int64)
     lid = np.full(dc.size, -1, np.int64)
     gb = np.int64(c['e19bits'])
-    spp = wdb_blockstats.signposts_from_load(seg, col)
-    if spp is not None:
+    if 'e19R' in c:
+        # THE SHELVES (Jackson, 2026-09-27): the labels by code range -- code k's pieces of every label sit
+        # together on shelf k // W (~256 KB for UserID), so the lookup reads that one shelf, not 58 MB
+        W = int(c['e19W']); r = code // W
+        if r < int(c['e19R']) and os.environ.get('WDB_E19_WARM', '1') != '0':
+            ds = int(c['e19dstart']); SW = c['e19SW']
+            seg.warm_span(ds + 8 * int(SW[r]), min(len(seg.buf), ds + 8 * int(SW[r + 1])))
+        _WK.e19s_eq_blocks(dw, np.int64(W), np.int64(c['e19wb']), c['e19gw'], c['e19pre'], c['e19soff'],
+                           c['e19SW'], np.int64(code), np.int64(b0), np.int64(b1), lid)
+    elif os.environ.get('WDB_E19_WARM', '1') != '0':
+        # THE GATE (Jackson, 2026-09-27): the walk touches ~1 page of every block's label, and cold each
+        # touch was one page fault waited on alone (483 x ~0.34 ms = 163 ms on the network volume). mincore
+        # asks which label pages are in memory (~70 us warm); the missing ones come in by parallel large
+        # reads first (warm_span), then the walk runs in memory. Warm, nothing is read.
+        ds = int(c['e19dstart']); doff = c['e19doff']
+        seg.warm_span(ds + 8 * int(doff[b0]), min(len(seg.buf), ds + 8 * (int(doff[b1]) + 1)))
+    spp = None if 'e19R' in c else wdb_blockstats.signposts_from_load(seg, col)
+    if 'e19R' in c:
+        pass                                           # (the shelf lookup above filled lid)
+    elif spp is not None:
         sp, spo, S = spp
         _WK.e19_eq_blocks_sp(dw, gb, c['e19gw'], dc, c['e19doff'], np.int64(S), spo, sp,
                              np.int64(code), np.int64(b0), np.int64(b1), lid)

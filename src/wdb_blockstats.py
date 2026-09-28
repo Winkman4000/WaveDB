@@ -182,8 +182,8 @@ def e19_signposts(seg, col):
     Q19 (UserID = k) touches one block of 1,526 by its label, never the other 1,525. Returns
     (sp, spo): the signposts of block b are sp[spo[b]:spo[b + 1]]. None for any other column."""
     c = seg.cols.get(col)
-    if c is None or c.get('code_enc') != 19 or c.get('e19dc') is None:
-        return None
+    if c is None or c.get('code_enc') != 19 or c.get('e19dc') is None or 'e19R' in c:
+        return None                                  # (shelved labels: a lookup already reads one shelf)
     import wdb_kernels as _WK
     pw, dw = seg._e19_words(c)
     dc = np.asarray(c['e19dc'], np.int64)
@@ -195,7 +195,8 @@ def e19_signposts(seg, col):
     return (sp.astype(np.uint32) if int(c.get('V') or 0) < (1 << 32) else sp), spo
 
 
-_SPC = {}                                        # (stats path, mtime, col) -> (sp int64, spo, S)
+_SPC = wdb_qmem.register_tier1({})              # (stats path, mtime, col) -> (sp int64, spo, S): the load's
+                                                 # signposts decoded (tier 1: kept for hot runs, WDB_HOT_KEEP=0 drops)
 
 
 def signposts_from_load(seg, col):
@@ -209,7 +210,7 @@ def signposts_from_load(seg, col):
     if hit is not None:
         return hit
     c = seg.cols.get(col)
-    if c is None or c.get('code_enc') != 19 or c.get('e19dc') is None:
+    if c is None or c.get('code_enc') != 19 or c.get('e19dc') is None or 'e19R' in c:
         return None
     sp = np.asarray(z[col + '.sp19'], np.int64); spo = np.asarray(z[col + '.sp19o'], np.int64)
     S = int(z[col + '.sp19s']) if (col + '.sp19s') in z.files else SIGNPOST_EVERY

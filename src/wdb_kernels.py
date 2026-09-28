@@ -4074,6 +4074,158 @@ def e19_gather(pw, dw, BR, gbits, lb, gw, dcnt, poff, doff, rows, starts, out):
             out[j] = loc[out[j]]
 
 
+# THE SHELVES (Jackson, 2026-09-27): the same block labels, laid out by CODE RANGE instead of by block.
+# Shelf r holds, block after block, each block's label entries whose code is in [r*W, (r+1)*W): the
+# block's first entry there as (code - r*W) in wb bits, then its gaps at the block's own width gw[b].
+# pre[r, b] = how many of block b's entries sit on shelves before r (local id = pre[r, b] + k);
+# soff[r, b] = the bit where block b's piece starts on shelf r; SW[r] = shelf r's first u64 word.
+# 'Which blocks hold code t' reads ONE shelf (+ one row of each table) instead of a piece of every
+# label: UserID cold 69-78 ms (the whole 58 MB, in parallel) -> 5.5-7 ms (~0.25 MB), measured.
+
+@njit(cache=True, parallel=True, nogil=True)
+def e19s_write(codes, BR, lb, poff, pw, LS, L):
+    """per block: its sorted distinct codes into L[LS[b]:LS[b+1]], and its row pointers (as e19_write)"""
+    N = codes.size; nb = lb.size
+    for b in prange(nb):
+        lo = b * BR; hi = min(lo + BR, N)
+        blk = codes[lo:hi]
+        s = np.unique(blk)
+        for k in range(s.size):
+            L[LS[b] + k] = s[k]
+        l = np.int64(lb[b]); pos = poff[b] * 64
+        for i in range(blk.size):
+            _e19_put(pw, pos, np.searchsorted(s, blk[i]), l); pos += l
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def e19s_counts(L, LS, W, cnt):
+    """cnt[r + 1, b] = how many of block b's label entries fall on shelf r"""
+    for b in prange(LS.size - 1):
+        for i in range(LS[b], LS[b + 1]):
+            cnt[np.int64(L[i]) // W + 1, b] += 1
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def e19s_shelve(L, LS, W, wb, gw, pre, soff, SW, dw):
+    """write every shelf (one thread per shelf: shelves start on their own u64 word)"""
+    R = SW.size - 1; nb = LS.size - 1
+    for r in prange(R):
+        base = SW[r] * 64
+        for b in range(nb):
+            p0 = np.int64(pre[r, b]); c = np.int64(pre[r + 1, b]) - p0
+            if c == 0:
+                continue
+            i0 = LS[b] + p0; pos = base + np.int64(soff[r, b])
+            _e19_put(dw, pos, np.int64(L[i0]) - r * W, wb); pos += wb
+            g = np.int64(gw[b])
+            for k in range(1, c):
+                _e19_put(dw, pos, np.int64(L[i0 + k]) - np.int64(L[i0 + k - 1]), g); pos += g
+
+
+@njit(inline='always')
+def _e19s_dict(dw, W, wb, gw, pre, soff, SW, b, upto):
+    """block b's label entries [0, upto], shelf after shelf"""
+    loc = np.empty(upto + 1, np.int64)
+    k = 0; g = np.int64(gw[b])
+    for r in range(SW.size - 1):
+        c = np.int64(pre[r + 1, b]) - np.int64(pre[r, b])
+        if c == 0:
+            continue
+        pos = SW[r] * 64 + np.int64(soff[r, b])
+        v = r * W + _e19_get(dw, pos, wb); pos += wb
+        loc[k] = v; k += 1
+        if k > upto:
+            break
+        for j in range(1, c):
+            v += _e19_get(dw, pos, g); pos += g
+            loc[k] = v; k += 1
+            if k > upto:
+                break
+        if k > upto:
+            break
+    return loc
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def e19s_decode(pw, dw, BR, N, W, wb, lb, gw, dcnt, poff, pre, soff, SW, b0, b1, out):
+    """the blocks [b0, b1) of the column into out (global rows): per block its label, one jump per row"""
+    for b in prange(b0, b1):
+        lo = b * BR; hi = min(lo + BR, N)
+        loc = _e19s_dict(dw, W, wb, gw, pre, soff, SW, b, np.int64(dcnt[b]) - 1)
+        l = np.int64(lb[b]); pos = poff[b] * 64
+        for i in range(lo, hi):
+            out[i] = loc[_e19_get(pw, pos, l)]; pos += l
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def e19s_gather(pw, dw, BR, W, wb, lb, gw, poff, pre, soff, SW, rows, starts, out, per_row):
+    """e19_gather over the shelves. A block with at most per_row rows asked: each row goes straight to
+    its entry -- the shelf holding local id j is found by halving block b's column of pre, then a walk
+    inside that one piece (~dc/R entries) -- so a row touches ONE shelf page, not all R. A block with
+    more rows: its label decoded once, only as far as its highest pointer."""
+    R = SW.size - 1
+    for t in prange(starts.size - 1):
+        s0 = starts[t]; s1 = starts[t + 1]
+        b = rows[s0] // BR
+        l = np.int64(lb[b]); base = poff[b] * 64; r0 = b * BR
+        mx = np.int64(0)
+        for j in range(s0, s1):
+            lid = _e19_get(pw, base + (rows[j] - r0) * l, l)
+            out[j] = lid
+            if lid > mx:
+                mx = lid
+        if s1 - s0 <= per_row:
+            g = np.int64(gw[b])
+            for j in range(s0, s1):
+                k = out[j]
+                lo = 0; hi = R                          # the last shelf r with pre[r, b] <= k
+                while hi - lo > 1:
+                    m = (lo + hi) // 2
+                    if np.int64(pre[m, b]) <= k:
+                        lo = m
+                    else:
+                        hi = m
+                r = lo
+                pos = SW[r] * 64 + np.int64(soff[r, b])
+                v = r * W + _e19_get(dw, pos, wb); pos += wb
+                for s in range(k - np.int64(pre[r, b])):
+                    v += _e19_get(dw, pos, g); pos += g
+                out[j] = v
+        else:
+            loc = _e19s_dict(dw, W, wb, gw, pre, soff, SW, b, mx)
+            for j in range(s0, s1):
+                out[j] = loc[out[j]]
+
+
+@njit(cache=True, nogil=True)
+def e19s_eq_blocks(dw, W, wb, gw, pre, soff, SW, t, b0, b1, lid):
+    """per block in [b0, b1): the local id of code t, or -1 -- reading only shelf t // W. One thread
+    (1,526 blocks x ~40 steps: 0.13 ms measured)"""
+    r = t // W
+    for b in range(b0, b1):
+        lid[b] = -1
+    if t < 0 or r >= SW.size - 1:
+        return
+    base = SW[r] * 64; lo = r * W
+    for b in range(b0, b1):
+        p0 = np.int64(pre[r, b]); c = np.int64(pre[r + 1, b]) - p0
+        if c == 0:
+            continue
+        pos = base + np.int64(soff[r, b])
+        v = lo + _e19_get(dw, pos, wb); pos += wb
+        if v >= t:
+            if v == t:
+                lid[b] = p0
+            continue
+        g = np.int64(gw[b])
+        for k in range(1, c):
+            v += _e19_get(dw, pos, g); pos += g
+            if v >= t:
+                if v == t:
+                    lid[b] = p0 + k
+                break
+
+
 # ------------------------------------------------------------------------------------------------
 # THE THREE READS (Jackson, 2026-09-23): differentiation (codes), identification (a decision per
 # distinct string, decisive bytes only, inherited across a shared prefix), return (answer strings

@@ -516,6 +516,11 @@ def _e19_candidate(arr, bits, seal):
     if best is None:
         return None
     size, BR, nb, lb, gw, dc, poff, doff = best
+    R = _e19_shelf_count(int(doff[-1]) * 8)
+    if R >= 2:
+        sec = _e19_shelved(a, bits, BR, nb, lb, gw, dc, poff, R)
+        if sec is not None and len(sec) <= seal:
+            return sec
     pw = np.zeros(int(poff[-1]) + 1, np.uint64); dw = np.zeros(int(doff[-1]) + 1, np.uint64)
     _WK19.e19_write(a, np.int64(BR), np.int64(bits), lb, gw, poff, doff, pw, dw)
     sec = (bytes([19, bits]) + struct.pack('<IIQQ', BR, nb, int(poff[-1]), int(doff[-1]))
@@ -523,6 +528,55 @@ def _e19_candidate(arr, bits, seal):
            + pw.tobytes() + dw.tobytes())
     assert len(sec) == size, (len(sec), size)
     return sec
+
+
+E19_SHELF_BYTES = 256 << 10     # THE SHELVES: one code range's pieces of every label, ~256 KB a shelf
+
+
+def _e19_shelf_count(label_bytes):
+    """how many shelves the labels are cut into: WDB_E19_SHELVES=0 keeps the labels by block, a number
+    forces that many (tests), auto sizes shelves at ~256 KB; under 2 shelves the labels stay by block"""
+    s = os.environ.get('WDB_E19_SHELVES', 'auto')
+    if s == '0':
+        return 0
+    if s not in ('', 'auto'):
+        return max(2, int(s))
+    R = label_bytes // E19_SHELF_BYTES
+    return int(min(R, 4096)) if R >= 2 else 0
+
+
+def _e19_shelved(a, bits, BR, nb, lb, gw, dc, poff, R):
+    """THE SHELVES (Jackson, 2026-09-27): tag 19 with its block labels laid out by code range.
+    Layout: [19][gbits | 0x80][BR u32][nb u32][P u64][D u64] + lb[nb] u8 + gw[nb] u8 + dcnt[nb] u32
+    + poff[nb+1] i64 + [R u32][wb u32][W u64] + SW[R+1] i64 + pre[(R+1) x nb] u32 + soff[R x (nb+1)] u32
+    + pointer words[P+1] + shelf words[D+1]. Shelf r holds every block's entries with code in
+    [r*W, (r+1)*W): first as (code - r*W) in wb bits, then gaps at gw[b] (wdb_kernels.e19s_*).
+    None when a table would not fit its u32."""
+    import wdb_kernels as _WK19
+    LS = np.zeros(nb + 1, np.int64); np.cumsum(dc, out=LS[1:])
+    L = np.empty(int(LS[-1]), np.uint32)
+    pw = np.zeros(int(poff[-1]) + 1, np.uint64)
+    _WK19.e19s_write(a, np.int64(BR), lb, poff, pw, LS, L)
+    W = -(-(int(L.max()) + 1) // R) if L.size else 1
+    wb = int(W - 1).bit_length()
+    cnt = np.zeros((R + 1, nb), np.int64)
+    _WK19.e19s_counts(L, LS, np.int64(W), cnt)
+    pre = np.cumsum(cnt, axis=0)
+    cc = pre[1:] - pre[:-1]
+    nbits = np.where(cc > 0, wb + (cc - 1) * gw.astype(np.int64)[None, :], 0)
+    soff = np.zeros((R, nb + 1), np.int64); np.cumsum(nbits, axis=1, out=soff[:, 1:])
+    if soff.max() >= (1 << 32) or pre.max() >= (1 << 32):
+        return None
+    SW = np.zeros(R + 1, np.int64); np.cumsum((soff[:, nb] + 63) // 64 + 1, out=SW[1:])   # +1: a straddle stays inside
+    pre = pre.astype(np.uint32); soff = soff.astype(np.uint32)
+    D = int(SW[-1])
+    dw = np.zeros(D + 1, np.uint64)
+    _WK19.e19s_shelve(L, LS, np.int64(W), np.int64(wb), gw, pre, soff, SW, dw)
+    del L
+    return (bytes([19, bits | 0x80]) + struct.pack('<IIQQ', BR, nb, int(poff[-1]), D)
+            + lb.tobytes() + gw.tobytes() + dc.tobytes() + poff.tobytes()
+            + struct.pack('<IIQ', R, wb, W) + SW.tobytes() + pre.tobytes() + soff.tobytes()
+            + pw.tobytes() + dw.tobytes())
 
 
 def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):

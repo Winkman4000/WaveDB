@@ -2994,3 +2994,56 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
 - tests/test_blockdict.py: signposts equal every 128th label entry; _scan_eq19 equals the full decode
   with and without signposts (present, absent and edge codes; edge row ranges); query answers equal
   with WDB_E19_LABELS=0.
+
+## 2026-09-27 (night) -- THE GATE AND THE SHELVES: Q19 COLD ~245 -> ~50-69 ms
+- Jackson's question: why do page faults matter on a cold read? They ARE the cold read through the
+  memory map -- and the walk can only wait on one at a time. Jackson's gate ("a few bytes that say
+  whether anything of the region is in RAM; bypass the fault mechanism when not") already existed as
+  Segment.warm_span (mincore, then parallel 8 MB preads of the missing pages); the label scan did not
+  call it. mincore over UserID's 14,198 label pages: ~70 us resident, ~0.95 ms not.
+- A (the gate on the label scan): Q19 true cold 245-280 -> 126-163 ms, the walk ~160 -> 10-17 ms.
+  WDB_E19_WARM=0 turns it off.
+- B = THE SHELVES: the same labels laid out by CODE RANGE. Shelf r holds, block after block, each
+  block's label entries with code in [r*W, (r+1)*W) (first as code - r*W in wb bits, then the block's
+  own gaps). pre[r, b] = entries of block b on shelves before r (local id = pre + k); soff[r, b] =
+  where block b's piece starts on shelf r. One code's lookup reads ONE shelf. Flag: tag 19's gbits
+  byte | 0x80 (old files read as before). R from a ~256 KB shelf target (wdb_encode._e19_shelf_count;
+  WDB_E19_SHELVES=0 keeps the labels by block, a number forces R). Kernels wdb_kernels.e19s_*.
+  Signposts are not built for shelved columns (the stats file loses them: 17.02 -> 12.08 MB).
+- Lab (shelflab.py, UserID, before building it in): cold lookup of Q19's user 69-78 ms (A) -> 5.5-7 ms
+  at R=256 (~0.25 MB read); hot 0.46 -> 0.13 ms; one block's whole label 0.098 -> 0.137 ms; all 1,526
+  labels on 16 cores 13-16 -> 18 ms.
+- Kit load with shelves (cb_shelf1): 278.9 s (same-host baseline 278.8). Every column blob and load
+  file identical to blob_base except the six tag-19 columns and the text-length files (their header
+  names the segment's size). UserID R=221, FUniqID 195, IPNetworkID 71, RemoteIP 199, ClientIP 202,
+  WindowClientHeight 27: +15.2 MB of columns (the tables), -4.9 MB of stats: net +10.3 MB (0.12%).
+- Also found: codes_at's scanned-codes shortcut took tags 3/18 only, so the codes _scan_eq19 kept at
+  its hits were never used for tag 19 -- Q19's 4 values cost a label decode (cold with shelves: a hop
+  onto all 221 shelves, 45-52 ms). Now tag 19 too: 0.1 ms.
+- Q19 true cold on cb_shelf1: 50-69 ms (ClickHouse 117, DuckDB 163, Umbra 252), 1.7 MB read; hot 3-6.
+  Cold line items: shelf read 3 ms, lookup 10 (the kernel's cache load + table faults), pointer scan
+  of the one block 9, the rest open/parse/route.
+- Suite 1766 passed; verify on cb_shelf1 42/43 (Q23 the known checker issue).
+- THE COST OF THE SHELVES, AND ITS FIX: one block's label now lies on every shelf, so values at
+  scattered rows (e19s_gather decoding each touched block's label shelf by shelf) cost up to R faults
+  per block cold. A/B, medians of 3, block labels -> shelves: Q17 cold 230 -> 492, Q23 1373 -> 1984,
+  Q31 233 -> 428, Q32 181 -> 337 (Q24/26/29/38/40 within noise). NOW: a block asked for at most 256
+  rows goes straight to each row's entry (halve block b's column of pre for the shelf holding local id
+  j, walk inside that one piece, ~dc/R entries): one shelf page per row. Cold, the tables (e19tab, a
+  few MB) come in by warm_span first; when the rows would touch more pieces than there are shelves,
+  the whole labels too. After: Q17 222, Q23 1318-1357, Q31 295, Q32 194, Q38 213-251 (first run of
+  each paid a numba compile: editing wdb_kernels.py invalidates the cache of every kernel in it).
+- BOARD HYGIENE: a prof.sh load has no sidecars; the kit (load --warm) does. `wdb warm` alone does not
+  turn the sidecar switch on (load --warm does): set_setting(db, 'on') first. Compare boards only
+  between realms with the same sidecars, the same code, and after the kernels are compiled.
+- THE CLEAN PAIR (same code, same sidecars, kernels compiled, same hour; session_2026-09-27/
+  board_url2_w4 vs board_shelf_w5): block labels cold 1.406 / hot 1.938 -> shelves cold 1.339 / hot
+  1.866. Q19 cold 138 -> 66 (ClickHouse 117). Everything else inside the noise: two block-label boards
+  of the same data two hours apart gave cold 1.401 / 1.406, hot 1.822 / 1.938 (+-6% on hot); Q16's
+  ~1,800 ms in those boards is 731-751 alone.
+- The law caught a miss from the signposts commit: wdb_blockstats._SPC (the load's signposts decoded)
+  was an unregistered module cache -- once a test left it full, every strict-qmem test after it
+  failed (424). Registered tier 1 (source data decoded: kept for hot runs, WDB_HOT_KEEP=0 drops it).
+- Final: suite 1767 passed; verify on cb_shelf1 42/43 (Q23 the known checker issue). cb_url2 (block
+  labels) still reads as before: old files carry no flag. The kit needs a fresh load --warm to take
+  the shelves; refresh /workspace/blob_base.json from it (the six tag-19 blobs + the length files).

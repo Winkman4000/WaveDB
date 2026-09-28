@@ -250,14 +250,25 @@ class Segment:
                 meta['poffs'] = np.frombuffer(buf, dtype=np.uint32, count=nfr+1, offset=off); off += 4*(nfr+1)
                 meta['cstart'] = off; meta['czlen'] = int(meta['poffs'][-1]); off += meta['czlen']
             elif code_enc == 19:               # BLOCK DICTIONARIES: per-block sorted list + local pointers
-                meta['e19bits'] = int(buf[off]); off += 1   # (no 'BR'/'boffs'/'cwidth': the enc-3 readers do not see it)
+                g19 = int(buf[off]); off += 1           # (no 'BR'/'boffs'/'cwidth': the enc-3 readers do not see it)
+                meta['e19bits'] = g19 & 0x7f
                 BR19, nb19, P19, D19 = struct.unpack_from('<IIQQ', buf, off); off += 24
                 meta['e19BR'] = int(BR19)
                 meta['e19lb'] = np.frombuffer(buf, np.uint8, nb19, off); off += nb19
                 meta['e19gw'] = np.frombuffer(buf, np.uint8, nb19, off); off += nb19
                 meta['e19dc'] = np.frombuffer(buf, np.uint32, nb19, off); off += 4 * nb19
                 meta['e19poff'] = np.frombuffer(buf, np.int64, nb19 + 1, off); off += 8 * (nb19 + 1)
-                meta['e19doff'] = np.frombuffer(buf, np.int64, nb19 + 1, off); off += 8 * (nb19 + 1)
+                if g19 & 0x80:                          # THE SHELVES: the labels by code range (wdb_encode._e19_shelved)
+                    R19, wb19, W19 = struct.unpack_from('<IIQ', buf, off); off += 16
+                    meta['e19R'] = int(R19); meta['e19wb'] = int(wb19); meta['e19W'] = int(W19)
+                    meta['e19tab'] = (off, off + 8 * (R19 + 1) + 4 * (R19 + 1) * nb19 + 4 * R19 * (nb19 + 1))
+                    meta['e19SW'] = np.frombuffer(buf, np.int64, R19 + 1, off); off += 8 * (R19 + 1)
+                    meta['e19pre'] = np.frombuffer(buf, np.uint32, (R19 + 1) * nb19, off).reshape(R19 + 1, nb19)
+                    off += 4 * (R19 + 1) * nb19
+                    meta['e19soff'] = np.frombuffer(buf, np.uint32, R19 * (nb19 + 1), off).reshape(R19, nb19 + 1)
+                    off += 4 * R19 * (nb19 + 1)
+                else:
+                    meta['e19doff'] = np.frombuffer(buf, np.int64, nb19 + 1, off); off += 8 * (nb19 + 1)
                 meta['cstart'] = off; meta['e19pn'] = int(P19) + 1; off += 8 * (int(P19) + 1)
                 meta['e19dstart'] = off; meta['e19dn'] = int(D19) + 1; off += 8 * (int(D19) + 1)
                 meta['czlen'] = off - meta['cstart']
@@ -1057,13 +1068,25 @@ class Segment:
         import wdb_kernels as _WK19, os as _os
         pw, dw = self._e19_words(c)
         BR = int(c['e19BR']); N = int(self.N); nb = int(c['e19lb'].size)
-        poff = c['e19poff']; doff = c['e19doff']
+        poff = c['e19poff']; doff = c.get('e19doff')
         cs = int(c['cstart']); ds = int(c['e19dstart'])
         cc = np.empty(N, dtype=self._e19_dtype(c))
-        pend = cs + 8 * (int(poff[nb]) + 1); dend = min(len(self.buf), ds + 8 * (int(doff[nb]) + 1))
+        pend = cs + 8 * (int(poff[nb]) + 1); dend = min(len(self.buf), ds + 8 * int(c['e19dn']))
+        shelved = 'e19R' in c
+        if shelved:                                  # THE SHELVES: a block range's labels lie on every shelf
+            sh = (np.int64(c['e19W']), np.int64(c['e19wb']), c['e19lb'], c['e19gw'], c['e19dc'], poff,
+                  c['e19pre'], c['e19soff'], c['e19SW'])
+
+            def dec(b0, b1):
+                W, wb, lb, gw, dc, po, pre, soff, SW = sh
+                _WK19.e19s_decode(pw, dw, np.int64(BR), np.int64(N), W, wb, lb, gw, dc, po, pre, soff, SW,
+                                  np.int64(b0), np.int64(b1), cc)
         if self._resident_share(cs, pend) > 0.9 and self._resident_share(ds, dend) > 0.9:
-            _WK19.e19_decode(pw, dw, np.int64(BR), np.int64(N), np.int64(c['e19bits']),
-                             c['e19lb'], c['e19gw'], c['e19dc'], poff, doff, cc)
+            if shelved:
+                dec(0, nb)
+            else:
+                _WK19.e19_decode(pw, dw, np.int64(BR), np.int64(N), np.int64(c['e19bits']),
+                                 c['e19lb'], c['e19gw'], c['e19dc'], poff, doff, cc)
             return cc
         K = max(1, min(K, nb))
         cuts = [nb * k // K for k in range(K + 1)]
@@ -1075,11 +1098,17 @@ class Segment:
             pool = _WARM[1] = ThreadPoolExecutor(max(1, len(_os.sched_getaffinity(0))))
         RUN = 8 << 20
         futs = []
+        labels = []                                  # shelved: every label word, first (all segments need them)
+        if shelved:
+            for x in range(ds, dend, RUN):
+                labels.append(pool.submit(_os.pread, fd, min(RUN, dend - x), x))
         for k in range(K):
             b0, b1 = cuts[k], cuts[k + 1]
             fk = []
-            for lo, hi in ((cs + 8 * int(poff[b0]), min(pend, cs + 8 * (int(poff[b1]) + 1))),
-                           (ds + 8 * int(doff[b0]), min(dend, ds + 8 * (int(doff[b1]) + 1)))):
+            spans = [(cs + 8 * int(poff[b0]), min(pend, cs + 8 * (int(poff[b1]) + 1)))]
+            if not shelved:
+                spans.append((ds + 8 * int(doff[b0]), min(dend, ds + 8 * (int(doff[b1]) + 1))))
+            for lo, hi in spans:
                 for x in range(lo, hi, RUN):
                     fk.append(pool.submit(_os.pread, fd, min(RUN, hi - x), x))
             futs.append(fk)
@@ -1087,10 +1116,15 @@ class Segment:
         def ro(x):
             x = np.ascontiguousarray(x, dtype=np.int64); x.setflags(write=False); return x
 
+        for f in labels:
+            f.result()
         for k in range(K):
             for f in futs[k]:
                 f.result()
             b0, b1 = cuts[k], cuts[k + 1]
+            if shelved:
+                dec(b0, b1)
+                continue
             p0 = int(poff[b0]); d0 = int(doff[b0])
             r0 = b0 * BR; r1 = min(N, b1 * BR)
             _WK19.e19_decode(pw[p0:], dw[d0:], np.int64(BR), np.int64(r1 - r0), np.int64(c['e19bits']),
@@ -1303,8 +1337,13 @@ class Segment:
             import wdb_kernels as _WK19
             pw, dw = self._e19_words(c)
             cc = np.empty(self.N, dtype=self._e19_dtype(c))
-            _WK19.e19_decode(pw, dw, np.int64(c['e19BR']), np.int64(self.N), np.int64(c['e19bits']),
-                             c['e19lb'], c['e19gw'], c['e19dc'], c['e19poff'], c['e19doff'], cc)
+            if 'e19R' in c:                          # THE SHELVES
+                _WK19.e19s_decode(pw, dw, np.int64(c['e19BR']), np.int64(self.N), np.int64(c['e19W']),
+                                  np.int64(c['e19wb']), c['e19lb'], c['e19gw'], c['e19dc'], c['e19poff'],
+                                  c['e19pre'], c['e19soff'], c['e19SW'], np.int64(0), np.int64(c['e19lb'].size), cc)
+            else:
+                _WK19.e19_decode(pw, dw, np.int64(c['e19BR']), np.int64(self.N), np.int64(c['e19bits']),
+                                 c['e19lb'], c['e19gw'], c['e19dc'], c['e19poff'], c['e19doff'], cc)
             self._codes[nm] = cc; return cc
         if _pipe3:
             cc = self._e3_pipelined(c)
@@ -1434,8 +1473,23 @@ class Segment:
         starts = np.concatenate(([0], np.flatnonzero(blk[1:] != blk[:-1]) + 1, [rs.size])).astype(np.int64)
         out = np.empty(rs.size, np.int64)
         pw, dw = self._e19_words(c)
-        _WK19.e19_gather(pw, dw, np.int64(BR), np.int64(c['e19bits']), c['e19lb'], c['e19gw'],
-                         c['e19dc'], c['e19poff'], c['e19doff'], rs, starts, out)
+        if 'e19R' in c:                              # THE SHELVES
+            # a block asked for few rows reads, per row, one piece of one shelf (PER_ROW); more rows,
+            # its label shelf after shelf. Cold, the tables (a few MB, halved per row) come in by
+            # parallel reads first; and when the rows would touch more pieces than there are shelves
+            # -- more scattered faults than one parallel read of the whole labels costs -- the labels too
+            R = int(c['e19R']); PER_ROW = 256
+            per_blk = np.diff(starts)
+            pieces = int(np.where(per_blk > PER_ROW, R, np.minimum(per_blk, R)).sum())
+            self.warm_span(*c['e19tab'])
+            if pieces > R:
+                ds = int(c['e19dstart']); self.warm_span(ds, min(len(self.buf), ds + 8 * int(c['e19dn'])))
+            _WK19.e19s_gather(pw, dw, np.int64(BR), np.int64(c['e19W']), np.int64(c['e19wb']), c['e19lb'],
+                              c['e19gw'], c['e19poff'], c['e19pre'], c['e19soff'], c['e19SW'], rs, starts, out,
+                              np.int64(PER_ROW))
+        else:
+            _WK19.e19_gather(pw, dw, np.int64(BR), np.int64(c['e19bits']), c['e19lb'], c['e19gw'],
+                             c['e19dc'], c['e19poff'], c['e19doff'], rs, starts, out)
         if order is not None:
             res = np.empty_like(out); res[order] = out; out = res
         return out.astype(self._e19_dtype(c))
@@ -2525,7 +2579,7 @@ class Segment:
                     _io1.BytesIO(memoryview(self.buf)[c['cstart']:c['cstart'] + c['czlen']])).read(need1), dtype=wdt1)
                 return raw1[rows]
         _sc = self.__dict__.get('_scan_codes')
-        if _sc is not None and nm in _sc and c.get('code_enc', 0) in (3, 18) and nm not in self._codes:
+        if _sc is not None and nm in _sc and c.get('code_enc', 0) in (3, 18, 19) and nm not in self._codes:
             # THE SCANNED CODES: a frame scan on this column kept its codes at the hit positions; a
             # gather over those positions (or a subset of them) is a lookup, not 1,526 decompressions
             _sp, _scc = _sc[nm]

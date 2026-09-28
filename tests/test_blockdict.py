@@ -188,3 +188,139 @@ def test_election_takes_it_within_slack_and_not_beyond():
     skew = np.minimum(rng.zipf(1.4, n), 5000) - 1         # skewed mid-V, no runs: zstd's entropy wins
     sec = wdb_encode._code_section(skew, 13)
     assert sec[0] in (1, 3, 18), sec[0]                   # an inflating dress, and enc 19 did not take it
+
+
+# ---- THE SHELVES (Jackson, 2026-09-27): the same labels laid out by code range ----
+
+def _shelved_parts(sec):
+    """the arrays of a shelved tag-19 section (mirrors the Segment header parse)"""
+    import struct
+    b = np.frombuffer(sec, np.uint8)
+    assert b[0] == 19 and b[1] & 0x80
+    BR, nb, P, D = struct.unpack_from('<IIQQ', sec, 2); o = 26
+    lb = b[o:o + nb]; o += nb
+    gw = b[o:o + nb]; o += nb
+    dc = np.frombuffer(sec, np.uint32, nb, o); o += 4 * nb
+    poff = np.frombuffer(sec, np.int64, nb + 1, o); o += 8 * (nb + 1)
+    R, wb, W = struct.unpack_from('<IIQ', sec, o); o += 16
+    SW = np.frombuffer(sec, np.int64, R + 1, o); o += 8 * (R + 1)
+    pre = np.frombuffer(sec, np.uint32, (R + 1) * nb, o).reshape(R + 1, nb); o += 4 * (R + 1) * nb
+    soff = np.frombuffer(sec, np.uint32, R * (nb + 1), o).reshape(R, nb + 1); o += 4 * R * (nb + 1)
+    pw = np.frombuffer(sec, np.uint64, P + 1, o); o += 8 * (P + 1)
+    dw = np.frombuffer(sec, np.uint64, D + 1, o); o += 8 * (D + 1)
+    assert o == len(sec), (o, len(sec))
+    return BR, nb, lb, gw, dc, poff, R, np.int64(wb), np.int64(W), SW, pre, soff, pw, dw
+
+
+@contextlib.contextmanager
+def _shelves(R):
+    os.environ['WDB_E19_SHELVES'] = str(R)
+    try: yield
+    finally: os.environ.pop('WDB_E19_SHELVES', None)
+
+
+def test_shelves_kernels_roundtrip_every_width():
+    """the shelved section decodes to the codes, gathers any rows, and finds every code's blocks exactly
+    as a brute-force search does -- every width, several shelf counts, one-code blocks, the widest gap"""
+    import wdb_kernels as K
+    rng = np.random.default_rng(11)
+    for bits in (1, 5, 9, 17, 25, 32):
+        top = (1 << bits) - 1
+        for R in (2, 7, 64):
+            n = 3 * 16384 + 17
+            a = rng.integers(0, top + 1, n, dtype=np.int64)
+            a[16384:2 * 16384] = top; a[0] = 0; a[1] = top
+            with _shelves(R):
+                sec = wdb_encode._e19_candidate(a, bits, float('inf'))
+            BR, nb, lb, gw, dc, poff, R_, wb, W, SW, pre, soff, pw, dw = _shelved_parts(sec)
+            assert R_ == R
+            out = np.empty(n, np.int64)
+            K.e19s_decode(pw, dw, np.int64(BR), np.int64(n), W, wb, lb, gw, dc, poff, pre, soff, SW,
+                          np.int64(0), np.int64(nb), out)
+            assert np.array_equal(out, a), (bits, R)
+            rows = np.sort(rng.choice(n, 999, replace=False)).astype(np.int64); blk = rows // BR
+            starts = np.concatenate(([0], np.flatnonzero(blk[1:] != blk[:-1]) + 1, [rows.size])).astype(np.int64)
+            for per_row in (0, 1 << 30):                # the whole label per block / straight to each row's piece
+                g = np.empty(rows.size, np.int64)
+                K.e19s_gather(pw, dw, np.int64(BR), W, wb, lb, gw, poff, pre, soff, SW, rows, starts, g, np.int64(per_row))
+                assert np.array_equal(g, a[rows]), (bits, R, per_row)
+            lid = np.empty(nb, np.int64)
+            for t in {0, top, int(a[5]), int(a[-1]), int(rng.integers(0, top + 1)), top + 1}:
+                K.e19s_eq_blocks(dw, W, wb, gw, pre, soff, SW, np.int64(t), np.int64(0), np.int64(nb), lid)
+                for b in range(nb):
+                    lab = np.unique(a[b * BR:(b + 1) * BR]); j = np.searchsorted(lab, t)
+                    want = j if (j < lab.size and lab[j] == t) else -1
+                    assert lid[b] == want, (bits, R, t, b)
+
+
+_FIXS = None
+def _fixture_shelved():
+    """the fixture's table again, its tag-19 labels on 7 shelves"""
+    global _FIXS
+    if _FIXS is None:
+        seg, w, pq, df = _fixture()
+        with _force19(), _shelves(7):
+            s2, w2, pq2 = _enc(df)
+        _FIXS = (s2, w2, pq2, df, w)
+    return _FIXS
+
+
+def test_shelved_column_matches_the_block_layout():
+    """full decode (hot, and the cold pipelined read), point reads, ranges, and the label scan of a
+    shelved column all equal the block-layout column's"""
+    import wdb_wherescan
+    s2, w2, pq2, df, w1 = _fixture_shelved()
+    c = s2.cols['user']
+    assert c['code_enc'] == 19 and c.get('e19R') == 7 and 'e19doff' not in c
+    full = np.asarray(Segment(w1)._raw_codes('user')).astype(np.int64)
+    assert np.array_equal(np.asarray(Segment(w2)._raw_codes('user')).astype(np.int64), full)
+    fd = os.open(w2, os.O_RDONLY); os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED); os.close(fd)
+    sg = Segment(w2)
+    assert np.array_equal(np.asarray(sg._e19_pipelined(sg.cols['user'])).astype(np.int64), full)
+    got = np.array([x.decode() for x in Segment(w2).values('user')])
+    assert np.array_equal(got, df['user'].to_numpy())
+    BR = int(c['e19BR']); N = s2.N; rng = np.random.default_rng(5)
+    for rows in (np.sort(rng.choice(N, 3000, replace=False)), np.array([5, 3, BR + 4, 1, N - 1]),
+                 rng.choice(N, 20_000), np.array([], dtype=np.int64)):
+        assert np.array_equal(np.asarray(Segment(w2).codes_at('user', rows)).astype(np.int64), full[rows])
+    for lo, hi in ((0, 10), (BR - 6, BR + 6), (100_000, 180_000), (N - 10, N)):
+        assert np.array_equal(np.asarray(Segment(w2)._raw_codes_range('user', lo, hi)).astype(np.int64), full[lo:hi])
+    V = int(c['V'])
+    present = full[rng.integers(0, N, 20)]
+    absent = sorted(set(range(V)) - set(np.unique(full).tolist()))[:5]
+    for k in sorted(set(present.tolist()) | {0, V - 1, int(full[0]), int(full[-1]), int(full[BR])}) + absent:
+        for lo, hi in ((0, N), (BR - 5, 2 * BR + 5), (123, 124), (N - 3, N)):
+            got = wdb_wherescan._scan_eq19(Segment(w2), 'user', int(k), lo, hi)
+            assert got is not None and np.array_equal(got, lo + np.flatnonzero(full[lo:hi] == k)), (k, lo, hi)
+
+
+def test_shelved_queries_match_duck():
+    s2, w2, pq2, df, w1 = _fixture_shelved()
+    con = duckdb.connect()
+    lit = df['user'].iloc[123_456]; lit2 = df['user'].iloc[7]
+    for sql in [f"SELECT COUNT(*) FROM TBL WHERE user = '{lit}'",
+                f"SELECT k, COUNT(*) FROM TBL WHERE user = '{lit}' GROUP BY k ORDER BY k",
+                f"SELECT COUNT(*) FROM TBL WHERE user IN ('{lit}', '{lit2}')",
+                "SELECT COUNT(*) FROM TBL WHERE user = 'no-such-user'",
+                "SELECT user, COUNT(*) FROM TBL GROUP BY user ORDER BY 2 DESC, 1 LIMIT 10",
+                "SELECT COUNT(DISTINCT user) FROM TBL",
+                "SELECT MIN(user), MAX(user) FROM TBL WHERE k = 3"]:
+        duck = sorted(con.execute(sql.replace('TBL', f"'{pq2}'")).fetchall())
+        rows, _ = wdb_sql.execute(Segment(w2), sql.replace('TBL', 'tbl'))
+        assert sorted(tuple(x.decode() if isinstance(x, bytes) else x for x in r) for r in rows) == duck, sql
+
+
+def test_codes_at_after_a_label_scan():
+    """the label scan leaves the code at its hit rows; codes_at over those rows answers from them (no
+    label decode), and rows it did not see still decode -- both layouts"""
+    import wdb_wherescan
+    s2, w2, pq2, df, w1 = _fixture_shelved()
+    for w in (w1, w2):
+        full = np.asarray(Segment(w)._raw_codes('user')).astype(np.int64)
+        k = int(full[123_456])
+        sg = Segment(w)
+        pos = wdb_wherescan._scan_eq19(sg, 'user', k, 0, sg.N)
+        assert pos.size and '_scan_codes' in sg.__dict__
+        assert np.array_equal(np.asarray(sg.codes_at('user', pos)).astype(np.int64), np.full(pos.size, k))
+        other = np.array([0, 1, 250_000], np.int64)
+        assert np.array_equal(np.asarray(sg.codes_at('user', other)).astype(np.int64), full[other])
