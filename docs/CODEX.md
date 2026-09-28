@@ -3081,3 +3081,20 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   load it outlived the load into the next query (45 strict tests after it failed), and it could
   misprice a later load of another file with the same column names. Now it is cleared when pricing
   starts and when the streaming load returns. Load output unchanged (a load process starts it empty).
+
+## 2026-09-28 -- SELECT * IN THE TABLE'S OWN COLUMN ORDER (Q23)
+- Cause: a segment keeps its columns in the order the load's jobs finished (seg.order is the file's
+  order; FD columns index into it, so it must not be reordered), and bin/wdb load wrote the catalog
+  schema from seg.order. SELECT * listed the columns that way on every read.
+- NOW: (1) the load writes the schema in the INPUT's order (wdb_encode.input_column_order: parquet or
+  CSV names; the segment's order when they do not name exactly the stored columns). (2) Database.run
+  lays a bare * over one table out in the catalog's order, once, whichever read served it
+  (_star_in_declared_order: names permuted only when they are the schema's own set). (3) The general
+  row projection (wdb_sql.execute) expands a bare * into the table's columns -- SELECT * ... LIMIT and
+  * with a multi-key ORDER BY raised "unsupported node Star" before.
+- The three kits' catalogs (cb_kit0928, cb_shelf1, cb_url2) rewritten in the parquet's order
+  (/workspace/fixorder.py; each old catalog kept as catalog.json.bak0928). Q23 now equals DuckDB
+  position by position.
+- tests/test_star_order.py: input_column_order (parquet, CSV, mismatch, missing file); seven * shapes
+  under the input order and under a deliberately different declared order, names and rows positional
+  against DuckDB; bin/wdb load itself writes the input order.

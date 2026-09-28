@@ -2103,6 +2103,23 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
                 sizes=sizes, cluster=None)
 
 
+def input_column_order(input_path, names):
+    """the input file's own column order for the columns a load stored (a segment keeps them in the
+    order their jobs finished): the table's declared order, which SELECT * answers in. The segment's
+    order when the input's cannot be read or does not name exactly these columns."""
+    names = list(names)
+    try:
+        import pyarrow.parquet as _pq
+        ins = list(_pq.ParquetFile(input_path).schema_arrow.names)
+    except Exception:
+        try:
+            import pyarrow.csv as _pc
+            ins = list(_pc.open_csv(input_path).schema.names)
+        except Exception:
+            return names
+    return ins if sorted(ins) == sorted(names) else names
+
+
 def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_specs=None, cluster_by=None, cubes=None, stream=False, date_pairs=None, casts=None):
     """fd_specs: optional {dependent_col: determinant_col} — store the dependent column as
     a mode-3 FD-reference into the determinant (lossless iff the FD is exact; callers pass

@@ -1188,6 +1188,11 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
 
     # ---- projections / shape ----
     proj = tree.expressions  # list of selected exprs
+    if len(proj) == 1 and isinstance(proj[0], E.Star) and tree.args.get('group') is None:
+        # A BARE * is every column of the table, in its declared order (the schema view's col_map is
+        # built in catalog order; a direct Segment has only its own). The row projection below took
+        # only named columns: SELECT * ... LIMIT and * with a multi-key ORDER BY raised.
+        proj = [E.column(c) for c in (list(col_map) if col_map else list(seg.order))]
     group = tree.args.get('group')
     rowexpr_nodes = {}
     gkeys_raw = [ _group_key(g, proj, node_sink=rowexpr_nodes) for g in group.expressions ] if group else []

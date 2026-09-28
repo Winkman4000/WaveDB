@@ -52,7 +52,8 @@ def _load(df, R=7):
     seg = Segment(out)
     cat = Catalog.open(d)
     tn = {0: 'int', 1: 'str', 2: 'float'}
-    cat.data['tables']['hits'] = {'schema': [[c, tn.get(seg.cols[c].get('dt'), 'str')] for c in seg.order],
+    cat.data['tables']['hits'] = {'schema': [[c, tn.get(seg.cols[c].get('dt'), 'str')]
+                                             for c in wdb_encode.input_column_order(pq, seg.order)],
                                   'segments': ['hits_0.wdb'], 'mode': 'segment'}
     cat.save()
     return d, pq, seg

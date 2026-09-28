@@ -670,6 +670,8 @@ class Database:
                     raise
             if _bill9 and self._qdepth == 1:
                 print('RUN BILL: impl=%.0fms' % ((_t9.perf_counter() - _r0) * 1000), flush=True)
+            if self._qdepth == 1:
+                r9 = self._star_in_declared_order(sql, r9)
             return r9
         finally:
             self._qdepth -= 1
@@ -680,6 +682,33 @@ class Database:
                 if _bill9:
                     print('RUN BILL: qmem-flush=%.0fms' % ((_t9.perf_counter() - _f0) * 1000), flush=True)
                 wdb_sidecar.sentinel_after(self.cat.dbdir)   # a newborn under an off switch is a missed gate
+
+    def _star_in_declared_order(self, sql, res):
+        """SELECT * ANSWERS IN THE TABLE'S OWN COLUMN ORDER (2026-09-28): a segment's columns sit in
+        the order the load finished them (seg.order is the file's order, and FD columns index into
+        it), and every read that serves a bare * listed them that way -- Q23's ten rows were right
+        value for value, in the wrong column order. The table's declared order is the catalog's
+        schema (written in the input's order at load); a bare * over one table is laid out in it
+        here, once, for whichever read served the query."""
+        try:
+            if not (isinstance(res, tuple) and len(res) == 2 and isinstance(res[1], (list, tuple))):
+                return res
+            tree = _parse_sql_cached(sql)
+            if not isinstance(tree, E.Select) or len(tree.expressions) != 1 \
+                    or not isinstance(tree.expressions[0], E.Star) or tree.args.get('joins'):
+                return res
+            frm = tree.args.get('from') or tree.args.get('from_')
+            if frm is None or not isinstance(frm.this, E.Table):
+                return res
+            decl = self.cat.column_names(frm.this.name)
+            rows, names = res
+            names = list(names)
+            if names == decl or sorted(names) != sorted(decl) or len(set(names)) != len(names):
+                return res
+            perm = [names.index(c) for c in decl]
+            return [tuple(r[i] for i in perm) for r in rows], list(decl)
+        except Exception:
+            return res
 
     def _run_impl(self, sql, escalate=None):
         esc = self.escalate if escalate is None else escalate

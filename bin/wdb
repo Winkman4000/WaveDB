@@ -119,8 +119,9 @@ def cmd_load(a):
     def tname(c):
         m = seg.cols[c]
         return {0: 'int', 1: 'str', 2: 'float', 3: ('date' if seg.unit(c) == 'D' else 'timestamp')}.get(m.get('dt'), 'str')
-    if existing is None:
-        cat.data['tables'][a.table] = {'schema': [[c, tname(c)] for c in seg.order], 'segments': [seg_name], 'mode': 'segment'}
+    if existing is None:                         # the table's columns in the INPUT's order (SELECT * answers in it)
+        cat.data['tables'][a.table] = {'schema': [[c, tname(c)] for c in wdb_encode.input_column_order(a.file, seg.order)],
+                                       'segments': [seg_name], 'mode': 'segment'}
     else:
         existing['segments'].append(seg_name)
     cat.save()
