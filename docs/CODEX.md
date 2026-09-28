@@ -3047,3 +3047,18 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
 - Final: suite 1767 passed; verify on cb_shelf1 42/43 (Q23 the known checker issue). cb_url2 (block
   labels) still reads as before: old files carry no flag. The kit needs a fresh load --warm to take
   the shelves; refresh /workspace/blob_base.json from it (the six tag-19 blobs + the length files).
+
+## 2026-09-28 (early) -- THE KIT WITH SHELVES (cb_kit0928)
+- Three kit loads died silently at ~1-2 minutes: the pod's /workspace QUOTA was full (df shows the
+  whole MooseFS volume's free space, not the pod's quota; `dd ... conv=fsync` reports "Disk quota
+  exceeded"). Jackson raised it by 200 GB. Two traps found on the way: an orphaned true_cold run on
+  the directory being loaded opens the database, and Database.open sweeps *.partial files (crash
+  recovery) -- it swept the in-progress segment; and `pkill -f PATTERN` over ssh kills the ssh's own
+  shell (its command line holds the pattern) -- kill by PID.
+- cb_kit0928: load 267.4 s + warm 39.8 s. Every column blob and load file IDENTICAL to cb_shelf1 (the
+  load is deterministic); /workspace/blob_base.json refreshed from it (the old one kept as
+  blob_base_0926.json). Verify 42/43 (Q23 the known checker issue).
+- True-cold board on the kit: cold WaveDB 1.38 (Umbra 1.96, ClickHouse 2.55, DuckDB 3.91), 24 wins of
+  43; hot Umbra 1.51, WaveDB 1.90 (ClickHouse 4.11, DuckDB 4.40). This morning: cold 1.43, hot 2.07.
+  Top losers now: cold Q41/Q40/Q36/Q38/Q42 (the CounterID = 62 family), Q30/Q35 (ClientIP groups),
+  Q6; hot Q22/Q21 (URL LIKE + MIN), Q40, Q30, Q35.
