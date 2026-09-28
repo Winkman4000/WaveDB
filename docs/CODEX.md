@@ -3062,3 +3062,22 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   43; hot Umbra 1.51, WaveDB 1.90 (ClickHouse 4.11, DuckDB 4.40). This morning: cold 1.43, hot 2.07.
   Top losers now: cold Q41/Q40/Q36/Q38/Q42 (the CounterID = 62 family), Q30/Q35 (ClientIP groups),
   Q6; hot Q22/Q21 (URL LIKE + MIN), Q40, Q30, Q35.
+- MORE ROBUST TESTS before the push (tests/test_shelves_db.py): the shelves through the kit's own load
+  path (streaming encode, workers) into a real Database, every query through Database.run under the
+  strict qmem law, with NULLs in the column, each query twice (cold then warm), all against DuckDB;
+  INSERT + DELETE in segment mode (the re-encoded column stays shelved) against DuckDB over the same
+  rows; the shelf-count rule; the table span warm_span reads (e19tab) covers exactly SW, pre, soff.
+- They found a bug that is not the shelves': COUNT(text column) raised in wdb_join._exact_scalar (it
+  built the integer value table for every COUNT; _int_table fails on a text dictionary). Now COUNT of a
+  non-integer column counts the codes below the dictionary's end (NULL is code V - 1). Same answer on
+  both label layouts. tests/test_count_textcol.py (text, float, date; with and without NULLs) fails on
+  the old code, passes now.
+- Q23 IS NOT A CHECKER ISSUE: its 10 rows equal DuckDB's column by column, but SELECT * returns the
+  columns in the load's internal order (every kit: cb_url2, cb_shelf1, cb_kit0928 -- the catalog
+  schema is written from seg.order), not the parquet's. verify_correctness hashes rows positionally,
+  so Q23 reads WRONG. Open: write the table's schema in the input's column order.
+- The new Database tests also woke the law on wdb_encode._TEXT_BYTES (each text column's size from the
+  input's parquet metadata, filled while pricing a streaming load, never cleared): after an in-process
+  load it outlived the load into the next query (45 strict tests after it failed), and it could
+  misprice a later load of another file with the same column names. Now it is cleared when pricing
+  starts and when the streaming load returns. Load output unchanged (a load process starts it empty).

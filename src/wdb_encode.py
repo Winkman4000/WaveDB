@@ -1695,6 +1695,7 @@ def _column_cost(input_path, cols, reader, N):
     tail, while the layout-only ones (flags, sequences, narrow codes) fill the gaps. Cost is
     estimated from the schema and a sample, never from a full read."""
     est = {}
+    _TEXT_BYTES.clear()                          # this load's text sizes only (never a previous file's)
     try:
         import pyarrow.parquet as pq
         pf = pq.ParquetFile(input_path)
@@ -2112,7 +2113,10 @@ def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_s
     fd_specs = fd_specs or {}
     t0 = time.time()
     if stream and not fd_specs:                      # the streaming encoder carries cluster_by (a shared permutation)
-        return _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0, casts=casts, cluster_by=cluster_by)
+        try:
+            return _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0, casts=casts, cluster_by=cluster_by)
+        finally:
+            _TEXT_BYTES.clear()                      # load planning state dies with the load (the qmem law's witness)
     coldata, N, cols = wdb_read.read_columns(input_path, columns, reader=reader)
     cluster_meta = None
     if cluster_by is not None:

@@ -227,6 +227,11 @@ def _exact_scalar(db, tree):
             else:
                 row.append(XI.exact_avg(XI.fold_values(v), int(v.size)))
             continue
+        if kind == 'COUNT' and c.get('dt') != 0:
+            # COUNT(text/float column): the non-null codes are the dictionary's own (a NULL is the
+            # last code, V - 1) -- no value table needed; _int_table on a text dict raised
+            cn = counts_of(col, int(c['V']) - (1 if c.get('has_null') else 0))
+            row.append(int(cn.sum())); continue
         tab = WN._int_table(seg, col)
         cn = counts_of(col, tab.size)
         if kind == 'COUNT':
