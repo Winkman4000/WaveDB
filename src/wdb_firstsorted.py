@@ -70,18 +70,30 @@ def detect(seg, tree, col_map):
             'proj': tree.expressions}
 
 
+def _planes_head(seg, p, K):
+    """the first >= K present rows and their codes, and how many the column holds: from the head
+    chunks only when the dress allows it (tag 8: Segment.e8_head), else the full planes"""
+    import os
+    h = seg.e8_head(p, K) if (hasattr(seg, 'e8_head') and os.environ.get('WDB_E8_HEAD', '1') != '0') else None
+    if h is not None:
+        return h
+    pl = seg.e8_planes(p)
+    pos = np.asarray(pl[0], dtype=np.int64)
+    return pos, np.asarray(pl[1], dtype=np.int64), int(pos.size)
+
+
 def execute(seg, spec):
     global _HITS
-    pl = seg.e8_planes(spec['p'])
-    pos = np.asarray(pl[0], dtype=np.int64)
-    lits = np.asarray(pl[1], dtype=np.int64)
-    k = min(spec['k'], pos.size)
     if not spec['tie']:
+        pos, lits, n_all = _planes_head(seg, spec['p'], spec['k'])
+        k = min(spec['k'], pos.size)
         pick = lits[:k]                          # file order IS et order (Q24)
     else:
         steps = np.asarray(seg.stairs(spec['o']), dtype=np.int64)
-        K = max(64, 4 * k)
+        K = max(64, 4 * spec['k'])
         while True:
+            pos, lits, n_all = _planes_head(seg, spec['p'], K)   # THE HEAD: only the chunks the window needs
+            k = min(spec['k'], pos.size)
             K9 = min(K, pos.size)
             cand_pos = pos[:K9]
             etc = np.searchsorted(steps, cand_pos, side='right')   # et code, no decode
@@ -89,14 +101,12 @@ def execute(seg, spec):
             pick = lits[:K9][order[:k]]
             # THE CERTIFICATE: the window is complete when the last candidate's
             # et strictly clears the k-th chosen row's et (or the file is spent)
-            if K9 >= pos.size or (k and int(etc[K9 - 1]) > int(etc[order[k - 1]])):
+            if K9 >= n_all or (k and int(etc[K9 - 1]) > int(etc[order[k - 1]])):
                 break
             K *= 4
-    out = []
-    for code in pick.tolist():
-        v9 = seg.fetch(spec['p'], int(code))     # THE pluck
-        if isinstance(v9, (bytes, bytearray)):
-            v9 = v9.decode('utf-8', 'replace')
-        out.append((v9,))
+    # THE pluck: k values in one batch -- values_at pops the touched dictionary chunks in parallel
+    # (ten point fetches were ~20 serial reads + inflates, ~50 ms of the cold run)
+    out = [(v9.decode('utf-8', 'replace') if isinstance(v9, (bytes, bytearray)) else v9,)
+           for v9 in seg.values_at(spec['p'], np.asarray(pick, dtype=np.int64))]
     _HITS += 1
     return out, [wdb_sql._alias(p) for p in spec['proj']]

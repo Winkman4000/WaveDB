@@ -2336,6 +2336,40 @@ class Segment:
         pm[nm] = res
         return res
 
+    def e8_head(self, nm, k):
+        """THE HEAD OF THE PLANES (2026-09-29): the first k (or a few more) present rows of a
+        sparse-default (tag 8) column and their codes, from the head chunks only -- (pos, lits, n_all).
+        A chunk's checkpoint is the rank at its start, so chunks [0, e) hold ck[e] present rows and
+        their literals are the first ck[e] of the lane: e is the first checkpoint >= k. Plain numpy
+        (no kernel to load cold). ORDER BY a staircase LIMIT k (Q24/Q26) wanted the first ~64 of
+        13.2M; e8_planes decoded all of them (~90-110 ms cold). The full planes when already decoded,
+        or when the head would be the whole column. None for any other column."""
+        c = self.cols.get(nm)
+        if c is None or c.get('code_enc', 0) != 8:
+            return None
+        n_all = int(c['e8n'])
+        hit = self.__dict__.get('_e8pm', {}).get(nm)
+        if hit is not None:
+            return np.asarray(hit[0], dtype=np.int64), np.asarray(hit[1], dtype=np.int64), n_all
+        nck = (self.N + 65535) >> 16
+        ck = np.frombuffer(self.buf, np.uint64, nck, c['e8ck']).astype(np.int64)
+        e = int(np.searchsorted(ck, min(int(k), n_all), side='left'))
+        if e >= nck or e > max(1, nck // 16):    # a big head: the parallel full decode is the faster read
+            # (measured: a 1M-row head in numpy 79 ms; all 13.2M rows by the kernels ~90 ms cold)
+            pl = self.e8_planes(nm)
+            return np.asarray(pl[0], dtype=np.int64), np.asarray(pl[1], dtype=np.int64), n_all
+        row_end = e << 16; nlit = int(ck[e])
+        pb = np.frombuffer(self.buf, np.uint8, row_end >> 3, c['e8pres'])
+        pos = np.flatnonzero(np.unpackbits(pb)).astype(np.int64)            # MSB-first, as e8_pos
+        assert pos.size == nlit, ('e8 head: presence bits disagree with the checkpoint', pos.size, nlit)
+        bits = int(c['e8bits'])
+        lits = np.zeros(nlit, dtype=np.int64)
+        if nlit and bits:
+            lb = np.frombuffer(self.buf, np.uint8, (nlit * bits + 7) // 8, c['cstart'])
+            lane = np.unpackbits(lb)[:nlit * bits].reshape(nlit, bits).astype(np.int64)
+            lits = lane @ (np.int64(1) << np.arange(bits - 1, -1, -1, dtype=np.int64))   # MSB-first, as unpack_any
+        return pos, lits, n_all
+
     def _raw_codes_range(self, nm, lo, hi):
         """Per-row codes for rows [lo, hi) ONLY. Raw bit-packed columns (code_enc 0) touch just
         the covering bytes -- the narrow-before-expand read. mode 4/6 are positional (free slice).

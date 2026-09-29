@@ -3098,3 +3098,27 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
 - tests/test_star_order.py: input_column_order (parquet, CSV, mismatch, missing file); seven * shapes
   under the input order and under a deliberately different declared order, names and rows positional
   against DuckDB; bin/wdb load itself writes the input order.
+
+## 2026-09-29 -- FENCE-RIDER RECON; Q24/Q26: THE HEAD OF THE PLANES
+- Recon (this host, load ~15; cProfile, fresh process per query): Q0/Q1 hot are at the floor without
+  the profiler (Q0 1.0-1.2 ms vs Umbra 1; Q1 2.1-2.2 vs ClickHouse 1; drop_derived 0.17 ms, qmem flush
+  0.17, parse 0.02) -- last night's board had them at 2/4 ms under load ~80. Q14 (pairfold): two
+  numpy argsorts 123-136 ms hot and cold, np.diff 127 ms of page faults cold. Q16 (tripletop): two
+  _hist_par ~150 ms, UserID decode 52 hot / 108 cold. Q24/Q26 (firstsorted): ~90-110 ms of ~225 cold
+  in e8_planes -- all 13.2M present rows of SearchPhrase decoded to find the first ~64.
+- NOW: Segment.e8_head(nm, k): a tag-8 column's first >= k present rows and their codes from the head
+  chunks only (a chunk's checkpoint is the rank at its start: chunks [0, e) hold ck[e] present rows,
+  whose literals are the lane's first ck[e]). Plain numpy, no kernel to load cold. The full planes
+  when already decoded (hot), or when the head passes 1/16 of the column (a 1M-row head in numpy is
+  79 ms; the parallel kernels decode all 13.2M in ~90). wdb_firstsorted reads through it (the Q26
+  window widens through it), and plucks its k values in one values_at batch (the touched dictionary
+  chunks popped in parallel) instead of k point fetches (~20 serial reads + inflates, ~50 ms cold).
+  WDB_E8_HEAD=0 restores the full decode.
+- Same-hour A/B (true cold, 3 runs): Q24 cold 182-194 -> 32-43 ms (DuckDB 184 best), Q26 174-255 ->
+  31-38 ms (Umbra 148 best); hot Q24 19 -> 8-9, Q26 20-34 -> 8-10; cold read 56.3 -> ~5.6 MB.
+- tests/test_firstsorted.py (the read had no test): the head against the full planes for many k; the
+  Q24 shape (a unique answer: et spans 4 rows, one of which may hold a phrase) and the Q26 shape (et
+  ties, the p tiebreak) for LIMIT 1..20000 against DuckDB; firstsorted must serve; small windows must
+  not decode the full planes; the same answers with WDB_E8_HEAD=0. The suite runs with
+  WDB_SEQ_NARROW_OK=1, which turns a sorted toy et into a sequence instead of a staircase: the test
+  encodes with it off, as the kit loads.
