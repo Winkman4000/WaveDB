@@ -106,6 +106,8 @@ def _pick(seg, weq):
         return None
     if not _PICK[0]:
         return ok[0] if ok[0] == weq[0] else None
+    if len(ok) == 1:
+        return ok[0]                             # one candidate: no census to consult (~20 ms cold, Q36-Q42)
     return min(ok, key=lambda cv: _est_rows(seg, cv[0], cv[1]))
 
 
@@ -269,14 +271,33 @@ def _compile_key(seg, expr, cm):
     return None
 
 
-def _key_eval(seg, plan, crumb):
+def _at_memo(seg):
+    """codes_at for ONE query: a column read twice at the same rows decodes once (Q39: SearchEngineID
+    and AdvEngineID feed the CASE and are keys themselves -- the same 722,688 rows, ~27 ms twice).
+    A local of execute, so it dies with the query. Keyed by the rows array itself (held, so its id
+    cannot be reused); callers never write into what it returns."""
+    memo = {}
+
+    def at(col, rows):
+        hit = memo.get((col, id(rows)))
+        if hit is not None and hit[0] is rows:
+            return hit[1]
+        r = seg.codes_at(col, rows)
+        memo[(col, id(rows))] = (rows, r)
+        return r
+    return at
+
+
+def _key_eval(seg, plan, crumb, at=None):
     """Codes for a compiled key at the crumb -- pure numpy, no values."""
+    if at is None:
+        at = seg.codes_at
     if plan['kind'] == 'col':
-        return np.asarray(seg.codes_at(plan['col'], crumb)).astype(np.int64)
+        return np.asarray(at(plan['col'], crumb)).astype(np.int64)
     mask = np.ones(crumb.size, bool)
     for cn9, v9, eq9 in plan['conds']:
         c9 = _code_of(seg, cn9, v9)
-        fc = np.asarray(seg.codes_at(cn9, crumb))
+        fc = np.asarray(at(cn9, crumb))
         if c9 is None:
             m9 = np.zeros(crumb.size, bool) if eq9 else np.ones(crumb.size, bool)
         else:
@@ -285,7 +306,7 @@ def _key_eval(seg, plan, crumb):
     V9 = int(seg.cols[plan['col']]['V'])
     def _side(b9, tok):
         if b9[0] == 'col':
-            return np.asarray(seg.codes_at(b9[1], crumb)).astype(np.int64)
+            return np.asarray(at(b9[1], crumb)).astype(np.int64)
         return np.full(crumb.size, V9 + tok, np.int64)
     return np.where(mask, _side(plan['then'], 0), _side(plan['els'], 1))
 
@@ -561,7 +582,10 @@ def execute(seg, spec):
     if code is None or wlo >= whi:
         crumb = np.empty(0, np.int64)
     else:
-        crumb = positions(seg, scol, code, wlo, whi, blocks=_eq_blocks(seg, spec))
+        # THE REGION only narrows the vanilla scan -- the position lists ignore it, so its three
+        # load-statistics reads are paid only when the scan will run (4-6 ms hot, Q36-Q41)
+        crumb = positions(seg, scol, code, wlo, whi,
+                          blocks=None if plist_ready(seg, scol) else _eq_blocks(seg, spec))
     _LG.stage('crumb', (_tm.perf_counter() - _t9) * 1000); _t9 = _tm.perf_counter()
     # hygiene at the crumb: point reads, never the column. When the first
     # two flags are enc-10 scalar tests, ONE fused walk serves both with
@@ -1181,13 +1205,14 @@ def execute(seg, spec):
     if _pg_plans is not None:
         import wdb_kernels as _WK
         cr9 = np.ascontiguousarray(crumb)
+        at9 = _at_memo(seg)
 
         def _field(p9, b9):
             if p9['kind'] != 'col':
-                return _key_eval(seg, p9, cr9)
+                return _key_eval(seg, p9, cr9, at9)
             kc9 = seg.cols[p9['col']]
             if kc9.get('code_enc') != 12:
-                return np.asarray(seg.codes_at(p9['col'], cr9)).astype(np.int64)
+                return np.asarray(at9(p9['col'], cr9)).astype(np.int64)
             nw9 = int(kc9['nwords'])
             pl9 = seg.vplanes(p9['col'])
             blo9 = int(cr9[0]); bhi9 = int(cr9[-1]) + 1
@@ -1295,8 +1320,9 @@ def execute(seg, spec):
         shifts = np.cumsum([0] + widths[::-1])[:-1][::-1]
         key = np.zeros(crumb.size, np.int64)
         karrs = []
+        atp9 = _at_memo(seg)
         for pl, sh in zip(plans, shifts):
-            ka = _key_eval(seg, pl, crumb)
+            ka = _key_eval(seg, pl, crumb, atp9)
             karrs.append(ka)
             key |= ka << int(sh)
         KVtot = 1 << int(sum(widths))
@@ -1319,7 +1345,8 @@ def execute(seg, spec):
         for i9, (pl, sh) in enumerate(zip(plans, shifts)):
             ucodes[i9] = (ukv >> int(sh)) & ((1 << widths[i9]) - 1)
     else:
-        karrs = [_key_eval(seg, pl, crumb) for pl in plans]
+        atl9 = _at_memo(seg)
+        karrs = [_key_eval(seg, pl, crumb, atl9) for pl in plans]
         order = np.lexsort(tuple(reversed(karrs)))
         srt = [ka[order] for ka in karrs]
         difs = np.zeros(crumb.size - 1, bool)
@@ -1346,8 +1373,12 @@ def execute(seg, spec):
     # batch the pluck: one values_at per column-plan for ALL picks
     batch9 = {}
     for i9, pl in enumerate(plans):
-        if pl['kind'] == 'col' and picks.size and hasattr(seg, 'values_at'):
+        if pl['kind'] in ('col', 'case') and picks.size and hasattr(seg, 'values_at'):
             cds = np.unique(ucodes[i9, picks])
+            if pl['kind'] == 'case':             # a CASE key's column codes (its literals sit at
+                cds = cds[cds < int(seg.cols[pl['col']]['V'])]   # V and V + 1: _key_decode's)
+                if cds.size == 0:
+                    continue
             try:
                 vs = seg.values_at(pl['col'], cds.astype(np.int64))
                 mp9 = {}
@@ -1444,7 +1475,8 @@ def _execute_trunc(seg, spec):
         # THE PLIST START (the counter's own law finishing the job): the
         # crumb's positions are already on the shelf -- no selector frames
         # pop at all. Window = two searchsorteds on the row-ordered list.
-        crumb = positions(seg, scol, code, rlo, rhi, blocks=_eq_blocks(seg, spec))   # the window first: vanilla scans only it
+        crumb = positions(seg, scol, code, rlo, rhi,     # the window first: vanilla scans only it
+                          blocks=None if plist_ready(seg, scol) else _eq_blocks(seg, spec))
     else:
         crumb = np.empty(0, np.int64)
     CH = 1 << 17                                 # crumb-prefix chunks: early stop

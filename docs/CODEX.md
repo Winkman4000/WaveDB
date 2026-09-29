@@ -3178,3 +3178,34 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
 - tests/test_sidecar_switch.py: test_lists_positions_exact (positions from the lists, whole and
   windowed; only the scan had a test) and test_lists_sample_draws_exact_counts (the lists draw: three
   runs, every count exact against DuckDB, the plucked strings are str, the lists were used).
+
+## 2026-09-29 -- THE COUNTERID FAMILY (Q36-Q42): RECON AND THE CHEAP TRIMS
+- vs ClickHouse (board c84088a, fair_clickhouse): the family is 2,247 ms cold vs 971, 544 hot vs 302;
+  we lose all seven cold and six hot (Q38 hot wins, 36 vs 53).
+- What they share: all serve through wdb_funnel. CounterID = 62 -> the position lists -> 738,172 rows
+  (Q42's window: the same rows), then enc-10/enc-3 flags at those rows, then 1-5 key columns read
+  at the survivors, count, the top k, the pluck.
+- THE ROOT: those 738,172 rows lie in 193 of 1,526 frames (a 12.6M-row band, 5.8% dense), so every
+  key column pops all 193 frames to keep 5.8% of them (cold: URL 93-121 ms, Referer 116,
+  WindowClientHeight 94, URLHash 52-78, Title 71). ClickHouse's ClickBench table is (as far as we
+  know -- its create.sql not checked here) ordered by CounterID first, so its 738K rows are
+  contiguous. Jackson, 2026-09-29: WaveDB stays ordered by time alone -- no CounterID sort key, no
+  projection; that is an architecture decision, not a gap to close.
+- NOW (the cheap ones):
+  - _pick: one candidate -> taken, no census load (it loaded the CounterID census to choose among
+    one: ~20 ms cold). read_methods detect cold 38 -> ~15 ms (the rest is the EventDate steps,
+    which execute needs anyway).
+  - execute and _execute_trunc: _eq_blocks (three load-statistics reads, 4-6 ms even hot) only when
+    positions() will scan -- the position lists ignore THE REGION.
+  - _at_memo: codes_at once per (column, rows) within a query -- Q39's SearchEngineID and
+    AdvEngineID fed the CASE and were keys too (the same 722,688 rows, decoded twice).
+  - The emit batch covers CASE keys (their column codes through values_at; the literals at V, V+1
+    stay _key_decode's) -- Q39's Src was ten serial Referer fetches.
+- Same-hour A/B (3 rounds, alternating; the host at load ~320, so noisy): every median better --
+  cold Q36 276 -> 263, Q37 200 -> 174, Q38 203 -> 193, Q39 573 -> 478, Q40 262 -> 251, Q41 304 ->
+  260, Q42 139 -> 129; hot Q39 185 -> 149, Q41 57 -> 47, others 0-10 ms.
+- tests/test_funnel_family.py (the funnel's ORDER BY ... LIMIT shapes had no DuckDB test): six family
+  shapes (string key with <> '', OFFSET, the CASE key, IN + a second wide equality, two small keys)
+  each run twice (the second through the replayed plan), checked for LEGALITY against DuckDB's full
+  grouping; the funnel and the lists must serve. test_case_key_reads_each_column_once fails on
+  c84088a (two reads each) and passes now.
