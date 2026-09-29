@@ -3138,3 +3138,26 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   tag 8; a Zipf mix elects tag 3) -- asserted, so an election drift fails loudly. LIMIT 1..20000 checked
   for LEGALITY against DuckDB's full grouping (true counts, descending, exactly the true top-k counts);
   pairfold must serve and the bar must be called (20000 covers the whole census, no exclusion bound).
+
+## 2026-09-29 -- Q14 COLD: THE SIDECAR'S COLD READ, THE OVERLAP, THE PLUCK IN ONE BATCH
+- Stages, true cold (after the bar): census diff over 48 MB of plist offsets 68-118 ms (page faults),
+  SearchEngineID decode 70 ms WARM OR COLD (CPU: codes_band's 8 lanes + an astype copy), the 64 top
+  phrases' position lists 72-78 ms (faults; 552,840 rows, 2.2 MB), topk_bar 24-28 (numba cold load),
+  the pluck ~23 (20 serial fetches, SearchPhrase dictionary chunks inflated one by one).
+- Tried and dropped: codes_at(SearchEngineID, rows9) -- the 552,840 rows touch all 1,526 frames, 182
+  ms cold. Finer pread runs for the offsets (256 KB .. 4 MB): all ~50-58 ms, storage-bound (~0.9 GB/s
+  on this host today) -- prefetch alone barely beats the faults there.
+- NOW: (1) wdb_engine.warm_mapped(base, fd, spans): warm_span's cold read for ANY mapped file (warm_span
+  now calls it); wdb_funnel.warm_plist(seg, col, codes, offsets) brings the census and the candidates'
+  lists in by parallel reads. (2) THE OVERLAP: the small key's decode (seg._raw_codes -> the pipelined
+  16-lane enc-3 decode, ~45 ms vs codes_band's ~70) runs on a side thread while the census is read.
+  (3) The pluck through values_at (touched dictionary chunks once, in parallel), as Q24's.
+  Switches: WDB_PF_WARM=0, WDB_PF_OVERLAP=0.
+- Same-hour A/B (true cold, 4 runs each): both off cold 297-366 / hot 117-142; warm only 199-254 /
+  90-143; overlap only 256-325 / 73-81; both 188-219 / 74-83; both + the batched pluck 156-172 / 73-90.
+  vs the board: Umbra 413 cold, 136 hot.
+- Left: the 48 MB census read (~55 ms cold) + diff/copy/nz/topk (~30 ms hot and cold) exist only to find
+  the top ~65 phrases by count. Hot floor under this path: the SearchEngineID decode (~40 ms).
+- tests/test_pairfold.py: each LIMIT again with both switches off -- the same rows in the same order;
+  test_warm_plist_reads_cold_pages_once: evicted (fsync first: dirty pages cannot drop), read once
+  (bytes > 0), resident on the second call (0), the mapped offsets and lists equal the file's bytes.

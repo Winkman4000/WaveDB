@@ -94,8 +94,45 @@ def test_q14_shape_legal_against_duck():
                 assert wdb_pairfold._HITS == h0 + 1, ('pairfold did not serve', enc, sql)
                 assert len(bars) > nb, ('the plist bar path did not serve', sql)
                 _legal(rows, truth, min(k, len(truth)))
+                # THE OVERLAP and THE COLD READ off (codes_band after the census, plist by faults):
+                # the same path, the same codes -- the same rows, in the same order
+                sw = (wdb_pairfold._OVERLAP[0], wdb_pairfold._PFWARM[0])
+                wdb_pairfold._OVERLAP[0] = wdb_pairfold._PFWARM[0] = False
+                try:
+                    rows0 = db.run(sql)[0]
+                finally:
+                    wdb_pairfold._OVERLAP[0], wdb_pairfold._PFWARM[0] = sw
+                assert [tuple(r) for r in rows0] == [tuple(r) for r in rows], ('switches changed the answer', k)
         finally:
             wdb_kernels.topk_bar = bar0
         print('encodings', enc, 'bars', bars)
+    finally:
+        shutil.rmtree(d, ignore_errors=True); os.remove(pq)
+
+
+def test_warm_plist_reads_cold_pages_once():
+    """warm_plist: evicted position lists are read (bytes > 0), then found resident (0); the offsets
+    and lists read through the map afterwards equal the file's own bytes"""
+    import wdb_funnel as F
+    d, pq, seg = _db(n=200_000, seed=3)
+    try:
+        offs, pos = F._plist(seg, 'p')          # (mapped, only the header page touched)
+        p = F._plist_path(seg, 'p')
+        raw = open(p, 'rb').read()              # the truth, by read(): nothing mapped is touched
+        V9 = int(np.frombuffer(raw[:8], np.int64)[0])
+        P0 = 8 + 8 * (V9 + 1)
+        top = np.argsort(np.diff(np.frombuffer(raw[8:P0], np.int64)))[::-1][:5]
+        fd = os.open(p, os.O_RDONLY)
+        os.fsync(fd)                            # a just-written file's dirty pages cannot be dropped
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED); os.close(fd)
+        n1 = F.warm_plist(seg, 'p', offsets=True, codes=top)
+        n2 = F.warm_plist(seg, 'p', offsets=True, codes=top)
+        assert n1 > 0, ('the evicted lists were not read', n1)
+        assert n2 == 0, ('resident lists were read again', n2)
+        assert np.array_equal(np.frombuffer(raw[8:P0], np.int64), offs)
+        for c9 in top.tolist():
+            a, b = int(offs[c9]), int(offs[c9 + 1])
+            assert np.array_equal(np.frombuffer(raw[P0 + 4 * a:P0 + 4 * b], np.uint32), pos[a:b])
+        print('warm_plist cold bytes', n1)
     finally:
         shutil.rmtree(d, ignore_errors=True); os.remove(pq)

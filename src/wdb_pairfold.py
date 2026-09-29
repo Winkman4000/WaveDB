@@ -14,6 +14,8 @@ from sqlglot import expressions as E
 import wdb_sql
 
 _HITS = 0
+_OVERLAP = [__import__('os').environ.get('WDB_PF_OVERLAP', '1') == '1']  # A/B: 0 decodes a after the census, via codes_band
+_PFWARM = [__import__('os').environ.get('WDB_PF_WARM', '1') == '1']      # A/B: 0 leaves the plist to page faults
 
 
 def detect(seg, tree, col_map):
@@ -126,17 +128,28 @@ def execute(seg, spec):
             and int(seg.cols[spec['a']].get('V') or 999) <= 256 \
             and __import__('wdb_funnel').plist_ready(seg, spec['b']):    # THE VANILLA LAW: lists that may serve
         import wdb_funnel as _F
-        offsB, plB = _F._plist(seg, spec['b'])
-        offsB = np.asarray(offsB, dtype=np.int64)
-        cnt_b = np.diff(offsB)
-        dflt9 = int(seg.cols[spec['b']].get('e8d', -1))
-        if 0 <= dflt9 < cnt_b.size:
-            cnt_b = cnt_b.copy()
-            cnt_b[dflt9] = 0                     # the WHERE excludes ''
-        BV = cnt_b.size
-        k = spec['lim']
-        aC = np.ascontiguousarray(
-            seg.codes_band(spec['a'], 0, seg.N).astype(np.uint8))
+        from concurrent.futures import ThreadPoolExecutor as _TPa
+        # THE OVERLAP (Q14 cold): the small key's full decode is CPU (~70 ms warm or cold through
+        # codes_band; the pipelined 16-lane decode ~45) and the census is storage (48 MB of offsets,
+        # ~50 ms) -- the decode runs beside the census read instead of after it
+        _exa = _TPa(max_workers=1)
+        futa = _exa.submit(seg._raw_codes, spec['a']) if _OVERLAP[0] else None
+        try:
+            offsB, plB = _F._plist(seg, spec['b'])
+            if _PFWARM[0]:
+                _F.warm_plist(seg, spec['b'], offsets=True)
+            offsB = np.asarray(offsB, dtype=np.int64)
+            cnt_b = np.diff(offsB)
+            dflt9 = int(seg.cols[spec['b']].get('e8d', -1))
+            if 0 <= dflt9 < cnt_b.size:
+                cnt_b = cnt_b.copy()
+                cnt_b[dflt9] = 0                     # the WHERE excludes ''
+            BV = cnt_b.size
+            k = spec['lim']
+            aC = np.ascontiguousarray(np.asarray(
+                futa.result() if futa is not None else seg.codes_band(spec['a'], 0, seg.N)).astype(np.uint8, copy=False))
+        finally:
+            _exa.shutdown(wait=True)
         nz = int((cnt_b > 0).sum())
         # THE BAR, not the sort: the loop reads only the top M candidates and the count just below
         # them -- topk_bar selects those M + 1 (a lowered bar, parallel compares) where a full argsort
@@ -147,6 +160,8 @@ def execute(seg, spec):
             top9 = _WK.topk_bar(cnt_b, min(M9 + 1, nz))
             cands = top9[:M9]
             max_excl = int(cnt_b[top9[M9]]) if M9 < nz else 0
+            if _PFWARM[0]:                       # the candidates' lists: parallel reads, not faults
+                _F.warm_plist(seg, spec['b'], codes=cands)
             rows9 = np.concatenate([np.asarray(plB[offsB[c]:offsB[c + 1]])
                                     for c in cands.tolist()]).astype(np.int64)
             cidr = np.repeat(np.arange(M9, dtype=np.int64),
@@ -164,11 +179,12 @@ def execute(seg, spec):
                 break
             M *= 4
         out = []
-        for j in topi.tolist():
-            ci9, acode = j >> 8, j & 0xFF
-            bcode = int(cands[ci9])
-            va = seg.fetch(spec['a'], acode)
-            vb = seg.fetch(spec['b'], bcode)
+        tl9 = topi.tolist()
+        # THE PLUCK IN ONE BATCH (as Q24's): values_at decodes each touched dictionary chunk once,
+        # in parallel -- k point fetches were k serial chunk inflates (~23 ms cold for 10 rows)
+        vbs = seg.values_at(spec['b'], np.array([int(cands[j >> 8]) for j in tl9], np.int64)) if tl9 else []
+        vas = seg.values_at(spec['a'], np.array([j & 0xFF for j in tl9], np.int64)) if tl9 else []
+        for j, va, vb in zip(tl9, vas, vbs):
             if isinstance(va, (bytes, bytearray)):
                 va = va.decode('utf-8', 'replace')
             if isinstance(vb, (bytes, bytearray)):

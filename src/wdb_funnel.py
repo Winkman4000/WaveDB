@@ -162,6 +162,28 @@ def _plist(seg, col):
     return memo[col]
 
 
+def warm_plist(seg, col, codes=None, offsets=False):
+    """THE COLD READ for the position lists (a memory-mapped sidecar): before a read touches them,
+    the offsets (`offsets`, the whole census) and/or the lists of `codes` are brought in by parallel
+    large reads instead of page faults (Q14 cold: the 64 top phrases' lists 78 -> ~13 ms). Resident
+    spans read nothing. Returns the bytes read."""
+    import wdb_engine
+    offs, pos = _plist(seg, col)
+    V9 = offs.size - 1
+    P0 = 8 + 8 * (V9 + 1)                     # the file: V, offsets[V + 1], positions (uint32)
+    spans = [(0, P0)] if offsets else []
+    if codes is not None:
+        for c9 in np.asarray(codes, dtype=np.int64).tolist():
+            spans.append((P0 + 4 * int(offs[c9]), P0 + 4 * int(offs[c9 + 1])))
+    if not spans:
+        return 0
+    fd = os.open(_plist_path(seg, col), os.O_RDONLY)
+    try:
+        return wdb_engine.warm_mapped(offs.ctypes.data - 8, fd, spans)
+    finally:
+        os.close(fd)
+
+
 def _lit(node):
     if isinstance(node, E.Literal) and not node.is_string:
         try:

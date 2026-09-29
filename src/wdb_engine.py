@@ -69,6 +69,43 @@ def _leaf_pool():
 _WARM = [None, None]      # program: libc handle for mincore, the cold-read pool (never data)
 
 
+def warm_mapped(base, fd, spans):
+    """THE COLD READ for any memory-mapped file (a segment, a sidecar): for each [fb, fe) of the
+    file, the pages not already in memory are brought in by parallel large reads (runs of at most
+    8 MB on the cold-read pool) before anything touches them through the map. `base` is the address
+    of file offset 0 in the mapping (page-aligned), `fd` the file opened for reading. A span found
+    >90% resident (mincore) reads nothing -- warm, this costs one mincore per span. Returns the
+    bytes read."""
+    import ctypes as _ct, os as _osw
+    PG = 4096
+    libc = _WARM[0]
+    if libc is None:
+        libc = _WARM[0] = _ct.CDLL(None, use_errno=True)
+    runs = []
+    for fb, fe in spans:
+        if fe <= fb:
+            continue
+        a = (fb // PG) * PG; npg = (fe - a + PG - 1) // PG
+        vec = (_ct.c_ubyte * npg)()
+        if libc.mincore(_ct.c_void_p(base + a), _ct.c_size_t(npg * PG), vec) != 0:
+            continue                                  # cannot tell: leave it to the faults
+        res = np.frombuffer(vec, np.uint8) & 1
+        if res.mean() > 0.9:
+            continue
+        miss = np.flatnonzero(res == 0)               # cold pages -> runs of at most 8 MB
+        cut = np.flatnonzero(np.diff(miss) != 1) + 1
+        for r in np.split(miss, cut):
+            for s in range(0, r.size, 2048):
+                q = r[s:s + 2048]
+                runs.append((a + int(q[0]) * PG, a + (int(q[-1]) + 1) * PG))
+    if not runs:
+        return 0
+    pool = _WARM[1]
+    if pool is None:
+        pool = _WARM[1] = ThreadPoolExecutor(max(1, len(_osw.sched_getaffinity(0))))
+    return sum(pool.map(lambda r: len(_osw.pread(fd, r[1] - r[0], r[0])), runs))
+
+
 class Segment:
     def __init__(self, path):
         # memmap instead of read(): the file is demand-paged by the OS, so a Segment
@@ -973,34 +1010,13 @@ class Segment:
         touches them -- page faults fetch a cold file in small pieces (~0.25 GB/s measured), 16
         large streams at ~1.7 GB/s. Warm, mincore finds the span resident and nothing is read.
         Returns the bytes read."""
-        import ctypes as _ct, os as _osw
         if fe <= fb:
             return 0
-        PG = 4096; a = (fb // PG) * PG; npg = (fe - a + PG - 1) // PG
-        base = self.buf.ctypes.data
-        vec = (_ct.c_ubyte * npg)()
-        libc = _WARM[0]
-        if libc is None:
-            libc = _WARM[0] = _ct.CDLL(None, use_errno=True)
-        if libc.mincore(_ct.c_void_p(base + a), _ct.c_size_t(npg * PG), vec) != 0:
-            return 0                                      # cannot tell: leave it to the faults
-        res = np.frombuffer(vec, np.uint8) & 1
-        if res.mean() > 0.9:
-            return 0
-        miss = np.flatnonzero(res == 0)                   # cold pages -> runs of at most 8 MB
-        cut = np.flatnonzero(np.diff(miss) != 1) + 1
-        runs = []
-        for r in np.split(miss, cut):
-            for s in range(0, r.size, 2048):
-                q = r[s:s + 2048]
-                runs.append((a + int(q[0]) * PG, a + (int(q[-1]) + 1) * PG))
         fd = self.__dict__.get('_fd_read')
         if fd is None:
+            import os as _osw
             fd = self._fd_read = _osw.open(self.path, _osw.O_RDONLY)
-        pool = _WARM[1]
-        if pool is None:
-            pool = _WARM[1] = ThreadPoolExecutor(max(1, len(_osw.sched_getaffinity(0))))
-        return sum(pool.map(lambda r: len(_osw.pread(fd, r[1] - r[0], r[0])), runs))
+        return warm_mapped(self.buf.ctypes.data, fd, [(fb, fe)])
 
     def _e3_pipelined(self, c):
         """THE READ AND THE DECODE AT ONCE (2026-09-24): an enc-3 full decode used to pull the whole
