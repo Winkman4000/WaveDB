@@ -52,6 +52,8 @@ def positions(seg, col, code, lo=0, hi=None, blocks=None):
     hi = int(seg.N) if hi is None else int(hi)
     if plist_ready(seg, col):
         offs, plist = _plist(seg, col)
+        # (no warm_plist here: measured 2026-09-29, CounterID 62's 3 MB list is one stream either
+        # way -- 20-25 ms with the parallel read first vs 17-19 by faults and the kernel's readahead)
         crumb = plist[int(offs[code]):int(offs[code + 1])]
         a = np.searchsorted(crumb, lo, side='left'); b = np.searchsorted(crumb, hi, side='left')
         return crumb[a:b].astype(np.int64)

@@ -3161,3 +3161,20 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
 - tests/test_pairfold.py: each LIMIT again with both switches off -- the same rows in the same order;
   test_warm_plist_reads_cold_pages_once: evicted (fsync first: dirty pages cannot drop), read once
   (bytes > 0), resident on the second call (0), the mapped offsets and lists equal the file's bytes.
+
+## 2026-09-29 -- THE BOARD AFTER Q14/Q24/Q26; Q17: NO CENSUS FOR A FEW DRAWS
+- Same-hour board, 297e620 vs c84088a alternating per query (load ~17): movers Q14 cold 502 -> 169 /
+  hot 227 -> 79, Q24 cold 200 -> 46, Q26 cold 182 -> 40. Every other "mover" of the single pass was
+  noise: 4 more rounds each of Q1/2/3/9/12/13/20/27/33/37 overlap A vs B (e.g. Q1 24-28 vs 17-29,
+  Q9 400-510 vs 385-439). Nothing else calls warm_mapped yet -- the prefetch sped up only Q14.
+- Siblings of the plist readers checked:
+  - wdb_funnel.positions (Q36-Q42, CounterID 62: a 3 MB list): warm_plist first measured WORSE,
+    positions() 20-25 ms vs 17-19 by faults (one stream either way; the kernel's readahead serves the
+    copy). Not wired; a note in the code says why.
+  - wdb_sampletop (Q17, GROUP BY UserID, SearchPhrase LIMIT 10 -- the sampling read): np.diff over
+    the whole 48 MB census (~115 ms cold) to look up a few dozen draws' counts. NOW each draw's count
+    is its two neighbouring offsets. And _emit's 20 serial fetches (~61 ms cold) -> values_at batches.
+    Same-hour A/B (3 rounds): cold 207-276 -> 89-101 ms, hot 94 -> 43 (DuckDB 168 hot, Umbra 465 cold).
+- tests/test_sidecar_switch.py: test_lists_positions_exact (positions from the lists, whole and
+  windowed; only the scan had a test) and test_lists_sample_draws_exact_counts (the lists draw: three
+  runs, every count exact against DuckDB, the plucked strings are str, the lists were used).

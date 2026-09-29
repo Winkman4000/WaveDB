@@ -266,3 +266,59 @@ def test_vanilla_sample_draws_exact_counts():
             exp = con.execute("SELECT COUNT(*) FROM t WHERE u = ? AND sp = ?", [int(u), str(s)]).fetchone()[0]
             assert int(n) == exp, (u, s, n, exp)
         assert _derived(d) == []
+
+
+def test_lists_positions_exact():
+    """positions() FROM THE POSITION LISTS (switch on): exact against the codes, whole-table and
+    windowed (the vanilla test covers the scan; this one the lists)"""
+    import numpy as np, wdb_funnel
+    from wdb_engine import Segment
+    db, con, d = _fixture()
+    with _NoEnv():
+        wdb_sidecar.set_setting(d, 'on')
+        seg = Segment(os.path.join(d, 'fact_0.wdb'))
+        codes = np.asarray(seg._raw_codes('k')).astype(np.int64)
+        assert wdb_funnel.plist_ready(seg, 'k')
+        for code in (int(codes[12345]), int(codes[0]), int(codes[-1])):
+            exp = np.flatnonzero(codes == code)
+            assert np.array_equal(wdb_funnel.positions(seg, 'k', code), exp), code
+            ew = exp[(exp >= 1000) & (exp < 40000)]
+            assert np.array_equal(wdb_funnel.positions(seg, 'k', code, 1000, 40000), ew), code
+        assert os.path.exists(wdb_funnel._plist_path(seg, 'k')), 'positions did not use the lists'
+
+
+def test_lists_sample_draws_exact_counts():
+    """THE LISTS DRAW (switch on): a LIMIT with no ORDER BY over (int, sparse string) draws group
+    keys from the position lists -- each draw's count from two neighbouring offsets, no census --
+    and every returned count is the exact count; the pluck (one values_at batch) returns the
+    strings themselves"""
+    import numpy as np, pandas as pd, wdb_sampletop, wdb_funnel
+    con = duckdb.connect()
+    d = os.path.join(tempfile.gettempdir(), f'sidesw_st_{uuid.uuid4().hex[:8]}'); os.makedirs(d)
+    rng = np.random.default_rng(19); n = 200_000
+    ph = rng.integers(0, 3000, n)
+    df = pd.DataFrame({'u': rng.integers(0, 5000, n).astype(np.int64),
+                       'sp': np.where(rng.random(n) < 0.15, np.char.add('phrase-', ph.astype(str)), '')})
+    con.register('t', df)
+    pq = os.path.join(d, 't.parquet'); df.to_parquet(pq, index=False)
+    with _NoEnv():
+        db = Database.create(d)
+        db.cat.add_table('t', [['u', 'int'], ['sp', 'string']])
+        wdb_encode.encode(pq, os.path.join(d, 't_0.wdb')); db.cat.add_segment('t', 't_0.wdb'); os.remove(pq)
+        wdb_sidecar.set_setting(d, 'on')
+        db = Database.open(d)
+        from wdb_engine import Segment
+        seg = Segment(os.path.join(d, 't_0.wdb'))
+        assert seg.cols['sp']['code_enc'] in (8, 9)
+        assert wdb_funnel.plist_ready(seg, 'sp')
+        for rep in range(3):
+            h0 = wdb_sampletop._HITS
+            rows = db.run("SELECT u, sp, COUNT(*) FROM t GROUP BY u, sp LIMIT 10")[0]
+            assert wdb_sampletop._HITS > h0, 'the sample lane did not serve'
+            assert len(rows) == 10
+            assert len({(int(u), s) for u, s, n in rows}) == 10
+            for u, s, n in rows:
+                assert isinstance(s, str), (type(s), s)
+                exp = con.execute("SELECT COUNT(*) FROM t WHERE u = ? AND sp = ?", [int(u), str(s)]).fetchone()[0]
+                assert int(n) == exp, (u, s, n, exp)
+        assert os.path.exists(os.path.join(d, 't_0.wdb.sp.plist')), 'the draws did not use the lists'

@@ -117,9 +117,9 @@ def execute(seg, spec):
                 pairs[(c, aa)] = int(nn)
         return _emit(seg, spec, pairs)
     offsB, plB = _F._plist(seg, spec['b'])
-    offsB = np.asarray(offsB, dtype=np.int64)
-    cnt_b = np.diff(offsB)
-    V = cnt_b.size
+    # a draw's count is two neighbouring offsets -- the census diff over all 6M codes (48 MB of
+    # offsets, ~115 ms cold) was read to look up a few dozen of them (Q17)
+    V = int(offsB.size) - 1
     rng = np.random.default_rng()
     k = spec['k']
     pairs = {}
@@ -130,7 +130,7 @@ def execute(seg, spec):
         if tries == 65:
             cap9 = 200000          # fallback phase: admit anything countable
         c = int(rng.integers(0, V))
-        n9 = int(cnt_b[c])
+        n9 = int(offsB[c + 1]) - int(offsB[c])
         if n9 == 0 or n9 > cap9:
             continue
         rows9 = np.asarray(plB[offsB[c]:offsB[c + 1]]).astype(np.int64)
@@ -147,9 +147,12 @@ def _emit(seg, spec, pairs):
     global _HITS
     k = spec['k']
     out = []
-    for (bc, ac), nn in list(pairs.items())[:k]:
-        vb = seg.fetch(spec['b'], bc)
-        va = seg.fetch(spec['a'], ac)
+    items = list(pairs.items())[:k]
+    # THE PLUCK IN ONE BATCH (as Q14's, Q24's): values_at decodes each touched dictionary chunk
+    # once, in parallel -- 2k point fetches were serial chunk inflates (~61 ms cold, Q17)
+    vbs = seg.values_at(spec['b'], np.array([bc for (bc, ac), nn in items], np.int64)) if items else []
+    vas = seg.values_at(spec['a'], np.array([ac for (bc, ac), nn in items], np.int64)) if items else []
+    for ((bc, ac), nn), vb, va in zip(items, vbs, vas):
         if isinstance(vb, (bytes, bytearray)):
             vb = vb.decode('utf-8', 'replace')
         if isinstance(va, (bytes, bytearray)):
