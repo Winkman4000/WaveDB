@@ -11,7 +11,8 @@ def load(p):
 
 def main():
     W = load(sys.argv[1])
-    R = {os.path.basename(p)[5:-6]: load(p) for p in sorted(glob.glob(os.path.join(sys.argv[2], 'fair_*.jsonl')))}
+    R = {os.path.basename(p)[5:-6]: load(p) for p in sorted(glob.glob(os.path.join(sys.argv[2], 'fair_*.jsonl')))
+         if 'wavedb' not in os.path.basename(p).lower()}          # our own old boards are not referees
     qs = sorted(q for q in W if all(q in r for r in R.values()))
     for kind in ('cold', 'hot'):
         def score(X, pool):
