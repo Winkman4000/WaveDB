@@ -2082,7 +2082,11 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
         if verbose:
             print('  statistics + lengths written from the jobs at +%.1fs' % (time.time() - _tp9), flush=True)
         try:
-            if _os.environ.get('WDB_LOAD_SHELVES', '1') != '0':
+            import wdb_sidecar as _SC9
+            # THE SWITCH governs the load's shelves too (2026-09-29): the pair tables are derived
+            # group facts, and with sidecars off they were born anyway -- measured, they only slowed
+            # the pair boards they serve (Q31 cold 265 -> 192 ms without them, Q32 194-216 -> 110)
+            if _os.environ.get('WDB_LOAD_SHELVES', '1') != '0' and _SC9.births_on(_os.path.dirname(out_path)):
                 _birth_differentiator_shelves(out_path, known={c: (_xt9[c].get('stats') or {}).get(c + '.rep') for c in cols})
         except Exception:
             pass
@@ -2261,7 +2265,9 @@ def _write_extras(out_path, N, order, extras, verbose=False):
 
 def _post_shelves(out_path):
     try:
-        if os.environ.get('WDB_LOAD_SHELVES', '1') != '0':
+        import wdb_sidecar
+        if os.environ.get('WDB_LOAD_SHELVES', '1') != '0' \
+                and wdb_sidecar.births_on(os.path.dirname(out_path)):     # THE SWITCH (see the in-job twin)
             _birth_differentiator_shelves(out_path)
     except Exception:
         pass

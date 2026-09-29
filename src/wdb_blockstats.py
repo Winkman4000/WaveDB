@@ -23,6 +23,12 @@ E = wdb_sql.E
 
 _ENABLED = True
 _HITS = 0
+# LOAD_ANSWERS (2026-09-29, the ClickBench rule: no "pre-aggregated tables or indices"): off, the load
+# statistics may steer (block min/max skipping, THE PICK's estimates, COUNT from per-block counts,
+# MIN/MAX from zone maps) but never ARE an answer -- no SUM/AVG from block sums, no per-value counts
+# as a GROUP BY's result, no repeat list as a pair board. WDB_LOAD_ANSWERS=0 turns it off.
+import os as _os_la
+_ANSWERS = [_os_la.environ.get('WDB_LOAD_ANSWERS', '1') == '1']
 _BR = 32768
 _SCACHE = wdb_qmem.register({})          # (seg.path, col, N) -> stats dict; qmem per the
                                          # cold-truth law. Persistence is LAWFUL only on
@@ -223,8 +229,12 @@ def signposts_from_load(seg, col):
     return hit
 
 
-def vcnt_from_load(seg, col):
-    """the load's rows-per-code of a column, or None (absent, or the shape does not match)"""
+def vcnt_from_load(seg, col, plan=False):
+    """the load's rows-per-code of a column, or None (absent, or the shape does not match).
+    plan=True: a planner's estimate (THE PICK), which LOAD_ANSWERS off still allows; an answer
+    path (the counts ARE the result) gets None when LOAD_ANSWERS is off."""
+    if not plan and not _ANSWERS[0]:
+        return None
     z = _load_npz(seg)
     k = col + '.vcnt'
     if z is None or k not in z.files:
@@ -237,7 +247,10 @@ def vcnt_from_load(seg, col):
 
 
 def rep_from_load(seg, col):
-    """the exception list from the load statistics, or None (absent or the column did not qualify)"""
+    """the exception list from the load statistics, or None (absent or the column did not qualify;
+    or LOAD_ANSWERS off -- the list says which rows can form a group, an answer path's fact)"""
+    if not _ANSWERS[0]:
+        return None
     p = stats_path(seg.path)
     import os as _os
     try:
@@ -396,6 +409,7 @@ def detect(seg, tree, col_map):
         if not eligible(seg, col):          return None
         if seg._effective(col) is not None: return None    # overrides falsify stored stats
         if ak[0] in ('SUM', 'AVG') and seg.cols[col].get('dt') != 0: return None
+        if ak[0] in ('SUM', 'AVG') and not _ANSWERS[0]: return None   # block sums are pre-aggregates
         specs.append((ak[0], col))
     if not P.no_deleted_rows(seg):      return None
     return {'specs': specs, 'proj': proj}

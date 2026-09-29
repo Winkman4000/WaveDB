@@ -3209,3 +3209,44 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   each run twice (the second through the replayed plan), checked for LEGALITY against DuckDB's full
   grouping; the funnel and the lists must serve. test_case_key_reads_each_column_once fails on
   c84088a (two reads each) and passes now.
+
+## 2026-09-29 -- SUBMISSION READINESS: THE RULE, THE NO-SIDECAR BOARD, LOAD_ANSWERS
+- The rule (ClickBench README): not allowed "Creation of pre-aggregated tables or indices, projections,
+  or materialized views"; primary-key indexing allowed; "Caching source data (e.g. buffer pools)" allowed.
+  The test we use: does a structure store the DATA (any encoding you could rebuild rows from), or facts
+  about GROUPS of rows computed ahead so a query can skip the data? The name/location does not matter.
+- Row lengths (rlen): the same thing ClickHouse ships by default since 25.10 (String .size stream,
+  length(s) -> s.size; PRs 89329, 82850). Fine; Jackson: it may become the default for every text column.
+- Which files each query READS cold (fincore after a fresh-process cold run, the kit): 24 of 43 read one;
+  23 of them an index or a pre-aggregate -- plist (Q14, Q17, Q36-Q42), .gbc/.gbc3/.cnt counts (Q7, Q12, Q15,
+  Q20, Q25, Q28, Q33), .gdc/tier2 distinct users (Q8-Q11, Q13), the Referer regex grouping (Q28), the
+  WatchID__ClientIP pair table (Q31, Q32); rlen (Q27). 19 read none.
+- THE NO-SIDECAR BOARD (fresh load cb_van0929, switch off, no warm; 295 s at host load ~210; 8.92 GB;
+  the segment byte-for-byte the kit's size; verify 43/43; nothing born during verify or board), same hour
+  as the kit, alternating per query (load ~208):
+    cold score kit 1.33 -> 1.54 (24.5 s); hot 1.82 -> 2.36 (11.7 s). ClickHouse 1.50 / 2.76, Umbra 1.16 / 1.02.
+  Biggest: Q8 15 -> 1007 ms cold, Q13 111 -> 997, Q9, Q14, Q12, Q25, Q33 ~3-4x. Q28 FASTER without its
+  650 MB of sidecars (3196 -> 2664 cold). Q31/Q32 FASTER without the load's pair tables (265 -> 192,
+  194-216 -> 110 cold; ~60 -> 5-6 hot), both correct.
+- The load's pair tables (WatchID.ptrep + 42 WatchID__*.pt2) were written with the switch off (the encoder
+  never asked it). NOW _birth_differentiator_shelves obeys births_on in both load paths.
+- stats.npz is not only zone maps: per-value counts (vcnt, ~95 columns), per-block sums, and a
+  near-unique column's repeat rows (WatchID: 8 rows) -- and answers came from them: Q1, Q7, Q29 (vcnt),
+  Q2, Q3 (block sums), Q31, Q32 (the repeat list). NOW LOAD_ANSWERS (wdb_blockstats._ANSWERS,
+  WDB_LOAD_ANSWERS=0 turns it off; default on): off, the statistics steer but never answer -- blockstats
+  declines SUM/AVG (COUNT, COUNT(col) from per-block counts, MIN/MAX from zone maps stay);
+  vcnt_from_load returns None to answer paths (plan=True, THE PICK's estimate, still reads it);
+  rep_from_load returns None.
+- Same-hour A/B, answers on -> off (3 rounds, no pair tables): Q1 25 -> 307 ms cold / 5 -> 43 hot, Q2 28 ->
+  272 / 8 -> 124, Q3 24 -> 647 / 5 -> 360, Q7 21 -> 183 / 6 -> 83, Q29 53 -> 371 / 17 -> 257, Q31 181 -> 954
+  / 8 -> 462, Q32 112 -> 848 / 6 -> 485; Q0, Q6 unchanged. Verify of those 9 with answers off: correct.
+- THE CLEAN CONFIGURATION (no sidecars, no pair tables, answers off), composed from the two same-hour runs:
+  cold 1.85 (27.4 s), hot 3.05 (13.3 s). ClickHouse 1.50 / 2.76, Umbra 1.16 / 1.02, DuckDB 2.30 / 2.95.
+  Wins vs ClickHouse 17 cold / 16 hot; vs Umbra 14 / 4.
+- FOUND (open, not fixed): a mode-4 (sequence) integer column's codes are row positions, so GROUP BY on a
+  mode-4 column with REPEATED values counts every row as its own group (toy: GROUP BY w -> 1s where DuckDB
+  says 2; the pair board the same). COUNT(DISTINCT) and equality are right (they use values). Happens with
+  WDB_SEQ_NARROW_OK=0 too: _try_seq admits any wide, high-cardinality sequential int column. The kit has
+  no mode-4 column, so ClickBench's answers are unaffected (43/43).
+- tests/test_load_answers.py: seven shapes equal DuckDB with LOAD_ANSWERS on and off, block sums must not
+  answer when off, estimates still readable; a sidecars-off load writes no pair tables.

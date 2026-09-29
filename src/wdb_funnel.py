@@ -89,7 +89,7 @@ def _est_rows(seg, col, value):
     """Rows expected for col = value: the load's census when it holds the column, else the even
     share N / V (a column of many distinct values -- a hash -- is expected to be rare)."""
     import wdb_blockstats
-    vc = wdb_blockstats.vcnt_from_load(seg, col)
+    vc = wdb_blockstats.vcnt_from_load(seg, col, plan=True)     # an estimate, not an answer
     if vc is not None:
         c9 = _code_of(seg, col, value)
         return 0 if c9 is None else int(vc[c9])
