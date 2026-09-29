@@ -3122,3 +3122,19 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   not decode the full planes; the same answers with WDB_E8_HEAD=0. The suite runs with
   WDB_SEQ_NARROW_OK=1, which turns a sorted toy et into a sequence instead of a staircase: the test
   encodes with it off, as the kit loads.
+
+## 2026-09-29 -- Q14: THE BAR, NOT THE SORT (wdb_pairfold plist path)
+- The plist path ranked every SearchPhrase by count (np.argsort of ~6M counts, 123 ms hot and cold) to
+  read only the top M = max(64, 4k) candidates and the count just below them (the certificate's
+  bound). NOW: wdb_kernels.topk_bar(cnt_b, M + 1) selects those M + 1 (a lowered bar, parallel
+  compares, only the survivors sorted: count descending, index ascending). The widening loop calls it
+  again with the larger M. Among tied counts the candidate order flips (the old reversed stable sort
+  took the higher index first); any order is a legal answer, the certificate is unchanged.
+- Same-hour A/B (true cold, 4 runs): cold 450-510 -> 366-394 ms (Umbra 413 best), hot 220-251 ->
+  105-132 (Umbra 136 best): both flip to wins. Left in cold: np.diff over 48 MB of plist offsets
+  (page faults) and codes_band(SearchEngineID) ~73 ms.
+- tests/test_pairfold.py (the read had no test): a toy that encodes like the kit (se in short runs ->
+  blocked zstd, tag 3; iid values elect tag 8, long runs tag 10. p ~87% empty, uniform phrases ->
+  tag 8; a Zipf mix elects tag 3) -- asserted, so an election drift fails loudly. LIMIT 1..20000 checked
+  for LEGALITY against DuckDB's full grouping (true counts, descending, exactly the true top-k counts);
+  pairfold must serve and the bar must be called (20000 covers the whole census, no exclusion bound).

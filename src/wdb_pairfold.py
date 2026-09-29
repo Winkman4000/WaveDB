@@ -138,12 +138,15 @@ def execute(seg, spec):
         aC = np.ascontiguousarray(
             seg.codes_band(spec['a'], 0, seg.N).astype(np.uint8))
         nz = int((cnt_b > 0).sum())
-        order_b = np.argsort(cnt_b, kind='stable')[::-1]
+        # THE BAR, not the sort: the loop reads only the top M candidates and the count just below
+        # them -- topk_bar selects those M + 1 (a lowered bar, parallel compares) where a full argsort
+        # of all 6M SearchPhrase counts cost ~123 ms hot and cold (Q14)
         M = max(64, 4 * k)
         while True:
             M9 = min(M, nz)
-            cands = order_b[:M9]
-            max_excl = int(cnt_b[order_b[M9]]) if M9 < nz else 0
+            top9 = _WK.topk_bar(cnt_b, min(M9 + 1, nz))
+            cands = top9[:M9]
+            max_excl = int(cnt_b[top9[M9]]) if M9 < nz else 0
             rows9 = np.concatenate([np.asarray(plB[offsB[c]:offsB[c + 1]])
                                     for c in cands.tolist()]).astype(np.int64)
             cidr = np.repeat(np.arange(M9, dtype=np.int64),
