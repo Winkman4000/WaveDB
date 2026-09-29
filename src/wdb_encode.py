@@ -216,6 +216,20 @@ def _try_seq(nm, col, allow_seq=True):
         return None
     if not np.array_equal(wdb_seqcodec.decode(blob), iv):
         return None                                   # safety: never emit a lossy mode-4
+    # THE IDENTITY LAW (2026-09-29): a mode-4 column's codes ARE row positions (V = N). The general
+    # GROUP BY learned to group mode 4 by value, but reads keep arriving that take equal codes for
+    # equal values (affinegroup, pairtop, cdgroup: counts of 1 where DuckDB said 2) -- so a sequence
+    # is emitted only when no value repeats, and codes always identify values. Strictly monotone is
+    # distinct for free; otherwise one exact check, paid only by a column that would become a
+    # sequence. WDB_SEQ_REPEATS_OK=1 (the suite's machinery toys) keeps the old admission.
+    if iv.size > 1 and _os.environ.get('WDB_SEQ_REPEATS_OK') != '1':
+        d9 = np.diff(iv)
+        if not ((d9 > 0).all() or (d9 < 0).all()):
+            s9 = np.sort(iv)
+            if (s9[1:] == s9[:-1]).any():
+                return None
+            del s9
+        del d9
     N = len(iv); V = N; bits = max(1, int(np.ceil(np.log2(max(V, 2)))))
     return dict(nm=nm, dtype=dtype, has_null=0, V=V, bits=bits, aux=aux, mode=4, seqblob=blob)
 

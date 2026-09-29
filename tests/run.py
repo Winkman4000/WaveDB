@@ -3,6 +3,10 @@
 On completion prints the scoreboard summary (examples/report.md); --report regenerates it."""
 import os
 os.environ.setdefault('WDB_SEQ_NARROW_OK', '1')   # machinery tests build narrow mode-4 toys
+os.environ.setdefault('WDB_SEQ_REPEATS_OK', '1')  # ...with repeated values: the state older databases hold
+                                                  # (the encoder no longer makes it); the reads must survive it
+os.environ.setdefault('WDB_LOAD_ANSWERS', '1')    # the machinery behind LOAD_ANSWERS stays exercised; the
+                                                  # engine's default is off (test_load_answers runs both)
 os.environ.setdefault('WDB_SIDECARS', '1')        # THE SWITCH: new databases are born off; the suite exercises births
 os.environ.setdefault('WDB_SIDECAR_STRICT', '1')  # THE SENTINEL raises: a birth under an off switch is a defect
 os.environ.setdefault('WDB_QMEM_STRICT', '1')     # THE LAW'S WITNESS raises: data-derived state that outlives a query

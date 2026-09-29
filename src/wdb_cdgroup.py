@@ -46,19 +46,33 @@ def detect(seg, tree, col_map):
     if ucol is None:
         return None
     w = tree.args.get('where')
-    if w is not None:
-        n2 = w.this
-        if not (isinstance(n2, E.NEQ) and isinstance(n2.this, E.Column)
-                and (col_map or {}).get(n2.this.name, n2.this.name) == key
-                and isinstance(n2.expression, E.Literal)
-                and str(n2.expression.this) == ''):
-            return None
+    # THE DEFAULT'S GROUP (2026-09-29): the planes hand only the NON-default rows, so the lane is
+    # exact only when the query itself drops the default -- WHERE key <> '' with '' the default.
+    # Without the WHERE it dropped the biggest group (a = 0, 160,025 distinct) from the podium.
+    if w is None:
+        return None
+    n2 = w.this
+    if not (isinstance(n2, E.NEQ) and isinstance(n2.this, E.Column)
+            and (col_map or {}).get(n2.this.name, n2.this.name) == key
+            and isinstance(n2.expression, E.Literal)
+            and str(n2.expression.this) == ''):
+        return None
     kc = seg.cols.get(key)
     uc = seg.cols.get(ucol)
     if kc is None or uc is None:
         return None
+    if uc.get('mode') == 4:
+        return None                              # codes are row positions: distinct would count rows
     if kc.get('code_enc') not in (8, 9):
         return None                              # v1: the sparse dress only --
+    d9 = int(kc.get('e8d' if kc.get('code_enc') == 8 else 'e9d', -1))
+    if d9 < 0:
+        return None
+    dv9 = seg.fetch(key, d9)
+    if isinstance(dv9, (bytes, bytearray)):
+        dv9 = dv9.decode('utf-8', 'replace')
+    if dv9 != '':
+        return None                              # the default is a real value: its rows are a group
     ox = tree.args.get('order')                  # its planes ARE the row list
     lim = None
     lx = tree.args.get('limit')

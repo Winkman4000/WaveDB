@@ -74,6 +74,9 @@ def detect(seg, tree, col_map):
     c = seg.cols.get(col)
     if c is None or c.get('has_null'):
         return None
+    if c.get('mode') == 4:
+        return None                              # codes are row positions, not values: the bincount
+                                                 # over them made every row its own group (2026-09-29)
     proj = []                                    # ('F', shift) | ('C',)
     calias = None
     for p in tree.expressions:

@@ -3250,3 +3250,32 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   no mode-4 column, so ClickBench's answers are unaffected (43/43).
 - tests/test_load_answers.py: seven shapes equal DuckDB with LOAD_ANSWERS on and off, block sums must not
   answer when off, estimates still readable; a sidecars-off load writes no pair tables.
+
+## 2026-09-29 -- THE FLOOR IS THE DEFAULT; THE IDENTITY LAW; THE DEFAULT'S GROUP
+- Jackson: "make this the version that we run when we launch the board from here on out, I want to work
+  from the floor, we have to actually face the problem if we want to win."
+  - LOAD_ANSWERS is OFF by default (WDB_LOAD_ANSWERS=1 turns it on; tests/run.py sets 1 so the machinery
+    stays exercised; test_load_answers runs both).
+  - benchmark/clickbench/load.sh: no --warm, WDB_SIDECARS=0 during the load, the catalog switched off.
+  - bench/board_floor.sh DB OUT [REFEREES]: refuses a database holding anything beyond the segment, its
+    stats.npz, its clen/rlen lengths and the catalog; pins WDB_SIDECARS=0 WDB_LOAD_ANSWERS=0; verifies
+    43 against the parquet; the true-cold board; flags any file born during it; bench/board_vs.py scores
+    it against referee boards (fair_<name>.jsonl). THE BOARD FROM HERE ON.
+- THE IDENTITY LAW (wdb_encode._try_seq): a mode-4 column's codes are row positions (V = N). The general
+  GROUP BY learned to group mode 4 by value (test_groupby_modes' regression net), but fast reads kept
+  arriving that take equal codes for equal values -- affinegroup (GROUP BY w ORDER BY c DESC LIMIT: counts
+  of 1 where DuckDB said 2), pairtop (the near-unique pair boards), cdgroup (COUNT(DISTINCT w) would count
+  rows). NOW the encoder emits mode 4 only when no value repeats (strictly monotone passes free; otherwise
+  one sort, paid only by a column that would become a sequence); WDB_SEQ_REPEATS_OK=1 (tests/run.py) keeps
+  the old admission so the suite still builds the state older databases hold; and the three reads decline
+  mode-4 columns. Checked before changing it: every mode-4 column in the pod's live databases is distinct
+  (TPC-H c_custkey, o_orderkey, p_partkey, s_suppkey); only cb25db_old / cb25db_v2_old (pre-guard flags) hold
+  repeats; the ClickBench kit has no mode-4 column.
+- THE DEFAULT'S GROUP (wdb_cdgroup): the planes hand only the NON-default rows, so the lane is exact only
+  when the query drops the default and the default is ''. It served COUNT(DISTINCT w) GROUP BY a (a sparse
+  int, default 0 a real group) and dropped the biggest group from ORDER BY u DESC LIMIT 5 (ranks 2-6 where
+  DuckDB's 1-5). NOW it requires WHERE key <> '' and a '' default (e8d / e9d), or declines. Q13 unchanged.
+- tests/test_mode4_reads.py: fourteen shapes against DuckDB on a mode-4 key with repeats and on the same
+  values as a dictionary; the encoder makes no sequence with repeats (and still makes one without); the
+  cdgroup lane keeps the default group (with the reads ahead of it set aside) and still serves Q13's shape.
+  On 16b85b1 the mode-4, encoder and cdgroup tests fail; now they pass.

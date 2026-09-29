@@ -94,6 +94,9 @@ def detect(seg, tree, col_map):
             b = cn
     if a is None or b is None:
         return None
+    if seg.cols[a].get('mode') == 4 or seg.cols[b].get('mode') == 4:
+        return None                              # codes are row positions, not values: a repeated
+                                                 # value's rows never met (2026-09-29)
     for _, cn in [t for t in aggs if t[0] in ('SUM', 'AVG')]:
         if cn not in seg.cols:
             return None

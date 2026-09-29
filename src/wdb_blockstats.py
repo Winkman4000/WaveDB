@@ -26,9 +26,10 @@ _HITS = 0
 # LOAD_ANSWERS (2026-09-29, the ClickBench rule: no "pre-aggregated tables or indices"): off, the load
 # statistics may steer (block min/max skipping, THE PICK's estimates, COUNT from per-block counts,
 # MIN/MAX from zone maps) but never ARE an answer -- no SUM/AVG from block sums, no per-value counts
-# as a GROUP BY's result, no repeat list as a pair board. WDB_LOAD_ANSWERS=0 turns it off.
+# as a GROUP BY's result, no repeat list as a pair board. OFF BY DEFAULT (Jackson, 2026-09-29: "work
+# from the floor"); WDB_LOAD_ANSWERS=1 turns the answers back on (the suite does, to exercise them).
 import os as _os_la
-_ANSWERS = [_os_la.environ.get('WDB_LOAD_ANSWERS', '1') == '1']
+_ANSWERS = [_os_la.environ.get('WDB_LOAD_ANSWERS', '0') == '1']
 _BR = 32768
 _SCACHE = wdb_qmem.register({})          # (seg.path, col, N) -> stats dict; qmem per the
                                          # cold-truth law. Persistence is LAWFUL only on
