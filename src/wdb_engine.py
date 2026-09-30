@@ -2419,6 +2419,41 @@ class Segment:
                 lits8 = _WK.unpack_any_off(lb8, nlit, bits8, sh0)
                 out8[np.nonzero(seg8)[0]] = lits8
             return out8
+        if enc_r == 9 and nm not in self._codes and 0 <= lo < hi and hi - lo < 65536:
+            # THE TIERED DRESS, BY RANK (2026-09-30): a small range of a tag-9 column fell to the full
+            # decode -- stairs()' first-block "no" on MobilePhoneModel paid 170 ms inside wherescan's
+            # detect (Q10, Q11) to read 64K rows. The presence bitmap + checkpoints give the window's
+            # literal ranks [a, b); each tier's bitmap runs over the literals the earlier tiers left,
+            # in order, so the window's leftovers stay one contiguous stretch of every tier's list:
+            # the bits before it shift it (a -= set bits before a), the bits inside it assign.
+            c = self.cols[nm]
+            pb9 = np.asarray(self.buf[c['e9pres']:c['e9pres'] + (self.N + 7) // 8], dtype=np.uint8)
+            ck9 = np.frombuffer(self.buf[c['e9ck']:c['e9ck'] + ((self.N + 65535) // 65536) * 8],
+                                dtype=np.uint64)
+            cb9 = lo >> 16
+            base9 = cb9 << 16
+            up9 = np.unpackbits(pb9[base9 >> 3:(hi + 7) >> 3], count=hi - base9).astype(bool)
+            a9 = int(ck9[cb9]) + int(up9[:lo - base9].sum())
+            win9 = up9[lo - base9:]
+            idx9 = np.flatnonzero(win9)                      # the window's present rows, in order
+            out9 = np.full(hi - lo, c['e9d'], dtype=np.uint8 if int(c['e9bits']) <= 8 else np.uint16)
+            if idx9.size:
+                lits9 = np.empty(idx9.size, np.int64)
+                left9 = np.arange(idx9.size)                 # window literals no tier has claimed yet
+                for tc9, tn9, toff in c['e9tiers']:
+                    b9 = a9 + left9.size
+                    bits9 = np.unpackbits(np.frombuffer(self.buf, np.uint8, (b9 + 7) // 8, toff),
+                                          count=b9).astype(bool)
+                    mine9 = bits9[a9:b9]
+                    lits9[left9[mine9]] = tc9
+                    left9 = left9[~mine9]
+                    a9 -= int(bits9[:a9].sum())
+                    if left9.size == 0:
+                        break
+                if left9.size:
+                    lits9[left9] = np.frombuffer(self.buf, np.uint8, left9.size, int(c['e9tail']) + a9)
+                out9[idx9] = lits9
+            return out9
         if enc_r in (5, 6):
             return self._raw_codes(nm)[lo:hi]    # bucket tags: the range reader predates them;
                                                  # the cached full decode is exact and 54ms-class

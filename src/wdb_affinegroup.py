@@ -128,7 +128,9 @@ def execute(seg, spec):
     memo = seg.__dict__.setdefault('_censusmemo', {})   # V-sized, planes-memo law
     cnt = memo.get(col)
     if cnt is None:
-        cnt = np.bincount(np.asarray(seg._raw_codes(col)), minlength=V)
+        import wdb_kernels as _WKg                # THE PARALLEL CENSUS (2026-09-30): numpy's bincount is
+        cnt = np.asarray(_WKg.bincount_par(np.asarray(seg._raw_codes(col)), V), np.int64)   # one thread;
+        # detect admits no nulls and no mode 4, so every code is < V as the kernel requires
         memo[col] = cnt
     k9 = min(k, V - 1)
     order = np.argpartition(-cnt, k9)[:k]

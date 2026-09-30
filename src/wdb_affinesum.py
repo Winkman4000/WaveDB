@@ -86,7 +86,11 @@ def execute(seg, spec):
             except Exception:                            # refused birth re-paid the
                 census = None                            # bincount every single run
     if census is None or census.size < V or int(census.sum()) != int(seg.N):
-        census = np.bincount(np.asarray(seg._raw_codes(col)), minlength=V)
+        # THE PARALLEL CENSUS (2026-09-30, the floor: the load's census no longer answers): numpy's
+        # bincount was one thread over 100M codes (Q29: 166 ms cold and hot); detect admits no nulls,
+        # so every code is < V as the kernel requires
+        import wdb_kernels as _WKa
+        census = np.asarray(_WKa.bincount_par(np.asarray(seg._raw_codes(col)), V), np.int64)
     memo[col] = census
     dv = memo.get((col, 'dv'))                           # the dictionary's values, once per segment: the
     if dv is None or dv.size != V:                       # per-value fetch fallback was 2,159 calls every run

@@ -3279,3 +3279,26 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
   values as a dictionary; the encoder makes no sequence with repeats (and still makes one without); the
   cdgroup lane keeps the default group (with the reads ahead of it set aside) and still serves Q13's shape.
   On 16b85b1 the mode-4, encoder and cdgroup tests fail; now they pass.
+
+## 2026-09-30 -- THE FLOOR'S CHEAP THINGS: PARALLEL CENSUS; THE TIERED DRESS BY RANK
+- Found by the floor recon (cb_van0929, WDB_SIDECARS=0, true cold; log session_2026-09-30/frecon.log).
+- THE PARALLEL CENSUS (wdb_affinesum Q29, wdb_affinegroup Q35): the per-code counts were numpy's
+  bincount, one thread over 100M codes. Now wdb_kernels.bincount_par (per-thread boards, T*V*4 bytes;
+  numpy below 4M rows or above 64M codes). Q35's ClientIP boards hold ~620 MB for the query's life.
+- THE TIERED DRESS, BY RANK (wdb_engine._raw_codes_range): a window [lo, hi) under 64K rows of a tag-9
+  column fell to the full decode. Now it reads the presence bitmap from its 64K checkpoint, ranks into
+  each tier's bitmap, and reads the tail bytes -- the column is never decoded. stairs()' first-block
+  check rides it: wherescan.detect Q10 187 -> 21 ms cold, Q11 177 -> 21 ms. Exact over 615 windows on
+  the three live tag-9 columns (MobilePhone, MobilePhoneModel, BrowserLanguage).
+- tests/test_e9_range.py: 156 windows (first block, checkpoint edges, the last rows, random) equal the
+  full decode on a 1.2M-row toy (rule eleven elects at >=65,536 non-default rows), and neither the
+  windows nor stairs() leave the column decoded.
+
+| query | before cold/hot | after cold/hot | note |
+|---|---|---|---|
+| Q29 | 344, 358, 353 / ~244 | 208, 225, 224 / ~94 | parallel census |
+| Q35 | 727, 728, 721 / ~526 | 507, 512, 485 / ~276 | parallel census |
+| Q10 | 518, 471, 484 / ~110 | 443, 486, 454 / ~109 | detect saved ~166 ms but the wall only ~30; where the rest went is NOT yet measured |
+| Q11 | 773, 714, 751 / ~233 | 699, 696, 710 / ~237 | same gap: ~156 saved in detect, ~45 on the wall |
+Same-hour A/B, alternating, 3 rounds, true cold (bench/true_cold.py), A = 12b9a76 src, B = this change.
+Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSWERS=0) 43/43, WRONG=0.
