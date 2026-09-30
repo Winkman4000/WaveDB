@@ -38,6 +38,32 @@ _POOL = None
 
 _PIPE3 = [__import__('os').environ.get('WDB_PIPE3', '1') == '1']   # A/B: 0 restores read-all-then-decode for enc-3
 _PIPE19 = [__import__('os').environ.get('WDB_PIPE19', '1') == '1'] # A/B: 0 restores warm_span-then-decode for enc 19
+_FWR = [__import__('os').environ.get('WDB_FW', '1') == '1']        # A/B: 0 restores the general-width readers (wdb_fw)
+
+
+def _e19s_blocks(c, pw, dw, N, b0, b1, cc):
+    """THE FIXED-WIDTH READERS, enc 19 shelved (Jackson, 2026-09-30): blocks [b0, b1) grouped by pointer
+    width, each group through its own generated kernel (wdb_fw.e19s_L: 64 rows = L whole words, every
+    shift a constant, a u32 label). UserID hot, measured: 26.2 ms -> 17.5, exact. A width with no
+    kernel (0: a one-value block) takes the general reader, block by block."""
+    import wdb_kernels as _WK
+    BR = np.int64(c['e19BR']); W = np.int64(c['e19W']); wb = np.int64(c['e19wb'])
+    lbs = c['e19lb'][b0:b1]
+    if not _FWR[0]:
+        _WK.e19s_decode(pw, dw, BR, np.int64(N), W, wb, c['e19lb'], c['e19gw'], c['e19dc'], c['e19poff'],
+                        c['e19pre'], c['e19soff'], c['e19SW'], np.int64(b0), np.int64(b1), cc)
+        return
+    import wdb_fw as _FW
+    for L in np.unique(lbs):
+        blocks = (np.flatnonzero(lbs == L) + b0).astype(np.int64)
+        fn = _FW.E19S.get(int(L))
+        if fn is not None:
+            fn(pw, dw, BR, np.int64(N), W, wb, c['e19gw'], c['e19dc'], c['e19poff'], c['e19pre'],
+               c['e19soff'], c['e19SW'], blocks, cc)
+        else:
+            for b in blocks:
+                _WK.e19s_decode(pw, dw, BR, np.int64(N), W, wb, c['e19lb'], c['e19gw'], c['e19dc'],
+                                c['e19poff'], c['e19pre'], c['e19soff'], c['e19SW'], np.int64(b), np.int64(b + 1), cc)
 _PLANES = [__import__('os').environ.get('WDB_PLANES', '1') == '1']  # A/B: 0 restores the old enc 8/9 full decodes
 
 
@@ -1094,9 +1120,7 @@ class Segment:
                   c['e19pre'], c['e19soff'], c['e19SW'])
 
             def dec(b0, b1):
-                W, wb, lb, gw, dc, po, pre, soff, SW = sh
-                _WK19.e19s_decode(pw, dw, np.int64(BR), np.int64(N), W, wb, lb, gw, dc, po, pre, soff, SW,
-                                  np.int64(b0), np.int64(b1), cc)
+                _e19s_blocks(c, pw, dw, N, b0, b1, cc)
         if self._resident_share(cs, pend) > 0.9 and self._resident_share(ds, dend) > 0.9:
             if shelved:
                 dec(0, nb)
@@ -1243,8 +1267,12 @@ class Segment:
             cc = np.zeros(int(c['pXn']), dtype=np.uint16 if bitsX > 8 else np.uint8)
             import wdb_kernels as _WK
             bufX = np.frombuffer(self.buf, np.uint8)
-            _WK.bp10_decode(bufX, np.ascontiguousarray(dirX), int(c['pXpay']),
-                            bitsX, int(c['pXn']), cc)
+            if _FWR[0] and 1 <= bitsX <= 16:         # THE FIXED-WIDTH READERS: 8 values = bitsX bytes (all
+                import wdb_fw as _FW                 # 31 enc-10 columns hot, measured: 431 ms -> 201, exact)
+                _FW.BP10[bitsX](bufX, np.ascontiguousarray(dirX), np.int64(c['pXpay']), np.int64(c['pXn']), cc)
+            else:
+                _WK.bp10_decode(bufX, np.ascontiguousarray(dirX), int(c['pXpay']),
+                                bitsX, int(c['pXn']), cc)
             self._codes[nm] = cc; return cc
         if c.get('code_enc', 0) == 9:                # tiered dress: absence + tier planes + tail
             import wdb_kernels as _WK
@@ -1364,10 +1392,8 @@ class Segment:
             import wdb_kernels as _WK19
             pw, dw = self._e19_words(c)
             cc = np.empty(self.N, dtype=self._e19_dtype(c))
-            if 'e19R' in c:                          # THE SHELVES
-                _WK19.e19s_decode(pw, dw, np.int64(c['e19BR']), np.int64(self.N), np.int64(c['e19W']),
-                                  np.int64(c['e19wb']), c['e19lb'], c['e19gw'], c['e19dc'], c['e19poff'],
-                                  c['e19pre'], c['e19soff'], c['e19SW'], np.int64(0), np.int64(c['e19lb'].size), cc)
+            if 'e19R' in c:                          # THE SHELVES (fixed-width readers)
+                _e19s_blocks(c, pw, dw, self.N, 0, int(c['e19lb'].size), cc)
             else:
                 _WK19.e19_decode(pw, dw, np.int64(c['e19BR']), np.int64(self.N), np.int64(c['e19bits']),
                                  c['e19lb'], c['e19gw'], c['e19dc'], c['e19poff'], c['e19doff'], cc)
@@ -1425,8 +1451,12 @@ class Segment:
             import wdb_kernels as _WK                # family rides bit math too;
             wdt0 = np.uint8 if bits <= 8 else (np.uint16 if bits <= 16 else np.uint32)
             cc = np.zeros(self.N, wdt0)              # native width, kernel at scale
-            _WK.bp0_decode(np.frombuffer(self.buf, np.uint8), int(base),
-                           int(bits), self.N, cc)
+            if _FWR[0]:                              # THE FIXED-WIDTH READERS: 8 values = bits bytes
+                import wdb_fw as _FW                 # (WatchID / HID hot, measured: ~31-41 ms -> ~22, exact)
+                _FW.BP0[int(bits)](np.frombuffer(self.buf, np.uint8), np.int64(base), np.int64(self.N), cc)
+            else:
+                _WK.bp0_decode(np.frombuffer(self.buf, np.uint8), int(base),
+                               int(bits), self.N, cc)
         else:
             cc = self._bitunpack(base, 0, self.N, bits)  # native width
         self._codes[nm] = cc; return cc
