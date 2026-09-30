@@ -72,6 +72,12 @@ CASES = [
     ('bsi_q6_multi',       'bsi',  "SELECT SUM(l_extendedprice * l_discount) FROM lineitem "
                                    "WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01' "
                                    "AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 24"),
+    # ...and by default (bsi off) the same shapes take the fused scan (texts differ: the plan cache keys on text)
+    ('bsi_off_discount',   'fast', "SELECT SUM(l_extendedprice) FROM lineitem "
+                                   "WHERE l_discount BETWEEN 0.04 AND 0.07"),
+    ('bsi_off_q6_multi',   'fast', "SELECT SUM(l_extendedprice * l_discount) FROM lineitem "
+                                   "WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01' "
+                                   "AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 25"),
     # ---- FK-pointer joins: must gather (not hash / pandas) ----
     ('jn_group_sum',       'fast', "SELECT c.c_mktsegment, SUM(o.o_totalprice) FROM orders o "
                                    "JOIN customer c ON o.o_custkey=c.c_custkey GROUP BY c.c_mktsegment"),
@@ -140,7 +146,14 @@ def _evaluate():
     db, con = _fixture()
     report, fails = [], []
     for label, expected, q in CASES:
-        got, g = _classify(db, q)
+        # the bsi read is OFF by default (Jackson, 2026-09-30); its cases turn it on for themselves
+        old = os.environ.get('WDB_BSI')
+        if expected == 'bsi': os.environ['WDB_BSI'] = '1'
+        try:
+            got, g = _classify(db, q)
+        finally:
+            if old is None: os.environ.pop('WDB_BSI', None)
+            else: os.environ['WDB_BSI'] = old
         try:
             e = con.execute(q).fetchall()
             ans = 'OK' if _eq(_norm(g), _norm([tuple(r) for r in e])) else 'WRONG'

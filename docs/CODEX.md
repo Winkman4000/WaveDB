@@ -3302,3 +3302,35 @@ ClickHouse 2.17, DuckDB 3.32 -- WaveDB leads cold on score and total (23.6 s vs 
 | Q11 | 773, 714, 751 / ~233 | 699, 696, 710 / ~237 | same gap: ~156 saved in detect, ~45 on the wall |
 Same-hour A/B, alternating, 3 rounds, true cold (bench/true_cold.py), A = 12b9a76 src, B = this change.
 Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSWERS=0) 43/43, WRONG=0.
+
+## 2026-09-30 -- BSI OFF BY DEFAULT; THE SHELVED SCHEDULE (enc 19 cold)
+- Jackson: "we should go without it" (the Q1 bsi_filter). read_methods._bsi_on: WDB_BSI=1 turns the read
+  on; default off, detect and execute both check (a replayed plan meets the switch). Measured true cold:
+  ClickBench Q1 ~300 ms with it vs ~120 without (hot ~35 either way, same answer); TPC-H-shaped
+  SUM WHERE l_discount BETWEEN (60M rows) 800-950 cold with it vs 1,070 without, hot 455 vs 136.
+  test_bsi_exec turns it on per test (+ test_off_by_default_same_answer); test_path_coverage runs its
+  'bsi' cases with it on and two new cases (bsi_off_*) take the fused path by default.
+- UserID, the facts (cb_van0929): 250 MB on disk = 189 MB row pointers (15.1 bits/row; the best a
+  per-block coder could do is 13.6) + 58 MB block dictionaries (34.4M entries, 13.5 bits each, a user
+  listed in ~1.95 blocks) + the 2.7 MB shelf table. Global order-0 entropy 22.4 bits/row (280 MB): the
+  blocks already beat it. Runs are useless (5.6% of rows repeat the previous row). Cold raw read at
+  16-64 streams 151-158 ms (1 stream: 345); hot decode 47 ms.
+- THE SHELVED SCHEDULE (wdb_engine._e19_pipelined): traced cold, every byte had landed by ~100-190 ms,
+  but a shelved decode needs every label first, then ran 16 thin slices one after another (118-159 ms,
+  vs 47 in one hot call), the first ~50 ms of it faulting the shelf table in page by page. Now the
+  shelf table is read with the labels and shelved columns decode in 4 slices.
+  Same-hour A/B, UserID cold after the kernel is loaded, 6 each: before 215, 218, 219, 272, 283, 297
+  (median ~245, two modes); after 204, 220, 225, 225, 233, 234 (median ~225, one mode); same checksum.
+  The decode now ends ~10-30 ms after the last byte lands: what remains is BYTES.
+- UserID BYTE PLANNING (counts only, nothing built; time order kept):
+  block rows | pointers | dictionary at 13.5 bits/entry | total | dictionary as Elias-Fano | total
+  8K   | 155.4 | 90.2 | 245.6 | 96.9 | 252.3
+  16K  | 165.2 | 76.5 | 241.7 | 77.4 | 242.6
+  32K  | 177.2 | 65.8 | 243.0 | 62.3 | 239.5
+  64K  | 188.7 | 58.1 | 246.8 | 52.2 | 240.9   (today)
+  128K | 195.3 | 52.6 | 247.9 | 44.0 | 239.3
+  Rows alone in their block: 18.0% at 64K (their entries are ~52% of the dictionary). Entries already in
+  the previous block's dictionary: 19.0% at 64K. Pointers entropy-coded per block: 13.6 bits (-19 MB).
+  THE READING: block size and dictionary coding are flat (239-252 MB); in time order the known knobs hold
+  ~5-13% together. A real cut needs a different model -- to plan with Jackson.
+- Gates: suite 1791/1791; floor verify 43/43, WRONG=0.

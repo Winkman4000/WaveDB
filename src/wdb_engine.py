@@ -1104,6 +1104,14 @@ class Segment:
                 _WK19.e19_decode(pw, dw, np.int64(BR), np.int64(N), np.int64(c['e19bits']),
                                  c['e19lb'], c['e19gw'], c['e19dc'], poff, doff, cc)
             return cc
+        if shelved:
+            # THE SHELVED SCHEDULE (2026-09-30, measured cold on UserID, 16 cores, 250 MB): a shelved decode
+            # needs EVERY label before any slice, so the slices only follow the pointers; 16 thin slices
+            # ran one after another after the labels landed (118-159 ms of decode vs 47 in one hot call)
+            # and the shelf table (e19tab, 2.7 MB) faulted in page by page inside the first (~50 ms).
+            # Now the shelf table is read with the labels and the pointers decode in 4 slices:
+            # 197-217 ms cold against 242-293, ~10-15 ms after the last byte lands.
+            K = 4
         K = max(1, min(K, nb))
         cuts = [nb * k // K for k in range(K + 1)]
         fd = self.__dict__.get('_fd_read')
@@ -1116,6 +1124,9 @@ class Segment:
         futs = []
         labels = []                                  # shelved: every label word, first (all segments need them)
         if shelved:
+            t0, t1 = c['e19tab']                     # the shelf table rides with the labels
+            for x in range(int(t0), int(t1), 1 << 20):
+                labels.append(pool.submit(_os.pread, fd, min(1 << 20, int(t1) - x), x))
             for x in range(ds, dend, RUN):
                 labels.append(pool.submit(_os.pread, fd, min(RUN, dend - x), x))
         for k in range(K):

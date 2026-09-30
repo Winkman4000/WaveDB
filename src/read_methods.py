@@ -302,15 +302,26 @@ cluster_group_slice = Read('cluster_group_slice',
 #     execute catches it and returns None (declines) -- folding them into the same
 #     uniform detect/execute loop. bsi's detect carries the throughput-only gate.
 
+def _bsi_on():
+    # DECIDED (Jackson, 2026-09-30: "we should go without it"): OFF by default. Measured on the pod,
+    # true cold: ClickBench Q1 ~300 ms with it vs ~120 without (hot ~35 either way, same answer); the
+    # TPC-H-shaped SUM WHERE l_discount BETWEEN (60M rows) 800-950 cold with it vs 1,070 without, but
+    # hot 455 with it vs 136 without. WDB_BSI=1 turns it back on (its tests do, locally).
+    import os
+    return os.environ.get('WDB_BSI', '0') == '1'
+
 def _bsi_detect(c):
+    if not _bsi_on(): return None
     return None if c.esc else True          # bsi filter is throughput-mode only
 
 def _bsi_execute(c, spec):
+    if not _bsi_on(): return None           # (a replayed plan meets the switch too)
     try:
         return wdb_bsi_exec.execute(c.seg, c.tree, c.cmap)
     except wdb_bsi_exec._BSIUnsupported:
         return None                          # shape/selectivity unfit -> fall through
 
+# DECIDED 2026-09-30: off by default (see _bsi_on). The note it answered:
 # PARKED (Jackson, 2026-09-24 -- see CODEX 'THE BIT-SLICE INDEX, AUDITED'): after the census of the
 # load, no ClickBench query reaches this read on any run (bench/route_census.py). It still serves
 # TPC-H-shaped filtered SUMs (test_path_coverage: bsi_discount_btw, bsi_q6_multi). THE HAZARD: its

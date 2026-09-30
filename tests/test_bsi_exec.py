@@ -32,11 +32,41 @@ def _seg(db):
     return db.open_segment(db.cat.segment_paths('t')[0], 't')
 
 
+def _bsi_on(fn):
+    """The read is OFF by default (Jackson, 2026-09-30); these tests exercise it with WDB_BSI=1."""
+    def wrapped():
+        old = os.environ.get('WDB_BSI'); os.environ['WDB_BSI'] = '1'
+        try:
+            fn()
+        finally:
+            if old is None: os.environ.pop('WDB_BSI', None)
+            else: os.environ['WDB_BSI'] = old
+    wrapped.__name__ = fn.__name__
+    return wrapped
+
+
+def test_off_by_default_same_answer():
+    assert os.environ.get('WDB_BSI', '0') != '1'
+    db = _db()
+    h0 = BX._BSI_HITS
+    off = db.run("SELECT SUM(n) FROM t WHERE disc < 0.03")[0]
+    assert BX._BSI_HITS == h0                            # the default never builds the index
+    os.environ['WDB_BSI'] = '1'
+    try:
+        db2 = _db()
+        got = db2.run("SELECT SUM(n) FROM t WHERE disc < 0.03")[0]
+        assert BX._BSI_HITS > h0
+    finally:
+        os.environ.pop('WDB_BSI', None)
+    assert abs(float(off[0][0]) - float(got[0][0])) < 1e-6
+
+
 def test_footprint_zero_before_use():
     db = _db()
     assert BX.footprint(_seg(db)) == (0, [])
 
 
+@_bsi_on
 def test_footprint_after_filter():
     db = _db()
     h0 = BX._BSI_HITS
@@ -45,6 +75,7 @@ def test_footprint_after_filter():
     assert BX.footprint(_seg(db)) == (0, [])             # ...and died with the query (wdb_qmem, Jackson's law)
 
 
+@_bsi_on
 def test_budget_guard_falls_back_but_correct():
     db = _db()
     ans_bsi = db.run("SELECT SUM(n) FROM t WHERE disc < 0.03")[0]
@@ -59,6 +90,7 @@ def test_budget_guard_falls_back_but_correct():
     assert abs(float(ans_bsi[0][0]) - float(ans_fb[0][0])) < 1e-6   # path-independent answer
 
 
+@_bsi_on
 def test_escalate_knob_routes_and_agrees():
     # default is throughput (non-escalated): BSI engages
     db = _db()
@@ -75,6 +107,7 @@ def test_escalate_knob_routes_and_agrees():
     assert abs(float(a_thru[0][0]) - float(a_lat[0][0])) < 1e-6
 
 
+@_bsi_on
 def test_db_level_escalate_default():
     db = _db(); db.escalate = True                      # operator sets the deployment default
     db.run("SELECT SUM(n) FROM t WHERE disc < 0.03")    # no per-call override -> uses db default

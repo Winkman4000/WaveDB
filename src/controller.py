@@ -78,7 +78,7 @@ _READ_ORDER = (
     R.group_mix,            # group + foldables + one distinct, one walk
     R.cluster_slice,        # contiguous slice of a clustered structure
     R.cluster_group_slice,  # clustered group-runs as slices
-    R.bsi_filter,           # bit-sliced index filter (throughput-only; detect gates on esc) -- PARKED: see read_methods
+    R.bsi_filter,           # bit-sliced index filter (throughput-only) -- OFF unless WDB_BSI=1 (2026-09-30, see read_methods)
     R.pairagg,              # filtered 2-key top-K by count + COUNT/SUM/AVG via parallel sparse hash-agg
     R.fused_agg,            # single-table fused fast path
 )
