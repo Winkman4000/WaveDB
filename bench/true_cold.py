@@ -1,4 +1,6 @@
-"""THE TRUE COLD RUN (2026-09-23): what ClickBench's cold run measures -- the database restarted
+"""(2026-10-01: the default now follows ClickBench's own order -- caches dropped, THEN the database
+started (kernels loaded, opened), then the timed query; TRUE_COLD_LAZY=1 gives the older order below.)
+THE TRUE COLD RUN (2026-09-23): what ClickBench's cold run measures -- the database restarted
 and the OS caches dropped. /proc/sys/vm/drop_caches is refused in the pod, but a file can leave
 the page cache on its own: posix_fadvise(DONTNEED) needs no root (measured on /workspace: 6.7 GB/s
 warm -> 0.71 GB/s after eviction). Per query, in a FRESH process:
@@ -20,16 +22,31 @@ def _resident(f):
 
 
 def one(db_dir, sql):
-    import wdb_db
-    db = wdb_db.Database.open(db_dir)
     segs = glob.glob(os.path.join(db_dir, '*.wdb'))
-    src = os.path.dirname(os.path.abspath(wdb_db.__file__))
+    import importlib.util                              # the src tree PYTHONPATH points at (A/B copies too),
+    src = os.path.dirname(os.path.abspath(importlib.util.find_spec('wdb_db').origin))   # not imported yet
     evict = [f for f in glob.glob(os.path.join(db_dir, '*')) if os.path.isfile(f)]
     evict += glob.glob(os.path.join(src, '__pycache__', '*.nb*'))
-    for f in evict:
-        fd = os.open(f, os.O_RDONLY)
-        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-        os.close(fd)
+
+    def _evict():
+        for f in evict:
+            fd = os.open(f, os.O_RDONLY)
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            os.close(fd)
+    if os.environ.get('TRUE_COLD_LAZY') == '1':
+        # the board before 2026-10-01: open, evict, then the query loads its kernels inside its own time
+        import wdb_db
+        db = wdb_db.Database.open(db_dir)
+        _evict()
+    else:
+        # CLICKBENCH'S ORDER (lib/benchmark-common.sh, 2026-10-01): stop, drop caches, start, wait for
+        # ./check, then the timed query. Start = what wdb_server._State does: warm(), every kernel we ship
+        # loaded (wdb_preload), the database opened -- all of it from a cold page cache, none of it timed.
+        _evict()
+        import wdb_db, wdb_kernels, wdb_preload
+        wdb_kernels.warm()
+        wdb_preload.preload_all()
+        db = wdb_db.Database.open(db_dir)
     r0 = sum(_resident(s) for s in segs)
     t = time.perf_counter(); db.run(sql); cold = (time.perf_counter() - t) * 1e3
     r1 = sum(_resident(s) for s in segs)

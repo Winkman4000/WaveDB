@@ -29,8 +29,9 @@ def _js(v):
 class _State:
     def __init__(self, dbdir):
         from wdb_db import Database
-        import wdb_kernels
+        import wdb_kernels, wdb_preload
         wdb_kernels.warm()
+        wdb_preload.preload_all(verbose=True)        # the program loads itself: every kernel we ship
         self.db = Database.open(dbdir); self.dbdir = dbdir
         self.lock = threading.Lock(); self.queries = 0; self.started = time.time()
         self.timeout = float(os.environ.get('WDB_QUERY_TIMEOUT') or 0) or None; self.cancel = threading.Event()

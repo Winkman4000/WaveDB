@@ -3394,3 +3394,22 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
   random, unsorted with repeats, every block edge, first/last, absent and present rows, and builds neither
   planes nor the full decode; WDB_RANKAT=0 agrees.
 - Gates: suite 1795/1795; floor verify 43/43, WRONG=0.
+
+## 2026-10-01 -- THE PROGRAM LOADS ITSELF (wdb_preload); THE BOARD FOLLOWS CLICKBENCH'S ORDER
+- Jackson: "we should be fine to do it then and if they have a problem with it when we submit it we know
+  what our next project is converting to the c++ binaries".
+- src/wdb_preload.py: preload_all() walks every wdb_* module that defines njit kernels, reads each kernel's
+  numba cache index and loads every signature whose key equals today's (code hash + CPU) -- a cache hit,
+  never a compile; stale entries are skipped. All kernels we ship, not a list from the queries. On the
+  pod: 270 kernels, 274 signatures, 0 stale, ~6.6 s. wdb_server._State calls it at startup (after
+  warm(), before the database opens). WDB_PRELOAD=0 turns it off.
+- bench/true_cold.py now follows lib/benchmark-common.sh: evict the database's files and numba's cache
+  files (= drop_caches), THEN start (warm(), preload_all(), Database.open -- untimed, from a cold page
+  cache), THEN the timed query. TRUE_COLD_LAZY=1 restores the older order (open, evict, lazy kernels).
+  It finds src from wherever PYTHONPATH's wdb_db lives (A/B copies evict their own kernel caches).
+- Floor board (cb_van0929, 43/43, no files born, host load 51-62): cold 1.539 (21.8 s), hot 2.875 (11.9 s);
+  ClickHouse 1.502 (29.0 s) / 2.756, Umbra 1.155 (24.4 s) / 1.016. 09-30: cold 1.670 (24.7 s).
+- OPEN for the submission: install.sh fills no kernel cache. On a fresh machine each query's first run
+  would COMPILE its kernels (seconds) inside the timer. A build step must fill the cache before the board
+  (the C++ engines compile at install) -- e.g. the test suite; measure that it covers every signature the
+  100M-row load and the queries need.
