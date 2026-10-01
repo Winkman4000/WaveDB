@@ -2656,6 +2656,60 @@ def e8_pos(pres_bytes, ck, n, pos):
                 w += 1
 
 
+@njit(inline='always')
+def _pop8(v):
+    v = v - ((v >> 1) & 0x55)
+    v = (v & 0x33) + ((v >> 2) & 0x33)
+    return (v + (v >> 4)) & 0x0F
+
+
+@njit(nogil=True, cache=True)
+def e8_rank_at(pres, ck, rows, rank, present):
+    """THE POINT READ BY RANK (2026-10-01), tags 8 and 9: for SORTED rows, each row's rank among the
+    present rows (its literal's index) and whether it is present -- the 64K checkpoint, then the set
+    presence bits (MSB-first) from the block start up to the row, counted on from the previous row.
+    Reads only the presence bytes up to the rows asked, never the whole column."""
+    cur = np.int64(-1); cnt = np.int64(0); byte = np.int64(0)
+    for i in range(rows.size):
+        r = rows[i]
+        b = r >> 16
+        if b != cur:
+            cur = b; cnt = np.int64(ck[b]); byte = b << 13
+        tb = r >> 3
+        while byte < tb:
+            cnt += _pop8(np.int64(pres[byte])); byte += 1
+        v = np.int64(pres[tb]); k = r & 7
+        rank[i] = cnt + (_pop8(v >> (8 - k)) if k else 0)
+        present[i] = (v >> (7 - k)) & 1
+
+
+@njit(nogil=True, cache=True)
+def e8_lits_at(lane, bits, idx, out):
+    """MSB-first literals of the given width at the given indices (any order): five bytes per read, as
+    unpack_any, the lane's end guarded."""
+    mask = np.int64((1 << bits) - 1); L = lane.size
+    for i in range(idx.size):
+        o = idx[i] * bits; j = o >> 3; sh = o & 7
+        acc = np.int64(0)
+        for kk in range(5):
+            acc = (acc << 8) | (np.int64(lane[j + kk]) if j + kk < L else np.int64(0))
+        out[i] = (acc >> (40 - sh - bits)) & mask
+
+
+@njit(nogil=True, cache=True)
+def e9_tier_at(tb, idx, hit, nxt):
+    """One tier of tag 9 for SORTED literal indices: hit[i] = the tier's bit at idx[i]; nxt[i] = the index
+    among the literals this tier leaves = idx[i] - the tier's set bits before idx[i], counted on."""
+    cnt = np.int64(0); byte = np.int64(0)
+    for i in range(idx.size):
+        a = idx[i]; t = a >> 3
+        while byte < t:
+            cnt += _pop8(np.int64(tb[byte])); byte += 1
+        v = np.int64(tb[t]); k = a & 7
+        hit[i] = (v >> (7 - k)) & 1
+        nxt[i] = a - (cnt + (_pop8(v >> (8 - k)) if k else 0))
+
+
 @njit(nogil=True, parallel=True, cache=True)
 def e8_scatter(pos, lits, n, default):
     """Pass 3: default-fill + scatter, parallel."""

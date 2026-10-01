@@ -39,6 +39,7 @@ _POOL = None
 _PIPE3 = [__import__('os').environ.get('WDB_PIPE3', '1') == '1']   # A/B: 0 restores read-all-then-decode for enc-3
 _PIPE19 = [__import__('os').environ.get('WDB_PIPE19', '1') == '1'] # A/B: 0 restores warm_span-then-decode for enc 19
 _FWR = [__import__('os').environ.get('WDB_FW', '1') == '1']        # A/B: 0 restores the general-width readers (wdb_fw)
+_RANKAT = [__import__('os').environ.get('WDB_RANKAT', '1') == '1'] # A/B: 0 restores codes_at's whole planes (tags 8/9)
 
 
 def _e19s_blocks(c, pw, dw, N, b0, b1, cc):
@@ -2571,6 +2572,55 @@ class Segment:
             return outW
         return self._bitunpack(c['cstart'], lo, hi, c['bits'])
 
+    def _e89_at(self, c, rows):
+        """THE POINT READ BY RANK (2026-10-01), tags 8 and 9 (codes in the caller's row order, int64).
+        Measured cold before it (the gather census, cb_van0929): codes_at built the column's whole planes
+        for any row count -- Q23 asked 10 rows of BrowserLanguage (175 ms), MobilePhone (159),
+        SearchPhrase (115), OriginalURL (101); Q21/Q22 ~17K/44K rows of SearchPhrase (135/150).
+        Now: rows sorted; each row's rank from its 64K checkpoint plus the presence bits up to it
+        (wdb_kernels.e8_rank_at); tag 8 reads each present row's literal at rank * bits; tag 9 walks the
+        tiers (e9_tier_at: hit, or the index among what the tier leaves) and the tail."""
+        import wdb_kernels as _WK
+        rows = np.asarray(rows, np.int64)
+        n = rows.size
+        order = np.argsort(rows, kind='stable')
+        rs = np.ascontiguousarray(rows[order])
+        t9 = c.get('code_enc', 0) == 9
+        nck = (self.N + 65535) >> 16
+        po = int(c['e9pres' if t9 else 'e8pres'])
+        pres = np.frombuffer(self.buf, np.uint8, (self.N + 7) // 8, po)
+        ck = np.frombuffer(self.buf, np.uint64, nck, c['e9ck' if t9 else 'e8ck'])
+        # (tried and dropped: warming the presence/literal spans ahead when many rows land on them --
+        # Q21's 17K-row SearchPhrase read went 115 -> 187 ms cold; the page faults were not the cost)
+        rank = np.empty(n, np.int64); present = np.empty(n, np.int64)
+        _WK.e8_rank_at(pres, ck, rs, rank, present)
+        outs = np.full(n, int(c['e9d' if t9 else 'e8d']), np.int64)
+        p = np.flatnonzero(present)
+        if p.size and not t9:
+            bits = int(c['e8bits']); nlit = int(c['e8n'])
+            lane = np.frombuffer(self.buf, np.uint8, (nlit * bits + 7) // 8, c['cstart'])
+            v = np.empty(p.size, np.int64)
+            _WK.e8_lits_at(lane, np.int64(bits), np.ascontiguousarray(rank[p]), v)
+            outs[p] = v
+        elif p.size:
+            idx = np.ascontiguousarray(rank[p])          # ascending: the rows are
+            left = np.arange(p.size)
+            for tc9, tn9, toff in c['e9tiers']:
+                tb = np.frombuffer(self.buf, np.uint8, (int(tn9) + 7) // 8, toff)
+                hit = np.empty(idx.size, np.int64); nxt = np.empty(idx.size, np.int64)
+                _WK.e9_tier_at(tb, idx, hit, nxt)
+                h = hit.astype(bool)
+                outs[p[left[h]]] = tc9
+                left = left[~h]; idx = np.ascontiguousarray(nxt[~h])
+                if left.size == 0:
+                    break
+            if left.size:
+                tail = np.frombuffer(self.buf, np.uint8, int(c['e9tail_n']), c['e9tail'])
+                outs[p[left]] = tail[idx]
+        out = np.empty(n, np.int64)
+        out[order] = outs
+        return out
+
     def codes_at(self, nm, rows):
         """Batch point-pop: codes at the given sorted-or-not row positions, decompressing ONLY the
         touched enc=3 frames (~0.6 ms each). min(point, pop): callers with huge scattered row sets
@@ -2629,6 +2679,11 @@ class Segment:
                             int(c['pXpay']), int(c['pXbits']), rowsX[srt], outX)
             inv9 = np.empty_like(srt); inv9[srt] = np.arange(srt.size)
             return outX[inv9]
+        if c.get('code_enc', 0) in (8, 9) and _RANKAT[0] and nm not in self._codes \
+                and nm not in self.__dict__.get('_e8pm', {}):
+            return self._e89_at(c, rows)     # THE POINT READ BY RANK: no planes built for a few rows
+        if c.get('code_enc', 0) == 9 and nm in self._codes:
+            return self._codes[nm][np.asarray(rows, np.int64)]
         if c.get('code_enc', 0) == 9:
             rows9 = np.asarray(rows, np.int64)
             pl9 = self.e8_planes(nm)         # planes speak tag-9, memoized

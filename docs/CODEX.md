@@ -3365,3 +3365,32 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
   bitpack blocks mixed; enc 19 shelved with pointer widths 0..14, whole and sliced, switch on and off.
 - Gates: suite 1794/1794; floor verify 43/43, WRONG=0. Kept (Jackson: "it may be small but its the
   kinda thing that will make us win if we can ever get neck and neck with them on something").
+
+## 2026-10-01 -- THE GATHER CENSUS; THE POINT READ BY RANK (tags 8, 9); KERNEL LOADING IS IN THE COLD TIME
+- THE GATHER CENSUS (/workspace/gcensus.py, gcensus_cold.py): every outermost codes_at / _raw_codes_range /
+  _raw_codes per query, column, encoding, rows, ms. Hot, all 43: the fixed-width gathers we meant to
+  specialize are small (enc 10 49 ms over 8 queries, enc 19 11, enc 0 <1) -- NOT DONE, not worth it. The
+  big gathers are zstd frames at scattered rows (enc 3: 585 ms hot, 1,543 cold over Q21-23, Q36-41;
+  Q22's URL 325 hot / 852 cold) -- Jackson: hot frame caching on hold, cold first.
+- THE POINT READ BY RANK (Segment._e89_at; wdb_kernels.e8_rank_at, e8_lits_at, e9_tier_at): codes_at on a
+  tag-8/9 column built the column's WHOLE planes for any row count (Q23: 10 rows of BrowserLanguage 175 ms
+  cold, MobilePhone 159, SearchPhrase 115, OriginalURL 101). Now: rows sorted; rank = the 64K checkpoint +
+  the presence bits from the block start to the row, counted on from the previous row; tag 8 reads the
+  literal at rank * bits; tag 9 walks the tiers (hit, or the index among what the tier leaves = index -
+  the tier's set bits before it) then the tail. Planes already in memory or a decoded column still serve.
+  WDB_RANKAT=0 restores the old path. Exact on all five live columns (10 / 1000 unsorted+dups / 50K /
+  every block edge / first+last).
+  True cold, same hour: Q23 ~1,317 -> ~780-837 ms (402 -> 246 MB read); Q21, Q22 unchanged.
+  Tried and dropped: warming the presence/literal spans ahead for many rows (Q21's read 115 -> 187 ms).
+- KERNEL LOADING (measured, rankprof.py): 10 rows of SearchPhrase cold = 340 ms; data cold + kernels
+  loaded = 28 ms; data resident + kernels cold = 306 ms. The whole board (kpre.py, same hour): true cold
+  24.5 s / score 1.721; kernels already loaded, data cold: 21.2 s / score 1.473 (ClickHouse 1.502,
+  Umbra 1.155) -- ~3.3 s of numba kernel loading inside cold times, 50-260 ms a query.
+  ClickBench's driver (lib/benchmark-common.sh): stop, wait down, sync + drop_caches, ./start, poll ./check
+  until ready, THEN the timed query -- startup is outside the timer. Jackson: load every kernel we ship at
+  startup (not a list picked from the 43 queries); if the maintainers object, the next project is native
+  binaries.
+- tests/test_rank_at.py: toys holding a real tag-8 and tag-9 column; codes_at equals the full decode for
+  random, unsorted with repeats, every block edge, first/last, absent and present rows, and builds neither
+  planes nor the full decode; WDB_RANKAT=0 agrees.
+- Gates: suite 1795/1795; floor verify 43/43, WRONG=0.
