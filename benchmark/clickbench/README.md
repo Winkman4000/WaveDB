@@ -19,4 +19,5 @@ engine is compiled at install.
 database before it answers `./check` -- program code only; nothing from the data, and no result, is cached
 across the restart.
 
-**Queries.** `queries.sql` is the standard set; Q28/Q29 use `length()` (characters).
+**Queries.** `queries.sql` is the standard set, one statement per line in canonical order (the driver runs
+every non-empty line, so the file carries no comments); Q28/Q29 use `length()` (characters).

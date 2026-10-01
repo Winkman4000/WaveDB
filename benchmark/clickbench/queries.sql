@@ -1,6 +1,3 @@
--- ClickBench standard 43 queries (Q0..Q42), vendored from RunPod volume cb25 build.
--- Target table: hits. Source of truth for the ClickBench half of docs/corpus.md.
--- One statement per line, in canonical ClickBench order.
 SELECT COUNT(*) FROM hits;
 SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0;
 SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits;
