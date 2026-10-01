@@ -32,9 +32,22 @@ class _State:
         import wdb_kernels, wdb_preload
         wdb_kernels.warm()
         wdb_preload.preload_all(verbose=True)        # the program loads itself: every kernel we ship
-        self.db = Database.open(dbdir); self.dbdir = dbdir
+        self.dbdir = dbdir; self._db = None
+        # ClickBench's driver starts the server and polls ./check BEFORE the load (and again after it): a
+        # database not there yet is opened when it is first needed instead of failing the start
+        if os.path.exists(os.path.join(dbdir, 'catalog.json')):
+            self._db = Database.open(dbdir)
         self.lock = threading.Lock(); self.queries = 0; self.started = time.time()
         self.timeout = float(os.environ.get('WDB_QUERY_TIMEOUT') or 0) or None; self.cancel = threading.Event()
+
+    @property
+    def db(self):
+        if self._db is None:
+            from wdb_db import Database
+            if not os.path.exists(os.path.join(self.dbdir, 'catalog.json')):
+                raise KeyError('no database at %s yet (load it first)' % self.dbdir)
+            self._db = Database.open(self.dbdir)
+        return self._db
 
 
 def make_handler(state):

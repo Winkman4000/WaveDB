@@ -3413,3 +3413,30 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
   would COMPILE its kernels (seconds) inside the timer. A build step must fill the cache before the board
   (the C++ engines compile at install) -- e.g. the test suite; measure that it covers every signature the
   100M-row load and the queries need.
+
+## 2026-10-01 -- THE SUBMISSION, IN CLICKBENCH'S CURRENT FORM
+- ClickBench now runs every system through lib/benchmark-common.sh (read in full from a clone): install,
+  start + check (1 s polls, 300 s), the download, load (timed, then a sync, then ./check and ./data-size
+  >= 5 GB or the run aborts), then per query: stop, wait until ./check fails, sync + drop_caches (+ an
+  optional ./flush-caches hook), start, check, three tries ("[t1,t2,t3],"; each try's seconds = the LAST
+  numeric line of ./query's stderr; non-zero exit = null), then data-size, a concurrent-QPS test (10
+  workers, 600 s by default; single-process engines set BENCH_CONCURRENT_DURATION=0), stop. set -e.
+- benchmark/clickbench/ is now that directory (the old install.sh/load.sh/run.sh are gone):
+  benchmark.sh (BENCH_DOWNLOAD_SCRIPT=download-hits-parquet-single, daemon + durable defaults), install
+  (WAVEDB_REF/WAVEDB_REPO/WAVEDB_PYTHON; pinned numpy 2.4.6, numba 0.65.1, llvmlite 0.47.0, pyarrow 24.0.0,
+  zstandard 0.25.0, sqlglot 30.11.0, pandas 3.0.3, duckdb 1.5.3; then THE BUILD), start/stop (wdb serve
+  under a pid file; the engine child dies with its watchdog), check (GET /health: answers only after the
+  kernels are loaded and the database is open), query (POST /sql through curl; curl's time_total on
+  stderr -- the round trip, as clickhouse-client --time; pandas' submission reports its server's elapsed),
+  load (the floor flags as before), data-size (du -sb cbdb: 8.9 GB on the pod), create.sql (the standard
+  DDL, from ClickBench's duckdb/), template.json (WaveDB, Python, column-oriented), README.md, and
+  results.py (the driver's log -> results/YYYYMMDD/<machine>.json).
+- wdb_server: a database not there at startup (the driver starts the server before the load) is opened
+  when first asked.
+- tools/kernel_build.py + src/kernels.manifest: `dump` records every kernel signature compiled and valid in
+  this checkout's numba cache (merged with the manifest); `build` (run by install) compiles them all on a
+  fresh machine, one function per worker. First manifest: 219 functions, 316 signatures, 13 KB.
+- Measured: after startup's preload, NONE of the 43 cold queries compiles a kernel inside the timer
+  (numba:compile events, /workspace/compprobe.py).
+- queries.sql: ours = ClickBench's duckdb/queries.sql except Q28/Q29 use length() (characters; DuckDB's
+  submission uses STRLEN = bytes). Allowed (each system ships its dialect).
