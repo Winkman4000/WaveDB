@@ -3477,3 +3477,45 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
 - STILL NEEDED FOR THE PR: a public source for install (the repo is private); WAVEDB_REF pinned to a fixed
   commit; the PR (benchmark/clickbench/* minus dev helpers -> ClickBench/wavedb/, plus
   results/20261001/c6a.4xlarge.json).
+
+## 2026-10-01 -- THE LOAD ON A SMALL MACHINE
+- HTTP + JSON is NOT a hot-run cost: all 43 queries timed three ways on the pod (curl's time_total, the
+  server's own wall, in-process). curl minus server = ~1 ms a query, 46 ms over all 43. The "~30 ms a
+  query" written in the dry-run entry above compared two runs taken at different times on a busy host.
+- THE c6a's 770 s LOAD, REPRODUCED ON THE POD: the same 16 cores, WDB_ENCODE_MB=23700 (three-quarters
+  of the c6a's RAM), the live rule off -> 783 s. The machine was not the cause (not gp2, not the CPU):
+  the load is 2,941 core-seconds (184 s on 16 cores), and under that budget it ran 3.8 cores on average,
+  1-2 columns in flight for most of the run. Every job is charged its peak for its whole life: a text
+  column 11.6 GB (half the budget), wide/mid columns 10-13 GB before the governor learns, and the next
+  text column keeps its seat.
+- THE LIVE RULE WAS OFF ON THE c6a: _cg_mem read only container files, and a plain VM under cgroup v2
+  sits in the root hierarchy, which has no memory.max -> None. Now it falls back to /proc/meminfo
+  (limit = MemTotal, live = MemTotal - MemAvailable); WDB_ENCODE_LIMIT_MB caps the limit (the pod
+  standing in for a 32 GB machine). Measured alone it did not help: 794 s (running jobs still reserve
+  their full charge). Live peak during that run 28.9 GB against the 31.6 GB limit.
+- THE GOVERNOR, REPLAYED (/workspace/govsim.py): the paper rule over a log's measured durations and
+  peaks reproduces the run (759 s vs 777 measured). On it the policies barely move: one text at a time,
+  no seat for the next text, texts charged a third of the budget -- all within +-10%. What binds is the
+  long, memory-heavy jobs (the texts, WatchID, HID, the hashes, UserID) running about two at a time: the
+  lever is making those jobs SHORTER.
+- THE SERIALIZE SPEEDUPS (byte-identical: every one of the 105 column blobs and the 8 load-time files
+  hash the same as the old code's load, /workspace/blobhash.py):
+  - _zframes: the tag-3 blocked frames and the tag-18 packed frames compress on WDB_FRAME_THREADS (4)
+    threads -- each frame is its own one-shot compression, so the bytes are the loop's. cProfile: zstd
+    frame calls were 16.0 of IPNetworkID's 26.6 s serialize, 15.0 of ClientIP's 27.3.
+  - pack_msb: _pack_codes' MSB-first bit stream by a compiled loop (bits <= 56) instead of numpy's
+    rows x bits bit matrix (4.5-5.6 s of a narrow column's serialize). WDB_PACK_JIT=0 restores.
+  - _LazyVals: a numeric dictionary's per-value bytes (an int's decimal text, a float's / a clock's 8
+    bytes) are built only when read -- a delta-coded dictionary (mode 2, every large one) only asks their
+    count. WatchID: 100M Python bytes objects, 31.6 s of its 94 s job.
+  tests/test_pack_frames.py: the compiled pack equals the old pack (widths 1-56, every code dtype,
+  negative codes, ragged tails, the old chunk edge); threaded frames equal the loop; _code_section's
+  bytes are the same with the threads on and off.
+- MEASURED (pod, ClickBench's load flags): c6a conditions 783 -> 609 (frames + pack) -> 573 s (+ lazy
+  values); the pod's own budget 283 -> 245 s (same host, back to back). Serialize per class, c6a
+  conditions: narrow 607 -> 329 job-s, flag 226 -> 138, text 150 -> 93. kernels.manifest: 221
+  functions, 331 signatures (pack_msb x8 + 1).
+- STILL ON THE TABLE: the text columns' prep (URL / Referer ~41 s each at 11-13 GB), the hash columns'
+  serialize (tag 20, ~30 s each), the near-unique columns' sort in _int_dictionary (WatchID argsort
+  16.7 s), and the scheduler's starting prices for the wide/mid classes (two wide members never reach
+  the three observations its 80th-percentile rule needs).

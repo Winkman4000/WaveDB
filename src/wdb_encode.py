@@ -110,7 +110,7 @@ def _encode_column(col):
             codes[~null_mask] = inv; codes[null_mask] = len(uniq)
         else:
             uniq, inv = np.unique(iv, return_inverse=True); codes = np.asarray(inv, dtype=np.int64)   # no null: the inverse IS the codes (a copy was 800 MB)
-        valb = [struct.pack('<q', int(v)) for v in uniq]
+        valb = _LazyVals(uniq, _vb_q)                         # built only if read
     elif dtype in (0, 2):
         if has_null:
             nn = data[~null_mask]
@@ -119,8 +119,7 @@ def _encode_column(col):
         else:
             uniq, inv = _int_dictionary(data) if dtype == 0 else np.unique(data, return_inverse=True)
             codes = inv if inv.dtype.kind in 'iu' else np.asarray(inv, dtype=np.int64)   # u32 from the bincount route: kept
-        if dtype == 0: valb = [str(int(v)).encode() for v in uniq]
-        else:          valb = [struct.pack('<d', float(v)) for v in uniq]
+        valb = _LazyVals(uniq, _vb_dec if dtype == 0 else _vb_f64)   # built only if read
     else:
         def to_b(x):
             if isinstance(x,(bytes,bytearray)): return bytes(x)
@@ -139,6 +138,93 @@ def _encode_column(col):
     V = len(valb) + has_null
     return dtype, has_null, V, valb, codes, aux, uniq
 
+
+def _vb_dec(v): return str(int(v)).encode()
+def _vb_f64(v): return struct.pack('<d', float(v))
+def _vb_q(v): return struct.pack('<q', int(v))
+
+
+class _LazyVals:
+    """THE NUMBERS' VALUE BYTES ON DEMAND (2026-10-01): a numeric dictionary's per-value bytes (an
+    int's decimal text, a float's or a clock's 8 bytes) were built for every distinct value --
+    WatchID: 100M Python bytes objects, 31.6 s of its 94 s job (cProfile); URLHash 6.2 s, FUniqID
+    4.6 s -- and a delta-coded dictionary (mode 2: every large one) only ever asks their COUNT.
+    They are built the first time something reads them, by the same expression as before, in the
+    same order; len() costs nothing. Module-level parts only: a prep stays picklable."""
+    def __init__(self, uniq, fn):
+        self.uniq = uniq; self.fn = fn; self._l = None
+
+    def _list(self):
+        if self._l is None:
+            self._l = [self.fn(v) for v in self.uniq]
+        return self._l
+
+    def __len__(self):
+        return len(self.uniq)
+
+    def __getitem__(self, i):
+        return self._list()[i]
+
+    def __iter__(self):
+        return iter(self._list())
+
+    def __eq__(self, other):
+        try:
+            return list(self) == list(other)
+        except TypeError:
+            return NotImplemented
+
+    __hash__ = None
+
+
+_FRAME_THREADS = max(1, int(os.environ.get('WDB_FRAME_THREADS', '4') or 1))
+
+
+def _zframes(level, n, make):
+    """THE FRAMES IN PARALLEL (2026-10-01): [zstd at `level` of make(k) for k < n]. Every frame is
+    its own one-shot compression -- nothing passes from one frame to the next -- so these are the
+    bytes one compressor going frame by frame writes. zstd lets go of the GIL while it compresses:
+    on the c6a's budget a narrow column spent 15-16 s of its 27 s serialize in 1,500-4,000 of these
+    calls on one core (IPNetworkID, ClientIP, cProfile). WDB_FRAME_THREADS (default 4; 1 = the loop)."""
+    if _FRAME_THREADS <= 1 or n < 16:
+        cz = zstd.ZstdCompressor(level=level)
+        return [cz.compress(make(k)) for k in range(n)]
+    import threading, concurrent.futures as cf
+    loc = threading.local()
+    def one(k):
+        cz = getattr(loc, 'cz', None)
+        if cz is None:
+            cz = loc.cz = zstd.ZstdCompressor(level=level)
+        return cz.compress(make(k))
+    with cf.ThreadPoolExecutor(max_workers=_FRAME_THREADS) as ex:
+        return list(ex.map(one, range(n)))
+
+
+_PACK_JIT = os.environ.get('WDB_PACK_JIT', '1') != '0'
+from numba import njit as _njit
+
+
+@_njit(cache=True, nogil=True)
+def pack_msb(codes, bits, out):
+    """THE BIT-PACK AS ONE PASS (2026-10-01): the stream _pack_codes always wrote -- each code's low
+    `bits` bits (bits <= 56), most significant first, rows back to back, np.packbits' order (a
+    byte's first bit is its 0x80), the last byte padded with zeros -- by a compiled loop instead of
+    numpy's rows x bits bit matrix (4.5-5.6 s of a narrow column's serialize, cProfile).
+    out: zeroed, ceil(n * bits / 8) bytes."""
+    b = np.uint64(bits)
+    mask = (np.uint64(1) << b) - np.uint64(1)
+    acc = np.uint64(0); nacc = 0; o = 0
+    for i in range(codes.size):
+        acc = (acc << b) | (np.uint64(codes[i]) & mask)
+        nacc += bits
+        while nacc >= 8:
+            nacc -= 8
+            out[o] = np.uint8((acc >> np.uint64(nacc)) & np.uint64(0xFF))
+            o += 1
+    if nacc > 0:
+        out[o] = np.uint8((acc << np.uint64(8 - nacc)) & np.uint64(0xFF))
+
+
 def _pack_codes(codes, bits):
     """bit-pack in CHUNKS: the N x bits intermediate was 16 GB for 100M x 20-bit codes
     (measured: the true peak of a string column's encode, not the strings)"""
@@ -147,6 +233,10 @@ def _pack_codes(codes, bits):
     codes = np.asarray(codes)
     n = codes.size
     if n == 0: return b''
+    if _PACK_JIT and 1 <= bits <= 56 and codes.dtype.kind in 'iub':
+        out = np.zeros((n * bits + 7) // 8, np.uint8)
+        pack_msb(codes.view(np.uint8) if codes.dtype.kind == 'b' else codes, int(bits), out)
+        return out.tobytes()
     # ~8M bit-cells per chunk, as the comment always said: '(1 << 23) // bits * 8' was 64M cells -- a
     # 1-bit column widened 64M rows at a time into three u64 matrices (1.5 GB). Any multiple of 8 rows
     # packs to whole bytes, so the chunk size never changes the output.
@@ -849,8 +939,8 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
         for BR9 in ((65536, BLOCK_ROWS) if (BLOCK_ROWS > 65536
                     and codes.size and int(np.max(codes)) > 1)
                     else (BLOCK_ROWS,)):
-            frames = [cxb.compress(a[i:i + BR9].tobytes())
-                      for i in range(0, a.size, BR9)]
+            frames = _zframes(CODE_ZSTD_LEVEL, (a.size + BR9 - 1) // BR9,
+                              lambda k, BR9=BR9: a[k * BR9:(k + 1) * BR9].tobytes())
             offs = np.zeros(len(frames) + 1, dtype=np.uint32)
             np.cumsum([len(f) for f in frames], out=offs[1:])
             cand9 = (bytes([3, width]) + struct.pack('<II', BR9, len(frames))
@@ -875,12 +965,12 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
         BR18 = 65536
         a18 = np.ascontiguousarray(arr, dtype=np.int64)
         cx18 = zstd.ZstdCompressor(level=CODE_ZSTD_LEVEL)
-        fr18 = []
-        for i in range(0, a18.size, BR18):
-            ch = a18[i:i + BR18]
+        def _mk18(k):
+            ch = a18[k * BR18:(k + 1) * BR18]
             out = np.zeros((ch.size * bits + 7) // 8 + 8, np.uint8)
             _pk32(ch, bits, out)
-            fr18.append(cx18.compress(out.tobytes()))
+            return out.tobytes()
+        fr18 = _zframes(CODE_ZSTD_LEVEL, (a18.size + BR18 - 1) // BR18, _mk18)
         o18 = np.zeros(len(fr18) + 1, dtype=np.uint32)
         np.cumsum([len(f) for f in fr18], out=o18[1:])
         cand18 = (bytes([18, bits]) + struct.pack('<II', BR18, len(fr18))
@@ -1670,8 +1760,39 @@ _TEXT_BYTES = {}                                  # text column -> estimated in-
 
 def _cg_mem():
     """(limit, live) bytes of this container's memory, or None. live = usage minus the inactive
-    page cache -- the part the kernel cannot hand back without refusing someone."""
+    page cache -- the part the kernel cannot hand back without refusing someone.
+    A MACHINE WITH NO CONTAINER (2026-10-01): on a plain VM under cgroup v2 the process sits in the
+    root's hierarchy, which has no memory.max -- this returned None, the live rule stayed off, and the
+    c6a.4xlarge loaded on the paper budget alone (770 s against 280 on the pod). There the machine is
+    the container: limit = MemTotal, live = MemTotal - MemAvailable.
+    WDB_ENCODE_LIMIT_MB caps the limit (a big machine standing in for a small one)."""
+    r = _cg_mem_raw()
     try:
+        cap = int(float(os.environ.get('WDB_ENCODE_LIMIT_MB', '0'))) << 20
+    except Exception:
+        cap = 0
+    if r is not None and cap:
+        r = (min(r[0], cap), r[1])
+    return r
+
+
+def _meminfo_mem():
+    """(MemTotal, MemTotal - MemAvailable) bytes from /proc/meminfo, or None"""
+    try:
+        d = {}
+        with open('/proc/meminfo') as f:
+            for ln in f:
+                k, v = ln.split(':', 1)
+                d[k] = int(v.split()[0]) * 1024
+        return d['MemTotal'], max(0, d['MemTotal'] - d['MemAvailable'])
+    except Exception:
+        return None
+
+
+def _cg_mem_raw():
+    try:
+        if not os.path.exists('/sys/fs/cgroup/memory.max') and not os.path.exists('/sys/fs/cgroup/memory/memory.limit_in_bytes'):
+            return _meminfo_mem()
         if os.path.exists('/sys/fs/cgroup/memory.max'):
             lim = open('/sys/fs/cgroup/memory.max').read().strip()
             use = int(open('/sys/fs/cgroup/memory.current').read())
