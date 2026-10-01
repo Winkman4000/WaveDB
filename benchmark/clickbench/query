@@ -8,7 +8,9 @@ cd "$(dirname "$0")"
 req=$(mktemp); resp=$(mktemp)
 trap 'rm -f "$req" "$resp"' EXIT
 python3 -c 'import json, sys; json.dump({"sql": sys.stdin.read()}, open(sys.argv[1], "w"))' "$req"
-t=$(curl -sS -o "$resp" -w '%{time_total}' -X POST -H 'Content-Type: application/json' \
+# (-H 'Expect:': for a body over 1 KB curl otherwise asks "Expect: 100-continue" and waits up to a second for
+# a go-ahead the server never sends -- Q29's 90 SUMs measured 1.14 s through curl against 0.135 s inside)
+t=$(curl -sS -o "$resp" -w '%{time_total}' -X POST -H 'Content-Type: application/json' -H 'Expect:' \
     --data-binary @"$req" http://127.0.0.1:8765/sql)
 python3 - "$resp" <<'PY'
 import json, sys
