@@ -3440,3 +3440,19 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
   (numba:compile events, /workspace/compprobe.py).
 - queries.sql: ours = ClickBench's duckdb/queries.sql except Q28/Q29 use length() (characters; DuckDB's
   submission uses STRLEN = bytes). Allowed (each system ships its dialect).
+- THE DRY RUNS (pod, ClickBench's own lib/benchmark-common.sh from a clone, our directory from a git bundle
+  of the commit; pod-only: drop_caches is read-only here, so the driver's line became `true` and a
+  ./flush-caches hook evicts our files; the 14 GB download skipped via a link to the pod's hits.parquet;
+  concurrency 60 s; Python 3.11 -- Ubuntu 24.04's 3.12 is untested):
+  run 1 (fa80d2d/014576a): exit 0, 43 rows, no nulls; Load time 264.5; Data size 8,918,683,321; QPS 3.317,
+  0 errors. Found: Q29 1.25 s through curl vs 0.135 s in the server -- curl's "Expect: 100-continue" on a
+  >1 KB body waits 1 s for a go-ahead http.server never sends (fixed: -H 'Expect:'); and 6 signatures the
+  manifest lacked compiled during the run (load: _hist_par x2, block_stats, pk_unpack x2; query:
+  e20_decode) -- merged, 322.
+  run 2 (d491317): exit 0, 43 rows, no nulls; kernel build 322 in 44 s; Load time 279.9; QPS 3.467, 0
+  errors; Q29 206 cold / 130 hot; ZERO signatures compiled during load or queries; cold total 21.9 s vs the
+  in-process board's 21.8 s; hot 13.3 vs 11.9 (~30 ms a query of HTTP + JSON: a later look).
+  results.py turns the log into the results JSON (session_2026-10-01/dryrun2.json).
+- STILL NEEDED FOR THE REAL SUBMISSION: a run on AWS c6a.4xlarge with a 500 GB gp2 root (Ubuntu 24.04);
+  WAVEDB_REF pinned to a fixed commit in the PR; the PR itself (benchmark/clickbench/* minus our dev helpers
+  -> ClickBench/wavedb/, plus results/YYYYMMDD/c6a.4xlarge.json); Jackson's call on the concurrency test.
