@@ -40,6 +40,7 @@ _PIPE3 = [__import__('os').environ.get('WDB_PIPE3', '1') == '1']   # A/B: 0 rest
 _PIPE19 = [__import__('os').environ.get('WDB_PIPE19', '1') == '1'] # A/B: 0 restores warm_span-then-decode for enc 19
 _FWR = [__import__('os').environ.get('WDB_FW', '1') == '1']        # A/B: 0 restores the general-width readers (wdb_fw)
 _RANKAT = [__import__('os').environ.get('WDB_RANKAT', '1') == '1'] # A/B: 0 restores codes_at's whole planes (tags 8/9)
+_CENSUS = [__import__('os').environ.get('WDB_CENSUS_DRESS', '1') == '1'] # A/B: 0 restores decode + bincount for every census
 
 
 def _e19s_blocks(c, pw, dw, N, b0, b1, cc):
@@ -2035,6 +2036,30 @@ class Segment:
     def codes(self, nm):
         eff = self._effective(nm)
         return eff[0] if eff is not None else self._raw_codes(nm)
+    def raw_census(self, nm, minlength=0):
+        """THE CENSUS FROM THE DRESS (2026-10-01): per-code row counts of the STORED codes (no
+        overrides), length max(V, minlength) -- np.bincount(self._raw_codes(nm)) exactly -- counted
+        from the encoding itself where it can be, with no 100M-row decode: enc 5 (patched buckets)
+        by a nibble census + its escapes, enc 10 (bitpack-plus) by its run lengths and its packed
+        blocks. Measured hot (pod): Q1's AdvEngineID decode + count 26 ms, Q2/Q29's ResolutionWidth
+        49 + 12-17 ms, plus the flush of the decoded arrays (14-16 ms). Otherwise the decode +
+        bincount_par, as every caller did. WDB_CENSUS_DRESS=0 restores the decode everywhere."""
+        import wdb_kernels as _WK
+        c = self.cols[nm]
+        L = max(int(c['V']), int(minlength))
+        enc = c.get('code_enc', 0)
+        if _CENSUS[0] and nm not in self._codes and c.get('mode') in (0, 1, 2):
+            if enc == 5:
+                pk = np.frombuffer(self.buf, dtype=np.uint8, count=c['czlen'], offset=c['cstart'])
+                return _WK.enc5_counts(pk, np.asarray(c['e5hot']), np.asarray(c['e5patch']),
+                                       np.int64(self.N), np.int64(L), _WK._nt())
+            if enc == 10 and 1 <= int(c['pXbits']) <= 16:
+                dirX = np.frombuffer(self.buf, np.int64, int(c['pXnblk']), c['pXdir'])
+                return _WK.bp10_counts(np.frombuffer(self.buf, np.uint8), np.ascontiguousarray(dirX),
+                                       np.int64(c['pXpay']), np.int64(c['pXbits']), np.int64(c['pXn']),
+                                       np.int64(L), _WK._nt())
+        cn = _WK.bincount_par(self._raw_codes(nm), L)
+        return cn
     def code_counts(self, nm):
         """Per-code row counts (np.bincount of the code array), cached. Length V (includes the
         null bin at V-1 when has_null). Lets COUNT(*) WHERE P(col) be summed over the dictionary
@@ -2057,9 +2082,12 @@ class Segment:
                         return cc[nm]
             except Exception:
                 pass
-            codes = self.codes(nm)
-            import wdb_kernels as _WKc
-            cc[nm] = _WKc.bincount_par(codes, self.cols[nm]['V'])            # THE PARALLEL CENSUS
+            if self._effective(nm) is None:
+                cc[nm] = self.raw_census(nm)                                 # no overrides: the stored codes ARE the codes
+            else:
+                codes = self.codes(nm)
+                import wdb_kernels as _WKc
+                cc[nm] = _WKc.bincount_par(codes, self.cols[nm]['V'])        # THE PARALLEL CENSUS
             try:
                 import wdb_sidecar as _wsc9
                 if not _wsc9.births_on(_os.path.dirname(self.path)):

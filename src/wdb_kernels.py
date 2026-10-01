@@ -1997,6 +1997,86 @@ def bp10_decode(buf, dirX, pay, bits, N, out):
 
 
 @njit(nogil=True, parallel=True, cache=True)
+def bp10_counts(buf, dirX, pay, bits, N, L, T):
+    """THE CENSUS FROM THE DRESS, enc 10 (2026-10-01): per-code row counts straight from the
+    blocks -- a run block adds each run's length to its value, a bitpack block counts its codes
+    (bp10_decode's own walk, counting instead of writing). No 100M-row array. Length L."""
+    B = 4096
+    nblk = dirX.size
+    part = np.zeros((T, L), np.int64)
+    for t in prange(T):
+        b0 = nblk * t // T
+        b1 = nblk * (t + 1) // T
+        for b in range(b0, b1):
+            lo = b * B
+            rows = min(B, N - lo)
+            o = pay + (dirX[b] >> 1)
+            if dirX[b] & 1:
+                nr = np.int64(buf[o]) | (np.int64(buf[o + 1]) << 8)
+                p = o + 2
+                for r in range(nr):
+                    cnt = np.int64(buf[p]) | (np.int64(buf[p + 1]) << 8)
+                    val = np.int64(buf[p + 2]) | (np.int64(buf[p + 3]) << 8)
+                    p += 4
+                    part[t, val] += cnt
+            else:
+                for r in range(rows):
+                    v = np.int64(0)
+                    base = r * bits
+                    for bi in range(bits):
+                        idx = base + bi
+                        byte = buf[o + (idx >> 3)]
+                        v = (v << 1) | ((np.int64(byte) >> (7 - (idx & 7))) & 1)
+                    part[t, v] += 1
+    out = np.zeros(L, np.int64)
+    for k in prange(L):
+        s = np.int64(0)
+        for t in range(T):
+            s += part[t, k]
+        out[k] = s
+    return out
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def enc5_counts(packed, hot, patches, N, L, T):
+    """THE CENSUS FROM THE DRESS, enc 5 (2026-10-01): per-code row counts from the patched buckets
+    without the 100M-row decode -- a 16-bin census of the nibbles (a hot pointer k counts for
+    hot[k]; nibble 15 is an escape) plus a census of the escape patches, which are exactly the
+    escaped rows' codes. The pad nibble of an odd row count is not a row. Length L."""
+    nb = N >> 1                                    # bytes whose two nibbles are both rows
+    part = np.zeros((T, 16), np.int64)
+    for t in prange(T):
+        a = nb * t // T
+        b = nb * (t + 1) // T
+        for i in range(a, b):
+            x = np.int64(packed[i])
+            part[t, x & 15] += 1
+            part[t, x >> 4] += 1
+    nib = np.zeros(16, np.int64)
+    for t in range(T):
+        for k in range(16):
+            nib[k] += part[t, k]
+    if N & 1:
+        nib[np.int64(packed[nb]) & 15] += 1
+    np_ = patches.size
+    pp = np.zeros((T, L), np.int64)
+    for t in prange(T):
+        a = np_ * t // T
+        b = np_ * (t + 1) // T
+        for j in range(a, b):
+            pp[t, np.int64(patches[j])] += 1
+    out = np.zeros(L, np.int64)
+    for k in prange(L):
+        s = np.int64(0)
+        for t in range(T):
+            s += pp[t, k]
+        out[k] = s
+    for k in range(min(15, hot.size)):
+        out[np.int64(hot[k])] += nib[k]
+    return out
+
+
+@njit(nogil=True, parallel=True, cache=True)
 def pf_prune(pos, bcol, heavy):
     """Q30's early stop: keep only typed positions whose b-code is HEAVY
     (cnt_ip bound: a pair can never outscore its IP's total). Two prange

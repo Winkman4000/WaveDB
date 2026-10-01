@@ -3519,3 +3519,34 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
   serialize (tag 20, ~30 s each), the near-unique columns' sort in _int_dictionary (WatchID argsort
   16.7 s), and the scheduler's starting prices for the wide/mid classes (two wide members never reach
   the three observations its 80th-percentile rule needs).
+
+## 2026-10-01 -- THE CENSUS FROM THE DRESS (the whole-column aggregates)
+- Where the hot score goes (the official c6a run, the board's own formula): grouped by read, the
+  CounterID = 62 funnel family (Q36-Q42) ~24% of WaveDB's log-gap to the per-query best, the
+  whole-column aggregates (Q1, Q2, Q3, Q7, Q29) ~21%, the LIKE family (Q20-Q23) ~19%, Q25 6%.
+- A FLOOR WARNING: /workspace/WaveDB/cbdb on the pod is NOT the floor database -- it carries sidecar
+  files (AdvEngineID.gbc, MobilePhoneModel__UserID.gdc, ...) that WDB_SIDECARS=0 does not fully refuse
+  (Q7 3.4 ms, Q10 4.2 ms there against 65 / 96 on the c6a). Query work is measured on a database loaded
+  with the submission's flags and wdb_sidecar.set_setting(db, 'off') -- /workspace/loadsim_podnew/cbdb.
+- Every one of the five decoded its whole column (100M rows) and then counted the codes: AdvEngineID
+  (enc 10, 4.6 MB on disk) decode 12 ms + count 14; ResolutionWidth (enc 5) decode 49 + count 12-17 +
+  the flush of the decoded arrays 14-16.
+- Segment.raw_census(nm, minlength): rows per code of the STORED codes counted from the encoding itself
+  -- enc 5 by a 16-bin nibble census plus the escape patches (wdb_kernels.enc5_counts), enc 10 by its run
+  lengths and its packed blocks (bp10_counts); else the decode + bincount_par as before.
+  WDB_CENSUS_DRESS=0 restores the decode. Every census site goes through it: code_counts (no overrides),
+  wdb_join's counts_of, affinesum, affinegroup, groupself. Checked on the floor database: all 35
+  enc-5/enc-10 columns equal np.bincount of the decode.
+- groupself without a LIMIT: Q07 (GROUP BY AdvEngineID WHERE AdvEngineID <> 0 ORDER BY COUNT(*) DESC,
+  every group) had fallen to the fused cascade (a 100M-row mask, a row walk). detect no longer demands a
+  LIMIT; execute emits every live bin and declines past 4,096 of them (one point-fetch per group).
+- MEASURED hot on the pod's floor database, same answers as the old code: Q1 35 -> 4 ms, Q2 113 -> 16,
+  Q7 82-132 -> 4, Q29 90 -> 22. With these four, the c6a run's hot score would go 3.08 -> ~2.74.
+  tests/test_census_dress.py: the census equals the decode for enc 5 (odd row count) and enc 10, builds no
+  decode, and the switch restores it; groupself's no-LIMIT answers equal DuckDB. kernels.manifest 333.
+- LEGAL, measured: every hot run recounts from the file. Q1, Q2, Q7, Q29, Q34, Q35, Q12, Q33 three runs
+  each under WDB_QMEM_STRICT=1 (flush raises on any data-derived state outliving a query), and after
+  every run the segment holds no census, no census memo, no decoded codes (/workspace/strictchk.py).
+  Nothing is computed at load to answer; nothing carries from one run to the next.
+- Q3 (AVG(UserID), enc 19, V = 17.6M) is untouched: its decode (62 ms), a 17.6M-bin census through
+  per-thread boards of 1.1 GB (119 ms), and the integer dictionary's inflate (111 ms, threads waiting).

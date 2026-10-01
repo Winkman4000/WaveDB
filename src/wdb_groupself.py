@@ -20,6 +20,7 @@ import wdb_wherescan as WS
 
 E = wdb_sql.E
 _HITS = 0
+_NOLIM_MAX = 4096                    # without a LIMIT, at most this many groups (one point-fetch each)
 
 
 def _term(cj, col):
@@ -74,7 +75,9 @@ def detect(seg, tree, col_map):
     if not P.no_joins(tree):           return None
     if not P.no_select_distinct(tree): return None
     if not P.single_group_key(tree):   return None
-    if not P.has_limit(tree):          return None
+    # NO LIMIT IS A SHAPE TOO (2026-10-01): Q07 (AdvEngineID <> 0, every group, ORDER BY COUNT(*) DESC)
+    # fell to the fused cascade -- a 100M-row mask and a row walk, 78-88 ms hot -- for 18 bins.
+    # Without a LIMIT every live bin is emitted (execute declines past _NOLIM_MAX of them)
     proj = tree.expressions
     if len(proj) != 2:
         return None
@@ -152,9 +155,9 @@ def detect(seg, tree, col_map):
     if not ok:
         return None
     lim = wdb_sql._limit(tree)
-    if lim is None or wdb_sql._offset(tree):
+    if wdb_sql._offset(tree):
         return None
-    return {'col': col, 'ci': ci, 'ki': ki, 'lim': int(lim), 'terms': terms,
+    return {'col': col, 'ci': ci, 'ki': ki, 'lim': (int(lim) if lim is not None else None), 'terms': terms,
             'having': hv, 'proj': proj, 'order': order, 'lower': lower}
 
 
@@ -163,9 +166,9 @@ def execute(seg, spec):
     global _HITS
     col = spec['col']
     c = seg.cols[col]
-    codes = np.asarray(seg._raw_codes(col))
     V = int(c['V'])
-    cn = np.bincount(codes, minlength=V).astype(np.int64)
+    # THE CENSUS FROM THE DRESS (2026-10-01): was np.bincount -- one thread -- over the decoded codes
+    cn = np.asarray(seg.raw_census(col, V), np.int64)[:V].copy()
     if c.get('has_null'):
         cn[V - 1] = 0                # terms present (detect gate): every op excludes NULL
     for op, vals in spec['terms']:
@@ -202,7 +205,9 @@ def execute(seg, spec):
     if idx.size == 0:
         _HITS += 1
         return [], hdrs
-    k = min(spec['lim'], int(idx.size))
+    if spec['lim'] is None and idx.size > _NOLIM_MAX:
+        return None                  # every group, one point-fetch each: the scan path's job
+    k = int(idx.size) if spec['lim'] is None else min(spec['lim'], int(idx.size))
     cnl = cn[idx]
     if idx.size > k:
         part = np.argpartition(-cnl, k - 1)
