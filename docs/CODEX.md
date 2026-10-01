@@ -3456,3 +3456,24 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
 - STILL NEEDED FOR THE REAL SUBMISSION: a run on AWS c6a.4xlarge with a 500 GB gp2 root (Ubuntu 24.04);
   WAVEDB_REF pinned to a fixed commit in the PR; the PR itself (benchmark/clickbench/* minus our dev helpers
   -> ClickBench/wavedb/, plus results/YYYYMMDD/c6a.4xlarge.json); Jackson's call on the concurrency test.
+
+## 2026-10-01 -- THE OFFICIAL RUN (AWS c6a.4xlarge)
+- Machine: c6a.4xlarge (16 vCPU, 30 GB RAM), 500 GB gp2 root, Ubuntu 24.04.4, Python 3.12.3. ClickBench's
+  own driver, unmodified (real drop_caches, the real 14.78 GB download, the default 600 s concurrency
+  test). Our directory from a git bundle of 9f13c5d (WAVEDB_REPO=$HOME/wavedb.bundle, WAVEDB_REF=9f13c5d):
+  the repo is private, so the plain install could not clone it.
+- Result: exit 0, 43 rows, no nulls. Kernel build 322 signatures in 33 s, 0 failed. Load time 769.780 s.
+  Data size 8,915,682,491. Concurrent QPS 3.748, error ratio 0.000. Cold total 25.1 s, hot total 11.0 s.
+  benchmark/clickbench/results/20261001/: c6a.4xlarge.json (results.py), run.log, mem.log.
+- Scored with the site's formula against every untuned CPU entry on c6a.4xlarge in a local copy of
+  ClickBench's data.generated.js (139 systems): COLD 2.41, 1st (Umbra 3.22); HOT 3.08, 5th (Umbra 1.43,
+  CedarDB 1.96, Salesforce Hyper 2.39, Hyper (web) 2.47); COMBINED 3.91, 5th (Umbra 2.23, ClickHouse (web)
+  3.23, Hyper 3.48, CedarDB 3.56).
+- Load is the drag on combined: 770 s here vs 280 s on the pod. The machine was mostly idle during it (CPU
+  ~85% idle, little I/O wait), so the encode ran nearly serial; memory peaked at 25.7 GB used of 30 GB
+  (5.6 GB free). With a 280 s load the combined score would be about 3.54 (4th). The server also held
+  ~25.7 GB through the concurrency test. Both are the next engineering items, with the ~30 ms a query of
+  HTTP + JSON overhead on hot.
+- STILL NEEDED FOR THE PR: a public source for install (the repo is private); WAVEDB_REF pinned to a fixed
+  commit; the PR (benchmark/clickbench/* minus dev helpers -> ClickBench/wavedb/, plus
+  results/20261001/c6a.4xlarge.json).
