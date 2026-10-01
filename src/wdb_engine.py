@@ -42,6 +42,7 @@ _FWR = [__import__('os').environ.get('WDB_FW', '1') == '1']        # A/B: 0 rest
 _RANKAT = [__import__('os').environ.get('WDB_RANKAT', '1') == '1'] # A/B: 0 restores codes_at's whole planes (tags 8/9)
 _CENSUS = [__import__('os').environ.get('WDB_CENSUS_DRESS', '1') == '1'] # A/B: 0 restores decode + bincount for every census
 _VALSUM = [__import__('os').environ.get('WDB_E19_VALSUM', '1') == '1']   # A/B: 0 restores SUM/AVG of enc 19 by the full census
+_SORTGATHER = [__import__('os').environ.get('WDB_SORTGATHER', '1') == '1']  # A/B: 0 restores the general frame gathers (enc 3/18)
 
 
 def _e19s_blocks(c, pw, dw, N, b0, b1, cc):
@@ -93,6 +94,19 @@ def _leaf_pool():
         from concurrent.futures import ThreadPoolExecutor as _TPl
         _LEAF_POOL = _TPl(max_workers=(_osl.cpu_count() or 8))
     return _LEAF_POOL
+
+
+_GATHER_POOL = None
+
+
+def _gather_pool():
+    """THE SORTED GATHERS' pool (codes at ascending rows, enc 3 / 18): persistent, 14 lanes, its threads
+    named so a gather started on one of them runs inline instead of waiting on its own pool"""
+    global _GATHER_POOL
+    if _GATHER_POOL is None:
+        from concurrent.futures import ThreadPoolExecutor as _TPg
+        _GATHER_POOL = _TPg(max_workers=14, thread_name_prefix='wdb-gather')
+    return _GATHER_POOL
 
 
 _WARM = [None, None]      # program: libc handle for mincore, the cold-read pool (never data)
@@ -2832,6 +2846,8 @@ class Segment:
         if c.get('code_enc', 0) == 18 and nm not in self._codes and rows.size < (self.N >> 2):
             # PACKED FRAMES, AT ROWS: inflate each touched frame to the byte its highest row needs,
             # gather by bit arithmetic; frames in lanes when there are many
+            if _SORTGATHER[0] and rows.size >= 2 and bool((rows[1:] >= rows[:-1]).all()):
+                return self._e18_at_sorted(c, rows)
             import wdb_kernels as _WK18
             bits18 = int(c['pbits']); BR = c['BR']
             out18 = np.empty(rows.size, dtype=np.int64)
@@ -2867,6 +2883,8 @@ class Segment:
             # frame through a positional walk (sq-nested passed ~90M positions here)
             return np.asarray(self._raw_codes(nm))[rows] if c.get('code_enc', 0) != 2 else \
                 np.searchsorted(self.stairs(nm), rows, side='right').astype(np.int64)
+        if _SORTGATHER[0] and rows.size >= 2 and bool((rows[1:] >= rows[:-1]).all()):
+            return self._e3_at_sorted(c, rows)
         wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
         BR = c['BR']; base = c['cstart']; bo = c['boffs']; dz = self._dz
         out = np.empty(rows.size, dtype=wdt)
@@ -2907,6 +2925,88 @@ class Segment:
                 j, s, e, raw = _popf(t)
                 out[order[s:e]] = raw[rs[s:e] - j * BR]
         return out
+
+    @staticmethod
+    def _frame_runs(rows, BR):
+        """rows ascending: each frame's rows are one contiguous slice -- (frames, slice starts, slice ends)
+        from one pass over the frame numbers (no argsort, no unique: 0.5 + 5.8 ms on 738K rows)"""
+        blks = rows // BR
+        cut = np.flatnonzero(blks[1:] != blks[:-1]) + 1
+        st = np.concatenate(([0], cut)).astype(np.int64)
+        en = np.concatenate((cut, [rows.size])).astype(np.int64)
+        return blks[st], st, en
+
+    @staticmethod
+    def _lanes(nf, run):
+        """run(k0, k1) over frames [0, nf) in contiguous lanes on a persistent pool of its own (a fresh
+        8-thread pool per call was measured overhead); one or two frames run inline, and so does a call
+        made from one of the pool's own threads (a lane never waits on its own pool)"""
+        import threading as _th
+        T = 1 if nf <= 2 else min(14 if nf >= 512 else 8, nf)
+        if T == 1 or _th.current_thread().name.startswith('wdb-gather'):
+            run(0, nf)
+            return
+        cuts = np.linspace(0, nf, T + 1).astype(np.int64)
+        pool = _gather_pool()
+        futs = [pool.submit(run, int(cuts[t]), int(cuts[t + 1])) for t in range(T)]
+        for f in futs:
+            f.result()
+
+    def _e3_at_sorted(self, c, rows):
+        """THE SORTED GATHER, enc 3 (2026-10-01): codes at ASCENDING rows (a funnel's crumb, any position
+        list). The touched frames still inflate whole -- that is the floor -- but nothing else may cost:
+        the frame runs come from one pass (_frame_runs), every lane takes a contiguous run of frames on
+        the persistent gather pool, and inflates and gathers straight into its own slice of the output with
+        a compiled loop (the main thread had gathered every frame, after two sorts and a fresh pool).
+        Measured on the dashboards' rows (CounterID = 62: 738K rows, 193 frames) against pure inflation of
+        the same frames on 8 threads (the floor): URL 27.6 -> 18.1 ms (floor 17.5), Referer 35.5 -> 24.8
+        (23.9), TraficSourceID 24.3 -> 8.8 (6.1), SearchEngineID 22.9 -> 6.9 (4.1). Same codes, same dtype.
+        WDB_SORTGATHER=0 restores the general path."""
+        import io as _io, wdb_kernels as _WK
+        wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]; isz = np.dtype(wdt).itemsize
+        BR = int(c['BR']); base = int(c['cstart']); bo = c['boffs']; N = int(self.N)
+        out = np.empty(rows.size, dtype=wdt)
+        ub, st, en = self._frame_runs(rows, BR)
+        mv = memoryview(self.buf)
+
+        def run(k0, k1):
+            import zstandard as _z
+            dz = _z.ZstdDecompressor()
+            for k in range(k0, k1):
+                j = int(ub[k]); a = int(st[k]); e = int(en[k])
+                fb = mv[base + int(bo[j]):base + int(bo[j + 1])]
+                frame_rows = min(BR, N - j * BR)
+                need = (int(rows[e - 1]) - j * BR + 1) * isz
+                if need * 4 <= frame_rows * isz * 3:     # PARTIAL-FRAME READ (as before): the prefix only
+                    raw = np.frombuffer(dz.stream_reader(_io.BytesIO(fb)).read(need), dtype=wdt)
+                else:
+                    raw = np.frombuffer(dz.decompress(fb), dtype=wdt)
+                _WK.gather_frame(raw, rows[a:e], np.int64(j * BR), out[a:e])
+        self._lanes(int(ub.size), run)
+        return out
+
+    def _e18_at_sorted(self, c, rows):
+        """THE SORTED GATHER, enc 18 (packed frames): as _e3_at_sorted -- frame runs from one pass, contiguous
+        lanes on the leaf pool, each frame inflated to the byte its highest row needs and gathered by bit
+        arithmetic straight into its own slice (no argsort, no unique, no inverse permutation, no fresh
+        pool). Same codes, int64 as before."""
+        import wdb_kernels as _WK18
+        bits18 = int(c['pbits']); BR = int(c['BR']); N = int(self.N)
+        out18 = np.empty(rows.size, dtype=np.int64)
+        ub, st, en = self._frame_runs(rows, BR)
+
+        def run(k0, k1):
+            import zstandard as _zs
+            dec = _zs.ZstdDecompressor(); mv = memoryview(self.buf)
+            for k in range(k0, k1):
+                j = int(ub[k]); a = int(st[k]); e = int(en[k])
+                rel = rows[a:e] - j * BR
+                frame_rows = min(BR, N - j * BR)
+                need = ((int(rel[-1]) + 1) * bits18 + 7) // 8 + 8
+                fb = self._pk18_frame(c, j, dec, mv, need if need * 4 <= frame_rows * bits18 // 8 * 3 else None)
+                _WK18.pk32_gather(fb, bits18, rel, out18[a:e])
+        self._lanes(int(ub.size), run)
+        return out18
 
     def values_range(self, nm, lo, hi):
         """Decoded values for rows [lo, hi) only (the cluster-slice read). Mirrors _base_values'

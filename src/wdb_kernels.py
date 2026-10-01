@@ -1996,6 +1996,14 @@ def bp10_decode(buf, dirX, pay, bits, N, out):
                 out[lo + r] = v
 
 
+@njit(nogil=True, cache=True)
+def gather_frame(raw, rows, j0, out):
+    """out[i] = raw[rows[i] - j0]: one frame's rows picked from its inflated codes (nogil: the lanes of a
+    sorted gather run it side by side, each into its own slice of the output)"""
+    for i in range(rows.size):
+        out[i] = raw[rows[i] - j0]
+
+
 @njit(nogil=True, parallel=True, cache=True)
 def bp10_counts(buf, dirX, pay, bits, N, L, T):
     """THE CENSUS FROM THE DRESS, enc 10 (2026-10-01): per-code row counts straight from the

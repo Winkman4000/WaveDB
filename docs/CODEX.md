@@ -3577,3 +3577,28 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
   16-thread multi-frame call, ~52 ms of the pod's network-filesystem read. Next if wanted: the counts
   scattered shelf by shelf (each shelf's code range is ~640 KB of counts, cache-resident) and folded
   against the dictionary chunk by chunk as they inflate -- no random lookups, no 141 MB table.
+
+## 2026-10-01 -- THE SORTED GATHER (the dashboards' scatter reads at the decode floor)
+- Jackson: "if we have to decode everything in order to get just 700k rows then lets work out if we
+  are reading everything as fast as we can". Measured on the floor database, CounterID=62's 738,172
+  rows (193 of 1,526 frames): codes_at over enc-3 / enc-18 columns cost 2-5x the pure inflate of the
+  touched frames -- URL 27.6 ms vs a 17.5 ms floor, Referer 35.5 vs 23.9, TraficSourceID 24.3 vs 6.1,
+  SearchEngineID 22.9 vs 4.1. The excess was the argsort / per-frame Python bookkeeping / a fresh
+  thread pool per call, not the inflate.
+- Segment._e3_at_sorted / _e18_at_sorted: when the rows come ascending (the crumb's positions always
+  do), one pass finds the frame runs (_frame_runs); the runs are split into contiguous lanes
+  (_lanes: 1 lane for <= 2 frames, else up to 8, or 14 from 512 frames) on a persistent module pool
+  (_gather_pool, 'wdb-gather' threads; a lane already on that pool runs inline). Per lane one zstd
+  decompressor; enc 3 inflates a frame prefix when the highest row needs <= 3/4 of it, else the whole
+  frame; the compiled gather_frame (wdb_kernels) copies rows[a:e] - frame start into out[a:e]. Enc 18
+  inflates the prefix to its highest row and pk32_gather unpacks. Same output dtype as the old path.
+  Unsorted rows keep the old path. WDB_SORTGATHER=0 declines. Nothing data-derived is kept: the pool
+  holds threads, not data.
+- MEASURED: per column on the dashboard rows URL 18.1 ms (floor 17.5), Referer 24.8 (23.9),
+  TraficSourceID 8.8 (6.1), SearchEngineID 6.9 (4.1). All 36 enc-3/18 columns x 6 row sets (dashboard,
+  ten rows, duplicates, one frame, frame edges, 2M rows): equal to the old path, values and dtype.
+  Dashboards hot, off -> on, same answers: Q36 99.3 -> 91.4 ms, Q37 96.8 -> 81.1, Q38 58.6 -> 58.2,
+  Q39 211.2 -> 192.9, Q40 87.0 -> 73.2, Q41 56.9 -> 49.1, Q42 53.8 -> 51.4 (pod, shared host).
+  tests/test_sorted_gather.py: a tag-3 and a tag-18 column, six ascending row sets and an unsorted
+  one, equal to the old path and to the full decode. Suite 1804 passed. Legal: Q36-Q42 (and Q1/2/3/
+  7/29) three runs each under WDB_QMEM_STRICT, nothing left on the segment. Manifest 341 signatures.
