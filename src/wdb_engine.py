@@ -41,6 +41,7 @@ _PIPE19 = [__import__('os').environ.get('WDB_PIPE19', '1') == '1'] # A/B: 0 rest
 _FWR = [__import__('os').environ.get('WDB_FW', '1') == '1']        # A/B: 0 restores the general-width readers (wdb_fw)
 _RANKAT = [__import__('os').environ.get('WDB_RANKAT', '1') == '1'] # A/B: 0 restores codes_at's whole planes (tags 8/9)
 _CENSUS = [__import__('os').environ.get('WDB_CENSUS_DRESS', '1') == '1'] # A/B: 0 restores decode + bincount for every census
+_VALSUM = [__import__('os').environ.get('WDB_E19_VALSUM', '1') == '1']   # A/B: 0 restores SUM/AVG of enc 19 by the full census
 
 
 def _e19s_blocks(c, pw, dw, N, b0, b1, cc):
@@ -2060,6 +2061,37 @@ class Segment:
                                        np.int64(L), _WK._nt())
         cn = _WK.bincount_par(self._raw_codes(nm), L)
         return cn
+    def e19_value_sum(self, nm, tab):
+        """THE SUM FROM THE BLOCK DICTIONARIES (2026-10-01): (exact SUM of the stored values as a Python
+        int, non-null rows) for an enc-19 column, or None. tab: the value of each non-null code (the
+        integer dictionary). Per block, its row pointers are counted on a board the size of its own
+        dictionary, and each entry is weighed once -- where AVG(UserID) decoded 100M codes (62 ms hot)
+        and counted them on per-thread boards of 17.6M bins (1.1 GB, 119 ms). Equal to
+        fold_counts(np.bincount(codes), tab). Cold: the pointers and the block dictionaries are brought
+        in by the parallel reader first (page faults run ~0.25 GB/s). WDB_E19_VALSUM=0 declines."""
+        c = self.cols[nm]
+        if (not _VALSUM[0] or c.get('code_enc') != 19 or nm in self._codes
+                or c.get('mode') not in (0, 1, 2)):
+            return None
+        import wdb_kernels as _WK
+        nb = int(c['e19lb'].size); poff = c['e19poff']
+        cs = int(c['cstart']); ds = int(c['e19dstart'])
+        pend = cs + 8 * (int(poff[nb]) + 1); dend = min(len(self.buf), ds + 8 * int(c['e19dn']))
+        spans = [(cs, pend), (ds, dend)] + ([tuple(int(x) for x in c['e19tab'])] if 'e19R' in c else [])
+        for a, b in spans:
+            self.warm_span(a, b)
+        pw, dw = self._e19_words(c)
+        tab = np.ascontiguousarray(tab, dtype=np.int64)
+        hi = np.empty(nb, np.int64); lo = np.empty(nb, np.int64); nn = np.empty(nb, np.int64)
+        BR = np.int64(c['e19BR']); N = np.int64(self.N)
+        if 'e19R' in c:
+            _WK.e19s_valsum(pw, dw, BR, N, np.int64(c['e19W']), np.int64(c['e19wb']), c['e19lb'], c['e19gw'],
+                            c['e19dc'], poff, c['e19pre'], c['e19soff'], c['e19SW'], tab, np.int64(tab.size),
+                            hi, lo, nn)
+        else:
+            _WK.e19_valsum(pw, dw, BR, N, np.int64(c['e19bits']), c['e19lb'], c['e19gw'], c['e19dc'], poff,
+                           c['e19doff'], tab, np.int64(tab.size), hi, lo, nn)
+        return int(hi.sum()) * (1 << 32) + int(lo.sum()), int(nn.sum())
     def code_counts(self, nm):
         """Per-code row counts (np.bincount of the code array), cached. Length V (includes the
         null bin at V-1 when has_null). Lets COUNT(*) WHERE P(col) be summed over the dictionary

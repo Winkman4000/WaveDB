@@ -24,8 +24,18 @@ def _toy():
     d = os.path.join(TMP, 'cd_' + uuid.uuid4().hex[:8]); pq = d + '.parquet'
     os.makedirs(d)
     pd.DataFrame({'width': width, 'adv': adv, 'flag': flag}).to_parquet(pq, index=False)
-    wdb_encode.encode(pq, os.path.join(d, 't_0.wdb'), stream=True)
+    old = {k: os.environ.get(k) for k in _REAL}
+    os.environ.update(_REAL)                         # the real load's rules: run.py opens mode 4 to toys
+    try:
+        wdb_encode.encode(pq, os.path.join(d, 't_0.wdb'), stream=True)
+    finally:
+        for k, v in old.items():
+            if v is None: os.environ.pop(k, None)
+            else: os.environ[k] = v
     return d, pq
+
+
+_REAL = {'WDB_SEQ_NARROW_OK': '0', 'WDB_SEQ_REPEATS_OK': '0'}
 
 
 def test_census_from_the_dress_equals_the_decode():
@@ -67,7 +77,8 @@ def test_groupself_no_limit_equals_duck():
     try:
         import subprocess
         wdb = os.path.join(os.path.dirname(__file__), '..', 'bin', 'wdb')
-        subprocess.run([sys.executable, wdb, 'load', db_dir, 't', pq], check=True, capture_output=True)
+        subprocess.run([sys.executable, wdb, 'load', db_dir, 't', pq], check=True, capture_output=True,
+                       env=dict(os.environ, **_REAL))
         db = Database.open(db_dir)
         for sql in ('SELECT adv, COUNT(*) FROM t WHERE adv <> 0 GROUP BY adv ORDER BY COUNT(*) DESC',
                     'SELECT width, COUNT(*) AS c FROM t WHERE width <> 1000 GROUP BY width ORDER BY c DESC'):

@@ -3550,3 +3550,30 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
   Nothing is computed at load to answer; nothing carries from one run to the next.
 - Q3 (AVG(UserID), enc 19, V = 17.6M) is untouched: its decode (62 ms), a 17.6M-bin census through
   per-thread boards of 1.1 GB (119 ms), and the integer dictionary's inflate (111 ms, threads waiting).
+
+## 2026-10-01 -- THE SUM FROM THE BLOCK DICTIONARIES (Q3, AVG(UserID))
+- Q3 hot, the pod's floor database: 317-365 ms = the enc-19 decode of 100M codes (62) + a census of
+  17.6M bins on per-thread boards (1.1 GB, 119) + the integer dictionary's inflate (~85-111) + the fold.
+- Segment.e19_value_sum(nm, tab): per block, the row pointers are counted on a board the size of the
+  block's own dictionary (cache-resident), then each entry is weighed once by its value, in two 32-bit
+  halves (a block's partial sums stay under 2^47, the column's under 2^59: nothing wraps); the exact
+  SUM = sum(hi) * 2^32 + sum(lo) as a Python int, the same integer fold_counts gives. Labels by block
+  (e19_valsum) and on shelves (e19s_valsum). Cold: the pointers, the labels and the shelf table come in
+  by the parallel reader first. _exact_scalar takes it for SUM/AVG of an enc-19 column; anything else
+  keeps the census. WDB_E19_VALSUM=0 declines.
+- MEASURED: all 6 enc-19 integer columns of the floor database (UserID, ClientIP, FUniqID, RemoteIP,
+  IPNetworkID, WindowClientHeight) EXACT against the old fold; Q3 hot 317 -> 172-185 ms, same answer;
+  legal under WDB_QMEM_STRICT (nothing outlives a run). tests/test_e19_valsum.py: both layouts, values
+  near +-2^62, negatives and NULLs, equal to the fold and to Python's exact sum; SQL SUM/AVG = DuckDB.
+- FOUND ON THE WAY (not the floor, not fixed): with WDB_LOAD_ANSWERS=1 (tests/run.py's default) the
+  load's block statistics answer SUM/AVG from float64 block sums -- AVG of values near 2^62 came out
+  -8219316662104229 against the exact -8219316662104369 (old code too: served by blockstats). The floor
+  (answers off) never takes it. tests/test_census_dress.py and tests/test_e19_valsum.py now pin the
+  real load's rules (WDB_SEQ_NARROW_OK=0, WDB_SEQ_REPEATS_OK=0; the SQL test also answers off): under
+  run.py's toy rules their columns had become mode-4 sequences and the dresses under test never ran.
+- WHAT IS LEFT IN Q3 (~100 ms valsum + ~95 dictionary, pod): UserID's blocks hold ~22,560 distinct
+  values each (34.4M entries over 1,526 blocks), each a random lookup into the 141 MB value table; and
+  the dictionary is 98.5 MB of zstd (level 9) over 2,153 chunks -- 42 ms to inflate even as one
+  16-thread multi-frame call, ~52 ms of the pod's network-filesystem read. Next if wanted: the counts
+  scattered shelf by shelf (each shelf's code range is ~640 KB of counts, cache-resident) and folded
+  against the dictionary chunk by chunk as they inflate -- no random lookups, no 141 MB table.

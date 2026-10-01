@@ -4102,6 +4102,56 @@ def e19_decode(pw, dw, BR, N, gbits, lb, gw, dcnt, poff, doff, out):
             out[i] = loc[_e19_get(pw, pos, l)]; pos += l
 
 
+@njit(inline='always')
+def _valsum_block(h, loc, dc, tab, ntab):
+    """one block's exact share of SUM(value): its pointer counts h against its dictionary loc, each
+    value split in two 32-bit halves so no partial sum can wrap (a block holds at most BR rows)"""
+    sh = np.int64(0); sl = np.int64(0); nn = np.int64(0)
+    for j in range(dc):
+        k = loc[j]
+        if k >= ntab:
+            continue                                # the null code: no value, not counted
+        v = tab[k]; cnt = h[j]
+        sh += cnt * (v >> 32)
+        sl += cnt * (v & np.int64(0xFFFFFFFF))
+        nn += cnt
+    return sh, sl, nn
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def e19_valsum(pw, dw, BR, N, gbits, lb, gw, dcnt, poff, doff, tab, ntab, hi_out, lo_out, nn_out):
+    """THE SUM FROM THE BLOCK DICTIONARIES, enc 19 (2026-10-01): per block, count its row pointers on
+    a board the size of its own dictionary (cache-resident), then weigh each entry once by its value
+    -- no 100M-row code array and no V-sized census. SUM = sum(hi) * 2^32 + sum(lo), exact."""
+    nb = lb.size
+    for b in prange(nb):
+        lo = b * BR; hi = min(lo + BR, N)
+        dc = np.int64(dcnt[b])
+        loc = _e19_dict(dw, b, gbits, gw, dcnt, doff, dc - 1)
+        h = np.zeros(dc, np.int64)
+        l = np.int64(lb[b]); pos = poff[b] * 64
+        for i in range(lo, hi):
+            h[_e19_get(pw, pos, l)] += 1; pos += l
+        a, s, n = _valsum_block(h, loc, dc, tab, ntab)
+        hi_out[b] = a; lo_out[b] = s; nn_out[b] = n
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def e19s_valsum(pw, dw, BR, N, W, wb, lb, gw, dcnt, poff, pre, soff, SW, tab, ntab, hi_out, lo_out, nn_out):
+    """e19_valsum over the shelves (the labels by code range)"""
+    nb = lb.size
+    for b in prange(nb):
+        lo = b * BR; hi = min(lo + BR, N)
+        dc = np.int64(dcnt[b])
+        loc = _e19s_dict(dw, W, wb, gw, pre, soff, SW, b, dc - 1)
+        h = np.zeros(dc, np.int64)
+        l = np.int64(lb[b]); pos = poff[b] * 64
+        for i in range(lo, hi):
+            h[_e19_get(pw, pos, l)] += 1; pos += l
+        a, s, n = _valsum_block(h, loc, dc, tab, ntab)
+        hi_out[b] = a; lo_out[b] = s; nn_out[b] = n
+
+
 @njit(cache=True, parallel=True, nogil=True)
 def e19_signposts(dw, gbits, gw, dcnt, doff, S, spo, sp):
     """THE SIGNPOSTS (Jackson, 2026-09-27): per block, every S-th entry of its sorted dictionary kept

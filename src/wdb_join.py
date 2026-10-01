@@ -232,6 +232,13 @@ def _exact_scalar(db, tree):
             cn = counts_of(col, int(c['V']) - (1 if c.get('has_null') else 0))
             row.append(int(cn.sum())); continue
         tab = WN._int_table(seg, col)
+        if kind in ('SUM', 'AVG') and col not in cnts:
+            # THE SUM FROM THE BLOCK DICTIONARIES (2026-10-01): enc 19 sums block by block, exact,
+            # with no full census (AVG(UserID): 17.6M bins); the same integer fold_counts gives
+            vs = seg.e19_value_sum(col, tab)
+            if vs is not None:
+                s, n = vs
+                row.append((s if n else None) if kind == 'SUM' else XI.exact_avg(s, n)); continue
         cn = counts_of(col, tab.size)
         if kind == 'COUNT':
             row.append(int(cn.sum())); continue
