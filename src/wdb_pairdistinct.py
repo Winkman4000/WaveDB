@@ -141,10 +141,80 @@ def _tier_shelf(seg, a, b, u):
     return typed, at, bt, ut
 
 
+_NARROW = [__import__('os').environ.get('WDB_PD_NARROW', '1') != '0']
+
+
+def _narrow(seg, a, b, u):
+    """THE NARROW READ (2026-10-02, Q11's line items on the c6a): only the rows that pass b <> '' are ever
+    read. b's planes ARE the filter (its non-default rows, ascending, and their codes); a's codes at those
+    rows by THE ZIPPER from a's own planes (5.6 ms -- the old way expanded a to all 100M rows, ~31 ms, and
+    gathered); u's codes at those rows only (codes_at, 35 ms -- the old way decoded all 100M, 47 ms, and
+    gathered, ~24 ms). None when b is not a sparse/tiered column whose default is ''."""
+    import wdb_kernels as _WK
+    cb = seg.cols.get(b) or {}
+    if cb.get('code_enc') not in (8, 9) or not hasattr(seg, 'e8_planes'):
+        return None
+    e0 = WS._code_of(seg, b, '')
+    plb = seg.e8_planes(b)
+    if plb is None or e0 is None or int(plb[2]) != int(e0):
+        return None
+    typed = np.ascontiguousarray(np.asarray(plb[0]), dtype=np.int64)
+    bt = np.ascontiguousarray(np.asarray(plb[1]), dtype=np.uint16)
+    ca = seg.cols.get(a) or {}
+    pla = seg.e8_planes(a) if ca.get('code_enc') in (8, 9) else None
+    if pla is not None:
+        at = np.empty(typed.size, np.uint16)
+        _WK.pd_at_planes(typed, np.ascontiguousarray(np.asarray(pla[0]), dtype=np.int64),
+                         np.ascontiguousarray(np.asarray(pla[1]), dtype=np.uint16),
+                         np.uint16(int(pla[2])), at, np.int64(16))
+    else:
+        at = np.ascontiguousarray(np.asarray(seg.codes_at(a, typed)), dtype=np.uint16)
+    ut = np.ascontiguousarray(np.asarray(seg.codes_at(u, typed)), dtype=np.uint32)
+    Va, Vb = int(seg.cols[a]['V']), int(seg.cols[b]['V'])
+    key, ukc = _WK.pd_pair_count(at, bt, np.int64(Vb), np.int64(Va * Vb), np.int64(8))
+    return key, ukc, ut
+
+
+def _hunt_lanes(seg, u, key, ukc, ut, K, k):
+    """Jackson's guillotine with the lane hunt: 32 pairs a round (one round on ClickBench's Q11)."""
+    import wdb_kernels as _WK
+    Vu = max(2, int(seg.cols[u]['V']))
+    SH = max(1, int(Vu - 1).bit_length() - 6)    # <= 64 user lanes, each table 2^SH u32
+    NL = ((Vu - 1) >> SH) + 1
+    live = np.flatnonzero(ukc)
+    live = live[np.argsort(-ukc[live], kind='stable')]
+    board = []; kth = 0; idx = 0
+    while idx < live.size:
+        take = []
+        while idx < live.size and (len(board) < k or int(ukc[live[idx]]) > kth):
+            take.append(int(live[idx])); idx += 1
+            if len(take) >= 32:
+                break                            # the u32 marks hold 32 slots
+        if not take:
+            break
+        tks = np.sort(np.asarray(take, np.int64))
+        lut = np.full(K, -1, np.int8)
+        lut[tks] = np.arange(tks.size, dtype=np.int8)
+        dc = _WK.pd_hunt_lanes(key, ut, lut, np.int64(tks.size), np.int64(SH), np.int64(NL), np.int64(8))
+        for j9 in range(tks.size):
+            board.append((int(dc[j9]), int(tks[j9])))
+        board.sort(reverse=True)
+        board = board[:max(k, 12)]
+        kth = board[k - 1][0] if len(board) >= k else 0
+        if idx < live.size and kth >= int(ukc[live[idx]]):
+            break
+    return board
+
+
 def execute(seg, spec):
     global _HITS
     a, b, u, k = spec['a'], spec['b'], spec['u'], spec['lim']
     Vb = int(seg.cols[b]['V'])
+    nr = _narrow(seg, a, b, u) if _NARROW[0] else None
+    if nr is not None:
+        key, ukc, ut = nr
+        board = _hunt_lanes(seg, u, key, ukc, ut, int(seg.cols[a]['V']) * Vb, k)
+        return _emit(seg, spec, a, b, Vb, k, board)
     typed, at9, bt9, ut9 = _tier_shelf(seg, a, b, u)
     key = at9.astype(np.int64) * Vb + bt9
     ukc = np.bincount(key, minlength=int(seg.cols[a]['V']) * Vb)
@@ -177,6 +247,11 @@ def execute(seg, spec):
         kth = board[k - 1][0] if len(board) >= k else 0
         if idx < live.size and kth >= int(ukc[live[idx]]):
             break                            # nothing left can climb
+    return _emit(seg, spec, a, b, Vb, k, board)
+
+
+def _emit(seg, spec, a, b, Vb, k, board):
+    global _HITS
     board = [(d9, pk9 // Vb, pk9 % Vb) for d9, pk9 in board[:k]]
     out = []
     for d9, acode, bcode in board:

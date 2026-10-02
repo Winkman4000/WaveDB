@@ -612,6 +612,100 @@ def pd_hunt(key, ut, lut, V, npairs):
     return cnt
 
 
+@njit(nogil=True, parallel=True, cache=True)
+def pd_at_planes(typed, posA, litA, dA, out, L):
+    """THE ZIPPER (2026-10-02, Q11): a sparse/tiered column's codes at sorted rows `typed`, from its planes
+    (posA = its non-default rows ascending, litA their codes, dA the default) -- two sorted lists walked
+    side by side, L lanes each starting by one binary search. No expansion to all N rows."""
+    n = typed.size
+    for l in prange(L):
+        i0 = l * n // L
+        i1 = (l + 1) * n // L
+        if i0 >= i1:
+            continue
+        j = np.searchsorted(posA, typed[i0])
+        for i in range(i0, i1):
+            r = typed[i]
+            while j < posA.size and posA[j] < r:
+                j += 1
+            if j < posA.size and posA[j] == r:
+                out[i] = litA[j]
+            else:
+                out[i] = dA
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def pd_pair_count(at, bt, Vb, K, L):
+    """Q11's pair key (a * Vb + b, int32) and the row count per pair, one pass, L lanes with private
+    boards summed (exact)."""
+    n = at.size
+    key = np.empty(n, np.int32)
+    boards = np.zeros((L, K), np.int64)
+    for l in prange(L):
+        for i in range(l * n // L, (l + 1) * n // L):
+            k = np.int32(at[i]) * np.int32(Vb) + np.int32(bt[i])
+            key[i] = k
+            boards[l, k] += 1
+    out = np.zeros(K, np.int64)
+    for l in range(L):
+        for k in range(K):
+            out[k] += boards[l, k]
+    return key, out
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def pd_hunt_lanes(key, ut, lut, nslot, SH, NL, L):
+    """THE HUNT BY USER LANES (2026-10-02, Q11): distinct users per slot (lut[pair] = slot 0..31 or -1).
+    The candidate rows are bucketed by the user code's top bits into NL lanes (two passes over the rows,
+    L row lanes with private counts -> stable offsets); then each lane marks its own users in a table of
+    2^SH entries (cache-sized, one u32 of slot bits per user) -- lanes in parallel, no sharing. Exact."""
+    n = key.size
+    pc = np.zeros((L, NL), np.int64)
+    for l in prange(L):
+        for i in range(l * n // L, (l + 1) * n // L):
+            if lut[key[i]] >= 0:
+                pc[l, np.int64(ut[i]) >> SH] += 1
+    offs = np.zeros(NL + 1, np.int64)
+    for g in range(NL):
+        s = 0
+        for l in range(L):
+            v = pc[l, g]
+            pc[l, g] = s
+            s += v
+        offs[g + 1] = offs[g] + s
+    bu = np.empty(offs[NL], np.uint32)
+    bs = np.empty(offs[NL], np.uint8)
+    for l in prange(L):
+        cur = np.empty(NL, np.int64)
+        for g in range(NL):
+            cur[g] = offs[g] + pc[l, g]
+        for i in range(l * n // L, (l + 1) * n // L):
+            p = lut[key[i]]
+            if p >= 0:
+                g = np.int64(ut[i]) >> SH
+                q = cur[g]
+                bu[q] = ut[i]
+                bs[q] = p
+                cur[g] = q + 1
+    W = np.int64(1) << SH
+    cnt = np.zeros((NL, nslot), np.int64)
+    for g in prange(NL):
+        jar = np.zeros(W, np.uint32)
+        base = np.int64(g) << SH
+        for q in range(offs[g], offs[g + 1]):
+            x = np.int64(bu[q]) - base
+            bit = np.uint32(1) << np.uint32(bs[q])
+            w = jar[x]
+            if w & bit == 0:
+                jar[x] = w | bit
+                cnt[g, bs[q]] += 1
+    out = np.zeros(nslot, np.int64)
+    for g in range(NL):
+        for s in range(nslot):
+            out[s] += cnt[g, s]
+    return out
+
+
 @njit(nogil=True, cache=True)
 def _mx_fold_nb(kc, ac, dv, acc):
     """One-pass weighted fold: acc[key] += dv[a-code]. Native dtypes in, no

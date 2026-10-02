@@ -3665,3 +3665,33 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
 - PROJECTED (the five queries' c6a ratios applied): on run 4's slow instance 3.261 -> 3.234-3.241 (3rd,
   still ~0.015 behind ClickHouse (web)); on run 3's instance with Q25 3.165 -> 3.138-3.145 (2nd). With
   the CounterID key as well (its pod ratios): the slow instance 3.183-3.184 (2nd).
+
+## 2026-10-02 -- Q11 SURGERY: THE NARROW READ (pairdistinct)
+- Q11 (MobilePhone, MobilePhoneModel, COUNT(DISTINCT UserID) WHERE MobilePhoneModel <> '' ... LIMIT 10):
+  4.0% of the gap on the board, hot 217 ms on the c6a vs Umbra 25. Only 5,563,212 of 100M rows have a model.
+- THE LINE ITEMS (c6a, hot, inside the query; the two tiered columns' planes are kept between queries in
+  _e8pm, source data): MobilePhone expanded from its planes to all 100M rows ~31 ms + the gathers and casts
+  of _tier_shelf 39 ms; UserID decoded for all 100M rows 47 ms; pair key + row count ~17 ms; the hunt
+  69 ms (pd_hunt: one thread, a 17.6M-entry u16 table hit at random, two rounds of 16 pairs, and a
+  5.6M-row int64 copy of the user codes per round).
+- THE NARROW READ (_narrow + _hunt_lanes; WDB_PD_NARROW=0 restores the old path): MobilePhoneModel's planes
+  are the filter; MobilePhone at those rows by THE ZIPPER (pd_at_planes: its own planes and the filter's
+  rows, two sorted lists walked side by side in 16 lanes) or codes_at when not sparse/tiered; UserID by
+  codes_at at those rows only; pair key + count in one pass (pd_pair_count); THE HUNT BY USER LANES
+  (pd_hunt_lanes): candidate rows bucketed by the user code's top bits into <= 64 lanes, each lane's mark
+  table 2^SH u32 (2 MB for UserID), lanes in parallel, 32 pairs a round -- one round on ClickBench.
+  Prototype line items on the c6a: zipper 5.6 ms, UserID at the rows 34.7, pair count 1.6, hunt 14.1.
+- MEASURED on the c6a: hot 196.0 -> 64.5 and 220.9 -> 70.4 ms (two sessions, interleaved), the same rows
+  as the old path, the counts equal DuckDB on the full parquet. Cold (drop_caches, fresh process, start
+  untimed, x3): 564-609 -> 540-567 ms -- cold is the reads: MobilePhoneModel's planes 78 ms, MobilePhone's
+  158 ms, UserID at 5.6M rows 270 ms (the rows touch nearly every block: nearly all of UserID's ~250 MB).
+  Legal under WDB_QMEM_STRICT; suite 1810 passed; manifest 349 (pd_at_planes, pd_pair_count,
+  pd_hunt_lanes). tests/test_pairdistinct_narrow.py: the kernels against numpy (the hunt at four lane
+  widths); through SQL a tiered and a plain group column at LIMIT 1/5/10/40 equal the old path, every
+  count equal to DuckDB's for its pair and the top-k counts equal DuckDB's.
+- TRIED AND DROPPED: a compiled tier walk for the tag-9 planes (one pass compacting the unassigned list in
+  place, instead of numpy's per-tier boolean indexing). Exact on all 3 tiered columns of the floor database,
+  but warm on the pod 497 vs 302 ms for the three, and cold on the c6a MobilePhone's planes 158-172 ->
+  127 ms with the whole query 606 -> 558 (within run-to-run spread). Cold there is the bytes, not the walk.
+- PROJECTED (Q11's c6a hot ratio on run 4's slow instance, with run_wide): combined 3.234 -> ~3.18, 2nd
+  (ClickHouse (web) 3.221); on run 3's instance with Q25 and run_wide ~3.09.
