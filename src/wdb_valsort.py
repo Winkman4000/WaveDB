@@ -97,10 +97,37 @@ def detect(seg, tree, col_map):
             'V': c['V'], 'has_null': c['has_null']}
 
 
+_LOWCOUNT = [__import__('os').environ.get('WDB_LOWCOUNT', '1') != '0']
+_LOW_MAX = 1 << 16          # LIMITs past this keep the census path
+
+
+class _Wider(Exception):
+    """The walk asked for a code past the low count's bound (codes with no rows): fall back."""
+
+
 def execute(seg, spec):
     global _HITS
     col = spec['col']; lim = spec['lim']; V = spec['V']
     null_code = (V - 1) if spec['has_null'] else -1
+    decode = lambda code: wdb_sql._pyval(seg.fetch(col, code))
+    if _LOWCOUNT[0] and lim is not None and 0 <= int(lim) <= _LOW_MAX:
+        # THE LOW COUNT (2026-10-02, Q25): every code of a dictionary has at least one row, so a walk
+        # from the front fills LIMIT k within its first k + 2 codes (k emitted, plus the empty
+        # string and the null code skipped). Exact counts of codes 0..k+1 are all it needs -- not a
+        # census of all V codes, not the count-sorted duplicate list. A code past the bound (only if
+        # some codes had no rows) falls back to the census path below.
+        T = int(lim) + 2
+        lc = seg.low_counts(col, T)
+        def count_low(code, lc=lc, T=T):
+            if code >= T:
+                raise _Wider(code)
+            return int(lc[code])
+        try:
+            rows = workers.take_sorted(decode, count_low, V, lim, {null_code})
+            _HITS += 1
+            return rows, [wdb_sql._alias(spec['proj'][0])]
+        except _Wider:
+            pass
     dc = _dupcounts(seg, col)
     if dc is None:
         count_of = lambda code: 1
@@ -109,7 +136,6 @@ def execute(seg, spec):
         def count_of(code, ca=ca, na=na):
             i = np.searchsorted(ca, code)
             return int(na[i]) if (i < ca.size and ca[i] == code) else 1
-    decode = lambda code: wdb_sql._pyval(seg.fetch(col, code))
     rows = workers.take_sorted(decode, count_of, V, lim, {null_code})
     _HITS += 1
     return rows, [wdb_sql._alias(spec['proj'][0])]

@@ -2717,6 +2717,57 @@ def unpack_any(b, n, bits):
 
 
 @njit(nogil=True, parallel=True, cache=True)
+def e8_lowcount(b, n, bits, T, L):
+    """THE LOW COUNT (2026-10-02, Q25): how many of the sparse dress's n literals (MSB-first, as
+    unpack_any reads them, any width <= 32) are each code below T -- the lane read once in L
+    lanes, a T-sized board per lane, no array of literals written."""
+    boards = np.zeros((L, T), np.int64)
+    mask = np.uint64((1 << bits) - 1)
+    nb = len(b)
+    per = (n + L - 1) // L
+    for l in prange(L):
+        a = l * per
+        e = min(n, a + per)
+        for i in range(a, e):
+            o = i * bits
+            j = o >> 3
+            sh = o & 7
+            acc = np.uint64(0)
+            for kk in range(5):
+                v = np.uint64(b[j + kk]) if j + kk < nb else np.uint64(0)
+                acc = (acc << np.uint64(8)) | v
+            c = np.int64((acc >> np.uint64(40 - sh - bits)) & mask)
+            if c < T:
+                boards[l, c] += 1
+    out = np.zeros(T, np.int64)
+    for l in range(L):
+        for t in range(T):
+            out[t] += boards[l, t]
+    return out
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def low_count(codes, T, L):
+    """THE LOW COUNT over decoded codes: rows per code for the codes below T only (L lanes, a
+    T-sized board each) -- not a census of every code."""
+    n = codes.size
+    boards = np.zeros((L, T), np.int64)
+    per = (n + L - 1) // L
+    for l in prange(L):
+        a = l * per
+        e = min(n, a + per)
+        for i in range(a, e):
+            c = np.int64(codes[i])
+            if c < T:
+                boards[l, c] += 1
+    out = np.zeros(T, np.int64)
+    for l in range(L):
+        for t in range(T):
+            out[t] += boards[l, t]
+    return out
+
+
+@njit(nogil=True, parallel=True, cache=True)
 def e8_pos(pres_bytes, ck, n, pos):
     """Pass 1 of the sparse reconstruct: collect present-row positions per 64K chunk,
     each chunk writing its own slice from its checkpoint rank. Zero bytes identify

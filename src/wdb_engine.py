@@ -2502,6 +2502,28 @@ class Segment:
             lits = lane @ (np.int64(1) << np.arange(bits - 1, -1, -1, dtype=np.int64))   # MSB-first, as unpack_any
         return pos, lits, n_all
 
+    def low_counts(self, nm, T):
+        """THE LOW COUNT (2026-10-02, Q25): rows per code for codes 0..T-1 only -- what ORDER BY a
+        value-sorted dictionary LIMIT k needs (the first k codes), not a census of all V. The sparse
+        dress (tag 8): the default value's count is N minus the literals; the literal lane is read
+        once by a counting kernel (no row positions, nothing densified). Any other dress: its codes,
+        counted below T. Exact. Nothing is kept."""
+        import wdb_kernels as _WK
+        c = self.cols[nm]; T = int(T)
+        bits = int(c.get('e8bits', 0) or 0)
+        if c.get('code_enc', 0) == 8 and 0 < bits <= 32 and nm not in self._codes:
+            n = int(c['e8n'])
+            fb = int(c['cstart']); fe = fb + (n * bits + 7) // 8
+            self.warm_span(fb, fe)
+            lane = np.frombuffer(self.buf, np.uint8, fe - fb, fb)
+            out = _WK.e8_lowcount(lane, np.int64(n), np.int64(bits), np.int64(T), np.int64(16))
+            d = int(c['e8d'])
+            if d < T:
+                out[d] += int(self.N) - n
+            return out
+        codes = np.ascontiguousarray(np.asarray(self._raw_codes(nm)))
+        return _WK.low_count(codes, np.int64(T), np.int64(16))
+
     def _raw_codes_range(self, nm, lo, hi):
         """Per-row codes for rows [lo, hi) ONLY. Raw bit-packed columns (code_enc 0) touch just
         the covering bytes -- the narrow-before-expand read. mode 4/6 are positional (free slice).

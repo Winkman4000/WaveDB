@@ -3602,3 +3602,38 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
   tests/test_sorted_gather.py: a tag-3 and a tag-18 column, six ascending row sets and an unsorted
   one, equal to the old path and to the full decode. Suite 1804 passed. Legal: Q36-Q42 (and Q1/2/3/
   7/29) three runs each under WDB_QMEM_STRICT, nothing left on the segment. Manifest 341 signatures.
+
+## 2026-10-02 -- THE LOW COUNT (Q25: ORDER BY SearchPhrase LIMIT 10)
+- The board after run 3 (the share of WaveDB's weighted log-gap to each query's best): Q25 7.8%, the
+  largest single query; then the LIKE family Q20-Q23 ~21% together, gd_pass1 (Q8/Q9/Q31) ~7%, Q3 5.8%.
+- Q25 hot 198 ms (pod) was all census: wdb_valsort asked wdb_gbcount._load for every code's count (the
+  full decode, bincount_par over 6M bins, the count-sorted duplicate list) to look up the first few.
+  The data: SearchPhrase is the sparse dress (tag 8; 86.8M empty rows as the default, 13.2M literals of
+  23 bits, no load statistics), and the first ten non-empty values in sort order occur once each,
+  scattered (rows 0.9M..87M) -- so their counts are only known by reading every literal, but nothing
+  else is needed.
+- THE RULE: every dictionary code has at least one row, so a walk from the front fills LIMIT k within its
+  first k + 2 codes (k emitted; the empty string and the null code skipped). Exact counts of codes
+  0..k+1 are the whole need. Segment.low_counts(col, T): on the sparse dress the literal lane is read
+  once by wdb_kernels.e8_lowcount (MSB-first as unpack_any, 16 lanes, a T-sized board each; no
+  positions, no densify; the default's count is N minus the literals; the lane's bytes come in by the
+  parallel cold read first); any other dress counts its decoded codes below T (low_count). The walk
+  raises past the bound (only possible if a code had no rows) and the census path answers. LIMIT >
+  65536 keeps the census path. WDB_LOWCOUNT=0 declines. Nothing is kept.
+- MEASURED (pod, floor database): Q25 hot 197.7 -> 11.6 ms (Umbra 10 on the board), cold 302-312 ->
+  60-69 ms (3 fresh processes each, caches evicted), same answer. Legal: 3 runs under WDB_QMEM_STRICT,
+  nothing left behind. tests/test_lowcount.py: the kernels equal a full count (widths 1..32, ragged
+  lanes, 1/7/16 lanes; decoded codes); through SQL a sparse and a dense column at LIMIT 1..25 and past
+  the distinct count equal DuckDB, valsort served each, and the census fallback gives the same rows.
+  Suite 1806 passed. Manifest 346 signatures.
+- PROJECTED on run 3's AWS times (pod change applied as a ratio / as milliseconds saved): combined
+  3.299 -> 3.17-3.21 (2nd; ClickHouse (web) 3.234), hot 2.595 -> 2.46-2.51, cold 2.067 -> ~2.00.
+- THE CounterID KEY, costed the same night (not built): a declared PRIMARY KEY (CounterID) as a
+  non-clustered index of row lists (the funnel's .plist format, built at load). Counting sort 0.36 s
+  (numpy's stable argsort 4.9 s), raw 381.5 MB written in 1.0 s; gaps + zstd per value 75.6 MB (built
+  1.1 s; CounterID=62 decodes in 2.2 ms). Measured on a hard-linked copy of the floor database, all 43
+  queries: only Q36-Q42 move -- hot 61->57, 66->54, 53->37, 189->157, 65->64, 46->46, 46->32 ms; cold
+  181->154, 154->118, 135->95, 310->269, 180->178, 224->208, 118->79 ms. Answers equal (Q17 is LIMIT
+  without ORDER BY and differs run to run on the floor too). Projected on run 3 alone: combined ~3.245.
+  Jackson's call: the operator declares the key (ClickHouse's own create.sql declares PRIMARY KEY
+  (CounterID, EventDate, UserID, EventTime, WatchID)); not built yet.
