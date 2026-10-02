@@ -3724,3 +3724,27 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
   Suite 1811 passed; manifest 351 (tt_walk; bincount_par on int64 codes).
 - PROJECTED (Q18's pod ratios on run 4 + Q11): WaveDB 3.206 unchanged, ClickHouse (web) 3.221 -> 3.238;
   the gap +0.014 -> +0.032. Q18 hot ~681 -> ~486 ms on the c6a (Umbra 721).
+
+## 2026-10-02 -- THE PERSON COUNT FROM THE SHELVES (enc-19 census at the read floor)
+- Jackson: the person count is the sorted-gather question again -- every frame of UserID must be read, so
+  read them at memory bandwidth. Measured on the pod (hot): UserID's stored bytes (row pointers 188.7 MB +
+  block dictionaries 58.3 MB) read once in parallel 28-31 ms (8-9 GB/s); today's count = decode all 100M
+  rows 18.5 ms + bincount_par on per-thread 17.6M boards 96.6 ms (138 inside the engine at 8 threads):
+  ~4x the floor, nearly all of it the boards. Q3's per-block count (e19_value_sum) already ran at 43 ms.
+- Segment._e19s_census (shelved enc 19; Segment.raw_census routes it, even when the column is decoded):
+  pass A (e19s_census_a) per block -- its row pointers counted on a board the size of its own dictionary
+  (cache-resident), written flat (34.4M entries); pass B (e19s_census_b) per SHELF -- UserID has 221
+  shelves of 79,779 codes, each shelf owns a 0.64 MB slice of the total, decodes its own part of every
+  block's dictionary and adds. No per-thread boards, no merge, no races. Exact. The parallel cold reader
+  brings the pointers and dictionaries in first. WDB_E19_CENSUS=0 restores decode + boards.
+- Pod prototype: pass A 25.3 + pass B 38.2 = 63.5 ms at 8 threads (36.5 at 16; the c6a's hyperthreads
+  are untested -- the engine's default 8 is what ships). Routed: wdb_gbcount.counts_of_stored (Q15's bar,
+  the census path) and wdb_tripletop's user census (Q16, Q18).
+- MEASURED (pod, floor database; all 43 hot interleaved, answers equal): Q15 215.0 -> 97.4 ms, Q16 387.3 ->
+  313.9, Q18 392.0 -> 315.9 (on top of the checklist walk), Q35 252.7 -> 163.0 (URL is shelved enc 19);
+  the rest within noise. Cold (x2): Q15 410-427 -> 354-359, Q16 684-701 -> 616-618, Q18 660-734 -> 618-628.
+  Legal under WDB_QMEM_STRICT (Q15/Q16/Q35/Q18 added). tests/test_e19_census.py: both layouts with NULLs
+  equal np.bincount of the decode, the shelved count builds no decode; GROUP BY ... ORDER BY COUNT(*) DESC
+  LIMIT 1/10/50 equal DuckDB. Suite 1813 passed; manifest 353.
+- PROJECTED (run 4 + Q11, pod ratios for Q15/Q16/Q35/Q18): WaveDB 3.206 -> 3.142 (2nd; hot 2.405, 3rd),
+  ClickHouse (web) 3.221 -> 3.248, the gap +0.014 -> +0.106; with run_wide's c6a ratios 3.122 / +0.126.

@@ -4380,6 +4380,45 @@ def e19s_valsum(pw, dw, BR, N, W, wb, lb, gw, dcnt, poff, pre, soff, SW, tab, nt
 
 
 @njit(cache=True, parallel=True, nogil=True)
+def e19s_census_a(pw, BR, N, lb, dcnt, poff, eoff, cnt):
+    """THE PERSON COUNT, pass A (2026-10-02): per block, its row pointers counted on a board the size of
+    its own dictionary (cache-resident), written flat at cnt[eoff[b]:eoff[b+1]] -- the pointer stream
+    read once, in order."""
+    for b in prange(lb.size):
+        lo = b * BR; hi = min(lo + BR, N)
+        dc = np.int64(dcnt[b]); e0 = eoff[b]
+        h = np.zeros(dc, np.uint32)
+        l = np.int64(lb[b]); pos = poff[b] * 64
+        for i in range(lo, hi):
+            h[_e19_get(pw, pos, l)] += 1; pos += l
+        for j in range(dc):
+            cnt[e0 + j] = h[j]
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def e19s_census_b(dw, W, wb, gw, pre, soff, SW, eoff, cnt, out):
+    """pass B: per SHELF (a range of W codes) -- each shelf owns its slice of the total (W int64s, cache-
+    sized), decodes its own part of every block's dictionary and adds that block's counts. No two shelves
+    touch the same entry: no per-thread 17.6M boards, no merge."""
+    R = SW.size - 1
+    nb = eoff.size - 1
+    for r in prange(R):
+        base = r * W
+        for b in range(nb):
+            c0 = np.int64(pre[r, b]); c1 = np.int64(pre[r + 1, b])
+            if c1 == c0:
+                continue
+            g = np.int64(gw[b])
+            pos = SW[r] * 64 + np.int64(soff[r, b])
+            v = base + _e19_get(dw, pos, wb); pos += wb
+            e = eoff[b] + c0
+            out[v] += cnt[e]
+            for j in range(1, c1 - c0):
+                v += _e19_get(dw, pos, g); pos += g
+                out[v] += cnt[e + j]
+
+
+@njit(cache=True, parallel=True, nogil=True)
 def e19_signposts(dw, gbits, gw, dcnt, doff, S, spo, sp):
     """THE SIGNPOSTS (Jackson, 2026-09-27): per block, every S-th entry of its sorted dictionary kept
     whole (entries 0, S, 2S, ...), written at sp[spo[b]:spo[b+1]] -- a lookup can then halve among a

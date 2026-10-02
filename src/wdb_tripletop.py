@@ -233,7 +233,8 @@ def execute(seg, spec):
     except Exception:
         ucnt = None
     if ucnt is None:
-        ucnt = WK.bincount_par(uc, int(seg.cols[uid]['V']))       # THE PARALLEL CENSUS (was 419 ms, one thread)
+        ucnt = seg.raw_census(uid, int(seg.cols[uid]['V']))       # THE PERSON COUNT FROM THE SHELVES (shelved enc 19)
+                                                                    # else decode + parallel boards, as before
     ucnt = np.ascontiguousarray(ucnt, np.int64)
     pl = seg.e8_planes(sp)
     if pl is None:

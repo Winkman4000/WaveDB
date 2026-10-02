@@ -104,6 +104,21 @@ def _census(seg, col):
     return wdb_blockstats.vcnt_from_load(seg, col)
 
 
+def counts_of_stored(seg, col):
+    """Per-code row counts of the stored codes (no overrides) -- the query's own census. A shelved enc-19
+    column (UserID) counts from its block dictionaries (Segment.raw_census: no 100M decode, no per-thread
+    boards); anything else decodes and counts on the parallel boards, as before. Length V for the former,
+    max code + 1 for the latter (trailing zero counts change nothing here). None for an empty column."""
+    c = seg.cols.get(col) or {}
+    if c.get('code_enc') == 19 and 'e19R' in c and int(seg.N) > 0:
+        return seg.raw_census(col)
+    import wdb_kernels as _WKg
+    codes = seg._raw_codes(col)
+    if codes.size == 0:
+        return None
+    return _WKg.bincount_par(codes, int(codes.max()) + 1)
+
+
 def _load(seg, col):
     """Load the persisted sidecar (rebuilding if absent or stale vs seg.N, caching in memory).
     Returns (codes, counts) or None if the column can't be projected."""
@@ -138,12 +153,9 @@ def _load(seg, col):
         # would: the parallel census, and a RADIX order on the counts instead of the 645 ms
         # argsort of 17M int64 (counts capped to u16 sort by radix; the few past the cap are
         # re-sorted exactly). Transient: the per-query cache only.
-        import wdb_kernels as _WKg
-        codes = seg._raw_codes(col)
-        if codes.size == 0:
+        counts = counts_of_stored(seg, col)
+        if counts is None:
             return None
-        K = int(codes.max()) + 1
-        counts = _WKg.bincount_par(codes, K)
         heavy = np.flatnonzero(counts >= 2)
         hn0 = counts[heavy]
         key = (65535 - np.minimum(hn0, 65535)).astype(np.uint16)
@@ -554,9 +566,8 @@ def execute(seg, spec):
         # the parallel census, then a bar lowered from the max until need+1 codes clear it, and
         # only those are sorted. The tie and singleton laws below see exactly what they saw.
         import wdb_kernels as _WKb
-        codes = seg._raw_codes(col)
-        if codes.size:
-            counts = _WKb.bincount_par(codes, int(codes.max()) + 1)
+        counts = counts_of_stored(seg, col)
+        if counts is not None:
             need0 = int(lim) + int(spec.get('off') or 0) + 1
             topi = _WKb.topk_bar(counts, min(need0, int(counts.size)))
             hn0 = counts[topi]

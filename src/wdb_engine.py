@@ -43,6 +43,7 @@ _RANKAT = [__import__('os').environ.get('WDB_RANKAT', '1') == '1'] # A/B: 0 rest
 _CENSUS = [__import__('os').environ.get('WDB_CENSUS_DRESS', '1') == '1'] # A/B: 0 restores decode + bincount for every census
 _VALSUM = [__import__('os').environ.get('WDB_E19_VALSUM', '1') == '1']   # A/B: 0 restores SUM/AVG of enc 19 by the full census
 _SORTGATHER = [__import__('os').environ.get('WDB_SORTGATHER', '1') == '1']  # A/B: 0 restores the general frame gathers (enc 3/18)
+_E19CENSUS = [__import__('os').environ.get('WDB_E19_CENSUS', '1') == '1']   # A/B: 0 restores decode + boards for shelved enc 19
 
 
 def _e19s_blocks(c, pw, dw, N, b0, b1, cc):
@@ -2053,6 +2054,28 @@ class Segment:
     def codes(self, nm):
         eff = self._effective(nm)
         return eff[0] if eff is not None else self._raw_codes(nm)
+    def _e19s_census(self, c, L):
+        """THE PERSON COUNT FROM THE SHELVES (2026-10-02, Jackson: "if we have to read all the frames, read
+        them at memory bandwidth"): per-code row counts of a shelved enc-19 column without the 100M decode
+        or the per-thread boards. Pass A per block (pointer counts on a block-sized board, flat list);
+        pass B per shelf (each shelf adds into its own slice of the total). UserID on the pod: today's
+        decode + boards 118 ms, this 63.5 ms at 8 threads (36.5 at 16); the bytes alone 28-31 ms."""
+        import wdb_kernels as _WK
+        nb = int(c['e19lb'].size); poff = c['e19poff']
+        cs = int(c['cstart']); ds = int(c['e19dstart'])
+        self.warm_span(cs, cs + 8 * (int(poff[nb]) + 1))
+        self.warm_span(ds, min(len(self.buf), ds + 8 * int(c['e19dn'])))
+        pw, dw = self._e19_words(c)
+        dcnt = np.asarray(c['e19dc'], np.int64)
+        eoff = np.zeros(dcnt.size + 1, np.int64)
+        np.cumsum(dcnt, out=eoff[1:])
+        cnt = np.empty(int(eoff[-1]), np.uint32)
+        out = np.zeros(L, np.int64)
+        _WK.e19s_census_a(pw, np.int64(c['e19BR']), np.int64(self.N), c['e19lb'], dcnt, poff, eoff, cnt)
+        _WK.e19s_census_b(dw, np.int64(c['e19W']), np.int64(c['e19wb']), c['e19gw'], c['e19pre'],
+                          c['e19soff'], c['e19SW'], eoff, cnt, out)
+        return out
+
     def raw_census(self, nm, minlength=0):
         """THE CENSUS FROM THE DRESS (2026-10-01): per-code row counts of the STORED codes (no
         overrides), length max(V, minlength) -- np.bincount(self._raw_codes(nm)) exactly -- counted
@@ -2065,6 +2088,8 @@ class Segment:
         c = self.cols[nm]
         L = max(int(c['V']), int(minlength))
         enc = c.get('code_enc', 0)
+        if _CENSUS[0] and _E19CENSUS[0] and enc == 19 and 'e19R' in c and c.get('mode') in (0, 1, 2):
+            return self._e19s_census(c, L)           # even when decoded: the dress counts in a third the time
         if _CENSUS[0] and nm not in self._codes and c.get('mode') in (0, 1, 2):
             if enc == 5:
                 pk = np.frombuffer(self.buf, dtype=np.uint8, count=c['czlen'], offset=c['cstart'])
