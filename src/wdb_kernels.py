@@ -3283,6 +3283,45 @@ def tt_survivors(uc, ucnt, pos8, lits8, spc, ec, mt, e0, emptyc, theta, outs, le
         lens[t] = w
 
 
+@njit(nogil=True, parallel=True, cache=True)
+def tt_walk(uc, ubit, uidx, pos8, lits8, pbit, steps, mt, e0, empty_ok, NM, board, kout, koff, klen):
+    """Q18's walk by CHECKLISTS (2026-10-02, Jackson's line items): one pass over the rows in L lanes.
+    ubit/pbit are 1-bit-per-code "has >= theta rows" checklists (UserID 2.2 MB, SearchPhrase 0.75 MB --
+    cache-resident, where the census itself was 141 MB of random reads). The minute comes from the
+    staircase's step rows (code = steps <= row) and the code -> minute table: no 100M time decode.
+    Survivors with the empty phrase (99.6% on ClickBench) tick a per-lane TALLY board[l, uidx[u]*NM + m];
+    survivors with a real phrase emit uid<<29 | m<<23 | sp into kout[koff[l]:], klen[l] of them."""
+    L = board.shape[0]
+    N = uc.size
+    n8 = pos8.size
+    ns = steps.size
+    for l in prange(L):
+        a = l * N // L
+        b = (l + 1) * N // L
+        p = np.searchsorted(pos8, a)
+        s = np.searchsorted(steps, a, side='right')
+        w = koff[l]
+        for i in range(a, b):
+            while s < ns and steps[s] <= i:
+                s += 1
+            here = p < n8 and pos8[p] == i
+            u = np.int64(uc[i])
+            if (ubit[u >> 3] >> (u & 7)) & 1 == 0:
+                if here:
+                    p += 1
+                continue
+            m = np.int64(mt[s])
+            if here:
+                sp = np.int64(lits8[p])
+                p += 1
+                if (pbit[sp >> 3] >> (sp & 7)) & 1:
+                    kout[w] = (u << 29) | (m << 23) | sp
+                    w += 1
+            elif empty_ok:
+                board[l, np.int64(uidx[u]) * NM + m] += 1
+        klen[l] = w - koff[l]
+
+
 @njit(nogil=True, cache=True)
 def pt_census(uc, jar):
     """u8 saturating census: 'seen once / seen again' is all the singleton-

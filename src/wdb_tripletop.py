@@ -128,6 +128,95 @@ def _minute_table(seg, dtcol):
     return ((vals // div) % 60).astype(np.int64)
 
 
+_TTBITS = [__import__('os').environ.get('WDB_TT_CHECKLISTS', '1') != '0']
+
+
+def _emit_rows(seg, spec, uid, sp, picks):
+    """picks: (packed key uid<<29 | minute<<23 | sp, count), best first -> the result rows"""
+    global _HITS
+    rows = []
+    for kk, c9 in picks:
+        ucode = kk >> 29; mv = (kk >> 23) & 63; scode = kk & ((1 << 23) - 1)
+        uv = seg.fetch(uid, ucode)
+        sv = seg.fetch(sp, scode)
+        if isinstance(uv, (bytes, bytearray)):
+            uv = uv.decode('utf-8', 'replace')
+        if isinstance(sv, (bytes, bytearray)):
+            sv = sv.decode('utf-8', 'replace')
+        row = []
+        for a in spec['aggs']:
+            row.append(uv if a[0] == 'K' and a[1] == uid else
+                       sv if a[0] == 'K' else
+                       int(mv) if a[0] == 'M' else c9)
+        rows.append(tuple(row))
+    _HITS += 1
+    return rows, [wdb_sql._alias(p) for p in spec['proj']]
+
+
+def _walk_checklists(seg, spec, uc, ucnt, pos8, lits8, spc, e0, emptyc, dtc, mt):
+    """THE CHECKLIST WALK (2026-10-02, Q18's line items; WDB_TT_CHECKLISTS=0 restores tt_survivors).
+    The same double bound (a triple's count <= its user's rows and <= its phrase's rows), asked of
+    1-bit checklists instead of the 141 MB census; the minute from EventTime's staircase steps (no 100M
+    decode); empty-phrase survivors counted on a (heavy user x 60 minutes) tally, only real-phrase
+    survivors packed and sorted. Exact under the same law: accept when the k-th count >= theta. None
+    when the time column is not a clean staircase (one step per code, no nulls) or the tally is too big."""
+    import wdb_kernels as WK
+    uid, sp, k = spec['uid'], spec['sp'], spec['lim']
+    ct = seg.cols[dtc]
+    Vt = int(ct['V'])
+    steps = seg.stairs(dtc)
+    if steps is None or ct.get('has_null') or int(np.asarray(steps).size) != Vt - 1 or mt.size != Vt:
+        return None
+    steps = np.ascontiguousarray(steps, np.int64)
+    N = int(seg.N)
+    L = 8
+    bounds = (np.arange(L + 1, dtype=np.int64) * N) // L
+    koff = np.ascontiguousarray(np.searchsorted(pos8, bounds)[:-1], np.int64)
+    kout = np.empty(max(1, pos8.size), np.int64)          # lane l's real-phrase keys <= its plane rows
+    theta = 256
+    while True:
+        hv = ucnt >= theta
+        heavy = np.flatnonzero(hv)
+        H = int(heavy.size)
+        empty_ok = bool(emptyc >= theta)
+        if empty_ok and L * max(1, H) * 60 * 4 > (512 << 20):
+            return None                                   # the tally would not be small: the old walk
+        ubit = np.packbits(hv, bitorder='little')
+        pbit = np.packbits(spc >= theta, bitorder='little')
+        uidx = np.full(ucnt.size, -1, np.int32)
+        uidx[heavy] = np.arange(H, dtype=np.int32)
+        board = np.zeros((L, max(1, H) * 60 if empty_ok else 1), np.int32)
+        klen = np.zeros(L, np.int64)
+        WK.tt_walk(uc, ubit, uidx, pos8, lits8, pbit, steps, mt, np.int64(e0), empty_ok,
+                   np.int64(60), board, kout, koff, klen)
+        keys, cnts = [], []
+        if empty_ok:
+            tally = board.sum(axis=0, dtype=np.int64)
+            nz = np.flatnonzero(tally)
+            keys.append((heavy[nz // 60].astype(np.int64) << 29) | ((nz % 60).astype(np.int64) << 23) | np.int64(e0))
+            cnts.append(tally[nz])
+        kk = np.concatenate([kout[int(koff[l]):int(koff[l]) + int(klen[l])] for l in range(L)])
+        if kk.size:
+            kk.sort()
+            brk = np.empty(kk.size, bool); brk[0] = True
+            np.not_equal(kk[1:], kk[:-1], out=brk[1:])
+            st = np.flatnonzero(brk)
+            keys.append(kk[st]); cnts.append(np.diff(np.append(st, kk.size)))
+        allk = np.concatenate(keys) if keys else np.empty(0, np.int64)
+        allc = np.concatenate(cnts) if cnts else np.empty(0, np.int64)
+        if allk.size >= k or theta <= 1:
+            kk9 = min(k, int(allk.size))
+            if kk9:
+                topi = np.argpartition(-allc, kk9 - 1)[:kk9]
+                order = topi[np.argsort(-allc[topi], kind='stable')]
+                kth = int(allc[order[-1]])
+            else:
+                order = np.empty(0, np.int64); kth = 0
+            if (allk.size >= k and kth >= theta) or theta <= 1:
+                return _emit_rows(seg, spec, uid, sp, [(int(allk[g]), int(allc[g])) for g in order.tolist()])
+        theta //= 4
+
+
 def execute(seg, spec):
     global _HITS
     import wdb_wherescan as WS
@@ -151,15 +240,19 @@ def execute(seg, spec):
         return None
     pos8 = np.ascontiguousarray(pl[0], np.int64)
     lits8 = np.ascontiguousarray(pl[1], np.int64)
-    spc = np.ascontiguousarray(np.bincount(lits8, minlength=int(seg.cols[sp]['V'])), np.int64)
+    spc = np.ascontiguousarray(WK.bincount_par(lits8, int(seg.cols[sp]['V'])), np.int64)   # was one thread, 52 ms
     e0 = WS._code_of(seg, sp, '')
     if e0 is None:
         return None
     e0 = int(e0)
     emptyc = N - int(pos8.size)
     if dtc is not None:
-        ec = np.ascontiguousarray(seg._raw_codes(dtc))
         mt = np.ascontiguousarray(_minute_table(seg, dtc))
+        if _TTBITS[0] and not spec.get('free'):
+            got = _walk_checklists(seg, spec, uc, ucnt, pos8, lits8, spc, e0, emptyc, dtc, mt)
+            if got is not None:
+                return got
+        ec = np.ascontiguousarray(seg._raw_codes(dtc))
     else:
         ec = np.zeros(1, np.int64)           # never read: has_m gates the branch
         mt = np.zeros(1, np.int64)

@@ -3695,3 +3695,32 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
   127 ms with the whole query 606 -> 558 (within run-to-run spread). Cold there is the bytes, not the walk.
 - PROJECTED (Q11's c6a hot ratio on run 4's slow instance, with run_wide): combined 3.234 -> ~3.18, 2nd
   (ClickHouse (web) 3.221); on run 3's instance with Q25 and run_wide ~3.09.
+
+## 2026-10-02 -- SHAVING A WIN: Q18 BY CHECKLISTS (tripletop)
+- THE BOARD'S LAW FOR WINS: on a query where WaveDB is the fastest system, our ratio is 1.0 whatever we do;
+  getting faster lowers the baseline everyone else is divided by. So a win sharpened moves the RANK, not our
+  score. Measured on run 4's times + run 5's Q11 (WaveDB 3.206, ClickHouse (web) 3.221), halving each win:
+  Q18 hot +0.031 to the gap (we led Umbra only 681 vs 721 ms); Q28/Q20/Q18/Q13/Q31/Q12/Q17/Q27 cold ~+0.010
+  each; Q7 +0.006; Q4/Q5 +0.002-0.003. Hot carries 0.6 of the weight: Q18 hot first.
+- Q18 LINE ITEMS (pod, hot, 470 ms): UserID decode 33; the user census (17.6M bins) 138; the phrase census
+  (6M bins, numpy, one thread) 52; EventTime decoded for all 100M rows 44 + the code -> minute table 29;
+  the survivor walk 163 (each row looked its user up in the 141 MB census, a cache miss nearly every row);
+  sorting the 6.2M survivor keys 57. Survivors at theta 256: 6,192,786 with the empty phrase, 23,012 with a
+  real one; 14,491 users and 2,112 phrases have >= 256 rows; EventTime is a staircase (one step per code).
+- THE CHECKLIST WALK (_walk_checklists + wdb_kernels.tt_walk; WDB_TT_CHECKLISTS=0 restores tt_survivors):
+  the same double bound asked of 1-bit checklists (users 2.2 MB, phrases 0.75 MB: cache-resident); the
+  minute from the staircase steps (code = steps <= row) and the minute table -- no 100M time decode;
+  empty-phrase survivors tick a per-lane (heavy user x 60) tally, only real-phrase survivors are packed
+  and sorted; the phrase census by bincount_par (both paths). Exact under the same law (accept when the
+  k-th count >= theta, else theta / 4); declines (old walk) when the time column is not a clean staircase
+  or the tally would pass 512 MB. Built per query, nothing kept (the planes and the staircase steps were
+  already kept: source data). Legal under WDB_QMEM_STRICT.
+- MEASURED (pod, floor database): hot 525.2 -> 374.7 ms interleaved, the same rows; cold (fresh process,
+  caches evicted, x3) 800-856 -> 690-710 ms. New line items: the walk 65 ms (was 163); the two censuses
+  173 (the next target: the user census is now more than half the query); minute table 29; checklists +
+  tally map 13; tally sum + real-phrase sort + top 41.
+  tests/test_tripletop_checklists.py: a heavy-hitter user column, a sparse phrase column, a time-ordered
+  timestamp; LIMIT 1/3/10/25 -- the checklist walk served each, counts equal the old walk and DuckDB.
+  Suite 1811 passed; manifest 351 (tt_walk; bincount_par on int64 codes).
+- PROJECTED (Q18's pod ratios on run 4 + Q11): WaveDB 3.206 unchanged, ClickHouse (web) 3.221 -> 3.238;
+  the gap +0.014 -> +0.032. Q18 hot ~681 -> ~486 ms on the c6a (Umbra 721).
