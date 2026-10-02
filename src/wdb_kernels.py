@@ -2529,8 +2529,43 @@ def gd_pass1(uc, rc, SH, T):
     return ku, kr, offs
 
 
+_WIDE = [int(__import__('os').environ.get('WDB_WIDE_THREADS', '0') or 0)]
+
+
+def wide_threads():
+    """Every vCPU numba was started with (WDB_WIDE_THREADS=n pins it; 8 restores the engine's cap)."""
+    if not HAVE_NUMBA:
+        return 1
+    top = int(numba.config.NUMBA_NUM_THREADS)
+    return max(1, min(_WIDE[0] or top, top))
+
+
+def run_wide(fn, *args, pass_t=False):
+    """THE LATENCY-BOUND KERNELS ON EVERY vCPU (2026-10-02): wdb_agg caps numba at 8 threads at import --
+    right for the bandwidth-bound boards (measured on the c6a: 16 threads made Q15/Q16/Q33/Q34 10-20%
+    slower) -- but kernels that wait on memory latency (lookups in cache-resident tables, back-reference
+    walks) run faster on the hyperthreads, which hide that latency. This raises numba's thread count for
+    ONE call and restores it. `pass_t`: the kernel takes its lane count as its last argument."""
+    n = wide_threads()
+    if pass_t:
+        args = args + (np.int64(n),)
+    if not HAVE_NUMBA:
+        return fn(*args)
+    old = numba.get_num_threads()
+    if n == old:
+        return fn(*args)
+    numba.set_num_threads(n)
+    try:
+        return fn(*args)
+    finally:
+        numba.set_num_threads(old)
+
+
 def gd_pass2_count(ku, kr, offs, SH, VR):
-    return _gd_pass2_count_nb(ku, kr, offs, SH, VR, _nt())
+    """Pass 2 of the distinct-count scatter ON EVERY vCPU (run_wide): per-bucket marker lookups, latency-
+    bound -- Q8's inputs on the c6a 170 ms at 8 threads -> 97 ms at 16, the counts identical. (Pass 1,
+    the scatter, is the other way, 213 -> 240 ms: it stays at the engine's 8.)"""
+    return run_wide(_gd_pass2_count_nb, ku, kr, offs, SH, VR, pass_t=True)
 
 
 @njit(nogil=True, parallel=True, cache=True)

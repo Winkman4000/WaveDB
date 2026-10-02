@@ -3637,3 +3637,31 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
   without ORDER BY and differs run to run on the floor too). Projected on run 3 alone: combined ~3.245.
   Jackson's call: the operator declares the key (ClickHouse's own create.sql declares PRIMARY KEY
   (CounterID, EventDate, UserID, EventTime, WatchID)); not built yet.
+
+## 2026-10-02 -- THE ENGINE'S 8 THREADS, AND THE KERNELS THAT WANT 16 (measured on the c6a itself)
+- Run 4 (a5ca600, AWS c6a.4xlarge): combined 3.261 (3rd), cold 2.012 (1st), hot 2.550 (5th); load 550.0 s;
+  QPS 3.700. Q25 cold 322 -> 61, hot 231 -> 11 ms as measured on the pod. The 42 queries a5ca600 did not
+  touch ran 5.2% slower hot (geomean) and 2.2% cold than run 3's instance -- Q8 +18%, Q11 +26%, Q18 +19%;
+  same CPU (AMD EPYC 7R13), steal ~0: instance-to-instance variance. Run 3's times with run 4's Q25:
+  3.165 (2nd). ClickHouse (web) 3.221.
+- FOUND: wdb_agg sets numba's thread count to min(8, cpu_count) at import (f826e90, "bandwidth-bound,
+  so more threads don't help") -- every parallel kernel launched from the query thread runs on 8 of the
+  c6a's 16 vCPUs (8 cores x 2 hyperthreads). Measured on the idle c6a after run 4, all 43 hot,
+  interleaved, 8 vs 16 globally: mixed -- Q8 582 -> 505, Q9 690 -> 622, Q40 70 -> 52, Q41 48 -> 39;
+  but Q2 16 -> 29, Q15 284 -> 327, Q16 491 -> 579, Q33/Q34 329 -> 372 (the counting boards: twice the
+  boards, more traffic). The global cap stays.
+- PER KERNEL, on the c6a (Q8's inputs): gd_pass1, the scatter, 213 ms at 8 threads vs 240 at 16 -- it
+  stays at 8 (the pod, a slice of a 64-core host, said the opposite: 265 vs 179 -- the pod cannot judge
+  hyperthreads). gd_pass2 (per-bucket marker lookups) 170 -> 97 ms at 16, identical counts.
+- wdb_kernels.run_wide(fn, *args, pass_t): raises numba's thread count to every vCPU for ONE call and
+  restores it (also when the kernel raises; set_num_threads is per calling thread). Used by
+  gd_pass2_count and the enc-20 back-reference walks (_e20_window -> e20_decode_blocks, _e20_at ->
+  e20_gather). WDB_WIDE_THREADS=n pins it (8 = the old behavior).
+- MEASURED on the c6a, all 43 hot, interleaved, wide vs pinned at 8, answers equal: Q8 597 -> 535, Q9
+  710 -> 639, Q10 117 -> 109, Q40 61.6 -> 56.2, Q41 45.3 -> 40.6 ms; the rest within noise; hot sum
+  10.645 -> 10.420 s. Pod: suite 1808 passed; legal under WDB_QMEM_STRICT (Q8/Q9/Q10 added to the
+  check). tests/test_run_wide.py: the kernel sees every vCPU, the caller's count comes back (also after
+  a raise), pass 2's counts equal at widths 1/3/all and equal a plain distinct-pair count.
+- PROJECTED (the five queries' c6a ratios applied): on run 4's slow instance 3.261 -> 3.234-3.241 (3rd,
+  still ~0.015 behind ClickHouse (web)); on run 3's instance with Q25 3.165 -> 3.138-3.145 (2nd). With
+  the CounterID key as well (its pod ratios): the slow instance 3.183-3.184 (2nd).

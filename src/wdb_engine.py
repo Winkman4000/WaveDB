@@ -1492,9 +1492,10 @@ class Segment:
         BR = int(c['e20BR'])
         b0 = lo // BR; b1 = (hi - 1) // BR + 1
         out = np.empty(min(self.N, b1 * BR) - b0 * BR, dtype=self._e20_dtype(c))
-        _WK20.e20_decode_blocks(np.frombuffer(self.buf, np.uint8), np.int64(c['cstart']), np.int64(BR),
-                                np.int64(self.N), np.int64(c['e20bits']), c['e20boff'],
-                                np.int64(b0), np.int64(b1), out)
+        # back-reference walks: latency-bound, on every vCPU (run_wide; Q40/Q41 on the c6a ~5 ms each)
+        _WK20.run_wide(_WK20.e20_decode_blocks, np.frombuffer(self.buf, np.uint8), np.int64(c['cstart']),
+                       np.int64(BR), np.int64(self.N), np.int64(c['e20bits']), c['e20boff'],
+                       np.int64(b0), np.int64(b1), out)
         return out[lo - b0 * BR:hi - b0 * BR]
 
     def _e20_at(self, c, rows):
@@ -1514,8 +1515,9 @@ class Segment:
         starts = np.concatenate(([0], np.flatnonzero(blk[1:] != blk[:-1]) + 1, [rs.size])).astype(np.int64)
         blocks = blk[starts[:-1]].astype(np.int64)
         out = np.empty(rs.size, np.int64)
-        _WK20.e20_gather(np.frombuffer(self.buf, np.uint8), np.int64(c['cstart']), np.int64(BR),
-                         np.int64(self.N), np.int64(c['e20bits']), c['e20boff'], blocks, starts, rs, out)
+        _WK20.run_wide(_WK20.e20_gather, np.frombuffer(self.buf, np.uint8), np.int64(c['cstart']),
+                       np.int64(BR), np.int64(self.N), np.int64(c['e20bits']), c['e20boff'], blocks,
+                       starts, rs, out)
         if order is not None:
             res = np.empty_like(out); res[order] = out; out = res
         return out.astype(self._e20_dtype(c))
