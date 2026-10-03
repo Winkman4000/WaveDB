@@ -36,6 +36,27 @@ def test_inline_extreme_and_equality_kernels():
         assert np.array_equal(out, np.array([x in set(lits) for x in b])), lits
 
 
+def test_like_token_kernel_equals_regex():
+    import re, itertools
+    import wdb_kernels as K, wdb_sql
+    rng = np.random.default_rng(84)
+    strs = [''.join(rng.choice(list('ab'), int(rng.integers(0, 7)))) for _ in range(400)] + ['', 'a', 'b', 'ab', 'ba', 'aab']
+    blob, off, b = _stream(strs)
+    rows = np.unique(rng.integers(0, len(b), 120)).astype(np.int64)
+    pats = [''.join(p) for L in range(0, 6) for p in itertools.product('ab%', repeat=L)]
+    for pat in pats:
+        tb, to, a0, a1 = wdb_sql._like_tok_parts(pat)
+        rx = re.compile('^' + ''.join('.*' if ch == '%' else re.escape(ch) for ch in pat) + '$', re.S)
+        ref = np.array([rx.match(s.decode()) is not None for s in b])
+        out = np.empty(len(b), np.bool_)
+        K.plike_tok(blob, off, tb, to, a0, a1, out)
+        assert np.array_equal(out, ref), (pat, [s for s, o, r in zip(b, out, ref) if o != r][:5])
+        out2 = np.empty(rows.size, np.bool_)
+        K.plike_tok_rows(blob, off, rows, tb, to, a0, a1, out2)
+        assert np.array_equal(out2, ref[rows]), pat
+    assert wdb_sql._like_tok_parts('a_b') is None and wdb_sql._like_tok_parts('a\\%') is None
+
+
 def test_cut_gather_and_unpack():
     import wdb_semijoin as S, wdb_engine
     rng = np.random.default_rng(82)
@@ -118,6 +139,12 @@ def test_semijoin_through_sql_equals_duck():
             "SELECT MIN(t.title), MIN(r.role) FROM t, c, r WHERE t.id = c.movie_id AND c.role_id = r.id AND r.role = 'r3' AND t.yr > 2015",
             "SELECT MIN(t.title) FROM t, c WHERE t.id = c.movie_id AND c.note NOT LIKE '%alpha%' AND t.title LIKE '%Shrek%Queen%'",
             "SELECT MAX(t.title) FROM t, c WHERE t.id = c.movie_id AND t.title = ''",
+            # deferred (no kernel says '_' or ILIKE): asked of the survivors, few and many
+            "SELECT MIN(t.title), MAX(c.note) FROM t, c WHERE t.id = c.movie_id AND t.title LIKE 'S_rek%' AND t.yr = 1990",
+            "SELECT MIN(t.title), MIN(c.note) FROM t, c WHERE t.id = c.movie_id AND t.title ILIKE '%shrek%' AND c.note LIKE 'n00%'",
+            "SELECT MIN(c.note), COUNT(*) FROM t, c WHERE t.id = c.movie_id AND (c.note LIKE 'n0001%' OR t.yr = 1999) AND t.title NOT LIKE 'Queen _eta%'",
+            "SELECT MIN(t.title), MAX(t.title) FROM t, c, r WHERE t.id = c.movie_id AND c.role_id = r.id AND r.role = 'r1' AND t.title LIKE '%a_p%'",
+            "SELECT MIN(t.title) FROM t, c WHERE t.id = c.movie_id AND t.title LIKE 'Shrek%' AND c.note LIKE '%Shrek%gamma%'",
         ]
         with _env(**floor):
             db = Database.open(db_dir)

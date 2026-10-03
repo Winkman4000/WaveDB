@@ -3801,3 +3801,34 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
   decode mostly the threads' fixed start: the fit read -0.19 to 1.44 on the shared pod), and values() is
   measured at 4-16M, past the last-level cache (its dictionary gather is a random walk; 1-4M straddled the
   cliff, 8/15/53 ms; the old path had it too, exponent 1.21). Now 1.00-1.04 on both, run after run.
+
+## 2026-10-03 (later) -- THE COSTLY CONDITION WAITS (PEMDAS across the join) + LIKE on the stored stream
+- Jackson, on JOB 7a's line items: "the most time is for name LIKE 'B%' when we have production year between
+  1980 and 1995 to take out a ton for 138 ms and the other 138 ms that can both prune before we have to do the
+  expensive name LIKE ... this is the potency PEMDAS rule of operations all over again." 7a hot 693 ms, of which
+  n.name LIKE 'B%' over 4.1M inline names was 507 ms (cold 2.5 s of 3.2 s) -- for 12 people left by the join
+  (pi.note = 'Volker Boehm' alone leaves 64 notes / 55 people in 9 ms).
+- The Sept 14 law (isolation first, per table) holds for cheap filters; a costly per-row condition is the
+  exception the two-term cost model (Aug 31) and the filter-before-the-read (Sept 23) already named: it waits.
+  wdb_semijoin: _is_dear splits each table's conjuncts; isolation runs the cheap ones; after the key-space settles,
+  _deferred_mask asks the costly ones of the survivors only (<= 65,536 rows: at those rows -- the inline token
+  kernel, or the text of those rows; more: the whole column, then the survivors); a shrink re-settles the space
+  (uncached: a provenance without the deferred cut would name a larger keep). WDB_DEFER=0 turns it off.
+- THE COST IS WHAT IT COSTS HERE (the first A/B on true cold/hot, 36 moved queries: cold x0.78 but hot x1.03 --
+  deferring '%Downey%'-style patterns that a kernel already answers in ms lost their early cut and their overlap):
+  a LIKE over an inline column is cheap when the token kernel can say it. plike_tok / plike_tok_rows: any LIKE
+  without '_' -- literal pieces split by '%', the first a prefix when anchored, the last a suffix, the rest
+  leftmost in order (exact for '%') -- one compiled pass over the stored bytes, all rows or the survivors; it
+  replaces the S-array + Python search in _like_mode5 ('B%': 507 ms hot / 2.5 s cold -> ms). Costly now means:
+  ILIKE / '_' on an inline column, or LIKE over a text dictionary of 100K+ values (movie_info.info 2.7M,
+  cast_info.note 716K, movie_info.note 134K, movie_info_idx.info 146K).
+- MEASURED (pod, true cold/hot, 36 queries the one-process board moved, kernel in both arms): deferral on vs off
+  cold 58.5 -> 39.2 s (x0.79), hot 8.8 -> 7.7 s (x0.92); 23a 3557 -> 643 / 549 -> 135 ms; 15a, 15b, 24a/b, 29a-c
+  alike. The kernel alone: 7a 3472 -> 844 cold, 654 -> 240 hot; 17a 2907 -> 646 / 484 -> 116.
+  Still losing to deferral: 10c (404 -> 851 hot), 15d, 15c -- a dictionary LIKE whose table the cheap filters
+  barely cut (ci.note LIKE '%(producer)%', cast_info's only filter): the check only moves later, out of overlap.
+- THE BOARD (all 113 correct): cold 4.91 (168.7 s) -> 3.75 (114.6 s); hot 2.80 (26.9 s) -> 2.53 (23.1 s).
+  ClickHouse 3.64 (101.4 s) / 2.76 (25.5 s); DuckDB 1.00 / 1.03. WaveDB beats ClickHouse on 65 cold, 71 hot.
+- tests/test_job_floor.py: the token kernel against a regex over every pattern of 'a', 'b', '%' up to length 5
+  (all rows and at rows); deferred queries ('_', ILIKE, NOT LIKE with '_', few and many survivors) equal DuckDB.
+  Manifest 404.

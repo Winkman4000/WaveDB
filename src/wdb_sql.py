@@ -466,15 +466,28 @@ def _mode5_null(seg, pc):
     return got[1] if got is not None else np.zeros(int(seg.N), bool)
 
 
+def _like_tok_parts(pat):
+    """a LIKE pattern without '_' (and no escapes) as the token kernel's arguments: the literal pieces between
+    '%' (bytes + offsets) and whether the first / last piece is anchored; None when the kernel cannot say it"""
+    if '_' in pat or '\\' in pat: return None
+    enc = [t.encode() for t in pat.split('%') if t != '']
+    to = np.zeros(len(enc) + 1, np.int64); np.cumsum([len(x) for x in enc], out=to[1:])
+    tb = np.frombuffer(b''.join(enc) or b'\x00', dtype=np.uint8)
+    return tb, to, pat[:1] != '%', pat[-1:] != '%'
+
+
 def _like_mode5(seg, pc, pat, icase):
-    if (not icase and '_' not in pat and '\\' not in pat and len(pat) >= 3 and pat[0] == '%' and pat[-1] == '%'
-            and seg.cols.get(pc, {}).get('mode') == 5 and seg._overrides(pc) is None):
-        toks = [t for t in pat.split('%') if t != '']
-        if 1 <= len(toks) <= 2:
-            # THE NEEDLES ON THE STORED STREAM (2026-10-03): '%a%' / '%a%b%' over an inline column is the
-            # ordered-needle kernel on the column's own bytes and offsets -- the S-array this replaces made a
-            # Python object per row first (n.name, 4.1M rows: most of JOB 6a's cold run)
-            return seg.like_mask(pc, toks)
+    parts = None if icase else _like_tok_parts(pat)
+    if parts is not None and seg.cols.get(pc, {}).get('mode') == 5 and seg._overrides(pc) is None:
+        # THE PATTERN ON THE STORED STREAM (2026-10-03): any LIKE without '_' over an inline column -- 'B%',
+        # 'USA:% 199%', '%a%b%c%' -- is one compiled pass on the column's own bytes and offsets; the S-array this
+        # replaces made a Python object per row first, then searched in Python (n.name LIKE 'B%': 0.5 s hot,
+        # 2.5 s cold over 4.1M names)
+        import wdb_kernels as _WKt
+        blob, off = seg.inline_stream(pc)
+        out = np.empty(int(seg.N), np.bool_)
+        _WKt.plike_tok(blob, np.ascontiguousarray(off, dtype=np.int64), parts[0], parts[1], parts[2], parts[3], out)
+        return out
     got = _mode5_sarray(seg, pc)
     if got is None: return None
     _arr, isn, b, obj, buf, starts = got

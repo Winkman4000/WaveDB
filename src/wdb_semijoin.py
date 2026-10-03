@@ -112,6 +112,8 @@ def _keyset_kernel(col, idx, mx):
 
 
 _NOIDX = np.zeros(0, np.int64)
+_CUT_PAR_MIN = 262_144          # rows a cut must walk before the cores are woken: a parallel launch costs ~10-20 ms
+                                # on a shared host, and the settling rounds cut tables of 5 rows (JOB 7a: 10 x ~23 ms)
 
 
 @njit(nogil=True, parallel=True, cache=True)
@@ -241,6 +243,18 @@ def execute(db, tree, sql=None):
         except _FastUnsupported:
             raise _Decline('multi-segment table %s' % t)
         segs[a] = seg
+    # THE COSTLY CONDITION WAITS (Jackson's PEMDAS, 2026-10-03: "production year takes out a ton for 138 ms ...
+    # both prune before we have to do the expensive name LIKE"): a condition that reads a wide text column row by
+    # row is kept out of isolation; the cheap ones and the join narrow first, then it is asked of the survivors
+    # only (JOB 7a: n.name LIKE 'B%' over 4.1M names, 507 ms hot / 2.5 s cold, for 12 people left standing)
+    dear = {a: [] for a in alias2t}
+    if os.environ.get('WDB_DEFER', '1') != '0':
+        cheap = {}
+        for a in alias2t:
+            cheap[a] = []
+            for c2 in local[a]:
+                (dear[a] if _is_dear(segs[a], c2, pms[a]) else cheap[a]).append(c2)
+        local = cheap
     def _local_keep(a):
         """PHASE 1, ISOLATION: one table's own filters, by itself (runs in the pool)"""
         seg = segs[a]; m = None
@@ -553,6 +567,24 @@ def execute(db, tree, sql=None):
         _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inverted, rows_for_keys, pack, _bill, _tk, futs=futs, pool=_pool9, keycache=keycache, local=local)
         _t0 = _tk()
         _pool9.shutdown(wait=False)
+        if any(dear.values()):
+            # THE SURVIVORS ANSWER THE COSTLY CONDITIONS: each asked only of its table's live rows; a shrink is one
+            # more cut, so the space settles again (uncached: a provenance that leaves out the deferred cut would
+            # name a larger keep)
+            shrank = False
+            for a in alias2t:
+                if not dear[a] or counts[a] == 0: continue
+                idx = np.flatnonzero(keeps[a])
+                m = _deferred_mask(segs[a], dear[a], idx, pms[a])
+                n9 = int(np.count_nonzero(m))
+                if _bill is not None: _bill.append(('deferred %s: %d -> %d' % (a, idx.size, n9), _tk() - _t0)); _t0 = _tk()
+                if n9 != idx.size:
+                    nk = np.zeros_like(keeps[a]); nk[idx[m]] = True
+                    keeps[a] = nk; counts[a] = n9; shrank = True
+            if shrank and not any(c == 0 for c in counts.values()):
+                _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inverted, rows_for_keys, pack, _bill, _tk,
+                                   futs=None, pool=None, keycache=keycache, local=None, cached=False)
+                _t0 = _tk()
     else:
       for _round in range(12):
         changed = False
@@ -629,6 +661,99 @@ def execute(db, tree, sql=None):
     return [tuple(out)], names
 
 
+_DEAR_DICT_V = 100_000          # a text dictionary this wide is read value by value: a LIKE over it is costly
+_DEFER_ROWS = 65_536            # survivors up to this many are asked one by one; more, the whole column answers
+
+
+def _is_dear(seg, node, pm):
+    """A condition that pays per row of a wide text column: LIKE / ILIKE over an inline column, or over a text
+    dictionary of _DEAR_DICT_V+ values -- the kind that should wait for the cheap ones and the join."""
+    import wdb_sql
+    for lk in node.find_all(E.Like, E.ILike):
+        col = lk.this
+        if not isinstance(col, E.Column): continue
+        pc = pm.get(col.name, col.name); cd = seg.cols.get(pc, {})
+        if cd.get('dt') != 1: continue
+        if cd.get('mode') == 5:
+            # THE COST IS WHAT IT COSTS HERE: a pattern the token kernel says over the stored stream is a few
+            # ms for millions of rows -- cheap, it stays in isolation (deferring it lost its early cut and its
+            # overlap: JOB 17a-f, 6d, 13b/c ~90 -> ~240 ms hot); only what falls back to Python objects waits
+            pat = lk.expression
+            if (isinstance(lk, E.Like) and isinstance(pat, E.Literal) and pat.is_string and lk.args.get('escape') is None
+                    and wdb_sql._like_tok_parts(pat.this) is not None and seg._overrides(pc) is None):
+                continue
+            return True
+        if int(cd.get('V', 0)) >= _DEAR_DICT_V:
+            return True
+    return False
+
+
+def _like_rx(pat, icase):
+    import re
+    out = []
+    for ch in pat:
+        out.append('.*' if ch == '%' else '.' if ch == '_' else re.escape(ch))
+    return re.compile('^' + ''.join(out) + '$', re.S | (re.I if icase else 0))
+
+
+def _deferred_mask(seg, conds, idx, pm):
+    """bool per row of idx: every deferred condition true there. Few survivors: each condition evaluated AT
+    those rows (text read for those rows only; a cheap part answered by its column and gathered). Many: the
+    whole-column evaluation, then the survivors -- never worse than evaluating it in isolation."""
+    import wdb_sql
+    resolve = lambda nm: pm.get(nm, nm)
+    m = np.ones(idx.size, bool)
+    if idx.size > _DEFER_ROWS:
+        for c in conds:
+            m &= np.asarray(wdb_sql._eval_pred(seg, c, resolve), dtype=bool)[idx]
+        return m
+    for c in conds:
+        live = idx[m]
+        if live.size == 0: break
+        m[m] = _at_rows(seg, c, live, resolve)
+    return m
+
+
+def _at_rows(seg, node, idx, resolve):
+    """a WHERE condition at the given rows (NULL counts as false: exact for AND / OR inside a WHERE; a NOT is
+    answered whole by the column evaluator, which keeps SQL's three values)"""
+    import wdb_sql
+    if isinstance(node, E.Paren):
+        return _at_rows(seg, node.this, idx, resolve)
+    if isinstance(node, E.And):
+        a = _at_rows(seg, node.this, idx, resolve)
+        if not a.any(): return a
+        out = a.copy(); out[a] = _at_rows(seg, node.expression, idx[a], resolve); return out
+    if isinstance(node, E.Or):
+        a = _at_rows(seg, node.this, idx, resolve)
+        if a.all(): return a
+        out = a.copy(); out[~a] = _at_rows(seg, node.expression, idx[~a], resolve); return out
+    lk, neg = node, False
+    if isinstance(lk, E.Not) and isinstance(lk.this, (E.Like, E.ILike)):
+        lk, neg = lk.this, True
+    if (isinstance(lk, (E.Like, E.ILike)) and isinstance(lk.this, E.Column) and isinstance(lk.expression, E.Literal)
+            and lk.expression.is_string and lk.args.get('escape') is None and '\\' not in lk.expression.this):
+        pc = resolve(lk.this.name)
+        neg = neg ^ bool(lk.args.get('negate'))
+        parts = wdb_sql._like_tok_parts(lk.expression.this) if isinstance(lk, E.Like) else None
+        if parts is not None and seg.cols.get(pc, {}).get('mode') == 5 and seg._overrides(pc) is None:
+            import wdb_kernels as _WKr                       # the survivors' text in place (an inline column has no NULL)
+            blob, off = seg.inline_stream(pc)
+            out = np.empty(idx.size, np.bool_)
+            _WKr.plike_tok_rows(blob, np.ascontiguousarray(off, dtype=np.int64), np.ascontiguousarray(idx, dtype=np.int64),
+                                parts[0], parts[1], parts[2], parts[3], out)
+            return ~out if neg else out
+        if seg.cols.get(pc, {}).get('dt') == 1 and seg._overrides(pc) is None:
+            rx = _like_rx(lk.expression.this, isinstance(lk, E.ILike))
+            out = np.zeros(idx.size, bool)
+            for i, v in enumerate(seg.values_at_rows(pc, idx)):
+                if v is None: continue                                   # NULL [NOT] LIKE x: not true
+                if isinstance(v, (bytes, bytearray)): v = bytes(v).decode('utf-8', 'surrogateescape')
+                out[i] = (rx.match(v) is None) if neg else (rx.match(v) is not None)
+            return out
+    return np.asarray(wdb_sql._eval_pred(seg, node, resolve), dtype=bool)[idx]
+
+
 def _string_rank(seg, pc):
     """each row's rank in the column's sorted order (NULL -> -1), int32, born once as a sidecar
     (<seg>.<col>.srank.npy) and shelved; a sort of 4.2M names is ~5s, once"""
@@ -686,7 +811,7 @@ def _codes_shelved(seg, pc):
     return c
 
 
-def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inverted, rows_for_keys, pack, _bill, _tk, futs=None, pool=None, keycache=None, local=None):
+def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inverted, rows_for_keys, pack, _bill, _tk, futs=None, pool=None, keycache=None, local=None, cached=True):
     """THE KEY-SPACE FIXPOINT (Jackson's two phases, 2026-09-14). Phase 1 -- isolation -- is done
     by the caller: every table has applied its own filters. Phase 2 -- the conjoined space:
     the join columns collapse into SHARED VALUE SPACES (one per equivalence class of equal
@@ -720,7 +845,7 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
     full = {a: counts[a] == n_of[a] for a in alias2t}
     kcache = {}
     import hashlib
-    prov = {a: frozenset() for a in alias2t}     # THE PROVENANCE OF A KEEP: local predicates + applied (col, S) cuts -- order-free
+    prov = {a: (frozenset() if cached else None) for a in alias2t}     # THE PROVENANCE OF A KEEP: local predicates + applied (col, S) cuts -- order-free; None: uncached
     def _sprov(r):
         """the symbolic identity of a space's live set: (segment, column, keep-provenance) of every
         member that restricts it, as a frozenset -- or None when any member's provenance already
@@ -923,7 +1048,7 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
                     _mk9 = (segs[a].path, c); mxk = kmax.get(_mk9)
                     if mxk is None: mxk = kmax[_mk9] = int(_kc9.max()) if _kc9.size else 0
                     mx = int(max(int(S[-1]) if S.size else 0, mxk))
-                    if mx < 200_000_000:
+                    if mx < 200_000_000 and (n if isfull else idx.size) >= _CUT_PAR_MIN:
                         # THE CUT IN ONE PASS (2026-10-03): the live set as a bitmap, then every core walks its
                         # stretch of the decoded keys (or of the live rows) and writes the rows that hit --
                         # the numpy road was an int64 copy, a where, a gather and a flatnonzero, one thread each

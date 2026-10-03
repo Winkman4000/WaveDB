@@ -3996,6 +3996,60 @@ def pgather_ptr(p, cc, out):
         out[i] = p[np.int64(cc[i])]
 
 
+@njit(cache=True, nogil=True)
+def _like_tok_row(blob, a, b, tb, to, astart, aend):
+    """SQL LIKE without '_' on one row's bytes [a, b): the pattern is literal pieces tb[to[k]:to[k+1]] split by
+    '%'; the first is a prefix when astart, the last a suffix when aend, the rest found leftmost in order
+    (greedy leftmost is exact for '%' -- each piece taken as early as possible leaves the most room after it)"""
+    K = to.shape[0] - 1
+    if K == 0:
+        return (b - a == 0) if (astart and aend) else True
+    lo = a; hi = b; k0 = 0; k1 = K
+    if astart:
+        L = to[1] - to[0]
+        if hi - lo < L: return False
+        for j in range(L):
+            if blob[lo + j] != tb[to[0] + j]: return False
+        lo += L; k0 = 1
+        if K == 1 and aend: return lo == hi
+    if aend and k1 > k0:
+        L = to[K] - to[K - 1]
+        if hi - lo < L: return False
+        s = hi - L
+        for j in range(L):
+            if blob[s + j] != tb[to[K - 1] + j]: return False
+        hi = s; k1 = K - 1
+    for k in range(k0, k1):
+        L = to[k + 1] - to[k]; s0 = to[k]
+        p = lo; found = -1
+        while p + L <= hi:
+            j = 0
+            while j < L and blob[p + j] == tb[s0 + j]:
+                j += 1
+            if j == L:
+                found = p; break
+            p += 1
+        if found < 0: return False
+        lo = found + L
+    return True
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def plike_tok(blob, off, tb, to, astart, aend, out):
+    """LIKE without '_' over every row of a mode-5 inline stream (any number of '%'-separated pieces, anchored
+    or not): 'B%', 'USA:% 199%', '%a%b%c%' -- one compiled pass, no Python object per row"""
+    for r in prange(off.shape[0] - 1):
+        out[r] = _like_tok_row(blob, off[r], off[r + 1], tb, to, astart, aend)
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def plike_tok_rows(blob, off, rows, tb, to, astart, aend, out):
+    """plike_tok at the given rows only (out[i] for rows[i]) -- the survivors' text, read in place"""
+    for i in prange(rows.shape[0]):
+        r = rows[i]
+        out[i] = _like_tok_row(blob, off[r], off[r + 1], tb, to, astart, aend)
+
+
 @njit(cache=True, parallel=True, nogil=True)
 def pinline_eq_any(blob, off, lb, lo, out):
     """= / IN over a mode-5 inline stream: out[r] = row r's bytes equal one of the literals (literal k is
