@@ -26,6 +26,7 @@ NUM_THRESHOLD = 50000   # delta-code numeric dictionaries above this cardinality
 R = 128
 ZSTD_LEVEL = 9
 BLOCK_ROWS = int(os.environ.get('WDB_BLOCK_ROWS', 524288))   # rows per enc=3 frame
+COARSE_ROWS = int(os.environ.get('WDB_COARSE_ROWS', 1 << 22))  # enc=3's coarse tier: big columns only (see _codes_section)
 # code-stream compression level. Measured on 10.7M-row ClickBench columns: level 19 -> 9 is
 # 7-13x faster (URL 14.5s -> 1.9s, SearchPhrase 18.1s -> 1.4s) for 6-8% more bytes (EventTime
 # 22%). Ingest speed wins by default; WDB_CODE_ZSTD=19 for archival encodes.
@@ -936,9 +937,14 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
         a = np.asarray(codes, dtype=wdt)
         cxb = zstd.ZstdCompressor(level=CODE_ZSTD_LEVEL)
         blocked = None
-        for BR9 in ((65536, BLOCK_ROWS) if (BLOCK_ROWS > 65536
-                    and codes.size and int(np.max(codes)) > 1)
-                    else (BLOCK_ROWS,)):
+        # THE COARSE TIER (2026-10-03): a big column whose clustering only one long frame keeps (cast_info.movie_id,
+        # 36M rows: one frame 90.3 MB, 216 ms to inflate on one core every query) gets 4M-row frames too --
+        # measured 92.0 MB (+2%) inflating on 9 lanes in 47 ms, where 512K-row frames cost +13% and lost the seal
+        tiers9 = ((65536, BLOCK_ROWS) if (BLOCK_ROWS > 65536 and codes.size and int(np.max(codes)) > 1)
+                  else (BLOCK_ROWS,))
+        if a.nbytes >= (64 << 20) and a.size >= 2 * COARSE_ROWS and COARSE_ROWS > BLOCK_ROWS:
+            tiers9 = tiers9 + (COARSE_ROWS,)
+        for BR9 in tiers9:
             frames = _zframes(CODE_ZSTD_LEVEL, (a.size + BR9 - 1) // BR9,
                               lambda k, BR9=BR9: a[k * BR9:(k + 1) * BR9].tobytes())
             offs = np.zeros(len(frames) + 1, dtype=np.uint32)

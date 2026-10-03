@@ -3997,6 +3997,28 @@ def pgather_ptr(p, cc, out):
 
 
 @njit(cache=True, parallel=True, nogil=True)
+def pinline_eq_any(blob, off, lb, lo, out):
+    """= / IN over a mode-5 inline stream: out[r] = row r's bytes equal one of the literals (literal k is
+    lb[lo[k]:lo[k+1]]). Lengths first, bytes only on a length match -- no Python object per row."""
+    R = off.shape[0] - 1
+    K = lo.shape[0] - 1
+    for r in prange(R):
+        a = off[r]; L = off[r + 1] - a
+        hit = False
+        for k in range(K):
+            s = lo[k]
+            if lo[k + 1] - s != L:
+                continue
+            j = 0
+            while j < L and blob[a + j] == lb[s + j]:
+                j += 1
+            if j == L:
+                hit = True
+                break
+        out[r] = hit
+
+
+@njit(cache=True, parallel=True, nogil=True)
 def plike2(blob, off, n1, n2, out):
     """Ordered two-needle LIKE over a mode-5 inline stream: out[r] = row r's
     bytes contain n1 and then n2 after it (n2 empty => single needle). The

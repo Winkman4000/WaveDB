@@ -103,14 +103,23 @@ SHELF = Shelf()
 
 # What may outlive a query (wdb_qmem, Jackson's law): a decoded DICTIONARY is V-scale vocabulary of
 # the source data -- a buffer-pool of the file's own values, cleared before every cold run anyway.
-# Everything a query COMPUTED (roads, keys, ranks, orders, predicates, settled rows, block stats,
-# inline N-scale text) dies with the query that computed it.
+# Everything a query COMPUTED (roads, key sets, ranks, orders, predicates, settled rows, block stats)
+# dies with the query that computed it.
 VOCABULARY = frozenset({'dictionary', 'joined-text', 'dictionary-sarray', 'inline-text'})
+
+
+# THE DECODED COLUMN IS SOURCE DATA (Jackson, 2026-10-03: "the whole premise of hot is to keep the data ready
+# in cache"): a join key column decoded to its values ('keys', vals[codes] -- no filter, no grouping) and a
+# column's decoded codes ('codes') are the file's own values, a buffer pool; they stay for the hot runs and
+# never touch a cold run. Measured on JOB (every 5th query): hot x0.54, cold unchanged. WDB_TIER1_KEYS=0: off.
+_KEYS_TIER1 = frozenset({'keys', 'codes'})
 
 
 def vocabulary():
     """TIER 1 on the shelf (decoded source data); empty under WDB_HOT_KEEP=0, the pure-cold A/B."""
-    return frozenset() if os.environ.get('WDB_HOT_KEEP', '1') == '0' else VOCABULARY
+    if os.environ.get('WDB_HOT_KEEP', '1') == '0':
+        return frozenset()
+    return VOCABULARY if os.environ.get('WDB_TIER1_KEYS') == '0' else (VOCABULARY | _KEYS_TIER1)
 
 
 def nbytes_of(obj):

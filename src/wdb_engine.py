@@ -976,6 +976,16 @@ class Segment:
                 return _WK.unpack24_be(np.ascontiguousarray(raw), n)
             if w == 4:
                 return np.frombuffer(raw, dtype='>u4').astype(np.uint32)
+        if bits <= 25 and n >= 65536:
+            # THE PARALLEL UNPACK (2026-10-03): the same MSB-first windows, one compiled pass on every core --
+            # cast_info.movie_id (36M x 22 bits) spent 300-370 ms here per query, single-threaded
+            import wdb_kernels as _WKu
+            b0 = (lo * bits) >> 3; b1 = ((hi * bits) >> 3) + 8
+            raw = self.buf[base + b0: base + b1]
+            if len(raw) < b1 - b0:                   # the last window reads past the section: zero tail
+                raw = np.concatenate([np.asarray(raw), np.zeros((b1 - b0) - len(raw), np.uint8)])
+            u = _WKu.unpack_any_off(raw, np.int64(n), np.int64(bits), np.int64((lo * bits) & 7))
+            return u if _od is np.uint32 else u.astype(_od)
         mask = np.uint64((1 << bits) - 1); CH = 4_000_000
         for c0 in range(lo, hi, CH):
             c1 = min(c0 + CH, hi)
@@ -2193,7 +2203,14 @@ class Segment:
         if c['mode'] == 4: return list(self._seq_decode(c))  # decoded values (override path only)
         if c['mode'] == 5: self._raw_codes(nm); return list(c['_idict'])  # factorized (override path)
         if c['mode'] == 2: return self._dict_ints(c)  # int64 array (dt 0/3)
-        if c['dt'] == 0: return [int(v) for v in c['vals']]
+        if c['dt'] == 0:
+            # THE DIGITS IN ONE PASS (2026-10-03): an integer dictionary in mode 0/1 is digit text; numpy's
+            # byte-string cast parses it in C -- int() per value cost 216 ms on cast_info.person_role_id (3.1M
+            # values) every query. An int64 array, the same form mode 2 already returns
+            try:
+                return np.asarray(c['vals']).astype(np.int64)
+            except (ValueError, TypeError):
+                return [int(v) for v in c['vals']]
         if c['dt'] == 2: return np.frombuffer(b''.join(c['vals']), dtype='<f8')   # vectorized + memoized
         if c['dt'] == 3: return [struct.unpack('<q', v)[0] for v in c['vals']]   # int64 epoch
         if c.get('aux') == 9 and c['dt'] == 1:               # THE BOOL MARKER: decode to Python bools at the source

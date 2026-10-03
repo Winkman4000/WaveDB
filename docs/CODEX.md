@@ -3748,3 +3748,56 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
   LIMIT 1/10/50 equal DuckDB. Suite 1813 passed; manifest 353.
 - PROJECTED (run 4 + Q11, pod ratios for Q15/Q16/Q35/Q18): WaveDB 3.206 -> 3.142 (2nd; hot 2.405, 3rd),
   ClickHouse (web) 3.221 -> 3.248, the gap +0.014 -> +0.106; with run_wide's c6a ratios 3.122 / +0.126.
+
+## 2026-10-03 -- THE JOB FLOOR (the semi-join organ with sidecars off; JOB on ClickBench's protocol)
+- Jackson: get the JOB board down in the form we submit -- sidecars off, ClickBench's cold/hot rules, no
+  pre-aggregation. The board is now bench/true_cold.py over bench/referee/job_queries.sql on a fresh sidecar-off
+  realm (a fresh process per query, files and kernels evicted; cold = first run, hot = better of the next two),
+  scored by bench/board_vs.py against DuckDB 1.5.3 and ClickHouse 26.10 measured the same way (/workspace/ch/
+  jobref.py: DuckDB a fresh process on imdb.duckdb, evicted; ClickHouse server stopped, data evicted, started).
+- WHY IT WAS 1004 s: the organ was built around sidecars. With the switch off it rebuilt them every query -- a
+  string rank (an object argsort of title/name + a 0.7 s Python decode) for one MIN, and reverse roads (a
+  stable argsort of 36M cast_info keys) for one cut. Both now obey the vanilla law (wdb_sidecar.may_build):
+  use what exists on disk, never build to answer; the callers read only the rows they need.
+- New per-query roads, nothing kept:
+  - _inline_extreme: MIN/MAX of an inline (mode-5) column over the surviving rows, byte compares on the stored
+    stream (memcmp order), one point read for the winner.
+  - _like_mode5: '%a%' / '%a%b%' straight to Segment.like_mask (plike2) on the stored stream; = / <> / IN on an
+    inline column by pinline_eq_any (lengths, then bytes). Both only without overrides; _mode5_null answers
+    from has_null without decoding. (The S-array made a Python object per row: n.name 4.1M, title 2.5M.)
+  - _bitunpack: widths <= 25 through unpack_any_off on every core (title.id 43 -> 2 ms).
+  - keys(): the dictionary gather on every core straight to int32 (_gather_i32); a nullable integer dictionary
+    (cast_info.person_role_id, 3.1M values, mode 0) taken directly instead of _col's Python lists; _typed_dict
+    parses a mode-0/1 integer dictionary's digit text in one numpy cast (216 ms -> ms).
+  - restrict(): the cut of a decoded key column by a live set in one parallel pass (_cut_rows).
+- THE ENCODER'S COARSE TIER: enc 3 also tries 4M-row frames for columns whose codes are >= 64 MB. cast_info
+  .movie_id (clustered): one frame 90.3 MB, 216 ms to inflate on one core; 512K frames +13% (lost the 10% seal);
+  4M frames 92.0 MB (+2%), 47 ms on 9 lanes -> elected. Realm 829 -> 830 MB. ClickBench's enc-1 columns compress
+  to almost nothing and are untouched (the rule is the same 10% seal).
+- TIER 1 GROWS (Jackson: "the whole premise of hot is to keep the data ready in cache"): a decoded join key
+  column ('keys') and decoded codes ('codes') are source data and stay for the hot runs; WDB_TIER1_KEYS=0 turns
+  it off. Measured on every 5th query: hot x0.54, cold unchanged. Only the semi-join shelves these kinds.
+- Bug found by the new test (present at 065eb9b): wdb_join._aggregate computed SUM/AVG/MIN/MAX/COUNT for every
+  aggregate, so MIN(string), COUNT(*) over a join died in mean(); now only the asked aggregate.
+- MEASURED (pod, true cold/hot, all 113 correct every run; score = geomean (t+10ms)/(best+10ms)):
+  | | cold score (sum) | hot score (sum) |
+  |---|---|---|
+  | WaveDB before (sidecars off, 065eb9b) | ~1004 s single first runs | |
+  | + the vanilla law in the organ | 7.83 (288.7 s) | 9.20 (96.6 s) |
+  | + parallel decode/gather, LIKE on the stream, coarse frames | 5.96 (203.7 s) | 6.88 (67.0 s) |
+  | + inline =/IN, nullable integer keys, the one-pass cut | 4.88 (168.6 s) | 4.77 (44.6 s) |
+  | + tier-1 keys/codes | 4.91 (168.7 s) | 2.80 (26.9 s) |
+  | ClickHouse 26.10 (untuned MergeTree) | 3.64 (101.4 s) | 2.76 (25.5 s) |
+  | DuckDB 1.5.3 | 1.00 (31.0 s) | 1.03 (9.3 s) |
+  WaveDB beats ClickHouse on 40 queries cold and 60 hot; DuckDB on 3 / 8.
+- Where the rest is: cold is reading + inflating text (title/name inline streams, front-coded dictionaries for
+  the LIKE/IN filters) and the per-query decode of the key columns; hot is the fixpoint cutting the same big
+  tables many times per query (15a: 22 rounds) on a shared pod whose 16 threads give ~2x, not 16x.
+- tests/test_job_floor.py: the kernels against references (extreme row, = / IN, the cut over all and live rows
+  with NULL keys, the int32 gather, the unpack at widths 1..25 with a ragged tail); through SQL, MIN/MAX of inline
+  strings, = / <> / IN / LIKE / NOT LIKE on inline columns and a nullable integer join key equal DuckDB, nothing
+  born on disk, WDB_QMEM_STRICT on. Manifest 401.
+- tests/test_perf.py: the complexity-class tests now run on one numba thread (the parallel unpack made a 1-4M
+  decode mostly the threads' fixed start: the fit read -0.19 to 1.44 on the shared pod), and values() is
+  measured at 4-16M, past the last-level cache (its dictionary gather is a random walk; 1-4M straddled the
+  cliff, 8/15/53 ms; the old path had it too, exponent 1.21). Now 1.00-1.04 on both, run after run.

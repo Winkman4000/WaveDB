@@ -2941,8 +2941,12 @@ def _aggregate(merged, proj, group, R):
     for i, s in enumerate(specs):
         if s[0] == 'agg':
             col = merged[s[2]]
-            sc9[s[3] if len(s) > 3 else f"_a{i}"] = {'SUM': col.sum(), 'AVG': col.mean(),
-                'MIN': col.min(), 'MAX': col.max(), 'COUNT': col.count()}[s[1]]
+            # ONLY THE ASKED AGGREGATE (2026-10-03): the dict literal computed all five, so MIN over a string
+            # column died in mean() (MIN(t.title), COUNT(*) over a join raised TypeError)
+            fn9 = s[1]
+            sc9[s[3] if len(s) > 3 else f"_a{i}"] = (col.sum() if fn9 == 'SUM' else col.mean() if fn9 == 'AVG'
+                                                     else col.min() if fn9 == 'MIN' else col.max() if fn9 == 'MAX'
+                                                     else col.count())
     for i, s in enumerate(specs):
         if s[0] == 'size': row.append(int(len(merged)))
         elif s[0] == 'compose':

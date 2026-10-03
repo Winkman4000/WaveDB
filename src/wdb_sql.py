@@ -460,11 +460,21 @@ def _mode5_sarray(seg, pc):
 
 
 def _mode5_null(seg, pc):
+    if not seg.cols.get(pc, {}).get('has_null') and seg._overrides(pc) is None:
+        return np.zeros(int(seg.N), bool)            # the column says it holds no NULL (and no override wrote one)
     got = _mode5_sarray(seg, pc)
     return got[1] if got is not None else np.zeros(int(seg.N), bool)
 
 
 def _like_mode5(seg, pc, pat, icase):
+    if (not icase and '_' not in pat and '\\' not in pat and len(pat) >= 3 and pat[0] == '%' and pat[-1] == '%'
+            and seg.cols.get(pc, {}).get('mode') == 5 and seg._overrides(pc) is None):
+        toks = [t for t in pat.split('%') if t != '']
+        if 1 <= len(toks) <= 2:
+            # THE NEEDLES ON THE STORED STREAM (2026-10-03): '%a%' / '%a%b%' over an inline column is the
+            # ordered-needle kernel on the column's own bytes and offsets -- the S-array this replaces made a
+            # Python object per row first (n.name, 4.1M rows: most of JOB 6a's cold run)
+            return seg.like_mask(pc, toks)
     got = _mode5_sarray(seg, pc)
     if got is None: return None
     _arr, isn, b, obj, buf, starts = got
@@ -2333,19 +2343,21 @@ def _eval_pred(seg, node, seg_col):
         _cd9 = seg.cols.get(_pc9, {})
         if _cd9.get('mode') == 5 and _cd9.get('dt') == 1:
             _lits9 = ([node.expression] if not isinstance(node, E.In) else list(node.args.get('expressions') or []))
-            if _lits9 and all(isinstance(L, E.Literal) and L.is_string for L in _lits9) and node.args.get('query') is None:
-                got = _mode5_sarray(seg, _pc9)
-                if got is not None:
-                    _arr9, _isn9, _b9, _obj9 = got[0], got[1], got[2], got[3]
-                    if isinstance(node, E.In):
-                        _set9 = set(L.this.encode() for L in _lits9)
-                        m = np.fromiter((x in _set9 for x in _b9), dtype=bool, count=len(_b9)) if len(_set9) > 4 else np.zeros(len(_b9), bool)
-                        if len(_set9) <= 4:
-                            for lv in _set9: m |= (_obj9 == lv)
-                    else:
-                        m = (_obj9 == _lits9[0].this.encode())
-                        if isinstance(node, E.NEQ): m = ~m & ~_isn9
-                    return m
+            if _lits9 and all(isinstance(L, E.Literal) and L.is_string for L in _lits9) and node.args.get('query') is None \
+                    and seg._overrides(_pc9) is None:
+                # THE LITERALS ON THE STORED STREAM (2026-10-03): = / <> / IN against an inline column compare
+                # each row's bytes in place -- the S-array made a Python object per row first (t.title = 'Shrek 2'
+                # and chn.name = 'Queen' were most of JOB 29a's cold isolation)
+                import wdb_kernels as _WKq
+                _ls9 = [L.this.encode() for L in _lits9]
+                _lo9 = np.zeros(len(_ls9) + 1, np.int64); np.cumsum([len(x) for x in _ls9], out=_lo9[1:])
+                _bl9, _of9 = seg.inline_stream(_pc9)
+                m = np.empty(int(seg.N), np.bool_)
+                _WKq.pinline_eq_any(_bl9, np.ascontiguousarray(_of9, dtype=np.int64),
+                                    np.frombuffer(b''.join(_ls9) or b'\x00', dtype=np.uint8), _lo9, m)
+                if isinstance(node, E.NEQ):
+                    m = ~m & ~_mode5_null(seg, _pc9)
+                return m
     if isinstance(node, (E.Like, E.ILike)) and isinstance(node.this, E.Column):
         _pc9 = seg_col(node.this.name) if seg_col is not None else node.this.name
         _cd9 = seg.cols.get(_pc9, {})

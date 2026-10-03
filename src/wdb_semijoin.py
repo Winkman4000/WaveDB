@@ -58,7 +58,7 @@ _PLANS = {}   # plans are program (qmem _MODULE_KEEP)
 _KMAX = {}   # (qmem _MODULE_KEEP)
 _REUSE = None
 
-from numba import njit
+from numba import njit, prange
 
 
 @njit(nogil=True, cache=True)
@@ -109,6 +109,72 @@ def _keyset_kernel(col, idx, mx):
         if mark[k]:
             out[p] = k; p += 1
     return out
+
+
+_NOIDX = np.zeros(0, np.int64)
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _cut_rows(keys, idx, lut, full):
+    """the rows whose key is in the live set (lut[key]; NULL keys are < 0): over every row when full, else
+    over the live rows idx -- counted per stretch, then written per stretch, on every core; rows ascending"""
+    n = keys.size if full else idx.size
+    NC = 256
+    chunk = (n + NC - 1) // NC
+    L = lut.size
+    cnt = np.zeros(NC, np.int64)
+    for c in prange(NC):
+        lo = c * chunk; hi = min(n, lo + chunk); k = 0
+        for j in range(lo, hi):
+            r = j if full else idx[j]
+            v = np.int64(keys[r])
+            if v >= 0 and v < L and lut[v]:
+                k += 1
+        cnt[c] = k
+    off = np.zeros(NC + 1, np.int64)
+    for c in range(NC):
+        off[c + 1] = off[c] + cnt[c]
+    out = np.empty(off[NC], np.int64)
+    for c in prange(NC):
+        lo = c * chunk; hi = min(n, lo + chunk); w = off[c]
+        for j in range(lo, hi):
+            r = j if full else idx[j]
+            v = np.int64(keys[r])
+            if v >= 0 and v < L and lut[v]:
+                out[w] = r; w += 1
+    return out
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _gather_i32(vals, codes):
+    """a key column decoded: each row's dictionary value, int32, on every core"""
+    out = np.empty(codes.size, np.int32)
+    for i in prange(codes.size):
+        out[i] = vals[codes[i]]
+    return out
+
+
+@njit(nogil=True, cache=True)
+def _inline_extreme(blob, off, rows, want_max):
+    """THE EXTREME ROW OF AN INLINE STRING COLUMN among rows: bytewise lexicographic compare (memcmp
+    order, a shorter prefix first -- the order bytes objects sort in, and DuckDB's), one pass"""
+    best = rows[0]
+    for i in range(1, rows.size):
+        r = rows[i]
+        a0 = off[r]; la = off[r + 1] - a0
+        b0 = off[best]; lb = off[best + 1] - b0
+        n = la if la < lb else lb
+        c = 0
+        for k in range(n):
+            x = blob[a0 + k]; y = blob[b0 + k]
+            if x != y:
+                c = 1 if x > y else -1
+                break
+        if c == 0:
+            c = 1 if la > lb else (-1 if la < lb else 0)
+        if (want_max and c > 0) or ((not want_max) and c < 0):
+            best = r
+    return best
 
 
 def execute(db, tree, sql=None):
@@ -227,11 +293,26 @@ def execute(db, tree, sql=None):
         if _hit9 is not None:
             keycache[k] = _hit9; return _hit9
         raw = wdb_sql.raw_dict_col(seg, pc, want_codes=False)
+        if raw is None and cd.get('mode') in (0, 1, 2) and cd.get('has_null') and not seg._override_vals_typed(pc):
+            # A NULLABLE INTEGER DICTIONARY (2026-10-03): the dictionary's V-1 values and the NULL code's slot (-1);
+            # raw_dict_col declines nullables, and _col built Python lists of the dictionary twice
+            # (cast_info.person_role_id: 3.1M values, ~0.5 s per query)
+            _d9 = np.asarray(seg._typed_dict(pc), dtype=np.int64)
+            if _d9.size == int(cd['V']) - 1:
+                raw = (_d9,)
         codes = np.asarray(seg.codes(pc))
         if raw is not None:
             vals = np.asarray(raw[0]).astype(np.int64)
             if cd.get('has_null'):
                 vals = np.append(vals, -1)
+            if codes.size >= 1_000_000 and vals.size and int(vals.min()) >= -1 and int(vals.max()) < (1 << 31):
+                # THE GATHER ON EVERY CORE, STRAIGHT TO int32 (2026-10-03): vals[codes] was one thread and an
+                # int64 result narrowed afterwards -- 264-283 ms for cast_info.movie_id, every query
+                out = _gather_i32(vals.astype(np.int32), codes)
+                keycache[k] = out
+                try: wdb_shelf.SHELF.put(_sk9, out, int(out.nbytes), kind='keys')
+                except Exception: pass
+                return out
             out = vals[codes]
         else:
             arr, nm = wdb_sql._col(seg, pc)
@@ -324,6 +405,11 @@ def execute(db, tree, sql=None):
                 return cache[pc]
         except Exception:
             pass
+        if path and not wdb_sidecar.may_build(path):
+            # THE VANILLA LAW (2026-10-03): a road nobody may keep is an argsort of the whole key column
+            # per query (cast_info.movie_id: 36M rows, seconds) to answer one cut; decline -- the
+            # cut's streaming pass (the decoded keys against a bitmap of the live set) serves
+            return None
         vals = keys(a, cols_a[0])
         order = np.argsort(vals, kind='stable').astype(np.int32 if vals.size < 2**31 else np.int64)
         sv = vals[order]
@@ -524,6 +610,15 @@ def execute(db, tree, sql=None):
                 j = rows[ok][int(rr[ok].argmin()) if isinstance(nd, E.Min) else int(rr[ok].argmax())]
                 out.append(wdb_sql._pyval(seg.values_at_rows(pc, np.array([j]))[0]))
                 continue
+            if cd.get('mode') == 5 and rows.size:
+                # THE EXTREME ON THE BYTES (2026-10-03): an inline column (never NULL) answers MIN/MAX over
+                # its surviving rows with one compiled pass of byte compares on the stored stream -- no
+                # Python object per row, no rank, no sort; then a single point read for the winner
+                blob, off = seg.inline_stream(pc)
+                j = _inline_extreme(blob, np.ascontiguousarray(off, dtype=np.int64),
+                                    np.ascontiguousarray(rows, dtype=np.int64), isinstance(nd, E.Max))
+                out.append(wdb_sql._pyval(seg.values_at_rows(pc, np.array([j]))[0]))
+                continue
             vals = list(seg.values_at_rows(pc, rows))
             vals = [v for v in vals if v is not None]
             out.append(wdb_sql._pyval(min(vals) if isinstance(nd, E.Min) else max(vals)) if vals else None)
@@ -549,6 +644,15 @@ def _string_rank(seg, pc):
             try: wdb_shelf.SHELF.put(key, r, int(r.nbytes), kind='string-rank')
             except Exception: pass
             return r
+    except Exception:
+        pass
+    try:
+        import wdb_sidecar
+        if not wdb_sidecar.may_build(seg.path):
+            # THE VANILLA LAW, HERE TOO (2026-10-03): with the switch off the rank could never be kept,
+            # so building it answers one MIN with a sort of the whole column -- 2.2 s of argsort and
+            # 0.7 s of decode in JOB 1b's 3.7 s. Decline: the callers read only the rows they need
+            return None
     except Exception:
         pass
     vals = np.asarray(seg.values(pc), dtype=object)
@@ -815,6 +919,19 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
                     except Exception: _kc9 = None
                 if isfull:
                     idx = np.arange(n, dtype=np.int64) if _kc9 is None else None
+                if _kc9 is not None:
+                    _mk9 = (segs[a].path, c); mxk = kmax.get(_mk9)
+                    if mxk is None: mxk = kmax[_mk9] = int(_kc9.max()) if _kc9.size else 0
+                    mx = int(max(int(S[-1]) if S.size else 0, mxk))
+                    if mx < 200_000_000:
+                        # THE CUT IN ONE PASS (2026-10-03): the live set as a bitmap, then every core walks its
+                        # stretch of the decoded keys (or of the live rows) and writes the rows that hit --
+                        # the numpy road was an int64 copy, a where, a gather and a flatnonzero, one thread each
+                        # (a quarter of JOB 6a's hot main thread)
+                        lut = np.zeros(mx + 2, bool); lut[S] = True
+                        rows = _cut_rows(np.asarray(_kc9), _NOIDX if isfull else np.ascontiguousarray(idx, dtype=np.int64),
+                                         lut, isfull)
+            if rows is None:
                 if _kc9 is not None:
                     dk = np.asarray(_kc9 if isfull else _kc9[idx], dtype=np.int64)
                 else:

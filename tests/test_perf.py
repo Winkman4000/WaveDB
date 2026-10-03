@@ -26,10 +26,18 @@ def _scaling_exponent(sizes, times):
     return float(np.polyfit(lx, ly, 1)[0])
 
 def _check_scaling(label, make_op, sizes, the_exp, lo, hi):
+    # THE COMPLEXITY CLASS ON ONE THREAD (2026-10-03): the bit-unpack now runs on every core, so at 1-4M rows a
+    # decode is mostly the threads' fixed start and the fit read anything from -0.19 to 1.44 on a shared host;
+    # the class is the algorithm's, measured where the work alone grows
+    import numba
+    nt = numba.get_num_threads(); numba.set_num_threads(1)
     times = []
-    for n in sizes:
-        op = make_op(n)
-        times.append(_bestof(op))
+    try:
+        for n in sizes:
+            op = make_op(n)
+            times.append(_bestof(op))
+    finally:
+        numba.set_num_threads(nt)
     p = _scaling_exponent(sizes, times)
     rates = [f"{n//1000}k:{t*1000:.0f}ms" for n, t in zip(sizes, times)]
     print(f"    [{label}] theory=O(n^{the_exp}) measured_exp={p:.2f} band=[{lo},{hi}]  {' '.join(rates)}")
@@ -48,8 +56,11 @@ def test_codes_decode_is_linear():
     _check_scaling("codes() decode", mk, sizes, 1, 0.80, 1.40)
 
 # ---- values() decode+gather: also O(rows). exponent ~1.0 ----
+# (2026-10-03: measured past the last-level cache, 4M-16M -- the gather is a random walk over the dictionary,
+# and 1-4M straddled the cache: 8 / 15 / 53 ms on one thread, a cliff read as exponent 1.40-1.46; the old
+# path had the same cliff, 1.21, hidden under a slower unpack)
 def test_values_decode_is_linear():
-    sizes = [1_000_000, 2_000_000, 4_000_000]
+    sizes = [4_000_000, 8_000_000, 16_000_000]
     def mk(n):
         seg, _ = roundtrip(pd.DataFrame({'x': np.random.default_rng(0).permutation(n).astype(np.int64)}))
         def op():
