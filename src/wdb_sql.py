@@ -476,6 +476,70 @@ def _like_tok_parts(pat):
     return tb, to, pat[:1] != '%', pat[-1:] != '%'
 
 
+def _dict_stream(seg, pc):
+    """a text dictionary's values as ONE byte stream + offsets (the dictionary itself, laid out for the token
+    kernel), on the column as tier 1 -- built once per process from the decoded dictionary"""
+    c = seg.cols[pc]
+    st = c.get('_dstream')
+    if st is None and c.get('vals') is None and c.get('R') is not None and pc not in seg._tdict:
+        st = c['_dstream'] = _fc_stream(seg, c)
+    if st is None:
+        vals = seg._typed_dict(pc)
+        b = vals.tolist() if isinstance(vals, np.ndarray) else list(vals)
+        b = [x if isinstance(x, (bytes, bytearray)) else (x.encode() if isinstance(x, str) else b'') for x in b]
+        off = np.zeros(len(b) + 1, np.int64)
+        if b: np.cumsum(np.fromiter(map(len, b), np.int64, len(b)), out=off[1:])
+        st = c['_dstream'] = (np.frombuffer(b''.join(b) or b'\x00', dtype=np.uint8), off)
+    return st
+
+
+def _fc_stream(seg, c):
+    """the front-coded dictionary expanded straight into the stream, compiled, chunk by chunk in the leaf
+    pool -- no Python bytes per value (_decode_fc's value-by-value walk was ~590 ms of a cold 716K-value
+    dictionary, cast_info.note)"""
+    import wdb_kernels as _WKf, wdb_engine as _WEf
+    R = np.int64(int(c['R']))
+    if c.get('chunked'):
+        raws = list(_WEf._leaf_pool().map(lambda j: np.ascontiguousarray(seg.fc_chunk(c, j)), range(int(c['nch']))))
+    else:
+        raws = [np.frombuffer(seg._dz.decompress(c['z']), dtype=np.uint8)]
+    sz = [_WKf.fc_expand_size(r, R) for r in raws]
+    i0 = np.zeros(len(raws) + 1, np.int64); b0 = np.zeros(len(raws) + 1, np.int64)
+    for j, (k, t) in enumerate(sz):
+        i0[j + 1] = i0[j] + k; b0[j + 1] = b0[j] + t
+    blob = np.zeros(max(int(b0[-1]), 1), np.uint8); off = np.empty(int(i0[-1]) + 1, np.int64)
+    off[-1] = b0[-1]
+    done = list(_WEf._leaf_pool().map(lambda j: _WKf.fc_expand(raws[j], R, blob, off, i0[j], b0[j]), range(len(raws))))
+    assert done == [int(k) for k, _ in sz], ('fc_expand entries', done[:3])
+    return blob, off
+
+
+def _like_dict_kernel(seg, pc, pat, negate=False):
+    """LIKE (no '_') over a text dictionary column: the token kernel decides each distinct value once on the
+    dictionary's stream, a parallel lookup paints the rows by code; NULL rows never match (LIKE or NOT LIKE).
+    None when the pattern or the column is not this simple case."""
+    parts = _like_tok_parts(pat)
+    c = seg.cols.get(pc, {})
+    if (parts is None or c.get('mode') not in (0, 1) or c.get('dt') != 1 or c.get('aux') == 9
+            or seg._overrides(pc) is not None):
+        return None
+    import wdb_kernels as _WKd
+    blob, off = _dict_stream(seg, pc)
+    nv = off.size - 1; V = int(c['V'])
+    keep = np.empty(nv, np.bool_)
+    _WKd.plike_tok(blob, off, parts[0], parts[1], parts[2], parts[3], keep)
+    if negate: keep = ~keep
+    if c.get('has_null'):                                                       # the NULL code (V-1): never true
+        if nv == V - 1: keep = np.append(keep, False)
+        elif nv == V: keep[V - 1] = False
+        else: return None
+    elif nv != V: return None
+    codes = np.asarray(seg.codes(pc))
+    out = np.empty(codes.shape[0], np.bool_)
+    _WKd.plut_u8(codes, keep, out)
+    return out
+
+
 def _like_mode5(seg, pc, pat, icase):
     parts = None if icase else _like_tok_parts(pat)
     if parts is not None and seg.cols.get(pc, {}).get('mode') == 5 and seg._overrides(pc) is None:
@@ -2379,6 +2443,14 @@ def _eval_pred(seg, node, seg_col):
             out = _like_mode5(seg, _pc9, str(node.expression.this), isinstance(node, E.ILike))
             if out is not None:
                 return (~out & ~_mode5_null(seg, _pc9)) if node.args.get('negate') else out
+        if (isinstance(node, E.Like) and _cd9.get('mode') in (0, 1) and _cd9.get('dt') == 1
+                and isinstance(node.expression, E.Literal) and node.expression.is_string and node.args.get('escape') is None):
+            # THE PATTERN ON THE DICTIONARY'S STREAM (2026-10-03): each distinct value decided once by the token
+            # kernel, the rows painted by code in parallel -- the Python map rebuilt a 716K-value list per call
+            # (ci.note LIKE '%(producer)%': 503 ms hot, 1.1 s cold)
+            out = _like_dict_kernel(seg, _pc9, str(node.expression.this), bool(node.args.get('negate')))
+            if out is not None:
+                return out
     if isinstance(node, _STRFN_TYPES) or (type(node) in _CMP9 and isinstance(node.this, _STRFN_TYPES)):
         if _dict_string_col(seg, node, seg_col) is not None:
             # THE DICTIONARY MAP first: LIKE/ILIKE/functions over a dictionary
@@ -2402,6 +2474,26 @@ def _eval_pred(seg, node, seg_col):
         return out
 
 
+def _strict_col(node):
+    """the one column of a predicate that is NULL exactly where that column is NULL -- a comparison, LIKE,
+    BETWEEN or IN of a bare column against non-NULL literals -- else None"""
+    while isinstance(node, E.Paren): node = node.this
+    lit = lambda x: (isinstance(x, E.Literal) or (isinstance(x, E.Neg) and isinstance(x.this, E.Literal)))
+    if isinstance(node, (E.EQ, E.NEQ, E.GT, E.LT, E.GTE, E.LTE, E.Like, E.ILike)):
+        if node.args.get('escape') is not None: return None
+        a, b = node.this, node.expression
+        if isinstance(a, E.Column) and lit(b): return a
+        if isinstance(b, E.Column) and lit(a) and not isinstance(node, (E.Like, E.ILike)): return b
+        return None
+    if isinstance(node, E.Between):
+        return node.this if isinstance(node.this, E.Column) and lit(node.args.get('low')) and lit(node.args.get('high')) else None
+    if isinstance(node, E.In):
+        ex = node.args.get('expressions') or []
+        if isinstance(node.this, E.Column) and node.args.get('query') is None and ex and all(lit(x) for x in ex):
+            return node.this
+    return None
+
+
 def _eval_pred_core(seg, node, seg_col):
     if isinstance(node, E.Is) and isinstance(node.this, E.Column) and isinstance(node.expression, E.Null):
         _c9 = seg.cols.get(seg_col(node.this.name), {})
@@ -2410,7 +2502,15 @@ def _eval_pred_core(seg, node, seg_col):
             return np.zeros(int(seg.N), bool) if not node.args.get('not') else np.ones(int(seg.N), bool)
     if isinstance(node, E.And): return _eval_pred(seg,node.this,seg_col) & _eval_pred(seg,node.expression,seg_col)
     if isinstance(node, E.Or):  return _eval_pred(seg,node.this,seg_col) | _eval_pred(seg,node.expression,seg_col)
-    if isinstance(node, E.Not): return ~_eval_pred(seg,node.this,seg_col)
+    if isinstance(node, E.Not):
+        out = ~_eval_pred(seg, node.this, seg_col)
+        col = _strict_col(node.this)
+        if col is not None:
+            # NOT IS TRUE ONLY WHERE ITS ARGUMENT IS FALSE (SQL's three values, 2026-10-03): a comparison / LIKE / IN
+            # of one column against literals is NULL where the column is NULL, and NOT NULL is NULL -- not true.
+            # The bare ~ counted every NULL row (NOT (c.tag LIKE 'tag0%'): 225,237 rows against DuckDB's 134,808)
+            out &= ~np.asarray(_eval_pred(seg, E.Is(this=col.copy(), expression=E.Null()), seg_col), dtype=bool)
+        return out
     if isinstance(node, E.Paren): return _eval_pred(seg,node.this,seg_col)
     if isinstance(node, (E.EQ,E.NEQ,E.GT,E.LT,E.GTE,E.LTE)) and isinstance(node.this, E.Cast) and isinstance(node.this.this, E.Column):
         raise NotImplementedError("predicate LHS Cast (type-changing): the row evaluator serves it")   # never stripped to the bare column

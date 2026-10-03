@@ -179,6 +179,88 @@ def _inline_extreme(blob, off, rows, want_max):
     return best
 
 
+@njit(nogil=True, cache=True, parallel=True)
+def _inline_prefix8(blob, off, rows):
+    """each row's first 8 bytes as one big-endian number (zero padded): x < y in byte order implies
+    prefix(x) <= prefix(y), so the k smallest prefixes hold the k smallest strings"""
+    out = np.empty(rows.size, np.uint64)
+    for i in prange(rows.size):
+        r = rows[i]; a0 = off[r]; L = off[r + 1] - a0
+        v = np.uint64(0)
+        for k in range(8):
+            b = np.uint64(blob[a0 + k]) if k < L else np.uint64(0)
+            v = (v << np.uint64(8)) | b
+        out[i] = v
+    return out
+
+
+# OFF BY DEFAULT, BY MEASUREMENT (JOB 7c, true cold/hot): 328 -> 511 ms hot, 1480 -> 1981 ms cold. Each try's
+# settle still re-derives the big tables' key sets (~90 ms), and waiting for every filter loses the stream's
+# overlap; 7c's time is its range filters (hot) and the whole pi.info stream read for the emit (cold)
+_WALK = os.environ.get('WDB_MIN_WALK', '0') == '1'
+_WALK_MIN = 4_096               # fewer candidates than this: the whole fixpoint is already cheap
+_WALK_FIRST = 64                # the first batch of the walk
+_WALK_BUDGET = 4_096            # the walk gives up past this many candidates (then the whole fixpoint answers)
+
+
+def _min_walk(tree, owner, segs, pms, alias2t, edges, base_keeps, base_counts, keys, keys_at, inverted, rows_for_keys,
+              pack, _bill, _tk, keycache):
+    """JACKSON'S WALK (JOB 7c, 2026-10-03: "start with a bunch of samples from the A letter ... work our way
+    backwards down the list until we find one that satisfies all the requirements since they only need one"):
+    a MIN/MAX needs one row. Its table's candidates (after its own filters) in value order; the first batch is
+    the only live part of that table and the join settles around it; a survivor's extreme is the answer
+    (every candidate before it was in the batch and fell). None of the batch: four times as many. Past the budget,
+    None -- the caller's whole fixpoint answers. Every MIN/MAX of the select is walked, or none."""
+    import wdb_sql
+    out = []
+    for p in tree.expressions:
+        nd = p.this if isinstance(p, E.Alias) else p
+        if not isinstance(nd, (E.Min, E.Max)) or not isinstance(nd.this, E.Column): return None
+        a = owner(nd.this); seg = segs[a]; pc = pms[a].get(nd.this.name, nd.this.name); cd = seg.cols.get(pc, {})
+        want_max = isinstance(nd, E.Max)
+        idx = np.flatnonzero(base_keeps[a])
+        if idx.size < _WALK_MIN: return None
+        if cd.get('mode') in (0, 1, 2):
+            codes = np.asarray(_codes_shelved(seg, pc))[idx]
+            if cd.get('has_null'):
+                nn = codes != int(cd['V']) - 1
+                idx = idx[nn]; codes = codes[nn]
+            order_key = (-codes.astype(np.int64)) if want_max else codes.astype(np.int64)
+            blob = off = None
+        elif cd.get('mode') == 5:
+            blob, off = seg.inline_stream(pc)
+            off = np.ascontiguousarray(off, dtype=np.int64)
+            pre = _inline_prefix8(blob, off, idx.astype(np.int64))
+            order_key = ~pre if want_max else pre
+        else:
+            return None
+        k = _WALK_FIRST; got = False
+        while k <= _WALK_BUDGET and k < order_key.size:
+            kth = np.partition(order_key, k - 1)[k - 1]
+            B = idx[order_key <= kth]
+            if B.size > 4 * k + 1024: return None                   # a prefix shared by too many: no cheap batch
+            keeps = dict(base_keeps); counts = dict(base_counts)
+            m = np.zeros(int(seg.N), bool); m[B] = True
+            keeps[a] = m; counts[a] = int(B.size)
+            _tq = _tk()
+            _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inverted, rows_for_keys, pack, None, _tk,
+                               futs=None, pool=None, keycache=keycache, local=None, cached=False)
+            if _bill is not None: _bill.append(('walk %s.%s batch %d (%d rows) -> %d' % (a, pc, k, B.size, counts[a]), _tk() - _tq))
+            if counts[a] > 0 and all(c > 0 for c in counts.values()):
+                S = np.flatnonzero(keeps[a])
+                if blob is None:
+                    sc = np.asarray(_codes_shelved(seg, pc))[S]
+                    out.append(wdb_sql._pyval(seg.fetch(pc, int(sc.max() if want_max else sc.min()))))
+                else:
+                    j = _inline_extreme(blob, off, S.astype(np.int64), want_max)
+                    out.append(wdb_sql._pyval(seg.values_at_rows(pc, np.array([j]))[0]))
+                got = True
+                break
+            k *= 4                                                 # four tries at most: 64, 256, 1024, 4096
+        if not got: return None
+    return out
+
+
 def execute(db, tree, sql=None):
     import wdb_sql, os, time
     _bill = [] if os.environ.get('WDB_SEMI_BILL') else None
@@ -563,6 +645,21 @@ def execute(db, tree, sql=None):
     counts = {a: int(np.count_nonzero(k)) for a, k in keeps.items() if a in keeps}
     for a in alias2t:
         if a not in keeps: keeps[a] = np.ones(int(segs[a].N), bool); counts[a] = int(segs[a].N)   # unrestricted until its filter lands
+    if (_WALK and os.environ.get('WDB_KEYSPACE', '1') != '0' and not any(dear.values()) and not _needs_weights(tree)
+            and all(isinstance(p.this if isinstance(p, E.Alias) else p, (E.Min, E.Max)) for p in tree.expressions)):
+        # THE WALK FIRST (Jackson): every table's own filters in, then a MIN/MAX asks its first candidates only
+        _bk9 = {a: _unpack9(futs[a].result(), a) for a in alias2t}
+        _bc9 = {a: int(np.count_nonzero(m9)) for a, m9 in _bk9.items()}
+        if _bill is not None: _bill.append(('isolation (walk)', _tk() - _t0)); _t0 = _tk()
+        if all(c9 > 0 for c9 in _bc9.values()):
+            _got9 = _min_walk(tree, owner, segs, pms, alias2t, edges, _bk9, _bc9, keys, keys_at, inverted, rows_for_keys,
+                              pack, _bill, _tk, keycache)
+            if _got9 is not None:
+                _pool9.shutdown(wait=False)
+                if _bill is not None:
+                    print('SEMI BILL: ' + ' | '.join('%s=%.0fms' % (n, v * 1000) for n, v in _bill), flush=True)
+                return [tuple(_got9)], [wdb_sql._alias(p) for p in tree.expressions]
+            if _bill is not None: _bill.append(('walk gave up', _tk() - _t0)); _t0 = _tk()
     if os.environ.get('WDB_KEYSPACE', '1') != '0':
         _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inverted, rows_for_keys, pack, _bill, _tk, futs=futs, pool=_pool9, keycache=keycache, local=local)
         _t0 = _tk()
@@ -663,6 +760,7 @@ def execute(db, tree, sql=None):
 
 _DEAR_DICT_V = 100_000          # a text dictionary this wide is read value by value: a LIKE over it is costly
 _DEFER_ROWS = 65_536            # survivors up to this many are asked one by one; more, the whole column answers
+_LIKE_FIRST = os.environ.get('WDB_LIKE_FIRST', '1') != '0'      # a kernelable dictionary LIKE prunes first
 
 
 def _is_dear(seg, node, pm):
@@ -684,6 +782,13 @@ def _is_dear(seg, node, pm):
                 continue
             return True
         if int(cd.get('V', 0)) >= _DEAR_DICT_V:
+            # JACKSON'S "LIKE FIRST" (JOB 10c): a pattern the token kernel says over the dictionary's own byte
+            # stream is one pass over the distinct values plus a code lookup -- cheap, so it prunes first
+            pat = lk.expression
+            if (isinstance(lk, E.Like) and isinstance(pat, E.Literal) and pat.is_string and lk.args.get('escape') is None
+                    and cd.get('mode') in (0, 1) and wdb_sql._like_tok_parts(pat.this) is not None
+                    and seg._overrides(pc) is None and _LIKE_FIRST):
+                continue
             return True
     return False
 

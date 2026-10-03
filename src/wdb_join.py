@@ -4875,7 +4875,18 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         if isinstance(node, E.Paren): return build_pred(node.this)
         if isinstance(node, E.And): return f"({build_pred(node.this)} and {build_pred(node.expression)})"
         if isinstance(node, E.Or):  return f"({build_pred(node.this)} or {build_pred(node.expression)})"
-        if isinstance(node, E.Not): return f"(not {build_pred(node.this)})"
+        if isinstance(node, E.Not):
+            inner9 = build_pred(node.this)
+            col9 = wdb_sql._strict_col(node.this)
+            if col9 is not None:
+                # NOT IS TRUE ONLY WHERE ITS ARGUMENT IS FALSE (2026-10-03): a NULL row's comparison is false here,
+                # and 'not' made it true -- COUNT(*) WHERE NOT (c.tag = 'x') counted every NULL tag
+                cs9, cp9, cptr9 = resolve(col9)
+                if cs9.cols[cp9].get('has_null') or cs9._overrides(cp9) is not None:
+                    if cs9.cols[cp9].get('dt') != 1: raise _FastUnsupported      # numeric NULLs: the mask road
+                    vkn9 = _code_lut(cs9, cp9, cptr9, None, mark_null=True)
+                    return f"((not {inner9}) and ({vkn9} == 0))"
+            return f"(not {inner9})"
         if isinstance(node, (E.Like, E.ILike)):           # LIKE / ILIKE -> code-LUT over the dictionary
             if not FUSE_STR_PRED: raise _FastUnsupported
             col = node.this

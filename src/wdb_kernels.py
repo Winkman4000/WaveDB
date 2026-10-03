@@ -4050,6 +4050,61 @@ def plike_tok_rows(blob, off, rows, tb, to, astart, aend, out):
         out[i] = _like_tok_row(blob, off[r], off[r + 1], tb, to, astart, aend)
 
 
+@njit(cache=True, nogil=True)
+def fc_expand_size(raw, R):
+    """(entries, full bytes) of one front-coded run <cp u16><sl u16><suffix>, restarting every R entries --
+    the sizes fc_expand writes, read off the headers alone"""
+    o = 0; k = 0; tot = 0; plen = 0; n = raw.shape[0]
+    while o + 4 <= n:
+        cp = np.int64(raw[o]) | (np.int64(raw[o + 1]) << 8)
+        sl = np.int64(raw[o + 2]) | (np.int64(raw[o + 3]) << 8)
+        if k % R == 0: plen = 0
+        if cp > plen: cp = plen
+        plen = cp + sl; tot += plen; o += 4 + sl; k += 1
+    return k, tot
+
+
+@njit(cache=True, nogil=True)
+def fc_expand(raw, R, blob, off, i0, b0):
+    """one front-coded run expanded into a flat dictionary stream: entry k's bytes at blob[off[i0+k]:...],
+    written from byte b0 -- the prefix copied from the entry before it (what _decode_fc does value by value)"""
+    o = 0; k = 0; w = b0; ps = b0; plen = 0; n = raw.shape[0]
+    while o + 4 <= n:
+        cp = np.int64(raw[o]) | (np.int64(raw[o + 1]) << 8)
+        sl = np.int64(raw[o + 2]) | (np.int64(raw[o + 3]) << 8)
+        o += 4
+        if k % R == 0: plen = 0
+        if cp > plen: cp = plen
+        off[i0 + k] = w
+        for q in range(cp): blob[w + q] = blob[ps + q]
+        for q in range(sl): blob[w + cp + q] = raw[o + q]
+        ps = w; plen = cp + sl; w += plen; o += sl; k += 1
+    return k
+
+
+@njit(cache=True, nogil=True)
+def parse_m0_ints(buf, start, out):
+    """a plain (mode-0) integer dictionary parsed where it lies: out.size entries of <u32 len><digits>, from
+    byte start. Decimal digits with an optional leading '-', 1..18 of them; anything else -> False (the
+    caller's general parse decides)"""
+    o = start
+    for i in range(out.shape[0]):
+        L = np.int64(buf[o]) | (np.int64(buf[o + 1]) << 8) | (np.int64(buf[o + 2]) << 16) | (np.int64(buf[o + 3]) << 24)
+        o += 4
+        if L == 0: return False
+        neg = buf[o] == 45
+        a = o + 1 if neg else o
+        if o + L - a == 0 or o + L - a > 18: return False
+        v = np.int64(0)
+        for q in range(a, o + L):
+            d = np.int64(buf[q]) - 48
+            if d < 0 or d > 9: return False
+            v = v * 10 + d
+        out[i] = -v if neg else v
+        o += L
+    return True
+
+
 @njit(cache=True, parallel=True, nogil=True)
 def pinline_eq_any(blob, off, lb, lo, out):
     """= / IN over a mode-5 inline stream: out[r] = row r's bytes equal one of the literals (literal k is

@@ -111,7 +111,11 @@ def _frames():
                      rng.integers(0, 10 ** 6, nc)], dtype=object)
     role = rng.integers(1, 40_000, nc).astype(float)
     role[rng.random(nc) < 0.3] = np.nan                      # a nullable integer join key
-    c = pd.DataFrame({'movie_id': rng.integers(1, nt + 1, nc), 'note': note, 'role_id': pd.array(role, dtype='Int64')})
+    tagv = np.array(['tag%06d %s' % (i, words[(i * 3) % 8]) for i in range(120_000)], dtype=object)
+    tag = tagv[rng.integers(0, 120_000, nc)]
+    tag[rng.random(nc) < 0.1] = None                         # a wide, nullable text dictionary
+    c = pd.DataFrame({'movie_id': rng.integers(1, nt + 1, nc), 'note': note, 'role_id': pd.array(role, dtype='Int64'),
+                      'tag': tag})
     r = pd.DataFrame({'id': np.arange(1, 40_001, dtype=np.int64), 'role': ['r%d' % (i % 9) for i in range(40_000)]})
     return {'t': t, 'c': c, 'r': r}
 
@@ -145,18 +149,59 @@ def test_semijoin_through_sql_equals_duck():
             "SELECT MIN(c.note), COUNT(*) FROM t, c WHERE t.id = c.movie_id AND (c.note LIKE 'n0001%' OR t.yr = 1999) AND t.title NOT LIKE 'Queen _eta%'",
             "SELECT MIN(t.title), MAX(t.title) FROM t, c, r WHERE t.id = c.movie_id AND c.role_id = r.id AND r.role = 'r1' AND t.title LIKE '%a_p%'",
             "SELECT MIN(t.title) FROM t, c WHERE t.id = c.movie_id AND t.title LIKE 'Shrek%' AND c.note LIKE '%Shrek%gamma%'",
+            # LIKE first on a wide dictionary (the token kernel over the dictionary's stream; NULL never matches)
+            "SELECT MIN(t.title), MAX(c.tag) FROM t, c WHERE t.id = c.movie_id AND c.tag LIKE '%Shrek%' AND t.yr = 1990",
+            "SELECT MIN(c.tag), MAX(t.title) FROM t, c WHERE t.id = c.movie_id AND c.tag NOT LIKE 'tag0%' AND t.yr > 2017",
+            # NOT is true only where its argument is false: a NULL row stays out (single table, the predicate core)
+            "SELECT COUNT(*) FROM c WHERE NOT (c.tag LIKE 'tag0%')",
+            "SELECT COUNT(*) FROM c WHERE NOT (c.tag = 'tag000001 delta')",
+            "SELECT COUNT(*) FROM c WHERE NOT (c.role_id BETWEEN 100 AND 30000)",
+            "SELECT COUNT(*) FROM c WHERE NOT (c.role_id IN (5, 7, 9)) AND NOT (c.tag IS NULL)",
+            "SELECT MAX(t.title) FROM t, c WHERE t.id = c.movie_id AND c.tag LIKE 'tag11999%'",
+            # the walk: MIN/MAX over many candidates, found early (inline and dictionary order), and given up on
+            "SELECT MIN(t.title), MAX(t.title) FROM t, c, r WHERE t.id = c.movie_id AND c.role_id = r.id AND r.role = 'r3'",
+            "SELECT MIN(c.tag), MAX(c.tag), MIN(t.title) FROM t, c WHERE t.id = c.movie_id AND t.yr BETWEEN 1960 AND 1990",
+            "SELECT MIN(t.title), MAX(t.title) FROM t, c WHERE t.id = c.movie_id AND c.note LIKE 'n00001%'",
+            "SELECT MIN(c.note), MAX(t.title) FROM t, c, r WHERE t.id = c.movie_id AND c.role_id = r.id AND t.title LIKE 'Queen%' AND r.role = 'r8'",
         ]
+        import wdb_semijoin
+        _walk0 = wdb_semijoin._WALK
         with _env(**floor):
             db = Database.open(db_dir)
-            for sql in sqls:
-                r = db.run(sql); got = [tuple(x) for x in (r[0] if isinstance(r, tuple) else r)]
-                ref = [tuple(x) for x in con.execute(sql).fetchall()]
-                assert got == ref, (sql, got, ref)
+            wdb_semijoin._WALK = True                          # the walk (off by default) is kept correct
+            try:
+                for sql in sqls:
+                    r = db.run(sql); got = [tuple(x) for x in (r[0] if isinstance(r, tuple) else r)]
+                    ref = [tuple(x) for x in con.execute(sql).fetchall()]
+                    assert got == ref, (sql, got, ref)
+            finally:
+                wdb_semijoin._WALK = _walk0
             segs = [ent[1] for ent in db._seg_cache.values()]
             seg = next(s for s in segs if 'title' in s.cols)
             assert seg.cols['title'].get('mode') == 5, seg.cols['title'].get('mode')      # the inline column ran
             cseg = next(s for s in segs if 'role_id' in s.cols)
             assert cseg.cols['role_id'].get('has_null') and cseg.cols['role_id'].get('mode') in (0, 1, 2)
+            assert cseg.cols['tag'].get('mode') in (0, 1) and cseg.cols['tag'].get('has_null')     # the dictionary LIKE ran
+            # the compiled dictionary expansion and integer parse equal the value-by-value decoders
+            import wdb_sql, wdb_kernels
+            for s9 in segs:
+                for pc, c9 in s9.cols.items():
+                    if c9.get('mode') in (0, 1) and c9.get('dt') == 1 and c9.get('R') is not None:
+                        blob, off = wdb_sql._fc_stream(s9, c9); vals = s9._decode_fc(c9)
+                        assert off.size - 1 == len(vals) and bytes(blob[:off[-1]]) == b''.join(vals), pc
+                    if c9.get('mode') == 0 and c9.get('dt') == 0:
+                        out = np.empty(int(c9['n_dict']), np.int64)
+                        assert wdb_kernels.parse_m0_ints(np.asarray(s9.buf), np.int64(c9['m0span']), out), pc
+                        assert np.array_equal(out, np.array([int(v) for v in c9['vals']], np.int64)), pc
+        with _env(**floor):                                    # the whole fixpoint answers the walk's queries alike
+            wdb_semijoin._WALK = False
+            try:
+                db2 = Database.open(db_dir)
+                for sql in sqls[-4:]:
+                    r = db2.run(sql); got = [tuple(x) for x in (r[0] if isinstance(r, tuple) else r)]
+                    assert got == [tuple(x) for x in con.execute(sql).fetchall()], sql
+            finally:
+                wdb_semijoin._WALK = _walk0
         born = [f for f in os.listdir(db_dir) if f.endswith(('.srank.npy', '.npy', '.hdr.npy'))]
         assert not born, born                                                            # nothing kept, nothing built to disk
     finally:

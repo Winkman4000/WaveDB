@@ -3832,3 +3832,40 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
 - tests/test_job_floor.py: the token kernel against a regex over every pattern of 'a', 'b', '%' up to length 5
   (all rows and at rows); deferred queries ('_', ILIKE, NOT LIKE with '_', few and many survivors) equal DuckDB.
   Manifest 404.
+
+## 2026-10-03 (evening) -- LIKE FIRST on the dictionary, the dictionary read compiled; THE WALK, measured; NOT's NULLs
+- Jackson on 10c: "what if the first step we did was just LIKE %producer%". ci.note LIKE '%(producer)%' (36M rows,
+  a 716K-value dictionary) was deferred as costly and, when run, was a Python map over the decoded dictionary:
+  503 ms hot / 1125 ms cold. Now: the dictionary laid out as one byte stream (_dict_stream, tier 1 '_dstream'),
+  plike_tok decides each distinct value once, plut_u8 paints the rows by code (NULL never matches, LIKE or NOT
+  LIKE) -- 16 ms hot / 92 ms cold. _is_dear counts such a LIKE cheap, so it prunes first, in isolation
+  (WDB_LIKE_FIRST=0 restores the deferral). 10c line items: hot 588 -> 153 ms, cold 2067 -> 1381 ms.
+- THE DICTIONARY READ COMPILED: the stream is expanded straight from the front coding (fc_expand_size /
+  fc_expand, one chunk per leaf-pool task), never a Python bytes per value -- cast_info.note 233 -> 57 ms,
+  movie_info.info (2.7M values) 1810 -> 463 ms, byte-identical on all five front-coded text dictionaries.
+  A plain (mode-0) integer dictionary is parsed where it lies (parse_m0_ints from the open's 'm0span'):
+  cast_info.person_role_id (3.1M values) 352 -> 35 ms; identical on all 33 integer dictionaries. 10c cold -> 1142.
+- THE BOARD (JOB true cold/hot, all 113 correct): cold 3.75 (114.6 s) -> 3.47 (101.1 s), hot 2.53 (23.1 s) ->
+  2.30 (20.1 s). ClickHouse 3.64 (101.4 s) / 2.76 (25.5 s) -- WaveDB now under it cold and hot; beats it on 70
+  queries cold, 80 hot. DuckDB 1.00 / 1.03. 10c 2023/579 -> 1115/158 ms (ClickHouse 638/162, DuckDB 341/112).
+- THE WALK (Jackson, for 10c, built for 7c: "start with a bunch of samples from the A letter ... work our way
+  backwards down the list until we find one that satisfies all the requirements"): _min_walk takes a MIN/MAX
+  column's candidates in value order (dictionary codes, or _inline_prefix8 for inline text), lets 64 / 256 /
+  1024 / 4096 of them be the table's only live rows, settles the join, and answers from the first batch with a
+  survivor. Correct (floor test, walk on and off), and MEASURED LOSING on 7c: hot 328 -> 511 ms, cold 1480 ->
+  1981 ms -- each try's settle still re-derives the big tables' key sets (~90 ms) and waiting for every filter
+  loses the stream's overlap. OFF by default (WDB_MIN_WALK=1). Where 7c's time is: hot, the range filters in
+  isolation (name_pcode_cf BETWEEN 194 ms, pi.note IS NULL 185, production_year BETWEEN 210) and the ci cut
+  (193); cold, the emit (769 ms: MIN(pi.info) decompresses the whole inline stream for a few rows).
+- NOT IS TRUE ONLY WHERE ITS ARGUMENT IS FALSE: the new floor data (a nullable 120K-value text dictionary)
+  showed COUNT(*) WHERE NOT (c.tag LIKE 'tag0%') = 225,237 against DuckDB's 134,808, and NOT (c.tag = 'x')
+  899,996 against 809,567 -- the bare ~ counted every NULL row (pre-existing; 065eb9b too). wdb_sql._strict_col
+  names the one column of a comparison / LIKE / BETWEEN / IN against literals; _eval_pred_core and the fused
+  build_pred (wdb_join) now AND the negation with that column's NOT NULL.
+- FOUND, STILL OPEN (pre-existing, off every board): the pandas join chain reads a NULL string as '' (a two-table
+  MIN(c.tag) ... NOT (c.tag = 'x') answers ''); _fast_pointer_agg's numpy fallback indexes a full-length mask
+  against rows9 (IndexError, same query shape); NOT over AND / OR of nullable columns still takes the bare ~.
+- STILL ON THE TABLE for 10c cold: the emit reads 7 rows of title / char_name by decompressing each whole inline
+  stream (one zstd frame per column) -- a storage matter.
+- tests/test_job_floor.py: dictionary LIKE / NOT LIKE through the organ, single-table NOT against DuckDB, the
+  compiled expansion and integer parse against the value-by-value decoders, the walk's queries walk on and off.

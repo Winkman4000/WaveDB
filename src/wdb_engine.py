@@ -18,7 +18,8 @@ _DT_UNITS = ['us','ns','ms','s','D','h','m','M','Y','W']
 #   frame maps, scanned hits, per-code function values, ranks): dies with the query, always.
 _SEG_PROGRAM = frozenset({'_synth', '_civil_lut_cache', '_shape'})     # not data at all
 _SEG_TIER1 = frozenset({'_e8pm', '_tdict'})                            # decoded planes, decoded dictionaries
-_COL_TIER1 = frozenset({'_dictbytes', '_steps', '_istream', '_idict', '_nline'})
+_COL_TIER1 = frozenset({'_dictbytes', '_steps', '_istream', '_idict', '_nline', '_dstream'})   # _dstream: a text
+                                                                    # dictionary's values as one stream + offsets
 
 
 def seg_keep():
@@ -176,7 +177,7 @@ class Segment:
             n_dict = V - has_null
             meta = dict(V=V, bits=bits, dt=dt, mode=mode, has_null=has_null, n_dict=n_dict, aux=aux, chunked=chunked, fc3=fc3)
             if mode == 0:
-                vals = []
+                vals = []; meta['m0span'] = off                # where the <u32 len><bytes> run starts
                 for _ in range(n_dict):
                     vl = struct.unpack_from('<I',buf,off)[0]; off += 4
                     vals.append(bytes(buf[off:off+vl])); off += vl
@@ -2207,6 +2208,13 @@ class Segment:
             # THE DIGITS IN ONE PASS (2026-10-03): an integer dictionary in mode 0/1 is digit text; numpy's
             # byte-string cast parses it in C -- int() per value cost 216 ms on cast_info.person_role_id (3.1M
             # values) every query. An int64 array, the same form mode 2 already returns
+            if c.get('m0span') is not None and c['mode'] == 0:
+                # THE DIGITS COMPILED (2026-10-03): the plain dictionary's own bytes parsed in place --
+                # np.asarray(list).astype was still ~0.5 s cold on person_role_id's 3.1M values (JOB 10c)
+                import wdb_kernels as _WKi
+                out = np.empty(int(c['n_dict']), np.int64)
+                if _WKi.parse_m0_ints(np.asarray(self.buf), np.int64(c['m0span']), out):
+                    return out
             try:
                 return np.asarray(c['vals']).astype(np.int64)
             except (ValueError, TypeError):
