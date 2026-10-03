@@ -104,6 +104,22 @@ def _code_of(seg, col, val):
         return None
     tgt = _lit_bytes(val)
     lo, hi = 0, V - 1
+    if c.get('mode') == 1 and c.get('chunked') and c.get('CHUNK') and int(c.get('nch', 0)) > 1 \
+            and seg._overrides(col) is None and col not in getattr(seg, '_tdict', {}):
+        # THE CHUNK FIRST, BY ITS HEAD (2026-10-03): the last chunk whose first value is <= the literal holds it,
+        # if anything does; the heads are read from the chunks' first bytes, then one chunk is inflated for the
+        # bisect inside it (the plain bisect inflated ~3-6 chunks per literal: movie_info.info, 8 countries, ~26)
+        CH = int(c['CHUNK']); a, b = 0, min(int(c['nch']), (V + CH - 1) // CH) - 1
+        if seg.fc_head(c, 0) > tgt:
+            return None
+        while a < b:
+            m = (a + b + 1) // 2
+            h = seg.fc_head(c, m)
+            if h == tgt:
+                return m * CH
+            if h < tgt: a = m
+            else: b = m - 1
+        lo, hi = a * CH, min(V, (a + 1) * CH) - 1
     while lo <= hi:
         mid = (lo + hi) // 2
         fv = seg.fetch(col, mid)
@@ -959,6 +975,8 @@ def detect(seg, tree, col_map):
             if ak[0] == 'MAX' and seg.cols[col].get('mode') in (0, 1, 2):
                 aggs.append((pi, 'MAX_DICT', col)); continue
             if seg.cols[col].get('dt') != 0:    return None
+            if ak[0] in ('MIN', 'MAX') and seg.cols[col].get('mode') != 4:
+                return None                       # MIN/MAX are answered here for sequence columns only
             aggs.append((pi, ak[0], col)); continue
         ck = _case_key(p, seg, col_map)
         if ck is not None:
@@ -1655,6 +1673,11 @@ def execute(seg, spec):
             if kind == 'COUNT_D':
                 cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
                 row.append(int(np.unique(cc).size)); continue
+            if kind in ('MIN', 'MAX'):
+                # MIN/MAX OF A SEQUENCE COLUMN (2026-10-03): it fell through to the SUM/AVG fold below and
+                # answered the AVERAGE -- MIN(id) WHERE info = '...' gave 82867.0 for DuckDB's 21106
+                v = np.asarray(seg._seq_decode(c))[pos]
+                row.append(int(v.min() if kind == 'MIN' else v.max())); continue
             if c['mode'] == 4:
                 v = np.asarray(seg._seq_decode(c))[pos]
                 import wdb_exactint as XI
@@ -1787,6 +1810,13 @@ def execute(seg, spec):
             Vc3 = int(cc3.max()) + 1 if cc3.size else 1
             u3 = np.unique(ginv.astype(np.int64) * Vc3 + cc3)
             _cells[pi3] = np.bincount((u3 // Vc3).astype(np.int64), minlength=G)
+        elif kind3 in ('MIN', 'MAX'):                    # a sequence column's own values (no NULLs)
+            v3 = _codes_all(col3).astype(np.int64)
+            if kind3 == 'MIN':
+                acc = np.full(G, np.iinfo(np.int64).max, np.int64); np.minimum.at(acc, ginv, v3)
+            else:
+                acc = np.full(G, np.iinfo(np.int64).min, np.int64); np.maximum.at(acc, ginv, v3)
+            _cells[pi3] = acc
         else:                                            # SUM / AVG
             if c3['mode'] == 4:
                 v3 = _codes_all(col3)
@@ -1818,7 +1848,7 @@ def execute(seg, spec):
                         row.append(None)             # a group whose every member was null
                     else:
                         row.append(wdb_sql._pyval(seg.fetch(col, k2)))
-                elif kind == 'SUM':
+                elif kind in ('SUM', 'MIN', 'MAX'):
                     row.append(int(_cells[_pi][gi]))
                 else:                                # AVG
                     row.append(float(_cells[_pi][gi]) / int(cnt[gi]))

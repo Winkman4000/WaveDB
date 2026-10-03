@@ -18,7 +18,7 @@ _DT_UNITS = ['us','ns','ms','s','D','h','m','M','Y','W']
 #   frame maps, scanned hits, per-code function values, ranks): dies with the query, always.
 _SEG_PROGRAM = frozenset({'_synth', '_civil_lut_cache', '_shape'})     # not data at all
 _SEG_TIER1 = frozenset({'_e8pm', '_tdict'})                            # decoded planes, decoded dictionaries
-_COL_TIER1 = frozenset({'_dictbytes', '_steps', '_istream', '_idict', '_nline', '_dstream', '_iblk'})   # _dstream: a text
+_COL_TIER1 = frozenset({'_dictbytes', '_steps', '_istream', '_idict', '_nline', '_dstream', '_iblk', '_fchead'})   # _dstream: a text
                                                                     # dictionary's values as one stream + offsets
 
 
@@ -478,15 +478,35 @@ class Segment:
             d = getattr(self, a, None)
             if isinstance(d, dict):
                 d.clear()
-        for c in self.cols.values():
+        _hot9 = '_tdict' in seg_keep()
+        for _nm9, c in self.cols.items():
             if c.get('mode') not in (0, 3) and 'vals' in c:
                 c['vals'] = None                 # lazily-decoded dicts die too (modes 0/3
             for k in ('intvals', 'raw', 'seqvals', 'ivals', 'fdmap'):   # parse eagerly at
                 if k in c:                       # open: file-shape metadata, they stay)
                     c[k] = None
             ch = c.get('chunks')
-            if isinstance(ch, dict):
-                ch.clear()
+            if isinstance(ch, dict) and ch:
+                # THE DICTIONARY'S CHUNKS ARE DICTIONARY (2026-10-03): a front-coded dictionary's inflated chunks
+                # are its values, decoded -- tier 1, kept like a whole decoded dictionary, through the shelf and
+                # under its ceiling (each literal lookup on movie_info.info re-inflated ~26 chunks, ~130 ms, every
+                # query). Anything the shelf refuses or evicted dies here.
+                _kc9 = {}
+                if _hot9 and c.get('mode') == 1:
+                    try:
+                        import wdb_shelf
+                        for _j9, _b9 in ch.items():
+                            _key9 = ('dchunk', getattr(self, 'path', id(self)), _nm9, _j9)
+                            if wdb_shelf.SHELF.get(_key9) is None:
+                                _n9 = sum(len(x) for x in _b9) if isinstance(_b9, tuple) else len(_b9)
+                                try:
+                                    wdb_shelf.SHELF.put(_key9, _b9, int(_n9), kind='dictionary')
+                                except wdb_shelf.ShelfRefused:
+                                    continue
+                            _kc9[_j9] = _b9
+                    except Exception:
+                        _kc9 = {}
+                ch.clear(); ch.update(_kc9)
         self._presence = 0; self._ov = 0; self._cluster = 0; self._cubes = 0
         # THE LAW, ENFORCED (2026-09-23): the named list above had drifted -- position lists, LIKE
         # flags, regex groups, sparse planes, scanned codes, censuses, date maps and more lived on
@@ -545,6 +565,38 @@ class Segment:
         base, offs = c['fc3_' + kind]
         fb = base + int(offs[j]); fe = base + int(offs[j + 1])
         return np.frombuffer(_z.ZstdDecompressor().decompress(self.read_span(fb, fe)), dtype=np.uint8)
+
+    def _fc_prefix(self, fb, fe, n):
+        """the first n bytes the zstd frame [fb, fe) inflates to -- the frame read in growing pieces and inflated
+        only until n bytes are out (a frame's first block, not the frame)"""
+        import zstandard as _z
+        d = _z.ZstdDecompressor().decompressobj(); out = b''; pos = fb; step = 4096
+        while len(out) < n and pos < fe:
+            q = min(fe, pos + step)
+            out += d.decompress(self.read_span(pos, q)); pos = q; step *= 4
+        return out[:n]
+
+    def fc_head(self, c, j):
+        """THE CHUNK'S FIRST VALUE (2026-10-03): a chunk begins at a restart, so its first entry is written
+        whole -- read from the first bytes of the chunk's frames instead of the chunk (a literal's bisect picks
+        its chunk from the heads, then inflates that one chunk). Kept on the column (tier 1: dictionary data)."""
+        hd = c.get('_fchead')
+        if hd is None:
+            hd = c['_fchead'] = {}
+        v = hd.get(j)
+        if v is not None:
+            return v
+        if c.get('fc3'):
+            bh, oh = c['fc3_h']
+            cp, sl = struct.unpack('<HH', self._fc_prefix(bh + int(oh[j]), bh + int(oh[j + 1]), 4))
+            bt, ot = c['fc3_t']
+            v = self._fc_prefix(bt + int(ot[j]), bt + int(ot[j + 1]), sl)
+        else:
+            fb = c['chunk_base'] + int(c['chunk_foff'][j]); fe = c['chunk_base'] + int(c['chunk_foff'][j + 1])
+            cp, sl = struct.unpack('<HH', self._fc_prefix(fb, fe, 4))
+            v = self._fc_prefix(fb, fe, 4 + sl)[4:]
+        hd[j] = v
+        return v
 
     def __del__(self):
         """the read descriptor dies with the Segment (the suite opens thousands)"""

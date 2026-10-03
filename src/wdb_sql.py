@@ -2362,21 +2362,32 @@ def _dict_eq_mask(seg, name, neg, lit):
                 m8[pos8[lits8 == np.uint32(int(dcode))]] = True
                 seg._codes[ck8] = m8
             return ~m8 if neg else m8
-    td = seg._typed_dict(name)
-    td = td if isinstance(td, np.ndarray) else np.asarray(td, dtype=object)
     V = c['V']
     nullcode = (V - 1) if c['has_null'] else None
-    kind = 'i' if c['dt'] == 0 else ('f' if c['dt'] == 2 else ('i' if c['dt'] == 3 else 'S'))
-    v = _lit_for_col(seg, name, lit, kind)
-    if c['dt'] not in (0, 2, 3) and isinstance(v, int):
-        v = str(v).encode()
-    try:
-        match = (td == v)
-    except Exception:
-        return None
-    mcodes = np.nonzero(match)[0]
-    if nullcode is not None:
-        mcodes = mcodes[mcodes != nullcode]
+    if c['mode'] == 1 and c['dt'] == 1 and name not in seg._tdict:
+        # THE LITERAL BY BISECTION (2026-10-03): a front-coded text dictionary not yet decoded answers one
+        # literal's code by fetch-bisect, as IN already did -- the whole-dictionary decode was 3.8 s on
+        # movie_info.info (2.7M values) for mi.info = 'Horror' (JOB 25a/b), ~0.5 s on cast_info.note
+        import wdb_wherescan as _WSq
+        _lv9 = _WSq._litval(lit) if isinstance(lit, E.Expression) else lit
+        if _lv9 is None:
+            return None
+        _dc9 = _WSq._code_of(seg, name, _lv9)
+        mcodes = np.array([] if _dc9 is None else [int(_dc9)], np.int64)
+    else:
+        td = seg._typed_dict(name)
+        td = td if isinstance(td, np.ndarray) else np.asarray(td, dtype=object)
+        kind = 'i' if c['dt'] == 0 else ('f' if c['dt'] == 2 else ('i' if c['dt'] == 3 else 'S'))
+        v = _lit_for_col(seg, name, lit, kind)
+        if c['dt'] not in (0, 2, 3) and isinstance(v, int):
+            v = str(v).encode()
+        try:
+            match = (td == v)
+        except Exception:
+            return None
+        mcodes = np.nonzero(match)[0]
+        if nullcode is not None:
+            mcodes = mcodes[mcodes != nullcode]
     if c.get('code_enc') == 3 and nullcode is None and len(mcodes) == 1:
         # FRAME-PRESENCE (Jackson's granularity find), riding the tail's OWN literal
         # resolution: pop only the frames containing the code -- 25 of 191 for

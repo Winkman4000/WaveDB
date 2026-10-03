@@ -3906,3 +3906,37 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
 - tests/test_inline_blocks.py: block boundaries (K + 2 rows, 3K + 517), both length widths (a 70,000-byte row),
   point reads in one block and across all, the whole stream with and without point reads first, the object
   array; MIN/MAX, LIKE, =, IN, length(), ORDER BY against DuckDB on the blocked and the one-block layout.
+
+## 2026-10-03 (evening) -- THE LITERAL IN A BIG DICTIONARY: = by bisection, the chunk by its head, the chunks kept
+- RECON (Jackson: "lets recon into movie_info.info IN"): alone, with its codes resident, mi.info IN (8 countries)
+  is 25 ms; inside 21c it took 223 ms wall and 171 ms of its own CPU, on the critical path (the settle waits for
+  it). The codes survive; the dictionary's inflated chunks did not: each literal's code was a fetch-bisect over
+  the 2.7M-value front-coded dictionary, ~3-6 chunk inflations per literal (~26 for 8 countries, ~130 ms), and
+  the end-of-query flush cleared the chunks, so every hot query paid it again.
+- AND THE WORSE ROAD: = took _dict_eq_mask's _typed_dict -- the WHOLE dictionary decoded in Python for one code:
+  3.8 s on movie_info.info (mi.info = 'Horror', 25a/25b: 3096 / 2866 ms cold, the two worst), ~0.5 s on
+  cast_info.note (ci.note = '(voice...)': 8a, 8b, 9b, 19b). Kept after, so true cold paid it every query.
+- 1. = BY BISECTION: _dict_eq_mask resolves the literal by wdb_wherescan._code_of on a front-coded text dictionary
+  not already decoded (as IN did); the decoded-dictionary road stays for the rest.
+- 2. THE CHUNK BY ITS HEAD: a chunk begins at a restart, so its first value is written whole: Segment.fc_head reads
+  it from the first bytes of the chunk's frames (_fc_prefix: the frame read in growing pieces, inflated only until
+  the value is out). _code_of bisects the chunks by their heads, then one chunk by fetch. Equal to the decoded
+  dictionary on every chunked text dictionary of JOB: 2,456 probes (random, every head and its neighbours, absent
+  values both sides), 0 mismatches.
+- 3. THE CHUNKS ARE DICTIONARY: drop_derived keeps a front-coded dictionary's inflated chunks through the shelf
+  (kind 'dictionary', under its ceiling, like a whole decoded dictionary) and the heads as tier 1 ('_fchead');
+  WDB_HOT_KEEP=0 drops both. Cold is untouched (a fresh process has none).
+- MEASURED (the predicate alone, job3): IN 8 countries cold 391 -> 180 ms, after the flush 158 -> 46 ms;
+  = 'Bulgaria' cold 2520 -> 49 ms, first after a flush 4060 -> 39 ms.
+- THE BOARD (JOB true cold/hot, job3, all 113 correct): cold 2.85 (82.7 s) -> 2.63 (73.3 s), hot 2.17 (18.8 s)
+  -> 1.87 (15.5 s). ClickHouse 3.64 / 2.76: WaveDB beats it on 100 queries cold, 100 hot. 25a 3096 -> 893 ms
+  cold, 25b 2866 -> 805; hot 21c 258 -> 172, 27c 295 -> 181, 12a 215 -> 153, 14b 326 -> 177.
+- FOUND BY THE NEW TEST, FIXED: MIN/MAX of a sequence (mode-4) integer column under a filter answered the AVERAGE
+  in wdb_wherescan (the scalar and the GROUP BY executors only knew SUM/AVG past the dictionary kinds):
+  MIN(id) WHERE info = '...' gave 82867.0 for DuckDB's 21106 (pre-existing). MIN/MAX now fold the sequence's
+  values; the planner declines MIN/MAX on any other non-dictionary column instead of guessing.
+- FOUND, STILL OPEN: the single-table fused aggregate (wdb_join._fast_pointer_agg) decodes the whole dictionary
+  for COUNT(*) WHERE info IN (...) -- not on the JOB board (its IN goes through the semi-join organ).
+- tests/test_dict_lookup.py: the head bisect against the decoded dictionary (present, heads, neighbours, absent),
+  =, <>, IN, NOT IN with NULLs against DuckDB cold and after the flush, the dictionary never decoded, chunks and
+  heads kept with WDB_HOT_KEEP=1 and dropped with 0.
