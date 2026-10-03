@@ -1284,9 +1284,14 @@ def _serialize_column(p, zc):
             inline = _serialize_inline(p)
             if len(inline[0]) < len(normal[0]):
                 return inline
+            if INLINE_BLOCK_ROWS > 0 and N > INLINE_BLOCK_ROWS \
+                    and len(_serialize_inline(p, blocked=False)[0]) < len(normal[0]):
+                # THE SAME DECISION AS BEFORE THE BLOCKS: the race is between the representations
+                # (rows inline vs dictionary + numbers); the blocks' cost is an access layout's, paid for reads
+                return inline
     return normal
 
-def _serialize_inline(p):
+def _serialize_inline(p, blocked=True):
     """Mode-5 inline string column: rows stored directly (no dict, no per-row codes). Wins when
     values rarely repeat -- the dictionary pointers become pure overhead. Reconstructs row-order
     bytes from the prepped dict (valb[codes]); payload = zstd(lengths u32) + zstd(concat bytes)."""
@@ -1297,13 +1302,49 @@ def _serialize_inline(p):
     # the inline VALUE blob keeps the archival level: the inline-vs-dictionary decision is a
     # size race and must not ride the code-stream speed knob (a near-unique column flipped
     # modes when CODE_ZSTD_LEVEL went 19 -> 9)
-    zc = zstd.ZstdCompressor(level=max(CODE_ZSTD_LEVEL, INLINE_ZSTD_LEVEL))
-    zl = zc.compress(lengths.tobytes()); zv = zc.compress(concat)
+    lvl = max(CODE_ZSTD_LEVEL, INLINE_ZSTD_LEVEL)
     out = bytearray()
     out += _header(p['nm'], p['V'], p['bits'], 1, 5, 0, p['aux'])
-    out += struct.pack('<I', len(zl)) + zl
-    out += struct.pack('<I', len(zv)) + zv
+    if blocked and INLINE_BLOCK_ROWS > 0 and len(lengths) > INLINE_BLOCK_ROWS:
+        out += _inline_blocks(lengths, concat, lvl)
+    else:
+        zc = zstd.ZstdCompressor(level=lvl)
+        zl = zc.compress(lengths.tobytes()); zv = zc.compress(concat)
+        out += struct.pack('<I', len(zl)) + zl
+        out += struct.pack('<I', len(zv)) + zv
     return bytes(out), (len(out), p['V'], p['bits'], 1, 5, 0, p['aux'])
+
+
+# THE BLOCKED INLINE COLUMN (Jackson, 2026-10-03; the row lengths of the ClickBench flag brought over): the rows
+# cut into blocks of INLINE_BLOCK_ROWS, each block its rows' byte lengths then their text, each zstd alone, and one
+# start table -- a point read inflates the blocks its rows live in, a whole read inflates every block at once.
+# Measured on JOB (zstd 19, cold, evicted): title 10 rows 132 -> 5 ms, whole column 119 -> 28 ms, for +17.5%
+# on the eight text columns (+3.4% of the realm). WDB_INLINE_BLOCK=0 writes the one-block layout.
+INLINE_BLOCK_ROWS = int(os.environ.get('WDB_INLINE_BLOCK', '16384'))
+
+
+def _inline_blocks(lengths, concat, lvl):
+    """<I 0xFFFFFFFF> <I rows per block> <I blocks> <B length width> <q payload bytes>
+       <q start>[blocks + 1] (from the payload's first byte) <I lengths part bytes>[blocks]
+       payload: per block, zstd(lengths u16|u32) then zstd(text)"""
+    from concurrent.futures import ThreadPoolExecutor
+    K = INLINE_BLOCK_ROWS; N = len(lengths)
+    lw = 2 if (N == 0 or int(lengths.max()) < 65536) else 4
+    L = lengths.astype(np.uint16 if lw == 2 else np.uint32)
+    off = np.zeros(N + 1, np.int64); np.cumsum(lengths, out=off[1:])
+    nb = (N + K - 1) // K
+    def one(j):
+        a, b = j * K, min(N, (j + 1) * K); zc = zstd.ZstdCompressor(level=lvl)
+        return zc.compress(L[a:b].tobytes()), zc.compress(concat[off[a]:off[b]])
+    with ThreadPoolExecutor(min(16, nb)) as ex:
+        parts = list(ex.map(one, range(nb)))
+    st = np.zeros(nb + 1, np.int64); np.cumsum([len(x) + len(y) for x, y in parts], out=st[1:])
+    ls = np.array([len(x) for x, _ in parts], np.uint32)
+    out = bytearray(struct.pack('<IIIBq', 0xFFFFFFFF, K, nb, lw, int(st[-1])))
+    out += st.tobytes(); out += ls.tobytes()
+    for x, y in parts:
+        out += x; out += y
+    return bytes(out)
 
 def _serialize_fd(p, det_idx, det_codes):
     """Mode-3 blob: dependent column Y stored as y_by_xcode (Vx entries of Y-codes)

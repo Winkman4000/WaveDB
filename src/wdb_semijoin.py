@@ -739,6 +739,15 @@ def execute(db, tree, sql=None):
                 j = rows[ok][int(rr[ok].argmin()) if isinstance(nd, E.Min) else int(rr[ok].argmax())]
                 out.append(wdb_sql._pyval(seg.values_at_rows(pc, np.array([j]))[0]))
                 continue
+            ib9 = cd.get('iblk')
+            if (cd.get('mode') == 5 and rows.size and ib9 is not None and cd.get('_istream') is None
+                    and np.unique(rows // ib9[0]).size * 4 <= ib9[1]):
+                # THE SURVIVORS' BLOCKS ONLY (2026-10-03): a blocked inline column whose surviving rows sit in a
+                # quarter of its blocks or fewer reads and inflates those blocks alone -- MIN(t.title) in 111 of
+                # JOB's 113 queries opened the whole 2.5M-title stream cold (~230 ms) for a handful of rows
+                vals9 = seg.inline_at(pc, rows)
+                out.append(wdb_sql._pyval(max(vals9) if isinstance(nd, E.Max) else min(vals9)))
+                continue
             if cd.get('mode') == 5 and rows.size:
                 # THE EXTREME ON THE BYTES (2026-10-03): an inline column (never NULL) answers MIN/MAX over
                 # its surviving rows with one compiled pass of byte compares on the stored stream -- no

@@ -3869,3 +3869,40 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
   stream (one zstd frame per column) -- a storage matter.
 - tests/test_job_floor.py: dictionary LIKE / NOT LIKE through the organ, single-table NOT against DuckDB, the
   compiled expansion and integer parse against the value-by-value decoders, the walk's queries walk on and off.
+
+## 2026-10-03 (later still) -- THE BLOCKED INLINE COLUMN (the row lengths brought over)
+- The cold floor: MIN(t.title) is in 111 of JOB's 113 selects, and the emit opened title's whole inline stream
+  (one zstd frame, 2.5M titles) for a handful of rows -- ~229 ms cold every query (n.name 41 selects, 222 ms;
+  chn.name 15, 222 ms; pi.info 1, 858 ms). 1b: 405 ms cold, 223 of it that emit; DuckDB 47.
+- THE CURVE (Jackson: "see how the text columns size scales with the number of blocks and find where the best
+  trade is"; bench/../ch/blocksweep.py + blockcold.py, zstd 19, each block alone + a 16-byte start entry). The
+  eight text columns the queries read, 161 MB today: 1M rows/block +0.6%, 256K +3%, 64K +9%, 16K +17.5%, 4K
+  +28%, 1K +41%. Cold (written, evicted, pread, best of 3), title: today 132 ms for 10 rows / 119 whole; 64K
+  13 / 28; 16K 5 / 28; 4K 3.5 / 51 (small reads lose the whole column). 16K is the knee. A shared trained zstd
+  dictionary only helps at 1K-4K and hurt person_info at every size -- not used.
+- THE REFEREES' SIZE on the same data: ClickHouse 1.88 GB (title 41.9 MB, name 48.1, char_name 51.3, person_info
+  218.8 -- its default codec, 8,192-row granules); DuckDB 2.68 GB file (title <=28.6 MB, person_info <=324 MB
+  uncompressed -- 256 KB blocks counted, an upper bound). WaveDB 830 -> 857 MB; every text column still under both.
+- THE FORMAT (Jackson: the lengths per row, as the ClickBench --row-lengths file keeps them): wdb_encode._inline_
+  blocks -- rows cut into blocks of WDB_INLINE_BLOCK rows (16,384; 0 = the one-block layout), each block its rows'
+  byte lengths (u16, or u32 when a row passes 65,535 bytes) then their text, each zstd 19 alone, compressed on 16
+  threads; one start table and each block's lengths-part size. Marked by a 0xFFFFFFFF where the one-block layout
+  has its lengths size (the mode-2 chunked spine's precedent -- the aux 'chunked' bit can be set already on an
+  inline column by its dictionary origin). Old segments read as before.
+- THE SAME DECISION: the inline-vs-dictionary size race is between representations; when the blocked layout loses
+  it only by its block cost, the one-block size decides, as before. JOB reload: zero mode flips, 14 inline columns
+  blocked. Load got faster (blocks compress in parallel): name 150 -> 20 s, title 89 -> 38, char_name 115 -> 61.
+- READERS (wdb_engine): _iblock (one pread of a block, lengths then text), _istream_blocked (every block on the
+  leaf pool, laid end to end in parallel; blocks a point read already inflated are reused), inline_at (rows in a
+  quarter of the blocks or fewer: those blocks alone, kept per block as tier 1 '_iblk'; more: the whole stream),
+  inline_stream / _inline_values through the stream. The semi-join emit reads MIN/MAX at the survivors' blocks
+  when they sit in a quarter of the blocks or fewer.
+- MEASURED (line items, cold): 1b 405 -> 194 ms; 10c 1142 -> 723 ms.
+- THE BOARD (JOB true cold/hot on the reloaded realm job3, all 113 correct): cold 3.47 (101.1 s) -> 2.85 (82.7 s),
+  hot 2.30 (20.1 s) -> 2.17 (18.8 s). ClickHouse 3.64 (101.4 s) / 2.76 (25.5 s): WaveDB beats it on 98 queries
+  cold, 91 hot. DuckDB 1.00 / 1.03. Next by share: hot, movie_info.info IN / = (35 queries, 190-280 ms).
+- NOT YET: the ClickBench realm is still one-block; its next load writes blocks (its inline columns' size and
+  the kit's load time to be measured then).
+- tests/test_inline_blocks.py: block boundaries (K + 2 rows, 3K + 517), both length widths (a 70,000-byte row),
+  point reads in one block and across all, the whole stream with and without point reads first, the object
+  array; MIN/MAX, LIKE, =, IN, length(), ORDER BY against DuckDB on the blocked and the one-block layout.

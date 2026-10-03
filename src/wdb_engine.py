@@ -18,7 +18,7 @@ _DT_UNITS = ['us','ns','ms','s','D','h','m','M','Y','W']
 #   frame maps, scanned hits, per-code function values, ranks): dies with the query, always.
 _SEG_PROGRAM = frozenset({'_synth', '_civil_lut_cache', '_shape'})     # not data at all
 _SEG_TIER1 = frozenset({'_e8pm', '_tdict'})                            # decoded planes, decoded dictionaries
-_COL_TIER1 = frozenset({'_dictbytes', '_steps', '_istream', '_idict', '_nline', '_dstream'})   # _dstream: a text
+_COL_TIER1 = frozenset({'_dictbytes', '_steps', '_istream', '_idict', '_nline', '_dstream', '_iblk'})   # _dstream: a text
                                                                     # dictionary's values as one stream + offsets
 
 
@@ -227,6 +227,19 @@ class Segment:
             elif mode == 5:
                 # inline string column: no dict, no per-row codes. zstd(lengths u32)+zstd(bytes).
                 zll = struct.unpack_from('<I', buf, off)[0]; off += 4
+                if zll == 0xFFFFFFFF:
+                    meta['chunked'] = False; meta['fc3'] = False   # (aux bits a dictionary origin may have left)
+                    # THE BLOCKED INLINE COLUMN (wdb_encode._inline_blocks): rows per block, blocks, length
+                    # width, payload bytes, the start table, each block's lengths-part size, the payload
+                    K5, nb5, lw5, pb5 = struct.unpack_from('<IIBq', buf, off); off += 17
+                    meta['iblk'] = (int(K5), int(nb5), int(lw5),
+                                    np.frombuffer(buf, np.int64, nb5 + 1, off),
+                                    np.frombuffer(buf, np.uint32, nb5, off + 8 * (nb5 + 1)),
+                                    off + 8 * (nb5 + 1) + 4 * nb5)
+                    off += 8 * (nb5 + 1) + 4 * nb5 + int(pb5)
+                    meta['ivals'] = None
+                    meta['blob'] = (blob0, off); self.cols[nm] = meta; self.order.append(nm)
+                    continue
                 meta['ilen'] = buf[off:off+zll]; off += zll
                 zvl = struct.unpack_from('<I', buf, off)[0]; off += 4
                 meta['ival'] = buf[off:off+zvl]; off += zvl
@@ -848,18 +861,78 @@ class Segment:
         """Mode-5: decode the inline string column to an object array of bytes (cached). Rows are
         stored directly (lengths + concatenated bytes); offsets are cumsum(lengths)."""
         if c.get('ivals') is None:
+            if c.get('iblk') is not None:
+                if c.get('_istream') is None:
+                    c['_istream'] = self._istream_blocked(c)
+                off, mv = c['_istream']
+                c['ivals'] = np.array([bytes(mv[off[i]:off[i+1]]) for i in range(off.size - 1)], dtype=object)
+                return c['ivals']
             lengths = np.frombuffer(self._dz.decompress(c['ilen']), dtype=np.uint32)
             data = self._dz.decompress(c['ival']); mv = memoryview(data)
             off = np.zeros(len(lengths) + 1, dtype=np.int64); np.cumsum(lengths, out=off[1:])
             c['ivals'] = np.array([bytes(mv[off[i]:off[i+1]]) for i in range(len(lengths))], dtype=object)
         return c['ivals']
+
+    def _iblock(self, c, j):
+        """block j of a blocked inline column, inflated: (its rows' offsets from the block's first byte, the
+        block's text) -- one read of the block's bytes, the lengths part, then the text part"""
+        K, nb, lw, st, ls, base = c['iblk']
+        raw = self.read_span(base + int(st[j]), base + int(st[j + 1])); s = int(ls[j])
+        dz = self._dz
+        L = np.frombuffer(dz.decompress(raw[:s]), np.uint16 if lw == 2 else np.uint32)
+        o = np.zeros(L.size + 1, np.int64); np.cumsum(L, out=o[1:])
+        return o, dz.decompress(raw[s:])
+
+    def _istream_blocked(self, c):
+        """the whole inline stream of a blocked column (off, memoryview): every block read and inflated on the
+        leaf pool, then laid end to end in parallel (blocks already inflated by point reads are reused)"""
+        K, nb, lw, st, ls, base = c['iblk']
+        have = c.get('_iblk') or {}
+        need = [j for j in range(nb) if j not in have]
+        got = dict(have)
+        if need:
+            got.update(zip(need, _leaf_pool().map(lambda j: self._iblock(c, j), need)))
+        rows = np.array([got[j][0].size - 1 for j in range(nb)], np.int64)
+        sizes = np.array([len(got[j][1]) for j in range(nb)], np.int64)
+        boff = np.zeros(nb + 1, np.int64); np.cumsum(sizes, out=boff[1:])
+        roff = np.zeros(nb + 1, np.int64); np.cumsum(rows, out=roff[1:])
+        blob = np.empty(max(int(boff[-1]), 1), np.uint8)
+        off = np.empty(int(roff[-1]) + 1, np.int64); off[-1] = boff[-1]
+        def put(j):
+            o, t = got[j]
+            if len(t): blob[boff[j]:boff[j + 1]] = np.frombuffer(t, np.uint8)
+            off[roff[j]:roff[j + 1]] = o[:-1] + boff[j]
+        list(_leaf_pool().map(put, range(nb)))
+        c.pop('_iblk', None)                          # the whole stream holds every block now
+        return off, memoryview(blob)[:int(boff[-1])]
+
     def inline_at(self, nm, rows):
         """Mode-5 POINT READ: bytes at ROW positions. Decompresses lengths+bytes
         once per column (cached on the column), then slices -- no full object
         array, no np.unique. (values_at's mode-5 path built the whole sorted
-        dict to answer 20 lookups: 7s per query on Q10, 2026-09-01.)"""
+        dict to answer 20 lookups: 7s per query on Q10, 2026-09-01.)
+        A BLOCKED column (2026-10-03): rows in a quarter of the blocks or fewer inflate those blocks alone
+        (kept on the column per block, tier 1); more, the whole stream."""
         c = self.cols[nm]
         st = c.get('_istream')
+        if st is None and c.get('iblk') is not None:
+            rows = np.asarray(rows, dtype=np.int64)
+            if rows.size == 0:
+                return []
+            K, nb = c['iblk'][0], c['iblk'][1]
+            bl = np.unique(rows // K)
+            if bl.size * 4 <= nb:
+                cache = c.setdefault('_iblk', {})
+                need = [int(j) for j in bl if int(j) not in cache]
+                if need:
+                    for j, v in zip(need, _leaf_pool().map(lambda j: self._iblock(c, j), need)):
+                        cache[j] = v
+                out = []
+                for r in rows.tolist():
+                    o, t = cache[r // K]; i = r - (r // K) * K
+                    out.append(t[o[i]:o[i + 1]])
+                return out
+            st = c['_istream'] = self._istream_blocked(c)
         if st is None:
             lengths = np.frombuffer(self._dz.decompress(c['ilen']), dtype=np.uint32)
             off = np.zeros(len(lengths) + 1, dtype=np.int64); np.cumsum(lengths, out=off[1:])
@@ -871,8 +944,12 @@ class Segment:
     def inline_stream(self, nm):
         """(blob_u8, off) of a mode-5 column's inline stream, cached -- the raw
         substrate for byte kernels (LIKE, prefixes) that never touch Python."""
-        self.inline_at(nm, np.empty(0, dtype=np.int64))     # warm the cache
-        off, mv = self.cols[nm]['_istream']
+        c = self.cols[nm]
+        if c.get('_istream') is None and c.get('iblk') is not None:
+            c['_istream'] = self._istream_blocked(c)          # every block, inflated at once
+        else:
+            self.inline_at(nm, np.empty(0, dtype=np.int64))     # warm the cache
+        off, mv = c['_istream']
         blob = np.frombuffer(mv, dtype=np.uint8)
         return blob, off
 
