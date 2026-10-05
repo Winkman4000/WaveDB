@@ -4083,6 +4083,33 @@ def fc_expand(raw, R, blob, off, i0, b0):
 
 
 @njit(cache=True, nogil=True)
+def pk_table(pk, lo, size, tab):
+    """THE PARENT KEY AS AN ADDRESS: tab[key - lo] = the parent row holding key (tab arrives filled with -1).
+    False the moment a key repeats (not a pointer's parent) -- one pass over the parent keys"""
+    for i in range(pk.shape[0]):
+        k = pk[i] - lo
+        if tab[k] != -1:
+            return False
+        tab[k] = i
+    return True
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def pk_probe(ck, lo, tab, out):
+    """every child row's parent row, read at its key's address (-1 when no parent holds it); the misses counted"""
+    n = ck.shape[0]; size = tab.shape[0]; miss = 0
+    for i in prange(n):
+        k = ck[i] - lo
+        if k < 0 or k >= size:
+            out[i] = -1; miss += 1
+        else:
+            v = tab[k]; out[i] = v
+            if v < 0:
+                miss += 1
+    return miss
+
+
+@njit(cache=True, nogil=True)
 def parse_m0_ints(buf, start, out):
     """a plain (mode-0) integer dictionary parsed where it lies: out.size entries of <u32 len><digits>, from
     byte start. Decimal digits with an optional leading '-', 1..18 of them; anything else -> False (the

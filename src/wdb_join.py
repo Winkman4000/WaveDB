@@ -1700,11 +1700,15 @@ def _join_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
     import pandas as pd
     pk = np.asarray(wdb_sql._col(pseg, pkey)[0])
     ck = np.asarray(wdb_sql._col(cseg, ckey)[0])
-    if pk.dtype.kind in 'OSU' or ck.dtype.kind in 'OSU':
-        pk = pk.astype(object); ck = ck.astype(object)
-    pidx = pd.Index(pk)
-    if not pidx.is_unique: raise _FastUnsupported                 # many-to-many -> not a pointer
-    ptr = np.ascontiguousarray(pidx.get_indexer(ck), dtype=np.int64)
+    ptr = _direct_pointer(ck, pk, allow_miss=True)               # integer keys in a narrow range: the key as an address
+    if ptr is False:
+        raise _FastUnsupported                                    # many-to-many -> not a pointer
+    if ptr is None:
+        if pk.dtype.kind in 'OSU' or ck.dtype.kind in 'OSU':
+            pk = pk.astype(object); ck = ck.astype(object)
+        pidx = pd.Index(pk)
+        if not pidx.is_unique: raise _FastUnsupported             # many-to-many -> not a pointer
+        ptr = np.ascontiguousarray(pidx.get_indexer(ck), dtype=np.int64)
     cache[k] = ptr
     return ptr
 
@@ -4333,16 +4337,30 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         # THE KEY IS THE ALIAS EVERY OTHER GROUP COLUMN ROUTES TO (Q18: both
         # c_name and o_orderkey are unique keys; only orders can host customer's
         # attributes -- customer is orders' PARENT, not the reverse).
-        cands9 = []
+        # ONE UNIQUE COLUMN PER TABLE IS ENOUGH, THE CHEAP ONES ASKED FIRST (2026-10-04): a table's candidacy
+        # needs one unique group column; uniqueness is free for a sequence column or a null-free dictionary
+        # (distinct count = rows) and a whole-column sort otherwise -- TPC-H Q10 sorted c_name, c_phone,
+        # c_address and c_comment (6.2 s hot) after c_custkey had already answered. Tables keep the order of
+        # their first group column.
+        def _ucost9(sg, pc):
+            c9 = sg.cols.get(pc, {})
+            if c9.get('mode') in (4, 6): return 0
+            if c9.get('mode') in (0, 1, 2) and not c9.get('has_null'): return 1
+            return 2
+        by9 = {}
         for g, sg, pc, cp in gcols9:
             if cp is None: continue
             a9 = _alias_of(g)
             if not a9: return None
-            try:
-                if _key_is_unique(db, alias2t9.get(a9, a9), pc):
-                    cands9.append((a9, cp, sg))
-            except Exception:
-                continue
+            by9.setdefault(a9, []).append((_ucost9(sg, pc), len(by9.get(a9, [])), pc, cp, sg))
+        cands9 = []
+        for a9, cols9 in by9.items():
+            for _c9, _i9, pc, cp, sg in sorted(cols9):
+                try:
+                    if _key_is_unique(db, alias2t9.get(a9, a9), pc):
+                        cands9.append((a9, cp, sg)); break
+                except Exception:
+                    continue
         if not cands9: return None
         def _route_for(A9c):
             def _r(g):
@@ -5497,6 +5515,51 @@ def _key_is_unique(db, table, col):
 
 _JPTR_ASKED = set()
 _JPTR_NOT = set()
+_DIRECT_MAX = 1 << 28           # a direct-address table up to 268M slots (1 GB of int32)
+
+
+def _key_values(seg, pc):
+    """A JOIN KEY COLUMN, DECODED, ON THE SHELF (2026-10-04): the same tier-1 entry the semi-join organ keeps
+    ('keys', segment, column: int32 values, kept across queries under the shelf's ceiling -- Jackson's ruling
+    on decoded keys); a null-free integer column of 1M+ rows whose values fit is shelved here too. lineitem's
+    l_orderkey decoded at 290 ms per query (codes 180, a one-thread gather 115) for every pointer build."""
+    import wdb_shelf
+    c9 = seg.cols.get(pc, {})
+    clean9 = not c9.get('has_null') and seg._overrides(pc) is None   # the semi-join's entries write NULL as -1:
+    if clean9:                                                        # a NULL parent key must never meet a NULL child
+        hit = wdb_shelf.SHELF.get(('keys', seg.path, pc))
+        if hit is not None:
+            return hit
+    v = np.asarray(wdb_sql._col(seg, pc)[0])
+    if (clean9 and v.dtype.kind in 'iu' and v.size >= 1_000_000
+            and int(v.min()) >= 0 and int(v.max()) < (1 << 31)):
+        v = v.astype(np.int32)
+        try: wdb_shelf.SHELF.put(('keys', seg.path, pc), v, int(v.nbytes), kind='keys')
+        except Exception: pass
+    return v
+
+
+def _direct_pointer(ck, pk, allow_miss=False):
+    """THE KEY AS AN ADDRESS (2026-10-04): integer parent keys spanning a range not much wider than their count
+    (TPC-H's o_orderkey: 15M keys over 60M values) are a table indexed by key -- one pass writes each parent row
+    at its key, one parallel pass reads every child row's parent at its key. pandas' hash (Index.get_indexer,
+    one thread) was ~4.9 s of every lineitem-orders query at SF10. Returns the pointer (int64), False when it
+    is not one (a repeated parent key, or -- unless allow_miss, where it stays -1 -- a child key no parent holds),
+    None when the keys don't suit."""
+    if ck.dtype.kind not in 'iu' or pk.dtype.kind not in 'iu' or pk.size == 0 or pk.size >= (1 << 31):
+        return None
+    lo = int(pk.min()); hi = int(pk.max()); size = hi - lo + 1
+    if size > _DIRECT_MAX or size > 8 * pk.size + (1 << 20):
+        return None
+    import wdb_kernels as _WKp
+    _k9 = lambda a: np.ascontiguousarray(a) if a.dtype in (np.int32, np.int64) else np.ascontiguousarray(a, dtype=np.int64)
+    tab = np.full(size, -1, np.int32)
+    if not _WKp.pk_table(_k9(pk), np.int64(lo), np.int64(size), tab):
+        return False                                              # many-to-many -> not a pointer
+    ptr = np.empty(ck.size, np.int64)
+    if _WKp.pk_probe(_k9(ck), np.int64(lo), tab, ptr) > 0 and not allow_miss:
+        return False                                              # unmatched child rows -> would drop -> fall back
+    return ptr
 
 
 def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
@@ -5583,12 +5646,16 @@ def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
                     _js.dump(mark, open(side + '.no', 'w'))
             except Exception: pass
         raise _FastUnsupported
-    ck = np.asarray(wdb_sql._col(cseg, cp)[0]); pk = np.asarray(wdb_sql._col(pseg, pp)[0])
-    pidx = pd.Index(pk)
-    if not pidx.is_unique: _refuse()                              # many-to-many -> not a pointer
-    ptr = pidx.get_indexer(ck)
-    if (ptr < 0).any(): _refuse()                                 # unmatched child rows -> would drop -> fall back
-    ptr = ptr.astype(np.int64)
+    ck = _key_values(cseg, cp); pk = _key_values(pseg, pp)
+    ptr = _direct_pointer(ck, pk)
+    if ptr is None:
+        pidx = pd.Index(pk)
+        if not pidx.is_unique: _refuse()                          # many-to-many -> not a pointer
+        ptr = pidx.get_indexer(ck)
+        if (ptr < 0).any(): _refuse()                             # unmatched child rows -> would drop -> fall back
+        ptr = ptr.astype(np.int64)
+    elif ptr is False:
+        _refuse()
     if side and mark:
         try:
             import wdb_shelf as _wsh9

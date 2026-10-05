@@ -3,7 +3,9 @@ queries (dates as int-days, decimals as doubles -- both engines read
 the identical parquet-born bytes), duck-refereed, float-tolerant
 comparator, holes reported as findings not failures."""
 import sys, time, os, duckdb
-sys.path.insert(0, '/workspace/WaveDB/src')
+if not os.environ.get('PYTHONPATH'):                    # the source on PYTHONPATH wins (the A/B trees, the pod's copy)
+    sys.path.insert(0, '/workspace/WaveDB/src')
+TPCH_DB = os.environ.get('WDB_TPCH_DB', '/workspace/data/tpchdb')
 import wdb_kernels
 wdb_kernels.warm()
 from wdb_db import Database
@@ -34,7 +36,8 @@ def rows_of(x):
 
 
 def main():
-    db = Database.open('/workspace/data/tpchdb')
+    db = Database.open(TPCH_DB)
+    print('realm %s, wdb_db from %s' % (TPCH_DB, sys.modules['wdb_db'].__file__), flush=True)
     con = duckdb.connect('/workspace/data/tpch_ref.db', read_only=True)
     wins = 0
     okc = 0

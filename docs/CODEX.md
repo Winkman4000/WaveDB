@@ -3940,3 +3940,37 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
 - tests/test_dict_lookup.py: the head bisect against the decoded dictionary (present, heads, neighbours, absent),
   =, <>, IN, NOT IN with NULLs against DuckDB cold and after the flush, the dictionary never decoded, chunks and
   heads kept with WDB_HOT_KEEP=1 and dropped with 0.
+
+## 2026-10-04 -- TPC-H: THE KEY AS AN ADDRESS, ONE UNIQUE COLUMN PER TABLE, THE KEYS KEPT
+- THE BOARD WAS ON UNCERTAIN GROUND: bench/board_tpch.py put /workspace/WaveDB/src (not a checkout) ahead of
+  PYTHONPATH and read /workspace/data/tpchdb (9.2 GB, every old sidecar). Now the source on PYTHONPATH wins and
+  WDB_TPCH_DB names the realm. On the sidecar-off realm (/workspace/data/sub/tpch, SF10: lineitem 60M, orders 15M)
+  with today's source and the JOB board's env: 13/14 correct, 53.0 s against DuckDB's 4.5 (Oct 2 recorded 52.3).
+- WHERE IT WENT (py-spy, all threads; every call timed): the lineitem -> orders pointer, ~4.9 s in every
+  lineitem-orders query (Q3, Q4, Q5, Q7, Q10, Q12, Q18): pandas Index.get_indexer, one thread, rebuilt per query
+  (the jptr sidecar is off, and a pointer is a join index -- tier 2, it may not outlive the query). And Q10's
+  top-k door asked _key_is_unique of every group column: c_name, c_phone, c_address, c_comment sorted whole in
+  Python, 6.2 s, after c_custkey had answered.
+- 1. THE KEY AS AN ADDRESS (wdb_join._direct_pointer; kernels pk_table, pk_probe): integer parent keys whose
+  range is at most 8x their count (+1M) and under 2^28 slots are a table indexed by key -- one pass writes each
+  parent row at its key (a repeat: not a pointer), one parallel pass reads every child's parent (a miss: not a
+  pointer, or -1 where allowed). Used by _hash_pointer and the h2o road join (allow_miss); the hash stays for
+  the rest. lineitem -> orders 4.98 s -> 0.42 s.
+- 2. ONE UNIQUE COLUMN PER TABLE, THE CHEAP ONES FIRST (_topk_attr_door): a table's candidacy needs one unique
+  group column; sequence columns and null-free dictionaries answer in O(1) and are asked first; the table's other
+  columns are not asked once one answers. The key pointer chosen is the table's, the same for any of its columns.
+  Q10 11.6 s -> 0.90 s.
+- 3. THE KEYS KEPT (wdb_join._key_values): the pointer's key columns come from the shelf entry the semi-join organ
+  already keeps ('keys', segment, column; int32; tier 1 by Jackson's ruling on decoded keys), and a null-free
+  integer key of 1M+ rows is shelved there too. NULL-bearing or overridden columns never take a shelf hit (the
+  semi-join writes NULL as -1; a NULL parent must never meet a NULL child). l_orderkey's decode was 290 ms per
+  query (codes 180 -- the staircase -- and a one-thread gather 115). The pointer hot: 0.42 s -> 0.07 s.
+- THE BOARD (hot, best of 3 in one process, sidecars off, strict query memory): 53.0 s -> 15.9 (1) -> 8.9 (2) ->
+  5.4 s (3); DuckDB 4.4 s. 13/14 correct throughout (Q21 still a hole). Faster than DuckDB on 5 (Q1, Q5, Q10,
+  Q13, Q19); geomean of WaveDB / DuckDB 1.14.
+- NOTED, NOT DONE: l_orderkey's dictionary IS orders.o_orderkey (equal arrays), so that pointer is the codes
+  themselves; the staircase codes decode costs 180 ms cold. Q4 (0.83 vs 0.29 s) is the worst ratio left.
+- tests/test_direct_pointer.py: the address table against pandas' hash (shuffled, offset, gapped, int32/int64,
+  misses refused or kept, repeated parents refused, sparse and non-integer keys left to the hash); a Q3-shaped
+  join, a top-k grouped on a key plus unique text columns, and a join count against DuckDB, twice (the second
+  round on the shelved keys).
