@@ -2143,6 +2143,84 @@ def distinct_on_rewrite(tree):
 
 
 
+_WIN_DIRECT_K = 1 << 22     # a partition code space this small is used as ids directly (no renumbering sort)
+
+
+def _win_nulls(seg, pc, rr):
+    """NULL flags of column pc at rows rr (all False for a column without NULLs)."""
+    c = seg.cols.get(pc) or {}
+    if not c.get('has_null'):
+        return np.zeros(rr.size, bool)
+    if c.get('mode') in (0, 1, 2) and seg._overrides(pc) is None:
+        return np.asarray(seg.codes_at(pc, rr)) == int(c['V']) - 1     # the NULL code sits past the dictionary
+    arr, nm = wdb_sql._col(seg, pc)
+    if nm is None:
+        a9 = np.asarray(arr, dtype=object)[rr]
+        return np.fromiter((v is None for v in a9), bool, a9.size)
+    return np.asarray(nm, bool)[rr]
+
+
+def _win_partition_totals(seg, pm, fn, fname, gid, rows):
+    """PARTITION TOTALS WITHOUT A SORT (2026-10-05, scope scalar_corr: 2.7 s): AGG(x) OVER (PARTITION BY g)
+    is a group-by read back at every row -- one counting pass over the partition ids gives the totals,
+    tot[gid] puts them back on the rows in their own order. MIN/MAX on a sorted dictionary run on the
+    CODES (the largest code holds the largest value). NULLs are skipped as SQL skips them; a partition
+    with no value answers NULL. None when the column isn't plain enough (the sorted road answers)."""
+    R = int(gid.size)
+    if R == 0: return None
+    G = int(gid.max()) + 1
+    if G > max(_WIN_DIRECT_K, R): return None
+    arg = fn.this
+    if fname == 'Count' and (arg is None or isinstance(arg, E.Star)):
+        return np.bincount(gid, minlength=G).astype(np.int64)[gid]
+    if not isinstance(arg, E.Column) or fn.args.get('distinct'): return None
+    pc = pm.get(arg.name, arg.name); c = seg.cols.get(pc) or {}
+    nul = _win_nulls(seg, pc, rows)
+    keep = ~nul if nul.any() else None
+    g_nn = gid if keep is None else gid[keep]
+    if fname == 'Count':
+        return np.bincount(g_nn, minlength=G).astype(np.int64)[gid]
+    if c.get('dt') not in (0, 2): return None
+    is_int = c.get('dt') == 0
+    have = np.bincount(g_nn, minlength=G) > 0              # partitions holding at least one value
+    coded = c.get('mode') in (0, 1, 2) and seg._overrides(pc) is None
+    if coded:
+        base = np.asarray(seg._typed_dict(pc), dtype=(np.int64 if is_int else np.float64))
+        cd = np.asarray(seg.codes_at(pc, rows)).astype(np.int64)
+        if keep is not None: cd = cd[keep]
+        if fname in ('Min', 'Max') and base.size:
+            acc = (wdb_kernels.group_max if fname == 'Max' else wdb_kernels.group_min)(g_nn, cd, G)
+            tot = base[np.clip(acc, 0, base.size - 1)]
+        else:
+            vals = base[cd]
+    else:
+        arr, _nm = wdb_sql._col(seg, pc)
+        vals = np.asarray(arr)[rows]
+        if keep is not None: vals = vals[keep]
+        if vals.dtype.kind not in 'iuf': return None
+        vals = vals.astype(np.int64 if is_int else np.float64)
+        if fname in ('Min', 'Max'):
+            if is_int:
+                tot = np.full(G, np.iinfo(np.int64).min if fname == 'Max' else np.iinfo(np.int64).max, np.int64)
+            else:
+                tot = np.full(G, -np.inf if fname == 'Max' else np.inf)
+            (np.maximum if fname == 'Max' else np.minimum).at(tot, g_nn, vals)
+    if fname in ('Sum', 'Avg'):
+        if is_int and vals.size and float(np.abs(vals).max()) * vals.size >= 2.0 ** 53:
+            tot = np.zeros(G, np.int64); np.add.at(tot, g_nn, vals)          # too wide for an exact float sum
+        else:
+            tot = np.bincount(g_nn, weights=vals.astype(np.float64), minlength=G)
+            if is_int and fname == 'Sum': tot = np.rint(tot).astype(np.int64)
+        if fname == 'Avg':
+            tot = tot / np.maximum(np.bincount(g_nn, minlength=G), 1)
+    out = tot[gid]
+    if keep is not None:
+        miss = ~have[gid]
+        if miss.any():                                       # a partition of only NULLs answers NULL
+            out = out.astype(object); out[miss] = None
+    return out
+
+
 def _window_door(db, tree):
     """THE WINDOW DOOR: single-table SELECT with window projections. Survivors,
     composite partition ids, ONE lexsort by (partition, order), boundaries,
@@ -2243,11 +2321,24 @@ def _window_door(db, tree):
                 pc = pm.get(c.name, c.name); cd = seg.cols.get(pc, {})
                 V = int(cd.get('V') or 1)
                 codes = np.asarray(seg.codes_at(pc, rows)).astype(np.int64)
+                if codes.size: V = max(V, int(codes.max()) + 1)     # override codes sit past V
                 if K * V > (1 << 62): raise _FastUnsupported
                 gid = gid * V + codes; K *= V
-            _u, gid = np.unique(gid, return_inverse=True)
+            if K > _WIN_DIRECT_K:
+                _u, gid = np.unique(gid, return_inverse=True)
+            # else: THE CODES ARE THE PARTITION IDS (2026-10-05): with a small code space the composite code
+            # needs no renumbering -- every step below takes ids with gaps (np.unique was a 10M-row sort)
         else:
-            gid = np.zeros(R, np.int64)
+            gid = np.zeros(R, np.int64); K = 1
+        fname = type(fn).__name__
+        if not ords and fname in ('Sum', 'Count', 'Avg', 'Min', 'Max'):
+            _tv9 = _win_partition_totals(seg, pm, fn, fname, gid, rows)
+            if _tv9 is not None:
+                val = _tv9
+                if outer9 is not win:
+                    val = _arith9(outer9, np.asarray(val, dtype=np.float64))
+                out_cols[i] = val                       # already in survivor order: no sort, no inverse
+                continue
         keys = [gid]
         for o in ords:
             k = sort_key(o.this, rows)
@@ -2312,6 +2403,9 @@ def _window_door(db, tree):
             arg = fn.this
             if fname == 'Count' and (arg is None or isinstance(arg, E.Star)):
                 x = np.ones(R, np.float64)
+            elif fname == 'Count' and isinstance(arg, E.Column):
+                # COUNT(col) counts the col's non-NULL rows -- it summed the VALUES before (2026-10-05)
+                x = (~_win_nulls(seg, pm.get(arg.name, arg.name), rows[order_idx])).astype(np.float64)
             else:
                 if not isinstance(arg, E.Column): raise _FastUnsupported
                 x = np.asarray(col_at(arg.name, rows[order_idx]), dtype=np.float64)
@@ -2390,7 +2484,16 @@ def _window_door(db, tree):
                 arrs.append(np.asarray(list(seg.values_at_rows(pc, rows)), dtype=object))
     q9 = tree.args.get('qualify')
     if q9 is not None and R:
-        env9 = {nm: a for nm, a in zip(names9, arrs)}
+        def _qnum9(a):
+            """a numeric column holding NULLs arrives as objects with None: as floats with NaN the
+            comparison is simply false there, as SQL's NULL comparison is (it raised TypeError)"""
+            if a.dtype != object: return a
+            nn9 = a[np.not_equal(a, None)]
+            if nn9.size and isinstance(nn9[0], (int, float, np.integer, np.floating)) and not isinstance(nn9[0], bool):
+                try: return a.astype(np.float64)
+                except (TypeError, ValueError): return a
+            return a
+        env9 = {nm: _qnum9(a) for nm, a in zip(names9, arrs)}
         m9 = np.asarray(wdb_sql._eval_rows(seg, q9.this, None, None, env=env9))
         if m9.dtype != bool:
             m9 = np.array([bool(v) if v is not None else False for v in m9], dtype=bool)
@@ -2656,6 +2759,236 @@ def _route9(name):
         print('ROUTE: %s' % name, flush=True)
 
 
+_OUTER_COUNT_SERVED = [0]   # how many outer joins the count door answered (tests read it)
+
+
+def _outer_count_door(db, tree):
+    """THE OUTER JOIN AS COUNTS OVER THE POINTER (2026-10-05, scope right_join 1.4 s, full_outer 0.8 s,
+    full_outer_extra 3.3 s -- all in the pandas merge). When one side's key is unique (the parent), every
+    child row points at ONE parent or at none, so a RIGHT/FULL (or parent-side LEFT) join's aggregates need
+    no joined rows at all: per parent, how many child rows point at it (and their sums, counts, mins,
+    maxes); a parent nobody points at still stands as one row with the child's side NULL; on a FULL join the
+    child rows that point nowhere are one more row with the parent's side NULL. An extra single-sided ON
+    condition only decides MATCHING (an unmatched row still stands). GROUP BY parent columns (or none).
+    Returns (rows, names) or None (not this shape)."""
+    if not isinstance(tree, E.Select): return None
+    joins = tree.args.get('joins') or []
+    if len(joins) != 1: return None
+    if tree.args.get('where') is not None or tree.args.get('distinct') is not None: return None
+    if tree.find(E.Window) is not None: return None
+    jn = joins[0]
+    side = (jn.args.get('side') or '').upper(); kind = (jn.args.get('kind') or '').upper()
+    if side not in ('LEFT', 'RIGHT', 'FULL') or kind not in ('', 'OUTER'): return None
+    frm = tree.args.get('from') or tree.args.get('from_')
+    if frm is None or not isinstance(frm.this, E.Table) or not isinstance(jn.this, E.Table): return None
+    lt, la = frm.this.name, (frm.this.alias or frm.this.name)
+    rt, ra = jn.this.name, (jn.this.alias or jn.this.name)
+    if la == ra: return None
+    on = jn.args.get('on')
+    if on is None or jn.args.get('using'): return None
+    lcols = set(db.cat.column_names(lt)); rcols = set(db.cat.column_names(rt))
+    def own(c):
+        if c.table: return c.table if c.table in (la, ra) else None
+        if c.name in lcols and c.name not in rcols: return la
+        if c.name in rcols and c.name not in lcols: return ra
+        return None
+    def _fl(x):
+        if isinstance(x, E.Paren): return _fl(x.this)
+        if isinstance(x, E.And): return _fl(x.this) + _fl(x.expression)
+        return [x]
+    eq = None; extras = []
+    for cj in _fl(on):
+        if cj.find(E.Subquery) is not None: return None
+        sd = {own(c) for c in cj.find_all(E.Column)}
+        if None in sd or not sd: return None
+        if (eq is None and isinstance(cj, E.EQ) and isinstance(cj.this, E.Column) and isinstance(cj.expression, E.Column)
+                and {own(cj.this), own(cj.expression)} == {la, ra}):
+            eq = cj
+        elif len(sd) == 1:
+            extras.append((sd.pop(), cj))
+        else:
+            return None                                   # a two-sided extra condition: the merge decides it
+    if eq is None: return None
+    a, b = eq.this, eq.expression
+    if own(a) == ra: a, b = b, a
+    try:
+        if _key_is_unique(db, rt, b.name):
+            (ft, fa, fk), (dt_, da, dk) = (lt, la, a), (rt, ra, b)
+            pres_f, pres_d = side in ('LEFT', 'FULL'), side in ('RIGHT', 'FULL')
+        elif _key_is_unique(db, lt, a.name):
+            (ft, fa, fk), (dt_, da, dk) = (rt, ra, b), (lt, la, a)
+            pres_f, pres_d = side in ('RIGHT', 'FULL'), side in ('LEFT', 'FULL')
+        else:
+            return None
+        if not pres_d: return None                        # child-preserving LEFT: the fused pointer paths own it
+        fseg, _f9 = _solo_segment(db, ft); dseg, _d9 = _solo_segment(db, dt_)
+    except _FastUnsupported:
+        return None
+    fpm = db.cat.phys_map(ft); dpm = db.cat.phys_map(dt_)
+    group = tree.args.get('group')
+    gcols = list(group.expressions) if group is not None else []
+    for g in gcols:
+        if not isinstance(g, E.Column) or own(g) != da: return None
+    gnames = [g.name for g in gcols]
+    specs = []                                            # ('key', i) | (fn, owner, physcol | None)
+    for p in tree.expressions:
+        nd = p.this if isinstance(p, E.Alias) else p
+        if isinstance(nd, E.Column):
+            if own(nd) != da or nd.name not in gnames: return None
+            specs.append(('key', gnames.index(nd.name)))
+            continue
+        fname = type(nd).__name__
+        if fname not in ('Count', 'Sum', 'Avg', 'Min', 'Max'): return None
+        arg = nd.this
+        if fname == 'Count' and isinstance(arg, E.Star):
+            specs.append(('Star', None, None)); continue
+        if not isinstance(arg, E.Column) or own(arg) is None: return None
+        if own(arg) == da and fname != 'Count': return None
+        pm9 = fpm if own(arg) == fa else dpm
+        specs.append((fname, 'F' if own(arg) == fa else 'D', pm9.get(arg.name, arg.name)))
+    if not any(s[0] != 'key' for s in specs): return None
+    fkp = fpm.get(fk.name, fk.name); dkp = dpm.get(dk.name, dk.name)
+    if (dseg.cols.get(dkp) or {}).get('has_null'): return None
+    NF = int(fseg.N); ND = int(dseg.N)
+    try:
+        ptr = _join_pointer(db, ft, fkp, fseg, dt_, dkp, dseg)
+    except _FastUnsupported:
+        return None
+    ptr = np.asarray(ptr)
+    if ptr.size != NF: return None
+    if (fseg.cols.get(fkp) or {}).get('has_null'):
+        ptr = ptr.copy(); ptr[_win_nulls(fseg, fkp, np.arange(NF, dtype=np.int64))] = -1   # a NULL key matches nothing
+    def _strip(cj):
+        c2 = cj.copy()
+        for c in c2.find_all(E.Column): c.set('table', None)
+        return c2
+    matched = ptr >= 0
+    mD = None
+    for ow, cj in extras:
+        if ow == fa:
+            matched &= np.asarray(wdb_sql._eval_pred(fseg, _strip(cj), lambda nm: fpm.get(nm, nm)), dtype=bool)
+        else:
+            m9 = np.asarray(wdb_sql._eval_pred(dseg, _strip(cj), lambda nm: dpm.get(nm, nm)), dtype=bool)
+            mD = m9 if mD is None else (mD & m9)
+    if mD is not None:
+        mi = np.flatnonzero(matched); matched[mi] = mD[ptr[mi]]
+    pm_ = ptr[matched]
+    cnt = np.bincount(pm_, minlength=ND)
+    mult = cnt.copy()
+    mult[cnt == 0] = 1                                    # pres_d: a parent nobody points at is one row
+    unF = ~matched if pres_f else None
+    nunF = int(unF.sum()) if pres_f else 0
+    ex = np.flatnonzero(mult > 0)
+    extra = pres_f and nunF > 0
+    NR = ex.size + (1 if extra else 0)                    # partial rows: the parents, then the unmatched children
+    # per-spec partials over the partial rows: n (values counted) and v (sum / min / max)
+    parts = []
+    for s in specs:
+        if s[0] == 'key':
+            parts.append(None); continue
+        if s[0] == 'Star':
+            n = mult[ex].astype(np.int64)
+            parts.append((np.append(n, nunF) if extra else n, None)); continue
+        fn9, side9, pc = s
+        if side9 == 'D':                                  # COUNT(parent col): every row of that parent counts
+            dnn = ~_win_nulls(dseg, pc, ex)
+            n = (mult[ex] * dnn).astype(np.int64)
+            parts.append((np.append(n, 0) if extra else n, None)); continue
+        fnul = _win_nulls(fseg, pc, np.arange(NF, dtype=np.int64))
+        sel = matched & ~fnul
+        n = np.bincount(ptr[sel], minlength=ND)[ex].astype(np.int64)
+        un = (unF & ~fnul) if extra else None
+        if fn9 == 'Count':
+            parts.append((np.append(n, int(un.sum())) if extra else n, None)); continue
+        c9 = fseg.cols.get(pc) or {}
+        if c9.get('dt') not in (0, 2): return None
+        arr, _nm9 = wdb_sql._col(fseg, pc)
+        arr = np.asarray(arr)
+        if arr.dtype.kind not in 'iuf': return None
+        is_int = c9.get('dt') == 0
+        vv = arr[sel].astype(np.int64 if is_int else np.float64)
+        if fn9 in ('Sum', 'Avg'):
+            if is_int and vv.size and float(np.abs(vv).max()) * vv.size >= 2.0 ** 53:
+                acc = np.zeros(ND, np.int64); np.add.at(acc, ptr[sel], vv)
+            else:
+                acc = np.bincount(ptr[sel], weights=vv.astype(np.float64), minlength=ND)
+                if is_int: acc = np.rint(acc).astype(np.int64)
+            v = acc[ex]
+            if extra:
+                uv = arr[un].astype(np.int64 if is_int else np.float64)
+                v = np.append(v, uv.sum() if uv.size else 0)
+        else:
+            big = (np.iinfo(np.int64).max if fn9 == 'Min' else np.iinfo(np.int64).min) if is_int else \
+                  (np.inf if fn9 == 'Min' else -np.inf)
+            acc = np.full(ND, big, np.int64 if is_int else np.float64)
+            (np.minimum if fn9 == 'Min' else np.maximum).at(acc, ptr[sel], vv)
+            v = acc[ex]
+            if extra:
+                uv = arr[un].astype(np.int64 if is_int else np.float64)
+                v = np.append(v, (uv.min() if fn9 == 'Min' else uv.max()) if uv.size else big)
+        parts.append((np.append(n, int(un.sum())) if extra else n, (v, is_int, big if fn9 in ('Min', 'Max') else None)))
+    # the groups: parent column values (NULL and the unmatched-children row group together, as SQL groups NULLs)
+    if gcols:
+        dv = _materialize(db, dt_, gnames)
+        comp = np.zeros(NR, np.int64); gvals = []
+        for g in gcols:
+            gpc = dpm.get(g.name, g.name)
+            vals = np.asarray(dv[g.name], dtype=object)[ex]
+            nul = _win_nulls(dseg, gpc, ex)
+            codes = np.zeros(ex.size, np.int64)
+            if (~nul).any():
+                fc, _u9 = pd.factorize(vals[~nul])
+                codes[~nul] = np.asarray(fc, np.int64) + 1
+            if extra: codes = np.append(codes, 0)
+            Vg = int(codes.max()) + 1 if codes.size else 1
+            if comp.size and Vg > 1:
+                if float(comp.max() + 1) * Vg > 2.0 ** 62:
+                    comp = np.unique(comp, return_inverse=True)[1].astype(np.int64)
+                comp = comp * Vg + codes
+            gvals.append((vals, nul))
+        uq, ginv = np.unique(comp, return_inverse=True)
+        ginv = np.asarray(ginv, np.int64).ravel(); NG = int(uq.size)
+        order9 = np.argsort(ginv, kind='stable')
+        rep = order9[np.concatenate(([0], np.flatnonzero(np.diff(ginv[order9])) + 1))] if NR else np.empty(0, np.int64)
+    else:
+        ginv = np.zeros(NR, np.int64); NG = 1; rep = None; gvals = []
+    cols9 = []
+    for s, pt in zip(specs, parts):
+        if s[0] == 'key':
+            vals, nul = gvals[s[1]]
+            cols9.append([None if (r >= ex.size or nul[r]) else _render(vals[r]) for r in rep]); continue
+        n, vinfo = pt
+        gn = np.bincount(ginv, weights=n.astype(np.float64), minlength=NG)
+        gn = np.rint(gn).astype(np.int64)
+        if vinfo is None:
+            cols9.append([int(x) for x in gn]); continue
+        v, is_int, big = vinfo
+        fn9 = s[0]
+        if fn9 in ('Sum', 'Avg'):
+            if is_int:
+                gs = np.zeros(NG, np.int64); np.add.at(gs, ginv, np.asarray(v, np.int64))
+            else:
+                gs = np.bincount(ginv, weights=np.asarray(v, np.float64), minlength=NG)
+            if fn9 == 'Sum':
+                cols9.append([None if gn[i] == 0 else (int(gs[i]) if is_int else float(gs[i])) for i in range(NG)])
+            else:
+                cols9.append([None if gn[i] == 0 else float(gs[i]) / int(gn[i]) for i in range(NG)])
+        else:
+            gm = np.full(NG, big, np.int64 if is_int else np.float64)
+            (np.minimum if fn9 == 'Min' else np.maximum).at(gm, ginv, np.asarray(v))
+            cols9.append([None if gn[i] == 0 else (int(gm[i]) if is_int else float(gm[i])) for i in range(NG)])
+    rows = list(zip(*cols9)) if cols9 else []
+    proj = tree.expressions
+    having = tree.args.get('having')
+    if having is not None:
+        rows = wdb_sql._apply_having(rows, proj, having.this, None)
+    rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))
+    lim = wdb_sql._limit(tree); off = wdb_sql._offset(tree)
+    if off or lim is not None: rows = rows[off:(None if lim is None else off + lim)]
+    _OUTER_COUNT_SERVED[0] += 1
+    return rows, [wdb_sql._alias(p) for p in proj]
+
+
 def join_query(db, sql, columnar=False):
     import time as _t8
     _jq_t0 = _t8.perf_counter()
@@ -2706,6 +3039,14 @@ def join_query(db, sql, columnar=False):
     joins = tree.args.get('joins')
     import wdb_sql as _ws
     has_aggs = any(_ws._agg_kind(p) is not None for p in tree.expressions)
+    if has_aggs and not columnar and len(joins or []) == 1 and (joins[0].args.get('side') or '').upper() in ('LEFT', 'RIGHT', 'FULL'):
+        try:
+            _oc9 = _outer_count_door(db, tree)
+        except _FastUnsupported:
+            _oc9 = None
+        if _oc9 is not None:
+            _route9('outer-count')
+            return _oc9
     if has_aggs and not columnar:
         _dc9j = _descent_court(db, tree.copy())   # pristine: doors below MUTATE the
         if _dc9j is not None:                     # tree (chain build pops join eqs)

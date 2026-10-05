@@ -4117,3 +4117,31 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
   (blocks steered; ClickHouse 0.017, DuckDB 0.08). From 7.3 s and 1.1 s this morning.
 - tests/test_join_limit.py now also: a LEFT join with a parent-side filter, the unmatched rows (d.id IS NULL),
   BETWEEN with a text <>; the piecewise road asserted to have answered.
+
+## 2026-10-05 (evening) -- THE OUTER JOIN AS COUNTS, PARTITION TOTALS WITHOUT A SORT
+- THE SCOPE CLIFFS LEFT: right_join 1.4 s, full_outer 0.8 s, full_outer_extra 3.3 s (all in the pandas merge
+  tail: both tables materialized, merged, then grouped) and scalar_corr 2.7 s (the window door's np.unique over
+  10M partition codes, a scatter, a reduceat).
+- THE OUTER JOIN AS COUNTS (wdb_join._outer_count_door): when one side's key is unique (the parent), every child
+  row points at one parent or at none, so a RIGHT / FULL / parent-side LEFT join with aggregates needs no joined
+  rows: per parent, how many child rows point at it (and their non-NULL counts, sums, mins, maxes, by bincount
+  over the pointer); a parent nobody points at still stands as one row with the child's side NULL; on a FULL join
+  the child rows that point nowhere are one more row with the parent's side NULL, grouped with the parents whose
+  group value is NULL (SQL groups NULLs together). A single-sided extra ON condition only decides MATCHING. GROUP BY
+  parent columns or none; HAVING / ORDER / LIMIT / OFFSET on the small result. A NULL child key matches nothing;
+  a nullable parent key, a WHERE, DISTINCT, a two-sided ON extra decline to the merge.
+- PARTITION TOTALS WITHOUT A SORT (wdb_join._win_partition_totals): AGG(x) OVER (PARTITION BY g) with no ORDER BY
+  is a group-by read back at every row: one counting pass over the partition ids, tot[gid]. A partition code space
+  up to 4M is used as the ids directly (np.unique was a 10M-row sort). MIN/MAX on a sorted dictionary run on the
+  codes (group_max / group_min kernels; the largest code holds the largest value). NULLs skipped; a partition of
+  only NULLs answers NULL.
+- OLD WRONG ANSWERS met on the way (now in the test): COUNT(col) OVER (...) summed the column's VALUES; the correlated
+  MAX/MIN/SUM/AVG subquery (rewritten to a window) handed a row with a NULL key the NULL partition's total (it now
+  keeps only rows whose key IS NOT NULL; COUNT(*) is 0 there, not NULL, and keeps every row); QUALIFY over a
+  nullable numeric column raised TypeError (None > float) -- the comparison now sees NaN, false as SQL's NULL is.
+  Override codes past V no longer collide in the window's composite partition code.
+- scope: full_outer_extra 3.3 s -> 0.12 s, right_join 1.4 -> 0.11, full_outer 0.8 -> 0.085, scalar_corr 2.7 ->
+  0.30; all equal to DuckDB.
+- tests/test_outer_count.py: eight outer shapes (NULL keys, NULL values, NULL group values, ON extras on either
+  side, the parent on the left, HAVING, two group columns) and six window / correlated shapes, all DuckDB's; the
+  count door asserted to have answered every outer shape.

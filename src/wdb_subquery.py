@@ -564,7 +564,10 @@ def _try_window_decorrelate(db, tree):
             _an.replace(_wn.copy())
         win_sql = _expr9.sql() + " AS __corr0"
     new = tree.copy()
-    new.set('where', None)
+    # a row whose key is NULL matches no inner row (= never holds), so its subquery is NULL and the
+    # comparison never true -- the window would have handed it the NULL partition's total (2026-10-05)
+    # (COUNT(*) is 0 there, not NULL: that shape keeps every row)
+    new.set('where', None if fname == 'COUNT' else E.Where(this=E.Not(this=E.Is(this=E.column(ocol), expression=E.Null()))))
     proj = list(new.expressions)
     import sqlglot
     proj.append(sqlglot.parse_one(f"SELECT {win_sql} FROM x").expressions[0])
