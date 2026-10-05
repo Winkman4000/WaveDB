@@ -581,6 +581,30 @@ def _like_flags_dict(seg, col, needle, kind='contains'):
         if keep is not None:
             memo[mk] = keep
             return keep
+    if kind == 'prefix' and c0.get('dt') == 1 and c0.get('mode') in (0, 1):
+        # THE PREFIX NEEDS NO HAYSTACK (2026-10-05): a value-sorted dictionary holds a prefix as one code range,
+        # two bisections by point fetch -- the road below built the whole text buffer first (18M URLs unpacked
+        # into Python: 7.7 s of URL LIKE 'http://holodilnik%') and then never read it
+        V0 = int(c0['V']) - (1 if c0.get('has_null') else 0)
+        lo = _bound_code(seg, col, nd, 'left')
+        up = nd.rstrip(b'\xff')
+        hi = V0 if not up else _bound_code(seg, col, up[:-1] + bytes([up[-1] + 1]), 'left')
+        if lo is not None and hi is not None:
+            flag = np.zeros(V0, bool); flag[lo:hi] = True
+            memo[mk] = flag
+            return flag
+    import wdb_scalar
+    st9 = wdb_scalar._stream(seg, col)
+    if st9 is not None:
+        # THE LIKE ON THE STREAM (2026-10-05): the dictionary's compiled byte stream, one parallel pass -- the
+        # token kernel without '_', the general kernel with it. The text buffer below unpacked every value into
+        # Python and ran a regex per value ('%карт%мир%' over 6M phrases: 6.8 s; '_оскв%' over 9.4M titles: 11.9 s)
+        ns9 = needle if isinstance(needle, str) else needle.decode('utf-8', 'replace')
+        pat9 = {'contains': '%' + ns9 + '%', 'prefix': ns9 + '%', 'suffix': '%' + ns9}.get(kind, ns9)
+        fl9 = wdb_sql._like_stream(st9[0], st9[1], pat9)
+        if fl9 is not None:
+            memo[mk] = fl9
+            return fl9
     hay, offs = _text_buffer(seg, col)
     V = int(offs.size) - 1
     flag = np.zeros(V, bool)

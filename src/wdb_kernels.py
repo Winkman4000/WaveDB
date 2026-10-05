@@ -3994,6 +3994,332 @@ def pcmp_dict2(ba, ca, bb, cb, op, out):
         else: out[i] = a <= b
 
 
+@njit(cache=True, nogil=True)
+def _lk_fwd(blob, p, end, pb, pk, s0, s1):
+    """match LIKE segment elements [s0, s1) starting at byte p (a character boundary): pk 0 = the literal byte
+    pb, pk 1 = '_' (one UTF-8 character). The end position, or -1."""
+    q = p
+    for e in range(s0, s1):
+        if q >= end:
+            return -1
+        if pk[e] == 1:
+            q += 1
+            while q < end and (blob[q] & 0xC0) == 0x80:
+                q += 1
+        else:
+            if blob[q] != pb[e]:
+                return -1
+            q += 1
+    return q
+
+
+@njit(cache=True, nogil=True)
+def _lk_back(blob, lo, b, pb, pk, s0, s1):
+    """match LIKE segment elements [s0, s1) ENDING exactly at byte b, starting no earlier than lo. The start, or -1."""
+    q = b
+    for e in range(s1 - 1, s0 - 1, -1):
+        if q <= lo:
+            return -1
+        if pk[e] == 1:
+            q -= 1
+            while q > lo and (blob[q] & 0xC0) == 0x80:
+                q -= 1
+        else:
+            if blob[q - 1] != pb[e]:
+                return -1
+            q -= 1
+    return q
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def plike_gen(blob, off, pb, pk, so, first_anch, last_anch, out):
+    """THE GENERAL LIKE ON A STREAM (2026-10-05): '%' between segments, '_' (one character) inside them, every
+    value of a byte stream judged in parallel. Segments so[s]..so[s+1] of (pb, pk); the first is anchored at
+    the start when first_anch, the last at the end when last_anch; the ones between are found leftmost (an
+    earlier start of a fixed-character segment never ends later, so leftmost is exact)."""
+    nseg = so.shape[0] - 1
+    n = off.shape[0] - 1
+    for i in prange(n):
+        a = off[i]; b = off[i + 1]
+        pos = a
+        ok = True
+        s_start = 0
+        s_end = nseg
+        both_one = False
+        if first_anch and nseg > 0:
+            r = _lk_fwd(blob, a, b, pb, pk, so[0], so[1])
+            if r < 0:
+                ok = False
+            else:
+                pos = r
+            s_start = 1
+            if nseg == 1 and last_anch:
+                both_one = True
+                ok = ok and pos == b
+        if ok and not both_one:
+            if last_anch and nseg > s_start:
+                s_end = nseg - 1
+            for s in range(s_start, s_end):
+                found = -1
+                p = pos
+                while p <= b:
+                    r = _lk_fwd(blob, p, b, pb, pk, so[s], so[s + 1])
+                    if r >= 0:
+                        found = r
+                        break
+                    p += 1
+                    while p < b and (blob[p] & 0xC0) == 0x80:
+                        p += 1
+                if found < 0:
+                    ok = False
+                    break
+                pos = found
+            if ok and last_anch and nseg > s_start:
+                if _lk_back(blob, pos, b, pb, pk, so[nseg - 1], so[nseg]) < 0:
+                    ok = False
+        out[i] = ok
+
+
+@njit(cache=True, nogil=True)
+def _utf8_ok(blob, a, b):
+    """the bytes [a, b) are well-formed UTF-8 exactly as Python's strict decoder defines it"""
+    p = a
+    while p < b:
+        c = blob[p]
+        if c < 0x80:
+            p += 1; continue
+        if 0xC2 <= c <= 0xDF:
+            k = 1; lo = 0x80; hi = 0xBF
+        elif 0xE0 <= c <= 0xEF:
+            k = 2; lo = 0xA0 if c == 0xE0 else 0x80; hi = 0x9F if c == 0xED else 0xBF
+        elif 0xF0 <= c <= 0xF4:
+            k = 3; lo = 0x90 if c == 0xF0 else 0x80; hi = 0x8F if c == 0xF4 else 0xBF
+        else:
+            return False
+        if p + k > b - 1:                        # the k continuation bytes must lie inside the value
+            return False
+        if blob[p + 1] < lo or blob[p + 1] > hi:
+            return False
+        for q in range(p + 2, p + 1 + k):
+            if blob[q] < 0x80 or blob[q] > 0xBF:
+                return False
+        p += 1 + k
+    return True
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def psubstr_bounds(blob, off, skip, take, ss, se, bad):
+    """SUBSTR on a stream without copying: each value's slice as byte bounds [ss, se) -- skip characters, then
+    take characters (take < 0: to the end). bad[i] when the bytes up to the slice's end are not well-formed
+    UTF-8 (the caller's Python road answers those, since a replacement character changes the count)."""
+    n = off.shape[0] - 1
+    for i in prange(n):
+        a = off[i]; b = off[i + 1]
+        p = a; c = 0
+        while p < b and c < skip:
+            p += 1
+            while p < b and (blob[p] & 0xC0) == 0x80:
+                p += 1
+            c += 1
+        ss[i] = p
+        if take < 0:
+            se[i] = b
+        else:
+            q = p; c = 0
+            while q < b and c < take:
+                q += 1
+                while q < b and (blob[q] & 0xC0) == 0x80:
+                    q += 1
+                c += 1
+            se[i] = q
+        bad[i] = not _utf8_ok(blob, a, se[i])    # only the bytes the slice spans (and skips) need to be whole
+
+
+@njit(cache=True, nogil=True)
+def count_into(keys, acc):
+    """acc[k] += 1 for every key: a group count over a dense key space, no sort"""
+    for i in range(keys.shape[0]):
+        acc[keys[i]] += 1
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def pslice_change(blob, ss, se, chg):
+    """chg[i]: slice i differs from slice i-1 (byte compare); returns through chg[0] = True. A slice that sorts
+    BELOW its predecessor marks chg[i] = 2 (the slices are not in order: the caller must not take ranks)."""
+    n = ss.shape[0]
+    for i in prange(n):
+        r = 1
+        if i > 0:
+            a0 = ss[i - 1]; a1 = se[i - 1]; b0 = ss[i]; b1 = se[i]
+            la = a1 - a0; lb = b1 - b0
+            m = la if la < lb else lb
+            r = 0
+            for k in range(m):
+                x = blob[a0 + k]; y = blob[b0 + k]
+                if x != y:
+                    r = 1 if y > x else 2
+                    break
+            if r == 0:
+                if lb > la:
+                    r = 1
+                elif lb < la:
+                    r = 2
+        chg[i] = r
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def plower_ru(blob, off, out, flag):
+    """LOWER on a stream for the characters whose lowering keeps their byte length: ASCII A-Z and Cyrillic
+    U+0400-U+042F (to U+0430-U+045F). flag[i] when a value holds anything else outside ASCII, or is not
+    well-formed UTF-8 -- the caller lowers those in Python (Python's str.lower is the reference)."""
+    n = off.shape[0] - 1
+    for i in prange(n):
+        a = off[i]; b = off[i + 1]
+        f = not _utf8_ok(blob, a, b)
+        p = a
+        while p < b:
+            c = blob[p]
+            if c < 0x80:
+                out[p] = c + 32 if 0x41 <= c <= 0x5A else c
+                p += 1
+            elif c == 0xD0 and p + 1 < b:
+                d = blob[p + 1]
+                if 0x90 <= d <= 0x9F:            # А-П -> а-п
+                    out[p] = 0xD0; out[p + 1] = d + 0x20
+                elif 0xA0 <= d <= 0xAF:          # Р-Я -> р-я
+                    out[p] = 0xD1; out[p + 1] = d - 0x20
+                elif 0x80 <= d <= 0x8F:          # Ѐ-Џ -> ѐ-џ
+                    out[p] = 0xD1; out[p + 1] = d + 0x10
+                else:                            # а-п already lower
+                    out[p] = c; out[p + 1] = d
+                p += 2
+            elif c == 0xD1 and p + 1 < b and blob[p + 1] <= 0x9F:
+                out[p] = c; out[p + 1] = blob[p + 1]   # р-я, ѐ-џ already lower
+                p += 2
+            else:
+                f = True
+                out[p] = c
+                p += 1
+        flag[i] = f
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def pdiff_vals(a, b, off, out):
+    """out[i]: value i's bytes differ between two same-shaped streams"""
+    n = off.shape[0] - 1
+    for i in prange(n):
+        d = False
+        for p in range(off[i], off[i + 1]):
+            if a[p] != b[p]:
+                d = True
+                break
+        out[i] = d
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def pgather_vals(blob, off, idx, qo, out):
+    """the values idx of a stream, packed into out at offsets qo (qo[j+1]-qo[j] = value idx[j]'s length)"""
+    m = idx.shape[0]
+    for j in prange(m):
+        a = off[idx[j]]; d = qo[j]
+        for k in range(qo[j + 1] - d):
+            out[d + k] = blob[a + k]
+
+
+@njit(cache=True, nogil=True)
+def _bcmp(blob, a0, a1, q, b0, b1):
+    la = a1 - a0; lb = b1 - b0
+    m = la if la < lb else lb
+    for k in range(m):
+        x = blob[a0 + k]; y = q[b0 + k]
+        if x != y:
+            return -1 if x < y else 1
+    if la < lb:
+        return -1
+    if la > lb:
+        return 1
+    return 0
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def pstream_find(blob, off, qb, qo, out):
+    """each query string's index in a byte-sorted stream (bisection), or -1"""
+    n = off.shape[0] - 1
+    m = qo.shape[0] - 1
+    for j in prange(m):
+        lo = 0; hi = n
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if _bcmp(blob, off[mid], off[mid + 1], qb, qo[j], qo[j + 1]) < 0:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo < n and _bcmp(blob, off[lo], off[lo + 1], qb, qo[j], qo[j + 1]) == 0:
+            out[j] = lo
+        else:
+            out[j] = -1
+
+
+@njit(cache=True, nogil=True)
+def str_dedupe(blob, off, gid, rep):
+    """one id per distinct byte string, in first-seen order: gid[i] for every value, rep[g] = the first value of
+    group g. Open addressing on a 64-bit FNV-1a hash; returns the number of groups."""
+    n = off.shape[0] - 1
+    size = 1
+    while size < 2 * n + 2:
+        size <<= 1
+    tab = np.full(size, -1, np.int64)
+    mask = size - 1
+    G = 0
+    for i in range(n):
+        a = off[i]; b = off[i + 1]
+        h = np.uint64(14695981039346656037)
+        for p in range(a, b):
+            h = (h ^ np.uint64(blob[p])) * np.uint64(1099511628211)
+        s = np.int64(h & np.uint64(mask))
+        while True:
+            j = tab[s]
+            if j < 0:
+                tab[s] = i; gid[i] = G; rep[G] = i; G += 1
+                break
+            ja = off[j]; jb = off[j + 1]
+            if jb - ja == b - a:
+                eq = True
+                for k in range(b - a):
+                    if blob[ja + k] != blob[a + k]:
+                        eq = False
+                        break
+                if eq:
+                    gid[i] = gid[j]
+                    break
+            s = (s + 1) & mask
+    return G
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def pstream_splice(blob, off, keep, off2, blob2):
+    """copy value i of (blob, off) to blob2 at off2[i] wherever keep[i] (the other values are written by the
+    caller): the stream rebuilt around a few replaced values"""
+    n = off.shape[0] - 1
+    for i in prange(n):
+        if keep[i]:
+            a = off[i]; d = off2[i]
+            for k in range(off[i + 1] - a):
+                blob2[d + k] = blob[a + k]
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def pstr_charlen(blob, off, out):
+    """Characters per value of a byte stream (UTF-8: every byte that is not a continuation byte starts one)."""
+    n = off.shape[0] - 1
+    for i in prange(n):
+        c = 0
+        for p in range(off[i], off[i + 1]):
+            if (blob[p] & 0xC0) != 0x80:
+                c += 1
+        out[i] = c
+
+
 @njit(cache=True, parallel=True, nogil=True)
 def pkeep_via_ptr(rows, ptr, keep, out):
     """out[j] = keep[ptr[rows[j]]] -- a parent keep applied through a road at

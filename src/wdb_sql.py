@@ -476,6 +476,37 @@ def _like_tok_parts(pat):
     return tb, to, pat[:1] != '%', pat[-1:] != '%'
 
 
+def _like_stream(blob, off, pat):
+    """bool per value of a byte stream: value LIKE pat (case-sensitive, no escapes). Without '_' the token kernel
+    answers; with '_' the general kernel (plike_gen). None for an escape (the caller's old road answers)."""
+    import wdb_kernels as _WKl
+    if '\\' in pat: return None
+    off = np.ascontiguousarray(off, dtype=np.int64)
+    n = off.size - 1
+    out = np.empty(n, np.bool_)
+    parts = _like_tok_parts(pat)
+    if parts is not None:
+        if not pat.strip('%'):                       # '%' (anything) or '' (only the empty string)
+            if pat: out[:] = True
+            else: out[:] = (off[1:] - off[:-1]) == 0
+            return out
+        _WKl.plike_tok(blob, off, parts[0], parts[1], parts[2], parts[3], out)
+        return out
+    pb, pk, so = [], [], [0]
+    for piece in pat.split('%'):
+        if piece == '': continue
+        for ch in piece:
+            if ch == '_':
+                pb.append(0); pk.append(1)
+            else:
+                for byt in ch.encode('utf-8'):
+                    pb.append(byt); pk.append(0)
+        so.append(len(pb))
+    _WKl.plike_gen(blob, off, np.asarray(pb, np.uint8), np.asarray(pk, np.uint8), np.asarray(so, np.int64),
+                   pat[:1] != '%', pat[-1:] != '%', out)
+    return out
+
+
 def _dict_stream(seg, pc):
     """a text dictionary's values as ONE byte stream + offsets (the dictionary itself, laid out for the token
     kernel), on the column as tier 1 -- built once per process from the decoded dictionary"""
@@ -515,19 +546,19 @@ def _fc_stream(seg, c):
 
 
 def _like_dict_kernel(seg, pc, pat, negate=False):
-    """LIKE (no '_') over a text dictionary column: the token kernel decides each distinct value once on the
-    dictionary's stream, a parallel lookup paints the rows by code; NULL rows never match (LIKE or NOT LIKE).
+    """LIKE over a text dictionary column: the token kernel (or, with '_', the general kernel) decides each
+    distinct value once on the dictionary's stream, a parallel lookup paints the rows by code; NULL rows never
+    match (LIKE or NOT LIKE).
     None when the pattern or the column is not this simple case."""
-    parts = _like_tok_parts(pat)
     c = seg.cols.get(pc, {})
-    if (parts is None or c.get('mode') not in (0, 1) or c.get('dt') != 1 or c.get('aux') == 9
+    if ('\\' in pat or c.get('mode') not in (0, 1) or c.get('dt') != 1 or c.get('aux') == 9
             or seg._overrides(pc) is not None):
         return None
     import wdb_kernels as _WKd
     blob, off = _dict_stream(seg, pc)
     nv = off.size - 1; V = int(c['V'])
-    keep = np.empty(nv, np.bool_)
-    _WKd.plike_tok(blob, off, parts[0], parts[1], parts[2], parts[3], keep)
+    keep = _like_stream(blob, off, pat)               # '_' too, since 2026-10-05 (the general kernel)
+    if keep is None: return None
     if negate: keep = ~keep
     if c.get('has_null'):                                                       # the NULL code (V-1): never true
         if nv == V - 1: keep = np.append(keep, False)
@@ -552,6 +583,15 @@ def _like_mode5(seg, pc, pat, icase):
         out = np.empty(int(seg.N), np.bool_)
         _WKt.plike_tok(blob, np.ascontiguousarray(off, dtype=np.int64), parts[0], parts[1], parts[2], parts[3], out)
         return out
+    if (not icase and '_' in pat and '\\' not in pat and seg.cols.get(pc, {}).get('mode') == 5
+            and seg._overrides(pc) is None):
+        # '_' ON THE STORED STREAM (2026-10-05): the general kernel over the column's own bytes; a NULL row
+        # (stored empty) never matches
+        blob, off = seg.inline_stream(pc)
+        out = _like_stream(blob, off, pat)
+        if out is not None:
+            if seg.cols[pc].get('has_null'): out &= ~_mode5_null(seg, pc)
+            return out
     got = _mode5_sarray(seg, pc)
     if got is None: return None
     _arr, isn, b, obj, buf, starts = got
@@ -2463,7 +2503,7 @@ def _eval_pred(seg, node, seg_col):
             if out is not None:
                 return out
     if isinstance(node, _STRFN_TYPES) or (type(node) in _CMP9 and isinstance(node.this, _STRFN_TYPES)):
-        if _dict_string_col(seg, node, seg_col) is not None:
+        if _dict_string_col(seg, node, seg_col) is not None and not _scalar_served(seg, node):
             # THE DICTIONARY MAP first: LIKE/ILIKE/functions over a dictionary
             # string column evaluate once per distinct value (the core's own LIKE
             # route decoded per row: 3.0s vs 0.3s at 10M)
@@ -2503,6 +2543,19 @@ def _strict_col(node):
         if isinstance(node.this, E.Column) and node.args.get('query') is None and ex and all(lit(x) for x in ex):
             return node.this
     return None
+
+
+def _scalar_served(seg, node):
+    """a comparison of a dictionary-level scalar (LENGTH(col) > 100) against a literal: the core judges it
+    once per distinct value through wdb_scalar's table (compiled where the stream serves) -- the dictionary
+    map below it walks every value in Python (LENGTH(SearchPhrase) = 12: 6.7 s over 6M phrases)"""
+    if type(node) not in (E.EQ, E.NEQ, E.GT, E.LT, E.GTE, E.LTE) or isinstance(node.this, E.Column):
+        return False
+    try:
+        import wdb_wherescan as _WSs
+        return _WSs._scalar_cmp(seg, node, None) is not None
+    except Exception:
+        return False
 
 
 _COLCOL_OP = {E.EQ: 0, E.NEQ: 1, E.GT: 2, E.LT: 3, E.GTE: 4, E.LTE: 5}
@@ -2552,15 +2605,24 @@ def _eval_pred_core(seg, node, seg_col):
             sc = _WS._scalar_cmp(seg, node, None)
             if sc is not None:
                 sp, op, lit2 = sc
-                fl = _WS._scalar_flag(seg, sp, op, lit2)
+                fl = np.asarray(_WS._scalar_flag(seg, sp, op, lit2), dtype=bool)
                 scol0 = seg_col(sp['col'])
+                _V9s = int(seg.cols[scol0].get('V') or fl.size)
+                if fl.size < _V9s:                 # the NULL code past the dictionary: never true
+                    fl = np.concatenate([fl, np.zeros(_V9s - fl.size, bool)])
+                elif seg.cols[scol0].get('has_null'):
+                    fl = fl.copy(); fl[_V9s - 1] = False   # NULL op x is never true
                 pl = seg.e8_planes(scol0) if hasattr(seg, 'e8_planes') else None
                 if pl is not None:              # paint the flag onto the planes: the
                     pos8, lits8, d8 = pl        # function ran once per DISTINCT value;
                     out = np.full(int(seg.N), bool(fl[d8]))   # rows never densify
                     out[pos8] = fl[lits8]
                     return out
-                return fl[np.asarray(seg._raw_codes(scol0))]   # native width
+                import wdb_kernels as _WKsf
+                _rc9s = np.asarray(seg._raw_codes(scol0))
+                out = np.empty(_rc9s.shape[0], np.bool_)
+                _WKsf.plut_u8(_rc9s, np.ascontiguousarray(fl), out)   # painted by code, in parallel
+                return out
             raise NotImplementedError(f"predicate LHS {type(node.this).__name__}")
         cn=seg_col(col); lit=node.expression
         if isinstance(lit, E.Column):

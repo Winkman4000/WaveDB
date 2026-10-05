@@ -33,6 +33,7 @@ _HITS = 0
 _SCAN_THREADS = 14
 _NORM_MIN_SHARE = 0.5
 _MAX_KEYS = 4
+_DENSE_KS = 1 << 22        # key spaces up to this many slots are counted in place (one int64 array per worker)
 
 
 def enable():
@@ -221,6 +222,9 @@ def execute(seg, spec):
         elif s0 >= _NORM_MIN_SHARE:
             norm_idx, norm_code = 0, m0
     radix = [k['V'] for _pi, k in keys]
+    KS = 1
+    for _r9 in radix:
+        KS *= int(_r9)
     buf = seg.buf
     K10 = spec['off'] + (spec['lim'] or 0)   # unused in DISTINCT mode (lim may be None)
 
@@ -262,6 +266,13 @@ def execute(seg, spec):
         tab = (np.bincount(np.concatenate(norm_vals), minlength=radix[1 - norm_idx]).astype(np.int32)
                if norm_idx >= 0 and norm_vals else None)
         ek = np.concatenate(exc) if exc else np.empty(0, np.int64)
+        if 0 < KS <= _DENSE_KS and ek.size > KS // 4:
+            # THE DENSE COUNT (2026-10-05): a key space this small is counted in place, no sort -- np.unique
+            # sorted each worker's ~6M keys (a third of GROUP BY SUBSTR(URL, 1, 20) once the keys were cheap)
+            acc = np.zeros(KS, np.int64)
+            K.count_into(ek, acc)
+            g = np.flatnonzero(acc)
+            return tab, g, acc[g]
         g, c = np.unique(ek, return_counts=True)
         return tab, g, c.astype(np.int64)
 

@@ -4034,3 +4034,47 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
 - tests/test_exists_window.py: Q4's shape (date window on the parent, column against column on the child), with a
   literal child condition beside it, a one-sided window, and a window that keeps nothing -- against DuckDB, each
   confirmed on the window-first path (WDB_JOIN_BILL shows window-lines for all four).
+
+## 2026-10-05 -- TEXT FUNCTIONS ON THE DICTIONARY STREAM (the megaboard's string cliffs)
+- THE FRESH BOARDS (today's source, ClickHouse from Oct 2): megaboard 2.36 (131.9 s), scope 2.03, h2o group-by
+  1.51 -- small moves from Oct 2. The tallest cliffs left were one family: eight text-function queries, 7-28 s
+  each against 0.03-1.3 s for DuckDB / ClickHouse, ~75 s of the megaboard's 132.
+- ONE ROAD UNDER ALL EIGHT (py-spy, each query): the question is asked once per distinct value (right), but the
+  dictionary was first unpacked value by value into Python strings (_typed_dict -> _decode_fc), then answered in
+  Python per value, and a GROUP BY on the result sorted millions of Python strings to number them. Five modules
+  did it on their own: wdb_scalar (LENGTH, SUBSTR), wdb_wherescan (LIKE via _text_buffer + a regex per value),
+  wdb_lmap (LOWER), wdb_sql._eval_rows (LENGTH = k), wdb_diskpair (the group step's np.unique).
+- THE LAYER: every per-value text function runs as a compiled kernel on the dictionary's byte stream
+  (wdb_sql._dict_stream: the Oct 3 compiled front-coding expansion, tier 1):
+  - LENGTH: pstr_charlen (characters per value, parallel); the integer surrogate takes ranks from presence over
+    the value range, no sort. LENGTH(col) <op> literal in _eval_pred goes to the core's scalar flag (painted by
+    plut_u8; the NULL code never true) instead of the Python dictionary map.
+  - LIKE: plike_gen -- '%' between segments, '_' (one UTF-8 character) inside them, leftmost search for the
+    middle segments (exact: an earlier start of a fixed-character segment never ends later); _like_stream picks
+    the token kernel without '_'. Served in wherescan, wdb_sql's dictionary LIKE and the inline (mode 5) LIKE.
+    The prefix LIKE takes its two bisections WITHOUT building the text buffer first.
+  - SUBSTR(col, 1, n): psubstr_bounds gives each value's slice as byte bounds (no copy); on the value-sorted
+    dictionary equal prefixes sit side by side, so pslice_change + a running count IS the sorted surrogate;
+    values become Python strings only when printed (_SliceVals). Malformed UTF-8 up to the cut, another start,
+    or a dictionary out of order: the old road.
+  - LOWER (wdb_lmap): plower_ru lowers ASCII and Cyrillic U+0400-U+042F in the kernel; any other value (other
+    scripts, malformed bytes) is lowered by Python's str.lower and spliced back. THE UNCHANGED ARE ALREADY
+    DISTINCT: a value lowering leaves alone keeps its own group, so only the changed values are looked up
+    (pstream_find, bisection in the sorted dictionary) and the leftovers deduped (str_dedupe). The whole-
+    dictionary hash runs only for a dictionary out of order.
+  - The group step (wdb_diskpair): a key space up to 4M slots is counted in place per worker (count_into)
+    instead of np.unique.
+- THE CLIFFS (hot, best of 2, every answer equal to DuckDB's row by row):
+  g-substr 28.2 -> 0.77 s (DuckDB 1.32) | g-len 20.6 -> 0.39 (0.18) | f-scalarpred 16.0 -> 0.54 (1.02) |
+  f-like-under 11.9 -> 0.10 (1.76) | g-lower 10.4 -> 1.05 (1.26) | f-like-prefix 7.7 -> 0.13 (0.87) |
+  f-like-multi 6.8 -> 0.12 (0.41) | f-scalar-eq 6.7 -> 0.13 (0.33).
+- THE BOARDS AFTER (today's source, ClickHouse from Oct 2): megaboard 103/103, score 2.36 -> 1.87 (WaveDB sum
+  on the 94 shared queries 131.9 -> 63.9 s; DuckDB 346, ClickHouse 75.2; small answers 95.0 -> 27.3 s, now below
+  DuckDB's 32.4); scope 2.03 and h2o group-by 1.51 unchanged, every answer correct. Queries that moved 25-60%
+  slower on the board (g-1key-sum-ord, a-sum, h-sum, ...) are the same on an A/B tree built from HEAD's files:
+  pod drift, not this change. The dense count served only g-substr among them (0.67 vs 1.01 s off).
+- tests/test_strfn_stream.py: every kernel against Python over ASCII, both cases of Cyrillic, Greek, accented
+  Latin, emoji and CJK (LIKE patterns with '_' and '%' in every position, SUBSTR bounds, LOWER, the dedupe,
+  strict UTF-8 validity); through SQL against DuckDB -- LENGTH in filters (=, >, <>, NULLs) and GROUP BY, LIKE with
+  '_', prefixes, NOT LIKE, SUBSTR and LOWER groups -- each family asserted served by the stream; the prefix
+  surrogate against sorted Python prefixes.
