@@ -3979,6 +3979,22 @@ def plut_u8(codes, lut, out):
 
 
 @njit(cache=True, parallel=True, nogil=True)
+def pcmp_dict2(ba, ca, bb, cb, op, out):
+    """Column against column of one table, both dictionary-coded numbers: out[i] = ba[ca[i]] OP bb[cb[i]],
+    op 0..5 = '=', '<>', '>', '<', '>=', '<=' (lineitem's l_receiptdate > l_commitdate: the row evaluator
+    took 3.7 s at 60M rows, the two numpy gathers 250 ms)."""
+    n = ca.shape[0]
+    for i in prange(n):
+        a = ba[np.int64(ca[i])]; b = bb[np.int64(cb[i])]
+        if op == 0: out[i] = a == b
+        elif op == 1: out[i] = a != b
+        elif op == 2: out[i] = a > b
+        elif op == 3: out[i] = a < b
+        elif op == 4: out[i] = a >= b
+        else: out[i] = a <= b
+
+
+@njit(cache=True, parallel=True, nogil=True)
 def pkeep_via_ptr(rows, ptr, keep, out):
     """out[j] = keep[ptr[rows[j]]] -- a parent keep applied through a road at
     survivor rows, in parallel (serial numpy chained gathers cost ~118ms at 15M)."""
@@ -4287,6 +4303,82 @@ def pruns_distinct(starts, ptr, supp, flag, nsupp, nflag):
                 if not seenf:
                     cf += 1
         nsupp[ptr[i]] = c; nflag[ptr[i]] = cf
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def run_bounds(k):
+    """The starts of the runs of equal k (with n appended) when k never decreases; an empty array when it
+    does (the groups are not contiguous stretches). Two parallel passes over 64 stripes: count the changes,
+    then write them at each stripe's offset (one thread: 178 ms over lineitem's 60M keys)."""
+    n = k.shape[0]
+    if n == 0:
+        return np.zeros(1, np.int64)
+    T = 64
+    step = (n + T - 1) // T
+    cnt = np.zeros(T, np.int64)
+    bad = np.zeros(T, np.bool_)
+    for t in prange(T):
+        lo = max(1, t * step); hi = min(n, (t + 1) * step)
+        c = 0
+        for i in range(lo, hi):
+            if k[i] < k[i - 1]:
+                bad[t] = True
+                break
+            if k[i] != k[i - 1]:
+                c += 1
+        cnt[t] = c
+    for t in range(T):
+        if bad[t]:
+            return np.empty(0, np.int64)
+    off = np.empty(T, np.int64)
+    s = 1
+    for t in range(T):
+        off[t] = s; s += cnt[t]
+    st = np.empty(s + 1, np.int64)
+    st[0] = 0; st[s] = n
+    for t in prange(T):
+        lo = max(1, t * step); hi = min(n, (t + 1) * step)
+        j = off[t]
+        for i in range(lo, hi):
+            if k[i] != k[i - 1]:
+                st[j] = i; j += 1
+    return st
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def pruns_others(starts, x, p, has_p, neg, out):
+    """THE COUNT INSTEAD OF THE SEARCH (TPC-H Q21): per run of the group key, is there another row of the
+    run meeting P (p[j] != 0, or every row when not has_p) whose x differs from this row's x? out[i] = that
+    answer for EXISTS, its negation for NOT EXISTS (neg). Short runs look pairwise and stop at the first
+    witness; long runs sort their P-rows' x once and count by bisection."""
+    S = starts.shape[0] - 1
+    for s in prange(S):
+        i0 = starts[s]; i1 = starts[s + 1]
+        if i1 - i0 <= 64:
+            for a in range(i0, i1):
+                hit = False
+                for b in range(i0, i1):
+                    if (not has_p or p[b] != 0) and x[b] != x[a]:
+                        hit = True
+                        break
+                out[a] = (not hit) if neg else hit
+        else:
+            tot = 0
+            for b in range(i0, i1):
+                if not has_p or p[b] != 0:
+                    tot += 1
+            xs = np.empty(tot, np.int64)
+            q = 0
+            for b in range(i0, i1):
+                if not has_p or p[b] != 0:
+                    xs[q] = np.int64(x[b]); q += 1
+            xs.sort()
+            for a in range(i0, i1):
+                v = np.int64(x[a])
+                lo = np.searchsorted(xs, v, side='left')
+                hi = np.searchsorted(xs, v, side='right')
+                hit = (tot - (hi - lo)) > 0
+                out[a] = (not hit) if neg else hit
 
 
 @njit(cache=True, nogil=True)

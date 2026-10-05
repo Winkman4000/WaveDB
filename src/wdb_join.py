@@ -14,6 +14,7 @@ import time, pandas as pd, os
 from wdb_engine import Segment
 import wdb_sql
 import wdb_kernels, wdb_dml, wdb_agg, wdb_fkptr, wdb_exprjit, wdb_radix
+import wdb_groupexists
 import wdb_measure_runtime as RT
 
 _CMP = {E.EQ: '==', E.NEQ: '!=', E.GT: '>', E.LT: '<', E.GTE: '>=', E.LTE: '<='}
@@ -2502,6 +2503,9 @@ def join_query(db, sql, columnar=False):
                                 expression=E.Column(this=E.Identifier(this=_nm9, quoted=False), table=E.Identifier(this=_ra9, quoted=False)))
                     _cond9 = _eq9 if _cond9 is None else E.And(this=_cond9, expression=_eq9)
                 _jn9.set('on', _cond9); _jn9.set('using', None)
+    # THE COUNT INSTEAD OF THE SEARCH (2026-10-04, Q21): [NOT] EXISTS(same group, other x, P) becomes a per-row
+    # verdict over the outer alias's table -- a WDB_ROWMASK placeholder build_pred and mask_eval read as a slot
+    wdb_groupexists.rewrite(db, tree)
 
     if tree.find(E.Window) is not None and not (tree.args.get('from') or tree.args.get('from_')).this.__class__.__name__ == 'Subquery':
         try:
@@ -3620,6 +3624,12 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 m = keep[codes]
                 return ~m if negate else m
             return leaf(node.this, mk)
+        if wdb_groupexists.is_mark(node):        # the counted EXISTS verdict: already one bool per row
+            try:
+                col9g, m9g, _f9g = wdb_groupexists.lookup(node)
+            except KeyError:
+                raise _FastUnsupported
+            return leaf(col9g, lambda seg, pcol: m9g)
         raise _FastUnsupported
     where = tree.args.get('where')
     _maskc = {}
@@ -4985,6 +4995,19 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             hi = wdb_sql._lit_for_col(cseg, cpcol, node.args['high'], kind)
             lo = float(lo) if kind == 'f' else int(lo); hi = float(hi) if kind == 'f' else int(hi)
             return f"(({lo} <= {v}) and ({v} <= {hi}))"
+        if wdb_groupexists.is_mark(node):
+            # THE PER-ROW VERDICT (Q21's counted EXISTS pair): a true/false byte per row of the outer alias's
+            # table, read through that alias's pointer exactly like a string code slot
+            try:
+                col9g, m9g, _f9g = wdb_groupexists.lookup(node)
+            except KeyError:
+                raise _FastUnsupported
+            cseg, cpcol, cptr = resolve(col9g)
+            if m9g.shape[0] != int(cseg.N): raise _FastUnsupported
+            a9g = m9g.view(np.uint8)
+            slot_list.append((None, np.ascontiguousarray(_rw9(a9g) if cptr is None else a9g),
+                              None if cptr is None else np.ascontiguousarray(_rw9(cptr))))
+            return f"(v{len(slot_list) - 1} != 0)"
         raise _FastUnsupported
 
     _b0 = _tk9()
@@ -5008,6 +5031,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     cols9 = list(n.find_all(E.Column))
                     if any(resolve(c)[2] is not None for c in cols9):
                         cost = 6.0
+                    if wdb_groupexists.is_mark(n):    # the verdict's keep fraction is known exactly
+                        return (1.0 - wdb_groupexists.lookup(n)[2]) / cost
                     if len(cols9) == 1:
                         cs9, cp9, _ = resolve(cols9[0])
                         td9 = np.asarray(cs9._typed_dict(cp9))

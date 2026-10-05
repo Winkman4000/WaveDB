@@ -2505,6 +2505,26 @@ def _strict_col(node):
     return None
 
 
+_COLCOL_OP = {E.EQ: 0, E.NEQ: 1, E.GT: 2, E.LT: 3, E.GTE: 4, E.LTE: 5}
+
+
+def _colcol_mask(seg, op, ca, cb):
+    """THE TWO COLUMNS ON THEIR CODES (2026-10-04): col OP col over one table, both null-free dictionary
+    numbers of one kind (numbers, or datetimes of one unit) -> one parallel pass reading each side's base
+    through its codes. None for anything else (the row evaluator answers, as before)."""
+    a9, b9 = seg.cols.get(ca), seg.cols.get(cb)
+    if a9 is None or b9 is None or op not in _COLCOL_OP: return None
+    if (a9.get('dt') == 3) != (b9.get('dt') == 3): return None
+    if a9.get('dt') == 3 and seg.unit(ca) != seg.unit(cb): return None
+    ra, rb = raw_dict_col(seg, ca), raw_dict_col(seg, cb)
+    if ra is None or rb is None: return None
+    import wdb_kernels as _WKc
+    out = np.empty(int(seg.N), np.bool_)
+    _WKc.pcmp_dict2(np.ascontiguousarray(ra[0]), np.ascontiguousarray(ra[1]),
+                    np.ascontiguousarray(rb[0]), np.ascontiguousarray(rb[1]), _COLCOL_OP[op], out)
+    return out
+
+
 def _eval_pred_core(seg, node, seg_col):
     if isinstance(node, E.Is) and isinstance(node.this, E.Column) and isinstance(node.expression, E.Null):
         _c9 = seg.cols.get(seg_col(node.this.name), {})
@@ -2543,6 +2563,9 @@ def _eval_pred_core(seg, node, seg_col):
                 return fl[np.asarray(seg._raw_codes(scol0))]   # native width
             raise NotImplementedError(f"predicate LHS {type(node.this).__name__}")
         cn=seg_col(col); lit=node.expression
+        if isinstance(lit, E.Column):
+            cm = _colcol_mask(seg, type(node), cn, seg_col(lit.name))
+            if cm is not None: return cm
         if not (isinstance(lit,E.Literal) or (isinstance(lit,E.Neg) and isinstance(lit.this,E.Literal))):
             raise NotImplementedError("non-literal RHS")
         if isinstance(node, (E.EQ, E.NEQ)):

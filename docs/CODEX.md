@@ -3974,3 +3974,45 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
   misses refused or kept, repeated parents refused, sparse and non-integer keys left to the hash); a Q3-shaped
   join, a top-k grouped on a key plus unique text columns, and a join count against DuckDB, twice (the second
   round on the shelved keys).
+
+## 2026-10-04 (evening) -- TPC-H Q21: THE COUNT INSTEAD OF THE SEARCH
+- Q21 WAS A HOLE, NOT A DIFFERENT VALID ANSWER: DuckDB returns 100 rows; WaveDB raised. build_pred could not
+  compile the EXISTS pair and the pandas chain could not place l2/l3. The old _lonely_rewrite (Q21-only: a parent
+  keep from distinct-supplier censuses) needs the declared-clock pair (code_enc 16) on l_receiptdate /
+  l_commitdate; the sidecar-off realm stores them as code_enc 14, so it declined.
+- THE RULE (Jackson): EXISTS (another row of my group, different from me on x, meeting P) is a count, not a
+  search -- (rows of my group meeting P) minus (rows of my group meeting P with my own x); EXISTS keeps the row
+  when that is above zero, NOT EXISTS when it is zero. wdb_groupexists.rewrite (called by join_query right after
+  the USING normalization) takes any top-level [NOT] EXISTS whose subquery is one table with exactly one =
+  correlation and one <> correlation to the same outer alias plus inner-only conjuncts P; it judges it ONCE over
+  the outer alias's whole table into one true/false per row and puts WDB_ROWMASK(<outer key column>, '<key>') in
+  its place. build_pred reads the verdict as a slot through the alias's pointer (like a string code slot, at
+  survivor rows when the cascade ran); mask_eval reads it too; the potency score uses its exact keep fraction.
+  The verdicts live in a wdb_qmem-registered dict: nothing outlives the query.
+- TWO ROADS: THE RUNS -- inner table is the outer table on the same key and x columns, and the key never
+  decreases on disk (lineitem by l_orderkey): run_bounds finds the runs (two parallel passes over 64 stripes),
+  pruns_others answers per row (runs of 64 or fewer look pairwise and stop at the first witness; longer runs
+  sort their P rows' x once and bisect). THE CENSUS -- everything else of numbers (another table, an unsorted
+  table, the same table on other columns): counts per group and per (group, x) over the inner P rows, looked up
+  per outer row. Identities: integer values from the shelf (_key_values), float values, or dictionary codes for
+  text only when both sides read the same column. Nulls, overrides, text across columns, any other use of an
+  outer column inside the subquery: the node stays, the query declines as before -- never a wrong answer.
+- THE SIBLING PATH (wdb_sql._colcol_mask, kernel pcmp_dict2): P was l_receiptdate > l_commitdate, and
+  _eval_pred judged column-against-column by the row evaluator: 3.7 s over 60M rows. Two null-free dictionary
+  numbers of one kind (or datetimes of one unit) on one table now compare in one parallel pass through their
+  codes; every single-table caller of _eval_pred gets it.
+- Q21 (SF10, hot, sidecars off, strict query memory): a raise -> 4.5 s (the row evaluator) -> 0.96 s (the two
+  columns on their codes) -> 0.59 s (parallel run bounds, shared by the pair); DuckDB 0.96 s. All 100 rows equal
+  DuckDB's, row for row, every run. The bill: run bounds 38 ms, the two counts 24 + 33 ms, P 263 ms (the E14 FULL
+  RECONSTRUCT of both date columns' codes -- the next thing to take), then the join ~220 ms.
+- THE BOARD (hot, best of 3 in one process, sidecars off, strict query memory): 14/14 correct, no holes, faster
+  than DuckDB on 6 (Q1, Q5, Q10, Q13, Q19, Q21); 5.6 s against DuckDB's 5.1 (both now carry Q21); geomean of
+  WaveDB / DuckDB 1.07 (1.14 over the 13 before). Q4 (0.76 vs 0.28 s) is still the worst ratio. Suite 1824/0.
+- NOT DONE: a single-table outer query (no join) with this shape still goes to wdb_subquery.rewrite, which raises
+  "EXISTS without a single eq-correlation". _lonely_rewrite stays (it runs after, sees no EXISTS when the count
+  served); its first copy in wdb_join (the earlier def of the same name) is dead code.
+- tests/test_groupexists.py: run bounds against numpy (and a decrease refused); the run kernel and the census
+  against a brute force (short and 65-300-row runs, with and without P, both polarities); through SQL against
+  DuckDB, each asserted served by the count: the Q21 pair grouped on text with a top-k, a lone EXISTS with P
+  (scalar), a lone NOT EXISTS without P, a text x written outer-first, another (unsorted) inner table, and an
+  unsorted table against itself.
