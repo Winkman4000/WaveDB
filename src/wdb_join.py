@@ -1724,6 +1724,17 @@ def _road_join_emit(db, tree):
     joins = tree.args.get('joins') or []
     if len(joins) != 1 or tree.args.get('group') is not None: return None
     if tree.args.get('having') is not None: return None
+    if tree.args.get('distinct') is not None: return None   # the emit never deduplicates
+    # THE LIMIT FIRST (2026-10-05): without ORDER BY any LIMIT rows are the answer, so only the first OFFSET+LIMIT
+    # joined rows are ever read -- the emit read every joined row's values into Python and cut at the end
+    # (j-dump: 7.3 s to return 1000 rows of a join that keeps millions)
+    _lim9 = tree.args.get('limit'); _off9 = tree.args.get('offset')
+    try:
+        _offn9 = int(_off9.expression.this) if _off9 is not None else 0
+        _limn9 = int(_lim9.expression.this) if _lim9 is not None else None
+    except Exception:
+        return None
+    _want9 = (_offn9 + _limn9) if (_limn9 is not None and tree.args.get('order') is None) else None
     jn = joins[0]
     side = (jn.args.get('side') or '').upper(); kind = (jn.args.get('kind') or '').upper()
     if kind not in ('', 'INNER', 'OUTER') or side not in ('', 'LEFT', 'RIGHT', 'FULL'): return None
@@ -1790,7 +1801,8 @@ def _road_join_emit(db, tree):
     else:
         rows = np.flatnonzero(ptr >= 0); prow = ptr[rows]; miss = None
     import wdb_govern
-    wdb_govern.ask(int(rows.size) + (int(rmiss.size) if rmiss is not None else 0), len(proj), 'join result')   # THE GOVERNOR
+    _ask9 = int(rows.size) + (int(rmiss.size) if rmiss is not None else 0)
+    wdb_govern.ask(_ask9 if _want9 is None else min(_ask9, _want9), len(proj), 'join result')   # THE GOVERNOR
     if _conj9:
         keep = np.ones(int(rows.size), bool)
         for cj in _conj9:
@@ -1809,6 +1821,9 @@ def _road_join_emit(db, tree):
                 return None                                  # a two-sided conjunct: the general joiner
         rows = rows[keep]; prow = prow[keep]
         if miss is not None: miss = miss[keep]
+    if _want9 is not None and rows.size > _want9:
+        rows = rows[:_want9]; prow = prow[:_want9]
+        if miss is not None: miss = miss[:_want9]
     def col_vals(seg, pc, rr):
         # MODE-AWARE point reads: plain dict numerics ride base[codes_at]
         # (cached base), everything else the general values_at_rows --
@@ -1863,6 +1878,8 @@ def _road_join_emit(db, tree):
                 # any conjunct that needs a child column sees NULL: IS NULL passes, everything else fails
                 keep_r &= _null_side_truth9(cj, la)
         rmiss = rmiss[keep_r]
+    if rmiss is not None and _want9 is not None:
+        rmiss = rmiss[:max(0, _want9 - len(rows_out))]
     if rmiss is not None and rmiss.size:
         # unmatched PARENT rows: child columns NULL, parent columns read at rmiss
         extra = []
@@ -1872,8 +1889,8 @@ def _road_join_emit(db, tree):
             else: extra.append(col_vals(rseg, rpm.get(nd.name, nd.name), rmiss))
         rows_out += list(zip(*extra))
     rows_out = wdb_sql._apply_order(rows_out, proj, tree.args.get('order'))
-    lim = tree.args.get('limit')
-    if lim is not None: rows_out = rows_out[:int(lim.expression.this)]
+    if _offn9 or _limn9 is not None:                     # OFFSET was never applied here before 2026-10-05
+        rows_out = rows_out[_offn9:(None if _limn9 is None else _offn9 + _limn9)]
     return rows_out, [wdb_sql._alias(p) for p in proj]
 
 
@@ -2758,13 +2775,16 @@ def join_query(db, sql, columnar=False):
     else:
         keys = [R(p.this if isinstance(p, E.Alias) else p) for p in proj]
         rows = [tuple(_render(v) for v in t) for t in merged[keys].itertuples(index=False, name=None)]
+    _dst9 = tree.args.get('distinct')
+    if _dst9 is not None and not _dst9.args.get('on'):
+        rows = list(dict.fromkeys(rows))           # SELECT DISTINCT: the merge tail never deduplicated (2026-10-05)
 
     having = tree.args.get('having')
     if having is not None:
         rows = wdb_sql._apply_having(rows, proj, having.this, None)   # fused path must filter too
     rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))
-    lim = wdb_sql._limit(tree)
-    if lim is not None: rows = rows[:lim]
+    lim = wdb_sql._limit(tree); off = wdb_sql._offset(tree)
+    if off or lim is not None: rows = rows[off:(None if lim is None else off + lim)]   # OFFSET too (2026-10-05)
     return rows, [wdb_sql._alias(p) for p in proj]
 
 
@@ -3076,6 +3096,14 @@ def _bulk_keyvals(seg, pcol, codes):
     c = seg.cols[pcol]; dt = c['dt']
     codes = np.asarray(codes)
     nc = (c['V'] - 1) if c['has_null'] else None
+    if (dt == 1 and codes.size * 64 < int(c['V']) and pcol not in seg._tdict
+            and pcol not in (getattr(seg, '_str_dict_cache', None) or {})):
+        # A FEW KEYS OF A BIG DICTIONARY (2026-10-05): point-fetch the distinct codes asked for -- the whole-
+        # dictionary decode below turned 6M SearchPhrases into Python strings to print the 1000 rows of a
+        # LIMIT 1000 join (and 10 rows of a top-k)
+        u, inv = np.unique(codes, return_inverse=True)
+        vals = [None if (nc is not None and int(k) == nc) else wdb_sql._pyval(seg.fetch(pcol, int(k))) for k in u]
+        return [vals[i] for i in inv.tolist()]
     if dt == 1 and not c['has_null']:
         # THE DECODED-DICT SHELF: a V-scale object array of Python strings
         # survives the per-query flush (the flush drops N-scale residue; a

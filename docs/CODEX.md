@@ -4078,3 +4078,22 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
   strict UTF-8 validity); through SQL against DuckDB -- LENGTH in filters (=, >, <>, NULLs) and GROUP BY, LIKE with
   '_', prefixes, NOT LIKE, SUBSTR and LOWER groups -- each family asserted served by the stream; the prefix
   surrogate against sorted Python prefixes.
+
+## 2026-10-05 (later) -- THE LIMIT FIRST on the road join; DISTINCT and OFFSET on the join tails
+- THE BILL (megaboard j-dump, a 100M x dimension join with LIMIT 1000 and no ORDER BY: 7.3 s against DuckDB 0.10,
+  ClickHouse 0.027): the road join read EVERY joined row's values into Python and cut at the end; the string
+  column (SearchPhrase) was decoded through _bulk_keyvals, which turns the whole 6M-value dictionary into Python
+  strings to print any number of rows.
+- THE CUT: without ORDER BY (and without DISTINCT) the first OFFSET+LIMIT joined rows are the answer -- the rows
+  are cut before any value is read (RIGHT/FULL's unmatched parents fill what is left); the governor is asked for
+  that many. _bulk_keyvals point-fetches the distinct codes asked for when they are under 1/64 of the dictionary
+  (10 rows of a top-k no longer decode a 6M dictionary either).
+- FOUND ON THE WAY (the test's exact checks): the road join answered SELECT DISTINCT without deduplicating (it
+  declines DISTINCT now), the pandas merge tail ignored DISTINCT too (deduplicated now, order kept), and both
+  ignored OFFSET (applied now).
+- j-dump 7.3 -> 1.0 s, j-left-dump 1.1 -> 0.65 s. What is left is the full-length work before the cut: the
+  child's key column and WHERE masks over all 100M rows (_lane decodes, numpy passes). NEXT: a chunked road --
+  pointer and filters over row ranges, stopping when the limit is full.
+- tests/test_join_limit.py: INNER / LEFT / RIGHT / FULL with WHERE on either side and LIMIT (OFFSET too, and a
+  limit larger than the answer): the count is DuckDB's and every row is a row of the full join; ORDER BY ... LIMIT
+  ... OFFSET and SELECT DISTINCT over the join equal DuckDB exactly.
