@@ -251,7 +251,10 @@ def _exists_road(db, tree, inner, icol, ocol, rest, outer_where=None, ex_node=No
             td9 = np.asarray(segc._typed_dict(colname))
             if td9.dtype.kind not in 'if':
                 return None
+            if rows9s is not None:                 # only the lines of parents the window kept
+                return td9[np.asarray(segc.codes_at(colname, rows9s))]
             return td9[np.asarray(segc.codes(colname))]
+        rows9s = None
         m9 = None
         import wdb_sql as _ws9
         # QUARTER-FIRST (Jackson's original order): evaluate the outer's own
@@ -296,6 +299,16 @@ def _exists_road(db, tree, inner, icol, ocol, rest, outer_where=None, ex_node=No
                 mo9 = op9o(vv9, v9o)
                 okeep9 = mo9 if okeep9 is None else (okeep9 & mo9)
                 _b9(_t9, 'okeep-conjunct'); _t9 = _tt9.perf_counter()
+        if okeep9 is not None and rest:
+            # THE FILTER FIRST (Jackson, 2026-10-05, Q4): the window already knows which parents count, so only
+            # their lines are judged -- every other line's dates are never decoded. Q4 judged lateness for all
+            # 60M lines (510 ms: two full code rebuilds, two full code->date gathers) and the window threw ~96%
+            # of the verdicts away in the scatter.
+            import wdb_kernels as _wk9s, wdb_engine as _we9s
+            lk9s = np.empty(int(segc.N), dtype=np.bool_)
+            _wk9s.plut_u8(np.ascontiguousarray(ptr), np.ascontiguousarray(okeep9, dtype=np.bool_), lk9s)
+            rows9s = _we9s.Segment.mask_rows(lk9s)
+            _b9(_t9, 'window-lines'); _t9 = _tt9.perf_counter()
         for cn in rest:
             cols = list(cn.find_all(E.Column))
             t9n = type(cn).__name__
@@ -311,6 +324,8 @@ def _exists_road(db, tree, inner, icol, ocol, rest, outer_where=None, ex_node=No
                     # THE BIT ANSWERS (the declared pair's whole purpose):
                     # bit means anchor <= partner; delta==0 means equal.
                     bit9, dl9 = segc.pair_bits(nl9)
+                    if rows9s is not None:
+                        bit9 = np.asarray(bit9)[rows9s]; dl9 = np.asarray(dl9)[rows9s]
                     _b9(_t9, 'pair_bits'); _t9 = _tt9.perf_counter()
                     lf9 = (cl9.get('code_enc') == 15)   # left is the anchor?
                     t9x = t9n if lf9 else {'GT': 'LT', 'LT': 'GT', 'GTE': 'LTE',
@@ -350,7 +365,9 @@ def _exists_road(db, tree, inner, icol, ocol, rest, outer_where=None, ex_node=No
             m9 = np.ones(int(segc.N), dtype=bool)
         _b9(_t9, 'child-mask-AND'); _t9 = _tt9.perf_counter()
         yes9 = np.zeros(int(sego.N), dtype=bool)
-        if okeep9 is not None:
+        if rows9s is not None:                     # the window is already in the rows
+            yes9[np.asarray(ptr)[rows9s[m9]]] = True
+        elif okeep9 is not None:
             import wdb_kernels as _wk9
             _wk9.exists_scatter(m9, np.asarray(ptr), okeep9, yes9)   # one fused pass
         else:

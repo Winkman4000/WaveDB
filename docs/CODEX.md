@@ -4016,3 +4016,21 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
   DuckDB, each asserted served by the count: the Q21 pair grouped on text with a top-k, a lone EXISTS with P
   (scalar), a lone NOT EXISTS without P, a text x written outer-first, another (unsorted) inner table, and an
   unsorted table against itself.
+
+## 2026-10-05 -- TPC-H Q4: THE FILTER FIRST (the window's lines only)
+- THE BILL (hot, SF10, sidecars off): 770 ms against DuckDB's 280. "Is this line late?" (l_commitdate <
+  l_receiptdate) was judged for all 60M lines: ~510 ms -- both date columns' codes rebuilt from their y/m/d planes
+  (130 + 130), both turned into dates by one-thread gathers (~240), the compare (29). Only lines of orders in the
+  3-month window can count, and the road (_exists_road) already knew which orders those were (the QUARTER-FIRST
+  okeep) -- but used it only at the scatter, throwing ~96% of the verdicts away.
+- THE FIX (Jackson): capitalize on the filter. When the outer's own window kept a set of parents and the child
+  has conditions, the window's lines are found first (one parallel LUT pass over the road, plut_u8, then
+  mask_rows: 21 ms), and every child condition is judged only at those rows -- codes_at (the E14 survivor read:
+  planes streamed, civil math only at the asked rows), the declared-pair bits indexed by them; the scatter writes
+  their verdicts straight through the road. The late-line step 510 ms -> ~110 ms (window lines 21, judging 91).
+- Q4 hot 0.77 s -> 0.35 s, the 5 rows equal DuckDB's. THE BOARD: 14/14 correct, 6 wins, WaveDB 5.2 s = DuckDB
+  5.2 s; geomean WaveDB / DuckDB 1.01 (1.07 before). Worst ratios left: Q12 (0.60 vs 0.36), Q6 (0.34 vs 0.21).
+  Suite 1825/0.
+- tests/test_exists_window.py: Q4's shape (date window on the parent, column against column on the child), with a
+  literal child condition beside it, a one-sided window, and a window that keeps nothing -- against DuckDB, each
+  confirmed on the window-first path (WDB_JOIN_BILL shows window-lines for all four).
