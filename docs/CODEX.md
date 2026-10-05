@@ -4097,3 +4097,23 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
 - tests/test_join_limit.py: INNER / LEFT / RIGHT / FULL with WHERE on either side and LIMIT (OFFSET too, and a
   limit larger than the answer): the count is DuckDB's and every row is a row of the full join; ORDER BY ... LIMIT
   ... OFFSET and SELECT DISTINCT over the join equal DuckDB exactly.
+
+## 2026-10-05 (later still) -- THE ROAD IN PIECES, and THE LOAD STEERS it
+- AFTER THE LIMIT CUT, j-dump (1.0 s) and j-left-dump (0.65 s) still paid for every child row before the cut:
+  the child's join key decoded over all 100M rows (_lane), the pointer built for all of them, every WHERE
+  evaluated full-length.
+- THE ROAD IN PIECES (wdb_join._road_join_emit, _pieces9): an INNER or LEFT road join with LIMIT and no ORDER BY
+  (and numeric keys) reads the child in row sets of growing size and stops when OFFSET+LIMIT rows are kept. In
+  each set the child's own filters come FIRST, judged by code (_code_lut9: col = / <> 'text' on a text
+  dictionary; comparisons, BETWEEN, IN on a numeric dictionary; painted with plut_u8), then the key is read and
+  the parent found only at the survivors; the parent's filters are a keep-by-parent-row evaluated once on the
+  (small) dimension, with the NULL-side truth for LEFT rows that find no parent. Anything a piece can't judge
+  (another filter, a text key, an error of any kind) hands the query to the whole road.
+- THE LOAD STEERS (Jackson's write-up thesis -- measured at load, known at query): when every child filter is a
+  code table, the load's per-block code ranges (wdb_blockstats, the stats file the encoder writes; steering, not
+  an answer, so legal under LOAD_ANSWERS=0) name the 32K-row blocks that can hold a kept row, and the road walks
+  only those. CounterID = 62 first appears 47.6M rows into the fj table; the plain walk read half the table.
+- j-dump 1.0 s -> 0.03 s (ClickHouse 0.027, DuckDB 0.10); j-left-dump 0.65 -> 0.44 (filters first) -> 0.015 s
+  (blocks steered; ClickHouse 0.017, DuckDB 0.08). From 7.3 s and 1.1 s this morning.
+- tests/test_join_limit.py now also: a LEFT join with a parent-side filter, the unmatched rows (d.id IS NULL),
+  BETWEEN with a text <>; the piecewise road asserted to have answered.

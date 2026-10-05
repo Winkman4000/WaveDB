@@ -1714,6 +1714,9 @@ def _join_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
     return ptr
 
 
+_PIECES_SERVED = [0]        # how many road joins the piecewise road answered (tests read it)
+
+
 def _road_join_emit(db, tree):
     """THE ROAD JOIN (H2O joins): a row-emitting two-table equi-join whose
     right key is unique is a POINTER, not a merge -- the child's columns
@@ -1785,45 +1788,195 @@ def _road_join_emit(db, tree):
         return False
     for cj in _conj9:
         if None in _sides9(cj) or cj.find(E.Subquery) is not None: return None
-    ptr = _join_pointer(db, lt, lpm.get(a.name, a.name), lseg, rt, rpm.get(b.name, b.name), rseg)
-    n = int(lseg.N)
-    rmiss = None                                      # RIGHT/FULL: parent rows nobody points at (NULL child side)
-    if side == 'LEFT':
-        rows = np.arange(n, dtype=np.int64); prow = ptr
-        miss = prow < 0
-    elif side in ('RIGHT', 'FULL'):
-        if side == 'FULL':
-            rows = np.arange(n, dtype=np.int64); prow = ptr; miss = prow < 0
+    def _code_lut9(cj):
+        """(column, keep-by-code) for a child conjunct judged once per distinct value: col = / <> 'text' on a text
+        dictionary, or a comparison / BETWEEN / IN against literals on a numeric dictionary; else None"""
+        if isinstance(cj, (E.EQ, E.NEQ, E.GT, E.LT, E.GTE, E.LTE, E.Between, E.In)) and isinstance(cj.this, E.Column):
+            pc = lpm.get(cj.this.name, cj.this.name); c = lseg.cols.get(pc) or {}
+            if (c.get('dt') in (0, 2) and c.get('mode') in (0, 1, 2) and lseg._overrides(pc) is None
+                    and int(c.get('V') or 0) <= (1 << 22)):
+                try:
+                    td = np.asarray(lseg._typed_dict(pc))
+                    if td.dtype.kind not in 'iuf': return None
+                    k9 = td.dtype.kind
+                    lv = lambda e: wdb_sql._lit_for_col(lseg, pc, e, k9)
+                    if isinstance(cj, E.Between):
+                        m = (td >= lv(cj.args['low'])) & (td <= lv(cj.args['high']))
+                    elif isinstance(cj, E.In):
+                        ex9 = cj.args.get('expressions') or []
+                        if cj.args.get('query') is not None or not ex9: return None
+                        m = np.isin(td, [lv(e) for e in ex9])
+                    else:
+                        if not (isinstance(cj.expression, E.Literal) or isinstance(cj.expression, E.Neg)): return None
+                        import operator as _op9
+                        m = {E.EQ: _op9.eq, E.NEQ: _op9.ne, E.GT: _op9.gt, E.LT: _op9.lt, E.GTE: _op9.ge,
+                             E.LTE: _op9.le}[type(cj)](td, lv(cj.expression))
+                    V = int(c['V']); lut = np.zeros(V, np.bool_)
+                    lut[:min(V, m.size)] = np.asarray(m, bool)[:V]   # the NULL code (past the dictionary): never true
+                    if c.get('has_null'): lut[V - 1] = False         # NULL op x is never true
+                    return pc, lut
+                except Exception:
+                    return None
+        if type(cj) not in (E.EQ, E.NEQ) or not isinstance(cj.this, E.Column): return None
+        lit = cj.expression
+        if not (isinstance(lit, E.Literal) and lit.is_string): return None
+        pc = lpm.get(cj.this.name, cj.this.name); c = lseg.cols.get(pc) or {}
+        if c.get('dt') != 1 or c.get('mode') not in (0, 1) or lseg._overrides(pc) is not None: return None
+        try:
+            import wdb_wherescan
+            code = wdb_wherescan._code_of(lseg, pc, str(lit.this).encode())
+        except Exception:
+            return None
+        V = int(c['V'])
+        lut = np.zeros(V, np.bool_)
+        if isinstance(cj, E.EQ):
+            if code is not None and 0 <= int(code) < V: lut[int(code)] = True
+        else:
+            lut[:] = True
+            if code is not None and 0 <= int(code) < V: lut[int(code)] = False
+            if c.get('has_null'): lut[V - 1] = False          # NULL <> x is not true
+        return pc, lut
+    def _pieces9():
+        """THE ROAD IN PIECES (2026-10-05): with LIMIT and no ORDER BY, an INNER or LEFT road reads the child in
+        growing row ranges -- key, pointer and the WHERE on each range only -- and stops when the limit is full.
+        The whole road read the child's key and every WHERE over all its rows first (j-dump: 1.0 s for 1000 rows,
+        all but a sliver of it spent on rows never returned). None when a piece can't be judged on a range."""
+        ckn = lpm.get(a.name, a.name); pkn = rpm.get(b.name, b.name)
+        cc9 = lseg.cols.get(ckn) or {}
+        if cc9.get('has_null') or lseg._overrides(ckn) is not None: return None
+        lconj = [cj for cj in _conj9 if _sides9(cj) == {la}]
+        rconj = [cj for cj in _conj9 if _sides9(cj) == {ra}]
+        if len(lconj) + len(rconj) != len(_conj9): return None
+        pk = np.asarray(wdb_sql._col(rseg, pkn)[0])
+        if pk.dtype.kind not in 'iuf': return None                # numeric keys only: a text key's two decodes
+        pidx = pd.Index(pk)                                       # (bytes vs str) must never silently mismatch
+        if not pidx.is_unique: return None
+        m_r = None
+        if rconj:
+            m_r = np.ones(int(rseg.N), bool)
+            for cj in rconj:
+                m_r &= np.asarray(wdb_sql._eval_pred(rseg, _strip9(cj), lambda nm: rpm.get(nm, nm)), dtype=bool)
+        rnull = all(_null_side_truth9(cj, ra) for cj in rconj)    # a LEFT row without a parent, under the WHERE
+        luts = [_code_lut9(cj) for cj in lconj]
+        n9 = int(lseg.N); lo = 0; step = max(1 << 16, min(1 << 20, _want9 * 64))
+        kraw = wdb_sql.raw_dict_col(lseg, ckn, want_codes=False)    # the key read only where the child's own
+        import wdb_kernels as _WKp                                    # filters left rows (CounterID = 62: 0.7%)
+        # THE LOAD STEERS (Jackson's thesis: measured at load, known at query): when every child filter is a
+        # code table, the load's per-block code ranges name the blocks that can hold a kept row -- the road
+        # walks only those (CounterID = 62 first appears 47.6M rows in; the plain walk read half the table)
+        cand9 = None; B9 = 32768
+        if lconj and all(lt is not None for lt in luts):
+            try:
+                import wdb_blockstats
+                nb9 = -(-n9 // B9)
+                cand9 = np.ones(nb9, bool)
+                for lt in luts:
+                    st9 = wdb_blockstats._from_load(lseg, lt[0])
+                    if st9 is None or st9['cmin'].size != nb9:
+                        cand9 = None; break
+                    cs9 = np.zeros(lt[1].size + 1, np.int64); np.cumsum(lt[1], out=cs9[1:])
+                    cmin9 = np.clip(np.asarray(st9['cmin'], np.int64), 0, lt[1].size - 1)
+                    cmax9 = np.clip(np.asarray(st9['cmax'], np.int64), 0, lt[1].size - 1)
+                    cand9 &= ((cs9[cmax9 + 1] - cs9[cmin9]) > 0) & (np.asarray(st9['nn']) > 0)
+            except Exception:
+                cand9 = None
+        def _ranges9():
+            """row sets to judge, in row order: candidate blocks in growing batches, or plain growing ranges"""
+            if cand9 is not None:
+                cb = np.flatnonzero(cand9); i = 0; nb = max(2, step // B9)
+                while i < cb.size:
+                    bs = cb[i:i + nb]; i += nb; nb *= 4
+                    lens = np.minimum(n9, (bs + 1) * B9) - bs * B9
+                    starts = np.repeat(bs * B9, lens)
+                    within = np.arange(int(lens.sum()), dtype=np.int64) - np.repeat(np.cumsum(lens) - lens, lens)
+                    yield None, None, starts + within
+                return
+            lo9, st = 0, step
+            while lo9 < n9:
+                hi9 = min(n9, lo9 + st); yield lo9, hi9, None; lo9 = hi9; st *= 4
+        R9, P9 = [], []; got = 0
+        for lo, hi, rr in _ranges9():
+            if got >= _want9: break
+            m9 = (hi - lo) if rr is None else rr.size
+            keep = np.ones(m9, bool)
+            for cj, lt9 in zip(lconj, luts):                         # the child's filters first, by code
+                if not keep.any(): break
+                if lt9 is not None:
+                    if rr is None: rr = np.arange(lo, hi, dtype=np.int64)
+                    cd9 = np.ascontiguousarray(lseg.codes_at(lt9[0], rr))
+                    k9 = np.empty(cd9.shape[0], np.bool_)
+                    _WKp.plut_u8(cd9, lt9[1], k9)
+                    keep &= k9
+                else:
+                    mm = wdb_sql._eval_pred_range(lseg, _strip9(cj), lambda nm: lpm.get(nm, nm), lo, hi, set())
+                    if mm is not None: keep &= np.asarray(mm, dtype=bool)
+            rows_c = (np.flatnonzero(keep) + lo) if rr is None else rr[keep]
+            if rows_c.size:
+                if kraw is not None:
+                    ck = np.asarray(kraw[0])[np.asarray(lseg.codes_at(ckn, rows_c))]
+                else:
+                    ck = np.asarray(list(lseg.values_at_rows(ckn, rows_c)))
+                if ck.dtype.kind not in 'iuf': return None
+                p = np.asarray(pidx.get_indexer(ck), dtype=np.int64)
+                sel = (p >= 0) if side != 'LEFT' else np.ones(rows_c.size, bool)
+                if rconj:
+                    ok = p >= 0
+                    kk = np.empty(rows_c.size, bool); kk[ok] = m_r[p[ok]]; kk[~ok] = rnull
+                    sel &= kk
+                R9.append(rows_c[sel]); P9.append(p[sel]); got += int(sel.sum())
+        rows9 = np.concatenate(R9)[:_want9] if R9 else np.empty(0, np.int64)
+        prow9 = np.concatenate(P9)[:_want9] if P9 else np.empty(0, np.int64)
+        return rows9, prow9, ((prow9 < 0) if side == 'LEFT' else None)
+    _pc9 = None
+    if _want9 is not None and side in ('', 'LEFT'):
+        try:
+            _pc9 = _pieces9()
+        except Exception as _e9:                      # any doubt: the whole road answers (never a wrong answer)
+            if os.environ.get('WDB_JOIN_BILL'): print('ROAD-PIECES declined: %r' % (_e9,), flush=True)
+            _pc9 = None
+    if _pc9 is not None:
+        rows, prow, miss = _pc9; rmiss = None
+        _PIECES_SERVED[0] += 1
+    else:
+        ptr = _join_pointer(db, lt, lpm.get(a.name, a.name), lseg, rt, rpm.get(b.name, b.name), rseg)
+        n = int(lseg.N)
+        rmiss = None                                      # RIGHT/FULL: parent rows nobody points at (NULL child side)
+        if side == 'LEFT':
+            rows = np.arange(n, dtype=np.int64); prow = ptr
+            miss = prow < 0
+        elif side in ('RIGHT', 'FULL'):
+            if side == 'FULL':
+                rows = np.arange(n, dtype=np.int64); prow = ptr; miss = prow < 0
+            else:
+                rows = np.flatnonzero(ptr >= 0); prow = ptr[rows]; miss = None
+            hit = np.zeros(int(rseg.N), bool); hit[ptr[ptr >= 0]] = True
+            rmiss = np.flatnonzero(~hit)
         else:
             rows = np.flatnonzero(ptr >= 0); prow = ptr[rows]; miss = None
-        hit = np.zeros(int(rseg.N), bool); hit[ptr[ptr >= 0]] = True
-        rmiss = np.flatnonzero(~hit)
-    else:
-        rows = np.flatnonzero(ptr >= 0); prow = ptr[rows]; miss = None
-    import wdb_govern
-    _ask9 = int(rows.size) + (int(rmiss.size) if rmiss is not None else 0)
-    wdb_govern.ask(_ask9 if _want9 is None else min(_ask9, _want9), len(proj), 'join result')   # THE GOVERNOR
-    if _conj9:
-        keep = np.ones(int(rows.size), bool)
-        for cj in _conj9:
-            sd = _sides9(cj)
-            if sd == {la}:
-                keep &= np.asarray(wdb_sql._eval_pred(lseg, _strip9(cj), lambda nm: lpm.get(nm, nm)), dtype=bool)[rows]
-            elif sd == {ra}:
-                m_r = np.asarray(wdb_sql._eval_pred(rseg, _strip9(cj), lambda nm: rpm.get(nm, nm)), dtype=bool)
-                if miss is not None:
-                    kk = np.zeros(int(rows.size), bool); okp = ~miss
-                    kk[okp] = m_r[prow[okp]]; kk[miss] = _null_side_truth9(cj, ra)
-                    keep &= kk
+        import wdb_govern
+        _ask9 = int(rows.size) + (int(rmiss.size) if rmiss is not None else 0)
+        wdb_govern.ask(_ask9 if _want9 is None else min(_ask9, _want9), len(proj), 'join result')   # THE GOVERNOR
+        if _conj9:
+            keep = np.ones(int(rows.size), bool)
+            for cj in _conj9:
+                sd = _sides9(cj)
+                if sd == {la}:
+                    keep &= np.asarray(wdb_sql._eval_pred(lseg, _strip9(cj), lambda nm: lpm.get(nm, nm)), dtype=bool)[rows]
+                elif sd == {ra}:
+                    m_r = np.asarray(wdb_sql._eval_pred(rseg, _strip9(cj), lambda nm: rpm.get(nm, nm)), dtype=bool)
+                    if miss is not None:
+                        kk = np.zeros(int(rows.size), bool); okp = ~miss
+                        kk[okp] = m_r[prow[okp]]; kk[miss] = _null_side_truth9(cj, ra)
+                        keep &= kk
+                    else:
+                        keep &= m_r[prow]
                 else:
-                    keep &= m_r[prow]
-            else:
-                return None                                  # a two-sided conjunct: the general joiner
-        rows = rows[keep]; prow = prow[keep]
-        if miss is not None: miss = miss[keep]
-    if _want9 is not None and rows.size > _want9:
-        rows = rows[:_want9]; prow = prow[:_want9]
-        if miss is not None: miss = miss[:_want9]
+                    return None                                  # a two-sided conjunct: the general joiner
+            rows = rows[keep]; prow = prow[keep]
+            if miss is not None: miss = miss[keep]
+        if _want9 is not None and rows.size > _want9:
+            rows = rows[:_want9]; prow = prow[:_want9]
+            if miss is not None: miss = miss[:_want9]
     def col_vals(seg, pc, rr):
         # MODE-AWARE point reads: plain dict numerics ride base[codes_at]
         # (cached base), everything else the general values_at_rows --

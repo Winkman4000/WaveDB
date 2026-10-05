@@ -32,6 +32,9 @@ def test_join_limit_equals_duck():
         ("SELECT f.v, d.zone FROM f FULL OUTER JOIN d ON f.k = d.id WHERE f.v > 990", 'LIMIT 400'),
         ("SELECT f.v, d.id FROM f JOIN d ON f.k = d.id", 'LIMIT 10 OFFSET 5'),
         ("SELECT f.v, d.zone FROM f JOIN d ON f.k = d.id WHERE f.v = 3", 'LIMIT 100000'),   # fewer rows than the limit
+        ("SELECT f.v, d.zone FROM f LEFT JOIN d ON f.k = d.id WHERE d.tier = 'gold' AND f.s = 'bb'", 'LIMIT 300'),
+        ("SELECT f.v, d.zone FROM f LEFT JOIN d ON f.k = d.id WHERE d.id IS NULL", 'LIMIT 50'),   # the unmatched rows
+        ("SELECT f.s, d.tier FROM f JOIN d ON f.k = d.id WHERE f.s <> 'a' AND f.v BETWEEN 10 AND 20", 'LIMIT 2000'),
     ]
     exact = [
         "SELECT f.v, d.zone FROM f JOIN d ON f.k = d.id ORDER BY f.v DESC, d.zone LIMIT 20 OFFSET 7",
@@ -48,12 +51,15 @@ def test_join_limit_equals_duck():
             con.execute("CREATE VIEW %s AS SELECT * FROM read_parquet('%s')" % (name, pq))
         os.environ.update(FLOOR)
         db = Database.open(db_dir)
+        import wdb_join
+        p0 = wdb_join._PIECES_SERVED[0]
         for base, lim in sub:
             r = db.run(base + ' ' + lim); got = [_norm(x) for x in (r[0] if isinstance(r, tuple) else r)]
             full = Counter(_norm(x) for x in con.execute(base).fetchall())
             want_n = len(con.execute(base + ' ' + lim).fetchall())
             assert len(got) == want_n, (base, lim, len(got), want_n)
             assert not (Counter(got) - full), (base, lim, 'rows outside the join')
+        assert wdb_join._PIECES_SERVED[0] - p0 >= 3, 'the piecewise road never answered'   # INNER / LEFT shapes
         for sql in exact:
             r = db.run(sql); got = [_norm(x) for x in (r[0] if isinstance(r, tuple) else r)]
             want = [_norm(x) for x in con.execute(sql).fetchall()]
