@@ -13,9 +13,10 @@ OUT=${2:?usage: bench/board_floor.sh DB_DIR OUT_DIR [REFEREE_DIR]}
 REF=${3:-}
 P=${PYTHON:-python3}
 PARQ=${HITS_PARQUET:-/workspace/data/hits.parquet}
-export PYTHONPATH=src WDB_SIDECARS=0 WDB_LOAD_ANSWERS=0
+export PYTHONPATH=src
+unset WDB_SIDECARS WDB_LOAD_ANSWERS          # THE DEFAULTS are the floor (2026-10-06): nothing set, nothing derived
 mkdir -p "$OUT"
-EXTRA=$(ls "$DB" | grep -v -E '^hits_[0-9]+\.wdb$|\.stats\.npz$|\.clen\.|\.rlen\.|^catalog\.json$|^routing_ledger\.jsonl$|^shelves\.json$' || true)
+EXTRA=$(ls "$DB" | grep -v -E '^hits_[0-9]+\.wdb$|\.stats\.npz$|\.clen\.|\.rlen\.|^catalog\.json$' || true)
 if [ -n "$EXTRA" ]; then
     echo "THE FLOOR REFUSES: $DB holds derived files:"; echo "$EXTRA" | head -20
     echo "(load with benchmark/clickbench/load.sh, or 'bin/wdb sidecars $DB drop')"; exit 2
@@ -24,7 +25,7 @@ echo "floor: $DB  load $(cut -d' ' -f1-3 /proc/loadavg)  $(date)" | tee "$OUT/bo
 $P bench/verify_correctness.py src "$DB" "$PARQ" bench/clickbench_queries.sql 300 > "$OUT/verify.log" 2>&1 || true
 tail -2 "$OUT/verify.log" | tee -a "$OUT/board.out"
 $P bench/true_cold.py "$DB" bench/clickbench_queries.sql > "$OUT/board.jsonl" 2> "$OUT/board.err"
-NEW=$(ls "$DB" | grep -v -E '^hits_[0-9]+\.wdb$|\.stats\.npz$|\.clen\.|\.rlen\.|^catalog\.json$|^routing_ledger\.jsonl$|^shelves\.json$' || true)
+NEW=$(ls "$DB" | grep -v -E '^hits_[0-9]+\.wdb$|\.stats\.npz$|\.clen\.|\.rlen\.|^catalog\.json$' || true)
 [ -n "$NEW" ] && { echo "THE FLOOR BROKE: files born during the board:"; echo "$NEW"; } | tee -a "$OUT/board.out"
 if [ -n "$REF" ]; then
     $P bench/board_vs.py "$OUT/board.jsonl" "$REF" | tee -a "$OUT/board.out"

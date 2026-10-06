@@ -34,7 +34,10 @@ def dump():
         with open(MANIFEST, 'rb') as f:
             man = pickle.load(f)
     before = sum(len(v) for v in man.values())
-    for mod, name, v in _dispatchers():
+    disp = list(_dispatchers())
+    live = {(mod, name) for mod, name, _v in disp}
+    man = {k: v for k, v in man.items() if k in live}       # a kernel that no longer exists leaves the manifest
+    for mod, name, v in disp:
         cache = getattr(v, '_cache', None); cf = getattr(cache, '_cache_file', None)
         if cf is None:
             continue

@@ -19,7 +19,7 @@ class Catalog:
             raise FileExistsError(f"database already exists at {dbdir}")
         os.makedirs(dbdir, exist_ok=True)
         # THE SWITCH: a new database is born with sidecars OFF -- derived files are an extension the
-        # operator turns on (wdb sidecars DB on). A catalog without the key (born before the switch) is on.
+        # operator turns on (wdb sidecars DB on). A catalog without the key is off too (the default).
         cat = cls(dbdir, {'tables': {}, 'sidecars': 'off'})
         cat.save()
         return cat

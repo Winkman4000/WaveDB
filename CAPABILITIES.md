@@ -1,5 +1,10 @@
 # WaveDB — SQL Capabilities
 
+> **Out of date (noted 2026-10-06).** This table was last revised in June 2026. Since then joins (inner, left,
+> right, full), subqueries (IN, EXISTS, scalar, correlated), CTEs and window functions run on the main path and
+> are tested against DuckDB in `tests/`; the marks below understate them, and the measured numbers are from
+> June. The tests are the current source of truth.
+
 What WaveDB can and cannot do at the atomic SQL level, vs a general-purpose
 database (SQLite as the reference). This is the source of truth for capability.
 A feature is marked supported ONLY if it runs on the real path (`db.run`).

@@ -6,5 +6,5 @@ cd "$(dirname "$0")"
 if [ -f wdb.pid ] && kill -0 "$(cat wdb.pid)" 2>/dev/null; then
     exit 0
 fi
-WDB_SIDECARS=0 nohup WaveDB/venv/bin/python WaveDB/bin/wdb serve "$PWD/cbdb" --port 8765 > wdb_serve.log 2>&1 &
+nohup WaveDB/venv/bin/python WaveDB/bin/wdb serve "$PWD/cbdb" --port 8765 > wdb_serve.log 2>&1 &
 echo $! > wdb.pid

@@ -134,9 +134,10 @@ def cmd_load(a):
 
 
 def _warm(dbdir, queries_file):
-    """THE WARM STEP: every sidecar the given queries need is born now -- as part of load, or on
-    its own (wdb warm DB QUERIES.sql) for a realm already loaded. A benchmark's first run is then
-    cold I/O, not index construction. Births persist on disk; a fresh process serves from them."""
+    """THE WARM STEP (an opt-in EXTENSION, never part of a benchmark entry): turns sidecars on and runs
+    the given queries once, so every derived structure (index, pre-aggregate) they would build is born
+    now and persists on disk. With sidecars off -- the default, and the ClickBench configuration --
+    nothing like this exists and nothing is built."""
     from wdb_db import Database
     import wdb_kernels; wdb_kernels.warm()
     db = Database.open(dbdir); t1 = time.perf_counter(); n = 0; failed = 0

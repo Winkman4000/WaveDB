@@ -1768,10 +1768,10 @@ def _column_extras(nm, blob, N):
         st = {}
         if os.environ.get('WDB_LOAD_STATS', '1') != '0':
             import wdb_blockstats as _B
-            rep = _B.differentiator_rows(seg, nm)
-            if rep is not None:
+            rep = _B.differentiator_rows(seg, nm) if _B._ANSWERS[0] else None   # pre-aggregates: only
+            if rep is not None:                                                  # with answers on (2026-10-06)
                 st[nm + '.rep'] = rep
-            vc = _B.value_counts(seg, nm)
+            vc = _B.value_counts(seg, nm) if _B._ANSWERS[0] else None    # a GROUP BY COUNT table: same law
             if vc is not None:
                 st[nm + '.vcnt'] = vc
             spp = _B.e19_signposts(seg, nm)            # THE SIGNPOSTS (block-dictionary columns)
@@ -1783,7 +1783,8 @@ def _column_extras(nm, blob, N):
                 try:
                     s9 = _B.compute(seg, nm)
                     for kk in ('cnt', 'nn', 'sum', 'cmin', 'cmax'):
-                        st[nm + '.' + kk] = s9[kk]
+                        if kk != 'sum' or _B._ANSWERS[0]:             # block sums: only with answers on
+                            st[nm + '.' + kk] = s9[kk]
                     st[nm + '.mode4'] = np.bool_(s9['mode4']); st[nm + '.maxabs'] = np.float64(s9['maxabs'])
                     st[nm + '.dt'] = np.int64(s9['dt'])
                 except Exception:
@@ -1792,7 +1793,10 @@ def _column_extras(nm, blob, N):
         if os.environ.get('WDB_LOAD_LENGTHS', '1') != '0':
             import wdb_lens
             dict9 = wdb_lens.dict_body(seg, nm)
-            if nm in [c for c in os.environ.get('WDB_ROWLEN_COLS', '').split(',') if c]:
+            # ROW LENGTHS FOR EVERY LARGE TEXT COLUMN (2026-10-06): every column that gets dictionary
+            # lengths gets row lengths too -- part of the format, the way a string store keeps its sizes,
+            # never a column named for a workload (--row-lengths still adds others)
+            if dict9 is not None or nm in [c for c in os.environ.get('WDB_ROWLEN_COLS', '').split(',') if c]:
                 row9 = wdb_lens.row_body(seg, nm)
         return {'stats': st, 'dict': dict9, 'row': row9}
     finally:
@@ -2404,8 +2408,10 @@ def encode(input_path, out_path, columns=None, workers=None, reader='auto', fd_s
                 import traceback, sys as _sy
                 print('CUBE BUILD DIED:', file=_sy.stderr); traceback.print_exc()
     try:
-        if os.environ.get('WDB_LOAD_SHELVES', '1') != '0':
-            _birth_differentiator_shelves(out_path)
+        import wdb_sidecar as _SC8
+        if os.environ.get('WDB_LOAD_SHELVES', '1') != '0' \
+                and _SC8.births_on(os.path.dirname(out_path)):          # THE SWITCH here too (2026-10-06:
+            _birth_differentiator_shelves(out_path)                     # this non-streaming twin skipped it)
     except Exception:
         pass
     _write_load_stats(out_path)
@@ -2440,8 +2446,8 @@ def _write_extras(out_path, N, order, extras, verbose=False):
         for col in order:
             if extras[col].get('dict') is not None:
                 wdb_lens.write_dict(out_path, col, extras[col]['dict'], size, verbose)
-        for col in [c for c in os.environ.get('WDB_ROWLEN_COLS', '').split(',') if c]:
-            if col in extras and extras[col].get('row') is not None:
+        for col in order:                                   # every column whose job computed row lengths
+            if extras[col].get('row') is not None:
                 wdb_lens.write_row(out_path, col, extras[col]['row'], size, verbose)
 
 

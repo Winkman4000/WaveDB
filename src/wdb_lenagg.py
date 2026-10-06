@@ -200,7 +200,8 @@ def _dict_sums(seg, spec):
     else:
         lens16 = lens.astype(np.int64)
     import wdb_kernels as WK
-    _price(seg, key, lcol)                       # the bidder's ledger: predict, then act
+    # (the bidder's ledger, _price, is no longer asked here (2026-10-06): its pick was never used, and asking it
+    # measured this machine once and wrote a .calib.json into the working directory -- a file a query wrote)
     # every row of both columns is read: ONE full decode each through the engine's own fastest
     # reader (pipelined frames / block dictionaries / tag 20), then the workers slice the codes.
     # Window-by-window reads of an uncached column measured 1.25 s against 0.31 s this way (Q27).

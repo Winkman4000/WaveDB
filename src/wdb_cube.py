@@ -387,6 +387,9 @@ def detect(seg, tree, col_map):
     if not P.no_joins(tree):           return None
     if not P.no_select_distinct(tree): return None
     if not P.has_group_key(tree):      return None
+    import os, wdb_sidecar
+    if not wdb_sidecar.births_on(os.path.dirname(getattr(seg, 'path', '') or '.')):
+        return None                    # a cube is a stored pre-aggregate: read only with sidecars ON (2026-10-06)
     cubes = seg.cubes()
     if not cubes: return None
     return {'tree': tree, 'col_map': col_map, 'cubes': cubes}

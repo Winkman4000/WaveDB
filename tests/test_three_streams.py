@@ -128,15 +128,18 @@ def _hostruns(fn, *args, n, size):
 
 
 def test_host_from_the_headers_equals_the_byte_walk():
-    """fc3_hostruns (headers decide inherited hosts; strings rebuilt only at breaks) must give the
-    byte walk's breaks, host ends and labels exactly -- with the newline shortcut and without"""
+    """fc3_prefruns (headers decide inherited labels; strings rebuilt only at breaks) must give the
+    byte walk's breaks, delimiter ends and labels exactly -- with the newline shortcut and without"""
+    import wdb_regexgroup as RG
     w3, w1, pq, df = _fixture()
     s3 = Segment(w3); c = s3.cols['ref']; R = int(c['R'])
-    for p in wdb_strings._chunk_plan(s3, 'ref'):
-        j, lo, n, rl = p
-        h = s3.fc_part(c, j, 'h').view(np.uint16); t = s3.fc_part(c, j, 't'); a = s3.fc_chunk(c, j)
-        old = _hostruns(WK.fc_hostruns, a, np.int64(R), n=n, size=a.size)
-        nl_free = not bool((t == 10).any())
-        for flag in {nl_free, False}:
-            new = _hostruns(WK.fc3_hostruns, h, t, np.int64(R), flag, n=n, size=t.size)
-            assert np.array_equal(old[0], new[0]) and np.array_equal(old[1], new[1]) and old[2] == new[2], (j, flag)
+    for pat in (r'^https?://(?:www\.)?([^/]+)/.*$', r'^(?:Google|https://www\.google\.com/)([^ ]+) .*$'):
+        pfx, pfo, d = RG._prefix_class(pat, '\\1')
+        for p in wdb_strings._chunk_plan(s3, 'ref'):
+            j, lo, n, rl = p
+            h = s3.fc_part(c, j, 'h').view(np.uint16); t = s3.fc_part(c, j, 't'); a = s3.fc_chunk(c, j)
+            old = _hostruns(WK.fc_prefruns, a, np.int64(R), pfx, pfo, d, n=n, size=a.size)
+            nl_free = not bool((t == 10).any())
+            for flag in {nl_free, False}:
+                new = _hostruns(WK.fc3_prefruns, h, t, np.int64(R), flag, pfx, pfo, d, n=n, size=t.size)
+                assert np.array_equal(old[0], new[0]) and np.array_equal(old[1], new[1]) and old[2] == new[2], (pat, j, flag)

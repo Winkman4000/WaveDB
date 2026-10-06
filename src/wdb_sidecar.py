@@ -15,8 +15,9 @@ THE SWITCH (Jackson's operator law): sidecars are an EXTENSION the operator turn
 tax the engine levies in secret. A database's catalog carries 'sidecars': 'on' | 'off'; off
 means no derived file is ever born (the engine answers from segments + the RAM shelf), so the
 number on disk is the number that was loaded. WDB_SIDECARS=0|1 in the environment overrides
-the catalog (an A/B without touching the realm). A catalog without the key is 'on' -- every
-realm born before the switch keeps its roads. `wdb sidecars DB on|off|status|drop`.
+the catalog (an A/B without touching the realm). OFF IS THE DEFAULT: a catalog without the key is
+'off' (2026-10-06; it was 'on' so realms born before the switch kept their roads -- turn those on
+explicitly). `wdb sidecars DB on|off|status|drop`.
 THE SENTINEL: while off, Database.run compares the directory before and after each query;
 a newborn is a missed gate -- removed and named on stderr, raised under WDB_SIDECAR_STRICT=1
 (the suite runs strict: a silent gate is a defect, not overhead).
@@ -246,7 +247,8 @@ def _env_setting():
 
 def setting(dbdir):
     """'on' | 'off' for this database: WDB_SIDECARS in the environment wins; else the catalog's
-    'sidecars' key; a catalog without the key is 'on'. Cached under the catalog stamp."""
+    'sidecars' key; a catalog without the key (or no readable catalog) is 'off'. Cached under the
+    catalog stamp."""
     env = _env_setting()
     if env is not None:
         return env
@@ -254,10 +256,10 @@ def setting(dbdir):
     hit = _SETTING_CACHE.get(dbdir)
     if hit is not None and stamp is not None and hit[0] == stamp:
         return hit[1]
-    v = 'on'
+    v = 'off'                                    # THE DEFAULT IS OFF (2026-10-06): nothing derived unless asked
     try:
         with open(os.path.join(dbdir, 'catalog.json')) as f:
-            v = 'off' if str(json.load(f).get('sidecars', 'on')).lower() == 'off' else 'on'
+            v = 'on' if str(json.load(f).get('sidecars', 'off')).lower() == 'on' else 'off'
     except Exception:
         pass
     if stamp is not None:

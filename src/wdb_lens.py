@@ -8,8 +8,9 @@ rewritten segment silently falls back to the dictionary walk.
   length, once, zstd. length() over a text column reads this instead of walking the front-coded
   dictionary for UTF-8 continuation bytes.            <seg>.clen.<col>
 
-  ROW LENGTHS (the operator's flag, bin/wdb load --row-lengths C,..): each ROW's character length in
-  row order, zstd per 65,536-row block with a block table -- the offsets are the answer, a length
+  ROW LENGTHS (also the default for every front-coded text column, since 2026-10-06 -- part of the
+  format, as a string store keeps its sizes; bin/wdb load --row-lengths C,.. adds other text columns):
+  each ROW's character length in row order, zstd per 65,536-row block with a block table -- a length
   aggregate never needs the row's dictionary number.   <seg>.rlen.<col>
   Its size is bounded by the column's own number stream (a length is a function of the value).
 """
@@ -105,11 +106,13 @@ def write_for_segment(seg_path, row_cols=(), verbose=False):
     seg = Segment(seg_path)
     size = os.path.getsize(seg_path)
     total = 0
+    auto = []
     for col in seg.cols:
         b = dict_body(seg, col)
         if b is not None:
             total += write_dict(seg_path, col, b, size, verbose)
-    for col in row_cols:
+            auto.append(col)                           # every large text column: its row lengths too
+    for col in list(dict.fromkeys(auto + list(row_cols))):
         b = row_body(seg, col)
         if b is None:
             if verbose and seg.cols.get(col, {}).get('dt') != 1:

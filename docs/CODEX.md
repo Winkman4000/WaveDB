@@ -340,7 +340,7 @@ anchor y/m/d (the e14 trick verbatim); mixed frames take the civil
 path per mismatched row only. Est: e14 parity, clock keeps -40MB.
 NEXT SESSION OPENS HERE: that kernel (e15_band_lex_chunk), then
 verdict trio, then the median election protocol for the clock.
-Pod .132:11381 holds lineitem_0.wdb(=e14, crowned), .e15, .enc3.
+The test pod holds lineitem_0.wdb(=e14, crowned), .e15, .enc3.
 Then: Q22 on the widened matcher; Q12/Q14/Q10 guard bugs; boards.
 
 
@@ -355,7 +355,7 @@ protocol still gates the formal election; trio is unambiguous.
 NEXT OPENERS: (1) Q4/Q12 bit consumer -- the scatter evaluator
 answers commit<receipt by READING THE BIT (est. Q4 ~350-450);
 (2) median protocol to formalize; (3) Q22 on the widened matcher;
-(4) guard bugs Q12/Q14/Q10. Pod .132:11381: lineitem_0.wdb =
+(4) guard bugs Q12/Q14/Q10. The test pod: lineitem_0.wdb =
 DECLARED CLOCK (live), .e14, .e15 (auto-pair), .enc3 backups.
 
 
@@ -4169,3 +4169,42 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
   the NULL code: IndexError), leaving them to the window door, which skips NULLs as SQL does.
 - tests/test_outer_count.py: + two correlated COUNT(*) shapes, three QUALIFY shapes over NULL-holding columns, six
   road joins with one-sided ON conditions (INNER / LEFT / RIGHT / FULL, NULL keys), all DuckDB's.
+
+## 2026-10-06 (later) -- THE AUDIT BEFORE SUBMITTING: ABOVE BOARD ON EVERYTHING
+Jackson: "we just want to make sure we are above board on everything before we submit for real." Three read-only
+audits (query special-casing; state that survives queries; load structures and the submission scripts against
+ClickBench's own README) and a scan of every file in every commit for sensitive content. What they found and
+what changed:
+- THE ONE REAL SPECIAL CASE: wdb_regexgroup compared the query's pattern to ClickBench's literal Referer regex
+  (_CANON_PAT) and sent it to a kernel with 'http(s)://', 'www.' and '/' written in. Measured without it, Q28 fell
+  to the Python regex road: cold 2.0 -> 34 s, hot 1.5 -> 21.5 s. Replaced by structure, two roads:
+  - THE PREFIX CLASS (_prefix_class; kernels _pref_match, fc_prefruns, fc3_prefruns): any pattern
+    ^ P ([^d]+) d .*$ with the capture as the replacement -- P fixed text with optional pieces and alternations,
+    read by Python's own regex parser and expanded into its alternatives in the regex's own priority order; the
+    kernel tries them with full backtracking under RE2's law and records H, the last byte its decision read: a
+    sorted neighbour sharing more than H bytes inherits the label (Jackson's prefix runs, now for the class).
+    key=([^&]+)&, (?:ab|cd)x?([^/]+)/, ([^/]+)/ ride it as the Referer host does.
+  - THE GENERAL ROAD (_derive_re2): every other pattern through RE2 -- DuckDB's own regex engine, as
+    pyarrow.compute ships it -- once per distinct value, sliced across threads; first match only unless 'g' (the
+    Python road replaced every match: wrong against DuckDB for unanchored patterns). Probe: 19.7M Referers in
+    2.9 s on 16 threads. Options other than 'g' decline the read.
+- THE DEFAULTS ARE THE FLOOR: sidecars are off when nothing says otherwise (a catalog without the key, or none);
+  ClickBench's load/start set nothing. The load writes no block sums, repeat lists or per-value counts unless
+  WDB_LOAD_ANSWERS=1 (the counts were the planner's estimate only -- dropped: cold 1.035 -> 1.033, hot 1.265 ->
+  1.267, noise). A cube is read only with sidecars on; the non-streaming load's pair shelves now ask the switch.
+- ROW LENGTHS FOR EVERY LARGE TEXT COLUMN: no column named on the command line -- every front-coded text column
+  gets row lengths with its dictionary lengths (wdb_encode job path, _write_extras, wdb_lens.write_for_segment).
+- A QUERY WROTE A FILE: wdb_lenagg asked _price (whose pick was never used), which measured the machine and wrote
+  .calib.json into the working directory -- removed.
+- The submission folder: old run results and results.first.json moved to bench/clickbench_runs; the stray
+  duck_reference.sh gone; README there says what is on disk and what each load flag does. The top-level README
+  rewritten (it described the June prototype); CAPABILITIES.md marked out of date. One pod address fragment
+  scrubbed from these notes. tools/kernel_build.py dump drops kernels that no longer exist.
+- Sensitive scan of all 1,027 commits: no keys, tokens, passwords or credentials; one old pod IP in one commit
+  message (no port; the machine is gone); the author email; Claude-Session links in commit messages.
+- tests/test_prefix_class.py: the class recognised by structure (and declined for near misses); nine patterns
+  (five class, four general, with and without 'g') answer as DuckDB, each by the road it should.
+- THE RELOAD with the engine's defaults (no environment, no named column): 202 s, 9,179,179,123 bytes (+260 MB:
+  row lengths for OriginalURL, Referer, SearchPhrase, SocialSourcePage and Title; the stats file 12.1 -> 7.7 MB).
+  Verify 43/43, no file born. Floor board cold 1.044 / hot 1.250 (before: 1.035 / 1.265). Q28 through the class
+  road: cold 2.18 s, hot 1.57 s (the hardcoded kernel: 2.0 / 1.5). Suite 1831/1831.

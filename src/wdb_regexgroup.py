@@ -21,11 +21,12 @@ import wdb_policies as P
 _FORK_BS = None
 _FORK_RX = None
 _FORK_REP = None
+_FORK_CNT = 1
 
 
 def _fork_chunk(se):
     rx = re.compile(_FORK_RX)
-    return [rx.sub(_FORK_REP, v) for v in _FORK_BS[se[0]:se[1]]]
+    return [rx.sub(_FORK_REP, v, count=_FORK_CNT) for v in _FORK_BS[se[0]:se[1]]]
 
 _ENABLED = True
 _HITS = 0
@@ -42,7 +43,8 @@ def disable():
 
 
 def _regex_key(p):
-    """(col, pattern, repl) for REGEXP_REPLACE(col, 'pat', 'repl') [AS alias]."""
+    """(col, pattern, repl, all) for REGEXP_REPLACE(col, 'pat', 'repl'[, 'g']) [AS alias]; all = the 'g'
+    option (every match replaced; without it only the first, as DuckDB does). Any other option: None."""
     inner = p.this if isinstance(p, E.Alias) else p
     if not isinstance(inner, E.RegexpReplace) or not isinstance(inner.this, E.Column):
         return None
@@ -50,7 +52,10 @@ def _regex_key(p):
     rep = inner.args.get('replacement')
     if not isinstance(pat, E.Literal) or not isinstance(rep, E.Literal):
         return None
-    return inner.this.name, str(pat.this), str(rep.this)
+    mods = inner.args.get('modifiers')
+    if mods is not None and not (isinstance(mods, E.Literal) and set(str(mods.this)) <= {'g'}):
+        return None                      # case-insensitive, multi-line, ...: not this read's law
+    return inner.this.name, str(pat.this), str(rep.this), mods is not None and 'g' in str(mods.this)
 
 
 def _avg_length(p):
@@ -96,7 +101,7 @@ def detect(seg, tree, col_map):
         if r is not None:
             if rk is not None: return None
             col = col_map.get(r[0], r[0]) if col_map else r[0]
-            rk = (pi, col, r[1], r[2]); continue
+            rk = (pi, col, r[1], r[2], r[3]); continue
         al = _avg_length(p)
         if al is not None:
             fn9 = 'LENGTH'
@@ -152,7 +157,7 @@ def detect(seg, tree, col_map):
         if osel is None:
             return None
     lim = wdb_sql._limit(tree)
-    return {'col': col, 'pat': rk[2], 'rep': rk[3], 'rk_pi': rk[0], 'aggs': cols,
+    return {'col': col, 'pat': rk[2], 'rep': rk[3], 'all': rk[4], 'rk_pi': rk[0], 'aggs': cols,
             'hmin': hmin, 'osel': osel, 'lim': lim, 'off': int(wdb_sql._offset(tree) or 0),
             'proj': proj, 'lenfn': lenfn}
 
@@ -197,7 +202,7 @@ def execute(seg, spec):
     import pandas as pd
     col = spec['col']
     memo = seg.__dict__.setdefault('_rg_memo', {})
-    mk = (col, spec['pat'], spec['rep'], spec.get('lenfn'))
+    mk = (col, spec['pat'], spec['rep'], spec.get('all'), spec.get('lenfn'))
     if mk in memo:
         counts, lens, lab_ids, uniq, empty_code = memo[mk]
     else:
@@ -216,7 +221,8 @@ def _sidecar_path(seg, col, spec):
     import hashlib
     base = getattr(seg, 'path', None)
     if not base or str(os.path.basename(base)).find('.union-') >= 0: return None
-    h = hashlib.sha1(('%s|%s|%s' % (spec['pat'], spec['rep'], spec.get('lenfn'))).encode()).hexdigest()[:8]
+    h = hashlib.sha1(('%s|%s|%s%s' % (spec['pat'], spec['rep'], spec.get('lenfn'),
+                                      '|g' if spec.get('all') else '')).encode()).hexdigest()[:8]
     return '%s.%s.rg-%s.npz' % (base, col, h)
 
 
@@ -257,7 +263,75 @@ def _save_sidecar(seg, col, spec, lens, lab_ids, uniq, empty_code):
         pass
 
 
-_CANON_PAT = '^https?://(?:www\\.)?([^/]+)/.*$'
+def _prefix_class(pat, rep):
+    """THE PREFIX CLASS (2026-10-06): patterns of the shape  ^ P ([^d]+) d .*$  replaced by the capture alone,
+    where P is fixed text built from literals, optional pieces ( s? , (?:www\\.)? ) and alternations of
+    fixed texts ( (?:a|b) ), and d is one ASCII byte. Read by Python's own regex parser, so the class is
+    recognised by structure, never by text: P is expanded into its alternatives in the order the regex
+    itself tries them (a greedy optional tries 'present' first, a lazy one 'absent' first; earlier choices
+    vary slowest), which is the order the run kernels test them in. Returns (prefixes, offsets, d) or None.
+    (Before this, one exact pattern string was compared and sent to a kernel with its prefixes written in.)"""
+    if rep not in ('\\1', '\\g<1>'):
+        return None
+    try:
+        try:
+            import re._parser as _sp, re._constants as _sc
+        except ImportError:                                  # Python < 3.11
+            import sre_parse as _sp, sre_constants as _sc
+        tree = _sp.parse(pat)
+    except Exception:
+        return None
+    if tree.state.flags & ~int(_sc.SRE_FLAG_UNICODE) or tree.state.groups != 2:
+        return None                                          # inline flags, or more than the one capture
+    it = list(tree)
+    C = _sc
+    if len(it) < 5 or it[0] != (C.AT, C.AT_BEGINNING) or it[-1] != (C.AT, C.AT_END):
+        return None
+    if it[-2][0] != C.MAX_REPEAT or it[-2][1][:2] != (0, C.MAXREPEAT) or list(it[-2][1][2]) != [(C.ANY, None)]:
+        return None                                          # the tail must be .*  (a SubPattern, compared as a list)
+    if it[-3][0] != C.LITERAL or not 0 < it[-3][1] < 128 or it[-3][1] == 10:
+        return None
+    d = it[-3][1]
+    cap = it[-4]
+    if cap[0] != C.SUBPATTERN or cap[1][0] != 1 or cap[1][1] or cap[1][2]:
+        return None
+    body = list(cap[1][3])
+    if len(body) != 1 or body[0][0] != C.MAX_REPEAT or body[0][1][:2] != (1, C.MAXREPEAT):
+        return None
+    inner = list(body[0][1][2])
+    if inner != [(C.NOT_LITERAL, d)] and inner != [(C.IN, [(C.NEGATE, None), (C.LITERAL, d)])]:
+        return None
+
+    def _text(items):
+        out = b''
+        for op, av in items:
+            if op != C.LITERAL:
+                return None
+            out += chr(av).encode('utf-8')
+        return out
+    alts = [b'']
+    for op, av in it[1:-4]:
+        if op == C.LITERAL:
+            alts = [x + chr(av).encode('utf-8') for x in alts]
+        elif op in (C.MAX_REPEAT, C.MIN_REPEAT) and av[:2] == (0, 1):
+            s = _text(av[2])
+            if s is None:
+                return None
+            alts = [y for x in alts for y in ((x + s, x) if op == C.MAX_REPEAT else (x, x + s))]
+        elif op == C.BRANCH and av[0] is None:
+            ss = [_text(b) for b in av[1]]
+            if any(s is None for s in ss):
+                return None
+            alts = [x + s for x in alts for s in ss]
+        else:
+            return None
+        if len(alts) > 64:
+            return None
+    if any(len(x) > 4096 for x in alts):
+        return None
+    pfo = np.zeros(len(alts) + 1, np.int64); np.cumsum([len(x) for x in alts], out=pfo[1:])
+    pfx = np.frombuffer(b''.join(alts) or b'\x00', dtype=np.uint8).copy()
+    return pfx, pfo, np.uint8(d)
 
 
 class _Labels:
@@ -272,11 +346,11 @@ class _Labels:
         return self.blob[int(self.offs[r]):int(self.offs[r + 1])].tobytes()
 
 
-def _derive_runs_one_read(seg, col, spec):
-    """THE THREE READS, Q28: two properties of every distinct Referer -- its length and its host --
-    from ONE read of the dictionary as stored. Chunks decompress once, in parallel; the length
-    walk and the host-run walk (the prefix-run road: a host is inherited while the shared prefix
-    reaches past its slash) both run on the chunk while it is in cache; labels are grouped exactly
+def _derive_runs_one_read(seg, col, spec, pcl):
+    """THE THREE READS: two properties of every distinct value -- its length and its label under a
+    prefix-class pattern (_prefix_class) -- from ONE read of the dictionary as stored. Chunks decompress
+    once, in parallel; the length walk and the prefix-run walk (a label is inherited while the shared
+    prefix reaches past everything its decision read) both run on the chunk while it is in cache; labels are grouped exactly
     in a kernel (hash buckets, byte-for-byte inside a bucket); only the surviving groups' labels
     ever become strings. The old road decompressed the dictionary twice, walked chunks serially and
     grouped 3.1M labels as Python objects (~7 s). Returns None (the caller falls back) on surprise."""
@@ -310,7 +384,8 @@ def _derive_runs_one_read(seg, col, spec):
                 brk = np.zeros(cap, np.uint8); hend = np.full(cap, -1, np.int32)
                 labuf = np.empty(lcap, np.uint8); laboff = np.empty(cap + 1, np.int64)
                 meta = np.zeros(1, np.int64)
-                nr = int(WK.fc3_hostruns(hv, t, np.int64(R), nl_free, brk, hend, labuf, laboff, meta))
+                nr = int(WK.fc3_prefruns(hv, t, np.int64(R), nl_free, pcl[0], pcl[1], pcl[2],
+                                         brk, hend, labuf, laboff, meta))
                 if int(meta[0]) != -1:
                     break
                 lcap *= 3
@@ -328,7 +403,7 @@ def _derive_runs_one_read(seg, col, spec):
             brk = np.zeros(cap, np.uint8); hend = np.full(cap, -1, np.int32)
             labuf = np.empty(lcap, np.uint8); laboff = np.empty(cap + 1, np.int64)
             meta = np.zeros(1, np.int64)
-            nr = int(WK.fc_hostruns(a, np.int64(R), brk, hend, labuf, laboff, meta))
+            nr = int(WK.fc_prefruns(a, np.int64(R), pcl[0], pcl[1], pcl[2], brk, hend, labuf, laboff, meta))
             if int(meta[0]) != -1:
                 break
             lcap *= 3
@@ -362,10 +437,10 @@ def _derive_runs_one_read(seg, col, spec):
     return counts, lens, lab_ids, _Labels(blob, offs, rep[:G]), empty_code
 
 
-def _derive_runs(seg, col, spec):
-    """Jackson's prefix-run road for the canonical hostization: the sorted front-
-    coded dict keeps one website's referers ADJACENT, so the label is constant
-    while the copy-prefix reaches past the host's slash. Labels are produced by
+def _derive_runs(seg, col, spec, pcl):
+    """Jackson's prefix-run road for a prefix-class pattern: the sorted front-coded dict keeps
+    values with the same beginning ADJACENT, so the label is constant while the copy-prefix
+    reaches past what the head's decision read. Labels are produced by
     a byte walk (no string births, no regex); counts, lengths, MIN and HAVING
     all ride existing V-tables. Falls back (None) on any layout surprise."""
     import pandas as pd
@@ -400,7 +475,7 @@ def _derive_runs(seg, col, spec):
             labuf = np.empty(lcap, np.uint8)     # (front-coding removed the very
             laboff = np.empty(cap + 1, np.int64)  # prefixes labels rebuild): retry
             meta = np.zeros(1, np.int64)         # with a tripled buffer on overflow
-            nr = int(WK.fc_hostruns(a, np.int64(R), brk, hend, labuf, laboff, meta))
+            nr = int(WK.fc_prefruns(a, np.int64(R), pcl[0], pcl[1], pcl[2], brk, hend, labuf, laboff, meta))
             if int(meta[0]) != -1:
                 break
             lcap *= 3
@@ -427,16 +502,77 @@ def _derive_runs(seg, col, spec):
     return counts, lens, lab_ids, uniq, empty_code
 
 
+class _ArrowLabels:
+    """the distinct labels of the RE2 road, read one at a time as bytes"""
+    def __init__(self, arr):
+        self.arr = arr
+    def __len__(self):
+        return len(self.arr)
+    def __getitem__(self, g):
+        v = self.arr[int(g)].as_py()
+        return v.encode('utf-8') if isinstance(v, str) else v
+
+
+_RE2ROAD = 0
+
+
+def _derive_re2(seg, col, spec):
+    """THE GENERAL ROAD (2026-10-06): any pattern, through RE2 -- the regex engine DuckDB itself uses, as
+    pyarrow.compute ships it -- run once per DISTINCT value over the dictionary laid out as one byte stream,
+    in slices across threads (RE2 releases the GIL). Without the 'g' option only the first match is
+    replaced, as DuckDB does. None when RE2 cannot take the pattern or the column is not a plain text
+    dictionary (the Python road answers)."""
+    import wdb_scalar
+    st = wdb_scalar._stream(seg, col)
+    if st is None:
+        return None
+    blob, off = st
+    V = int(off.size - 1)
+    lens = (seg.dict_bytelens(col) if spec.get('lenfn') == 'STRLEN' else seg.dict_charlens(col))
+    if lens is None:
+        return None
+    try:
+        import pyarrow as pa, pyarrow.compute as pc
+        arr = pa.LargeStringArray.from_buffers(V, pa.py_buffer(np.ascontiguousarray(off, np.int64)),
+                                               pa.py_buffer(np.ascontiguousarray(blob)))
+        rep = re.sub(r'\\g<(\d+)>', r'\\\1', spec['rep'])          # RE2 writes a group as \1
+        mr = None if spec.get('all') else 1
+        nt = max(1, min(32, os.cpu_count() or 1)); step = max(1, -(-V // nt))
+
+        def one(i):
+            return pc.replace_substring_regex(arr.slice(i, min(step, V - i)), pattern=spec['pat'],
+                                              replacement=rep, max_replacements=mr)
+        with ThreadPoolExecutor(nt) as ex:
+            parts = list(ex.map(one, range(0, V, step)))
+        out = pa.concat_arrays(parts) if len(parts) > 1 else (parts[0] if parts else arr)
+        enc = pc.dictionary_encode(out)
+    except Exception:
+        return None
+    lab_ids = np.asarray(enc.indices.to_numpy(zero_copy_only=False), np.int64)
+    lens = np.asarray(lens[:V], np.int64)
+    empty_code = None
+    e = np.nonzero(lens == 0)[0]
+    if e.size:
+        empty_code = int(e[0])
+    global _RE2ROAD
+    _RE2ROAD += 1
+    return _code_counts(seg, col), lens, lab_ids, _ArrowLabels(enc.dictionary), empty_code
+
+
 def _derive(seg, col, spec):
     import pandas as pd
-    if spec.get('pat') == _CANON_PAT and spec.get('rep') in ('\\1', '\\g<1>'):
-        r9 = _derive_runs_one_read(seg, col, spec)
+    pcl = _prefix_class(spec.get('pat'), spec.get('rep'))      # by structure: the prefix class
+    if pcl is not None:
+        r9 = _derive_runs_one_read(seg, col, spec, pcl)
         if r9 is None:
-            r9 = _derive_runs(seg, col, spec)
+            r9 = _derive_runs(seg, col, spec, pcl)
         if r9 is not None:
             global _RUNROAD
             _RUNROAD += 1
             return r9
+    r9 = _derive_re2(seg, col, spec)                          # every other pattern
+    if r9 is not None:
+        return r9
     counts = _code_counts(seg, col)
     vals = seg._typed_dict(col)
     # stay in BYTES end to end: no per-value decode (measured 15.7 s on 19.7M Referers);
@@ -454,8 +590,9 @@ def _derive(seg, col, spec):
     e = np.nonzero(lens == 0)[0]
     if e.size:
         empty_code = int(e[0])
-    global _FORK_BS, _FORK_RX, _FORK_REP
+    global _FORK_BS, _FORK_RX, _FORK_REP, _FORK_CNT
     _FORK_BS, _FORK_RX, _FORK_REP = bs, spec['pat'].encode(), spec['rep'].encode()
+    _FORK_CNT = 0 if spec.get('all') else 1             # first match only, as DuckDB, unless 'g'
     try:
         import multiprocessing as mp
         with mp.get_context('fork').Pool(6) as pool:      # COW: children inherit bs, no copy in
@@ -464,7 +601,7 @@ def _derive(seg, col, spec):
         labels = [x for part in parts for x in part]
     except Exception:
         rx = re.compile(_FORK_RX)
-        labels = [rx.sub(_FORK_REP, v) for v in bs]
+        labels = [rx.sub(_FORK_REP, v, count=_FORK_CNT) for v in bs]
     finally:
         _FORK_BS = None
     lab_ids, uniq = pd.factorize(np.array(labels, dtype=object), sort=False)

@@ -112,7 +112,8 @@ def _from_load(seg, col):
     k = col + '.'
     if (k + 'cnt') not in z.files or int(z['N']) != int(seg.N):
         return None
-    return {'cnt': np.asarray(z[k + 'cnt']), 'nn': np.asarray(z[k + 'nn']), 'sum': np.asarray(z[k + 'sum']),
+    return {'cnt': np.asarray(z[k + 'cnt']), 'nn': np.asarray(z[k + 'nn']),
+            'sum': np.asarray(z[k + 'sum']) if (k + 'sum') in z.files else None,   # written only with answers on
             'cmin': np.asarray(z[k + 'cmin']), 'cmax': np.asarray(z[k + 'cmax']),
             'mode4': bool(z[k + 'mode4']), 'maxabs': float(z[k + 'maxabs']), 'dt': int(z[k + 'dt'])}
 
@@ -281,11 +282,16 @@ def write_for_segment(seg_path, verbose=False):
     out = {'N': np.int64(seg.N)}
     n = 0
     for col in seg.order:
-        rep = differentiator_rows(seg, col)  # FAIL-LOUD: eligibility is decided inside, never by an exception
+        # THE LOAD WRITES NO PRE-AGGREGATE UNLESS ASKED (2026-10-06): the repeat lists and the block sums are
+        # facts about groups of rows that only an answer path reads -- written only with WDB_LOAD_ANSWERS=1
+        rep = differentiator_rows(seg, col) if _ANSWERS[0] else None
         if rep is not None:
             out[col + '.rep'] = rep
             if verbose: print('  stats: %s is a differentiator, %d exception rows' % (col, rep.size), flush=True)
-        vc = value_counts(seg, col)          # THE CENSUS OF THE LOAD (small dictionaries)
+        # THE CENSUS OF THE LOAD (small dictionaries): a GROUP BY COUNT(*) table -- only with answers on too.
+        # The planner's estimate falls back to N / V; measured on ClickBench, cold 1.035 -> 1.033 and hot
+        # 1.265 -> 1.267 without it (2026-10-06): it was never earning its place
+        vc = value_counts(seg, col) if _ANSWERS[0] else None
         if vc is not None:
             out[col + '.vcnt'] = vc
         spp = e19_signposts(seg, col)        # THE SIGNPOSTS (block-dictionary columns)
@@ -301,7 +307,8 @@ def write_for_segment(seg_path, verbose=False):
             if verbose: print('  stats: %s declined (%s)' % (col, ex), flush=True)
             continue
         for kk in ('cnt', 'nn', 'sum', 'cmin', 'cmax'):
-            out[col + '.' + kk] = st[kk]
+            if kk != 'sum' or _ANSWERS[0]:
+                out[col + '.' + kk] = st[kk]
         out[col + '.mode4'] = np.bool_(st['mode4']); out[col + '.maxabs'] = np.float64(st['maxabs'])
         out[col + '.dt'] = np.int64(st['dt'])
         seg._codes.pop(col, None); n += 1
@@ -428,6 +435,8 @@ def execute(seg, spec):
         tot_nn = int(st['nn'].sum())
         if kind == 'COUNT':
             row.append(tot_nn)
+        elif kind in ('SUM', 'AVG') and st.get('sum') is None:
+            return None                           # no block sums stored (a load with answers off)
         elif kind == 'SUM':
             if tot_nn * st['maxabs'] >= 2.0 ** 53:
                 return None                       # float64 exactness not provable -> exact paths

@@ -3062,94 +3062,84 @@ def lenagg_pour(kc, uc, lens, jars, cnts, ec):
 
 
 @njit(nogil=True, cache=True)
-def fc_hostruns(a, R, brk, hend, labuf, laboff, meta):
-    """Jackson's prefix-run walk with the full regex law: byte-exact http(s)
-    schemes, www backtracking, and newlines -- '.' never matches \n, so any
-    \n strictly after the host slash kills the match (a single TRAILING \n
-    survives, labelled host+\n). Runs continue only while the copy-prefix
-    clears the slash AND the tail stays newline-clean."""
+def _pref_match(prev, plen, pfx, pfo, d):
+    """THE PREFIX CLASS, matched (2026-10-06): ^(p0|p1|...)([^d]+)d.*$ under RE2's law -- '.' never matches
+    a newline and $ is the absolute end -- with the alternatives pfx[pfo[k]:pfo[k+1]] tried in the regex's own
+    priority order (backtracking: the first alternative whose capture, delimiter and newline-free tail all
+    hold wins). [^d]+ followed by d can only end at the first d, so each alternative has one candidate.
+    Returns (hs, he, H): the capture [hs, he) (-1, -1: no match) and H, the last position the decision read
+    -- a sorted neighbour that shares more than H bytes is decided the same way."""
+    H = np.int64(-1)
+    for k in range(pfo.size - 1):
+        a = pfo[k]; L = pfo[k + 1] - a
+        ok = True
+        for q in range(L):
+            if q >= plen:
+                H = max(H, plen); ok = False; break
+            if prev[q] != pfx[a + q]:
+                H = max(H, np.int64(q)); ok = False; break
+        if not ok:
+            continue
+        he = np.int64(-1)
+        j = L
+        while j < plen:
+            if prev[j] == d:
+                he = j
+                break
+            j += 1
+        if he < 0:
+            H = max(H, plen); continue           # no delimiter: the whole string was read
+        H = max(H, he)
+        if he == L:
+            continue                             # [^d]+ needs one byte
+        nl = False
+        for q in range(he + 1, plen):
+            if prev[q] == 10:
+                nl = True
+                break
+        if nl:
+            H = max(H, plen); continue           # the tail held a newline: '.*$' fails here
+        return np.int64(L), he, H
+    return np.int64(-1), np.int64(-1), H
+
+
+@njit(nogil=True, cache=True)
+def fc_prefruns(a, R, pfx, pfo, d, brk, hend, labuf, laboff, meta):
+    """Jackson's prefix-run walk, for any pattern of the prefix class (_pref_match): the sorted
+    front-coded dictionary keeps values that share a beginning adjacent, so the label is constant while
+    the copied prefix reaches past everything the head's decision read (H) and the new suffix is
+    newline-clean. A label is the capture; a value that does not match is its own label (REGEXP_REPLACE
+    returns it whole). brk[i] = 1 where a new run starts; hend[i] = the run's delimiter position or -1."""
     o = np.int64(0); i = np.int64(0); nr = np.int64(0); lw = np.int64(0)
     prev = np.zeros(131072, np.uint8)   # the longest string the format can hold (u16 cp + u16 sl)
-    plen = np.int64(0)
-    W = np.int64(-2)          # current run's host-end (the slash); -2 = no run
-    Whs = np.int64(-1)        # current run's host start
-    pnl = np.int64(-1)        # first \n strictly after W in prev, else -1
+    W = np.int64(-2); H = np.int64(-2)
     while o < a.size:
         cp = np.int64(a[o]) | (np.int64(a[o + 1]) << 8)
         sl = np.int64(a[o + 2]) | (np.int64(a[o + 3]) << 8)
         o += 4
         if i % R == 0:
             cp = np.int64(0)
-        # first \n after W contributed by the copied prefix
-        enl = np.int64(-1)
-        if W >= 0 and pnl >= 0 and pnl < cp:
-            enl = pnl
+        clean = True
         for t in range(sl):
             b9 = a[o + t]
             prev[cp + t] = b9
-            if b9 == 10 and enl < 0 and W >= 0 and cp + t > W:
-                enl = cp + t
+            if b9 == 10:
+                clean = False
         o += sl
         plen = cp + sl
-        cont = (W >= 0) and (cp > W) and (enl < 0)
-        if cont:
+        if W >= 0 and cp > H and clean:
             brk[i] = 0
             hend[i] = W
-            pnl = np.int64(-1)
             i += 1
             continue
         brk[i] = 1
-        hs = np.int64(-1); he = np.int64(-1)
-        okh = (plen > 8 and prev[0] == 104 and prev[1] == 116
-               and prev[2] == 116 and prev[3] == 112)
-        if okh and prev[4] == 58 and prev[5] == 47 and prev[6] == 47:
-            hs = np.int64(7)
-        elif (okh and plen > 9 and prev[4] == 115 and prev[5] == 58
-              and prev[6] == 47 and prev[7] == 47):
-            hs = np.int64(8)
+        hs, he, h9 = _pref_match(prev, plen, pfx, pfo, d)
         if hs >= 0:
-            hs0 = hs
-            if plen > hs + 4 and prev[hs] == 119 and prev[hs+1] == 119 and prev[hs+2] == 119 and prev[hs+3] == 46:
-                hs += 4
-            j2 = hs
-            while j2 < plen and j2 < 131072:
-                if prev[j2] == 47:
-                    he = j2
-                    break
-                j2 += 1
-            if he <= hs and hs != hs0:
-                hs = hs0
-                j2 = hs
-                he = np.int64(-1)
-                while j2 < plen and j2 < 131072:
-                    if prev[j2] == 47:
-                        he = j2
-                        break
-                    j2 += 1
-        # newline law at the break: first \n strictly after he
-        bnl = np.int64(-1)
-        if he > hs:
-            j3 = he + 1
-            while j3 < plen and j3 < 131072:
-                if prev[j3] == 10:
-                    bnl = j3
-                    break
-                j3 += 1
-        matched = (he > hs) and (bnl < 0)   # RE2 law: $ is absolute end --
-                                             # ANY newline after the slash kills it
-        if matched:
-            hend[i] = he
-            W = he
-            Whs = hs
-            pnl = np.int64(-1)
-            a0, b0 = hs, he
+            hend[i] = he; W = he; H = h9
+            a0 = hs; b0 = he
         else:
-            hend[i] = -1
-            W = np.int64(-2)
-            Whs = np.int64(-1)
-            pnl = np.int64(-1)
-            a0 = np.int64(0)
-            b0 = plen                    # no match: REGEXP_REPLACE returns the whole string
+            hend[i] = -1; W = np.int64(-2); H = np.int64(-2)
+            a0 = np.int64(0); b0 = plen
         if lw + (b0 - a0) > labuf.size or nr + 1 >= laboff.size:
             meta[0] = -1
             return nr
@@ -5621,14 +5611,14 @@ def _fc3_fill(ps, pt, top, plen, text, prev):
 
 
 @njit(nogil=True, cache=True)
-def fc3_hostruns(hdr16, text, R, nl_free, brk, hend, labuf, laboff, meta):
-    """fc_hostruns on the three streams, same law and same outputs (brk, hend, labels): a run
-    continues while cp > W (the host's slash) and the suffix is newline-clean; nl_free = the chunk's
-    text holds no newline at all, so no suffix is even looked at while a run continues."""
+def fc3_prefruns(hdr16, text, R, nl_free, pfx, pfo, d, brk, hend, labuf, laboff, meta):
+    """fc_prefruns on the three streams, same law and same outputs (brk, hend, labels): a run continues
+    while cp > H and the suffix is newline-clean; nl_free = the chunk's text holds no newline at all, so no
+    suffix is even looked at while a run continues; a string is rebuilt only where a run breaks."""
     n = hdr16.size // 2
     prev = np.zeros(131072, np.uint8)
     ps = np.zeros(R + 2, np.int64); pt = np.zeros(R + 2, np.int64); top = 0
-    W = np.int64(-2); nr = np.int64(0); lw = np.int64(0); t = np.int64(0)
+    W = np.int64(-2); H = np.int64(-2); nr = np.int64(0); lw = np.int64(0); t = np.int64(0)
     for i in range(n):
         cp = np.int64(hdr16[2 * i]); sl = np.int64(hdr16[2 * i + 1])
         if i % R == 0:
@@ -5637,7 +5627,7 @@ def fc3_hostruns(hdr16, text, R, nl_free, brk, hend, labuf, laboff, meta):
             top -= 1
         ps[top] = cp; pt[top] = t; top += 1
         plen = cp + sl
-        if W >= 0 and cp > W:
+        if W >= 0 and cp > H:
             clean = True
             if not nl_free:
                 for q in range(sl):
@@ -5651,46 +5641,12 @@ def fc3_hostruns(hdr16, text, R, nl_free, brk, hend, labuf, laboff, meta):
         t += sl
         brk[i] = 1
         _fc3_fill(ps, pt, top, plen, text, prev)
-        hs = np.int64(-1); he = np.int64(-1)
-        okh = (plen > 8 and prev[0] == 104 and prev[1] == 116
-               and prev[2] == 116 and prev[3] == 112)
-        if okh and prev[4] == 58 and prev[5] == 47 and prev[6] == 47:
-            hs = np.int64(7)
-        elif (okh and plen > 9 and prev[4] == 115 and prev[5] == 58
-              and prev[6] == 47 and prev[7] == 47):
-            hs = np.int64(8)
+        hs, he, h9 = _pref_match(prev, plen, pfx, pfo, d)
         if hs >= 0:
-            hs0 = hs
-            if plen > hs + 4 and prev[hs] == 119 and prev[hs + 1] == 119 and prev[hs + 2] == 119 and prev[hs + 3] == 46:
-                hs += 4
-            j2 = hs
-            while j2 < plen:
-                if prev[j2] == 47:
-                    he = j2
-                    break
-                j2 += 1
-            if he <= hs and hs != hs0:
-                hs = hs0
-                j2 = hs
-                he = np.int64(-1)
-                while j2 < plen:
-                    if prev[j2] == 47:
-                        he = j2
-                        break
-                    j2 += 1
-        bnl = np.int64(-1)
-        if he > hs:
-            j3 = he + 1
-            while j3 < plen:
-                if prev[j3] == 10:
-                    bnl = j3
-                    break
-                j3 += 1
-        if (he > hs) and (bnl < 0):
-            hend[i] = he; W = he
+            hend[i] = he; W = he; H = h9
             a0 = hs; b0 = he
         else:
-            hend[i] = -1; W = np.int64(-2)
+            hend[i] = -1; W = np.int64(-2); H = np.int64(-2)
             a0 = np.int64(0); b0 = plen          # no match: the label is the whole string
         if lw + (b0 - a0) > labuf.size or nr + 1 >= laboff.size:
             meta[0] = -1

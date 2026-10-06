@@ -1,10 +1,8 @@
 #!/bin/bash
-# Load the official hits.parquet (100M rows, one file). THE FLOOR: no index, projection or pre-aggregate is
-# built -- the data, ordered by EventTime, its load statistics and its text lengths, nothing else.
+# Load the official hits.parquet (100M rows, one file) with the engine's defaults: no index, projection or
+# pre-aggregate is built -- the data, ordered by EventTime, its load statistics and its text lengths.
 set -e
 cd "$(dirname "$0")"
 rm -rf cbdb
-export WDB_SIDECARS=0
 WaveDB/venv/bin/python WaveDB/bin/wdb load cbdb hits hits.parquet --cluster-by EventTime \
-    --cast EventDate=date_days --cast EventTime=timestamp_s --hash URLHash,RefererHash --row-lengths URL
-WaveDB/venv/bin/python -c "import sys; sys.path.insert(0, 'WaveDB/src'); import wdb_sidecar; wdb_sidecar.set_setting('cbdb', 'off')"
+    --cast EventDate=date_days --cast EventTime=timestamp_s --hash URLHash,RefererHash

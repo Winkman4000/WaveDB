@@ -80,9 +80,10 @@ def test_charlens_equal_definition():
 def test_host_road_one_read_equals_old_road():
     import wdb_regexgroup as RG
     seg, w, pq, df = _fixture()
-    spec = {'col': 'ref', 'pat': RG._CANON_PAT, 'rep': '\\1', 'lenfn': None}
-    new = RG._derive_runs_one_read(seg, 'ref', spec)
-    old = RG._derive_runs(Segment(w), 'ref', spec)
+    spec = {'col': 'ref', 'pat': r'^https?://(?:www\.)?([^/]+)/.*$', 'rep': '\\1', 'lenfn': None}
+    pcl = RG._prefix_class(spec['pat'], spec['rep'])
+    new = RG._derive_runs_one_read(seg, 'ref', spec, pcl)
+    old = RG._derive_runs(Segment(w), 'ref', spec, pcl)
     assert new is not None and old is not None
     assert np.array_equal(new[0], old[0]) and np.array_equal(np.asarray(new[1]), np.asarray(old[1]))
     pairs = np.unique(np.stack([np.asarray(old[2], np.int64), np.asarray(new[2], np.int64)], 1), axis=0)
