@@ -4208,3 +4208,19 @@ what changed:
   row lengths for OriginalURL, Referer, SearchPhrase, SocialSourcePage and Title; the stats file 12.1 -> 7.7 MB).
   Verify 43/43, no file born. Floor board cold 1.044 / hot 1.250 (before: 1.035 / 1.265). Q28 through the class
   road: cold 2.18 s, hot 1.57 s (the hardcoded kernel: 2.0 / 1.5). Suite 1831/1831.
+
+## 2026-10-06 -- THE OFFICIAL RUN AT THE SUBMITTED COMMIT (AWS c6a.4xlarge)
+- Machine: c6a.4xlarge (16 vCPU, 30 GB), 500 GB gp2 root, Ubuntu 24.04.4, Python 3.12.3. ClickBench's own driver,
+  unmodified (ClickBench 8c4eb6ee). Our directory from the PUBLIC repo at 7c2b3e6; its install cloned GitHub and
+  checked out the pinned engine aaa517b by itself -- no bundle, no environment overrides.
+- Result: 43 rows, no nulls. Kernel build 453 signatures in 43 s, 0 failed. Load 558 s (Oct 1: 770). Data size
+  9,176,178,269. Concurrent QPS 4.41 (Oct 1: 3.75), error ratio 0. Cold total 24.0 s, hot total 9.4 s.
+  benchmark/clickbench/results/20261006/c6a.4xlarge.json (results.py); bench/clickbench_runs/20261006: run.log, mem.log.
+- Scored with the page's own formula (index.html renderSummary, ported: +10 ms, per-query baselines over the
+  selected systems, combined = 0.6 hot + 0.2 cold + 0.1 load + 0.1 size) against the newest result of every untuned
+  system on c6a.4xlarge in the ClickBench checkout (149): COMBINED 2.66, 3rd (elosdb 1.59, Umbra 1.91); COLD 2.27,
+  1st of 121 (elosdb 2.83, Pivotlake 3.21, Umbra 3.28); HOT 2.58, 5th (elosdb 1.43, Umbra 1.64, Rayforce 2.22,
+  CedarDB 2.25).
+- Checked on the pod: COUNT(*) and COUNT(DISTINCT UserID / SearchPhrase) are answered in ~6 ms from the row count
+  and the columns' own global dictionaries (UserID: V = 17,630,976, the encoding's code space); the benchmark
+  README now says so.

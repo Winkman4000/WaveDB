@@ -18,7 +18,9 @@ environment variable is set.
 rows, the smallest and largest code and the number of non-NULL rows, plus sampled entries of the block
 dictionaries used to seek inside a column; and, for every large text column, the character length of each
 dictionary entry and of each row (the string sizes, kept for every such column by default -- no column is
-named). No index, projection, materialized view or pre-aggregated table is built, by
+named). Each column's dictionary is its own sorted list of distinct values -- part of the column's encoding,
+so `COUNT(DISTINCT col)` with no filter is that list's length, and `COUNT(*)` is the stored row count.
+No index, projection, materialized view or pre-aggregated table is built, by
 the load or by any query: the engine's derived-structure extension ("sidecars") is off by default, and
 answering from stored sums or per-value counts is off by default (none are written). Like ClickHouse's
 min/max-count projection, MIN, MAX and COUNT of a column with no filter can be answered from the per-block
