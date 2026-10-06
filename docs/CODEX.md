@@ -4145,3 +4145,27 @@ Gates: suite 1790/1790; floor verify on cb_van0929 (WDB_SIDECARS=0 WDB_LOAD_ANSW
 - tests/test_outer_count.py: eight outer shapes (NULL keys, NULL values, NULL group values, ON extras on either
   side, the parent on the left, HAVING, two group columns) and six window / correlated shapes, all DuckDB's; the
   count door asserted to have answered every outer shape.
+
+## 2026-10-06 -- THE DICTIONARY READ IN PLACE AT OPEN; THE ON'S OWN CONDITIONS ON THE ROAD; COUNT(*) AT A NULL KEY
+- THE OPEN COST: Segment.__init__ parsed every plain (mode-0) dictionary one value at a time in Python (a memmap
+  slice and a bytes object per value). scope's v3 (9.5M floats) cost 9.9 s at every open; cast_info.person_role_id
+  (3.1M) 3.3 s; TPC-H's o_totalprice (12M floats) the same order as scope.
+- THE EIGHT-BYTE DICTIONARY READ IN PLACE (wdb_engine._Fixed8Vals): a float64 / int64-epoch dictionary is n
+  records of <u32 8><8 bytes> -- its end is known without walking it (first and last length words checked at
+  open, every one when the values are first read), and the typed dictionary is one strided view.
+- THE RUN WALKED COMPILED (wdb_engine._VarVals, kernel m0_starts): any other large mode-0 dictionary has its value
+  starts found in one compiled pass and its values read in place (bytes per value only when asked).
+- Open: scope 10.3 -> 0.35 s, JOB 4.3 -> 0.62 s, TPC-H 0.65 s.
+- THE ON'S OWN CONDITIONS (wdb_join._road_join_emit): besides the key equality, ON conjuncts touching one side only
+  decide MATCHING -- a pair whose parent or child fails one is no pair; on an outer join the row still stands with
+  the other side NULL. They cut the pointer (whole road) or each piece's parents (pieces). A NULL child key matches
+  nothing on the whole road too (its decoded filler could name a real parent).
+- THE FILTER FIRST WITHOUT A LIMIT: an INNER / LEFT road whose child has its own WHERE now reads in pieces even
+  with no LIMIT -- the child's filters by code first, the key and the parent only at the survivors (the governor
+  asked for the full count). scope left_rows 0.44 s (pandas merge) -> ~0.10 s (ClickHouse 0.033).
+- COUNT(*) AT A NULL KEY: the correlated COUNT(*) subquery, rewritten to a window, is COUNT(key) OVER (PARTITION BY
+  key) -- the same count wherever the key is set and 0 in the NULL partition, as a NULL key matches no inner row.
+- wdb_window's detect now declines a NULL-holding window argument or QUALIFY column (its value tables end before
+  the NULL code: IndexError), leaving them to the window door, which skips NULLs as SQL does.
+- tests/test_outer_count.py: + two correlated COUNT(*) shapes, three QUALIFY shapes over NULL-holding columns, six
+  road joins with one-sided ON conditions (INNER / LEFT / RIGHT / FULL, NULL keys), all DuckDB's.

@@ -1746,13 +1746,30 @@ def _road_join_emit(db, tree):
     lt, la = frm.this.name, (frm.this.alias or frm.this.name)
     rt, ra = jn.this.name, (jn.this.alias or jn.this.name)
     on = jn.args.get('on')
-    if not (isinstance(on, E.EQ) and isinstance(on.this, E.Column) and isinstance(on.expression, E.Column)): return None
+    if on is None: return None
     lcols = set(db.cat.column_names(lt)); rcols = set(db.cat.column_names(rt))
     def own(c):
         if c.table: return c.table
         if c.name in lcols and c.name not in rcols: return la
         if c.name in rcols and c.name not in lcols: return ra
         return None
+    # THE ON'S OWN CONDITIONS (2026-10-06, scope left_rows: 0.44 s in the pandas merge): besides the one key
+    # equality, ON conjuncts that touch ONE side only decide MATCHING -- a pair whose parent (or child) fails one
+    # is no pair; on an outer join the row still stands with the other side NULL. They cut the pointer itself.
+    def _fl_on9(x):
+        if isinstance(x, E.Paren): return _fl_on9(x.this)
+        if isinstance(x, E.And): return _fl_on9(x.this) + _fl_on9(x.expression)
+        return [x]
+    _on_eq9 = None; _on_x9 = []
+    for _cj9 in _fl_on9(on):
+        if (_on_eq9 is None and isinstance(_cj9, E.EQ) and isinstance(_cj9.this, E.Column)
+                and isinstance(_cj9.expression, E.Column) and {own(_cj9.this), own(_cj9.expression)} == {la, ra}):
+            _on_eq9 = _cj9; continue
+        _sd9 = {own(c) for c in _cj9.find_all(E.Column)}
+        if len(_sd9) != 1 or not (_sd9 <= {la, ra}) or _cj9.find(E.Subquery) is not None: return None
+        _on_x9.append((_sd9.pop(), _cj9))
+    if _on_eq9 is None: return None
+    on = _on_eq9
     a, b = on.this, on.expression
     if own(a) == ra: a, b = b, a
     if own(a) != la or own(b) != ra: return None
@@ -1858,7 +1875,17 @@ def _road_join_emit(db, tree):
                 m_r &= np.asarray(wdb_sql._eval_pred(rseg, _strip9(cj), lambda nm: rpm.get(nm, nm)), dtype=bool)
         rnull = all(_null_side_truth9(cj, ra) for cj in rconj)    # a LEFT row without a parent, under the WHERE
         luts = [_code_lut9(cj) for cj in lconj]
-        n9 = int(lseg.N); lo = 0; step = max(1 << 16, min(1 << 20, _want9 * 64))
+        # the ON's one-sided conditions: a parent (child) failing one is no pair -- the child row's parent is -1
+        m_on = None; on_l = []
+        for _ow9, _cj9 in _on_x9:
+            if _ow9 == ra:
+                _m9 = np.asarray(wdb_sql._eval_pred(rseg, _strip9(_cj9), lambda nm: rpm.get(nm, nm)), dtype=bool)
+                m_on = _m9 if m_on is None else (m_on & _m9)
+            else:
+                _lt9 = _code_lut9(_cj9)
+                on_l.append((_lt9, None if _lt9 is not None else
+                             np.asarray(wdb_sql._eval_pred(lseg, _strip9(_cj9), lambda nm: lpm.get(nm, nm)), dtype=bool)))
+        n9 = int(lseg.N); lo = 0; step = max(1 << 16, min(1 << 20, (_want9 if _want9 is not None else 1 << 20) * 64))
         kraw = wdb_sql.raw_dict_col(lseg, ckn, want_codes=False)    # the key read only where the child's own
         import wdb_kernels as _WKp                                    # filters left rows (CounterID = 62: 0.7%)
         # THE LOAD STEERS (Jackson's thesis: measured at load, known at query): when every child filter is a
@@ -1896,7 +1923,7 @@ def _road_join_emit(db, tree):
                 hi9 = min(n9, lo9 + st); yield lo9, hi9, None; lo9 = hi9; st *= 4
         R9, P9 = [], []; got = 0
         for lo, hi, rr in _ranges9():
-            if got >= _want9: break
+            if _want9 is not None and got >= _want9: break
             m9 = (hi - lo) if rr is None else rr.size
             keep = np.ones(m9, bool)
             for cj, lt9 in zip(lconj, luts):                         # the child's filters first, by code
@@ -1918,6 +1945,16 @@ def _road_join_emit(db, tree):
                     ck = np.asarray(list(lseg.values_at_rows(ckn, rows_c)))
                 if ck.dtype.kind not in 'iuf': return None
                 p = np.asarray(pidx.get_indexer(ck), dtype=np.int64)
+                if m_on is not None:
+                    _ok9 = np.flatnonzero(p >= 0)
+                    p[_ok9[~m_on[p[_ok9]]]] = -1
+                for _lt9, _full9 in on_l:
+                    if _lt9 is not None:
+                        _cd9 = np.ascontiguousarray(lseg.codes_at(_lt9[0], rows_c))
+                        _k9 = np.empty(_cd9.shape[0], np.bool_); _WKp.plut_u8(_cd9, _lt9[1], _k9)
+                    else:
+                        _k9 = _full9[rows_c]
+                    p[~_k9] = -1
                 sel = (p >= 0) if side != 'LEFT' else np.ones(rows_c.size, bool)
                 if rconj:
                     ok = p >= 0
@@ -1928,7 +1965,11 @@ def _road_join_emit(db, tree):
         prow9 = np.concatenate(P9)[:_want9] if P9 else np.empty(0, np.int64)
         return rows9, prow9, ((prow9 < 0) if side == 'LEFT' else None)
     _pc9 = None
-    if _want9 is not None and side in ('', 'LEFT'):
+    # THE FILTER FIRST WITHOUT A LIMIT TOO (2026-10-06, scope left_rows): when the child has its own WHERE, the
+    # pieces judge it by code and read the key and the parent only at the survivors -- the whole road decoded the
+    # child's column for np.isin over all 10M rows and built 10M-row masks to keep 200K
+    _lw9 = any(_sides9(cj) == {la} for cj in _conj9)
+    if side in ('', 'LEFT') and (_want9 is not None or _lw9):
         try:
             _pc9 = _pieces9()
         except Exception as _e9:                      # any doubt: the whole road answers (never a wrong answer)
@@ -1937,9 +1978,26 @@ def _road_join_emit(db, tree):
     if _pc9 is not None:
         rows, prow, miss = _pc9; rmiss = None
         _PIECES_SERVED[0] += 1
+        if _want9 is None:
+            import wdb_govern
+            wdb_govern.ask(int(rows.size), len(proj), 'join result')   # THE GOVERNOR (no limit bounds it)
     else:
         ptr = _join_pointer(db, lt, lpm.get(a.name, a.name), lseg, rt, rpm.get(b.name, b.name), rseg)
         n = int(lseg.N)
+        _ckp9 = lpm.get(a.name, a.name)
+        if (lseg.cols.get(_ckp9) or {}).get('has_null'):      # a NULL child key matches nothing (its decode is a
+            ptr = np.array(ptr, dtype=np.int64, copy=True)     # filler value that could name a real parent)
+            ptr[_win_nulls(lseg, _ckp9, np.arange(n, dtype=np.int64))] = -1
+        if _on_x9:                                        # the ON's one-sided conditions cut pairs, never rows
+            ptr = np.array(ptr, dtype=np.int64, copy=True)  # (the pointer is cached: never cut it in place)
+            for _ow9, _cj9 in _on_x9:
+                if _ow9 == ra:
+                    _mr9 = np.asarray(wdb_sql._eval_pred(rseg, _strip9(_cj9), lambda nm: rpm.get(nm, nm)), dtype=bool)
+                    _hp9 = np.flatnonzero(ptr >= 0)
+                    ptr[_hp9[~_mr9[ptr[_hp9]]]] = -1
+                else:
+                    _ml9 = np.asarray(wdb_sql._eval_pred(lseg, _strip9(_cj9), lambda nm: lpm.get(nm, nm)), dtype=bool)
+                    ptr[~_ml9] = -1
         rmiss = None                                      # RIGHT/FULL: parent rows nobody points at (NULL child side)
         if side == 'LEFT':
             rows = np.arange(n, dtype=np.int64); prow = ptr

@@ -553,7 +553,10 @@ def _try_window_decorrelate(db, tree):
     if icol != ocol:
         return None                              # partition key must be the same column
     fname = {'SUM': 'SUM', 'AVG': 'AVG', 'MIN': 'MIN', 'MAX': 'MAX', 'COUNT_STAR': 'COUNT'}[ak[0]]
-    arg = '*' if ak[0] == 'COUNT_STAR' else ak[1]
+    # COUNT(*) over the correlated rows is COUNT(key) over the key's partition: the same count wherever the key is
+    # set, and 0 in the NULL partition -- a NULL key matches no inner row, so its COUNT(*) is 0 (2026-10-06; it
+    # was handed the NULL partition's size)
+    arg = icol if ak[0] == 'COUNT_STAR' else ak[1]
     if _agg_node9 is _p0i:
         win_sql = f"{fname}({arg}) OVER (PARTITION BY {icol}) AS __corr0"
     else:                                        # arithmetic around the aggregate: MAX(v3) - 0.001
@@ -566,7 +569,7 @@ def _try_window_decorrelate(db, tree):
     new = tree.copy()
     # a row whose key is NULL matches no inner row (= never holds), so its subquery is NULL and the
     # comparison never true -- the window would have handed it the NULL partition's total (2026-10-05)
-    # (COUNT(*) is 0 there, not NULL: that shape keeps every row)
+    # (COUNT(*) is 0 there, not NULL: that shape keeps every row and reads its 0 from COUNT(key) above)
     new.set('where', None if fname == 'COUNT' else E.Where(this=E.Not(this=E.Is(this=E.column(ocol), expression=E.Null()))))
     proj = list(new.expressions)
     import sqlglot

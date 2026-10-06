@@ -4452,6 +4452,23 @@ def pk_probe(ck, lo, tab, out):
 
 
 @njit(cache=True, nogil=True)
+def m0_starts(buf, start, n, starts):
+    """where a plain (mode-0) dictionary's values lie: n records of <u32 len><bytes> from byte start. starts[i] is
+    record i's first value byte and starts[n] the run's end + 4, so value i is starts[i] .. starts[i+1] - 4.
+    Returns the run's end, or -1 when a record runs past the buffer."""
+    o = start
+    B = buf.shape[0]
+    for i in range(n):
+        if o + 4 > B: return -1
+        L = np.int64(buf[o]) | (np.int64(buf[o + 1]) << 8) | (np.int64(buf[o + 2]) << 16) | (np.int64(buf[o + 3]) << 24)
+        starts[i] = o + 4
+        o += 4 + L
+        if o > B: return -1
+    starts[n] = o + 4
+    return o
+
+
+@njit(cache=True, nogil=True)
 def parse_m0_ints(buf, start, out):
     """a plain (mode-0) integer dictionary parsed where it lies: out.size entries of <u32 len><digits>, from
     byte start. Decimal digits with an optional leading '-', 1..18 of them; anything else -> False (the

@@ -47,7 +47,21 @@ def test_outer_count_and_partition_totals_equal_duck():
         "SELECT o, AVG(v) OVER (PARTITION BY k, s) AS a, COUNT(*) OVER (PARTITION BY s) AS n FROM f",
         "SELECT k, v FROM f WHERE v > (SELECT MAX(v) - 3 FROM f f2 WHERE f2.k = f.k)",
         "SELECT k, w FROM f WHERE w >= (SELECT MAX(w) - 0.5 FROM f f2 WHERE f2.k = f.k)",
+        "SELECT k, v FROM f WHERE v >= (SELECT COUNT(*) FROM f f2 WHERE f2.k = f.k)",       # NULL k: COUNT(*) is 0
+        "SELECT o, v FROM f WHERE v > (SELECT COUNT(*) * 2 FROM f f2 WHERE f2.k = f.k)",
+        "SELECT k, v, COUNT(*) OVER (PARTITION BY k) AS n FROM f QUALIFY v >= n",          # nullable QUALIFY column
+        "SELECT o, COUNT(v) OVER (PARTITION BY s) AS n FROM f QUALIFY o < n",               # nullable window arg
+        "SELECT o, COUNT(*) OVER (PARTITION BY s) AS n FROM f QUALIFY o < n",
     ]
+    road = [   # row-emitting joins whose ON carries one-sided conditions (they decide matching only)
+        "SELECT f.o, d.zone FROM f LEFT JOIN d ON f.k = d.id AND d.id < 50 WHERE f.k IN (5, 60)",
+        "SELECT f.o, d.zone FROM f LEFT JOIN d ON f.k = d.id AND f.v > 500 WHERE f.s = 'bb'",
+        "SELECT f.o, d.tier FROM f JOIN d ON f.k = d.id AND d.tier = 'gold' AND f.v < 100",
+        "SELECT f.o, d.zone FROM f RIGHT JOIN d ON f.k = d.id AND f.v < 3",
+        "SELECT f.o, d.id FROM f FULL JOIN d ON f.k = d.id AND d.zone = 'z3' WHERE f.w < 1",
+        "SELECT f.o, f.k, d.zone FROM f LEFT JOIN d ON f.k = d.id WHERE f.v = 7",          # NULL keys match nothing
+    ]
+    win = win + road
     dd = os.path.join(TMP, 'oc_' + uuid.uuid4().hex[:8]); db_dir = dd + '_db'; os.makedirs(dd)
     old = {kk: os.environ.get(kk) for kk in FLOOR}
     try:

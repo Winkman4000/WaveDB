@@ -134,6 +134,8 @@ def detect(seg, tree, col_map):
         if w['arg'] is not None:
             if not P.columns_exist(seg, w['arg']):
                 return None
+            if seg.cols[w['arg']].get('has_null'):
+                return None              # the value tables stop before the NULL code (index past the end, 2026-10-06)
             if w['kind'] in ('sum', 'avg', 'min', 'max') and seg.cols[w['arg']].get('dt') != 0:
                 return None
         if w['frame'] is not None and w['kind'] not in ('sum', 'avg', 'count', 'min', 'max'):
@@ -158,18 +160,18 @@ def detect(seg, tree, col_map):
             elif isinstance(a, E.Column) and isinstance(b, E.Column) \
                     and b.name in aliases and a.name not in aliases:
                 nm = col_map.get(a.name, a.name) if col_map else a.name
-                if not P.columns_exist(seg, nm) or seg.cols[nm].get('dt') != 0:
+                if not P.columns_exist(seg, nm) or seg.cols[nm].get('dt') != 0 or seg.cols[nm].get('has_null'):
                     return None
                 qterms.append(('col', b.name, _FLIP[WS._SCMP[tn]], nm))   # alias <flip> col
             elif isinstance(b, E.Column) and isinstance(a, E.Column) \
                     and a.name in aliases and b.name not in aliases:
                 nm = col_map.get(b.name, b.name) if col_map else b.name
-                if not P.columns_exist(seg, nm) or seg.cols[nm].get('dt') != 0:
+                if not P.columns_exist(seg, nm) or seg.cols[nm].get('dt') != 0 or seg.cols[nm].get('has_null'):
                     return None
                 qterms.append(('col', a.name, WS._SCMP[tn], nm))          # alias <op> col
             elif isinstance(a, E.Column) and a.name not in aliases and isinstance(b, E.Literal):
                 nm = col_map.get(a.name, a.name) if col_map else a.name   # plain col <op> lit
-                if not P.columns_exist(seg, nm):
+                if not P.columns_exist(seg, nm) or seg.cols[nm].get('has_null'):
                     return None
                 v = str(b.this)
                 try:

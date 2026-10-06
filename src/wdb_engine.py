@@ -151,6 +151,94 @@ def warm_mapped(base, fd, spans):
     return sum(pool.map(lambda r: len(_osw.pread(fd, r[1] - r[0], r[0])), runs))
 
 
+def _m0_fixed8(buf, off, n):
+    """True when a mode-0 run of n records starting at off is laid out as <u32 8><8 bytes> (what the encoder writes
+    for float64 and int64-epoch values): first and last length words read 8 and the run fits in the file. The
+    whole run is checked when its values are first read (_Fixed8Vals.typed)."""
+    end = off + 12 * n
+    if n <= 0 or end > buf.shape[0]:
+        return False
+    return (struct.unpack_from('<I', buf, off)[0] == 8
+            and struct.unpack_from('<I', buf, off + 12 * (n - 1))[0] == 8)
+
+
+class _Fixed8Vals:
+    """A mode-0 dictionary of 8-byte values read in place: v[i] is the 8 bytes of record i (what the per-value list
+    held), len, iteration and slices as a list; typed() is the whole dictionary as one numpy array."""
+    __slots__ = ('_buf', '_mv', '_off', '_n')
+
+    def __init__(self, buf, off, n):
+        self._buf = buf; self._mv = memoryview(buf); self._off = int(off); self._n = int(n)
+
+    def __len__(self):
+        return self._n
+
+    def _rows(self):
+        return np.frombuffer(self._buf, dtype=np.uint8, count=12 * self._n, offset=self._off).reshape(self._n, 12)
+
+    def typed(self, dtype):
+        r = self._rows()
+        if not np.all(np.ascontiguousarray(r[:, :4]).view('<u4') == 8):
+            raise ValueError('mode-0 dictionary record not 8 bytes wide')
+        return np.ascontiguousarray(r[:, 4:]).view(dtype).ravel()
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            return [self[j] for j in range(*i.indices(self._n))]
+        i = int(i)
+        if i < 0: i += self._n
+        if not 0 <= i < self._n: raise IndexError(i)
+        o = self._off + 12 * i + 4
+        return bytes(self._mv[o:o + 8])
+
+    def __iter__(self):
+        raw = np.ascontiguousarray(self._rows()[:, 4:]).tobytes()
+        return (raw[k:k + 8] for k in range(0, 8 * self._n, 8))
+
+
+def _m0_var(buf, off, n, meta):
+    """A large mode-0 dictionary of any width: its value starts in one compiled pass (wdb_kernels.m0_starts);
+    sets meta['vals'] (a _VarVals), meta['m0span'] and meta['_m0end']. False when the kernel can't walk it."""
+    try:
+        import wdb_kernels as _WKs
+        starts = np.empty(n + 1, np.int64)
+        end = int(_WKs.m0_starts(np.asarray(buf).view(np.ndarray), np.int64(off), np.int64(n), starts))
+    except Exception:
+        return False
+    if end < 0:
+        return False
+    meta['m0span'] = off; meta['vals'] = _VarVals(buf, starts); meta['_m0end'] = end
+    return True
+
+
+class _VarVals:
+    """A mode-0 dictionary read in place: v[i] is record i's bytes (what the per-value list held), len,
+    iteration and slices as a list. starts[i] is value i's first byte; it ends 4 bytes before starts[i+1]."""
+    __slots__ = ('_mv', '_st', '_n')
+
+    def __init__(self, buf, starts):
+        self._mv = memoryview(buf); self._st = starts; self._n = int(starts.size - 1)
+
+    def __len__(self):
+        return self._n
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            return [self[j] for j in range(*i.indices(self._n))]
+        i = int(i)
+        if i < 0: i += self._n
+        if not 0 <= i < self._n: raise IndexError(i)
+        return bytes(self._mv[int(self._st[i]):int(self._st[i + 1]) - 4])
+
+    def __iter__(self):
+        if self._n == 0:
+            return iter(())
+        a0 = int(self._st[0])
+        raw = bytes(self._mv[a0:int(self._st[-1]) - 4])
+        st = (self._st - a0).tolist()
+        return (raw[st[k]:st[k + 1] - 4] for k in range(self._n))
+
+
 class Segment:
     def __init__(self, path):
         # memmap instead of read(): the file is demand-paged by the OS, so a Segment
@@ -176,7 +264,18 @@ class Segment:
             assert not fc3 or chunked, ('three streams without chunks', nm)
             n_dict = V - has_null
             meta = dict(V=V, bits=bits, dt=dt, mode=mode, has_null=has_null, n_dict=n_dict, aux=aux, chunked=chunked, fc3=fc3)
-            if mode == 0:
+            if mode == 0 and dt in (2, 3) and n_dict > 4096 and _m0_fixed8(buf, off, n_dict):
+                # THE EIGHT-BYTE DICTIONARY READ IN PLACE (2026-10-06): a float64 / int64-epoch dictionary is
+                # n records of <u32 8><8 bytes> -- its end is known without walking it, and its values are one
+                # strided view. The per-value loop parsed scope's v3 (9.5M floats) for 9.9 s at every open.
+                meta['m0span'] = off
+                meta['vals'] = _Fixed8Vals(buf, off, n_dict)
+                off += 12 * n_dict
+            elif mode == 0 and n_dict > 4096 and _m0_var(buf, off, n_dict, meta):
+                off = meta.pop('_m0end')                       # THE RUN WALKED COMPILED (2026-10-06): the starts
+                                                               # in one kernel pass, the values read in place --
+                                                               # cast_info.person_role_id (3.1M) took 3.3 s per open
+            elif mode == 0:
                 vals = []; meta['m0span'] = off                # where the <u32 len><bytes> run starts
                 for _ in range(n_dict):
                     vl = struct.unpack_from('<I',buf,off)[0]; off += 4
@@ -2345,14 +2444,18 @@ class Segment:
                 if _WKi.parse_m0_ints(np.asarray(self.buf), np.int64(c['m0span']), out):
                     return out
             try:
-                return np.asarray(c['vals']).astype(np.int64)
+                _v9 = c['vals']
+                return np.asarray(list(_v9) if isinstance(_v9, (_VarVals, _Fixed8Vals)) else _v9).astype(np.int64)
             except (ValueError, TypeError):
                 return [int(v) for v in c['vals']]
+        if isinstance(c.get('vals'), _Fixed8Vals) and c['dt'] in (2, 3):
+            return c['vals'].typed('<f8' if c['dt'] == 2 else '<i8')    # one strided view, no per-value bytes
         if c['dt'] == 2: return np.frombuffer(b''.join(c['vals']), dtype='<f8')   # vectorized + memoized
         if c['dt'] == 3: return [struct.unpack('<q', v)[0] for v in c['vals']]   # int64 epoch
         if c.get('aux') == 9 and c['dt'] == 1:               # THE BOOL MARKER: decode to Python bools at the source
             return [(v == b'True') for v in self.dict_vals(nm)]
-        return self.dict_vals(nm)  # bytes
+        _dv9 = self.dict_vals(nm)  # bytes
+        return list(_dv9) if isinstance(_dv9, (_VarVals, _Fixed8Vals)) else _dv9   # the typed dict is a list (-> array)
     def unit(self, nm):
         return _DT_UNITS[self.cols[nm]['aux']]
     def values(self, nm):
