@@ -301,6 +301,22 @@ def table_agg(db, tree):
     """Single-table aggregate routed through the SAME fused engine as joins: a 0-join chain (fact only, every
     cptr is None). Reuses predicate fusion, high-card factorise, and vectorised assembly. Raises
     _FastUnsupported on anything not fusable so the caller falls back to the mature single-table executor."""
+    off9 = wdb_sql._offset(tree)
+    if off9:
+        # THE OFFSET WINDOW (2026-10-12): every road below answers LIMIT in ORDER BY order (the early pick,
+        # the peel, the top-K emit) but none applies OFFSET -- so OFFSET queries were routed past fused_agg
+        # to the general scan (the funnel family's variants: 0.7-1.6 s where DuckDB took 0.1 s). Ask for
+        # the first LIMIT + OFFSET rows in order, then drop OFFSET of them: rows [OFFSET : OFFSET + LIMIT]
+        # of a valid ordering, ties included.
+        lim9 = wdb_sql._limit(tree)
+        t9 = tree.copy()
+        t9.set('offset', None)
+        if lim9 is not None:
+            t9.set('limit', E.Limit(expression=E.Literal.number(lim9 + off9)))
+        out9 = table_agg(db, t9)
+        if not isinstance(out9, tuple):
+            raise _FastUnsupported                       # a columnar answer: not this road's to slice
+        return list(out9[0])[off9:], out9[1]
     w = tree.args.get('where')
     if w is None:
         ex = _exact_scalar(db, tree)         # dict-arithmetic scalars: exact hugeint SUM,
