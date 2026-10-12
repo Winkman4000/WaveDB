@@ -106,6 +106,11 @@ def detect(seg, tree, col_map):
         return None
     if not _order_is_count_desc(tree, proj, ci):
         return None
+    if len(tree.args['order'].expressions) > 1:
+        # the pick is by count alone (ties at the cut are any of them) and only the k picked are
+        # re-sorted: a tiebreak after the count would choose WHICH tied rows survive the LIMIT, and
+        # this read never looks at it (ORDER BY c DESC, w, a returned the wrong ten, 2026-10-12)
+        return None
     if not P.has_where(tree):
         return None
     f = _eq_on_nonkey(seg, tree.args.get('where'), gnames, col_map)

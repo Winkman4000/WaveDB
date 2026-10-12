@@ -1045,16 +1045,20 @@ def detect(seg, tree, col_map):
                 return None
         elif tgt not in (wdb_sql._alias(proj[cnt_idx[0]]), 'COUNT', 'count'):
             return None
-        # trailing ASC key columns (the validator's total-order tiebreak) are exactly the
-        # canonical emission order (count desc, composite asc = value asc) -- accept them
-        knames = {k['src'] for _pi, k in keys if k.get('kind') == 'col'}
-        kalias = {wdb_sql._alias(proj[pi]) for pi, _k in keys}
-        for oe2 in order.expressions[1:]:
-            if oe2.args.get('desc') or not isinstance(oe2.this, E.Column):
+        # trailing ASC key columns are this read's canonical emission order (count desc, then the
+        # composite asc = each key's value asc, IN KEY ORDER) only when they are the keys in that
+        # order, from the first: ORDER BY c DESC, WatchID over keys (ClientIP, WatchID) broke the
+        # count ties on ClientIP and cut the wrong rows at the LIMIT (the shifting board's G,
+        # 2026-10-12). A prefix is enough -- ties past it are SQL's to leave in any order.
+        tail = order.expressions[1:]
+        if len(tail) > len(keys):
+            return None
+        for oe2, (pi2, k2) in zip(tail, keys):
+            if oe2.args.get('desc') or not isinstance(oe2.this, E.Column) or k2.get('kind') != 'col':
                 return None
             n2 = oe2.this.name
             n2m = col_map.get(n2, n2) if col_map else n2
-            if n2m not in knames and n2 not in kalias:
+            if n2m != k2['src'] and n2 != wdb_sql._alias(proj[pi2]):
                 return None
     lim = wdb_sql._limit(tree)
     off = wdb_sql._offset(tree) or 0
