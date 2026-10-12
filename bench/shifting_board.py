@@ -54,7 +54,7 @@ HITS_CTE = ("WITH hits AS (SELECT * REPLACE ("
             "FROM read_parquet('%s'))" % A.parquet)
 
 seed = A.seed if A.seed is not None else int.from_bytes(os.urandom(4), 'little')
-OUT = os.path.join(A.out, 'seed_%d' % seed)
+OUT = os.path.join(A.out, 'seed_%d_%s' % (seed, time.strftime('%Y%m%d_%H%M%S')))   # a rerun never overwrites
 os.makedirs(OUT, exist_ok=True)
 LOG = open(os.path.join(OUT, 'results.jsonl'), 'w')
 

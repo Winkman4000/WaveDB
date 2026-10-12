@@ -4750,6 +4750,156 @@ def hcomposite_rep(tg, tk0, tk1, g0, g1):
             g0[g] = tk0[j]; g1[g] = tk1[j]
 
 
+@njit(cache=True, nogil=True, inline='always')
+def _pf_mix(a, b):
+    """splitmix64-style finalizer over one or two key words, as uint64: the HIGH bits pick the
+    shard, the LOW bits the slot inside it, so the two choices never correlate."""
+    x = np.uint64(a) * np.uint64(0x9E3779B97F4A7C15) ^ (np.uint64(b) + np.uint64(0xBF58476D1CE4E5B9))
+    x ^= x >> np.uint64(30)
+    x *= np.uint64(0xBF58476D1CE4E5B9)
+    x ^= x >> np.uint64(27)
+    x *= np.uint64(0x94D049BB133111EB)
+    x ^= x >> np.uint64(31)
+    return x
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def _pf_partition(w0, w1, two, sbits, NT):
+    """Pass 1+2: every row's shard (top sbits of the mix), per-thread histograms, then a disjoint
+    scatter of row numbers into shard order. Inside a shard rows stay ascending (thread t's chunk
+    precedes thread t+1's), so the result does not depend on the thread count."""
+    n = w0.shape[0]
+    S = np.int64(1) << sbits
+    sh = np.empty(n, np.int32)
+    chunk = (n + NT - 1) // NT
+    hist = np.zeros((NT, S), np.int64)
+    for t in prange(NT):
+        lo = t * chunk
+        hi = min(lo + chunk, n)
+        for i in range(lo, hi):
+            b = w1[i] if two else np.int64(0)
+            s = np.int64(_pf_mix(w0[i], b) >> np.uint64(64 - sbits)) if sbits > 0 else np.int64(0)
+            sh[i] = s
+            hist[t, s] += 1
+    base = np.zeros(S + 1, np.int64)
+    woff = np.zeros((NT, S), np.int64)
+    for s in range(S):
+        acc = base[s]
+        for t in range(NT):
+            woff[t, s] = acc
+            acc += hist[t, s]
+        base[s + 1] = acc
+    idx = np.empty(n, np.int64)
+    for t in prange(NT):
+        lo = t * chunk
+        hi = min(lo + chunk, n)
+        cur = woff[t].copy()
+        for i in range(lo, hi):
+            s = sh[i]
+            idx[cur[s]] = i
+            cur[s] += 1
+    return idx, base
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def _pf_shards(w0, w1, two, idx, base, gid, u0, u1, ngs):
+    """Pass 3: each shard factorises its own rows with a private open-addressing table (one core
+    per shard, no sharing). Local ids follow first appearance; each new key's words are parked at
+    the shard's own region of u0/u1 (a shard has at most as many keys as rows)."""
+    S = base.shape[0] - 1
+    for s in prange(S):
+        lo = base[s]
+        m = base[s + 1] - lo
+        if m == 0:
+            ngs[s] = 0
+            continue
+        tsz = np.int64(16)
+        while tsz < 2 * m:
+            tsz *= 2
+        mask = np.uint64(tsz - 1)
+        tk0 = np.empty(tsz, np.int64)
+        tk1 = np.empty(tsz, np.int64)
+        tg = np.full(tsz, -1, np.int64)
+        ng = np.int64(0)
+        for j in range(lo, lo + m):
+            r = idx[j]
+            a = w0[r]
+            b = w1[r] if two else np.int64(0)
+            h = np.int64(_pf_mix(a, b) & mask)
+            while True:
+                g = tg[h]
+                if g < 0:
+                    tk0[h] = a
+                    tk1[h] = b
+                    tg[h] = ng
+                    u0[lo + ng] = a
+                    if two:
+                        u1[lo + ng] = b
+                    gid[r] = ng
+                    ng += 1
+                    break
+                if tk0[h] == a and tk1[h] == b:
+                    gid[r] = g
+                    break
+                h = (h + 1) & np.int64(mask)
+        ngs[s] = ng
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def _pf_globalise(idx, base, gid, u0, u1, two, goff, g0, g1):
+    """Pass 4: local ids -> global (shard offset added), each shard's keys compacted to g0/g1."""
+    S = base.shape[0] - 1
+    for s in prange(S):
+        lo = base[s]
+        hi = base[s + 1]
+        off = goff[s]
+        for j in range(lo, hi):
+            gid[idx[j]] += off
+        for k in range(goff[s + 1] - off):
+            g0[off + k] = u0[lo + k]
+            if two:
+                g1[off + k] = u1[lo + k]
+
+
+def parallel_factorize(w0, w1=None, sbits=None):
+    """THE PARALLEL FACTORISE (2026-10-12): dense group ids for one or two int64 key words per row,
+    on every core -- the atom under any GROUP BY whose composite is too big for a dense array.
+    Replaces pandas' single-threaded factorize (6.5 s of a 7.9 s UserID x SearchPhrase group,
+    14 s of WatchID x ClientIP on the shifting board) and the serial hcomposite2.
+
+    Rows are partitioned by a hash of their key into 2^sbits shards (~16K rows each, a table that
+    stays in L2), each shard factorises privately, and shard offsets make the ids global.
+    Returns (gid int64[n], keys0 int64[G], keys1 int64[G] or None): row i's group is gid[i], and
+    group g's key words are keys0[g] (and keys1[g]). Ids are dense 0..G-1, deterministic for a
+    given input; their ORDER is shard-major (not first appearance) -- callers treat it as unordered,
+    as SQL does."""
+    w0 = np.ascontiguousarray(w0, dtype=np.int64)
+    n = w0.shape[0]
+    two = w1 is not None
+    w1a = np.ascontiguousarray(w1, dtype=np.int64) if two else np.zeros(1, np.int64)
+    if n == 0:
+        return np.empty(0, np.int64), np.empty(0, np.int64), (np.empty(0, np.int64) if two else None)
+    if sbits is None:
+        sbits = 0
+        while sbits < 14 and (n >> (sbits + 14)) > 0:   # ~16K rows a shard, at most 16K shards
+            sbits += 1
+    NT = _nt()
+    idx, base = _pf_partition(w0, w1a, two, np.int64(sbits), NT)
+    S = base.shape[0] - 1
+    gid = np.empty(n, np.int64)
+    u0 = np.empty(n, np.int64)
+    u1 = np.empty(n if two else 1, np.int64)
+    ngs = np.zeros(S, np.int64)
+    _pf_shards(w0, w1a, two, idx, base, gid, u0, u1, ngs)
+    goff = np.zeros(S + 1, np.int64)
+    np.cumsum(ngs, out=goff[1:])
+    G = int(goff[-1])
+    g0 = np.empty(G, np.int64)
+    g1 = np.empty(G if two else 1, np.int64)
+    _pf_globalise(idx, base, gid, u0, u1, two, goff, g0, g1)
+    return gid, g0, (g1 if two else None)
+
+
 @njit(cache=True, parallel=True, nogil=True)
 def pack2(codes, shifts, words, w0, w1):
     """Pack k code arrays (int64[k, n] as a 2-D view) into two words by the

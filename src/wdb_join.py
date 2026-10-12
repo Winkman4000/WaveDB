@@ -5224,13 +5224,10 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 w0 = np.empty(n, np.int64); w1 = np.empty(n, np.int64)
                 wdb_kernels.pack2(cm9, shifts9, words9, w0, w1)
                 del cm9
-                tsz = 1 << max(4, int(2 * n - 1).bit_length())
-                tk0 = np.empty(tsz, np.int64); tk1 = np.empty(tsz, np.int64); tg = np.full(tsz, -1, np.int64)
-                gids = np.empty(n, np.int64)
-                ng9 = int(wdb_kernels.hcomposite2(w0, w1, gids, tk0, tk1, tg))
-                g0 = np.empty(ng9, np.int64); g1 = np.empty(ng9, np.int64)
-                wdb_kernels.hcomposite_rep(tg, tk0, tk1, g0, g1)
-                del tk0, tk1, tg, w0, w1
+                # THE PARALLEL FACTORISE (was the serial hcomposite2): ids on every core
+                gids, g0, g1 = wdb_kernels.parallel_factorize(w0, w1)
+                ng9 = int(g0.size)
+                del w0, w1
                 _gid_words9 = (g0, g1, shifts9, words9, widths9)
                 gid_to_comp = None
                 gids = np.ascontiguousarray(gids)
@@ -5290,7 +5287,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     gids = np.cumsum(gids)
                     gid_to_comp = comp[starts]
                 else:
-                    gids, gid_to_comp = pd.factorize(comp, sort=False)   # hash-factorise -> only groups present
+                    # THE PARALLEL FACTORISE (was pandas' single-threaded factorize: 6.5 s of a
+                    # 7.9 s UserID x SearchPhrase group, 14 s of WatchID x ClientIP) -> only groups present
+                    gids, gid_to_comp, _ = wdb_kernels.parallel_factorize(comp)
             if not _hashed_done9:
                 gids = np.ascontiguousarray(gids.astype(np.int64))
                 K = len(gid_to_comp); group_op = ('d', gids); group_keys = [(gids, K, None)]
