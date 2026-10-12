@@ -920,19 +920,7 @@ def _date_family(seg, n, mask, resolve, env):
         if type(n).__name__ == _cls9 and hasattr(E, _cls9):
             return extract(_fld9, ev(n.this))
     if type(n).__name__ in ('DateTrunc', 'TimestampTrunc'):
-        unit = str(n.args.get('unit').this if hasattr(n.args.get('unit'), 'this') else n.args.get('unit')).upper().strip("'")
-        a = dt64(ev(n.this))
-        if unit in ('YEAR', 'Y'): return a.astype('datetime64[Y]').astype('datetime64[D]')
-        if unit == 'QUARTER':
-            y, m, d, D = ymd(a); return from_ymd(y, ((m - 1) // 3) * 3 + 1, np.ones_like(d))
-        if unit == 'MONTH': return a.astype('datetime64[M]').astype('datetime64[D]')
-        if unit == 'WEEK':
-            D = a.astype('datetime64[D]'); return D - (((D.astype(np.int64) + 3) % 7)).astype('timedelta64[D]')   # Monday
-        if unit == 'DAY': return a.astype('datetime64[D]') if np.datetime_data(a.dtype)[0] == 'D' else a.astype('datetime64[D]').astype(a.dtype)
-        if unit == 'HOUR': return a.astype('datetime64[h]').astype(a.dtype)
-        if unit == 'MINUTE': return a.astype('datetime64[m]').astype(a.dtype)
-        if unit == 'SECOND': return a.astype('datetime64[s]').astype(a.dtype)
-        raise TypeError('DATE_TRUNC %s' % unit)
+        return date_trunc(trunc_unit(n), dt64(ev(n.this)))
     def interval_add(a, iv, sign):
         a = dt64(a); nlit = iv.this; k = int(nlit.this if isinstance(nlit, E.Literal) else ev(nlit)) * sign
         unit = str(iv.args.get('unit').this if hasattr(iv.args.get('unit'), 'this') else iv.args.get('unit')).upper().rstrip('S')
@@ -2020,6 +2008,30 @@ def _pyval(v):
     if isinstance(v,(np.integer,)): return int(v)
     if isinstance(v,(np.floating,)): return float(v)
     return v
+def trunc_unit(n):
+    """DATE_TRUNC / TIMESTAMP_TRUNC node -> its unit, upper case ('MINUTE')."""
+    u = n.args.get('unit')
+    return str(u.this if hasattr(u, 'this') else u).upper().strip("'\"")
+
+
+def date_trunc(unit, a):
+    """DATE_TRUNC over a datetime64 array -- the ONE definition, shared by the row evaluator and fused_agg's
+    dictionary-riding group key (so both roads emit the same values and types). Calendar units (YEAR, QUARTER,
+    MONTH, WEEK) come back as dates; DAY keeps a timestamp's unit; HOUR/MINUTE/SECOND keep the input unit."""
+    if unit in ('YEAR', 'Y'): return a.astype('datetime64[Y]').astype('datetime64[D]')
+    if unit == 'QUARTER':
+        m = a.astype('datetime64[M]').astype(np.int64)
+        return ((m // 3) * 3).astype('datetime64[M]').astype('datetime64[D]')
+    if unit == 'MONTH': return a.astype('datetime64[M]').astype('datetime64[D]')
+    if unit == 'WEEK':
+        D = a.astype('datetime64[D]'); return D - (((D.astype(np.int64) + 3) % 7)).astype('timedelta64[D]')   # Monday
+    if unit == 'DAY': return a.astype('datetime64[D]') if np.datetime_data(a.dtype)[0] == 'D' else a.astype('datetime64[D]').astype(a.dtype)
+    if unit == 'HOUR': return a.astype('datetime64[h]').astype(a.dtype)
+    if unit == 'MINUTE': return a.astype('datetime64[m]').astype(a.dtype)
+    if unit == 'SECOND': return a.astype('datetime64[s]').astype(a.dtype)
+    raise TypeError('DATE_TRUNC %s' % unit)
+
+
 def _limit(tree):
     lim = tree.args.get('limit')
     if lim is None: return None

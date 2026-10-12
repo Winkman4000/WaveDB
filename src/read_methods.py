@@ -347,6 +347,9 @@ def _fused_detect(c):
                 for p in proj:                       # resolve a bare name to its SELECT-alias expr
                     if isinstance(p, wdb_sql.E.Alias) and p.alias == nm:
                         node = p.this; break
+            if isinstance(node, (wdb_sql.E.TimestampTrunc, wdb_sql.E.DateTrunc)) \
+                    and isinstance(node.this, wdb_sql.E.Column):
+                continue                     # DATE_TRUNC(unit, col): rides the dictionary in fused_agg (O(V))
             if not isinstance(node, wdb_sql.E.Column):
                 return None
     return True                              # always eligible to try; execute decides

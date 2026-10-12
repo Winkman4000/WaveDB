@@ -3579,6 +3579,21 @@ _TOPK_EMIT_HITS = 0   # diagnostic: queries whose emit picked exactly k groups i
 _VETO_HITS = 0        # diagnostic: grouped queries answered empty by the dictionary-range proof
 
 
+def _like_too_big9(where, resolve):
+    """True when the WHERE holds a LIKE/ILIKE on a main-table string column whose dictionary is too big for the
+    code LUT (or string predicates are off) -- a pred fused_agg's compiler can never build."""
+    for lk in where.this.find_all(E.Like, E.ILike):
+        if not isinstance(lk.this, E.Column): continue
+        try:
+            sg, pc, cp = resolve(lk.this)
+        except _FastUnsupported:
+            continue
+        c = sg.cols.get(pc) or {}
+        if cp is None and c.get('dt') == 1 and (not FUSE_STR_PRED or not RT.code_lut_fits(int(c.get('V') or 0))):
+            return True
+    return False
+
+
 _VETO_FLIP = {E.GT: E.LT, E.LT: E.GT, E.GTE: E.LTE, E.LTE: E.GTE, E.EQ: E.EQ, E.NEQ: E.NEQ}
 
 
@@ -4334,6 +4349,23 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             global _VETO_HITS; _VETO_HITS += 1
             _bump_fast()
             return [], [wdb_sql._alias(p) for p in proj]
+    if where is not None and group is not None and not tree.args.get('joins') and not columnar \
+            and _like_too_big9(where, resolve):
+        # DECIDE BEFORE PAYING (2026-10-12): a grouped single-table WHERE with a LIKE on a string dictionary too
+        # big for the code LUT always ends in a decline (no fact-only cascade with leftovers; no LUT for the
+        # pred) -- decline before the cascade's censuses and the group keys are paid for. Only the singleton
+        # peel (it reads the WHERE as one mask) still answers such a query: leave it the chance.
+        import wdb_peel
+        _pk9 = []
+        for _g9 in gnodes:
+            if isinstance(_g9, E.Column):
+                try:
+                    _s9, _p9, _c9 = resolve(_g9)
+                except _FastUnsupported:
+                    continue
+                if _c9 is None: _pk9.append({'seg': _s9, 'pcol': _p9})
+        if os.environ.get('WDB_PEEL') == '0' or wdb_peel.pick_key(_pk9) is None:
+            raise _FastUnsupported
     _maskc = {}
     def get_mask():                # materialise the WHERE bool mask lazily -- only non-fused paths need it
         if _where_spent:
@@ -4605,6 +4637,11 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                             if _c9l is not None and _c9l >= 0: kx9[_c9l] = False
                             if c9.get('has_null'): kx9[V9 - 1] = False
                         td9 = None
+                    elif c9.get('dt') == 1 and V9 >= 200_000 and not isinstance(cn, E.In):
+                        # ...and anything else but IN (its literals resolve one by one below) on a big string dictionary
+                        # (LIKE, ranges) is a leftover judged at
+                        # survivors -- never a whole-dictionary decode just to find that out (2026-10-12)
+                        _cres9.append(cn); continue
                     else:
                         td9 = np.asarray(cs9._typed_dict(cp9))
                 if td9 is None:
@@ -5349,6 +5386,12 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         _peel9 = None
     if _peel9 is not None:
         return _peel9
+    # DECIDE BEFORE PAYING, PART TWO (2026-10-12): a grouped single-table query whose WHERE holds a LIKE on a
+    # string dictionary too big for the code LUT always ends in a decline -- the arbiter refuses a fact-only
+    # cascade with leftovers, and the predicate compiler needs the LUT. Decline now, before the group keys are
+    # built over every row (a DATE_TRUNC key paid 0.7 s warm, 7 s cold, to reach that refusal).
+    if where is not None and group is not None and not tree.args.get('joins') and _like_too_big9(where, resolve):
+        raise _FastUnsupported                       # the peel declined: nothing below can answer this WHERE
     gkeys = []                                           # one per GROUP BY column
     for g in gnodes:
         if not isinstance(g, E.Column):
@@ -5375,9 +5418,19 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 if isinstance(nd, E.Mod): return np.mod(_dx9(nd.this, bv), _dx9(nd.expression, bv))
                 if isinstance(nd, E.IntDiv): return np.floor_divide(_dx9(nd.this, bv), _dx9(nd.expression, bv))
                 raise _FastUnsupported
-            dv9 = _dx9(g, np.asarray(rawx[0], dtype=np.float64))
-            if gseg.cols[gpcol].get('dt') == 0 and (dv9 == np.floor(dv9)).all():
-                dv9 = dv9.astype(np.int64)             # integer keys stay integers (labels emit as ints)
+            if isinstance(g, (E.TimestampTrunc, E.DateTrunc)):
+                # DATE_TRUNC RIDES THE DICT TOO (2026-10-12): truncate the V distinct times, not the N rows --
+                # the same wdb_sql.date_trunc the row evaluator uses, so values and types match that road
+                if not isinstance(g.this, E.Column) or gseg.cols[gpcol].get('dt') != 3: raise _FastUnsupported
+                try:
+                    dv9 = wdb_sql.date_trunc(wdb_sql.trunc_unit(g),
+                                             np.asarray(rawx[0], dtype=np.int64).view('datetime64[%s]' % gseg.unit(gpcol)))
+                except TypeError:
+                    raise _FastUnsupported
+            else:
+                dv9 = _dx9(g, np.asarray(rawx[0], dtype=np.float64))
+                if gseg.cols[gpcol].get('dt') == 0 and (dv9 == np.floor(dv9)).all():
+                    dv9 = dv9.astype(np.int64)             # integer keys stay integers (labels emit as ints)
             u9x, inv9x = np.unique(dv9, return_inverse=True)
             inv9x = np.ascontiguousarray(inv9x, dtype=np.int64)
             if gcptr is None and rows9 is not None:
@@ -5388,7 +5441,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 if gcptr is None: full = _rw9(full)
                 else: gcptr = _rw9(gcptr)
             gkeys.append({'seg': gseg, 'pcol': gpcol, 'cptr': gcptr, 'full': full,
-                          'K': int(u9x.size), 'labels': [wdb_sql._pyval(x) for x in u9x.tolist()],
+                          'K': int(u9x.size), 'labels': ([wdb_sql._pyval(x) for x in u9x] if u9x.dtype.kind == 'M'
+                                                         else [wdb_sql._pyval(x) for x in u9x.tolist()]),
                           'expr': True})
             continue
         gseg, gpcol, gcptr = resolve(g)
@@ -5667,6 +5721,10 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         # ARBITRARY single-column string predicate -> code-LUT: precompute keep[code]=fn(dict_value) over
         # the (small) dictionary, add it as a value slot whose base IS that bool table, predicate -> 'vk!=0'.
         # Reuses the value-slot kernel verbatim (base[codes[i]]); gated on dict cardinality (precompute cost).
+        # DECIDE BEFORE PAYING (2026-10-12): the LUT's size is the dictionary's, known from metadata -- a
+        # LIKE on SearchPhrase built a 6M-entry code map and only then found the table too big (5.4 s spent
+        # to decline a query the general scan answers in 0.9 s)
+        if not RT.code_lut_fits(int(cseg.cols[cpcol].get('V') or 0)): raise _FastUnsupported
         sc = _str_codes(cseg, cpcol)
         if sc is None: raise _FastUnsupported
         codes, code_of, nullcode = sc
