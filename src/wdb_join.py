@@ -4908,6 +4908,48 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     # own parents' attributes), ORDER BY one aggregate, LIMIT k: group by the
     # PARENT ROW alone (one int key), select the top k, and decode every
     # attribute for k rows only. Duck decodes them for every group.
+    def _door_rows():
+        # THE DOORS' SURVIVORS (shared by the top-K attribute door and the singleton peel): the base
+        # rows that pass WHERE, with the cascade's leftovers re-applied AT ROWS; None = can't judge.
+        if _plane_mask9 is not None or (_resid_c9X and rows9 is None): return None
+        # survivors -- WITH the cascade's leftovers re-applied AT ROWS (the door
+        # once consumed rows9 raw and shipped Q21 wrong, 2026-09-03)
+        if rows9 is not None:
+            rows = rows9
+            for _lc9 in (_cres_left9 or []):
+                _mk9 = None
+                if (type(_lc9) in (E.GT, E.LT) and isinstance(_lc9.this, E.Column)
+                        and isinstance(_lc9.expression, E.Column)):
+                    _sA, _pA, _cA = resolve(_lc9.this); _sB, _pB, _cB = resolve(_lc9.expression)
+                    if _sA is _sB and _cA is None and _cB is None:
+                        _big, _small = (_pA, _pB) if isinstance(_lc9, E.GT) else (_pB, _pA)
+                        _cbig = _sA.cols.get(_big, {}); _csm = _sA.cols.get(_small, {})
+                        if _cbig.get('code_enc') == 16 and _cbig.get('e16_partner') == _small:
+                            _b9, _d9 = _sA.pair_bits(_big)
+                            _mk9 = np.asarray(_b9)[rows] & (np.asarray(_d9)[rows] > 0)
+                        elif _csm.get('code_enc') == 16 and _csm.get('e16_partner') == _big:
+                            _b9, _d9 = _sA.pair_bits(_small)
+                            _mk9 = (~np.asarray(_b9)[rows]) & (np.asarray(_d9)[rows] > 0)
+                else:
+                    _lcols = list(_lc9.find_all(E.Column))
+                    if len(_lcols) == 1:
+                        _sL, _pL, _cL = resolve(_lcols[0])
+                        _cLd = _sL.cols.get(_pL, {})
+                        if _cLd.get('mode') in (0, 1, 2):
+                            _tdL = np.asarray(_sL._typed_dict(_pL))
+                            _kpL = _dict_keep(_lc9, _sL, _pL, _tdL) if _tdL.dtype.kind in 'iuf' else None
+                            if _kpL is not None:
+                                _rr = rows if _cL is None else np.asarray(_cL)[rows]
+                                _cdL = np.asarray(_sL.codes_at(_pL, _rr))
+                                _kxL = np.zeros(int(_cLd['V']) + 1, bool); _kxL[:len(_kpL)] = _kpL
+                                _mk9 = _kxL[_cdL]
+                if _mk9 is None:
+                    return None                    # a leftover the door can't judge
+                rows = rows[_mk9]
+        else:
+            m9 = get_mask()
+            rows = np.flatnonzero(m9) if m9 is not None else np.arange(n, dtype=np.int64)
+        return rows
     def _topk_attr_door():
         order9 = tree.args.get('order'); limit9 = tree.args.get('limit')
         if group is None or order9 is None or limit9 is None: return None
@@ -5018,43 +5060,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         if not (any(kind == 'agg' and al9 == okey9 for kind, _n, al9 in plan9)
                 or all(o9.this.name in _pcols9 for o9 in ords9)):    # ORDER BY attributes (Q18)
             return None
-        # survivors -- WITH the cascade's leftovers re-applied AT ROWS (the door
-        # once consumed rows9 raw and shipped Q21 wrong, 2026-09-03)
-        if rows9 is not None:
-            rows = rows9
-            for _lc9 in (_cres_left9 or []):
-                _mk9 = None
-                if (type(_lc9) in (E.GT, E.LT) and isinstance(_lc9.this, E.Column)
-                        and isinstance(_lc9.expression, E.Column)):
-                    _sA, _pA, _cA = resolve(_lc9.this); _sB, _pB, _cB = resolve(_lc9.expression)
-                    if _sA is _sB and _cA is None and _cB is None:
-                        _big, _small = (_pA, _pB) if isinstance(_lc9, E.GT) else (_pB, _pA)
-                        _cbig = _sA.cols.get(_big, {}); _csm = _sA.cols.get(_small, {})
-                        if _cbig.get('code_enc') == 16 and _cbig.get('e16_partner') == _small:
-                            _b9, _d9 = _sA.pair_bits(_big)
-                            _mk9 = np.asarray(_b9)[rows] & (np.asarray(_d9)[rows] > 0)
-                        elif _csm.get('code_enc') == 16 and _csm.get('e16_partner') == _big:
-                            _b9, _d9 = _sA.pair_bits(_small)
-                            _mk9 = (~np.asarray(_b9)[rows]) & (np.asarray(_d9)[rows] > 0)
-                else:
-                    _lcols = list(_lc9.find_all(E.Column))
-                    if len(_lcols) == 1:
-                        _sL, _pL, _cL = resolve(_lcols[0])
-                        _cLd = _sL.cols.get(_pL, {})
-                        if _cLd.get('mode') in (0, 1, 2):
-                            _tdL = np.asarray(_sL._typed_dict(_pL))
-                            _kpL = _dict_keep(_lc9, _sL, _pL, _tdL) if _tdL.dtype.kind in 'iuf' else None
-                            if _kpL is not None:
-                                _rr = rows if _cL is None else np.asarray(_cL)[rows]
-                                _cdL = np.asarray(_sL.codes_at(_pL, _rr))
-                                _kxL = np.zeros(int(_cLd['V']) + 1, bool); _kxL[:len(_kpL)] = _kpL
-                                _mk9 = _kxL[_cdL]
-                if _mk9 is None:
-                    return None                    # a leftover the door can't judge
-                rows = rows[_mk9]
-        else:
-            m9 = get_mask()
-            rows = np.flatnonzero(m9) if m9 is not None else np.arange(n, dtype=np.int64)
+        rows = _door_rows()
+        if rows is None: return None
         key = np.asarray(keyptr9)[rows]
         NK = int(kseg9.N)
         cnt = np.bincount(key, minlength=NK)
@@ -5124,6 +5131,108 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         _door9 = None
     if _door9 is not None:
         return _door9
+    # ---- THE SINGLETON PEEL DOOR (2026-10-12): a nearly-unique group key makes nearly every group one
+    # row -- census that key over the survivors, group only the repeaters, emit the k winners (wdb_peel)
+    def _singleton_peel_door():
+        import wdb_peel, wdb_union
+        if os.environ.get('WDB_PEEL') == '0': return None          # ablation: the fused kernel groups everything
+        if columnar or group is None or tree.args.get('joins') or tree.args.get('having') is not None:
+            return None
+        if tree.args.get('distinct') is not None or wdb_sql._offset(tree):
+            return None
+        k9 = wdb_sql._limit(tree)
+        if k9 is None or k9 <= 0 or k9 > 100000:
+            return None
+        keys9 = []
+        for g in gnodes:
+            if not isinstance(g, E.Column): return None
+            sg, pc, cp = resolve(g)
+            if cp is not None or sg.cols[pc].get('mode') not in (0, 1, 2): return None
+            keys9.append({'seg': sg, 'pcol': pc, 'name': g.name})
+        if not keys9: return None
+        peel9 = wdb_peel.pick_key(keys9)
+        if peel9 is None: return None
+        def _key_of(col):
+            sg, pc, cp = resolve(col)
+            for j, kk in enumerate(keys9):
+                if kk['seg'] is sg and kk['pcol'] == pc: return j
+            return None
+        def _agg_entry(nd):
+            if isinstance(nd, E.Count):
+                a = nd.this
+                if a is None or isinstance(a, E.Star): return ('count',)
+                if isinstance(a, E.Column):
+                    sg, pc, cp = resolve(a)
+                    if cp is None and not sg.cols[pc].get('has_null'): return ('count',)
+                return None
+            kind = {E.Sum: 'SUM', E.Avg: 'AVG', E.Min: 'MIN', E.Max: 'MAX'}.get(type(nd))
+            if kind is None or not isinstance(nd.this, E.Column): return None
+            sg, pc, cp = resolve(nd.this)
+            c9 = sg.cols[pc]
+            if cp is not None or c9.get('has_null') or c9.get('dt') not in (0, 2): return None
+            if wdb_sql.raw_dict_col(sg, pc, want_codes=False) is None: return None
+            return ('agg', kind, sg, pc)
+        plan9 = []; inner9 = []
+        for p in proj:
+            nd = p.this if isinstance(p, E.Alias) else p
+            if isinstance(nd, E.Column):
+                j = _key_of(nd)
+                if j is None: return None
+                plan9.append(('key', j))
+            else:
+                e9 = _agg_entry(nd)
+                if e9 is None: return None
+                plan9.append(e9)
+            inner9.append(nd)
+        def _key_orderable(j):
+            kk = keys9[j]; c9 = kk['seg'].cols[kk['pcol']]
+            return (not c9.get('has_null') and c9.get('dt') in (0, 1, 3)
+                    and not isinstance(kk['seg'], wdb_union.SegmentUnion))
+        order9 = []
+        ox9 = tree.args.get('order')
+        for o in (ox9.expressions if ox9 is not None else []):
+            t9 = o.this; pi = None
+            if isinstance(t9, E.Literal) and not t9.is_string:
+                pi = int(t9.this) - 1
+                if not 0 <= pi < len(proj): return None
+            elif isinstance(t9, E.Column) and not t9.table:
+                for i9, p in enumerate(proj):
+                    if isinstance(p, E.Alias) and p.alias == t9.name: pi = i9; break
+            if pi is None:
+                for i9, nd in enumerate(inner9):
+                    if nd == t9: pi = i9; break
+            if pi is None:                               # an ORDER BY term not projected: carried hidden
+                if isinstance(t9, E.Column):
+                    j = _key_of(t9)
+                    if j is None: return None
+                    e9 = ('key', j)
+                else:
+                    e9 = _agg_entry(t9)
+                    if e9 is None: return None
+                plan9.append(tuple(e9) + (None,) * (4 - len(e9)) + ('hidden',))
+                pi = len(plan9) - 1
+            if plan9[pi][0] == 'key' and not _key_orderable(plan9[pi][1]): return None
+            order9.append((pi, bool(o.args.get('desc'))))
+        rows = _door_rows()
+        if rows is None:
+            # the cascade left a plane mask and/or residual conjuncts for the kernel's predicate: the
+            # peel takes the whole WHERE as one mask instead (exact; the kernel never runs here)
+            if where is None: return None
+            m9 = _maskc.get('m')
+            if m9 is None: m9 = mask_eval(where.this)
+            rows = np.flatnonzero(m9)
+        out9 = wdb_peel.run(rows, keys9, peel9, plan9, order9, k9)
+        if out9 is None: return None
+        if _bill9 is not None:
+            print('JOIN BILL: singleton peel door (%d survivors) %.0fms' % (rows.size, (_tk9() - _fpa_t0) * 1000), flush=True)
+        _bump_fast()
+        return out9, [wdb_sql._alias(p) for p in proj]
+    try:
+        _peel9 = _singleton_peel_door()
+    except _FastUnsupported:
+        _peel9 = None
+    if _peel9 is not None:
+        return _peel9
     gkeys = []                                           # one per GROUP BY column
     for g in gnodes:
         if not isinstance(g, E.Column):

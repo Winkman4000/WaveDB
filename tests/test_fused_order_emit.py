@@ -72,13 +72,15 @@ def test_limit_without_order():
 # ---- THE EARLY PICK: the k rows are chosen before keys are decoded and the governor is asked ----
 _U = None
 def _unique_fixture():
-    """a near-unique key: every id its own group, so ORDER BY COUNT(*) ASC ties all of them at 1"""
+    """every (u, k) its own group, so ORDER BY COUNT(*) ASC ties all of them at 1 -- but u alone repeats
+    (each value twice, k differing), so no key is near-unique and the singleton peel stays out: these
+    tests are the emit's"""
     global _U
     if _U is not None:
         return _U
     con = duckdb.connect()
     d = os.path.join(tempfile.gettempdir(), 'foeu_%s' % uuid.uuid4().hex[:8]); os.makedirs(d, exist_ok=True)
-    con.execute("CREATE TABLE t AS SELECT i AS id, (i * 7919) % 1000003 AS u, i % 5 AS k, "
+    con.execute("CREATE TABLE t AS SELECT i AS id, (i * 7919) % 150001 AS u, i % 5 AS k, "
                 "((i * 31) % 50) * 1.5 AS amt FROM range(300000) t(i)")
     db = Database.create(d)
     pq = os.path.join(d, 't.parquet')
