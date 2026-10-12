@@ -5953,6 +5953,60 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     present = np.array([0]) if not gkeys else np.nonzero(counts > 0)[0]
     present = _topk_prefilter(tree, proj, col_results, counts, present, gkeys)   # bounded top-K: drop non-winners pre-assembly
 
+    # THE EARLY PICK (2026-10-12): choose the k rows to emit BEFORE the keys are decoded and the
+    # governor is asked. The prefilter keeps every group tied at the cut -- ORDER BY count ASC on a
+    # near-unique key ties millions at 1 -- and decoding them all, then asking the governor about
+    # every one of them as a Python row, cost ~4 s and refused WatchID x ClientIP outright (99,997,489
+    # "rows" for a LIMIT 10). When the order uses no key column (or there is no ORDER BY), the pick
+    # needs only the count/aggregate arrays; with ties at the cut SQL owes any of them.
+    _early9 = False
+    if (not columnar and gkeys and tree.args.get('having') is None and not wdb_sql._offset(tree)
+            and wdb_sql._limit(tree) is not None):
+        _lim_e = int(wdb_sql._limit(tree))
+        _pres_e = np.flatnonzero(present) if present.dtype == bool else present
+        _ne = int(_pres_e.size)
+        _pick_e = None
+        _ord_e = tree.args.get('order')
+        if _ord_e is None:
+            _pick_e = np.arange(min(_lim_e, _ne))
+        else:
+            try:
+                _al_e = [wdb_sql._alias(p) for p in proj]
+                _in_e = [(p.this if isinstance(p, E.Alias) else p).sql() for p in proj]
+                _keys_e = []
+                for oe in _ord_e.expressions:
+                    t_e = oe.this
+                    if isinstance(t_e, E.Literal) and not t_e.is_string:
+                        i_e = int(str(t_e.this)) - 1
+                        if not 0 <= i_e < len(proj):
+                            raise ValueError('ordinal')
+                    else:
+                        s_e = t_e.sql(); n_e = t_e.name if isinstance(t_e, E.Column) else None
+                        i_e = next(j for j in range(len(proj)) if _in_e[j] == s_e or _al_e[j] == n_e)
+                    r_e = col_results[i_e]
+                    if r_e[0] == 'count':
+                        a_e = counts[_pres_e].astype(np.float64)
+                    elif r_e[0] == 'arr' and not r_e[2] and r_e[1].dtype != object:
+                        a_e = r_e[1][_pres_e].astype(np.float64)
+                    else:
+                        raise ValueError('key or object order term')   # the late pick decides
+                    if np.isnan(a_e).any():
+                        raise ValueError('NULL order value')            # null placement: the late pick
+                    _keys_e.append(-a_e if oe.args.get('desc') else a_e)
+                k_e = min(_lim_e, _ne)
+                if len(_keys_e) == 1 and 0 < k_e < _ne:
+                    a_e = _keys_e[0]
+                    part_e = np.argpartition(a_e, k_e - 1)[:k_e]                 # O(groups), not a sort
+                    _pick_e = part_e[np.argsort(a_e[part_e], kind='stable')]
+                else:
+                    _pick_e = np.lexsort(tuple(reversed(_keys_e)))[:k_e]
+            except (StopIteration, ValueError):
+                _pick_e = None
+        if _pick_e is not None:
+            present = _pres_e[_pick_e]
+            _early9 = True
+            global _TOPK_EMIT_HITS; _TOPK_EMIT_HITS += 1
+
     # ---- assemble rows (vectorised) ----
     # Decode every present group's composite code into per-key code arrays in one shot, bulk-decode each key
     # column through its dict, and bulk-pull each aggregate -- then zip columns into row tuples. The old path
@@ -6008,12 +6062,12 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     _ord9 = tree.args.get('order')
     _lim9 = wdb_sql._limit(tree)
     if (_ord9 is None and _lim9 is not None and tree.args.get('having') is None
-            and not wdb_sql._offset(tree) and gkeys):
+            and not wdb_sql._offset(tree) and gkeys and not _early9):
         # LIMIT WITHOUT ORDER BY: SQL owes any k groups -- emit k, not every group (a
         # GROUP BY UserID, SearchPhrase LIMIT 10 paid 17 s of emit for 10 rows)
         _np9 = int(present.sum()) if present.dtype == bool else int(present.size)
         _sel9 = np.arange(min(int(_lim9), _np9))
-    if _ord9 is not None and _lim9 is not None and tree.args.get('having') is None:
+    if _ord9 is not None and _lim9 is not None and tree.args.get('having') is None and not _early9:
         try:
             keys9 = []
             aliases9 = [wdb_sql._alias(p) for p in proj]
@@ -6062,7 +6116,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 print('JOIN BILL: topk-declined %s: %s' % (type(_e9).__name__, str(_e9)[:80]), flush=True)
             _sel9 = None
     if _sel9 is not None:
-        global _TOPK_EMIT_HITS; _TOPK_EMIT_HITS += 1
+        _TOPK_EMIT_HITS += 1
         present = np.flatnonzero(present)[_sel9] if present.dtype == bool else present[_sel9]
         counts_present = counts[present]
         kc_arr = [k9[_sel9] for k9 in kc_arr]
@@ -6096,7 +6150,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     having = tree.args.get('having')
     if having is not None:
         rows = wdb_sql._apply_having(rows, proj, having.this, None)   # fused path must filter too
-    if _sel9 is None:
+    if _sel9 is None and not _early9:
         rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))
         lim = wdb_sql._limit(tree)
         if lim is not None: rows = rows[:lim]

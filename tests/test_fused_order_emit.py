@@ -67,3 +67,52 @@ def test_order_by_count_then_keys_exact():
 
 def test_limit_without_order():
     _check("SELECT a, b, COUNT(*), SUM(amt) FROM t GROUP BY a, b LIMIT 10", None, 10)
+
+
+# ---- THE EARLY PICK: the k rows are chosen before keys are decoded and the governor is asked ----
+_U = None
+def _unique_fixture():
+    """a near-unique key: every id its own group, so ORDER BY COUNT(*) ASC ties all of them at 1"""
+    global _U
+    if _U is not None:
+        return _U
+    con = duckdb.connect()
+    d = os.path.join(tempfile.gettempdir(), 'foeu_%s' % uuid.uuid4().hex[:8]); os.makedirs(d, exist_ok=True)
+    con.execute("CREATE TABLE t AS SELECT i AS id, (i * 7919) % 1000003 AS u, i % 5 AS k, "
+                "((i * 31) % 50) * 1.5 AS amt FROM range(300000) t(i)")
+    db = Database.create(d)
+    pq = os.path.join(d, 't.parquet')
+    con.execute("COPY (SELECT * FROM t ORDER BY id) TO '%s' (FORMAT parquet)" % pq)
+    db.cat.add_table('t', [['id', 'int'], ['u', 'int'], ['k', 'int'], ['amt', 'float']])
+    wdb_encode.encode(pq, os.path.join(d, 't_0.wdb')); db.cat.add_segment('t', 't_0.wdb')
+    _U = (db, con)
+    return _U
+
+
+def test_early_pick_under_a_small_governor_budget():
+    """300K tied groups as Python rows would exceed a 1 MB budget; the 5 rows asked for do not.
+    Before the early pick the governor was asked about every tied group and refused."""
+    db, con = _unique_fixture()
+    q = "SELECT u, k, COUNT(*) AS c, SUM(amt) FROM t GROUP BY u, k ORDER BY c ASC LIMIT 5"
+    old = os.environ.get('WDB_WORK_MB')
+    os.environ['WDB_WORK_MB'] = '1'
+    try:
+        e0 = wdb_join._TOPK_EMIT_HITS
+        got = [tuple(_n(c) for c in r) for r in db.run(q)[0]]
+        assert wdb_join._TOPK_EMIT_HITS == e0 + 1
+    finally:
+        if old is None: os.environ.pop('WDB_WORK_MB', None)
+        else: os.environ['WDB_WORK_MB'] = old
+    full = {(r[0], r[1]): tuple(_n(c) for c in r) for r in
+            con.execute("SELECT u, k, COUNT(*) AS c, SUM(amt) FROM t GROUP BY u, k").fetchall()}
+    assert len(got) == 5 and len({(r[0], r[1]) for r in got}) == 5
+    assert all(full[(r[0], r[1])] == r and r[2] == 1 for r in got), got
+
+
+def test_early_pick_with_a_key_tiebreak_is_exact():
+    """a key in the ORDER BY leaves the pick to the late road (it needs decoded keys): exact order"""
+    db, con = _unique_fixture()
+    q = "SELECT u, k, COUNT(*) AS c FROM t GROUP BY u, k ORDER BY c ASC, u, k LIMIT 7"
+    got = [tuple(r) for r in db.run(q)[0]]
+    want = [tuple(r) for r in con.execute(q).fetchall()]
+    assert got == want, (got, want)
