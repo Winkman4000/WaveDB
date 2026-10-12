@@ -462,6 +462,8 @@ def execute(seg, det, tree):
             _gdc_save(seg, kcol, tcol, counts, keys)     # birth-on-first-touch, gbc-style
             import wdb_shelves
             wdb_shelves.record(seg, 'gdc', k=kcol, t=tcol)
+        if excl_empty and _ecode is not None and _ecode < counts.size:
+            counts = counts.copy(); counts[_ecode] = 0   # WHERE key <> '': the empty group leaves
         lim = wdb_sql._limit(tree)
         present = np.nonzero(counts)[0]
         sel = _top_sel(counts, present, lim)
@@ -502,6 +504,8 @@ def execute(seg, det, tree):
         present = np.nonzero(np.bincount(grp, minlength=gmax))[0]   # NULL has count 0 but still appears
     else:
         present = np.nonzero(counts)[0]                  # no nulls: count>0 exactly when the group occurs
+    if excl_empty and _ecode is not None:                # WHERE key <> '': the empty group leaves
+        present = present[present != _ecode]
     sel = _top_sel(counts, present, lim)
 
     names = [wdb_sql._alias(p) for p in proj]
