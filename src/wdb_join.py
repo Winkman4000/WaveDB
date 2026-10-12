@@ -3576,6 +3576,45 @@ class _FastUnsupported(Exception):
 _FAST_HITS = 0   # diagnostic: how many queries took the gather fast path
 _TOPK_HITS = 0   # diagnostic: how many queries had `present` pruned by the bounded top-K prefilter
 _TOPK_EMIT_HITS = 0   # diagnostic: queries whose emit picked exactly k groups in array space (top-K or LIMIT-only)
+_VETO_HITS = 0        # diagnostic: grouped queries answered empty by the dictionary-range proof
+
+
+_VETO_FLIP = {E.GT: E.LT, E.LT: E.GT, E.GTE: E.LTE, E.LTE: E.GTE, E.EQ: E.EQ, E.NEQ: E.NEQ}
+
+
+def _dict_ends(seg, pcol):
+    """(lowest, highest) stored value of a dictionary-coded numeric/time column as numbers (time in its native
+    unit), from the sorted dictionary's two ends -- two point fetches, nothing decoded. None if not that."""
+    c = seg.cols.get(pcol)
+    if c is None or c.get('mode') not in (0, 1, 2) or c.get('dt') not in (0, 2, 3):
+        return None
+    if seg._overrides(pcol) is not None or seg._override_vals_typed(pcol):
+        return None                                      # updated values may sit outside the stored ends
+    V = int(c['V']) - (1 if c.get('has_null') else 0)
+    if V <= 0:
+        return None
+    lo, hi = seg.fetch(pcol, 0), seg.fetch(pcol, V - 1)
+    if c['dt'] == 3:
+        u = seg.unit(pcol)
+        lo = int(np.datetime64(lo, u).astype(np.int64)); hi = int(np.datetime64(hi, u).astype(np.int64))
+    elif c['dt'] == 2 and (np.isnan(lo) or np.isnan(hi)):
+        return None
+    return lo, hi
+
+
+def _range_verdict(op, lo, hi, lv, has_null):
+    """'false' when no stored value v can make `v op lv` true, 'true' when every one does (and no NULL rows),
+    else None -- the dictionary's ends are the column's exact min and max."""
+    t = f = False
+    if op is E.LT:    f, t = lo >= lv, hi < lv
+    elif op is E.LTE: f, t = lo > lv, hi <= lv
+    elif op is E.GT:  f, t = hi <= lv, lo > lv
+    elif op is E.GTE: f, t = hi < lv, lo >= lv
+    elif op is E.EQ:  f, t = (lv < lo or lv > hi), (lo == hi == lv)
+    elif op is E.NEQ: f, t = (lo == hi == lv), (lv < lo or lv > hi)
+    if f: return 'false'
+    if t and not has_null: return 'true'
+    return None
 _SLICE_SCALAR_HITS = 0   # diagnostic: how many queries took the per-slice scalar agg (cluster-key GROUP BY + predicate)
 def _bump_fast():
     global _FAST_HITS
@@ -4234,6 +4273,67 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             return leaf(col9g, lambda seg, pcol: m9g)
         raise _FastUnsupported
     where = tree.args.get('where')
+    # THE DICTIONARY-RANGE PROOF (2026-10-12): a conjunct no stored value can satisfy -- IsLink < 0 on a 0/1
+    # column -- makes the WHERE empty, so a grouped query has no rows. Proven from each column's sorted
+    # dictionary ends (two point fetches) BEFORE any row is touched: the board's Q36 variant grouped 100M
+    # rows on FlashMinor2 for 9.4 s and then filtered every one out (DuckDB: 0.045 s from its min/max).
+    if where is not None and group is not None and not columnar:
+        def _veto_lit(nd, sg, pc):
+            k9 = 'f' if sg.cols[pc]['dt'] == 2 else 'i'
+            if isinstance(nd, E.Paren): nd = nd.this
+            if not (isinstance(nd, E.Literal) or (isinstance(nd, (E.Neg, E.Cast)) and isinstance(nd.this, E.Literal))):
+                return None
+            try:
+                v9 = wdb_sql._lit_for_col(sg, pc, nd, k9)
+            except Exception:
+                return None
+            return v9 if isinstance(v9, (int, float, np.integer, np.floating)) else None
+        def _veto_col(nd):
+            if isinstance(nd, E.Paren): nd = nd.this
+            if not isinstance(nd, E.Column): return None
+            try:
+                sg, pc, cp = resolve(nd)
+            except _FastUnsupported:
+                return None
+            if cp is not None: return None
+            ends = _dict_ends(sg, pc)
+            return None if ends is None else (sg, pc, ends)
+        def _veto(nd):
+            if isinstance(nd, E.Paren): return _veto(nd.this)
+            if isinstance(nd, E.And): return 'false' if 'false' in (_veto(nd.this), _veto(nd.expression)) else None
+            if type(nd) in _VETO_FLIP:
+                a9, b9 = nd.this, nd.expression; op9 = type(nd)
+                c9 = _veto_col(a9)
+                if c9 is None:
+                    c9 = _veto_col(b9); a9, b9 = b9, a9; op9 = _VETO_FLIP[op9]
+                if c9 is None: return None
+                sg, pc, (lo, hi) = c9
+                lv = _veto_lit(b9, sg, pc)
+                return None if lv is None else _range_verdict(op9, lo, hi, lv, sg.cols[pc].get('has_null'))
+            if isinstance(nd, E.In) and not nd.args.get('query') and nd.args.get('expressions'):
+                c9 = _veto_col(nd.this)
+                if c9 is None: return None
+                sg, pc, (lo, hi) = c9
+                for it in nd.args['expressions']:
+                    lv = _veto_lit(it, sg, pc)
+                    if lv is None or _range_verdict(E.EQ, lo, hi, lv, True) != 'false': return None
+                return 'false'
+            if isinstance(nd, E.Between):
+                c9 = _veto_col(nd.this)
+                if c9 is None: return None
+                sg, pc, (lo, hi) = c9
+                l9 = _veto_lit(nd.args.get('low'), sg, pc); h9 = _veto_lit(nd.args.get('high'), sg, pc)
+                if l9 is None or h9 is None: return None
+                return 'false' if (hi < l9 or lo > h9 or l9 > h9) else None
+            return None
+        try:
+            _empty9 = _veto(where.this) == 'false'
+        except Exception:
+            _empty9 = False
+        if _empty9:
+            global _VETO_HITS; _VETO_HITS += 1
+            _bump_fast()
+            return [], [wdb_sql._alias(p) for p in proj]
     _maskc = {}
     def get_mask():                # materialise the WHERE bool mask lazily -- only non-fused paths need it
         if _where_spent:
