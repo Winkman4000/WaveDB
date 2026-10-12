@@ -256,15 +256,20 @@ def _exact_scalar(db, tree):
 
 
 def _sum_overflow_gate(db, tree):
-    """Raise _FastUnsupported when a SUM/AVG argument is a dict-int column whose extremes
-    times N could exceed 2^53: the fused engine accumulates float64, which drifts there
-    (SUM(UserID) at 100M: ~1e13 absolute error). Falling through reaches wherescan's
-    exact two-limb fold. Extremes cost two point-fetches on the value-ordered dict."""
-    risky = []
+    """Raise _FastUnsupported when the fused engine's float64 accumulators would round an
+    integer answer: a SUM/AVG over a dict-int column whose extremes times N could exceed 2^53
+    (SUM(UserID) at 100M: ~1e13 absolute error), or a MIN/MAX over one whose extremes
+    themselves pass 2^53 (MIN(URLHash) WHERE ... came back with its last three digits rounded;
+    the shifting board, 2026-10-12). Falling through reaches the exact paths (wherescan's
+    two-limb fold). Extremes cost two point-fetches on the value-ordered dict."""
+    risky = []                                        # (column, scaled by N?)
     for p in tree.expressions:
         ak = wdb_sql._agg_kind(p)
-        if ak and ak[0] in ('SUM', 'AVG') and isinstance(ak[1], str):
-            risky.append(ak[1])
+        if ak and len(ak) > 1 and isinstance(ak[1], str):     # COUNT(*) is a 1-tuple
+            if ak[0] in ('SUM', 'AVG'):
+                risky.append((ak[1], True))
+            elif ak[0] in ('MIN', 'MAX'):
+                risky.append((ak[1], False))
     if not risky:
         return
     frm = tree.find(E.From)
@@ -277,7 +282,7 @@ def _sum_overflow_gate(db, tree):
     if len(paths) != 1:
         return
     seg = db.open_segment(paths[0], frm.this.name)
-    for col in risky:
+    for col, scaled in risky:
         c = seg.cols.get(col)
         if c is None or c.get('mode') not in (0, 1, 2) or c.get('dt') != 0:
             continue
@@ -288,7 +293,7 @@ def _sum_overflow_gate(db, tree):
             lov = int(seg.fetch(col, 0)); hiv = int(seg.fetch(col, nd - 1))
         except Exception:
             continue
-        if max(abs(lov), abs(hiv)) * max(int(seg.N), 1) >= (1 << 53):
+        if max(abs(lov), abs(hiv)) * (max(int(seg.N), 1) if scaled else 1) >= (1 << 53):
             raise _FastUnsupported
 
 
@@ -3554,6 +3559,7 @@ class _FastUnsupported(Exception):
 
 _FAST_HITS = 0   # diagnostic: how many queries took the gather fast path
 _TOPK_HITS = 0   # diagnostic: how many queries had `present` pruned by the bounded top-K prefilter
+_TOPK_EMIT_HITS = 0   # diagnostic: queries whose emit picked exactly k groups in array space (top-K or LIMIT-only)
 _SLICE_SCALAR_HITS = 0   # diagnostic: how many queries took the per-slice scalar agg (cluster-key GROUP BY + predicate)
 def _bump_fast():
     global _FAST_HITS
@@ -6002,16 +6008,39 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     _sel9 = None
     _ord9 = tree.args.get('order')
     _lim9 = wdb_sql._limit(tree)
+    if (_ord9 is None and _lim9 is not None and tree.args.get('having') is None
+            and not wdb_sql._offset(tree) and gkeys):
+        # LIMIT WITHOUT ORDER BY: SQL owes any k groups -- emit k, not every group (a
+        # GROUP BY UserID, SearchPhrase LIMIT 10 paid 17 s of emit for 10 rows)
+        _np9 = int(present.sum()) if present.dtype == bool else int(present.size)
+        _sel9 = np.arange(min(int(_lim9), _np9))
     if _ord9 is not None and _lim9 is not None and tree.args.get('having') is None:
         try:
             keys9 = []
             aliases9 = [wdb_sql._alias(p) for p in proj]
+            inner9 = [(p.this if isinstance(p, E.Alias) else p).sql() for p in proj]
+
+            def _order_index(tgt):
+                # THE SAME MATCH RULE AS wdb_sql._apply_order (so both roads pick the same
+                # column): an ordinal, else the first projection whose expression IS the term
+                # or whose alias is the term's bare name. Matching by .name alone missed every
+                # aggregate term -- COUNT(*) and MAX(x) have names '*' and '' -- and sent all
+                # groups to the slow sort (the shifting board's ORDER BY COUNT(*) ASC cliffs)
+                if isinstance(tgt, E.Literal) and not tgt.is_string:
+                    k9 = int(str(tgt.this))
+                    if 1 <= k9 <= len(proj):
+                        return k9 - 1
+                    raise ValueError('ordinal %d out of range' % k9)
+                s9 = tgt.sql()
+                n9 = tgt.name if isinstance(tgt, E.Column) else None
+                for j9 in range(len(proj)):
+                    if inner9[j9] == s9 or aliases9[j9] == n9:
+                        return j9
+                raise ValueError('order term %r not in %r' % (s9, aliases9))
             for oe in _ord9.expressions:
                 tgt = oe.this
-                nm9 = tgt.name if hasattr(tgt, 'name') else str(tgt)
-                if nm9 not in aliases9:
-                    raise ValueError('order term %r not in %r' % (nm9, aliases9))
-                i9 = aliases9.index(nm9)
+                i9 = _order_index(tgt)
+                nm9 = aliases9[i9]
                 r9 = col_results[i9]
                 if r9[0] == 'count':
                     a9 = counts[present].astype(np.float64)
@@ -6034,6 +6063,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 print('JOIN BILL: topk-declined %s: %s' % (type(_e9).__name__, str(_e9)[:80]), flush=True)
             _sel9 = None
     if _sel9 is not None:
+        global _TOPK_EMIT_HITS; _TOPK_EMIT_HITS += 1
         present = np.flatnonzero(present)[_sel9] if present.dtype == bool else present[_sel9]
         counts_present = counts[present]
         kc_arr = [k9[_sel9] for k9 in kc_arr]

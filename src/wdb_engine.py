@@ -2879,6 +2879,22 @@ class Segment:
         if enc_r in (5, 6):
             return self._raw_codes(nm)[lo:hi]    # bucket tags: the range reader predates them;
                                                  # the cached full decode is exact and 54ms-class
+        if enc_r == 17:
+            # RAW PACKED CODES had no branch here and fell to the bit-packed reader below, which
+            # reads another layout: every window of Age and WindowClientWidth came back scrambled
+            # (WHERE WindowClientWidth = 1863 counted 123,662 rows of 1,985,884; the shifting
+            # board, 2026-10-12). The cached decode if present; a small window gathers its rows;
+            # a wide one unpacks the column once.
+            if nm in self._codes or hi - lo >= (1 << 16):
+                return self._raw_codes(nm)[lo:hi]
+            if lo >= hi:
+                return np.empty(0, dtype=np.int64)
+            c17 = self.cols[nm]
+            import wdb_kernels as _WK17r
+            out17 = np.empty(hi - lo, dtype=np.int64)
+            _WK17r.pk_gather(np.asarray(self.buf[c17['cstart']:c17['cstart'] + c17['czlen']]),
+                             c17['pk_bits'], np.arange(lo, hi, dtype=np.int64), out17)
+            return out17
         if lo >= hi:
             return np.empty(0, dtype=np.int64)
         c = self.cols[nm]
