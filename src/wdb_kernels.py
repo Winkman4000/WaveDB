@@ -2704,6 +2704,296 @@ def _gd_pass2_count_nb(ku, kr, offs, SH, VR, T):
     return total
 
 
+def gd_dense(grp, tgt, KV, VT, tnull):
+    """THE Q13 BOARD'S DENSE LANE (2026-10-13): per-group COUNT(DISTINCT target) when the (group x
+    target) cell table is small -- per-thread presence boards (T x KV x VT bytes), filled in one
+    parallel pass, OR-reduced and counted per group. Returns (distinct counts, rows per group); a
+    null target (tnull >= 0) marks the group present without counting."""
+    return _gd_dense_nb(grp, tgt, np.int64(KV), np.int64(VT), np.int64(tnull), _nt())
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _gd_dense_nb(grp, tgt, KV, VT, tnull, T):
+    n = grp.shape[0]
+    cells = KV * VT
+    # each thread's board and row counts padded to whole cache lines: a 2 x 2 table packed (T, 4) put
+    # every thread's writes on one line (JavaEnable x a binary D: 1.5 s of false sharing)
+    PB = ((cells + 127) // 64) * 64
+    PR = ((KV + 15) // 8) * 8
+    board = np.zeros((T, PB), np.uint8)
+    rows = np.zeros((T, PR), np.int64)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        bt = board[t]
+        rt = rows[t]
+        for i in range(lo, hi):
+            g = np.int64(grp[i])
+            rt[g] += 1
+            v = np.int64(tgt[i])
+            if v != tnull:
+                bt[g * VT + v] = 1
+    merged = np.zeros(cells, np.uint8)               # OR the boards: cells split across threads
+    for t in prange(T):
+        lo = t * cells // T
+        hi = (t + 1) * cells // T
+        for s in range(T):
+            for c in range(lo, hi):
+                merged[c] |= board[s, c]
+    dist = np.zeros(KV, np.int64)
+    present = np.zeros(KV, np.int64)
+    for g in range(KV):
+        c = 0
+        for v in range(g * VT, (g + 1) * VT):
+            c += merged[v]
+        dist[g] = c
+        r = 0
+        for t in range(T):
+            r += rows[t, g]
+        present[g] = r
+    return dist, present
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def gd_pass1_skip(uc, rc, SH, T, skip):
+    """gd_pass1 for the key lanes, with the rows of one key code left out (WHERE key <> literal): the
+    filtered group never reaches pass 2 -- left in, it is ONE bucket on ONE thread (ResponseEndTiming's
+    0 is 75% of the rows). skip < 0 keeps every row."""
+    n = uc.size
+    NB = 1 << 12
+    pc = np.zeros((T, NB), np.int64)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        for i in range(lo, hi):
+            u = np.int64(uc[i])
+            if u != skip:
+                pc[t, u >> SH] += 1
+    offs = np.zeros(NB + 1, np.int64)
+    for b in range(NB):
+        s = 0
+        for t in range(T):
+            v = pc[t, b]
+            pc[t, b] = s
+            s += v
+        offs[b + 1] = offs[b] + s
+    m = offs[NB]
+    ku = np.empty(m, np.uint32)
+    kr = np.empty(m, np.uint32)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        cur = np.empty(NB, np.int64)
+        for b in range(NB):
+            cur[b] = offs[b] + pc[t, b]
+        for i in range(lo, hi):
+            u = np.int64(uc[i])
+            if u == skip:
+                continue
+            b = u >> SH
+            p = cur[b]
+            ku[p] = uc[i]
+            kr[p] = rc[i]
+            cur[b] = p + 1
+    return ku, kr, offs
+
+
+def gd_bucket_order(offs, T):
+    """Nonempty buckets, biggest first, dealt round-robin: thread t takes order[t::T]. A static split of
+    the 4096 bucket ids leaves every row of a small key space (RegionID's ~9K codes land in buckets
+    0..9039>>SH) on the first few threads."""
+    sizes = np.diff(offs)
+    nz = np.flatnonzero(sizes)
+    return np.ascontiguousarray(nz[np.argsort(-sizes[nz], kind='stable')].astype(np.int64))
+
+
+def gd_keymark(ku, kr, offs, SH, KV, VT, tnull, mark=True):
+    """THE Q13 BOARD'S KEY LANES (2026-10-13), pass 2 after gd_pass1 scattered rows by the GROUP code's
+    top bits: per bucket, a counting scatter by the low bits puts each group's rows together, then each
+    group's distinct targets are counted --
+      mark=True  (KEYMARK): one walk with a per-thread marker table over the TARGET space (marker = the
+                 group code, so it never needs clearing): linear, no sort; the target space must fit T
+                 marker tables (the caller's gate);
+      mark=False (KEYSORT): sort each group's own run (insertion sort when short): no table at all, for
+                 a target space too wide to mark (WatchID, UserID as the counted column).
+    -1 = group absent."""
+    order = gd_bucket_order(offs, int(wide_threads()))
+    return run_wide(_gd_keymark_nb, ku, kr, offs, order, np.int64(SH), np.int64(KV), np.int64(VT),
+                    np.int64(tnull), np.int64(1 if mark else 0), pass_t=True)
+
+
+@njit(nogil=True, cache=True)
+def _gd_run_distinct(lr, a, z, tnull):
+    """distinct non-null values in lr[a:z], sorting that run in place"""
+    n = z - a
+    if n <= 32:
+        for i in range(a + 1, z):
+            x = lr[i]
+            j = i - 1
+            while j >= a and lr[j] > x:
+                lr[j + 1] = lr[j]
+                j -= 1
+            lr[j + 1] = x
+    else:
+        lr[a:z].sort()
+    c = 0
+    prev = np.int64(-2)
+    for i in range(a, z):
+        v = lr[i]
+        if v != prev:
+            if v != tnull:
+                c += 1
+            prev = v
+    return c
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _gd_keymark_nb(ku, kr, offs, order, SH, KV, VT, tnull, mark, T):
+    LOW = np.int64(1) << SH
+    out = np.full(KV, -1, np.int32)
+    for t in prange(T):
+        seen = np.full(VT if mark else 1, -1, np.int32)
+        cnt = np.zeros(LOW + 1, np.int64)
+        for j in range(t, order.size, T):
+            b = order[j]
+            lo = offs[b]
+            hi = offs[b + 1]
+            if SH == 0:                              # one group per bucket: walk it as it lies
+                g = np.int64(ku[lo])
+                if mark:
+                    c = 0
+                    for i in range(lo, hi):
+                        v = np.int64(kr[i])
+                        if v != tnull and seen[v] != g:
+                            seen[v] = g
+                            c += 1
+                else:
+                    lr = np.empty(hi - lo, np.int64)
+                    for i in range(lo, hi):
+                        lr[i - lo] = np.int64(kr[i])
+                    c = _gd_run_distinct(lr, 0, hi - lo, tnull)
+                out[g] = c
+                continue
+            for u in range(LOW + 1):
+                cnt[u] = 0
+            for i in range(lo, hi):
+                cnt[(np.int64(ku[i]) & (LOW - 1)) + 1] += 1
+            for u in range(LOW):
+                cnt[u + 1] += cnt[u]
+            lr = np.empty(hi - lo, np.int64)
+            cur = cnt[:LOW].copy()
+            for i in range(lo, hi):
+                u = np.int64(ku[i]) & (LOW - 1)
+                lr[cur[u]] = np.int64(kr[i])
+                cur[u] += 1
+            for u in range(LOW):
+                a = cnt[u]
+                z = cnt[u + 1]
+                if z <= a:
+                    continue
+                g = (b << SH) | u
+                if mark:
+                    c = 0
+                    for i in range(a, z):
+                        v = lr[i]
+                        if v != tnull and seen[v] != g:
+                            seen[v] = g
+                            c += 1
+                else:
+                    c = _gd_run_distinct(lr, a, z, tnull)
+                out[g] = c
+    return out
+
+
+def gd_topk(runs, ecode, k):
+    """THE PICK over a per-group count array (-1 = absent): the k groups by count descending, code
+    ascending -- exactly the full sort's first k -- without the full sort, the 100M-wide nonzero /
+    maximum / partition passes a near-unique key paid (WatchID: ~1 s of numpy). One parallel census of
+    the counts finds the k-th count; one walk in code order takes everything above it and the
+    lowest codes on it. None when the counts are too tall for a census (the caller sorts)."""
+    T = int(_nt())
+    mx = _gd_max_nb(runs, np.int64(ecode), np.int64(T))
+    if mx < 0:
+        return np.empty(0, np.int64)
+    if mx > (1 << 22):
+        return None
+    hist = _gd_hist_nb(runs, np.int64(ecode), np.int64(mx), np.int64(T))
+    need = int(k)
+    kth = int(mx)
+    above = 0
+    while kth > 0 and above + int(hist[kth]) < need:
+        above += int(hist[kth]); kth -= 1
+    if kth == 0 and above + int(hist[0]) < need:
+        kth = 0
+    return _gd_pick_nb(runs, np.int64(ecode), np.int64(kth), np.int64(need - above), np.int64(need))
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _gd_max_nb(runs, ecode, T):
+    n = runs.size
+    part = np.full(T, -1, np.int64)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        m = np.int64(-1)
+        for i in range(lo, hi):
+            v = np.int64(runs[i])
+            if v > m and i != ecode:
+                m = v
+        part[t] = m
+    return part.max()
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _gd_hist_nb(runs, ecode, mx, T):
+    n = runs.size
+    W = mx + 1 + 16
+    part = np.zeros((T, W), np.int64)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        for i in range(lo, hi):
+            v = np.int64(runs[i])
+            if v >= 0 and i != ecode:
+                part[t, v] += 1
+    out = np.zeros(mx + 1, np.int64)
+    for v in range(mx + 1):
+        s = 0
+        for t in range(T):
+            s += part[t, v]
+        out[v] = s
+    return out
+
+
+@njit(nogil=True, cache=True)
+def _gd_pick_nb(runs, ecode, kth, on, k):
+    """Codes with count > kth (all of them), then the lowest codes with count == kth (on of them),
+    ordered count descending, code ascending."""
+    hi_c = np.empty(k, np.int64)
+    hi_v = np.empty(k, np.int64)
+    nh = 0
+    eq = np.empty(max(on, 0), np.int64)
+    ne = 0
+    for i in range(runs.size):
+        v = np.int64(runs[i])
+        if v < 0 or i == ecode:
+            continue
+        if v > kth:
+            hi_c[nh] = i
+            hi_v[nh] = v
+            nh += 1
+        elif v == kth and ne < on:
+            eq[ne] = i
+            ne += 1
+    o = np.argsort(-hi_v[:nh], kind='mergesort')       # stable: codes stay ascending within a count
+    out = np.empty(nh + ne, np.int64)
+    for j in range(nh):
+        out[j] = hi_c[o[j]]
+    for j in range(ne):
+        out[nh + j] = eq[j]
+    return out
+
+
 def grid2_count(c1, c2, fc, lit, V2, K):
     return _grid2_count_nb(c1, c2, fc, lit, V2, K, _nt())
 

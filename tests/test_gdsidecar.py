@@ -183,10 +183,14 @@ def test_filter_on_nongroup_column_declines_serve():
     assert _norm(r) == _duck(QF_OTHER)                           # answer still exact via the fallback path
 
 
-def test_walk_path_still_rejects_where():
+def test_walk_path_where_contract():
+    """The walk serves `key <> literal` itself (the Q13 board, 2026-10-13: was `key <> ''` only) and
+    still declines every other group filter, which only the sidecar opt-in lets through."""
     db, _ = _fixture()
     seg = db.open_segment(db.cat.segment_paths('t')[0], 't')
-    tree = __import__('wdb_db')._parse_sql_cached(QF_NEQ)
-    assert gd.try_groupdistinct(seg, tree, None) is None         # walk contract unchanged: declines WHERE
-    assert gd.detect(seg, tree, None) is None                    # default gate still rejects WHERE
-    assert gd.detect(seg, tree, None, _allow_group_filter=True) is not None  # sidecar opt-in lets it through
+    P = __import__('wdb_db')._parse_sql_cached
+    got = gd.try_groupdistinct(seg, P(QF_NEQ), None)
+    assert got is not None and _norm(got[0]) == _duck(QF_NEQ)   # one group leaves at emission, exactly
+    for q in (QF_EQ, QF_IN, QF_NIN, QF_AND):
+        assert gd.detect(seg, P(q), None) is None, q             # default gate still rejects these WHEREs
+        assert gd.detect(seg, P(q), None, _allow_group_filter=True) is not None, q  # sidecar opt-in

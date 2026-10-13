@@ -26,6 +26,9 @@ import wdb_policies as P
 E = wdb_sql.E
 
 _HITS = 0   # telemetry: queries answered by the group-distinct kernel
+LANES = {}  # telemetry: lane -> answers (dense / scatter / keymark / keysort / None = numpy)
+DENSE_CELLS = 1 << 22   # dense lane: (groups x targets) cells; per-thread boards cost T x cells bytes
+MARK_MAX = 1 << 22      # key-mark lane: target space; per-thread marker tables cost T x targets x 4 bytes
 
 try:
     from numba import njit
@@ -263,6 +266,68 @@ def birth_gdc(seg, kcol, tcol):
     return True
 
 
+def _is_literal(node):
+    """A plain literal, a negated number, or a typed literal (DATE '...', CAST('...' AS ...))."""
+    if isinstance(node, E.Literal):
+        return True
+    if isinstance(node, E.Neg):
+        return isinstance(node.this, E.Literal) and not node.this.is_string
+    if isinstance(node, E.Cast):
+        return isinstance(node.this, E.Literal)
+    return False
+
+
+def _excl_code(seg, kcol, lit):
+    """The group code a `key <> literal` filter removes, or None when no row holds that value (then
+    the filter removes nothing). Resolved through the column's own dictionary, then decoded back and
+    compared, so a literal that only converts near the value never removes a neighbouring group."""
+    import wdb_wherescan as _WS
+    c = seg.cols[kcol]
+    kind = 'f' if c.get('dt') == 2 else 'i'
+    try:
+        val = wdb_sql._lit_for_col(seg, kcol, lit, kind)
+    except Exception:
+        return None
+    if isinstance(val, float) and c.get('dt') != 2:
+        if val != int(val):
+            return None                                  # 3.5 against an integer column: no row equals it
+        val = int(val)
+    def num(v):
+        if isinstance(v, np.datetime64):
+            return int(v.astype('datetime64[%s]' % seg.unit(kcol)).astype(np.int64))
+        return v
+    try:
+        if c.get('mode') != 2 and c.get('dt') in (0, 2, 3) and not isinstance(val, (bytes, bytearray)):
+            # a small numeric or time dictionary: bisect it by point fetches (wherescan's _code_of reads a
+            # mode-0 time dictionary as text)
+            lo, hi = 0, int(c['V']) - (1 if c.get('has_null') else 0) - 1
+            code = None
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                fv = num(seg.fetch(kcol, mid))
+                if fv == val:
+                    code = mid
+                    break
+                if fv < val:
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+        else:
+            code = _WS._code_of(seg, kcol, val)
+    except Exception:
+        return None
+    if code is None:
+        return None
+    back = num(seg.fetch(kcol, int(code)))
+    if isinstance(val, (bytes, bytearray)):
+        back = back if isinstance(back, (bytes, bytearray)) else str(back).encode()
+        return int(code) if bytes(back) == bytes(val) else None
+    try:
+        return int(code) if back == val or int(back) == int(val) else None
+    except (TypeError, ValueError):
+        return None
+
+
 def detect(seg, tree, col_map, _allow_group_filter=False):
     """Shape gate shared by the live walk and the materialized sidecar. Returns
     (kcol, tcol, ci, ki, proj) for a `GROUP BY key, COUNT(DISTINCT target)` query inside v1 scope,
@@ -272,20 +337,22 @@ def detect(seg, tree, col_map, _allow_group_filter=False):
     if not P.no_joins(tree):           return None
     if not P.no_select_distinct(tree): return None
     if not P.no_having(tree):          return None
-    excl_empty = False
+    excl = None
     if not P.no_where(tree):
         w9 = tree.args.get('where')
         n9 = w9.this if w9 is not None else None
         gx = tree.args.get('group')
+        # WHERE key <> <any literal> (THE Q13 BOARD, 2026-10-13: was key <> '' only -- ClickBench's own
+        # literal): the filter names only the group key, so the other groups' counts are untouched and
+        # the one group whose value it names leaves at emission
         if (isinstance(n9, E.NEQ) and isinstance(n9.this, E.Column)
                 and gx is not None and len(gx.expressions) == 1
                 and isinstance(gx.expressions[0], E.Column)
                 and n9.this.name == gx.expressions[0].name
-                and isinstance(n9.expression, E.Literal)
-                and str(n9.expression.this) == ''):
-            excl_empty = True    # filter names only the group key: other
-        elif not _allow_group_filter:    # groups' counts untouched; mask
-            return None                  # one group at emission
+                and _is_literal(n9.expression)):
+            excl = n9.expression
+        elif not _allow_group_filter:
+            return None
 
     if not P.single_group_key(tree):   return None
     group = tree.args.get('group')
@@ -313,22 +380,17 @@ def detect(seg, tree, col_map, _allow_group_filter=False):
     if not P.columns_exist(seg, kcol, tcol): return None
     if not P.no_deleted_rows(seg):           return None
     if not P.key_not_nullable(seg, kcol):    return None
-    return kcol, tcol, ci, ki, proj, excl_empty
+    return kcol, tcol, ci, ki, proj, excl
 
 
 def execute(seg, det, tree):
     """THE READ: per-group COUNT(DISTINCT) via one code-hash walk. May decline (None) on
     measured conditions (mismatched lengths, pack overflow)."""
     global _HITS
-    kcol, tcol, ci, ki, proj, excl_empty = det
-    _ecode = None
-    if excl_empty:
-        import wdb_wherescan as _WS
-        _e0 = _WS._code_of(seg, kcol, '')
-        if _e0 is None:
-            excl_empty = False
-        else:
-            _ecode = int(_e0)
+    kcol, tcol, ci, ki, proj, excl = det
+    _ecode = _excl_code(seg, kcol, excl) if excl is not None else None
+    excl_empty = (_ecode is not None and isinstance(excl, E.Literal) and excl.is_string
+                  and str(excl.this) == '')      # the shelf's own cut: it only ever stored that one
 
 
     # THE SHELF FIRST: an unfiltered per-group distinct count is a stored fact.
@@ -372,7 +434,8 @@ def execute(seg, det, tree):
 
     kc9 = seg.cols.get(kcol)
     if (kc9 is not None and kc9.get('code_enc') in (8, 9) and hasattr(seg, 'e8_planes')
-            and P.no_deleted_rows(seg) and excl_empty):
+            and P.no_deleted_rows(seg) and _ecode is not None
+            and _ecode == int(kc9.get('e8d' if kc9.get('code_enc') == 8 else 'e9d', -1))):
         # the planes hold only NON-default rows: this branch serves solely the
         # filtered shape (the default group is exactly what the filter removes)
         # BIG-KEY BRANCH (Q13's shape): sparse planes hand non-default rows;
@@ -404,7 +467,7 @@ def execute(seg, det, tree):
             import wdb_shelves
             wdb_shelves.record(seg, 'gdc2', k=kcol, t=tcol)
             counts = dcounts
-            if excl_empty and _ecode is not None and _ecode < counts.size:
+            if _ecode is not None and _ecode < counts.size:
                 counts = counts.copy(); counts[_ecode] = 0
             lim = wdb_sql._limit(tree)
             present = np.nonzero(counts)[0]
@@ -432,11 +495,18 @@ def execute(seg, det, tree):
                 dec = np.asarray(_WN._int_table(seg, col), dtype=np.int64)
             return np.ascontiguousarray(np.asarray(seg._raw_codes(col))), -1, dec
         return _ids(seg, col)
-    kinfo = _codes_or_ids(kcol)
-    tinfo = _codes_or_ids(tcol)
-    if kinfo is None or tinfo is None:
+    kc0 = seg.cols.get(kcol)
+    if kc0 is None or kc0.get('mode') not in (0, 1, 2) or kc0.get('has_null'):
         return None
-    grp, _knull, kdecode = kinfo
+    if _ecode is not None and int(kc0['V']) == 1:
+        _HITS += 1                                       # the key holds one value and the filter removes it
+        return [], [wdb_sql._alias(p) for p in proj]
+    # the key is its code, decoded at emission for the winners only (_bulk_keyvals: typed -- a time key
+    # emits as a time -- and point-fetched from a big dictionary)
+    grp = np.ascontiguousarray(np.asarray(seg._raw_codes(kcol)))
+    tinfo = _codes_or_ids(tcol)
+    if tinfo is None:
+        return None
     tgt, tnull, _tdecode = tinfo
     if grp.shape[0] != tgt.shape[0]:
         return None
@@ -445,79 +515,98 @@ def execute(seg, det, tree):
     # big target space -> MSD 2-pass scatter groups rows by target, then an
     # L1-resident marker table counts each target's first touch of every key.
     # Measured on a-cd-grp: 2.4s walk -> ~0.65s, exact. All transient: cold-truth.
+    if N and (int(grp.min()) < 0):
+        return None                                      # group ids are codes or bare values >= 0 here
+    if N and tgt.dtype.kind == 'i' and int(tgt.min()) < 0:
+        lo9 = int(tgt.min())                             # raw-value targets below zero: distinctness is all
+        tgt = tgt.astype(np.int64) - lo9                 # that matters, so shift them onto >= 0
+        tnull = tnull - lo9 if tnull >= 0 else -1
     VRk = int(grp.max()) + 1 if N else 0
     VTt = int(tgt.max()) + 1 if N else 0
-    if (tnull < 0 and N > 4_000_000 and 0 < VRk <= 262_144 and VTt > 65_536):
-        import wdb_kernels as _WK
-        SH = max(1, VTt.bit_length() - 12)
-        ku, kr, offs = _WK.gd_pass1(np.ascontiguousarray(tgt),
-                                    np.ascontiguousarray(grp),
-                                    np.int64(SH), np.int64(8))
-        counts = _WK.gd_pass2_count(ku, kr, offs, np.int64(SH), np.int64(VRk))
-        if P.no_where(tree) and P.no_deleted_rows(seg):
-            keys = [wdb_sql._pyval(kdecode[g] if kdecode is not None else np.int64(g))
-                    for g in range(VRk)]
-            keys = [k.decode('utf-8', 'replace') if isinstance(k, (bytes, bytearray)) else k
-                    for k in keys]
-            _gdc_save(seg, kcol, tcol, counts, keys)     # birth-on-first-touch, gbc-style
-            import wdb_shelves
-            wdb_shelves.record(seg, 'gdc', k=kcol, t=tcol)
-        if excl_empty and _ecode is not None and _ecode < counts.size:
-            counts = counts.copy(); counts[_ecode] = 0   # WHERE key <> '': the empty group leaves
-        lim = wdb_sql._limit(tree)
-        present = np.nonzero(counts)[0]
-        sel = _top_sel(counts, present, lim)
-        names = [wdb_sql._alias(p) for p in proj]
-        rows = []
-        for gid in sel.tolist():
-            row = [None, None]
-            row[ki] = wdb_sql._pyval(kdecode[gid] if kdecode is not None else np.int64(gid))
-            row[ci] = int(counts[gid])
-            rows.append(tuple(row))
-        rows = workers.finalize(rows, proj, tree.args.get('order'), lim)
-        _HITS += 1
-        return rows, names
+    names = [wdb_sql._alias(p) for p in proj]
     if N == 0:
         _HITS += 1
-        return [], [wdb_sql._alias(p) for p in proj]
-
-    k = int(tgt.max()) + 1
-    gmax = int(grp.max()) + 1
-    if gmax * k >= (1 << 62):                            # pack would overflow int64 -> decline
-        return None
-
+        return [], names
+    import wdb_kernels as _WK
+    # THE Q13 BOARD'S LANES (2026-10-13): the walk is chosen by the two columns' profiles --
+    #   DENSE   (groups x targets) cells small: per-thread presence boards, one parallel pass;
+    #   SCATTER few groups, a big target space: MSD by target + a group marker table (Q8/Q9's lane);
+    #   KEYMARK the target space fits a per-thread marker table: MSD by group, one linear marker walk;
+    #   KEYSORT anything else: MSD by group, each group's own run sorted (no table at all).
+    # Every lane is exact; a group whose targets are all NULL is present with count 0.
+    lane = None
     if _HAVE_NUMBA:
-        # (measured, 2026-07: a group-major scatter + epoch-stamp board was tried here
-        # and reverted -- it pays the same board-sized cache misses as the hash probe
-        # PLUS two full-N gathers the walk never needs. The walk runs in raw order and
-        # is near single-thread optimal; beating duck's 0.4s needs parallel kernels.)
-        capbits = max(20, min(28, int(np.ceil(np.log2(max(N, 2)))) + 1))
-        counts = _walk(grp, tgt, np.int64(k), gmax, np.int64(tnull), capbits)
+        if VRk * VTt <= DENSE_CELLS:
+            lane = 'dense'
+        elif tnull < 0 and N > 4_000_000 and VRk <= 262_144 and VTt > 65_536:
+            lane = 'scatter'
+        elif VTt <= MARK_MAX and VRk < (1 << 31):
+            lane = 'keymark'
+        elif VRk < (1 << 31) and VTt < (1 << 32):
+            lane = 'keysort'
+    LANES[lane] = LANES.get(lane, 0) + 1
+    if lane == 'dense':
+        counts, rowsper = _WK.gd_dense(np.ascontiguousarray(grp), np.ascontiguousarray(tgt), VRk, VTt, tnull)
+        present = np.flatnonzero(rowsper)
+    elif lane == 'scatter':
+        # THE SCATTER LANE (Jackson's reorganization): MSD 2-pass scatter groups rows by target, then an
+        # L1-resident marker table counts each target's first touch of every key (a-cd-grp 2.4 s -> 0.65 s)
+        SH = max(1, VTt.bit_length() - 12)
+        ku, kr, offs = _WK.gd_pass1(np.ascontiguousarray(tgt), np.ascontiguousarray(grp),
+                                    np.int64(SH), np.int64(8))
+        counts = _WK.gd_pass2_count(ku, kr, offs, np.int64(SH), np.int64(VRk))
+        del ku, kr
+        if P.no_where(tree) and P.no_deleted_rows(seg):
+            import wdb_sidecar as _wsc9, os as _os9
+            if _wsc9.births_on(_os9.path.dirname(seg.path)):
+                keys = _keyvals(seg, kcol, np.arange(VRk, dtype=np.int64))
+                _gdc_save(seg, kcol, tcol, counts, keys)  # birth-on-first-touch, gbc-style (switch-gated)
+            import wdb_shelves
+            wdb_shelves.record(seg, 'gdc', k=kcol, t=tcol)
+        present = np.flatnonzero(counts)                 # no nulls on this lane: count > 0 iff the group occurs
+    elif lane in ('keymark', 'keysort'):
+        SH = max(0, VRk.bit_length() - 12)
+        ku, kr, offs = _WK.gd_pass1_skip(np.ascontiguousarray(grp), np.ascontiguousarray(tgt),
+                                         np.int64(SH), np.int64(8), np.int64(-1 if _ecode is None else _ecode))
+        runs = _WK.gd_keymark(ku, kr, offs, SH, VRk, VTt, tnull, mark=(lane == 'keymark'))
+        del ku, kr
     else:
+        if VRk * VTt >= (1 << 62):                       # pack would overflow int64 -> decline
+            return None
         keep = (tgt != tnull) if tnull >= 0 else slice(None)
-        key = grp[keep].astype(np.int64) * k + tgt[keep].astype(np.int64)
+        key = grp[keep].astype(np.int64) * VTt + tgt[keep].astype(np.int64)
         uq = np.unique(key)
-        counts = np.bincount((uq // k).astype(np.int64), minlength=gmax)
-
+        counts = np.bincount((uq // VTt).astype(np.int64), minlength=VRk)
+        present = np.flatnonzero(np.bincount(grp, minlength=VRk))
     lim = wdb_sql._limit(tree)
-    if tnull >= 0:                                       # nullable target: a group whose targets are all
-        present = np.nonzero(np.bincount(grp, minlength=gmax))[0]   # NULL has count 0 but still appears
-    else:
-        present = np.nonzero(counts)[0]                  # no nulls: count>0 exactly when the group occurs
-    if excl_empty and _ecode is not None:                # WHERE key <> '': the empty group leaves
-        present = present[present != _ecode]
-    sel = _top_sel(counts, present, lim)
-
-    names = [wdb_sql._alias(p) for p in proj]
+    sel = None
+    if lane in ('keymark', 'keysort'):                   # per-group counts, -1 = absent
+        if lim is not None and lim > 0:
+            sel = _WK.gd_topk(runs, -1 if _ecode is None else _ecode, int(lim))
+        counts = runs
+        if sel is None:
+            present = np.flatnonzero(runs >= 0)
+            counts = np.maximum(runs, 0)
+    if sel is None:
+        if _ecode is not None:                           # WHERE key <> literal: that one group leaves
+            present = present[present != _ecode]
+        sel = _top_sel(counts, present, lim)
+    kv = _keyvals(seg, kcol, np.asarray(sel, dtype=np.int64))
     rows = []
-    for gid in sel.tolist():
+    for j, gid in enumerate(sel.tolist()):
         row = [None, None]
-        row[ki] = wdb_sql._pyval(kdecode[gid] if kdecode is not None else np.int64(gid))
+        row[ki] = kv[j]
         row[ci] = int(counts[gid])
         rows.append(tuple(row))
     rows = workers.finalize(rows, proj, tree.args.get('order'), lim)
     _HITS += 1
     return rows, names
+
+
+def _keyvals(seg, kcol, codes):
+    import wdb_join
+    out = wdb_join._bulk_keyvals(seg, kcol, codes)
+    return [k.decode('utf-8', 'replace') if isinstance(k, (bytes, bytearray)) else k for k in out]
 
 
 def try_groupdistinct(seg, tree, col_map):

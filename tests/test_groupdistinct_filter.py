@@ -24,7 +24,7 @@ def _case(n, empty_share, nuser, null_share=0.0, seed=7):
     seg, pq = helpers.roundtrip(pd.DataFrame({'k': k, 'u': u}))
     tree = sqlglot.parse_one(SQL)
     det = GD.detect(seg, tree, None)
-    assert det is not None and det[-1] is True, 'the filtered shape must reach the read'
+    assert det is not None and det[-1] is not None, 'the filtered shape must reach the read'
     got = GD.execute(seg, det, tree)
     assert got is not None
     want = duckdb.sql(SQL.replace('FROM t', "FROM '%s'" % pq)).fetchall()
