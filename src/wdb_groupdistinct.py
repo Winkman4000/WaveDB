@@ -13,9 +13,12 @@ re-seen pair is a no-op. Flips the group-wise-distinct class (the ClickBench Q08
 Same contract as the other operators: try_groupdistinct(seg, tree, col_map) -> (rows, colnames) | None
 (None => caller falls through to the scan paths). Fail-closed on anything outside the exact shape.
 
-v1 scope: single segment, no WHERE/HAVING/JOIN, projection exactly {bare key, COUNT(DISTINCT target)},
-both key and target value-identity (mode 0/1/2, never mode-4 positional codes), group key not nullable,
-ORDER BY the distinct-count DESC (or absent), optional LIMIT. Filters and co-aggregates are v2.
+Scope: single segment, no HAVING/JOIN, projection exactly {bare key, COUNT(DISTINCT target)}, both key
+and target value-identity (mode 0/1/2, never mode-4 positional codes), group key not nullable, ORDER BY the
+distinct-count DESC (or absent), optional LIMIT; WHERE only `key <> literal` (the Q13 board, 2026-10-13:
+any literal). The walk is picked by the two columns' profiles (execute): the sparse planes, the dense
+boards, the target scatter, the key marker, the key sort -- and the survivor road when the filter removes
+nearly every row. Co-aggregates live in wdb_groupmix.
 """
 import numpy as np
 from sqlglot import expressions as E
@@ -29,6 +32,10 @@ _HITS = 0   # telemetry: queries answered by the group-distinct kernel
 LANES = {}  # telemetry: lane -> answers (dense / scatter / keymark / keysort / None = numpy)
 DENSE_CELLS = 1 << 22   # dense lane: (groups x targets) cells; per-thread boards cost T x cells bytes
 MARK_MAX = 1 << 22      # key-mark lane: target space; per-thread marker tables cost T x targets x 4 bytes
+SURVIVOR_ROAD = 64      # read the counted column at the survivors when the filter keeps <= 1/64 of the rows:
+                        # a gather costs ~30 ns a row on the sparse encodings (MobilePhoneModel at IsMobile's
+                        # 10%: 0.29 s gathered vs 0.08 s whole), so the road pays only when few rows survive
+SURVIVOR_HITS = 0       # telemetry: answers that took the survivor road
 
 try:
     from numba import njit
@@ -386,7 +393,7 @@ def detect(seg, tree, col_map, _allow_group_filter=False):
 def execute(seg, det, tree):
     """THE READ: per-group COUNT(DISTINCT) via one code-hash walk. May decline (None) on
     measured conditions (mismatched lengths, pack overflow)."""
-    global _HITS
+    global _HITS, SURVIVOR_HITS
     kcol, tcol, ci, ki, proj, excl = det
     _ecode = _excl_code(seg, kcol, excl) if excl is not None else None
     excl_empty = (_ecode is not None and isinstance(excl, E.Literal) and excl.is_string
@@ -504,7 +511,23 @@ def execute(seg, det, tree):
     # the key is its code, decoded at emission for the winners only (_bulk_keyvals: typed -- a time key
     # emits as a time -- and point-fetched from a big dictionary)
     grp = np.ascontiguousarray(np.asarray(seg._raw_codes(kcol)))
-    tinfo = _codes_or_ids(tcol)
+    tinfo = None
+    tc0 = seg.cols.get(tcol)
+    if _ecode is not None and tc0 is not None and tc0.get('mode') in (0, 1, 2) and grp.size:
+        # THE SURVIVOR ROAD (2026-10-13): when the removed group is nearly every row (IsOldCounter's 0,
+        # OpenerName's -1, ParamOrderID's '': ~100%), read the counted column at the survivors only --
+        # the whole column decode was the bill (DuckDB 0.08 s, the full lanes 0.4-0.7 s; the road 0.05 s)
+        keep = grp != _ecode
+        m9 = int(np.count_nonzero(keep))
+        if m9 * SURVIVOR_ROAD <= grp.size:
+            rows9 = np.flatnonzero(keep)
+            grp = np.ascontiguousarray(grp[rows9])
+            tgt9 = np.ascontiguousarray(np.asarray(seg.codes_at(tcol, rows9)))
+            tinfo = (tgt9, (int(tc0['V']) - 1) if tc0.get('has_null') else -1, None)
+            SURVIVOR_HITS += 1
+        del keep
+    if tinfo is None:
+        tinfo = _codes_or_ids(tcol)
     if tinfo is None:
         return None
     tgt, tnull, _tdecode = tinfo

@@ -25,6 +25,7 @@ def _fixture():
         'wide': rng.integers(0, 250_000, N),                       # big target
         'tiny': rng.integers(0, 6, N),
         'one': np.full(N, 4),                                      # a key with one value
+        'dom': np.where(rng.random(N) < 0.99, 3, rng.integers(0, 500, N)),   # 99% one value
         's': np.array(['s%03d' % i for i in range(300)], dtype=object)[rng.integers(0, 300, N)],
         'ts': (pd.Timestamp('2013-07-01') + pd.to_timedelta(rng.integers(0, 50_000, N), unit='s')),
     })
@@ -156,3 +157,20 @@ def test_nullable_target_on_every_key_lane():
         F._case(200_000, 0.3, 50, null_share=0.5)                 # keysort, long runs per group
     finally:
         GD.DENSE_CELLS, GD.MARK_MAX = old
+
+
+def test_survivor_road_when_the_removed_group_dominates():
+    """the filter keeps ~1%: the counted column is read at the survivors only"""
+    h0 = GD.SURVIVOR_HITS
+    _full('dom', 'big', '3')
+    assert GD.SURVIVOR_HITS == h0 + 1
+    _full('small', 'big', '7')                                    # keeps 60%: the whole column
+    assert GD.SURVIVOR_HITS == h0 + 1
+    _top('dom', 'wide', '3')
+    _full('dom', 's', '3')
+    old = GD.DENSE_CELLS
+    GD.DENSE_CELLS = 0
+    try:
+        _full('dom', 'tiny', '3', 'keymark')
+    finally:
+        GD.DENSE_CELLS = old
