@@ -350,6 +350,8 @@ def _fused_detect(c):
             if isinstance(node, (wdb_sql.E.TimestampTrunc, wdb_sql.E.DateTrunc)) \
                     and isinstance(node.this, wdb_sql.E.Column):
                 continue                     # DATE_TRUNC(unit, col): rides the dictionary in fused_agg (O(V))
+            if wdb_sql.extract_unit(node) is not None and isinstance(wdb_sql.extract_arg(node), wdb_sql.E.Column):
+                continue                     # EXTRACT(field FROM col) / MINUTE(col): rides the dictionary too
             if not isinstance(node, wdb_sql.E.Column):
                 return None
     return True                              # always eligible to try; execute decides

@@ -3955,6 +3955,12 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
 
     fact = ctx['fact']; alias2t = ctx['alias2t']; seg_of = ctx['seg_of']; composed = ctx['composed']
     cols_of = {a: set(db.cat.column_names(t)) for a, t in alias2t.items()}
+    # GROUP BY a SELECT alias of a computed key (Q18: extract(minute FROM EventTime) AS m ... GROUP BY m) groups
+    # by that expression -- unless a table column carries the name, which SQL resolves first
+    _al9g = {p.alias: p.this for p in proj if isinstance(p, E.Alias) and not isinstance(p.this, E.Column)}
+    if _al9g:
+        gnodes = [(_al9g[g.name] if isinstance(g, E.Column) and not g.table and g.name in _al9g
+                   and not any(g.name in cs for cs in cols_of.values()) else g) for g in gnodes]
     phys_of = {a: db.cat.phys_map(t) for a, t in alias2t.items()}
 
     _colmemo = {}
@@ -5286,6 +5292,59 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         return _door9
     # ---- THE SINGLETON PEEL DOOR (2026-10-12): a nearly-unique group key makes nearly every group one
     # row -- census that key over the survivors, group only the repeaters, emit the k winners (wdb_peel)
+    def _expr_key(g):
+        """an expression GROUP BY key over one column -> (seg, pcol, cptr, distinct results u, code -> index
+        into u); shared by the singleton peel door and the fused key build"""
+        # EXPRESSION GROUP KEY RIDES THE DICT: transform the V dictionary
+        # values through the expression, collapse equal results, remap the
+        # codes -- O(V), never O(N) (Q7's l_shipdate/365 folds ~2500 days
+        # into 7 years at dict scale).
+        cols9g = list(g.find_all(E.Column))
+        if len(cols9g) != 1: raise _FastUnsupported            # declines RAISE (a None from fpa is 'no answer')
+        gseg, gpcol, gcptr = resolve(cols9g[0])
+        rawx = wdb_sql.raw_dict_col(gseg, gpcol, want_codes=False)
+        if rawx is None: raise _FastUnsupported
+        def _dx9(nd, bv):
+            if isinstance(nd, E.Paren): return _dx9(nd.this, bv)
+            if isinstance(nd, E.Column): return bv
+            if isinstance(nd, E.Literal):
+                if nd.is_string: raise _FastUnsupported
+                return float(nd.this)
+            if isinstance(nd, E.Neg): return -_dx9(nd.this, bv)
+            if isinstance(nd, E.Mul): return _dx9(nd.this, bv) * _dx9(nd.expression, bv)
+            if isinstance(nd, E.Div): return _dx9(nd.this, bv) / _dx9(nd.expression, bv)
+            if isinstance(nd, E.Add): return _dx9(nd.this, bv) + _dx9(nd.expression, bv)
+            if isinstance(nd, E.Sub): return _dx9(nd.this, bv) - _dx9(nd.expression, bv)
+            if isinstance(nd, E.Mod): return np.mod(_dx9(nd.this, bv), _dx9(nd.expression, bv))
+            if isinstance(nd, E.IntDiv): return np.floor_divide(_dx9(nd.this, bv), _dx9(nd.expression, bv))
+            raise _FastUnsupported
+        fld9x = wdb_sql.extract_unit(g)
+        if fld9x is not None:
+            # EXTRACT RIDES THE DICT (2026-10-13, the Q18 board): the field of the V distinct times, not the N
+            # rows -- wdb_sql.extract_field, the row evaluator's own definition
+            if not isinstance(wdb_sql.extract_arg(g), E.Column) or gseg.cols[gpcol].get('dt') != 3:
+                raise _FastUnsupported
+            try:
+                dv9 = np.asarray(wdb_sql.extract_field(
+                    fld9x, np.asarray(rawx[0], dtype=np.int64).view('datetime64[%s]' % gseg.unit(gpcol))))
+            except TypeError:
+                raise _FastUnsupported
+        elif isinstance(g, (E.TimestampTrunc, E.DateTrunc)):
+            # DATE_TRUNC RIDES THE DICT TOO (2026-10-12): truncate the V distinct times, not the N rows --
+            # the same wdb_sql.date_trunc the row evaluator uses, so values and types match that road
+            if not isinstance(g.this, E.Column) or gseg.cols[gpcol].get('dt') != 3: raise _FastUnsupported
+            try:
+                dv9 = wdb_sql.date_trunc(wdb_sql.trunc_unit(g),
+                                         np.asarray(rawx[0], dtype=np.int64).view('datetime64[%s]' % gseg.unit(gpcol)))
+            except TypeError:
+                raise _FastUnsupported
+        else:
+            dv9 = _dx9(g, np.asarray(rawx[0], dtype=np.float64))
+            if gseg.cols[gpcol].get('dt') == 0 and (dv9 == np.floor(dv9)).all():
+                dv9 = dv9.astype(np.int64)             # integer keys stay integers (labels emit as ints)
+        u9x, inv9x = np.unique(dv9, return_inverse=True)
+        inv9x = np.ascontiguousarray(inv9x, dtype=np.int64)
+        return gseg, gpcol, gcptr, u9x, inv9x
     def _singleton_peel_door():
         import wdb_peel, wdb_union
         if os.environ.get('WDB_PEEL') == '0': return None          # ablation: the fused kernel groups everything
@@ -5298,17 +5357,37 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             return None
         keys9 = []
         for g in gnodes:
-            if not isinstance(g, E.Column): return None
+            if not isinstance(g, E.Column):
+                # an expression key over one column (minute of EventTime): its codes through the dictionary
+                # map, its labels the distinct results -- the peel key itself is always a bare column
+                sg, pc, cp, u9, inv9 = _expr_key(g)          # (codes_at indexes the map whatever the mode:
+                if cp is not None: return None               #  raw_dict_col vouched for it, as for fused's keys)
+                keys9.append({'seg': sg, 'pcol': pc, 'name': g.sql(), 'map': inv9,
+                              'labels': [wdb_sql._pyval(x) for x in (u9 if u9.dtype.kind == 'M' else u9.tolist())]})
+                continue
             sg, pc, cp = resolve(g)
             if cp is not None or sg.cols[pc].get('mode') not in (0, 1, 2): return None
             keys9.append({'seg': sg, 'pcol': pc, 'name': g.name})
         if not keys9: return None
         peel9 = wdb_peel.pick_key(keys9)
-        if peel9 is None: return None
+        bound9 = False
+        if peel9 is None:
+            # no near-unique key: THE BOUND HUNT may still take a COUNT-ordered top-k over a composite too wide
+            # for the fused kernel's dense table (decided below, once the ORDER BY is read)
+            if os.environ.get('WDB_BOUND') == '0' or len(keys9) < 2: return None
+            prod9 = 1
+            for kk in keys9:
+                prod9 *= len(kk['labels']) if kk.get('labels') is not None else int(kk['seg'].cols[kk['pcol']]['V'])
+            if RT.dense_multigroup_fits(prod9): return None
+            bound9 = True
         def _key_of(col):
+            if not isinstance(col, E.Column):
+                for j, kk in enumerate(keys9):
+                    if kk.get('map') is not None and kk['name'] == col.sql(): return j
+                return None
             sg, pc, cp = resolve(col)
             for j, kk in enumerate(keys9):
-                if kk['seg'] is sg and kk['pcol'] == pc: return j
+                if kk['seg'] is sg and kk['pcol'] == pc and kk.get('map') is None: return j
             return None
         def _agg_entry(nd):
             if isinstance(nd, E.Count):
@@ -5328,7 +5407,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         plan9 = []; inner9 = []
         for p in proj:
             nd = p.this if isinstance(p, E.Alias) else p
-            if isinstance(nd, E.Column):
+            if isinstance(nd, E.Column) or _key_of(nd) is not None:
                 j = _key_of(nd)
                 if j is None: return None
                 plan9.append(('key', j))
@@ -5339,6 +5418,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             inner9.append(nd)
         def _key_orderable(j):
             kk = keys9[j]; c9 = kk['seg'].cols[kk['pcol']]
+            if kk.get('map') is not None:
+                return not c9.get('has_null')        # codes index the sorted distinct results: code order = value order
             return (not c9.get('has_null') and c9.get('dt') in (0, 1, 3)
                     and not isinstance(kk['seg'], wdb_union.SegmentUnion))
         order9 = []
@@ -5374,6 +5455,15 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             m9 = _maskc.get('m')
             if m9 is None: m9 = mask_eval(where.this)
             rows = np.flatnonzero(m9)
+        if bound9:
+            import wdb_bound
+            if not order9 or plan9[order9[0][0]][0] != 'count' or not order9[0][1]: return None
+            out9 = wdb_bound.run(rows, keys9, plan9, order9, k9)
+            if out9 is None: return None
+            if _bill9 is not None:
+                print('JOIN BILL: bound hunt door (%d survivors) %.0fms' % (rows.size, (_tk9() - _fpa_t0) * 1000), flush=True)
+            _bump_fast()
+            return out9, [wdb_sql._alias(p) for p in proj]
         out9 = wdb_peel.run(rows, keys9, peel9, plan9, order9, k9)
         if out9 is None: return None
         if _bill9 is not None:
@@ -5395,44 +5485,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     gkeys = []                                           # one per GROUP BY column
     for g in gnodes:
         if not isinstance(g, E.Column):
-            # EXPRESSION GROUP KEY RIDES THE DICT: transform the V dictionary
-            # values through the expression, collapse equal results, remap the
-            # codes -- O(V), never O(N) (Q7's l_shipdate/365 folds ~2500 days
-            # into 7 years at dict scale).
-            cols9g = list(g.find_all(E.Column))
-            if len(cols9g) != 1: raise _FastUnsupported            # declines RAISE (a None from fpa is 'no answer')
-            gseg, gpcol, gcptr = resolve(cols9g[0])
-            rawx = wdb_sql.raw_dict_col(gseg, gpcol, want_codes=False)
-            if rawx is None: raise _FastUnsupported
-            def _dx9(nd, bv):
-                if isinstance(nd, E.Paren): return _dx9(nd.this, bv)
-                if isinstance(nd, E.Column): return bv
-                if isinstance(nd, E.Literal):
-                    if nd.is_string: raise _FastUnsupported
-                    return float(nd.this)
-                if isinstance(nd, E.Neg): return -_dx9(nd.this, bv)
-                if isinstance(nd, E.Mul): return _dx9(nd.this, bv) * _dx9(nd.expression, bv)
-                if isinstance(nd, E.Div): return _dx9(nd.this, bv) / _dx9(nd.expression, bv)
-                if isinstance(nd, E.Add): return _dx9(nd.this, bv) + _dx9(nd.expression, bv)
-                if isinstance(nd, E.Sub): return _dx9(nd.this, bv) - _dx9(nd.expression, bv)
-                if isinstance(nd, E.Mod): return np.mod(_dx9(nd.this, bv), _dx9(nd.expression, bv))
-                if isinstance(nd, E.IntDiv): return np.floor_divide(_dx9(nd.this, bv), _dx9(nd.expression, bv))
-                raise _FastUnsupported
-            if isinstance(g, (E.TimestampTrunc, E.DateTrunc)):
-                # DATE_TRUNC RIDES THE DICT TOO (2026-10-12): truncate the V distinct times, not the N rows --
-                # the same wdb_sql.date_trunc the row evaluator uses, so values and types match that road
-                if not isinstance(g.this, E.Column) or gseg.cols[gpcol].get('dt') != 3: raise _FastUnsupported
-                try:
-                    dv9 = wdb_sql.date_trunc(wdb_sql.trunc_unit(g),
-                                             np.asarray(rawx[0], dtype=np.int64).view('datetime64[%s]' % gseg.unit(gpcol)))
-                except TypeError:
-                    raise _FastUnsupported
-            else:
-                dv9 = _dx9(g, np.asarray(rawx[0], dtype=np.float64))
-                if gseg.cols[gpcol].get('dt') == 0 and (dv9 == np.floor(dv9)).all():
-                    dv9 = dv9.astype(np.int64)             # integer keys stay integers (labels emit as ints)
-            u9x, inv9x = np.unique(dv9, return_inverse=True)
-            inv9x = np.ascontiguousarray(inv9x, dtype=np.int64)
+            gseg, gpcol, gcptr, u9x, inv9x = _expr_key(g)
             if gcptr is None and rows9 is not None:
                 full = inv9x[np.asarray(gseg.codes_at(gpcol, rows9))]
             else:

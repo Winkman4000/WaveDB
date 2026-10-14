@@ -1,5 +1,5 @@
 """THE Q13 BOARD, the ranking: read OUT/results.jsonl and rank every (K, D) pair against the submitted
-Q13 hot time. Prints the bands, the reads, the worst pairs, and per-profile rows for the K slot and the
+shape's submitted hot time. Prints the bands, the reads, the worst pairs, and per-profile rows for the K slot and the
 D slot; writes OUT/grid.csv (K profile x D profile, hot seconds; T = timeout).
 
 Usage: python bench/q13_rank.py OUT_DIR [--form filtered] [--worst 40]"""
@@ -7,8 +7,10 @@ import sys, os, json, csv, argparse, collections, statistics
 ap = argparse.ArgumentParser(); ap.add_argument('out'); ap.add_argument('--form', default='filtered')
 ap.add_argument('--worst', type=int, default=40)
 A = ap.parse_args()
-SUB = 0.498798
 R = [json.loads(l) for l in open(os.path.join(A.out, 'results.jsonl')) if l.strip()]
+SUB = next((r['sub_hot'] for r in R if r.get('sub_hot')), 0.498798)   # the shape's submitted hot (Q13's before shapes)
+if A.form == 'filtered' and not any(r['form'] == 'filtered' for r in R):
+    A.form = R[0]['form'] if R else A.form
 R = [r for r in R if r['form'] == A.form]
 INF = float('inf')
 
@@ -26,7 +28,7 @@ def band(r):
     return 'over 10x'
 
 
-print('pairs %d  (form %s)   submitted Q13 hot %.3fs' % (len(R), A.form, SUB))
+print('pairs %d  (form %s)   submitted hot %.3fs' % (len(R), A.form, SUB))
 print('verdicts:', dict(collections.Counter(r.get('verdict', '?') for r in R)))
 print('\nbands vs submitted:')
 for b in ('at or under submitted', '1-2x', '2-10x', 'over 10x', 'TIMEOUT/error'):

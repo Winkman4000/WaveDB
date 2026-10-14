@@ -143,6 +143,7 @@ def _emit_rows(seg, spec, uid, sp, picks):
             uv = uv.decode('utf-8', 'replace')
         if isinstance(sv, (bytes, bytearray)):
             sv = sv.decode('utf-8', 'replace')
+        uv = wdb_sql._pyval(uv); sv = wdb_sql._pyval(sv)   # a time key emits as a time, not numpy datetime64
         row = []
         for a in spec['aggs']:
             row.append(uv if a[0] == 'K' and a[1] == uid else
@@ -333,6 +334,7 @@ def execute(seg, spec):
                 uv = uv.decode('utf-8', 'replace')
             if isinstance(sv, (bytes, bytearray)):
                 sv = sv.decode('utf-8', 'replace')
+            uv = wdb_sql._pyval(uv); sv = wdb_sql._pyval(sv)   # a time key emits as a time, not numpy datetime64
             row = []
             for a9 in spec['aggs']:
                 row.append(uv if a9[0] == 'K' and a9[1] == uid else
@@ -376,6 +378,7 @@ def execute(seg, spec):
                             uv = uv.decode('utf-8', 'replace')
                         if isinstance(sv, (bytes, bytearray)):
                             sv = sv.decode('utf-8', 'replace')
+                        uv = wdb_sql._pyval(uv); sv = wdb_sql._pyval(sv)   # a time key emits as a time, not numpy datetime64
                         row = []
                         for a in spec['aggs']:
                             row.append(uv if a[0] == 'K' and a[1] == uid else
@@ -421,6 +424,7 @@ def _free_serve(seg, spec):
             uv = uv.decode('utf-8', 'replace')
         if isinstance(sv, (bytes, bytearray)):
             sv = sv.decode('utf-8', 'replace')
+        uv = wdb_sql._pyval(uv); sv = wdb_sql._pyval(sv)   # a time key emits as a time, not numpy datetime64
         row = []
         for a9 in spec['aggs']:
             row.append(uv if a9[0] == 'K' and a9[1] == uid else

@@ -2994,6 +2994,131 @@ def _gd_pick_nb(runs, ecode, kth, on, k):
     return out
 
 
+def bound_min(b, cnt, codes, first):
+    """THE BOUND HUNT's per-row bound, one key at a time, in place: b[i] = cnt[codes[i]] (first key) or
+    min(b[i], cnt[codes[i]]) -- one parallel pass per key (numpy's gather + minimum was 1.2 s for 3 keys)."""
+    _bound_min_nb(b, cnt, codes, np.int64(1 if first else 0), _nt())
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _bound_min_nb(b, cnt, codes, first, T):
+    n = b.size
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        if first:
+            for i in range(lo, hi):
+                b[i] = cnt[codes[i]]
+        else:
+            for i in range(lo, hi):
+                v = cnt[codes[i]]
+                if v < b[i]:
+                    b[i] = v
+
+
+def pack_or(word, codes, shift):
+    """word |= codes << shift, in place, every core (packing group-key codes into one int64 word)"""
+    _pack_or_nb(word, codes, np.int64(shift), _nt())
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _pack_or_nb(word, codes, shift, T):
+    n = word.size
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        for i in range(lo, hi):
+            word[i] |= np.int64(codes[i]) << shift
+
+
+def radix_acc(comp, codes, V, first):
+    """mixed-radix composite, one key at a time, in place: comp = codes (first) or comp * V + codes"""
+    _radix_acc_nb(comp, codes, np.int64(V), np.int64(1 if first else 0), _nt())
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _radix_acc_nb(comp, codes, V, first, T):
+    n = comp.size
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        if first:
+            for i in range(lo, hi):
+                comp[i] = np.int64(codes[i])
+        else:
+            for i in range(lo, hi):
+                comp[i] = comp[i] * V + np.int64(codes[i])
+
+
+def masked_count(comp, mask, V):
+    """counts of comp's cells over the rows where mask is set (per-thread boards, every core)"""
+    return _masked_count_nb(comp, mask, np.int64(V), _nt())
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _masked_count_nb(comp, mask, V, T):
+    n = comp.size
+    part = np.zeros((T, V), np.int32)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        for i in range(lo, hi):
+            if mask[i]:
+                part[t, comp[i]] += 1
+    out = np.zeros(V, np.int64)
+    for v in prange(V):
+        s = 0
+        for t in range(T):
+            s += part[t, v]
+        out[v] = s
+    return out
+
+
+def eq_all(codes_list, tops):
+    """mask of the rows where every listed key holds its listed code"""
+    m = np.ones(codes_list[0].size, np.bool_)
+    for c, d in zip(codes_list, tops):
+        _eq_and_nb(m, c, np.int64(d), _nt())
+    return m
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _eq_and_nb(m, c, d, T):
+    n = m.size
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        for i in range(lo, hi):
+            if m[i] and np.int64(c[i]) != d:
+                m[i] = False
+
+
+def bound_hist(b, cap):
+    """histogram of min(b, cap): how many rows carry each bound (all bounds >= cap share the last bin)"""
+    return _bound_hist_nb(b, np.int64(cap), _nt())
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _bound_hist_nb(b, cap, T):
+    n = b.size
+    part = np.zeros((T, cap + 1 + 16), np.int64)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        for i in range(lo, hi):
+            v = np.int64(b[i])
+            if v > cap:
+                v = cap
+            part[t, v] += 1
+    out = np.zeros(cap + 1, np.int64)
+    for v in range(cap + 1):
+        s = 0
+        for t in range(T):
+            s += part[t, v]
+        out[v] = s
+    return out
+
+
 def grid2_count(c1, c2, fc, lit, V2, K):
     return _grid2_count_nb(c1, c2, fc, lit, V2, K, _nt())
 

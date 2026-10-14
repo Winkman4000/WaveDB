@@ -28,9 +28,12 @@ _HITS = 0                # answers served by the peel (tests assert the road was
 
 def pick_key(keys):
     """Index of the key to peel on (largest dictionary relative to its table), or None if none is
-    near-unique. keys: [{'seg', 'pcol'}]. Metadata only."""
+    near-unique. keys: [{'seg', 'pcol'}] (+ 'map', 'labels' for an expression key, never peeled).
+    Metadata only."""
     best = None; bestf = 0.0
     for j, k in enumerate(keys):
+        if k.get('map') is not None:
+            continue
         c = k['seg'].cols[k['pcol']]
         N = int(k['seg'].N)
         if N <= 0 or c.get('mode') not in (0, 1, 2):
@@ -48,6 +51,14 @@ def _census(codes, V):
         return np.bincount(codes, minlength=V)
     import wdb_kernels
     return wdb_kernels.bincount_par(codes, V)
+
+
+def _kcodes(kk, rows):
+    """a key's codes at base rows: the dictionary code, or for an expression key its index into the distinct
+    results (code order = value order either way)"""
+    c = np.asarray(kk['seg'].codes_at(kk['pcol'], rows), dtype=np.int64)
+    m = kk.get('map')
+    return c if m is None else m[c]
 
 
 def _values(seg, pcol, rows):
@@ -109,7 +120,7 @@ def run(rows, keys, peel, plan, order, k):
     if nrep:
         kc = np.empty((nrep, nk), np.int64)
         for j, kk in enumerate(keys):
-            kc[:, j] = np.asarray(kk['seg'].codes_at(kk['pcol'], rrows), dtype=np.int64)
+            kc[:, j] = _kcodes(kk, rrows)
         ukeys, gid = np.unique(kc, axis=0, return_inverse=True)
         gid = np.asarray(gid, dtype=np.int64).ravel()
     else:
@@ -145,7 +156,7 @@ def run(rows, keys, peel, plan, order, k):
         if e[0] == 'key':
             j = e[1]; kk = keys[j]
             return (lambda r: ukeys[r, j]), \
-                (lambda s: np.asarray(kk['seg'].codes_at(kk['pcol'], srows[s]), dtype=np.int64))
+                (lambda s: _kcodes(kk, srows[s]))
         a = ragg[pi]; sg, pc_ = e[2], e[3]
         def sv(s):
             v = _values(sg, pc_, srows[s])
@@ -227,7 +238,7 @@ def run(rows, keys, peel, plan, order, k):
         if e[0] == 'key':
             j = e[1]; kk = keys[j]
             return np.concatenate([ukeys[pr, j],
-                                   np.asarray(kk['seg'].codes_at(kk['pcol'], srows[ps]), dtype=np.int64)])
+                                   _kcodes(kk, srows[ps])])
         sv = _values(e[2], e[3], srows[ps])
         if e[1] == 'AVG':
             sv = sv.astype(np.float64)
@@ -252,7 +263,10 @@ def run(rows, keys, peel, plan, order, k):
         if e[0] == 'key':
             kk = keys[e[1]]
             import wdb_join
-            out_cols.append(wdb_join._bulk_keyvals(kk['seg'], kk['pcol'], v))
+            if kk.get('labels') is not None:
+                out_cols.append([kk["labels"][int(x)] for x in v])
+            else:
+                out_cols.append(wdb_join._bulk_keyvals(kk['seg'], kk['pcol'], v))
         elif e[0] == 'count':
             out_cols.append([int(x) for x in v])
         elif v.dtype.kind == 'f':

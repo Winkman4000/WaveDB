@@ -895,30 +895,10 @@ def _date_family(seg, n, mask, resolve, env):
         m0 = (y - 1970) * 12 + (m - 1)
         return (m0.astype('datetime64[M]').astype('datetime64[D]') + (d - 1).astype('timedelta64[D]'))
     def extract(field, a):
-        field = str(field).upper()
-        a = dt64(a); y, m, d, D = ymd(a)
-        if field in ('YEAR', 'Y', 'YY', 'YYYY'): return y
-        if field in ('MONTH', 'MON', 'MM'): return m
-        if field in ('DAY', 'DD', 'DAYOFMONTH'): return d
-        if field == 'QUARTER': return (m - 1) // 3 + 1
-        if field in ('DOW', 'DAYOFWEEK', 'WEEKDAY'): return (D.astype(np.int64) + 4) % 7          # 1970-01-01 was a Thursday; Sunday = 0
-        if field in ('ISODOW',): return ((D.astype(np.int64) + 3) % 7) + 1
-        if field in ('DOY', 'DAYOFYEAR'): return (D - a.astype('datetime64[Y]').astype('datetime64[D]')).astype(np.int64) + 1
-        if field in ('WEEK', 'ISOWEEK'):
-            import datetime as _dt9
-            di = D.astype(np.int64)
-            return np.array([(_dt9.date(1970, 1, 1) + _dt9.timedelta(days=int(x))).isocalendar()[1] for x in di], dtype=np.int64)
-        us = a.astype('datetime64[us]').astype(np.int64)
-        if field == 'HOUR': return (us // 3_600_000_000) % 24
-        if field == 'MINUTE': return (us // 60_000_000) % 60
-        if field == 'SECOND': return (us // 1_000_000) % 60
-        if field in ('EPOCH',): return us / 1e6
-        raise TypeError('EXTRACT %s' % field)
-    if isinstance(n, E.Extract):
-        return extract(n.this.name if hasattr(n.this, 'name') else n.this.sql(), ev(n.expression))
-    for _cls9, _fld9 in (('Year', 'YEAR'), ('Month', 'MONTH'), ('Day', 'DAY'), ('Quarter', 'QUARTER'), ('Week', 'WEEK'), ('DayOfWeek', 'DOW'), ('DayOfYear', 'DOY'), ('Hour', 'HOUR'), ('Minute', 'MINUTE'), ('Second', 'SECOND')):
-        if type(n).__name__ == _cls9 and hasattr(E, _cls9):
-            return extract(_fld9, ev(n.this))
+        return extract_field(field, dt64(a))
+    fld9 = extract_unit(n)
+    if fld9 is not None:
+        return extract(fld9, ev(extract_arg(n)))
     if type(n).__name__ in ('DateTrunc', 'TimestampTrunc'):
         return date_trunc(trunc_unit(n), dt64(ev(n.this)))
     def interval_add(a, iv, sign):
@@ -2008,6 +1988,51 @@ def _pyval(v):
     if isinstance(v,(np.integer,)): return int(v)
     if isinstance(v,(np.floating,)): return float(v)
     return v
+_EXTRACT_NAMED = (('Year', 'YEAR'), ('Month', 'MONTH'), ('Day', 'DAY'), ('Quarter', 'QUARTER'), ('Week', 'WEEK'),
+                  ('DayOfWeek', 'DOW'), ('DayOfYear', 'DOY'), ('Hour', 'HOUR'), ('Minute', 'MINUTE'), ('Second', 'SECOND'))
+
+
+def extract_unit(n):
+    """EXTRACT(field FROM x) or a named form (YEAR(x), MINUTE(x), ...) -> the field, upper case; else None."""
+    if isinstance(n, E.Extract):
+        return str(n.this.name if hasattr(n.this, 'name') else n.this.sql()).upper()
+    for cls9, fld9 in _EXTRACT_NAMED:
+        if type(n).__name__ == cls9 and hasattr(E, cls9):
+            return fld9
+    return None
+
+
+def extract_arg(n):
+    """the argument an extract_unit node reads"""
+    return n.expression if isinstance(n, E.Extract) else n.this
+
+
+def extract_field(field, a):
+    """EXTRACT over a datetime64 array -- the ONE definition, shared by the row evaluator and fused_agg's
+    dictionary-riding group key (2026-10-13, the Q18 board: a minute key paid the general scan's per-row
+    path, JavaEnable x minute x Age 10.8 s), so both roads emit the same integers."""
+    field = str(field).upper()
+    Y = a.astype('datetime64[Y]'); M = a.astype('datetime64[M]'); D = a.astype('datetime64[D]')
+    y = Y.astype(np.int64) + 1970; m = (M.astype(np.int64) % 12) + 1; d = (D - M).astype(np.int64) + 1
+    if field in ('YEAR', 'Y', 'YY', 'YYYY'): return y
+    if field in ('MONTH', 'MON', 'MM'): return m
+    if field in ('DAY', 'DD', 'DAYOFMONTH'): return d
+    if field == 'QUARTER': return (m - 1) // 3 + 1
+    if field in ('DOW', 'DAYOFWEEK', 'WEEKDAY'): return (D.astype(np.int64) + 4) % 7          # 1970-01-01 was a Thursday; Sunday = 0
+    if field in ('ISODOW',): return ((D.astype(np.int64) + 3) % 7) + 1
+    if field in ('DOY', 'DAYOFYEAR'): return (D - Y.astype('datetime64[D]')).astype(np.int64) + 1
+    if field in ('WEEK', 'ISOWEEK'):
+        import datetime as _dt9
+        di = D.astype(np.int64)
+        return np.array([(_dt9.date(1970, 1, 1) + _dt9.timedelta(days=int(x))).isocalendar()[1] for x in di], dtype=np.int64)
+    us = a.astype('datetime64[us]').astype(np.int64)
+    if field == 'HOUR': return (us // 3_600_000_000) % 24
+    if field == 'MINUTE': return (us // 60_000_000) % 60
+    if field == 'SECOND': return (us // 1_000_000) % 60
+    if field in ('EPOCH',): return us / 1e6
+    raise TypeError('EXTRACT %s' % field)
+
+
 def trunc_unit(n):
     """DATE_TRUNC / TIMESTAMP_TRUNC node -> its unit, upper case ('MINUTE')."""
     u = n.args.get('unit')
