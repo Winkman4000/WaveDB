@@ -5342,7 +5342,16 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             dv9 = _dx9(g, np.asarray(rawx[0], dtype=np.float64))
             if gseg.cols[gpcol].get('dt') == 0 and (dv9 == np.floor(dv9)).all():
                 dv9 = dv9.astype(np.int64)             # integer keys stay integers (labels emit as ints)
-        u9x, inv9x = np.unique(dv9, return_inverse=True)
+        dv9 = np.asarray(dv9)
+        if dv9.dtype.kind in 'iu' and dv9.size and int(dv9.max()) - int(dv9.min()) < (1 << 20):
+            # a small integer range (the minute's 60, an hour's 24): the distinct results by presence, not a
+            # sort -- np.unique over EventTime's 1.4M distinct times was 50 ms a query
+            lo9 = int(dv9.min()); off9 = (dv9 - lo9).astype(np.int64)
+            seen9 = np.bincount(off9) > 0
+            u9x = (np.flatnonzero(seen9) + lo9).astype(dv9.dtype)
+            inv9x = (np.cumsum(seen9) - 1)[off9]
+        else:
+            u9x, inv9x = np.unique(dv9, return_inverse=True)
         inv9x = np.ascontiguousarray(inv9x, dtype=np.int64)
         return gseg, gpcol, gcptr, u9x, inv9x
     def _singleton_peel_door():
@@ -5447,21 +5456,25 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 pi = len(plan9) - 1
             if plan9[pi][0] == 'key' and not _key_orderable(plan9[pi][1]): return None
             order9.append((pi, bool(o.args.get('desc'))))
-        rows = _door_rows()
-        if rows is None:
-            # the cascade left a plane mask and/or residual conjuncts for the kernel's predicate: the
-            # peel takes the whole WHERE as one mask instead (exact; the kernel never runs here)
-            if where is None: return None
-            m9 = _maskc.get('m')
-            if m9 is None: m9 = mask_eval(where.this)
-            rows = np.flatnonzero(m9)
+        if (bound9 and rows9 is None and _plane_mask9 is None and not _resid_c9X and get_mask() is None):
+            rows = None                    # every row survives: the hunt reads whole columns (no 100M arange, 72 ms)
+        else:
+            rows = _door_rows()
+            if rows is None:
+                # the cascade left a plane mask and/or residual conjuncts for the kernel's predicate: the
+                # peel takes the whole WHERE as one mask instead (exact; the kernel never runs here)
+                if where is None: return None
+                m9 = _maskc.get('m')
+                if m9 is None: m9 = mask_eval(where.this)
+                rows = np.flatnonzero(m9)
         if bound9:
             import wdb_bound
             if not order9 or plan9[order9[0][0]][0] != 'count' or not order9[0][1]: return None
             out9 = wdb_bound.run(rows, keys9, plan9, order9, k9)
             if out9 is None: return None
             if _bill9 is not None:
-                print('JOIN BILL: bound hunt door (%d survivors) %.0fms' % (rows.size, (_tk9() - _fpa_t0) * 1000), flush=True)
+                print('JOIN BILL: bound hunt door (%s survivors) %.0fms' % ('every row' if rows is None else rows.size,
+                                                                            (_tk9() - _fpa_t0) * 1000), flush=True)
             _bump_fast()
             return out9, [wdb_sql._alias(p) for p in proj]
         out9 = wdb_peel.run(rows, keys9, peel9, plan9, order9, k9)

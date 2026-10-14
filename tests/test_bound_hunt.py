@@ -17,20 +17,23 @@ def _fixture():
     if _DB is not None: return _DB, _CON
     _CON = duckdb.connect()
     d = os.path.join(tempfile.gettempdir(), 'bnd_%s' % uuid.uuid4().hex[:8]); os.makedirs(d, exist_ok=True)
-    # a, b: heavy heads and long tails (users, phrases); u: wide and flat (no bound prunes it); x: a measure
+    # a, b: heavy heads and long tails (users, phrases); u: wide and flat (no bound prunes it); x: a measure;
+    # w, w2: small value spaces with common values (screen sizes: no key spreads evenly, none past half the rows)
     _CON.execute("""CREATE TABLE t AS SELECT i AS id,
         CAST(floor(60000 * pow(((i * 7919) %% 100003) / 100003.0, 4)) AS BIGINT) AS a,
         CAST(floor(30000 * pow(((i * 104729) %% 99991) / 99991.0, 5)) AS BIGINT) AS b,
         (i * 31) %% 150001 AS u, (i * 17) %% 1000 AS x, i %% 3 AS r,
         CASE WHEN (i * 7) %% 100 < 95 THEN 0 ELSE (i * 13) %% 50000 END AS h,
         CASE WHEN (i * 11) %% 100 < 90 THEN 7 ELSE (i * 3) %% 20000 END AS g,
-        TIMESTAMP '2013-07-01 00:00:00' + INTERVAL ((i * 7907) %% 86400) SECOND AS ts
+        TIMESTAMP '2013-07-01 00:00:00' + INTERVAL ((i * 7907) %% 86400) SECOND AS ts,
+        CAST(floor(2000 * pow(((i * 6007) %% 99989) / 99989.0, 6)) AS BIGINT) AS w,
+        CAST(floor(500 * pow(((i * 4001) %% 99971) / 99971.0, 6)) AS BIGINT) AS w2
         FROM range(%d) t(i)""" % N)
     _DB = Database.create(d)
     pq = os.path.join(d, 't.parquet')
     _CON.execute("COPY (SELECT * FROM t ORDER BY id) TO '%s' (FORMAT parquet)" % pq)
     _DB.cat.add_table('t', [['id', 'int'], ['a', 'int'], ['b', 'int'], ['u', 'int'], ['x', 'int'], ['r', 'int'],
-                            ['h', 'int'], ['g', 'int'], ['ts', 'datetime']])
+                            ['h', 'int'], ['g', 'int'], ['ts', 'datetime'], ['w', 'int'], ['w2', 'int']])
     saved = {k: os.environ.pop(k, None) for k in ('WDB_SEQ_NARROW_OK', 'WDB_SEQ_REPEATS_OK')}
     try:
         wdb_encode.encode(pq, os.path.join(d, 't_0.wdb'))
@@ -106,10 +109,19 @@ def test_dense_cells():
 def test_heavy_split():
     """h holds 95% on one value, g 90%: the rows on both heavy values differ only in the minute -- counted as 60
     dense cells; the rest grouped exactly"""
-    h0 = wdb_bound._HEAVY
+    h0 = wdb_bound._HEAVY; l0 = wdb_bound._LIGHT_FLAT
     _exact("SELECT h, minute(ts) AS m, g, COUNT(*) AS c FROM t GROUP BY h, m, g ORDER BY c DESC, h, m, g LIMIT 10")
     _exact("SELECT h, minute(ts) AS m, a, COUNT(*) AS c FROM t GROUP BY h, m, a ORDER BY c DESC, h, m, a LIMIT 10")
     assert wdb_bound._HEAVY == h0 + 2
+    assert wdb_bound._LIGHT_FLAT == l0 + 2          # the light rows scanned flat, in place
+    old = os.environ.get('WDB_FLAT')
+    os.environ['WDB_FLAT'] = '0'                    # the switch: the light rows grouped as before, same answer
+    try:
+        _exact("SELECT h, minute(ts) AS m, a, COUNT(*) AS c FROM t GROUP BY h, m, a ORDER BY c DESC, h, m, a LIMIT 10")
+        assert wdb_bound._HEAVY == h0 + 3 and wdb_bound._LIGHT_FLAT == l0 + 2
+    finally:
+        if old is None: os.environ.pop('WDB_FLAT', None)
+        else: os.environ['WDB_FLAT'] = old
     _exact("SELECT g, h, COUNT(*) AS c FROM t WHERE r <> 0 GROUP BY g, h ORDER BY c DESC, g, h LIMIT 10", hunted=None)
 
 
@@ -135,18 +147,52 @@ def test_flat_scan():
 
 
 def test_flat_count_kernel():
-    """the kernel against np.unique, including the census cap (counts past it settled exactly)"""
+    """the kernel against np.unique: the census cap (counts past it settled exactly), and one bucket holding
+    every row (its table sized to the whole); a table too small for a bucket's groups declines (None)"""
     import numpy as np, wdb_kernels as WK
     rng = np.random.default_rng(7)
     n = 300_000
-    a = (rng.zipf(1.3, n) % 70_000).astype(np.int64)
-    r = rng.integers(0, 40, n).astype(np.uint32)
-    ku, kr, offs = WK.gd_pass1(a, r, np.int64(5), np.int64(8))
-    P = (a.astype(np.uint64) << np.uint64(32)) | r.astype(np.uint64)
-    u, c = np.unique(P, return_counts=True)
-    for k in (1, 10, 100):
-        ck = np.sort(c)[::-1][k - 1]
-        want = dict(zip(u[c >= ck].tolist(), c[c >= ck].tolist()))
-        for cap in (1 << 16, 4, 1):
-            pk, pc = WK.flat_count(ku, kr, offs, k, cap=cap)
-            assert dict(zip(pk.tolist(), pc.tolist())) == want, (k, cap)
+    a = (rng.zipf(1.3, n) % 70_000).astype(np.uint64)
+    r = rng.integers(0, 40, n).astype(np.uint64)
+    comp = (a << np.uint64(32)) | r
+    u, c = np.unique(comp, return_counts=True)
+    for SH in (49 - 12, 60):
+        P, offs = WK.flat_scatter(comp, np.int64(SH), np.int64(8))
+        for k in (1, 10, 100):
+            ck = np.sort(c)[::-1][k - 1]
+            want = dict(zip(u[c >= ck].tolist(), c[c >= ck].tolist()))
+            for cap in (1 << 16, 4, 1):
+                pk, pc = WK.flat_count(P, offs, k, cap=cap)
+                assert dict(zip(pk.tolist(), pc.tolist())) == want, (SH, k, cap)
+    old = WK.FLAT_TAB
+    WK.FLAT_TAB = 1 << 10
+    try:
+        assert WK.flat_count(P, offs, 10) is None
+    finally:
+        WK.FLAT_TAB = old
+
+
+def test_flat_scan_lead_key():
+    """w x r x w2 (screen-size-like keys: each has a common value holding many rows): the key that spreads the
+    rows most evenly over the buckets leads the composite; exact either way round. Keys past 64 bits (ts, u, a,
+    b: 66) decline to the hunt."""
+    f0 = wdb_bound._FLAT
+    old = wdb_bound.FLAT_SHARE, wdb_bound.DENSE_MAX
+    wdb_bound.FLAT_SHARE = 0.0              # (the gate and the dense cells are not under test here: at 400K
+    wdb_bound.DENSE_MAX = 1000              #  rows the bounds keep under half, and 3M cells are dense)
+    try:
+        _exact("SELECT w, r, w2, COUNT(*) AS c FROM t GROUP BY w, r, w2 ORDER BY c DESC, w, r, w2 LIMIT 10")
+        _exact("SELECT w2, r, w, COUNT(*) AS c FROM t GROUP BY w2, r, w ORDER BY c DESC, w2, r, w LIMIT 10")
+        assert wdb_bound._FLAT == f0 + 2, wdb_bound._FLAT - f0
+        _exact("SELECT ts, u, a, b, COUNT(*) AS c FROM t GROUP BY ts, u, a, b ORDER BY c DESC, ts, u, a, b LIMIT 10")
+        assert wdb_bound._FLAT == f0 + 2, wdb_bound._FLAT - f0
+        import wdb_kernels as WK
+        old_tab = WK.FLAT_TAB
+        WK.FLAT_TAB = 64                    # a bucket's groups overflow the table: the hunt answers
+        try:
+            _exact("SELECT w, r, w2, COUNT(*) AS c FROM t GROUP BY w, r, w2 ORDER BY c DESC, w, r, w2 LIMIT 10")
+        finally:
+            WK.FLAT_TAB = old_tab
+        assert wdb_bound._FLAT == f0 + 2, wdb_bound._FLAT - f0
+    finally:
+        wdb_bound.FLAT_SHARE, wdb_bound.DENSE_MAX = old

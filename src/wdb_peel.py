@@ -58,7 +58,20 @@ def _kcodes(kk, rows):
     results (code order = value order either way)"""
     c = np.asarray(kk['seg'].codes_at(kk['pcol'], rows), dtype=np.int64)
     m = kk.get('map')
-    return c if m is None else m[c]
+    return c if m is None else map_codes(c, m)
+
+
+def map_codes(c, m):
+    """an expression key's codes through its map, on every core, into the narrowest unsigned type that holds
+    them (2026-10-14: the minute of EventTime at 100M rows was a serial numpy gather, 182 ms of the Q18
+    board's 0.9 s; the 60 minutes then travel as one byte a row, not eight)"""
+    import wdb_kernels
+    hi = int(m.max()) if m.size else 0
+    dt = np.uint8 if hi < (1 << 8) else np.uint16 if hi < (1 << 16) else np.uint32 if hi < (1 << 32) else np.int64
+    mm = np.ascontiguousarray(m, dtype=dt)
+    out = np.empty(c.size, dt)
+    wdb_kernels.plut_u8(np.ascontiguousarray(c), mm, out)
+    return out
 
 
 def _values(seg, pcol, rows):

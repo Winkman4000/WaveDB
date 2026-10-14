@@ -2012,6 +2012,14 @@ def extract_field(field, a):
     dictionary-riding group key (2026-10-13, the Q18 board: a minute key paid the general scan's per-row
     path, JavaEnable x minute x Age 10.8 s), so both roads emit the same integers."""
     field = str(field).upper()
+    if field in ('HOUR', 'MINUTE', 'SECOND', 'EPOCH'):
+        # the clock fields need no calendar (2026-10-14: the three calendar casts were 50 ms of the minute's
+        # 72 over EventTime's 1.4M distinct times, on every Q18-shape query)
+        us = a.astype('datetime64[us]').astype(np.int64)
+        if field == 'HOUR': return (us // 3_600_000_000) % 24
+        if field == 'MINUTE': return (us // 60_000_000) % 60
+        if field == 'SECOND': return (us // 1_000_000) % 60
+        return us / 1e6
     Y = a.astype('datetime64[Y]'); M = a.astype('datetime64[M]'); D = a.astype('datetime64[D]')
     y = Y.astype(np.int64) + 1970; m = (M.astype(np.int64) % 12) + 1; d = (D - M).astype(np.int64) + 1
     if field in ('YEAR', 'Y', 'YY', 'YYYY'): return y
@@ -2025,11 +2033,6 @@ def extract_field(field, a):
         import datetime as _dt9
         di = D.astype(np.int64)
         return np.array([(_dt9.date(1970, 1, 1) + _dt9.timedelta(days=int(x))).isocalendar()[1] for x in di], dtype=np.int64)
-    us = a.astype('datetime64[us]').astype(np.int64)
-    if field == 'HOUR': return (us // 3_600_000_000) % 24
-    if field == 'MINUTE': return (us // 60_000_000) % 60
-    if field == 'SECOND': return (us // 1_000_000) % 60
-    if field in ('EPOCH',): return us / 1e6
     raise TypeError('EXTRACT %s' % field)
 
 

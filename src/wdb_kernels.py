@@ -3093,23 +3093,86 @@ def _eq_and_nb(m, c, d, T):
                 m[i] = False
 
 
-def flat_count(ku, kr, offs, k, cap=1 << 16):
+def pack_u64(word, codes, shift):
+    """word |= codes << shift as unsigned 64-bit, in place, every core (the flat scan's composite key)"""
+    _pack_u64_nb(word, codes, np.int64(shift), _nt())
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _pack_u64_nb(word, codes, shift, T):
+    n = word.size
+    s = np.uint64(shift)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        for i in range(lo, hi):
+            word[i] |= np.uint64(codes[i]) << s
+
+
+def flat_scatter(comp, SH, T, keep=None):
+    """THE FLAT SCATTER: every row's composite key into one of 4096 buckets by its top bits (comp >> SH);
+    per-thread counts merge into stable offsets, as gd_pass1. keep (bool per row, optional): only those rows
+    (the heavy split's light rows, without gathering them first). Returns (keys in bucket order, offsets)."""
+    if keep is None:
+        return _flat_scatter_nb(comp, np.ones(1, np.bool_), np.int64(0), np.int64(SH), np.int64(T))
+    return _flat_scatter_nb(comp, keep, np.int64(1), np.int64(SH), np.int64(T))
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _flat_scatter_nb(comp, keep, use, SH, T):
+    n = comp.size
+    NB = 1 << 12
+    sh = np.uint64(SH)
+    pc = np.zeros((T, NB), np.int64)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        for i in range(lo, hi):
+            if use == 0 or keep[i]:
+                pc[t, np.int64(comp[i] >> sh)] += 1
+    offs = np.zeros(NB + 1, np.int64)
+    for b in range(NB):
+        s = 0
+        for t in range(T):
+            v = pc[t, b]
+            pc[t, b] = s
+            s += v
+        offs[b + 1] = offs[b] + s
+    P = np.empty(offs[NB], np.uint64)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        cur = np.empty(NB, np.int64)
+        for b in range(NB):
+            cur[b] = offs[b] + pc[t, b]
+        for i in range(lo, hi):
+            if use == 0 or keep[i]:
+                b = np.int64(comp[i] >> sh)
+                p = cur[b]
+                P[p] = comp[i]
+                cur[b] = p + 1
+    return P, offs
+
+
+def flat_count(P, offs, k, cap=1 << 16):
     """THE FLAT SCAN (2026-10-14, Jackson: "if we have to read everything then scan as fast as possible"):
-    after gd_pass1 scattered (flat key, packed other keys) rows into buckets by the flat key's top bits, every
-    group lives in exactly one bucket, so each bucket is counted on its own in a small open-addressing table
-    (key << 32 | rest -> count) that stays in cache. Pass A: the census of every group's count (-> the k-th
-    count c_k) and each bucket's biggest count. Pass B: only the buckets whose biggest count reaches c_k are
-    counted again and their groups with count >= c_k emitted (ties kept). Returns (packed keys, counts).
-    (Measured on 20M rows, 38 rows a flat value, 2 cores: 190 ms; a counting scatter + per-run sort was 440,
-    a whole-bucket sort 600.)"""
+    after flat_scatter put every row's composite key into a bucket by its top bits, every group lives in
+    exactly one bucket, so each bucket is counted on its own in an open-addressing table sized to twice its
+    rows, at most FLAT_TAB slots (a bucket of 362K rows on one screen size holds few groups; one whose groups
+    pass half the table declines the lane: None). Pass A: the census of every group's
+    count (-> the k-th count c_k) and each bucket's biggest count. Pass B: only the buckets whose biggest
+    count reaches c_k are counted again and their groups with count >= c_k emitted (ties kept). Returns
+    (composite keys, counts), or None. (Measured on 20M rows, 38 rows a value, 2 cores: 190 ms; a counting scatter +
+    per-run sort was 440, a whole-bucket sort 600.)"""
     T = int(wide_threads())
     order = gd_bucket_order(offs, T)
     if order.size == 0:
         return np.empty(0, np.uint64), np.empty(0, np.int64)
     sizes = (offs[order + 1] - offs[order]).astype(np.int64)
-    LB = max(1, int(2 * int(sizes.max()) - 1).bit_length())  # table: a power of two >= twice the biggest bucket
     bmax = np.zeros(order.size, np.int64)
-    hist = run_wide(_flat_hash_hist_nb, ku, kr, offs, order, bmax, np.int64(cap), np.int64(LB), pass_t=True)
+    hist = run_wide(_flat_hash_hist_nb, P, offs, order, bmax, np.int64(cap), np.int64(FLAT_TAB), pass_t=True)
+    if int(bmax.min()) < 0:
+        return None                                      # a bucket's groups overflowed its table: decline
     if int(hist[cap]) >= k:                              # counts past the cap: settle among them exactly
         ck = cap
     else:
@@ -3121,8 +3184,8 @@ def flat_count(ku, kr, offs, k, cap=1 << 16):
     starts[1:] = np.cumsum(np.where(qual, sizes, 0))     # room: a bucket has at most as many groups as rows
     keys = np.empty(int(starts[-1]), np.uint64); cnts = np.empty(keys.size, np.int64)
     got = np.zeros(order.size, np.int64)
-    run_wide(_flat_hash_emit_nb, ku, kr, offs, order, bmax, np.int64(ck), np.int64(LB), starts, keys, cnts,
-             got, pass_t=True)
+    run_wide(_flat_hash_emit_nb, P, offs, order, bmax, np.int64(ck), starts, keys, cnts, got, np.int64(FLAT_TAB),
+             pass_t=True)
     q = np.flatnonzero(got)
     if q.size:
         sel = np.concatenate([np.arange(starts[j], starts[j] + got[j], dtype=np.int64) for j in q])
@@ -3137,43 +3200,57 @@ def flat_count(ku, kr, offs, k, cap=1 << 16):
     return keys, cnts
 
 
+FLAT_TAB = 1 << 20      # the flat scan's table, per thread: 12 MB (a bucket holding more than half this many
+                        # groups declines the lane -- 4096 buckets, so a 2-billion-group composite)
+
+
 @njit(nogil=True, inline='always')
-def _flat_hash_fill(ku, kr, lo, hi, tk, tc, LB):
-    """count the bucket's rows into the table's first 2^lb slots; returns lb"""
-    m = 1
-    lb = 0
-    while m < 2 * (hi - lo):
+def _flat_tab(P, lo, hi, tk, tc):
+    """count P[lo:hi] into the open-addressing table (tk keys, tc counts) sized to twice the bucket's rows,
+    at most the whole table; returns the slots used (m), or -1 when the groups overflow half the table"""
+    cap = tk.size
+    m = 16
+    lb = 4
+    while m < 2 * (hi - lo) and m < cap:
         m <<= 1
         lb += 1
-    M = m - 1
     for x in range(m):
         tc[x] = 0
-    sh = np.uint64(64 - max(lb, 1))
+    M = m - 1
+    lim = m >> 1
+    used = 0
+    sh = np.uint64(64 - lb)
+    C = np.uint64(0x9E3779B97F4A7C15)
     for i in range(lo, hi):
-        v = (np.uint64(ku[i]) << np.uint64(32)) | np.uint64(kr[i])
-        h = np.int64((v * np.uint64(0x9E3779B97F4A7C15)) >> sh) & M
+        v = P[i]
+        h = np.int64((v * C) >> sh) & M
         while True:
             if tc[h] == 0:
                 tk[h] = v
                 tc[h] = 1
+                used += 1
                 break
             if tk[h] == v:
                 tc[h] += 1
                 break
             h = (h + 1) & M
+        if used > lim:
+            return -1
     return m
 
 
 @njit(nogil=True, parallel=True, cache=True)
-def _flat_hash_hist_nb(ku, kr, offs, order, bmax, cap, LB, T):
+def _flat_hash_hist_nb(P, offs, order, bmax, cap, TAB, T):
     part = np.zeros((T, cap + 1 + 16), np.int64)
-    L = np.int64(1) << LB
     for t in prange(T):
-        tk = np.empty(L, np.uint64)
-        tc = np.zeros(L, np.int32)
+        tk = np.empty(TAB, np.uint64)
+        tc = np.empty(TAB, np.int32)
         for j in range(t, order.size, T):
             b = order[j]
-            m = _flat_hash_fill(ku, kr, offs[b], offs[b + 1], tk, tc, LB)
+            m = _flat_tab(P, offs[b], offs[b + 1], tk, tc)
+            if m < 0:
+                bmax[j] = -1
+                continue
             mx = 0
             for x in range(m):
                 c = np.int64(tc[x])
@@ -3194,16 +3271,15 @@ def _flat_hash_hist_nb(ku, kr, offs, order, bmax, cap, LB, T):
 
 
 @njit(nogil=True, parallel=True, cache=True)
-def _flat_hash_emit_nb(ku, kr, offs, order, bmax, ck, LB, starts, keys, cnts, got, T):
-    L = np.int64(1) << LB
+def _flat_hash_emit_nb(P, offs, order, bmax, ck, starts, keys, cnts, got, TAB, T):
     for t in prange(T):
-        tk = np.empty(L, np.uint64)
-        tc = np.zeros(L, np.int32)
+        tk = np.empty(TAB, np.uint64)
+        tc = np.empty(TAB, np.int32)
         for j in range(t, order.size, T):
             if bmax[j] < ck:
                 continue
             b = order[j]
-            m = _flat_hash_fill(ku, kr, offs[b], offs[b + 1], tk, tc, LB)
+            m = _flat_tab(P, offs[b], offs[b + 1], tk, tc)
             w = starts[j]
             for x in range(m):
                 if np.int64(tc[x]) >= ck:

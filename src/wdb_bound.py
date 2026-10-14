@@ -31,8 +31,8 @@ _HITS = 0
 _ROUNDS = 0
 _HEAVY = 0             # answers by the heavy split
 _FLAT = 0              # answers by the flat scan
+_LIGHT_FLAT = 0        # heavy splits whose light rows were scanned flat
 FLAT_SHARE = 0.5       # the bounds keep more than this share of the rows: they cannot prune -- scan flat instead
-FLAT_BUCKET = 1 << 20  # the flat key's biggest scatter bucket: its count table (2x, 12 bytes a slot) per thread
 
 
 def _census(codes, V):
@@ -134,10 +134,9 @@ def run(rows, keys, plan, order, k):
     if not order or plan[order[0][0]][0] != 'count' or not order[0][1] or len(keys) < 2:
         return None
     seg0 = keys[0]['seg']
-    if rows is None:
-        rows = np.arange(int(seg0.N), dtype=np.int64)
-    rows = np.asarray(rows, dtype=np.int64)
-    n = int(rows.size)
+    if rows is not None:
+        rows = np.asarray(rows, dtype=np.int64)
+    n = int(seg0.N) if rows is None else int(rows.size)   # rows None: every row (never materialised)
     if n == 0 or k <= 0:
         _HITS += 1
         return []
@@ -147,7 +146,7 @@ def run(rows, keys, plan, order, k):
         nonlocal t0
         if bill is not None:
             t1 = time.perf_counter(); bill.append('%s=%.0fms' % (nm, (t1 - t0) * 1e3)); t0 = t1
-    full = n == int(seg0.N)                              # every row survives: whole-column codes, no gather
+    full = rows is None or n == int(seg0.N)              # every row survives: whole-column codes, no gather
     codes = [_kcodes_all(kk) if full else wdb_peel._kcodes(kk, rows) for kk in keys]
     tick('codes')
     Vs = [(len(kk['labels']) if kk.get('labels') is not None else int(kk['seg'].cols[kk['pcol']]['V']))
@@ -211,7 +210,7 @@ def run(rows, keys, plan, order, k):
         theta = max(1, ck)                               # one more pass keeps every group that can reach c_k
     else:
         return None
-    out = _emit(rows if keep is None else rows[keep], keys, ukeys, gid, cnt, plan, order, k)
+    out = _emit(rows if keep is None else (keep if rows is None else rows[keep]), keys, ukeys, gid, cnt, plan, order, k)
     tick('emit')
     _say(bill, ' '.join(bill or []))
     if out is not None:
@@ -286,13 +285,24 @@ def _heavy_split(rows, codes, Vs, cnts, keys, plan, order, k, tick):
     for j, d in zip(H, tops):
         hk[:, j] = d
     tick('heavy cells(%d)' % nz.size)
-    light = np.flatnonzero(~heavy)
-    if light.size:
+    nl = n - nh
+    got = None
+    if nl and os.environ.get('WDB_FLAT', '1') != '0':
+        # THE LIGHT ROWS, SCANNED FLAT (2026-10-14): only the light rows' own top k can reach the answer's top k
+        # (the answer's k-th count is at least the light rows' k-th), so the flat scan counts them in place --
+        # no gather, no factorise -- and hands over its candidates
+        got = _flat_candidates(codes, Vs, k, tick, keep=~heavy)
+    if got is not None:
+        global _LIGHT_FLAT
+        _LIGHT_FLAT += 1
+        lk, lcnt = got
+    elif nl:
+        light = np.flatnonzero(~heavy)
         lk, lgid = _group([c[light] for c in codes])
         lcnt = np.bincount(lgid, minlength=lk.shape[0]).astype(np.int64)
     else:
         lk = np.empty((0, len(Vs)), np.int64); lcnt = np.empty(0, np.int64)
-    tick('light(%d rows, %d groups)' % (light.size, lk.shape[0]))
+    tick('light(%d rows, %d groups%s)' % (nl, lk.shape[0], ', flat' if got is not None else ''))
     ukeys = np.concatenate([hk, lk]); cnt = np.concatenate([np.asarray(cells[nz], np.int64), lcnt])
     return _emit(rows, keys, ukeys, None, cnt, plan, order, k)
 
@@ -300,50 +310,77 @@ def _heavy_split(rows, codes, Vs, cnts, keys, plan, order, k, tick):
 def _flat(rows, codes, Vs, cnts, keys, plan, order, k, tick):
     """THE FLAT SCAN (2026-10-14, Jackson: "if we have to read everything then we just need to scan as fast as
     possible and get it over with"): when no bound prunes (a time key as the person: every value a handful of
-    rows), the hunt's filter and factorise are pure overhead. Instead one key -- the FLAT key, whose values
-    spread the rows most evenly -- scatters every row into 4096 buckets by its top bits, carrying the other keys
-    packed into one 32-bit word; every group then lives in one bucket, counted in a small table that stays in
-    cache: a census of the counts gives the k-th count, and only the buckets holding a group that reaches it
-    are counted again to emit (ties kept). Every row is read once into the scatter and once in cache -- no
-    filter, no table the size of the groups.
-    COUNT-only plans. None when no key fits the shape (the caller hunts as before)."""
+    rows), the hunt's filter and factorise are pure overhead. Instead every row's keys pack into one 64-bit
+    composite, the rows scatter into 4096 buckets by the composite's top bits, and every group -- living in
+    exactly one bucket -- is counted in that bucket's small table, which stays in cache: a census of the counts
+    gives the k-th count, and only the buckets holding a group that reaches it are counted again to emit (ties
+    kept). Every row is read once into the scatter and once in cache -- no filter, no table the size of the
+    groups.
+    WHICH KEY LEADS: the composite's top bits are its first key's (and the next's, when the first is narrower
+    than 12 bits), so the leading key decides how evenly rows spread over the buckets. Each key is tried in the
+    lead on a strided sample and the evenest wins (WindowClientHeight's commonest value is 1.67M rows; with the
+    minute in the lead it splits across 60 x 64 buckets).
+    COUNT-only plans. None when the keys pass 64 bits (the caller hunts as before)."""
+    got = _flat_candidates(codes, Vs, k, tick)
+    if got is None:
+        return None
+    ukeys, cnt = got
+    out = _emit(rows, keys, ukeys, None, cnt, plan, order, k)
+    tick('emit')
+    return out
+
+
+def _flat_candidates(codes, Vs, k, tick, keep=None):
+    """the flat scan's count: (unique key rows, counts) of every group whose count reaches the k-th count of the
+    rows counted (all, or those `keep` marks), ties kept -- None when the keys pass 64 bits or a bucket's groups
+    overflow its table"""
     import wdb_kernels
     n = codes[0].size
     widths = [max(1, (int(V) - 1).bit_length()) for V in Vs]
-    best = None
-    for j in range(len(Vs)):
-        if Vs[j] >= (1 << 32) or sum(widths) - widths[j] > 32:
-            continue
-        SH = max(0, widths[j] - 12)
-        c = np.asarray(cnts[j], np.int64)
-        big = int(np.add.reduceat(c, np.arange(0, c.size, 1 << SH)).max()) if c.size else 0
-        if best is None or big < best[1]:
-            best = (j, big, SH)
-    if best is None or best[1] > max(FLAT_BUCKET, n // 4096):
-        tick('flat: no key fits (%s)' % (best[1] if best else '-'))
+    W = sum(widths)
+    if W > 64:
+        tick('flat: %d key bits' % W)
         return None
-    f, _big, SH = best
-    rest = [j for j in range(len(Vs)) if j != f]
-    rc = np.zeros(n, np.uint32)                          # the other keys, packed by bit width (<= 32 bits)
-    place = []; bit = 0
-    for j in rest:
-        wdb_kernels.pack_or(rc, np.ascontiguousarray(codes[j]), bit)
-        place.append((j, bit, widths[j])); bit += widths[j]
-    tick('flat pack(key %d, %d bits)' % (f, bit))
-    ku, kr, offs = wdb_kernels.gd_pass1(np.ascontiguousarray(codes[f]), rc, np.int64(SH), np.int64(8))
-    del rc
-    tick('flat scatter(biggest bucket %d)' % _big)
-    pk, cnt = wdb_kernels.flat_count(ku, kr, offs, int(k))
-    del ku, kr
-    tick('flat sort+runs(%d candidates)' % pk.size)
+    SH = max(0, W - 12)
+    st = max(1, n // SAMPLE)
+    smp = [np.asarray(c[::st], np.uint64) for c in codes]
+    if keep is not None:
+        ks = keep[::st]
+        smp = [c[ks] for c in smp]
+    if smp[0].size == 0:
+        smp = [np.zeros(1, np.uint64) for _ in codes]
+    best = None
+    for lead in range(len(Vs)):
+        lay = [lead] + [j for j in range(len(Vs)) if j != lead]
+        cs = np.zeros(smp[0].size, np.uint64)
+        for j in lay:
+            cs = (cs << np.uint64(widths[j])) | smp[j]
+        big = int(np.bincount((cs >> np.uint64(SH)).astype(np.int64), minlength=1).max())
+        if best is None or big < best[1]:
+            best = (lay, big)
+    lay, big = best
+    comp = np.zeros(n, np.uint64)
+    pos = {}
+    bit = W
+    for j in lay:
+        bit -= widths[j]
+        pos[j] = bit
+        wdb_kernels.pack_u64(comp, np.ascontiguousarray(codes[j]), bit)
+    tick('flat pack(lead key %d, %d bits, sampled biggest bucket %d of %d)' % (lay[0], W, big, smp[0].size))
+    P, offs = wdb_kernels.flat_scatter(comp, SH, 8, keep)
+    del comp
+    tick('flat scatter(biggest bucket %d)' % int(np.diff(offs).max()))
+    got = wdb_kernels.flat_count(P, offs, int(k))
+    del P
+    if got is None:
+        tick('flat: a bucket overflowed its table')
+        return None
+    pk, cnt = got
+    tick('flat count(%d candidates)' % pk.size)
     ukeys = np.empty((pk.size, len(Vs)), np.int64)
-    ukeys[:, f] = (pk >> np.uint64(32)).astype(np.int64)
-    lo = (pk & np.uint64(0xFFFFFFFF)).astype(np.int64)
-    for j, b0, w in place:
-        ukeys[:, j] = (lo >> b0) & ((1 << w) - 1)
-    out = _emit(rows, keys, ukeys, None, cnt.astype(np.int64), plan, order, k)
-    tick('emit')
-    return out
+    for j in range(len(Vs)):
+        ukeys[:, j] = ((pk >> np.uint64(pos[j])) & np.uint64((1 << widths[j]) - 1)).astype(np.int64)
+    return ukeys, cnt.astype(np.int64)
 
 
 def _say(bill, msg):
@@ -354,7 +391,7 @@ def _say(bill, msg):
 def _kcodes_all(kk):
     c = np.asarray(kk['seg'].codes(kk['pcol']))
     m = kk.get('map')
-    return c if m is None else m[c]
+    return c if m is None else wdb_peel.map_codes(c, m)
 
 
 def _emit(krows, keys, ukeys, gid, cnt, plan, order, k):
@@ -379,7 +416,7 @@ def _emit(krows, keys, ukeys, gid, cnt, plan, order, k):
                     gid = gid()
                 pos = np.full(G, -1, np.int64); pos[cand] = np.arange(C, dtype=np.int64)
                 cg = pos[gid]; on = cg >= 0
-                crows = krows[on]; cg = cg[on]
+                crows = np.flatnonzero(on) if krows is None else krows[on]; cg = cg[on]   # krows None: every row
             kind, sg, pc = e[1], e[2], e[3]
             v = wdb_peel._values(sg, pc, crows)
             if v.dtype.kind == 'f' and np.isnan(v).any():
