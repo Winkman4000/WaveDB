@@ -129,6 +129,7 @@ def _minute_table(seg, dtcol):
 
 
 _TTBITS = [__import__('os').environ.get('WDB_TT_CHECKLISTS', '1') != '0']
+TALLY_MAX_BYTES = 512 << 20     # the checklists' (heavy person x minute) tally boards, all lanes
 
 
 def _emit_rows(seg, spec, uid, sp, picks):
@@ -180,8 +181,8 @@ def _walk_checklists(seg, spec, uc, ucnt, pos8, lits8, spc, e0, emptyc, dtc, mt)
         heavy = np.flatnonzero(hv)
         H = int(heavy.size)
         empty_ok = bool(emptyc >= theta)
-        if empty_ok and L * max(1, H) * 60 * 4 > (512 << 20):
-            return None                                   # the tally would not be small: the old walk
+        if empty_ok and L * max(1, H) * 60 * 4 > TALLY_MAX_BYTES:
+            return 'TALLY_TOO_BIG'                        # the tally would not be small: the old walk (or a decline)
         ubit = np.packbits(hv, bitorder='little')
         pbit = np.packbits(spc >= theta, bitorder='little')
         uidx = np.full(ucnt.size, -1, np.int32)
@@ -252,6 +253,16 @@ def execute(seg, spec):
         mt = np.ascontiguousarray(_minute_table(seg, dtc))
         if _TTBITS[0] and not spec.get('free'):
             got = _walk_checklists(seg, spec, uc, ucnt, pos8, lits8, spc, e0, emptyc, dtc, mt)
+            if got == 'TALLY_TOO_BIG':
+                # THE FLAT-PERSON GATE (2026-10-14, the Q18 board): hundreds of thousands of "person" values
+                # clear the bar at once (ClientEventTime, LocalEventTime: ~40 rows a value, none heavy) -- the
+                # checklists cannot tally them and the old walk ladders the bar down over every row, 3.4-3.8 s.
+                # Hand the query on (the bound hunt's flat scan answers it in ~1.0 s) -- unless the person IS the minute's
+                # own time column (EventTime x minute of EventTime): its groups never split by minute and the
+                # old walk is quick (0.7 s against the hunt's 1.3 s). Measured on all 124 tripletop pairs.
+                if uid != dtc:
+                    return None
+                got = None
             if got is not None:
                 return got
         ec = np.ascontiguousarray(seg._raw_codes(dtc))

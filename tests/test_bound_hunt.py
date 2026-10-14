@@ -111,3 +111,42 @@ def test_heavy_split():
     _exact("SELECT h, minute(ts) AS m, a, COUNT(*) AS c FROM t GROUP BY h, m, a ORDER BY c DESC, h, m, a LIMIT 10")
     assert wdb_bound._HEAVY == h0 + 2
     _exact("SELECT g, h, COUNT(*) AS c FROM t WHERE r <> 0 GROUP BY g, h ORDER BY c DESC, g, h LIMIT 10", hunted=None)
+
+
+def test_flat_scan():
+    """u x minute x, ts x x: no bound prunes (the bounds keep every row) -- the flat scan answers: scatter by the
+    evenest key, sort each bucket in cache, every run one group"""
+    f0 = wdb_bound._FLAT
+    _exact("SELECT u, minute(ts) AS m, x, COUNT(*) AS c FROM t GROUP BY u, minute(ts), x "
+           "ORDER BY c DESC, u, m, x LIMIT 10")
+    _exact("SELECT ts, minute(ts) AS m, x, COUNT(*) AS c FROM t GROUP BY ts, minute(ts), x "
+           "ORDER BY c DESC, ts, m, x LIMIT 10")
+    _exact("SELECT r, u, x, COUNT(*) AS c FROM t GROUP BY r, u, x ORDER BY c DESC, r, u, x LIMIT 25")
+    assert wdb_bound._FLAT == f0 + 3, wdb_bound._FLAT - f0
+    old = os.environ.get('WDB_FLAT')
+    os.environ['WDB_FLAT'] = '0'
+    try:
+        _exact("SELECT u, minute(ts) AS m, x, COUNT(*) AS c FROM t GROUP BY u, minute(ts), x "
+               "ORDER BY c DESC, u, m, x LIMIT 10")
+        assert wdb_bound._FLAT == f0 + 3
+    finally:
+        if old is None: os.environ.pop('WDB_FLAT', None)
+        else: os.environ['WDB_FLAT'] = old
+
+
+def test_flat_count_kernel():
+    """the kernel against np.unique, including the census cap (counts past it settled exactly)"""
+    import numpy as np, wdb_kernels as WK
+    rng = np.random.default_rng(7)
+    n = 300_000
+    a = (rng.zipf(1.3, n) % 70_000).astype(np.int64)
+    r = rng.integers(0, 40, n).astype(np.uint32)
+    ku, kr, offs = WK.gd_pass1(a, r, np.int64(5), np.int64(8))
+    P = (a.astype(np.uint64) << np.uint64(32)) | r.astype(np.uint64)
+    u, c = np.unique(P, return_counts=True)
+    for k in (1, 10, 100):
+        ck = np.sort(c)[::-1][k - 1]
+        want = dict(zip(u[c >= ck].tolist(), c[c >= ck].tolist()))
+        for cap in (1 << 16, 4, 1):
+            pk, pc = WK.flat_count(ku, kr, offs, k, cap=cap)
+            assert dict(zip(pk.tolist(), pc.tolist())) == want, (k, cap)

@@ -30,6 +30,9 @@ TARGET = 1 << 21        # aim the first threshold at about this many kept rows
 _HITS = 0
 _ROUNDS = 0
 _HEAVY = 0             # answers by the heavy split
+_FLAT = 0              # answers by the flat scan
+FLAT_SHARE = 0.5       # the bounds keep more than this share of the rows: they cannot prune -- scan flat instead
+FLAT_BUCKET = 1 << 20  # the flat key's biggest scatter bucket: its count table (2x, 12 bytes a slot) per thread
 
 
 def _census(codes, V):
@@ -127,7 +130,7 @@ def _theta_sampled(codes, n, k):
 def run(rows, keys, plan, order, k):
     """rows: base rows of the survivors (None = every row). keys / plan / order as wdb_peel.run takes them;
     order[0] must be COUNT descending. Returns the k emitted rows or None (decline)."""
-    global _HITS, _ROUNDS, _HEAVY
+    global _HITS, _ROUNDS, _HEAVY, _FLAT
     if not order or plan[order[0][0]][0] != 'count' or not order[0][1] or len(keys) < 2:
         return None
     seg0 = keys[0]['seg']
@@ -167,12 +170,26 @@ def run(rows, keys, plan, order, k):
             _HITS += 1
             _HEAVY += 1
             return out
+    theta = _theta_sampled(codes, n, k)
+    tick('theta(%s)' % theta)
+    if theta is not None and os.environ.get('WDB_FLAT', '1') != '0' and all(e[0] in ('key', 'count') for e in plan):
+        # THE FLAT GATE: the share of rows the threshold would keep, read off the sample's bounds (the full
+        # bound pass is the hunt's own cost -- the flat scan never needs it)
+        st = max(1, n // SAMPLE)
+        sb = _bound([c[::st] for c in codes], cnts)
+        share = 1.0 if theta <= 1 else float(np.count_nonzero(sb >= theta)) / max(1, sb.size)
+        if share > FLAT_SHARE:
+            tick('flat gate(%.2f kept)' % share)
+            out = _flat(rows, codes, Vs, cnts, keys, plan, order, k, tick)
+            if out is not None:
+                _say(bill, ' '.join(bill or []))
+                _HITS += 1
+                _FLAT += 1
+                return out
     b = _bound(codes, cnts)
     tick('bound')
-    theta = _theta_sampled(codes, n, k)
     if theta is None:
         theta = _theta_for(b, min(TARGET, int(MAX_SHARE * n)))
-    tick('theta(%d)' % theta)
     for _round in range(2):
         _ROUNDS += 1
         if theta <= 1:
@@ -278,6 +295,55 @@ def _heavy_split(rows, codes, Vs, cnts, keys, plan, order, k, tick):
     tick('light(%d rows, %d groups)' % (light.size, lk.shape[0]))
     ukeys = np.concatenate([hk, lk]); cnt = np.concatenate([np.asarray(cells[nz], np.int64), lcnt])
     return _emit(rows, keys, ukeys, None, cnt, plan, order, k)
+
+
+def _flat(rows, codes, Vs, cnts, keys, plan, order, k, tick):
+    """THE FLAT SCAN (2026-10-14, Jackson: "if we have to read everything then we just need to scan as fast as
+    possible and get it over with"): when no bound prunes (a time key as the person: every value a handful of
+    rows), the hunt's filter and factorise are pure overhead. Instead one key -- the FLAT key, whose values
+    spread the rows most evenly -- scatters every row into 4096 buckets by its top bits, carrying the other keys
+    packed into one 32-bit word; every group then lives in one bucket, counted in a small table that stays in
+    cache: a census of the counts gives the k-th count, and only the buckets holding a group that reaches it
+    are counted again to emit (ties kept). Every row is read once into the scatter and once in cache -- no
+    filter, no table the size of the groups.
+    COUNT-only plans. None when no key fits the shape (the caller hunts as before)."""
+    import wdb_kernels
+    n = codes[0].size
+    widths = [max(1, (int(V) - 1).bit_length()) for V in Vs]
+    best = None
+    for j in range(len(Vs)):
+        if Vs[j] >= (1 << 32) or sum(widths) - widths[j] > 32:
+            continue
+        SH = max(0, widths[j] - 12)
+        c = np.asarray(cnts[j], np.int64)
+        big = int(np.add.reduceat(c, np.arange(0, c.size, 1 << SH)).max()) if c.size else 0
+        if best is None or big < best[1]:
+            best = (j, big, SH)
+    if best is None or best[1] > max(FLAT_BUCKET, n // 4096):
+        tick('flat: no key fits (%s)' % (best[1] if best else '-'))
+        return None
+    f, _big, SH = best
+    rest = [j for j in range(len(Vs)) if j != f]
+    rc = np.zeros(n, np.uint32)                          # the other keys, packed by bit width (<= 32 bits)
+    place = []; bit = 0
+    for j in rest:
+        wdb_kernels.pack_or(rc, np.ascontiguousarray(codes[j]), bit)
+        place.append((j, bit, widths[j])); bit += widths[j]
+    tick('flat pack(key %d, %d bits)' % (f, bit))
+    ku, kr, offs = wdb_kernels.gd_pass1(np.ascontiguousarray(codes[f]), rc, np.int64(SH), np.int64(8))
+    del rc
+    tick('flat scatter(biggest bucket %d)' % _big)
+    pk, cnt = wdb_kernels.flat_count(ku, kr, offs, int(k))
+    del ku, kr
+    tick('flat sort+runs(%d candidates)' % pk.size)
+    ukeys = np.empty((pk.size, len(Vs)), np.int64)
+    ukeys[:, f] = (pk >> np.uint64(32)).astype(np.int64)
+    lo = (pk & np.uint64(0xFFFFFFFF)).astype(np.int64)
+    for j, b0, w in place:
+        ukeys[:, j] = (lo >> b0) & ((1 << w) - 1)
+    out = _emit(rows, keys, ukeys, None, cnt.astype(np.int64), plan, order, k)
+    tick('emit')
+    return out
 
 
 def _say(bill, msg):

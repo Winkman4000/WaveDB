@@ -80,3 +80,43 @@ def test_checklist_walk_equals_old_walk_and_duck():
         shutil.rmtree(d, ignore_errors=True); shutil.rmtree(db_dir, ignore_errors=True)
         try: os.remove(pq)
         except OSError: pass
+
+
+def test_flat_person_gate():
+    """THE FLAT-PERSON GATE (2026-10-14): when the checklists' tally would not be small, tripletop hands the
+    query on (here the bound hunt answers) unless the person is the minute's own time column, whose groups
+    never split by minute -- then the old walk serves. Forced by a zero tally ceiling; answers against DuckDB."""
+    import duckdb, controller
+    import wdb_tripletop as TT
+    from wdb_db import Database
+    df = _frame()
+    d = os.path.join(TMP, 'ttg_' + uuid.uuid4().hex[:8]); pq = d + '.parquet'; db_dir = d + '_db'
+    os.makedirs(d)
+    floor = dict(WDB_LOAD_ANSWERS='0', WDB_SIDECARS='0', WDB_SEQ_NARROW_OK='0', WDB_SEQ_REPEATS_OK='0',
+                 WDB_PLANCACHE_OFF='1')
+    old = TT.TALLY_MAX_BYTES
+    try:
+        df.to_parquet(pq, index=False)
+        wdb = os.path.join(os.path.dirname(__file__), '..', 'bin', 'wdb')
+        subprocess.run([sys.executable, wdb, 'load', db_dir, 't', pq], check=True, capture_output=True,
+                       env=dict(os.environ, WDB_E8_FORCE='1', **floor))
+        TT.TALLY_MAX_BYTES = 0
+        with _env(**floor):
+            db = Database.open(db_dir)
+            for sql, served_by_tt in (
+                    ("SELECT uid, extract(minute FROM ts) AS m, ph, COUNT(*) AS c FROM t GROUP BY uid, m, ph "
+                     "ORDER BY c DESC LIMIT 10", False),
+                    ("SELECT ts, extract(minute FROM ts) AS m, ph, COUNT(*) AS c FROM t GROUP BY ts, m, ph "
+                     "ORDER BY c DESC LIMIT 10", True)):
+                h0 = TT._HITS
+                got = [tuple(x) for x in db.run(sql)[0]]
+                assert (TT._HITS == h0 + 1) == served_by_tt, (sql, controller._SERVED[0])
+                truth = {tuple(r[:3]): int(r[3]) for r in duckdb.sql(
+                    sql.replace(' FROM t GROUP', " FROM read_parquet('%s') GROUP" % pq).split(' ORDER BY')[0]).fetchall()}
+                top = sorted(truth.values(), reverse=True)[:10]
+                assert [int(x[3]) for x in got] == top, (sql, got[:3], top[:3])
+                for r in got:
+                    assert truth.get(tuple(r[:3])) == int(r[3]), (sql, r)
+    finally:
+        TT.TALLY_MAX_BYTES = old
+        shutil.rmtree(d, ignore_errors=True); shutil.rmtree(db_dir, ignore_errors=True)
