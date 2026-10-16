@@ -319,13 +319,21 @@ def execute(seg, spec):
             board = [(int(E[u]), int(u), int(e0)) for u in topi.tolist()]
             board.sort(reverse=True)
         kth9 = board[k - 1][0] if len(board) >= k else 0
+        if kth9 <= 0:
+            # THE EMPTY BAR (2026-10-15, the Q16 board): fewer than k persons own an empty-phrase group (a yes/no or
+            # tiny person: GoodEvent, IsOldCounter), so the bar is 0 and the walk would pack and SORT every
+            # non-empty phrase row on one core (13.2M rows, 4.9 s against DuckDB's 0.55). Hand the query on: the
+            # pair count composed from the atoms (gridwalk: a parallel tally of the 2 x 6M cells) answers it.
+            return None
         cand = np.flatnonzero(pcnt > kth9)
         if cand.size:
             cm = np.zeros(ucnt.size, bool)
             cm[cand] = True
             spm9 = spc > kth9                # the phrase-cut: a pair can't beat
             sel = np.flatnonzero(cm[ucp] & spm9[lits8])   # kth on a rarer phrase
-            pk = (ucp[sel] << 23) | lits8[sel]
+            # the person's codes widen BEFORE the shift (2026-10-15: a narrow person -- uint8 codes, a yes/no
+            # column -- shifted 23 places inside its own dtype came back 0, and every person's phrase rows merged)
+            pk = (ucp[sel].astype(np.int64) << 23) | lits8[sel]
             pk.sort(kind='stable')
             b9 = np.empty(pk.size, bool)
             if pk.size:

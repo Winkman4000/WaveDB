@@ -148,7 +148,8 @@ def test_flat_scan():
 
 def test_flat_count_kernel():
     """the kernel against np.unique: the census cap (counts past it settled exactly), and one bucket holding
-    every row (its table sized to the whole); a table too small for a bucket's groups declines (None)"""
+    every row (its table sized to the whole); a bucket whose groups overflow the shared table is counted again
+    alone, in a table sized to its rows -- still exact"""
     import numpy as np, wdb_kernels as WK
     rng = np.random.default_rng(7)
     n = 300_000
@@ -167,7 +168,13 @@ def test_flat_count_kernel():
     old = WK.FLAT_TAB
     WK.FLAT_TAB = 1 << 10
     try:
-        assert WK.flat_count(P, offs, 10) is None
+        for SH in (49 - 12, 60):
+            P, offs = WK.flat_scatter(comp, np.int64(SH), np.int64(8))
+            for k in (1, 10, 100):
+                ck = np.sort(c)[::-1][k - 1]
+                want = dict(zip(u[c >= ck].tolist(), c[c >= ck].tolist()))
+                pk, pc = WK.flat_count(P, offs, k)
+                assert dict(zip(pk.tolist(), pc.tolist())) == want, ('overflow', SH, k)
     finally:
         WK.FLAT_TAB = old
 
@@ -175,7 +182,7 @@ def test_flat_count_kernel():
 def test_flat_scan_lead_key():
     """w x r x w2 (screen-size-like keys: each has a common value holding many rows): the key that spreads the
     rows most evenly over the buckets leads the composite; exact either way round. Keys past 64 bits (ts, u, a,
-    b: 66) decline to the hunt."""
+    b: 66) decline to the hunt; buckets that overflow the shared table are counted alone."""
     f0 = wdb_bound._FLAT
     old = wdb_bound.FLAT_SHARE, wdb_bound.DENSE_MAX
     wdb_bound.FLAT_SHARE = 0.0              # (the gate and the dense cells are not under test here: at 400K
@@ -188,11 +195,11 @@ def test_flat_scan_lead_key():
         assert wdb_bound._FLAT == f0 + 2, wdb_bound._FLAT - f0
         import wdb_kernels as WK
         old_tab = WK.FLAT_TAB
-        WK.FLAT_TAB = 64                    # a bucket's groups overflow the table: the hunt answers
+        WK.FLAT_TAB = 64                    # every bucket's groups overflow the table: each counted alone, exact
         try:
             _exact("SELECT w, r, w2, COUNT(*) AS c FROM t GROUP BY w, r, w2 ORDER BY c DESC, w, r, w2 LIMIT 10")
         finally:
             WK.FLAT_TAB = old_tab
-        assert wdb_bound._FLAT == f0 + 2, wdb_bound._FLAT - f0
+        assert wdb_bound._FLAT == f0 + 3, wdb_bound._FLAT - f0
     finally:
         wdb_bound.FLAT_SHARE, wdb_bound.DENSE_MAX = old

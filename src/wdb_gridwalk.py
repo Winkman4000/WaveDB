@@ -216,6 +216,71 @@ def _build(seg, cols):
     return head_gid, head_cnt, Vb, int(gid.size), bulk, ones, pos, nd
 
 
+_COMPOSE = [__import__('os').environ.get('WDB_GRIDWALK_COMPOSE', '1') != '0']
+_COMPOSED = 0             # top-K answers by the composed atoms (no structure built)
+
+
+def _compose_top(seg, cols, lim):
+    """THE PAIR COUNT FROM THE ATOMS (2026-10-15, the Q16 board): the canonical top `lim` cells (count DESC,
+    gid ASC, gid = codeA * Vb + codeB over the name-sorted columns) WITHOUT building the structure -- the
+    structure lives one query (qmem) and its build was the whole bill: codes copied to 8 bytes and glued
+    (~280 ms), then ONE core tallied (~190 ms) or sorted all 100M keys (5-8 s) whenever the POSSIBLE pairs
+    passed 16.7M (WindowClientHeight x WindowClientWidth: 24.7M possible, 776K occurring), then every heavy
+    cell sorted and bulk-encoded for LIMITs nobody asked. Composed instead, on every core:
+      possible pairs <= DENSE_MAX: radix_acc glues the stored-width codes, bincount_par tallies the cells;
+      otherwise the flat lane (pack_u64 / flat_scatter / flat_count) counts only the pairs that occur;
+    then only the cells reaching the lim-th count (ties kept) are sorted canonically.
+    Returns (sel_gid, sel_cnt, Vb) or None (the structure build answers, as before)."""
+    import os, time
+    import wdb_kernels, wdb_bound
+    bill = os.environ.get('WDB_JOIN_BILL')
+    t0 = time.perf_counter(); T = []
+    def tick(nm):
+        nonlocal t0
+        if bill:
+            t1 = time.perf_counter(); T.append('%s=%.0fms' % (nm, (t1 - t0) * 1e3)); t0 = t1
+    a, b = sorted(cols)
+    if seg.cols[a].get('has_null') or seg.cols[b].get('has_null'):
+        return None                                   # a null code may sit past the dictionary: the build
+    Va = int(seg.cols[a]['V']); Vb = int(seg.cols[b]['V'])
+    if Va <= 0 or Vb <= 0:
+        return None
+    ca = np.ascontiguousarray(seg._raw_codes(a)); cb = np.ascontiguousarray(seg._raw_codes(b))
+    if ca.size == 0:
+        return None
+    if ca.dtype.kind not in 'iu' or cb.dtype.kind not in 'iu':
+        return None
+    tick('codes(%s,%s)' % (ca.dtype, cb.dtype))
+    prod = Va * Vb
+    if prod <= wdb_bound.DENSE_MAX:
+        comp = np.empty(ca.size, np.int64)
+        wdb_kernels.radix_acc(comp, ca, Va, True)
+        wdb_kernels.radix_acc(comp, cb, Vb, False)
+        tick('glue')
+        cells = wdb_kernels.bincount_par(comp, prod)
+        del comp
+        gid = np.flatnonzero(cells)
+        cnt = np.asarray(cells[gid], np.int64)
+        tick('tally(%d cells, %d occur)' % (prod, gid.size))
+        ck = wdb_bound._kth_largest(cnt, lim) if gid.size > lim else 0
+        if ck > 0:
+            keep = cnt >= ck
+            gid = gid[keep]; cnt = cnt[keep]
+    else:
+        got = wdb_bound._flat_candidates([ca, cb], [Va, Vb], int(lim), tick)
+        if got is None:
+            if bill:
+                print('GRIDWALK BILL: ' + ' '.join(T) + ' -> structure', flush=True)
+            return None
+        uk, cnt = got
+        gid = uk[:, 0].astype(np.int64) * Vb + uk[:, 1].astype(np.int64)
+    o = np.lexsort((gid, -cnt))[:lim]                 # the canonical prefix: count DESC, gid ASC
+    tick('pick(%d candidates)' % gid.size)
+    if bill:
+        print('GRIDWALK BILL: ' + ' '.join(T), flush=True)
+    return gid[o], cnt[o], Vb
+
+
 def _load(seg, cols):
     """RAM-resident: cache the count-head for this pair, built on first touch. Never disk."""
     a, b = sorted(cols)
@@ -362,14 +427,25 @@ def execute(seg, spec):
     global _HITS
     cols = spec['cols']; ci = spec['ci']; lim = spec['lim']; proj = spec['proj']
     knames = spec['knames']
-    loaded = _load(seg, cols)
-    if loaded is None:
-        return None
-    head_gid, head_cnt, Vb, nheavy, bulk, ones, pos, _nd = loaded
     if lim <= 0:
         return None
     a, b = sorted(cols)
-    if lim <= head_gid.size:
+    composed = None
+    if (_COMPOSE[0] and not spec.get('payphys') and not spec.get('unordered') and lim <= _HEAD_N
+            and _CACHE.get((seg.path, (a, b), int(seg.N))) is None):
+        composed = _compose_top(seg, cols, lim)
+    if composed is not None:
+        global _COMPOSED
+        _COMPOSED += 1
+        sel_gid, sel_cnt, Vb = composed
+    else:
+        loaded = _load(seg, cols)
+        if loaded is None:
+            return None
+        head_gid, head_cnt, Vb, nheavy, bulk, ones, pos, _nd = loaded
+    if composed is not None:
+        pass
+    elif lim <= head_gid.size:
         # hot path: the head is a canonical prefix -- top-K is a direct slice, plateaus included
         sel_gid = head_gid[:lim]; sel_cnt = head_cnt[:lim]
     elif lim <= nheavy:

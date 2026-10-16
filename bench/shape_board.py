@@ -32,6 +32,8 @@ ap.add_argument('--shape', default='q13')
 ap.add_argument('--k', default='')
 ap.add_argument('--d', default='')
 ap.add_argument('--no-duck', action='store_true')
+ap.add_argument('--duck-cache', default='', help="JSON lines: DuckDB's answer hash and times per query, reused "
+                "on later runs (the data and DuckDB never change between boards; keep one file per machine)")
 A = ap.parse_args()
 sys.path.insert(0, A.src)
 import duckdb, _cbnorm as N
@@ -107,6 +109,29 @@ con = duckdb.connect()
 con.execute('PRAGMA threads=%d' % int(os.environ.get('WDB_MAIN_THREADS', '16')))
 
 
+_DC = {}
+if A.duck_cache and os.path.exists(A.duck_cache):
+    for _l in open(A.duck_cache):
+        try:
+            _r = json.loads(_l); _DC[_r['sql']] = _r
+        except Exception:
+            pass
+
+
+def duck_cached(sql, runs, timeout):
+    """(DuckDB's answer hash, its times): from the cache when this query was answered before, else run and keep"""
+    hit = _DC.get(sql)
+    if hit is not None and len(hit['times']) >= runs:
+        return hit['hash'], hit['times']
+    rows, times = duck(sql, runs, timeout)
+    rec = {'sql': sql, 'hash': N.limit_hash(rows), 'times': times}
+    _DC[sql] = rec
+    if A.duck_cache:
+        with open(A.duck_cache, 'a') as f:
+            f.write(json.dumps(rec) + '\n')
+    return rec['hash'], times
+
+
 def duck(sql, runs, timeout):
     timer = threading.Timer(timeout, con.interrupt)
     timer.start()
@@ -155,8 +180,8 @@ class Wave:
 wave = Wave()
 
 
-def same_answer(sql, w_hash, d_rows):
-    if w_hash == N.limit_hash(d_rows):
+def same_answer(sql, w_hash, d_hash):
+    if w_hash == d_hash:
         return True
     cq = total_order_sql(sql)
     if cq is None:
@@ -166,8 +191,8 @@ def same_answer(sql, w_hash, d_rows):
     w2 = wave.ask(cq, 1, max(90.0, A.timeout * 4))
     if 'err' in w2:
         return False
-    d2, _ = duck(cq, 1, max(90.0, A.timeout * 4))
-    return w2['hash'] == N.limit_hash(d2)
+    d2, _ = duck_cached(cq, 1, max(90.0, A.timeout * 4))
+    return w2['hash'] == d2
 
 
 # ---------------------------------------------------------------- the run
@@ -204,9 +229,9 @@ for n, (k, d, form) in enumerate(todo, 1):
         rec['x_submitted'] = round(rec['hot'] / SUBMITTED['hot'], 2)
         if not A.no_duck:
             try:
-                d_rows, d_t = duck(sql, 2, max(60.0, A.timeout * 3))
+                d_hash, d_t = duck_cached(sql, 2, max(60.0, A.timeout * 3))
                 rec['duck_s'] = min(d_t)
-                rec['verdict'] = 'correct' if same_answer(sql, w['hash'], d_rows) else 'WRONG'
+                rec['verdict'] = 'correct' if same_answer(sql, w['hash'], d_hash) else 'WRONG'
             except Exception as e:
                 rec['verdict'] = 'unchecked'; rec['duck_err'] = str(e)[:120]
     LOG.write(json.dumps(rec) + '\n'); LOG.flush()

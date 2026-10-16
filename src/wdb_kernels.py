@@ -3159,7 +3159,7 @@ def flat_count(P, offs, k, cap=1 << 16):
     after flat_scatter put every row's composite key into a bucket by its top bits, every group lives in
     exactly one bucket, so each bucket is counted on its own in an open-addressing table sized to twice its
     rows, at most FLAT_TAB slots (a bucket of 362K rows on one screen size holds few groups; one whose groups
-    pass half the table declines the lane: None). Pass A: the census of every group's
+    pass half the table is counted again alone, in a table sized to its own rows). Pass A: the census of every group's
     count (-> the k-th count c_k) and each bucket's biggest count. Pass B: only the buckets whose biggest
     count reaches c_k are counted again and their groups with count >= c_k emitted (ties kept). Returns
     (composite keys, counts), or None. (Measured on 20M rows, 38 rows a value, 2 cores: 190 ms; a counting scatter +
@@ -3171,8 +3171,23 @@ def flat_count(P, offs, k, cap=1 << 16):
     sizes = (offs[order + 1] - offs[order]).astype(np.int64)
     bmax = np.zeros(order.size, np.int64)
     hist = run_wide(_flat_hash_hist_nb, P, offs, order, bmax, np.int64(cap), np.int64(FLAT_TAB), pass_t=True)
-    if int(bmax.min()) < 0:
-        return None                                      # a bucket's groups overflowed its table: decline
+    big = np.flatnonzero(bmax < 0)                       # buckets whose groups overflowed the shared table
+    bigk = []
+    for j in big.tolist():
+        # THE OVERFLOW BUCKET (2026-10-15, the Q16 board: Referer x IPNetworkID, one bucket of 3.5M rows holding
+        # more than 512K pairs): counted alone in a table sized to its own rows, its groups kept whole for the
+        # emit -- instead of declining the lane
+        b = int(order[j]); lo = int(offs[b]); hi = int(offs[b + 1])
+        m = 16
+        while m < 2 * (hi - lo):
+            m <<= 1
+        tk = np.empty(m, np.uint64); tc = np.empty(m, np.int32)
+        m = int(_flat_big_nb(P, np.int64(lo), np.int64(hi), tk, tc))
+        nz = np.flatnonzero(tc[:m])
+        kk = tk[nz]; cc = tc[nz].astype(np.int64)
+        hist += np.bincount(np.minimum(cc, cap), minlength=cap + 1)[:cap + 1]
+        bigk.append((kk, cc))
+        bmax[j] = 0                                      # the emit pass skips it: its groups are in hand
     if int(hist[cap]) >= k:                              # counts past the cap: settle among them exactly
         ck = cap
     else:
@@ -3192,6 +3207,9 @@ def flat_count(P, offs, k, cap=1 << 16):
         keys, cnts = keys[sel], cnts[sel]
     else:
         keys, cnts = keys[:0], cnts[:0]
+    if bigk:
+        keys = np.concatenate([keys] + [kk[cc >= ck] for kk, cc in bigk])
+        cnts = np.concatenate([cnts] + [cc[cc >= ck] for kk, cc in bigk])
     if int(hist[cap]) >= k and keys.size:                # the cap case: the true k-th among the big runs
         big = np.sort(cnts)[::-1]
         ck2 = int(big[min(k, big.size) - 1])
@@ -3201,7 +3219,7 @@ def flat_count(P, offs, k, cap=1 << 16):
 
 
 FLAT_TAB = 1 << 20      # the flat scan's table, per thread: 12 MB (a bucket holding more than half this many
-                        # groups declines the lane -- 4096 buckets, so a 2-billion-group composite)
+                        # groups is counted again alone, in a table sized to its rows)
 
 
 @njit(nogil=True, inline='always')
@@ -3237,6 +3255,11 @@ def _flat_tab(P, lo, hi, tk, tc):
         if used > lim:
             return -1
     return m
+
+
+@njit(nogil=True, cache=True)
+def _flat_big_nb(P, lo, hi, tk, tc):
+    return _flat_tab(P, lo, hi, tk, tc)
 
 
 @njit(nogil=True, parallel=True, cache=True)
