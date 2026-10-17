@@ -16,6 +16,11 @@ import wdb_sql
 _HITS = 0
 _OVERLAP = [__import__('os').environ.get('WDB_PF_OVERLAP', '1') == '1']  # A/B: 0 decodes a after the census, via codes_band
 _PFWARM = [__import__('os').environ.get('WDB_PF_WARM', '1') == '1']      # A/B: 0 leaves the plist to page faults
+_DENSE = [__import__('os').environ.get('WDB_PF_DENSE', '1') == '1']      # A/B: 0 buckets and sorts every pair space
+_UNIQUE_HANDOFF = [__import__('os').environ.get('WDB_PF_UNIQUE', '1') == '1']  # A/B: 0 keeps near-unique partners
+SMALL_MAX = 4 << 20          # the smaller key's values for pairfold (both keys past it: pairtop's)
+DENSE_MAX = 1 << 18         # pair slots Va x Vb for the dense fold: 16 thread tables x 3 x 8 B x 256K = 100 MB
+_DENSED = 0
 
 
 def detect(seg, tree, col_map):
@@ -23,17 +28,20 @@ def detect(seg, tree, col_map):
             or tree.args.get('having') or tree.args.get('distinct'):
         return None
     w = tree.args.get('where')
-    if w is None or not isinstance(w.this, E.NEQ):
-        return None
-    wl, wr = w.this.this, w.this.expression
-    if not (isinstance(wl, E.Column) and isinstance(wr, E.Literal)
-            and wr.is_string and str(wr.this) == ''):
-        return None
     cm = col_map or {}
-    fcol = cm.get(wl.name, wl.name)
-    fc = seg.cols.get(fcol)
-    if fc is None or fc.get('code_enc') not in (8, 9) or fc.get('has_null'):
-        return None
+    if w is None:
+        fcol = None                              # NO FILTER (2026-10-17, Q32's form): every row is a position
+    else:
+        if not isinstance(w.this, E.NEQ):
+            return None
+        wl, wr = w.this.this, w.this.expression
+        if not (isinstance(wl, E.Column) and isinstance(wr, E.Literal)
+                and wr.is_string and str(wr.this) == ''):
+            return None
+        fcol = cm.get(wl.name, wl.name)
+        fc = seg.cols.get(fcol)
+        if fc is None or fc.get('code_enc') not in (8, 9) or fc.get('has_null'):
+            return None
     g = tree.args.get('group')
     if g is None or len(g.expressions) != 2 \
             or not all(isinstance(x, E.Column) for x in g.expressions):
@@ -43,10 +51,23 @@ def detect(seg, tree, col_map):
     ac, bc = seg.cols.get(acol), seg.cols.get(bcol)
     if ac is None or bc is None or ac.get('has_null') or bc.get('has_null'):
         return None
-    if int(ac.get('V') or 1 << 30) > 256:
-        acol, bcol = bcol, acol                  # small key rides the low byte
+    Va0, Vb0 = int(ac.get('V') or 1 << 30), int(bc.get('V') or 1 << 30)
+    if Va0 > 256 and Vb0 < Va0:
+        acol, bcol = bcol, acol                  # the smaller key rides the low bits
         ac, bc = bc, ac
-    if int(ac.get('V') or 1 << 30) > 256 or int(bc.get('V') or 1 << 30) >= 1 << 40:
+        Va0, Vb0 = Vb0, Va0
+    # THE SMALL KEY'S OWN BITS (2026-10-17): the low field was one byte (a <= 256 values); it is now as
+    # wide as the smaller key needs, so a mid key pairs too. Both keys past SMALL_MAX values (WatchID x
+    # ClientIP) stay pairtop's; the packed pair must fit 62 bits
+    if Va0 > SMALL_MAX:
+        return None
+    abits = max(1, (Va0 - 1).bit_length())
+    if max(1, (Vb0 - 1).bit_length()) + abits > 62:
+        return None
+    # A NEAR-UNIQUE PARTNER IS PAIRTOP'S (2026-10-17, the c3 Q31 board): with the larger key holding a value
+    # per ~row (WatchID: 100M values in 100M rows) every pair counts ~1 and pairtop's walk wins -- SendTiming x
+    # WatchID 0.30 s there vs 1.19 s here; the Q31 board's WatchID family 12.5 s vs 25.2 s
+    if _UNIQUE_HANDOFF[0] and Vb0 >= max(1, int(getattr(seg, 'N', 0) or 0)) // 2:
         return None
     proj = []                                    # ('A',)('B',)('C',)('S',col)('V',col)
     calias = None
@@ -80,6 +101,8 @@ def detect(seg, tree, col_map):
         return None
     if len(scols) > 2 or not any(k[0] == 'C' for k in proj):
         return None
+    if fcol is None and not scols:
+        return None          # an unfiltered COUNT-only pair is gridwalk's composed tally (wdb_gridwalk._compose_top)
     ox = tree.args.get('order'); lx = tree.args.get('limit')
     if ox is None or lx is None or len(ox.expressions) != 1:
         return None
@@ -99,7 +122,7 @@ def detect(seg, tree, col_map):
     import wdb_policies as P
     if not P.no_deleted_rows(seg):
         return None
-    return {'f': fcol, 'a': acol, 'b': bcol, 'scols': scols, 'lim': lim,
+    return {'f': fcol, 'a': acol, 'b': bcol, 'scols': scols, 'lim': lim, 'abits': abits,
             'projkinds': proj, 'proj': tree.expressions}
 
 
@@ -115,7 +138,7 @@ def _dv(seg, col):
 
 
 def execute(seg, spec):
-    global _HITS
+    global _HITS, _DENSED
     import wdb_kernels as _WK
     # THE PLIST PATH (Jackson's audit: the counts were in the data all
     # along). The big key's plist offsets ARE the census (diff), its
@@ -123,7 +146,7 @@ def execute(seg, spec):
     # runs on slices: candidates descending, partner gathered at their
     # rows, one tiny bincount, the certificate verbatim. Zero storage,
     # zero N-arrays, nothing to purge.
-    if not spec.get('scols') and seg.cols.get(spec['a'], {}).get('code_enc') == 3 \
+    if spec['f'] is not None and not spec.get('scols') and seg.cols.get(spec['a'], {}).get('code_enc') == 3 \
             and seg.cols.get(spec['b'], {}).get('code_enc') == 8 \
             and int(seg.cols[spec['a']].get('V') or 999) <= 256 \
             and __import__('wdb_funnel').plist_ready(seg, spec['b']):    # THE VANILLA LAW: lists that may serve
@@ -200,21 +223,37 @@ def execute(seg, spec):
             out.append(tuple(row))
         _HITS += 1
         return out, [wdb_sql._alias(p) for p in spec['proj']]
-    pl = seg.e8_planes(spec['f'])
-    pos = np.ascontiguousarray(np.asarray(pl[0], dtype=np.int64))
+    if spec['f'] is None:
+        pos = None                               # no filter: the kernels walk every row in order
+    else:
+        pl = seg.e8_planes(spec['f'])
+        pos = np.ascontiguousarray(np.asarray(pl[0], dtype=np.int64))
     bc9 = np.asarray(seg._raw_codes(spec['b']))
     BV = int(seg.cols[spec['b']]['V'])
+    k = spec['lim']
+    scols = spec['scols']
+    x1 = scols[0] if scols else spec['a']
+    x2 = scols[1] if len(scols) > 1 else x1
+    VA = int(seg.cols[spec['a']]['V'])
+    if _DENSE[0] and VA * BV <= DENSE_MAX:
+        # THE SMALL PAIR SPACE: every pair gets its own slot, counted exactly -- no census, no
+        # prune, no certificate needed, no buckets, no sort
+        ac9 = np.asarray(seg._raw_codes(spec['a']))
+        cnt, s1, s2 = _WK.pf_dense(pos, ac9, bc9, np.asarray(seg._raw_codes(x1)), np.asarray(seg._raw_codes(x2)),
+                                   _dv(seg, x1), _dv(seg, x2), VA, VA * BV)
+        nzk = np.flatnonzero(cnt)
+        ucnt = cnt[nzk]; us1 = s1[nzk]; us2 = s2[nzk]
+        ukey = ((nzk // VA) << spec['abits']) | (nzk % VA)
+        order = np.lexsort((ukey, -ucnt))[:min(k, ucnt.size)]      # count DESC, then (b, a) ASC
+        _DENSED += 1
+        return _pluck(seg, spec, order, ukey, ucnt, {x1: us1, x2: us2})
     memo = seg.__dict__.setdefault('_censusmemo', {})
     ckey = ('pf', spec['f'], spec['b'])
     cnt_b = memo.get(ckey)
     if cnt_b is None:                        # the bound: a pair can never
-        cnt_b = np.bincount(bc9[pos], minlength=BV)   # outscore its b's total
+        cnt_b = np.bincount(bc9 if pos is None else bc9[pos], minlength=BV)   # outscore its b's total
         memo[ckey] = cnt_b
-    k = spec['lim']
     ac9 = np.asarray(seg._raw_codes(spec['a']))
-    scols = spec['scols']
-    x1 = scols[0] if scols else spec['a']
-    x2 = scols[1] if len(scols) > 1 else x1
     xc9 = np.asarray(seg._raw_codes(x1))
     yc9 = np.asarray(seg._raw_codes(x2))
     SH = max(0, BV.bit_length() - 12)
@@ -238,19 +277,22 @@ def execute(seg, spec):
                 heavy = np.zeros(BV, np.bool_)                   # remember
                 heavy[thr_idx] = True
                 max_excl = int(cnt_b[~heavy].max()) if M9 < BV else 0
-                spos9 = _WK.pf_prune(pos, bc9, heavy)
+                spos9 = _WK.pf_prune_all(bc9, heavy) if pos is None else _WK.pf_prune(pos, bc9, heavy)
                 memo[hkey] = (max_excl, spos9)
                 hit = memo[hkey]
             max_excl, spos = hit
-        key, pay, offs = _WK.pr_scatter(spos, ac9, bc9, xc9, yc9, SH, T9)
+        if spos is None:                     # no filter, no prune: every row
+            key, pay, offs = _WK.pr_scatter_all(ac9, bc9, xc9, yc9, SH, spec['abits'], T9)
+        else:
+            key, pay, offs = _WK.pr_scatter2(spos, ac9, bc9, xc9, yc9, SH, spec['abits'], T9)
         n = key.size
         ucnt = np.zeros(n, np.int64)
         us1 = np.zeros(n, np.float64)
         us2 = np.zeros(n, np.float64)
         ukey = np.zeros(n, np.int64)
         nruns = np.zeros(1 << 12, np.int64)
-        _WK.pr_fold(key, pay, offs, _dv(seg, x1), _dv(seg, x2),
-                    ucnt, us1, us2, ukey, nruns)
+        _WK.pr_fold2(key, pay, offs, SH, spec['abits'], _dv(seg, x1), _dv(seg, x2),    # a heavy bucket is counted, not sorted
+                     ucnt, us1, us2, ukey, nruns)
         live = np.zeros(n, bool)
         for b in range(nruns.size):
             if nruns[b]:
@@ -265,24 +307,17 @@ def execute(seg, spec):
         if max_excl <= p10 or M9 >= nz:      # THE CERTIFICATE: every excluded
             break                            # b PROVABLY hosts no better pair
         M *= 4                               # widen once, re-check
-    n = key.size
-    ucnt = np.zeros(n, np.int64)
-    us1 = np.zeros(n, np.float64)
-    us2 = np.zeros(n, np.float64)
-    ukey = np.zeros(n, np.int64)
-    nruns = np.zeros(1 << 12, np.int64)
-    _WK.pr_fold(key, pay, offs, _dv(seg, x1), _dv(seg, x2),
-                ucnt, us1, us2, ukey, nruns)
-    live = np.zeros(n, bool)
-    for b in range(nruns.size):
-        if nruns[b]:
-            live[offs[b]:offs[b] + nruns[b]] = True
-    ucnt = ucnt[live]; us1 = us1[live]; us2 = us2[live]; ukey = ukey[live]
-    sums = {x1: us1, x2: us2}
+    # (the loop's last fold IS the answer: the fold that was re-run here from the same buckets,
+    # doubling every pair's bill, is gone -- 2026-10-17)
+    return _pluck(seg, spec, order, ukey, ucnt, {x1: us1, x2: us2})
+
+
+def _pluck(seg, spec, order, ukey, ucnt, sums):
+    global _HITS
     out = []
     for j in order.tolist():
         kv = int(ukey[j])
-        bcode, acode = kv >> 8, kv & 0xFF
+        bcode, acode = kv >> spec['abits'], kv & ((1 << spec['abits']) - 1)
         va = seg.fetch(spec['a'], acode)         # THE pluck
         vb = seg.fetch(spec['b'], bcode)
         if isinstance(va, (bytes, bytearray)):

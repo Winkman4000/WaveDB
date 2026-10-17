@@ -2211,6 +2211,67 @@ def pf_prune(pos, bcol, heavy):
 
 
 @njit(nogil=True, parallel=True, cache=True)
+def pf_prune_all(bcol, heavy):
+    """pf_prune with no filter (2026-10-17): the rows whose b-code is HEAVY, from every row"""
+    n = bcol.size
+    T = 16
+    pc = np.zeros(T + 1, np.int64)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        c = 0
+        for i in range(lo, hi):
+            if heavy[bcol[i]]:
+                c += 1
+        pc[t + 1] = c
+    for t in range(T):
+        pc[t + 1] += pc[t]
+    out = np.empty(pc[T], np.int64)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        w = pc[t]
+        for i in range(lo, hi):
+            if heavy[bcol[i]]:
+                out[w] = i
+                w += 1
+    return out
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def pr_scatter_all(acol, bcol, xcol, ycol, SH, AB, T):
+    """pr_scatter with no filter (2026-10-17): every row, read in order -- no position array"""
+    n = bcol.size
+    NB = 1 << 12
+    pc = np.zeros((T, NB), np.int64)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        for i in range(lo, hi):
+            pc[t, np.int64(bcol[i]) >> SH] += 1
+    offs = np.zeros(NB + 1, np.int64)
+    for b in range(NB):
+        s0 = 0
+        for t in range(T):
+            v = pc[t, b]
+            pc[t, b] = s0
+            s0 += v
+        offs[b + 1] = offs[b] + s0
+    key = np.empty(n, np.int64)
+    pay = np.empty(n, np.int64)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        for i in range(lo, hi):
+            bb = np.int64(bcol[i])
+            j = offs[bb >> SH] + pc[t, bb >> SH]
+            pc[t, bb >> SH] += 1
+            key[j] = (bb << AB) | np.int64(acol[i])
+            pay[j] = (np.int64(xcol[i]) << 16) | np.int64(ycol[i])
+    return key, pay, offs
+
+
+@njit(nogil=True, parallel=True, cache=True)
 def pr_scatter(pos, acol, bcol, xcol, ycol, SH, T):
     """Q30's fused gather+radix: walk the planes' typed positions ONCE, read all
     four columns at the row, pack key=(b<<8|a) and pay=(x<<16|y), bucket by b's
@@ -2242,6 +2303,40 @@ def pr_scatter(pos, acol, bcol, xcol, ycol, SH, T):
             j = offs[bb >> SH] + pc[t, bb >> SH]
             pc[t, bb >> SH] += 1
             key[j] = (bb << 8) | np.int64(acol[p])
+            pay[j] = (np.int64(xcol[p]) << 16) | np.int64(ycol[p])
+    return key, pay, offs
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def pr_scatter2(pos, acol, bcol, xcol, ycol, SH, AB, T):
+    """pr_scatter, the small key packed in its own AB bits (2026-10-17: a small key above 256 values)"""
+    n = pos.size
+    NB = 1 << 12
+    pc = np.zeros((T, NB), np.int64)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        for i in range(lo, hi):
+            pc[t, np.int64(bcol[pos[i]]) >> SH] += 1
+    offs = np.zeros(NB + 1, np.int64)
+    for b in range(NB):
+        s0 = 0
+        for t in range(T):
+            v = pc[t, b]
+            pc[t, b] = s0
+            s0 += v
+        offs[b + 1] = offs[b] + s0
+    key = np.empty(n, np.int64)
+    pay = np.empty(n, np.int64)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        for i in range(lo, hi):
+            p = pos[i]
+            bb = np.int64(bcol[p])
+            j = offs[bb >> SH] + pc[t, bb >> SH]
+            pc[t, bb >> SH] += 1
+            key[j] = (bb << AB) | np.int64(acol[p])
             pay[j] = (np.int64(xcol[p]) << 16) | np.int64(ycol[p])
     return key, pay, offs
 
@@ -2399,6 +2494,18 @@ def warm():
         _c9 = np.zeros(3, np.int64); _s19 = np.zeros(3, np.float64); _s29 = np.zeros(3, np.float64)
         _u9 = np.zeros(3, np.int64); _n9 = np.zeros(1 << 12, np.int64)
         pr_fold(_k9, _p9, _o9, np.array([0.0, 1.0]), np.array([2.0, 3.0]), _c9, _s19, _s29, _u9, _n9)
+        pr_fold2(_k9, _p9, _o9, 0, 8, np.array([0.0, 1.0]), np.array([2.0, 3.0]), _c9, _s19, _s29, _u9, _n9)
+        pf_dense(np.array([0, 1, 2], np.int64), np.array([0, 1, 0], np.int64), np.array([1, 1, 0], np.int64),
+                 np.array([0, 1, 0], np.int64), np.array([0, 0, 1], np.int64), np.array([0.0, 1.0]),
+                 np.array([2.0, 3.0]), 2, 4)
+        pf_dense(None, np.array([0, 1, 0], np.int64), np.array([1, 1, 0], np.int64),
+                 np.array([0, 1, 0], np.int64), np.array([0, 0, 1], np.int64), np.array([0.0, 1.0]),
+                 np.array([2.0, 3.0]), 2, 4)
+        pr_scatter_all(np.array([0, 1, 0], np.int64), np.array([1, 1, 2], np.int64), np.array([0, 1, 0], np.int64),
+                       np.array([0, 0, 1], np.int64), 0, 8, 2)
+        pr_scatter2(np.array([0, 1, 2], np.int64), np.array([0, 1, 0], np.int64), np.array([1, 1, 2], np.int64),
+                    np.array([0, 1, 0], np.int64), np.array([0, 0, 1], np.int64), 0, 8, 2)
+        pf_prune_all(np.array([1, 0, 1], np.int64), np.array([True, False]))
 
 
 def grouped_sum_codes(kc, vc, vt, K):
@@ -2583,6 +2690,141 @@ def pr_fold(key, pay, offs, dv1, dv2, ucnt, us1, us2, ukey, nruns):
             us2[w + r] = s2
             r += 1
         nruns[b] = r
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _pr_fold2_nb(key, pay, offs, SH, AB, dv1, dv2, ucnt, us1, us2, ukey, nruns, TC, TA1, TA2, R):
+    """pr_fold, but a bucket whose rows outnumber its key range is COUNTED, not sorted (2026-10-17).
+    Bucket b holds the keys (b << (SH + AB)) .. +R (R = 2^(SH+AB), AB the small key's bits): with that range
+    small next to the bucket's rows (a heavy b value: SendTiming's 0 is 94% of the rows, one bucket of ~12M
+    on one thread, its argsort 3.9 s) one linear pass into a table of the range emits the runs in key order,
+    exactly as the sort's run walk does. Small buckets keep the sort.
+    THE TABLES ARE THE THREADS' OWN, made before the loop (TC/TA1/TA2: one row per thread, R slots; R = 0
+    when the range is too wide to count): the first version allocated a table of the range INSIDE the
+    parallel loop, and numba set up that allocation ahead of the range check -- a 2^37-slot table for
+    ClientEventTime x WatchID, MemoryError. Each thread walks its own buckets (b = t, t + T, ...) and
+    clears the slots it emitted, so a table is never shared and never re-zeroed whole."""
+    NB = offs.size - 1
+    T = TC.shape[0]
+    for t in prange(T):
+        c = TC[t]
+        a1 = TA1[t]
+        a2 = TA2[t]
+        for b in range(t, NB, T):
+            lo = offs[b]
+            hi = offs[b + 1]
+            m = hi - lo
+            if m <= 0:
+                nruns[b] = 0
+                continue
+            if R > 0 and m >= R // 4:
+                base = np.int64(b) << (SH + AB)
+                for i in range(lo, hi):
+                    s = key[i] - base
+                    pv = pay[i]
+                    c[s] += 1
+                    a1[s] += dv1[(pv >> 16) & 0xFFFF]
+                    a2[s] += dv2[pv & 0xFFFF]
+                r = 0
+                for s in range(R):
+                    if c[s]:
+                        ukey[lo + r] = base + s
+                        ucnt[lo + r] = c[s]
+                        us1[lo + r] = a1[s]
+                        us2[lo + r] = a2[s]
+                        c[s] = 0
+                        a1[s] = 0.0
+                        a2[s] = 0.0
+                        r += 1
+                nruns[b] = r
+                continue
+            sl = np.argsort(key[lo:hi], kind='mergesort')
+            w = lo
+            r = 0
+            i = 0
+            while i < m:
+                kv = key[lo + sl[i]]
+                cc = 0
+                s1 = 0.0
+                s2 = 0.0
+                while i < m and key[lo + sl[i]] == kv:
+                    pv = pay[lo + sl[i]]
+                    s1 += dv1[(pv >> 16) & 0xFFFF]
+                    s2 += dv2[pv & 0xFFFF]
+                    cc += 1
+                    i += 1
+                ukey[w + r] = kv
+                ucnt[w + r] = cc
+                us1[w + r] = s1
+                us2[w + r] = s2
+                r += 1
+            nruns[b] = r
+
+
+TALLY_MAX = 1 << 18          # a bucket's key range counted in a table: 16 threads x 3 x 8 B x 256K = 100 MB
+
+
+def pr_fold2(key, pay, offs, SH, AB, dv1, dv2, ucnt, us1, us2, ukey, nruns):
+    import numba
+    T = max(1, numba.get_num_threads())
+    R = 1 << (int(SH) + int(AB))
+    if R > TALLY_MAX:
+        R = 0                                   # too wide to count: every bucket sorts
+    W = max(1, R)
+    TC = np.zeros((T, W), np.int64)
+    TA1 = np.zeros((T, W), np.float64)
+    TA2 = np.zeros((T, W), np.float64)
+    _pr_fold2_nb(key, pay, offs, np.int64(SH), np.int64(AB), dv1, dv2, ucnt, us1, us2, ukey, nruns,
+                 TC, TA1, TA2, np.int64(R))
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _pf_dense_nb(pos, acol, bcol, xcol, ycol, dv1, dv2, VA, cnt2, s1, s2):
+    """pairfold's small pair space (2026-10-17): each thread walks its share of the filtered positions and
+    adds count + both dictionary-valued sums into ITS OWN table at b*VA + a -- no buckets, no sort.
+    (pr_scatter + pr_fold bucket by b: a b of ~6 values made ~6 buckets of millions of rows, six
+    threads each sorting -- Income x JavaEnable 2.2 s.) The tables are summed after."""
+    T = cnt2.shape[0]
+    n = pos.size
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        for i in range(lo, hi):
+            p = pos[i]
+            k = np.int64(bcol[p]) * VA + np.int64(acol[p])
+            cnt2[t, k] += 1
+            s1[t, k] += dv1[xcol[p]]
+            s2[t, k] += dv2[ycol[p]]
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _pf_dense_all_nb(acol, bcol, xcol, ycol, dv1, dv2, VA, cnt2, s1, s2):
+    """_pf_dense_nb with no filter: every row, in order"""
+    T = cnt2.shape[0]
+    n = bcol.size
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        for i in range(lo, hi):
+            k = np.int64(bcol[i]) * VA + np.int64(acol[i])
+            cnt2[t, k] += 1
+            s1[t, k] += dv1[xcol[i]]
+            s2[t, k] += dv2[ycol[i]]
+
+
+def pf_dense(pos, acol, bcol, xcol, ycol, dv1, dv2, VA, KV):
+    """(count, sum1, sum2) per pair code b*VA + a over the positions (pos None: every row); thread tables of
+    KV slots"""
+    import numba
+    T = max(1, numba.get_num_threads())
+    cnt2 = np.zeros((T, KV), np.int64)
+    s1 = np.zeros((T, KV), np.float64)
+    s2 = np.zeros((T, KV), np.float64)
+    if pos is None:
+        _pf_dense_all_nb(acol, bcol, xcol, ycol, dv1, dv2, np.int64(VA), cnt2, s1, s2)
+    else:
+        _pf_dense_nb(pos, acol, bcol, xcol, ycol, dv1, dv2, np.int64(VA), cnt2, s1, s2)
+    return cnt2.sum(0), s1.sum(0), s2.sum(0)
 
 
 @njit(nogil=True, parallel=True, cache=True)
