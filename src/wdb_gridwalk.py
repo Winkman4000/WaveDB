@@ -220,44 +220,107 @@ _COMPOSE = [__import__('os').environ.get('WDB_GRIDWALK_COMPOSE', '1') != '0']
 _COMPOSED = 0             # top-K answers by the composed atoms (no structure built)
 
 
-_GRAB_MAX = [int(__import__('os').environ.get('WDB_GW_GRAB_MAX', str(1 << 20)))]
+_GRAB_MAX = [int(__import__('os').environ.get('WDB_GW_GRAB_MAX', '-1'))]   # rows; -1: the share below decides
+# THE LINE (2026-10-18, measured: cross5.jsonl / cross6.jsonl, 26 pairs): the grab saves the other key's decode and
+# a count of N, and pays a gather and a count of S -- so the line is the share where count(S) + gather(S) meets
+# count(N), and the count is what differs by lane: the dense census is cheap per row (ties at 17-27% of the rows),
+# the flat lane's pack + scatter + bucket count is not (ties at 27-45%; ClientTimeZone x Title still won at 56%)
+_GRAB_SHARE = [float(__import__('os').environ.get('WDB_GW_GRAB_DENSE', '0.15')),
+               float(__import__('os').environ.get('WDB_GW_GRAB_FLAT', '0.30'))]
+GRAB_AT_DIV = 256        # survivors up to N / this are read AT their rows; more: the column decoded whole, gathered
+GRAB_STREAM = (1,)       # one zstd stream: a point read costs a decode (calib.jsonl) -- decoded whole
+GRAB_SORT_MAX = 1 << 18  # survivors up to this are counted by one sort (np.unique: 0.3 ms at 10K, 3.8 at 100K);
+                         # past it the all-core atoms (their fixed cost was 38-53 ms at 2K survivors)
+GRAB_FRAMES = 0.5        # frame-coded (enc 3 / 18 / 20): read at rows while the survivors touch at most this share
+                         # of the frames (a point read inflates exactly the frames it touches)
 _GRABBED = 0
+
+
+def _grab_limit(N, dense):
+    return _GRAB_MAX[0] if _GRAB_MAX[0] >= 0 else int(_GRAB_SHARE[0 if dense else 1] * N)
 
 
 def _grab_top(seg, a, b, Va, Vb, lim, afilter, tick):
     """THE GRAB (2026-10-18, the Q14 board; Jackson: "is just grabbing the 1M faster than removing the 99M"):
-    the axis filter's survivors are found from the filter key's codes alone; when they number at most GRAB_MAX,
-    the other key is read AT those rows (seg.codes_at: the encodings' point reads) and only they are counted --
-    the remove lane decodes both keys whole, counts all 100M rows, then drops the filtered cells. A filter key
-    holding one value answers from its dictionary: '<>' that value keeps no row. Returns the canonical top
-    (sel_gid, sel_cnt, Vb), or None (the remove lane answers)."""
+    the axis filter's survivors are found from the filter key's codes alone, the other key is read only for them,
+    and only they are counted. The remove lane decodes both keys whole, counts all N rows, then drops the
+    filtered cells. Both decode the filter key, so the grab saves (decode of the other key + a count of N) and
+    pays (reading the other key at S rows + a count of S):
+      the read: point reads (seg.codes_at) while S <= N / GRAB_AT_DIV; past that the frames a point read inflates
+        are most of the column anyway (enc 1/3/18/20 reach a full decode by ~20K spread rows, enc 8/9 pass it near
+        N/128), so the column is decoded whole and gathered;
+      the count: the remove lane's own atoms on S rows -- dense cells (radix_acc + bincount_par) when Va x Vb fits
+        DENSE_MAX, the flat lane (wdb_bound._flat_candidates) otherwise -- every core, no sort (np.unique was
+        51 ms per 1M survivors on one core).
+    A filter key holding one value answers from its dictionary: '<>' that value keeps no row. Grabs while
+    S <= _grab_limit(N); returns the canonical top (sel_gid, sel_cnt, Vb), or None (the remove lane answers)."""
     global _GRABBED
+    import wdb_kernels, wdb_bound
     fcol, fneg, fcode = afilter
     c = seg.cols[fcol]
     if int(c['V']) - (1 if c.get('has_null') else 0) == 1 and int(fcode) == 0 and fneg:
         tick('grab: one-value key, nothing kept')
         _GRABBED += 1
         return np.empty(0, np.int64), np.empty(0, np.int64), Vb
+    N = int(seg.N)
     cf = np.ascontiguousarray(seg._raw_codes(fcol))
     m = (cf != fcode) if fneg else (cf == fcode)
     S = int(np.count_nonzero(m))
     tick('grab survivors(%d)' % S)
-    if S > _GRAB_MAX[0]:
+    if S > _grab_limit(N, Va * Vb <= wdb_bound.DENSE_MAX):
         return None
     _GRABBED += 1
     if S == 0:
         return np.empty(0, np.int64), np.empty(0, np.int64), Vb
-    pos = np.flatnonzero(m).astype(np.int64)
+    pos = np.flatnonzero(m)
     other = b if fcol == a else a
-    co = np.asarray(seg.codes_at(other, pos)).astype(np.int64)
-    cfp = cf[pos].astype(np.int64)
-    tick('grab read %s at %d rows' % (other, S))
+    oc = seg.cols[other]
+    enc = oc.get('code_enc', 0)
+    BR = int(oc.get('BR') or oc.get('e20BR') or 0) if enc in (3, 18, 20) else 0
+    if enc in GRAB_STREAM:
+        at = False
+    elif BR > 0:
+        fr = pos // BR
+        touched = 1 + int(np.count_nonzero(fr[1:] != fr[:-1]))
+        at = touched <= GRAB_FRAMES * ((N + BR - 1) // BR)
+    else:
+        at = S * GRAB_AT_DIV <= N
+    if at:
+        co = np.ascontiguousarray(seg.codes_at(other, pos))
+        how = 'at rows'
+    else:
+        co = np.ascontiguousarray(np.asarray(seg._raw_codes(other))[pos])
+        how = 'decoded, gathered'
+    cfp = np.ascontiguousarray(cf[pos])
+    tick('grab read %s %s (%d)' % (other, how, S))
     ka, kb = (cfp, co) if fcol == a else (co, cfp)
-    u, cnt = np.unique(ka * Vb + kb, return_counts=True)
-    cnt = cnt.astype(np.int64)
-    o = np.lexsort((u, -cnt))[:lim]                   # the canonical prefix: count DESC, gid ASC
-    tick('grab count(%d pairs)' % u.size)
-    return u[o].astype(np.int64), cnt[o], Vb
+    prod = Va * Vb
+    if S <= GRAB_SORT_MAX:
+        u, cnt = np.unique(ka.astype(np.int64) * Vb + kb.astype(np.int64), return_counts=True)
+        gid = u.astype(np.int64); cnt = cnt.astype(np.int64)
+        tick('grab count sorted(%d pairs)' % gid.size)
+    elif prod <= wdb_bound.DENSE_MAX:
+        comp = np.empty(S, np.int64)
+        wdb_kernels.radix_acc(comp, ka, Va, True)
+        wdb_kernels.radix_acc(comp, kb, Vb, False)
+        cells = wdb_kernels.bincount_par(comp, prod)
+        gid = np.flatnonzero(cells); cnt = np.asarray(cells[gid], np.int64)
+        ck = wdb_bound._kth_largest(cnt, lim) if gid.size > lim else 0
+        if ck > 0:
+            keep = cnt >= ck; gid = gid[keep]; cnt = cnt[keep]
+        tick('grab count dense(%d cells, %d occur)' % (prod, gid.size))
+    else:
+        got = wdb_bound._flat_candidates([ka, kb], [Va, Vb], int(lim), tick)
+        if got is None:
+            u, cnt = np.unique(ka.astype(np.int64) * Vb + kb.astype(np.int64), return_counts=True)
+            gid = u.astype(np.int64); cnt = cnt.astype(np.int64)
+            tick('grab count sorted(%d pairs)' % gid.size)
+        else:
+            uk, cnt = got
+            gid = uk[:, 0].astype(np.int64) * Vb + uk[:, 1].astype(np.int64)
+            tick('grab count flat(%d candidates)' % gid.size)
+    o = np.lexsort((gid, -cnt))[:lim]                 # the canonical prefix: count DESC, gid ASC
+    return gid[o], cnt[o], Vb
 
 
 def _compose_top(seg, cols, lim, afilter=None):

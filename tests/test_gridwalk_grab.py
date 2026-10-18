@@ -46,11 +46,11 @@ def _fixture():
 def _lanes(cols, af):
     db, df, seg = _fixture()
     out = []
-    for gmax in (-1, int(seg.N)):
+    for gmax in (0, int(seg.N)):     # 0: only an empty filter grabs
         GW._GRAB_MAX[0] = gmax
         wdb_qmem.flush(db)
         out.append(GW._compose_top(seg, cols, 10, af))
-    GW._GRAB_MAX[0] = 1 << 20
+    GW._GRAB_MAX[0] = -1
     return out
 
 
