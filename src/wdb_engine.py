@@ -2329,6 +2329,17 @@ class Segment:
         enc = c.get('code_enc', 0)
         if _CENSUS[0] and _E19CENSUS[0] and enc == 19 and 'e19R' in c and c.get('mode') in (0, 1, 2):
             return self._e19s_census(c, L)           # even when decoded: the dress counts in a third the time
+        if _CENSUS[0] and c.get('mode') in (0, 1, 2) and (enc == 2 or c.get('_steps') is not None):
+            # THE STAIRCASE CENSUS (2026-10-18): a staircase's count of code k is the gap between its k-th and
+            # (k+1)-th step -- the stair read's own arithmetic, O(V). Under a WHERE (groupself) the census had
+            # repeated 100M codes out of the steps and counted them: GoodEvent / HTTPError 42 ms against 2 ms.
+            st = self.stairs(nm)
+            if st is not None:
+                cnt = np.diff(np.concatenate(([0], st, [self.N]))).astype(np.int64)
+                if cnt.size <= L:
+                    out = np.zeros(L, np.int64)
+                    out[:cnt.size] = cnt
+                    return out
         if _CENSUS[0] and nm not in self._codes and c.get('mode') in (0, 1, 2):
             if enc == 5:
                 pk = np.frombuffer(self.buf, dtype=np.uint8, count=c['czlen'], offset=c['cstart'])

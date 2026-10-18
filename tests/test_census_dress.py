@@ -21,9 +21,10 @@ def _toy():
     adv = np.repeat(np.where(rng.random(n // 300 + 1) < 0.9, 0, rng.integers(1, 19, n // 300 + 1)), 300)[:n]
     adv = np.where(rng.random(n) < 0.002, rng.integers(0, 19, n), adv).astype(np.int64)   # runs + noise: tag 10
     flag = rng.integers(0, 3, n).astype(np.int64)
+    st = np.sort(rng.integers(0, 40, n)).astype(np.int64)            # sorted: a staircase, tag 2
     d = os.path.join(TMP, 'cd_' + uuid.uuid4().hex[:8]); pq = d + '.parquet'
     os.makedirs(d)
-    pd.DataFrame({'width': width, 'adv': adv, 'flag': flag}).to_parquet(pq, index=False)
+    pd.DataFrame({'width': width, 'adv': adv, 'flag': flag, 'st': st}).to_parquet(pq, index=False)
     old = {k: os.environ.get(k) for k in _REAL}
     os.environ.update(_REAL)                         # the real load's rules: run.py opens mode 4 to toys
     try:
@@ -43,17 +44,17 @@ def test_census_from_the_dress_equals_the_decode():
     try:
         P = os.path.join(d, 't_0.wdb')
         tags = {}
-        for nm in ('width', 'adv', 'flag'):
+        for nm in ('width', 'adv', 'flag', 'st'):
             s = Segment(P)
             c = s.cols[nm]
             tags[nm] = c.get('code_enc')
             got = s.raw_census(nm, int(c['V']) + 3)
-            if c.get('code_enc') in (5, 10):
+            if c.get('code_enc') in (2, 5, 10):
                 assert nm not in s._codes, ('the census decoded the column', nm)
             ref = np.bincount(np.asarray(Segment(P)._raw_codes(nm)), minlength=int(c['V']) + 3)
             assert got.size == ref.size and np.array_equal(got, ref), (nm, c.get('code_enc'))
             assert int(got.sum()) == int(s.N)
-        assert 5 in tags.values() and 10 in tags.values(), tags        # both dresses were exercised
+        assert 5 in tags.values() and 10 in tags.values() and tags['st'] == 2, tags   # every dress exercised
         old = wdb_engine._CENSUS[0]
         try:                                                          # the switch restores the decode
             wdb_engine._CENSUS[0] = False
@@ -81,6 +82,7 @@ def test_groupself_no_limit_equals_duck():
                        env=dict(os.environ, **_REAL))
         db = Database.open(db_dir)
         for sql in ('SELECT adv, COUNT(*) FROM t WHERE adv <> 0 GROUP BY adv ORDER BY COUNT(*) DESC',
+                    'SELECT st, COUNT(*) AS c FROM t WHERE st <> 7 GROUP BY st ORDER BY c DESC',
                     'SELECT width, COUNT(*) AS c FROM t WHERE width <> 1000 GROUP BY width ORDER BY c DESC'):
             r = db.run(sql)
             rows = r[0] if isinstance(r, tuple) else r

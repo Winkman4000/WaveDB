@@ -210,8 +210,8 @@ try:
         """per key: sum of lengths and count of rows (rows of length 0 -- the empty string -- left out
         when excl), T partial tables merged at the end"""
         n = kc.size
-        S = np.zeros((T, K), np.int64)
-        C = np.zeros((T, K), np.int64)
+        S = np.zeros((T, K + 16), np.int64)        # rows padded apart (THE PADDED BOARDS)
+        C = np.zeros((T, K + 16), np.int64)
         per = (n + T - 1) // T
         for t in prange(T):
             for i in range(t * per, min(n, (t + 1) * per)):
@@ -220,7 +220,7 @@ try:
                     continue
                 S[t, kc[i]] += l
                 C[t, kc[i]] += 1
-        return S.sum(0), C.sum(0)
+        return S.sum(0)[:K], C.sum(0)[:K]
 except Exception:                                     # pragma: no cover
     def row_pour(kc, L, K, excl, T):
         L = np.asarray(L, np.int64); m = (L > 0) if excl else np.ones(L.size, bool)

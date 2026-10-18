@@ -150,7 +150,7 @@ def _part_scatter_nb(codes, K, T):
     count, passed in (see THE CACHEABLE THREAD COUNT)."""
     N = codes.size
     chunk = (N + T - 1) // T
-    hist = np.zeros((T, K), np.int64)
+    hist = np.zeros((T, K + 16), np.int64)        # rows padded apart (THE PADDED BOARDS)
     for t in numba.prange(T):
         lo = t * chunk
         hi = min(N, lo + chunk)
@@ -2395,11 +2395,11 @@ def mx_fold2(kc, ac1, dv1, ac2, dv2, KV):
     if HAVE_NUMBA:
         import numba
         T = max(1, numba.get_num_threads())
-        cnt2 = np.zeros((T, KV), np.int64)
-        s1 = np.zeros((T, KV), np.float64)
-        s2 = np.zeros((T, KV), np.float64)
+        cnt2 = np.zeros((T, KV + 16), np.int64)          # rows padded apart (THE PADDED BOARDS)
+        s1 = np.zeros((T, KV + 16), np.float64)
+        s2 = np.zeros((T, KV + 16), np.float64)
         _mx_fold2_nb(kc, ac1, dv1, ac2, dv2, cnt2, s1, s2)
-        return cnt2.sum(0), s1.sum(0), s2.sum(0)
+        return cnt2.sum(0)[:KV], s1.sum(0)[:KV], s2.sum(0)[:KV]
     cnt = np.bincount(kc, minlength=KV)
     return cnt, mx_fold(kc, ac1, dv1, KV), mx_fold(kc, ac2, dv2, KV)
 
@@ -2548,7 +2548,7 @@ def grouped_sum_codes(kc, vc, vt, K):
 def _grouped_sum_codes_nb(kc, vc, vt, K, T):
     """sums[k] += vt[vc[i]] for k = kc[i]: the single-key SUM board, fused gather+
     accumulate, per-thread partials (no atomics, no dtype casts, no factorize)."""
-    part = np.zeros((T, K), np.int64)
+    part = np.zeros((T, K + 16), np.int64)
     n = kc.size
     for t in prange(T):
         lo = t * n // T
@@ -2803,9 +2803,9 @@ def pr_fold2(key, pay, offs, SH, AB, dv1, dv2, ucnt, us1, us2, ukey, nruns):
     if R > TALLY_MAX:
         R = 0                                   # too wide to count: every bucket sorts
     W = max(1, R)
-    TC = np.zeros((T, W), np.int64)
-    TA1 = np.zeros((T, W), np.float64)
-    TA2 = np.zeros((T, W), np.float64)
+    TC = np.zeros((T, W + 16), np.int64)                 # rows padded apart (THE PADDED BOARDS)
+    TA1 = np.zeros((T, W + 16), np.float64)
+    TA2 = np.zeros((T, W + 16), np.float64)
     _pr_fold2_nb(key, pay, offs, np.int64(SH), np.int64(AB), dv1, dv2, ucnt, us1, us2, ukey, nruns,
                  TC, TA1, TA2, np.int64(R))
 
@@ -2849,14 +2849,14 @@ def pf_dense(pos, acol, bcol, xcol, ycol, dv1, dv2, VA, KV):
     KV slots"""
     import numba
     T = max(1, numba.get_num_threads())
-    cnt2 = np.zeros((T, KV), np.int64)
-    s1 = np.zeros((T, KV), np.float64)
-    s2 = np.zeros((T, KV), np.float64)
+    cnt2 = np.zeros((T, KV + 16), np.int64)              # rows padded apart (THE PADDED BOARDS)
+    s1 = np.zeros((T, KV + 16), np.float64)
+    s2 = np.zeros((T, KV + 16), np.float64)
     if pos is None:
         _pf_dense_all_nb(acol, bcol, xcol, ycol, dv1, dv2, np.int64(VA), cnt2, s1, s2)
     else:
         _pf_dense_nb(pos, acol, bcol, xcol, ycol, dv1, dv2, np.int64(VA), cnt2, s1, s2)
-    return cnt2.sum(0), s1.sum(0), s2.sum(0)
+    return cnt2.sum(0)[:KV], s1.sum(0)[:KV], s2.sum(0)[:KV]
 
 
 @njit(nogil=True, parallel=True, cache=True)
@@ -2945,7 +2945,7 @@ def _gd_pass2_count_nb(ku, kr, offs, SH, VR, T):
     without asking numba for it (get_thread_id made the kernel uncacheable)."""
     NB = offs.size - 1
     LOW = 1 << SH
-    ans = np.zeros((T, VR), np.int64)            # per-THREAD rows (was per-bucket: 4096 x VR, 296 MB
+    ans = np.zeros((T, VR + 16), np.int64)       # per-THREAD rows, padded apart (was per-bucket: 4096 x VR, 296 MB
     for t in prange(T):                           # zeroed and reduced serially for RegionID's 9,040)
         for b in range(NB * t // T, NB * (t + 1) // T):
             lo = offs[b]
@@ -3332,7 +3332,7 @@ def masked_count(comp, mask, V):
 @njit(nogil=True, parallel=True, cache=True)
 def _masked_count_nb(comp, mask, V, T):
     n = comp.size
-    part = np.zeros((T, V), np.int32)
+    part = np.zeros((T, V + 16), np.int32)
     for t in prange(T):
         lo = t * n // T
         hi = (t + 1) * n // T
@@ -3620,7 +3620,7 @@ def grid2_count(c1, c2, fc, lit, V2, K):
 def _grid2_count_nb(c1, c2, fc, lit, V2, K, T):
     """Composite 2-key COUNT grid with optional eq-filter (lit<0 = unfiltered):
     per-thread boards, one fused pass, no factorize, no sorts."""
-    part = np.zeros((T, K), np.int64)
+    part = np.zeros((T, K + 16), np.int64)
     n = c1.size
     for t in prange(T):
         lo = t * n // T
@@ -4660,7 +4660,7 @@ def _group_fold_dict_nb(grp, codes, dvals, G, out, T):
     numerator per group straight from two code streams and a dictionary, per-thread boards
     (T x G float64) and a reduce. No value array is ever built (Q09 built three, 630 ms)."""
     n = grp.size
-    part = np.zeros((T, G), np.float64)
+    part = np.zeros((T, G + 16), np.float64)      # rows padded apart (THE PADDED BOARDS)
     for t in prange(T):
         a = n * t // T; b = n * (t + 1) // T
         for i in range(a, b):
@@ -4992,7 +4992,7 @@ def count_codes(codes, K):
 @njit(cache=True, parallel=True, nogil=True)
 def _count_codes_nb(codes, K, T):
     n = codes.shape[0]
-    part = np.zeros((T, K), np.int64)
+    part = np.zeros((T, K + 16), np.int64)
     chunk = (n + T - 1) // T
     for t in prange(T):
         lo = t * chunk
