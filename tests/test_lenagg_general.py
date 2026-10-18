@@ -23,18 +23,22 @@ def _fixture():
     s = np.array(pool, dtype=object)[rng.integers(0, len(pool), n)]
     s[rng.random(n) < 0.2] = ''
     tag = np.array(['', 'x', 'yy', 'zzz', 'wwww'], dtype=object)[rng.integers(0, 5, n)]   # a small text column
+    sp = np.full(n, '', dtype=object)                                    # mostly empty: the grab's case
+    hit = rng.random(n) < 0.004
+    sp[hit] = np.array(pool, dtype=object)[rng.integers(0, len(pool), int(hit.sum()))]
+    emp = np.full(n, '', dtype=object)                                   # every row empty: no live row
     df = pd.DataFrame({
         'st': np.sort(rng.integers(0, 30, n)).astype(np.int64),          # sorted: a staircase key
         'rk': rng.integers(0, 2000, n).astype(np.int64),                 # random key
         'wide': rng.integers(0, 150_000, n).astype(np.int64),            # many keys (the big pour, forced)
         'sk': np.array(['k%02d' % i for i in range(40)], dtype=object)[rng.integers(0, 40, n)],   # string key
-        's': s, 'tag': tag})
+        's': s, 'tag': tag, 'sp': sp, 'emp': emp})
     t = uuid.uuid4().hex[:8]; pq = f'{TMP}/lg_{t}.parquet'
     df.to_parquet(pq, index=False)
     d = f'{TMP}/lgdb_{t}'
     db = Database.create(d)
     db.cat.add_table('tbl', [['st', 'int'], ['rk', 'int'], ['wide', 'int'], ['sk', 'string'], ['s', 'string'],
-                             ['tag', 'string']])
+                             ['tag', 'string'], ['sp', 'string'], ['emp', 'string']])
     keep = {k: os.environ.get(k) for k in ('WDB_ROWLEN_COLS', 'WDB_SEQ_NARROW_OK', 'WDB_SEQ_REPEATS_OK')}
     os.environ.update(WDB_ROWLEN_COLS='s', WDB_SEQ_NARROW_OK='0', WDB_SEQ_REPEATS_OK='0')
     try:
@@ -51,7 +55,7 @@ def _fixture():
 def _sqls():
     out = []
     for k in ('st', 'rk', 'sk', 'wide'):
-        for sc in ('s', 'tag'):
+        for sc in ('s', 'tag', 'sp', 'emp'):
             out += [
                 "SELECT %s, AVG(length(%s)) AS l, COUNT(*) AS c FROM tbl WHERE %s <> '' GROUP BY %s "
                 "HAVING COUNT(*) > 50 ORDER BY l DESC LIMIT 25" % (k, sc, sc, k),
@@ -99,6 +103,13 @@ def test_lenagg_every_key_both_pours():
         _check(db, pq, _sqls())
     finally:
         wdb_lenagg.BIG_KV = old
+    old = wdb_lenagg.SPARSE_DIV, wdb_lenagg.SPARSE_DIV_SMALL
+    try:
+        for div in (1, 0):                           # every filtered query grouped at its live rows; then never
+            wdb_lenagg.SPARSE_DIV = wdb_lenagg.SPARSE_DIV_SMALL = div
+            _check(db, pq, _sqls())
+    finally:
+        wdb_lenagg.SPARSE_DIV, wdb_lenagg.SPARSE_DIV_SMALL = old
 
 
 def test_lenagg_without_row_lengths():

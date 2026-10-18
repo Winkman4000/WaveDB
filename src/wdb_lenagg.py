@@ -25,6 +25,14 @@ _PF = {}                      # kept for older callers (tests cleared it after a
 # KV 9K 13 / 406 (URL dense) 16 / 91 (SearchPhrase sparse); 1.4M 117 / 293, 91 / 78; 6M 353 / 350; 9.8M 631 / 362,
 # 572 / 84; 17.6M 1058 / 358, 989 / 90. The boards grow with the keys, the partition with the live rows.
 BIG_KV = int(os.environ.get('WDB_LENAGG_BIG_KV', str(4 << 20)))
+# under WHERE S <> '': live rows up to N / SPARSE_DIV are grouped at their rows (0: never) for a key past SPARSE_KV
+# values, up to N / SPARSE_DIV_SMALL for a smaller key. Measured (pod 2, the Q27 board): a big key's pour costs its
+# boards / partition -- 1.56% live sorted and grouped in 31-44 ms, 13% live 285-450 ms where the pour is cheaper;
+# a small key's pour is cheap and its read at 1.5M rows is not (Robotness x UTMSource 98 -> 205 ms), while 2,263
+# live rows still win (ResolutionHeight x ParamOrderID 100 -> 35 ms)
+SPARSE_KV = 1 << 20
+SPARSE_DIV = int(os.environ.get('WDB_LENAGG_SPARSE_DIV', '50'))
+SPARSE_DIV_SMALL = int(os.environ.get('WDB_LENAGG_SPARSE_DIV_SMALL', '1024'))
 _HAVING = {E.GT: lambda c, n: c > n, E.GTE: lambda c, n: c >= n, E.LT: lambda c, n: c < n,
            E.LTE: lambda c, n: c <= n, E.EQ: lambda c, n: c == n}
 
@@ -181,26 +189,70 @@ def _empty_code(seg, lcol):
     return -1
 
 
+def _key_at(seg, key, pos):
+    """the key's codes at the live rows only, by the grab's rule (wdb_gridwalk): point reads while the rows touch
+    few frames (frame-coded) or are few (the rest); a one-stream column, or many rows, decoded whole and gathered"""
+    import wdb_gridwalk as GW
+    if key in seg._codes:
+        return np.asarray(seg._codes[key])[pos]
+    N = int(seg.N)
+    oc = seg.cols[key]
+    enc = oc.get('code_enc', 0)
+    BR = int(oc.get('BR') or oc.get('e20BR') or 0) if enc in (3, 18, 20) else 0
+    if enc in GW.GRAB_STREAM:
+        at = False
+    elif BR > 0:
+        fr = pos // BR
+        touched = 1 + int(np.count_nonzero(fr[1:] != fr[:-1])) if pos.size else 0
+        at = touched <= GW.GRAB_FRAMES * ((N + BR - 1) // BR)
+    else:
+        at = pos.size * GW.GRAB_AT_DIV <= N
+    if at:
+        return np.asarray(seg.codes_at(key, pos))
+    return np.asarray(seg._raw_codes(key))[pos]
+
+
+def _group(kk, w):
+    """(the keys present, ascending; the sum of w; the count) over the few live (key, value) pairs: one parallel
+    bucketed sort of (key << 16 | value) when the values are lengths under 65536, else a stable argsort"""
+    import wdb_kernels as WK
+    if kk.size == 0:
+        return np.empty(0, np.int64), np.empty(0, w.dtype), np.empty(0, np.int64)
+    if w.dtype.kind in 'iu' and int(w.min()) >= 0 and int(w.max()) < 65536 and int(kk.max()) < (1 << 46):
+        p = (np.asarray(kk, np.int64) << 16) | np.asarray(w, np.int64)
+        ps = WK.sort_keys_par(p, np.int64(max(0, int(p.max()).bit_length() - 12)))
+        ks = ps >> 16
+        ws = ps & 0xFFFF
+    else:
+        o = np.argsort(kk, kind='stable')
+        ks = np.asarray(kk, np.int64)[o]
+        ws = w[o]
+    brk = np.flatnonzero(np.r_[True, ks[1:] != ks[:-1]])
+    return ks[brk], np.add.reduceat(ws, brk), np.diff(np.r_[brk, ks.size]).astype(np.int64)
+
+
 def _sums(seg, spec):
-    """(sums, counts) per key code: the stored row lengths, or the V-table of F over S's dictionary, poured on
-    every core against the key's codes"""
+    """(key codes, sums, counts): the stored row lengths, or the V-table of F over S's dictionary, poured on every
+    core against the key's codes (key codes None: dense, indexed by code) -- or, under WHERE S <> '' with few live
+    rows, grouped at those rows (the codes present, ascending)"""
     import wdb_kernels as WK
     key, lcol = spec['key'], spec['lcol']
     KV = int(seg.cols[key]['V'])
+    N = int(seg.N)
     T = WK._nt()
     L = tab = sc = None
     ec = -1
-    # THE OVERLAP: the key's codes (and S's, without row lengths) unpack on a thread while the lengths are
-    # read. Started here, joined below, in one call (2026-10-18: started in detect, it was left running whenever
-    # execute did not follow -- the route map's markers -- and died with the interpreter mid-decode)
+    rowl = spec['rowl']
+    # THE OVERLAP: with row lengths the key's codes unpack on a thread while the lengths are read; without, S's
+    # codes unpack while F's table is made (the key waits: few live rows read it at those rows only). Started
+    # here, joined below, in one call (2026-10-18: started in detect, it was left running whenever execute did
+    # not follow -- the route map's markers -- and died with the interpreter mid-decode)
     import threading
-    def _pf(s=seg, a=key, b=lcol, r=spec['rowl']):
-        s._raw_codes(a)
-        if not r:
-            s._raw_codes(b)
+    def _pf(s=seg, a=key, b=lcol, r=rowl):
+        s._raw_codes(a if r else b)
     t9 = threading.Thread(target=_pf, daemon=True); t9.start()
     try:
-        if spec['rowl']:
+        if rowl:
             import wdb_lens as _L9
             L = _L9.row_lens(seg, lcol)
         else:
@@ -214,10 +266,27 @@ def _sums(seg, spec):
         t9.join()
     if L is None and tab is None:
         return None
-    kc = np.asarray(seg._raw_codes(key))
-    if not spec['rowl']:
+    if not rowl:
         sc = np.asarray(seg._raw_codes(lcol))
+    # THE GRAB (2026-10-18, the Q27 board's corner): under WHERE S <> '' a mostly-empty S leaves few live rows --
+    # a big key's whole decode and its KV-sized boards were most of the cost (WatchID x ParamOrderID 2,263 live
+    # rows: 211 ms). Count the live rows (one parallel pass); none: no group; few: read the key at them only and
+    # group them by a sort. Past N / SPARSE_DIV the pour below is cheaper (measured: 13% live, a sort 285-450 ms)
+    div = SPARSE_DIV if KV > SPARSE_KV else SPARSE_DIV_SMALL
+    if spec['excl_empty'] and div > 0 and (rowl or ec >= 0):
+        # a strided sample (~100K rows, ~1 ms) says when the live rows are plainly too many, so the dense side skips
+        # the count pass (12-30 ms on 100M; UserID x SearchPhrase, 13% live, had paid it for nothing)
+        smp = (L if rowl else sc)[::1021]
+        live_est = float(np.count_nonzero(smp) if rowl else np.count_nonzero(smp != ec)) / max(1, smp.size)
+        pos = None
+        if live_est * N <= 2.0 * (N // div):
+            pos = (WK.live_rows(L, 1, ge=True, limit=N // div) if rowl
+                   else WK.live_rows(sc, ec, limit=N // div))
+        if pos is not None:
+            return _group(_key_at(seg, key, pos), L[pos] if rowl else tab[sc[pos]])
+    kc = np.asarray(seg._raw_codes(key))
     acc = np.float64 if (tab is not None and tab.dtype.kind == 'f') else np.int64
+    sums = cnt = None
     if KV > BIG_KV:
         bits = max(1, (KV - 1).bit_length())
         outS = np.zeros(KV, acc); outC = np.zeros(KV, np.int64)
@@ -226,14 +295,16 @@ def _sums(seg, spec):
                        tab if tab is not None else np.zeros(1, np.int64),
                        tab is not None, bool(spec['excl_empty']), np.int64(ec),
                        np.int64(max(0, bits - 12)), np.int64(min(T, 16)), outS, outC)
-        return outS, outC
-    if L is not None:
+        sums, cnt = outS, outC
+    elif L is not None:
         import wdb_lens as _L9
-        return _L9.row_pour(kc, L, KV, bool(spec['excl_empty']), T)
-    S = np.zeros((T, KV + 16), acc)              # rows padded apart (THE PADDED BOARDS)
-    C = np.zeros((T, KV + 16), np.int64)
-    WK.lenpour_dict(kc, sc, tab, np.int64(ec), S, C)
-    return S.sum(0)[:KV], C.sum(0)[:KV]
+        sums, cnt = _L9.row_pour(kc, L, KV, bool(spec['excl_empty']), T)
+    else:
+        S = np.zeros((T, KV + 16), acc)          # rows padded apart (THE PADDED BOARDS)
+        C = np.zeros((T, KV + 16), np.int64)
+        WK.lenpour_dict(kc, sc, tab, np.int64(ec), S, C)
+        sums, cnt = S.sum(0)[:KV], C.sum(0)[:KV]
+    return None, sums, cnt                       # dense: the key code IS the index (no compaction of KV slots)
 
 
 def execute(seg, spec):
@@ -242,16 +313,17 @@ def execute(seg, spec):
     r9 = _sums(seg, spec)
     if r9 is None:
         return None
-    sums, cnt = r9
+    gk, sums, cnt = r9
     keep = cnt > 0
     if spec['having'] is not None:
         op, n = spec['having']
         keep &= op(cnt, n)
-    gs = np.flatnonzero(keep)
+    sel = np.flatnonzero(keep)
+    gs = sel if gk is None else gk[sel]
     rows = []
     vals = seg.values_at(key, gs) if gs.size else []
     isint = sums.dtype.kind in 'iu'
-    for i2, g0 in enumerate(gs.tolist()):
+    for i2, g0 in enumerate(sel.tolist()):
         kv = vals[i2]
         if isinstance(kv, (bytes, bytearray)):
             kv = kv.decode('utf-8', 'replace')

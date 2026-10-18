@@ -4867,6 +4867,44 @@ def _ge_write_nb(a, v, T, off, out):
                 w += 1
 
 
+@njit(nogil=True, parallel=True, cache=True)
+def _ne_count_nb(a, v, T, cnt):
+    n = a.size
+    for t in prange(T):
+        c = 0
+        for i in range(t * n // T, (t + 1) * n // T):
+            if np.int64(a[i]) != v:
+                c += 1
+        cnt[t] = c
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _ne_write_nb(a, v, T, off, out):
+    n = a.size
+    for t in prange(T):
+        w = off[t]
+        for i in range(t * n // T, (t + 1) * n // T):
+            if np.int64(a[i]) != v:
+                out[w] = i
+                w += 1
+
+
+def live_rows(a, v, ge=False, limit=-1):
+    """the rows i with a[i] != v (ge: a[i] >= v), ascending, on every core -- or None when there are more than
+    `limit` of them (limit >= 0: the count pass alone decides, nothing is written)"""
+    T = _nt()
+    cnt = np.zeros(T, np.int64)
+    (_ge_count_nb if ge else _ne_count_nb)(a, np.int64(v), T, cnt)
+    m = int(cnt.sum())
+    if 0 <= limit < m:
+        return None
+    off = np.zeros(T, np.int64)
+    off[1:] = np.cumsum(cnt)[:-1]
+    out = np.empty(m, np.int64)
+    (_ge_write_nb if ge else _ne_write_nb)(a, np.int64(v), T, off, out)
+    return out
+
+
 def _collect_ge(a, v):
     """the indices i with a[i] >= v, ascending, on every core (a signed integer array, or unsigned below 2**63)"""
     T = _nt()
