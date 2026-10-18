@@ -2102,11 +2102,18 @@ def gather_frame(raw, rows, j0, out):
 def bp10_counts(buf, dirX, pay, bits, N, L, T):
     """THE CENSUS FROM THE DRESS, enc 10 (2026-10-01): per-code row counts straight from the
     blocks -- a run block adds each run's length to its value, a bitpack block counts its codes
-    (bp10_decode's own walk, counting instead of writing). No 100M-row array. Length L."""
+    (bp10_decode's own walk, counting instead of writing). No 100M-row array. Length L.
+    2026-10-18: each thread counts on its own local board (the shared T x L board put every thread's counters
+    for a 2-value key in one cache line: a binary column's census was 105-133 ms against a 5 ms decode). A full
+    bitpack block of width 1, 2, 4 or 8 is counted by its bytes (one count per byte, expanded once at the end);
+    of width 3, 5, 6 or 7, by 8-row words (8 codes = `bits` bytes). Binary census 1-1.5 ms, 3-bit 10-19 ms."""
     B = 4096
     nblk = dirX.size
-    part = np.zeros((T, L), np.int64)
+    part = np.zeros((T, L + 16), np.int64)
+    bytewise = bits == 1 or bits == 2 or bits == 4 or bits == 8
     for t in prange(T):
+        loc = np.zeros(L, np.int64)
+        bc = np.zeros(256, np.int64)
         b0 = nblk * t // T
         b1 = nblk * (t + 1) // T
         for b in range(b0, b1):
@@ -2120,7 +2127,19 @@ def bp10_counts(buf, dirX, pay, bits, N, L, T):
                     cnt = np.int64(buf[p]) | (np.int64(buf[p + 1]) << 8)
                     val = np.int64(buf[p + 2]) | (np.int64(buf[p + 3]) << 8)
                     p += 4
-                    part[t, val] += cnt
+                    loc[val] += cnt
+            elif bytewise and rows == B:
+                for i in range(o, o + ((B * bits) >> 3)):
+                    bc[buf[i]] += 1
+            elif bits <= 8 and rows == B:
+                mask = (np.int64(1) << bits) - 1
+                for g in range(B >> 3):
+                    q = o + g * bits
+                    w = np.int64(0)
+                    for j in range(bits):
+                        w = (w << 8) | np.int64(buf[q + j])
+                    for s in range(8):
+                        loc[(w >> (bits * (7 - s))) & mask] += 1
             else:
                 for r in range(rows):
                     v = np.int64(0)
@@ -2129,7 +2148,17 @@ def bp10_counts(buf, dirX, pay, bits, N, L, T):
                         idx = base + bi
                         byte = buf[o + (idx >> 3)]
                         v = (v << 1) | ((np.int64(byte) >> (7 - (idx & 7))) & 1)
-                    part[t, v] += 1
+                    loc[v] += 1
+        if bytewise:
+            per = 8 // bits
+            mk = (1 << bits) - 1
+            for x in range(256):
+                c = bc[x]
+                if c:
+                    for s in range(per):
+                        loc[(x >> (8 - bits * (s + 1))) & mk] += c
+        for k in range(L):
+            part[t, k] = loc[k]
     out = np.zeros(L, np.int64)
     for k in prange(L):
         s = np.int64(0)
@@ -2146,22 +2175,25 @@ def enc5_counts(packed, hot, patches, N, L, T):
     hot[k]; nibble 15 is an escape) plus a census of the escape patches, which are exactly the
     escaped rows' codes. The pad nibble of an odd row count is not a row. Length L."""
     nb = N >> 1                                    # bytes whose two nibbles are both rows
-    part = np.zeros((T, 16), np.int64)
+    part = np.zeros((T, 256 + 16), np.int64)       # rows padded apart; each thread counts on its own board
     for t in prange(T):
         a = nb * t // T
         b = nb * (t + 1) // T
+        bc = np.zeros(256, np.int64)               # a census of the bytes: one count per byte, not per nibble
         for i in range(a, b):
-            x = np.int64(packed[i])
-            part[t, x & 15] += 1
-            part[t, x >> 4] += 1
+            bc[packed[i]] += 1
+        for x in range(256):
+            part[t, x] = bc[x]
     nib = np.zeros(16, np.int64)
     for t in range(T):
-        for k in range(16):
-            nib[k] += part[t, k]
+        for x in range(256):
+            c = part[t, x]
+            nib[x & 15] += c
+            nib[x >> 4] += c
     if N & 1:
         nib[np.int64(packed[nb]) & 15] += 1
     np_ = patches.size
-    pp = np.zeros((T, L), np.int64)
+    pp = np.zeros((T, L + 16), np.int64)
     for t in prange(T):
         a = np_ * t // T
         b = np_ * (t + 1) // T
