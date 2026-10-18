@@ -3969,6 +3969,75 @@ def lenagg_pour(kc, uc, lens, jars, cnts, ec):
             cnts[kk] += 1
 
 
+@njit(nogil=True, parallel=True, cache=True)
+def lenpour_dict(kc, sc, tab, ec, S, C):
+    """THE LENGTH POUR, small key (2026-10-18, Q27's shape): S[t, k] += tab[s], C[t, k] += 1 for every row
+    (k, s) = (kc[i], sc[i]) whose s != ec (ec = -1: every row), on per-thread rows of S and C (the caller pads
+    them apart). tab is the per-code value of F(S) -- the dictionary's lengths for LENGTH."""
+    T = S.shape[0]
+    n = kc.size
+    for t in prange(T):
+        for i in range(n * t // T, n * (t + 1) // T):
+            s = np.int64(sc[i])
+            if s == ec:
+                continue
+            k = np.int64(kc[i])
+            S[t, k] += tab[s]
+            C[t, k] += 1
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def lenpour_big(kc, L, sc, tab, use_tab, skip0, ec, SH, T, outS, outC):
+    """THE LENGTH POUR, large key (2026-10-18): a key past the per-thread boards (UserID's 17.6M values: 16
+    boards of 17.6M x 2 x 8 bytes) -- each live row's (key, value) is partitioned by the key's high bits into
+    4096 ranges (bincount_big's method), then every range is summed on its own core into its own slice of
+    outS / outC, so no two cores touch one counter. A row's value is tab[sc[i]] (use_tab) or L[i] (stored row
+    lengths). Live: sc[i] != ec (use_tab), or L[i] != 0 when skip0 (a length is 0 only for '')."""
+    n = kc.size
+    NB = 4096
+    pc = np.zeros((T, NB + 16), np.int64)
+    for t in prange(T):
+        for i in range(n * t // T, n * (t + 1) // T):
+            if use_tab:
+                if np.int64(sc[i]) == ec:
+                    continue
+            elif skip0 and L[i] == 0:
+                continue
+            pc[t, np.int64(kc[i]) >> SH] += 1
+    offs = np.zeros(NB + 1, np.int64)
+    for b in range(NB):
+        s = 0
+        for t in range(T):
+            v = pc[t, b]; pc[t, b] = s; s += v
+        offs[b + 1] = offs[b] + s
+    m = offs[NB]
+    PK = np.empty(m, np.int64)
+    PW = np.empty(m, outS.dtype)
+    for t in prange(T):
+        cur = np.empty(NB, np.int64)
+        for b in range(NB):
+            cur[b] = offs[b] + pc[t, b]
+        for i in range(n * t // T, n * (t + 1) // T):
+            if use_tab:
+                s = np.int64(sc[i])
+                if s == ec:
+                    continue
+                w = tab[s]
+            else:
+                w = L[i]
+                if skip0 and w == 0:
+                    continue
+            b = np.int64(kc[i]) >> SH
+            PK[cur[b]] = np.int64(kc[i])
+            PW[cur[b]] = w
+            cur[b] += 1
+    for b in prange(NB):
+        for j in range(offs[b], offs[b + 1]):
+            k = PK[j]
+            outS[k] += PW[j]
+            outC[k] += 1
+
+
 @njit(nogil=True, cache=True)
 def _pref_match(prev, plen, pfx, pfo, d):
     """THE PREFIX CLASS, matched (2026-10-06): ^(p0|p1|...)([^d]+)d.*$ under RE2's law -- '.' never matches

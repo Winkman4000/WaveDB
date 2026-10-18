@@ -1,18 +1,32 @@
-"""wdb_lenagg -- grouped string-measure aggregates from the charlens table.
+"""wdb_lenagg -- grouped string-measure aggregates (Q27's shape) from the strings' stored lengths.
 
-Q27's lane: AVG/SUM(LENGTH(c)) [+ COUNT(*)] GROUP BY key [WHERE c <> ''] [HAVING
-COUNT(*) > lit] [ORDER BY agg] [LIMIT n]  ==  two weighted bincounts over the code
-streams. The lengths live in the V-sized charlens table; no string is ever born.
-Fail-closed: any unrecognized limb -> None, the general scan serves."""
+  SELECT K, AGG(F(S)) [, COUNT(*)] FROM t [WHERE S <> ''] GROUP BY K [HAVING COUNT(*) op n]
+  [ORDER BY <a projection> [ASC|DESC]] [LIMIT n]          AGG = AVG | SUM, F any registered numeric scalar fn
+
+== per key, the sum of F over its rows and their count: one pour over two code streams. F's value per row
+comes from the V-table of F over S's dictionary (the dictionary's character lengths for LENGTH), or, for
+LENGTH, from the row lengths the load stored (wdb_lens) -- then S's numbers are never read. No string is born.
+
+2026-10-18 (the Q27 board, every key profile x every text profile, 680 queries): this was a hidden first try
+inside general_scan, so the route map could not see it, and its frame-range reader carried an encoding gate
+(code_enc 0/3/5/8/10/12/19 for both columns) that sent 386 of the 680 queries to the scan at 2.2x DuckDB.
+Now a registered read; the pour runs over the decoded codes (_raw_codes reads every encoding) on every core:
+per-thread padded boards for a key up to BIG_KV values, the range partition (bincount_big's method) past it.
+Fail-closed: any unrecognized limb -> None, the next read serves."""
+import os
 import numpy as np
 from sqlglot import expressions as E
 import wdb_sql
+import wdb_policies as P
 
 _HITS = 0
-import wdb_qmem
-_PF = wdb_qmem.register({})   # id(seg) -> the unpacking thread; query-scoped (a detect that declines
-                              # after starting it leaves nothing behind the query)
-_PRICED = []     # (chosen, fused_ms_est, chain_ms_est) -- the honesty loop's seed
+_PF = {}                      # kept for older callers (tests cleared it after a detect); detect starts no thread
+# past this many keys: the range partition. Measured (pod 2, 100M rows, stored row lengths; boards / partition ms):
+# KV 9K 13 / 406 (URL dense) 16 / 91 (SearchPhrase sparse); 1.4M 117 / 293, 91 / 78; 6M 353 / 350; 9.8M 631 / 362,
+# 572 / 84; 17.6M 1058 / 358, 989 / 90. The boards grow with the keys, the partition with the live rows.
+BIG_KV = int(os.environ.get('WDB_LENAGG_BIG_KV', str(4 << 20)))
+_HAVING = {E.GT: lambda c, n: c > n, E.GTE: lambda c, n: c >= n, E.LT: lambda c, n: c < n,
+           E.LTE: lambda c, n: c <= n, E.EQ: lambda c, n: c == n}
 
 
 def _fn_table(seg, col, lkind):
@@ -39,21 +53,12 @@ def _fn_table(seg, col, lkind):
     return None
 
 
-def _price(seg, key, lcol):
-    """Cost arithmetic from the cards: fused frame-pour vs gather+bincount chain.
-    Returns ('fused'|'chain', est_ms_fused, est_ms_chain)."""
-    try:
-        import wdb_calib
-        mc = wdb_calib.machine_card(getattr(seg, 'db_dir', '.') or '.')
-        N = float(seg.N)
-        fused = (N / 1e6) / max(mc.get('fused_pour_mrps') or 1, 1) * 1000
-        chain = (N / 1e6) / max(mc.get('gather_i64_mrps') or 1, 1) * 1000 \
-            + 2 * (N / 1e6) / max(mc.get('bincount_w_mrps') or 1, 1) * 1000
-        pick = 'fused' if fused <= chain else 'chain'
-        _PRICED.append((pick, round(fused, 1), round(chain, 1)))
-        return pick, fused, chain
-    except Exception:
-        return 'fused', 0.0, 0.0
+def _plain_col(seg, col):
+    """a dictionary column the pour can read as stored: present, not positional, no NULL, no deleted rows,
+    no overrides (the pour reads the stored codes)"""
+    return (P.columns_exist(seg, col) and P.not_positional(seg, col) and P.no_deleted_rows(seg)
+            and seg.cols[col].get('mode') in (0, 1, 2) and not seg.cols[col].get('has_null')
+            and seg._effective(col) is None)
 
 
 def detect(seg, tree, col_map):
@@ -106,36 +111,21 @@ def detect(seg, tree, col_map):
         else:
             return None
     hv = tree.args.get('having')
-    hmin = None
+    having = None
     if hv is not None:
         h = hv.this
-        if not isinstance(h, E.GT):
+        op = _HAVING.get(type(h))
+        if op is None:
             return None
         hk = wdb_sql._agg_kind(h.this)
-        if hk is None or hk[0] != 'COUNT_STAR' or not isinstance(h.expression, E.Literal):
+        if hk is None or hk[0] != 'COUNT_STAR' or not isinstance(h.expression, E.Literal) or h.expression.is_string:
             return None
-        hmin = int(str(h.expression.this))
-    for c in (key, lcol):
-        if c not in seg.cols or seg.cols[c].get('code_enc') not in (0, 3, 5, 8, 10, 12, 19):
+        try:
+            having = (op, int(str(h.expression.this)))
+        except ValueError:
             return None
-    # THE OVERLAP: the V-table (the dictionary's lengths) and the two row columns are independent
-    # reads -- unpack the columns on a thread while the dictionary is read here
-    # THE ROW LENGTHS (the operator's --row-lengths): when the load stored lcol's character length
-    # per row, a LENGTH aggregate reads that column and the key -- never lcol's dictionary numbers
-    import wdb_lens as _L9
-    rowl = bool(isinstance(lkind, tuple) and lkind[0] == 'LENGTH' and hasattr(seg, 'path')
-                and _L9.has_row_lens(seg, lcol) and _L9.clean(seg))
-    import threading
-    def _pf(s=seg, a=key, b=lcol, r=rowl):
-        s._raw_codes(a)
-        if not r:
-            s._raw_codes(b)
-    t9 = threading.Thread(target=_pf, daemon=True); t9.start()
-    _PF[id(seg)] = t9
-    if not rowl:
-        lens = _fn_table(seg, lcol, lkind)
-        if lens is None:
-            return None
+    if key == lcol or not _plain_col(seg, key) or not _plain_col(seg, lcol):
+        return None
     lim = None
     lx = tree.args.get('limit')
     if lx is not None:
@@ -143,109 +133,129 @@ def detect(seg, tree, col_map):
             lim = int(lx.expression.this)
         except Exception:
             return None
+    if tree.args.get('offset') is not None:
+        return None
     oi = None
+    odesc = True
     ox = tree.args.get('order')
     if ox is not None:
-        if len(ox.expressions) != 1 or not ox.expressions[0].args.get('desc'):
+        if len(ox.expressions) != 1:
             return None
-        onm = ox.expressions[0].this
+        o0 = ox.expressions[0]
+        odesc = bool(o0.args.get('desc'))
+        onm = o0.this
         if not isinstance(onm, E.Column):
             return None
-        alias_names = [ (p.alias if isinstance(p, E.Alias) else None) for p in tree.expressions ]
-        if onm.name not in alias_names:
+        alias_names = [(p.alias if isinstance(p, E.Alias) else None) for p in tree.expressions]
+        if onm.name in alias_names:
+            oi = alias_names.index(onm.name)
+        elif (col_map or {}).get(onm.name, onm.name) == key and ('KEY', None) in aggs:
+            oi = aggs.index(('KEY', None))
+        else:
             return None
-        oi = alias_names.index(onm.name)
-    return {'key': key, 'lcol': lcol, 'lkind': lkind, 'aggs': aggs, 'excl_empty': excl_empty,
-            'hmin': hmin, 'lim': lim, 'oi': oi, 'proj': tree.expressions, 'rowl': rowl}
-
-
-def _row_sums(seg, spec):
-    """per key: length sum and row count from the stored row lengths (the key unpacks on the thread
-    detect started, while the lengths are read)"""
+    # THE ROW LENGTHS (the operator's --row-lengths): when the load stored lcol's character length
+    # per row, a LENGTH aggregate reads that column and the key -- never lcol's dictionary numbers
     import wdb_lens as _L9
+    rowl = bool(isinstance(lkind, tuple) and lkind[0] == 'LENGTH' and hasattr(seg, 'path')
+                and _L9.has_row_lens(seg, lcol) and _L9.clean(seg))
+    if not rowl and _fn_table(seg, lcol, lkind) is None:
+        return None
+    return {'key': key, 'lcol': lcol, 'lkind': lkind, 'aggs': aggs, 'excl_empty': excl_empty,
+            'having': having, 'lim': lim, 'oi': oi, 'odesc': odesc, 'proj': tree.expressions, 'rowl': rowl}
+
+
+def _empty_code(seg, lcol):
+    """the code of '' in lcol's dictionary, or -1: '' sorts first in a sorted dictionary, so when present it IS
+    code 0 -- one fetch, not a binary search through the front-coded chunks (measured 71 ms on URL)"""
+    if not int(seg.cols[lcol]['V']):
+        return -1
+    z0 = seg.fetch(lcol, 0)
+    if isinstance(z0, (bytes, bytearray)):
+        z0 = z0.decode('utf-8', 'replace')
+    if z0 == '':
+        return 0
+    if z0 is None or not isinstance(z0, str):
+        import wdb_wherescan as WS
+        ec0 = WS._code_of(seg, lcol, '')
+        return int(ec0) if ec0 is not None else -1
+    return -1
+
+
+def _sums(seg, spec):
+    """(sums, counts) per key code: the stored row lengths, or the V-table of F over S's dictionary, poured on
+    every core against the key's codes"""
+    import wdb_kernels as WK
     key, lcol = spec['key'], spec['lcol']
-    L = _L9.row_lens(seg, lcol)
-    t9 = _PF.pop(id(seg), None)
-    if t9 is not None:
+    KV = int(seg.cols[key]['V'])
+    T = WK._nt()
+    L = tab = sc = None
+    ec = -1
+    # THE OVERLAP: the key's codes (and S's, without row lengths) unpack on a thread while the lengths are
+    # read. Started here, joined below, in one call (2026-10-18: started in detect, it was left running whenever
+    # execute did not follow -- the route map's markers -- and died with the interpreter mid-decode)
+    import threading
+    def _pf(s=seg, a=key, b=lcol, r=spec['rowl']):
+        s._raw_codes(a)
+        if not r:
+            s._raw_codes(b)
+    t9 = threading.Thread(target=_pf, daemon=True); t9.start()
+    try:
+        if spec['rowl']:
+            import wdb_lens as _L9
+            L = _L9.row_lens(seg, lcol)
+        else:
+            tab = _fn_table(seg, lcol, spec['lkind'])
+            if tab is not None:
+                tab = np.asarray(tab)
+                tab = tab.astype(np.float64) if tab.dtype.kind == 'f' else tab.astype(np.int64)
+                if spec['excl_empty']:
+                    ec = _empty_code(seg, lcol)
+    finally:
         t9.join()
-    if L is None:
+    if L is None and tab is None:
         return None
     kc = np.asarray(seg._raw_codes(key))
-    S, C = _L9.row_pour(kc, L, int(seg.cols[key]['V']), bool(spec['excl_empty']), 16)
-    return S.astype(np.float64), C.astype(np.float64)
-
-
-def _dict_sums(seg, spec):
-    key, lcol = spec['key'], spec['lcol']
-    lens = _fn_table(seg, lcol, spec.get('lkind'))
-    if lens is None:
-        return None
-    KV = int(seg.cols[key]['V'])
-    ec = -1
-    if spec['excl_empty']:
-        # '' sorts first in a sorted dictionary: when present it IS code 0 -- one fetch, not a
-        # binary search through the front-coded chunks (measured 71 ms on URL)
-        z0 = seg.fetch(lcol, 0) if int(seg.cols[lcol]['V']) else None
-        if isinstance(z0, (bytes, bytearray)):
-            z0 = z0.decode('utf-8', 'replace')
-        if z0 == '':
-            ec = 0
-        elif z0 is None or not isinstance(z0, str):
-            import wdb_wherescan as WS
-            ec0 = WS._code_of(seg, lcol, '')
-            ec = int(ec0) if ec0 is not None else -1
-    N = int(seg.N)
-    if int(lens.max() if lens.size else 0) < 65536:
-        lens16 = lens.astype(np.uint16)          # the tiny alphabet rides a u16 bus
-    else:
-        lens16 = lens.astype(np.int64)
-    import wdb_kernels as WK
-    # (the bidder's ledger, _price, is no longer asked here (2026-10-06): its pick was never used, and asking it
-    # measured this machine once and wrote a .calib.json into the working directory -- a file a query wrote)
-    # every row of both columns is read: ONE full decode each through the engine's own fastest
-    # reader (pipelined frames / block dictionaries / tag 20), then the workers slice the codes.
-    # Window-by-window reads of an uncached column measured 1.25 s against 0.31 s this way (Q27).
-    t9 = _PF.pop(id(seg), None)
-    if t9 is not None:
-        t9.join()
-    seg._raw_codes(key)
-    seg._raw_codes(lcol)
-    BR = 524288
-    nfr = (N + BR - 1) // BR
-    from concurrent.futures import ThreadPoolExecutor
-    def _work(t, T=8):
-        j = np.zeros(KV, np.int64)
-        c = np.zeros(KV, np.int64)
-        for f in range(t, nfr, T):               # striped frames, ONE dispatch:
-            lo, hi = f * BR, min((f + 1) * BR, N)
-            kcf = np.asarray(seg._raw_codes_range(key, lo, hi))
-            ucf = np.asarray(seg._raw_codes_range(lcol, lo, hi))
-            WK.lenagg_pour(kcf, ucf, lens16, j, c, np.int64(ec))
-        return j, c                              # one partial pair per worker
-    sums = np.zeros(KV, np.float64)
-    cnt = np.zeros(KV, np.float64)
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        for j, c in ex.map(_work, range(8)):     # eight workers, no future churn
-            sums += j
-            cnt += c
-    return sums, cnt
+    if not spec['rowl']:
+        sc = np.asarray(seg._raw_codes(lcol))
+    acc = np.float64 if (tab is not None and tab.dtype.kind == 'f') else np.int64
+    if KV > BIG_KV:
+        bits = max(1, (KV - 1).bit_length())
+        outS = np.zeros(KV, acc); outC = np.zeros(KV, np.int64)
+        WK.lenpour_big(kc, L if L is not None else np.zeros(1, np.uint16),
+                       sc if sc is not None else np.zeros(1, np.uint8),
+                       tab if tab is not None else np.zeros(1, np.int64),
+                       tab is not None, bool(spec['excl_empty']), np.int64(ec),
+                       np.int64(max(0, bits - 12)), np.int64(min(T, 16)), outS, outC)
+        return outS, outC
+    if L is not None:
+        import wdb_lens as _L9
+        return _L9.row_pour(kc, L, KV, bool(spec['excl_empty']), T)
+    S = np.zeros((T, KV + 16), acc)              # rows padded apart (THE PADDED BOARDS)
+    C = np.zeros((T, KV + 16), np.int64)
+    WK.lenpour_dict(kc, sc, tab, np.int64(ec), S, C)
+    return S.sum(0)[:KV], C.sum(0)[:KV]
 
 
 def execute(seg, spec):
     global _HITS
     key = spec['key']
-    r9 = _row_sums(seg, spec) if spec.get('rowl') else _dict_sums(seg, spec)
+    r9 = _sums(seg, spec)
     if r9 is None:
         return None
     sums, cnt = r9
-    keep = cnt > (spec['hmin'] if spec['hmin'] is not None else 0)
+    keep = cnt > 0
+    if spec['having'] is not None:
+        op, n = spec['having']
+        keep &= op(cnt, n)
     gs = np.flatnonzero(keep)
     rows = []
     vals = seg.values_at(key, gs) if gs.size else []
+    isint = sums.dtype.kind in 'iu'
     for i2, g0 in enumerate(gs.tolist()):
         kv = vals[i2]
         if isinstance(kv, (bytes, bytearray)):
             kv = kv.decode('utf-8', 'replace')
+        kv = wdb_sql._pyval(kv)
         row = []
         for kind, _ in spec['aggs']:
             if kind == 'KEY':
@@ -253,12 +263,13 @@ def execute(seg, spec):
             elif kind == 'CNT':
                 row.append(int(cnt[g0]))
             elif kind == 'SUML':
-                row.append(float(sums[g0]))
+                row.append(int(sums[g0]) if isint else float(sums[g0]))
             else:
-                row.append(float(sums[g0] / cnt[g0]) if cnt[g0] else None)
+                row.append(float(sums[g0]) / float(cnt[g0]))
         rows.append(tuple(row))
     if spec['oi'] is not None:
-        rows.sort(key=lambda r: (r[spec['oi']] is None, r[spec['oi']]), reverse=True)
+        oi = spec['oi']
+        rows.sort(key=lambda r: (r[oi] is None, r[oi]), reverse=spec['odesc'])
     if spec['lim'] is not None:
         rows = rows[:spec['lim']]
     _HITS += 1

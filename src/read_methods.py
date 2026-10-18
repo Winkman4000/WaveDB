@@ -126,6 +126,21 @@ stair = Read('stair',
              lambda c, spec: wdb_stair.execute(c.seg, spec),
              'staircase-column group-by from step positions')
 
+
+def _lenagg_detect(c):
+    import wdb_lenagg
+    return wdb_lenagg.detect(c.seg, c.tree, c.cmap)
+
+
+def _lenagg_execute(c, spec):
+    import wdb_lenagg
+    return wdb_lenagg.execute(c.seg, spec)
+
+
+# Q27's shape (2026-10-18): it had been a first try hidden inside general_scan
+lenagg = Read('lenagg', _lenagg_detect, _lenagg_execute,
+              'AVG/SUM(F(S)) GROUP BY K: one pour of stored lengths (or F over the dictionary) against the key')
+
 dict_count = Read('dict_count',
                   lambda c: wdb_gbcount.detect(c.seg, c.tree, c.cmap),
                   lambda c, spec: wdb_gbcount.execute(c.seg, spec),
@@ -396,15 +411,6 @@ def general_scan(ctx):
         cd = wdb_cdgroup.detect(ctx.seg, ctx.tree, ctx.cmap)
         if cd is not None:
             r = wdb_cdgroup.execute(ctx.seg, cd)
-            if r is not None:
-                return r
-    except Exception:
-        pass
-    try:
-        import wdb_lenagg
-        la = wdb_lenagg.detect(ctx.seg, ctx.tree, ctx.cmap)
-        if la is not None:
-            r = wdb_lenagg.execute(ctx.seg, la)
             if r is not None:
                 return r
     except Exception:

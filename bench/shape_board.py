@@ -9,6 +9,8 @@ Shapes (slot 1 = 'k', slot 2 = 'd' in the records):
        ORDER BY COUNT(*) DESC LIMIT 10
   q31  SELECT K1, K2, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> ''
        GROUP BY K1, K2 ORDER BY c DESC LIMIT 10    (Q30/Q31; form 'open' drops the WHERE = Q32)
+  q27  SELECT K, AVG(length(S)) AS l, COUNT(*) AS c FROM hits WHERE S <> '' GROUP BY K HAVING COUNT(*) > 100000
+       ORDER BY l DESC LIMIT 25      (slot 2 = S, text columns only; form 'open' drops the WHERE)
 A profile is a column's passport (mode, code encoding, type) plus its V class (bench/q13_profiles.py); one
 representative column stands for each profile (the original's own columns pinned), and the board runs every
 ordered pair of representatives.
@@ -76,6 +78,7 @@ SHAPES = {
     'q35': {'orig': ('ClientIP',), 'qnum': 35, 'forms': 'plain', 'numeric': True},
     'q33': {'orig': ('URL',), 'qnum': 33, 'forms': 'plain'},
     'q34': {'orig': ('URL',), 'qnum': 34, 'forms': 'plain'},
+    'q27': {'orig': ('CounterID', 'URL'), 'qnum': 27, 'forms': 'filtered,open', 'text_d': True},
 }
 SH = SHAPES[A.shape]
 if 'qnum' in SH:
@@ -156,6 +159,10 @@ def sql_of(k, d, form):
         return 'SELECT %s, COUNT(*) FROM hits GROUP BY %s ORDER BY COUNT(*) DESC LIMIT 10' % (k, k)
     if A.shape == 'q33':
         return 'SELECT %s, COUNT(*) AS c FROM hits GROUP BY %s ORDER BY c DESC LIMIT 10' % (k, k)
+    if A.shape == 'q27':
+        where = " WHERE %s <> ''" % d if form == 'filtered' else ''
+        return ('SELECT %s, AVG(length(%s)) AS l, COUNT(*) AS c FROM hits%s GROUP BY %s HAVING COUNT(*) > 100000 '
+                'ORDER BY l DESC LIMIT 25' % (k, d, where, k))
     if A.shape == 'q34':
         return 'SELECT 1, %s, COUNT(*) AS c FROM hits GROUP BY 1, %s ORDER BY c DESC LIMIT 10' % (k, k)
     if A.shape == 'q35':
@@ -355,6 +362,8 @@ LOG = open(RES, 'a')
 
 ks = A.k.split(',') if A.k else list(REPS.values())
 ds = A.d.split(',') if A.d else list(REPS.values())
+if SH.get('text_d'):                         # slot 2 takes a string function: text columns only
+    ds = [c for c in ds if COLS[c]['dt'] == 'str']
 if SH.get('numeric'):
     ks = [c for c in ks if COLS[c]['dt'] == 'int' or c == ORIG_K]
 if SINGLE:

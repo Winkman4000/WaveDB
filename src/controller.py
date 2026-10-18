@@ -46,6 +46,7 @@ _READ_ORDER = (
     R.gbcount,              # full-table group census from the gbc shelf
     R.stair,                # staircase column: single-key GROUP BY from step positions (no decode)
     R.regexgroup,           # GROUP BY regex over the dict: per-code counts, V-level strings
+    R.lenagg,               # AVG/SUM(F(S)) GROUP BY K: stored lengths poured against the key (Q27)
     R.window,               # window fns: stable scatter by partition, lanes inherit cluster order
     R.dict_count,           # dictionary per-code counts (sidecar: answers before any scan)
     R.groupself,            # counting board: GROUP BY K + WHERE on K, bins not rows
