@@ -48,11 +48,13 @@ def _m4_range(seg, col, lo, hi):
 
 
 def _m4_in_ranges(seg, col, los, his):
-    return np.concatenate([_m4_range(seg, col, int(a), int(b)) for a, b in zip(los, his)])
+    parts = [_m4_range(seg, col, int(a), int(b)) for a, b in zip(los, his)]
+    return np.concatenate(parts) if parts else np.empty(0, np.int64)     # no range kept: no rows (one <> 7)
 
 
 def _codes_in_ranges(seg, col, los, his):
-    return np.concatenate([np.asarray(seg._raw_codes_range(col, int(a), int(b))) for a, b in zip(los, his)])
+    parts = [np.asarray(seg._raw_codes_range(col, int(a), int(b))) for a, b in zip(los, his)]
+    return np.concatenate(parts) if parts else np.empty(0, np.int64)
 
 
 def _APPLY(v, op, c):

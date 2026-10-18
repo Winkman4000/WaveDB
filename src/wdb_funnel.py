@@ -210,6 +210,12 @@ def _flatten_and(node, out):
         out.append(node)
 
 
+# THE DICTIONARY MODES (2026-10-18): funnel's codes are dictionary codes -- a literal is found by bisecting the
+# column's value dictionary (_code_of), a key decodes by fetching its code. A mode-4 column's codes are ROW
+# POSITIONS, so both read garbage there ('rare = 3' on a mode-4 toy answered no rows): such columns decline.
+_DICT_MODES = (0, 1, 2)
+
+
 def _compile_key(seg, expr, cm):
     """THE KEY COMPILER: an expression over dict-coded columns is itself a
     code-space citizen. Compiles a group-key expression to a plan that
@@ -219,7 +225,7 @@ def _compile_key(seg, expr, cm):
     if isinstance(expr, E.Column):
         cn = cm.get(expr.name, expr.name)
         c9 = seg.cols.get(cn)
-        if c9 is None or c9.get('has_null'):
+        if c9 is None or c9.get('has_null') or c9.get('mode') not in _DICT_MODES:
             return None
         return {'kind': 'col', 'col': cn, 'W': int(c9['V'])}
     if isinstance(expr, E.Case):
@@ -246,7 +252,8 @@ def _compile_key(seg, expr, cm):
             if not isinstance(v9, int):
                 return None
             cn9 = cm.get(l9.name, l9.name)
-            if seg.cols.get(cn9) is None or seg.cols[cn9].get('has_null'):
+            if seg.cols.get(cn9) is None or seg.cols[cn9].get('has_null') \
+                    or seg.cols[cn9].get('mode') not in _DICT_MODES:
                 return None
             conds.append((cn9, v9, isinstance(nd, E.EQ)))
         def _branch(b9):
@@ -354,13 +361,13 @@ def detect(seg, tree, col_map):
             if v9 is None and not (isinstance(r9, E.Literal) and r9.is_string):
                 return None
             if isinstance(p9, E.NEQ) and v9 == '':
-                if seg.cols.get(cn) is None:
+                if seg.cols.get(cn) is None or seg.cols[cn].get('mode') not in _DICT_MODES:
                     return None
                 strneq.append(cn); continue
             if not isinstance(v9, int):
                 return None
             c9 = seg.cols.get(cn)
-            if c9 is None or c9.get('dt') != 0 or c9.get('has_null'):
+            if c9 is None or c9.get('dt') != 0 or c9.get('has_null') or c9.get('mode') not in _DICT_MODES:
                 return None
             if isinstance(p9, E.EQ) and int(c9.get('V') or 0) >= 64:
                 weq.append((cn, v9))             # wide equalities: THE PICK chooses the selector
@@ -385,6 +392,8 @@ def detect(seg, tree, col_map):
                 return None
             vs = [_lit(x) for x in p9.expressions]
             if any(not isinstance(v, int) for v in vs):
+                return None
+            if seg.cols.get(cm.get(l9.name, l9.name), {}).get('mode') not in _DICT_MODES:
                 return None
             flags.append((cm.get(l9.name, l9.name), tuple(vs), 'in'))
         else:
