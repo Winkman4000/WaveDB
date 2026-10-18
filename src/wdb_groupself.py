@@ -119,8 +119,8 @@ def detect(seg, tree, col_map):
     if not P.not_positional(seg, col): return None
     if not P.no_deleted_rows(seg):     return None
     c = seg.cols[col]
-    if c.get('mode') not in (0, 1):
-        return None                                      # dict columns (v1)
+    if c.get('mode') not in (0, 1, 2):
+        return None                                      # dictionary columns (mode 2: int dicts, 2026-10-18)
     if lower and c.get('has_null'):
         return None                                      # NULL under LOWER: scan path
     if seg._effective(col) is not None:
@@ -135,6 +135,8 @@ def detect(seg, tree, col_map):
             terms.append(t)
     if c.get('has_null') and not terms:
         return None                                      # NULL group must be emitted: scan path
+    if c.get('mode') == 2 and not terms:
+        return None                                      # a plain int-dictionary key: dict_count / affinegroup
     hv = None
     having = tree.args.get('having')
     if having is not None:
@@ -200,24 +202,35 @@ def execute(seg, spec):
         op, val = spec['having']
         live &= (cn > val) if op == '>' else (cn >= val) if op == '>=' else \
                 (cn < val) if op == '<' else (cn <= val) if op == '<=' else (cn == val)
-    idx = np.flatnonzero(live)
+    nlive = int(np.count_nonzero(live))     # counted, not listed: a near-unique key has V live squares
     hdrs = [wdb_sql._alias(p) for p in spec['proj']]
-    if idx.size == 0:
+    if nlive == 0:
         _HITS += 1
         return [], hdrs
-    if spec['lim'] is None and idx.size > _NOLIM_MAX:
+    if spec['lim'] is None and nlive > _NOLIM_MAX:
         return None                  # every group, one point-fetch each: the scan path's job
-    k = int(idx.size) if spec['lim'] is None else min(spec['lim'], int(idx.size))
-    cnl = cn[idx]
-    if idx.size > k:
+    k = nlive if spec['lim'] is None else min(spec['lim'], nlive)
+    if nlive > k and len(spec['order'].expressions) == 1:
+        # THE CANONICAL TOP (2026-10-18): ORDER BY the count alone -- a tie at the LIMIT is SQL's to leave
+        # unordered, and declining it sent WatchID-like keys (every count 1) to a 4.7 s scan. Count desc, then code
+        # asc, by topk_bar over the live board without sorting it (dead squares zeroed sit below every live count)
+        import wdb_kernels
+        board = np.where(live, cn, 0)
+        sel = np.asarray(wdb_kernels.topk_bar(board, k), np.int64)
+    elif nlive > k:
+        # more ORDER BY terms: the pick must follow them -- a tie straddling the LIMIT declines (the scan decides)
+        idx = np.flatnonzero(live)
+        cnl = cn[idx]
         part = np.argpartition(-cnl, k - 1)
         top = part[:k]
         rest_max = int(cnl[part[k:]].max())
         top = top[np.argsort(-cnl[top], kind='stable')]
         if int(cnl[top[-1]]) == rest_max:
-            return None              # tie straddles the LIMIT boundary: scan path decides
+            return None
         sel = idx[top]
     else:
+        idx = np.flatnonzero(live)
+        cnl = cn[idx]
         sel = idx[np.argsort(-cnl, kind='stable')]
     rows = []
     for g in sel.tolist():

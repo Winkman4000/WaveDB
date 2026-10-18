@@ -4695,21 +4695,138 @@ def _count_ge_nb(a, bar, T):
     return part.sum()
 
 
+@njit(cache=True, nogil=True)
+def _first_eq_nb(a, v, out):
+    """the first out.size indices i where a[i] == v, ascending (a scan that stops when it has them)"""
+    j = 0
+    m = out.size
+    if m == 0:
+        return
+    for i in range(a.size):
+        if a[i] == v:
+            out[j] = i; j += 1
+            if j == m:
+                return
+
+
+BAR_CAP = 4096          # the census bins of topk_bar: T x 4097 int64 boards stay in cache
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _bar_census_nb(a, cap, T):
+    """one parallel pass over an integer array: (census of min(max(a, 0), cap), min, max)"""
+    n = a.size
+    part = np.zeros((T, cap + 1 + 16), np.int64)
+    pmn = np.empty(T, np.int64); pmx = np.empty(T, np.int64)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        mn = np.int64(a[lo]) if hi > lo else np.int64(a[0])
+        mx = mn
+        for i in range(lo, hi):
+            v = np.int64(a[i])
+            if v < mn:
+                mn = v
+            if v > mx:
+                mx = v
+            if v < 0:
+                v = 0
+            elif v > cap:
+                v = cap
+            part[t, v] += 1
+        pmn[t] = mn; pmx[t] = mx
+    out = np.zeros(cap + 1, np.int64)
+    for v in range(cap + 1):
+        s = 0
+        for t in range(T):
+            s += part[t, v]
+        out[v] = s
+    return out, pmn.min(), pmx.max()
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _ge_count_nb(a, v, T, cnt):
+    n = a.size
+    for t in prange(T):
+        c = 0
+        for i in range(t * n // T, (t + 1) * n // T):
+            if np.int64(a[i]) >= v:
+                c += 1
+        cnt[t] = c
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _ge_write_nb(a, v, T, off, out):
+    n = a.size
+    for t in prange(T):
+        w = off[t]
+        for i in range(t * n // T, (t + 1) * n // T):
+            if np.int64(a[i]) >= v:
+                out[w] = i
+                w += 1
+
+
+def _collect_ge(a, v):
+    """the indices i with a[i] >= v, ascending, on every core (a signed integer array, or unsigned below 2**63)"""
+    T = _nt()
+    cnt = np.zeros(T, np.int64)
+    _ge_count_nb(a, np.int64(v), T, cnt)
+    off = np.zeros(T, np.int64)
+    off[1:] = np.cumsum(cnt)[:-1]
+    out = np.empty(int(cnt.sum()), np.int64)
+    _ge_write_nb(a, np.int64(v), T, off, out)
+    return out
+
+
+def _desc_key(x):
+    """a key whose ascending order is x's descending order: ~x for integers and bools (exact, no overflow at the
+    type's ends, unsigned included), -x for floats"""
+    return ~x if x.dtype.kind in 'iub' else -x
+
+
 def topk_bar(a, k):
     """THE BAR (Jackson: stop after inspecting the top hundred, not the top seventeen million):
-    indices of the k largest of `a`, ordered value desc then index asc, without partitioning
-    the whole array. Lower a bar from the max until at least k values clear it (each probe a
-    parallel compare, ~10 ms on 17.6M), then sort only those. Exact: everything below the bar
-    is below the k-th value."""
+    indices of the k largest of `a`, ordered value desc then index asc, without sorting the whole array.
+    A non-negative integer array (a census): the k-th value v_k from one parallel census of the values (all past
+    CAP share its last bin, settled exactly among themselves), then the fewer-than-k values above v_k sorted, then
+    the first ties at v_k in index order by a scan that stops when it has them (2026-10-18: the bar search before
+    this lowered by doubling steps and overshot v_k on spread plateaus -- HID 0.7 s). Other arrays: lower a bar
+    from the max until k values clear it, then sort those."""
     a = np.ascontiguousarray(a)
     n = int(a.size); k = int(k)
     if k <= 0 or n == 0:
         return np.empty(0, np.int64)
     if k >= n:
-        return np.argsort(-a, kind='stable')
-    mx = int(a.max()); mn = int(a.min())
-    if mx == mn:
-        return np.arange(k)
+        return np.argsort(_desc_key(a), kind='stable').astype(np.int64)
+    if n <= (1 << 16):
+        return np.argsort(_desc_key(a), kind='stable')[:k].astype(np.int64)
+    if a.dtype.kind in 'iu' and a.dtype != np.uint64:
+        # one parallel pass: min, max and a cache-sized census of min(a, BAR_CAP) (2026-10-18: a census capped at
+        # max(a) up to 1M bins was 16 x 1M boards to zero and fold -- URL's top-10 paid 40-57 ms for it)
+        h, mn, mx = _bar_census_nb(a, np.int64(BAR_CAP), _nt())
+        mn = int(mn); mx = int(mx)
+        if mx == mn:
+            return np.arange(k)
+        if mn >= 0:
+            if int(h[BAR_CAP]) >= k:                      # k values at or past the cap: the few past it settle all
+                big = _collect_ge(a, BAR_CAP)             # their indices ascending, one parallel pass
+                vals = a[big].astype(np.int64)
+                vk = int(np.partition(vals, big.size - k)[big.size - k])
+                m = vals > vk
+                upv = vals[m]; up = big[m][np.argsort(-upv, kind='stable')]
+                eq = big[vals == vk][:k - up.size]        # ascending already: the first ties
+                return np.concatenate([up, eq]).astype(np.int64)
+            tail = np.cumsum(h[::-1])                     # values >= cap, cap-1, ...
+            vk = int(BAR_CAP - int(np.flatnonzero(tail >= k)[0]))
+            up = _collect_ge(a, vk + 1)
+            up = up[np.argsort(-a[up].astype(np.int64), kind='stable')]
+            eq = np.empty(k - up.size, np.int64)
+            _first_eq_nb(a, np.int64(vk), eq)
+            return np.concatenate([up, eq]).astype(np.int64)
+    else:
+        mx = a.max().item(); mn = a.min().item()          # python values: a float's range stays a float
+        if mx == mn:
+            return np.arange(k)
     bar = mx
     step = max(1, (mx - mn) // 64)
     while bar > mn and _count_ge(a, bar) < k:
@@ -4718,7 +4835,7 @@ def topk_bar(a, k):
     if bar < mn:
         bar = mn
     cand = np.flatnonzero(a >= bar)
-    return cand[np.argsort(-a[cand], kind='stable')][:k]
+    return cand[np.argsort(_desc_key(a[cand]), kind='stable')][:k]
 
 
 @njit(nogil=True, cache=True)
@@ -4762,6 +4879,53 @@ def counting_order(key, out_dtype=np.int64):
     return out
 
 
+def bincount_big(codes, V):
+    """THE BIG CENSUS (2026-10-18, the single-key board): np.bincount for a dictionary past bincount_par's boards
+    (T x V x 4 bytes), on every core. The codes are partitioned by their high bits into 4096 code ranges (a
+    per-thread count of the ranges, the offsets, one scatter); then every range is counted on its own core into
+    its own slice of the answer, so no two cores ever touch one counter. WatchID's 100M codes: numpy's one thread
+    was the 1.6-2.1 s of its top count. Codes are assumed < V (the caller's contract, as bincount_par)."""
+    codes = np.ascontiguousarray(codes)
+    V = int(V)
+    bits = max(1, (V - 1).bit_length())
+    SH = max(0, bits - 12)
+    T = min(numba.get_num_threads(), 16)
+    out = np.zeros(V, np.int64)
+    _big_census_nb(codes, np.int64(SH), np.int64(T), out)
+    return out
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def _big_census_nb(codes, SH, T, out):
+    n = codes.size
+    NB = 4096
+    pc = np.zeros((T, NB), np.int64)
+    for t in prange(T):
+        for i in range(n * t // T, n * (t + 1) // T):
+            pc[t, np.int64(codes[i]) >> SH] += 1
+    offs = np.zeros(NB + 1, np.int64)
+    for b in range(NB):
+        s = 0
+        for t in range(T):
+            v = pc[t, b]; pc[t, b] = s; s += v
+        offs[b + 1] = offs[b] + s
+    P = np.empty(n, codes.dtype)
+    for t in prange(T):
+        cur = np.empty(NB, np.int64)
+        for b in range(NB):
+            cur[b] = offs[b] + pc[t, b]
+        for i in range(n * t // T, n * (t + 1) // T):
+            b = np.int64(codes[i]) >> SH
+            P[cur[b]] = codes[i]
+            cur[b] += 1
+    V = out.size
+    for b in prange(NB):
+        for j in range(offs[b], offs[b + 1]):
+            c = np.int64(P[j])
+            if c < V:
+                out[c] += 1
+
+
 def bincount_par(codes, minlength):
     """THE PARALLEL CENSUS: np.bincount of 100M codes is one thread for 300 ms (plus an astype
     copy); this is per-thread boards and a reduce, measured ~60 ms. Boards cost T*V*4 bytes, so
@@ -4769,12 +4933,17 @@ def bincount_par(codes, minlength):
     past the dictionary is the caller's to trim)."""
     codes = np.asarray(codes)
     V = int(minlength)
+    if V > (64 << 20) and codes.size >= (1 << 22) and codes.dtype.kind in 'iu' and codes.dtype.itemsize <= 4:
+        return bincount_big(codes, V)
     if codes.size < (1 << 22) or V > (64 << 20) or codes.dtype.kind not in 'iu':
         return np.bincount(codes, minlength=V)
     if V < int(codes.max()) + 1:
         return np.bincount(codes, minlength=V)
     T = min(numba.get_num_threads(), 16)
-    part = np.zeros((T, V), np.int32)
+    # THE BOARDS APART (2026-10-18): each thread's row padded to whole 64-byte lines plus one, so no two
+    # threads' counters share a cache line (V=3 on 16 cores: 155 ms with the rows side by side)
+    Vp = ((V + 15) // 16) * 16 + 16
+    part = np.zeros((T, Vp), np.int32)
     out = np.empty(V, np.int64)
     _hist_par(np.ascontiguousarray(codes), V, part, out)
     return out

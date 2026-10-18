@@ -74,6 +74,8 @@ SHAPES = {
     'q14': {'orig': ('SearchEngineID', 'SearchPhrase'), 'qnum': 14, 'forms': 'filtered'},
     'q15': {'orig': ('UserID',), 'pins': ('UserID', 'URL'), 'qnum': 15, 'forms': 'plain'},
     'q35': {'orig': ('ClientIP',), 'qnum': 35, 'forms': 'plain', 'numeric': True},
+    'q33': {'orig': ('URL',), 'qnum': 33, 'forms': 'plain'},
+    'q34': {'orig': ('URL',), 'qnum': 34, 'forms': 'plain'},
 }
 SH = SHAPES[A.shape]
 if 'qnum' in SH:
@@ -152,6 +154,10 @@ def sql_of(k, d, form):
             k, k, literal(k), k)
     if A.shape == 'q15':
         return 'SELECT %s, COUNT(*) FROM hits GROUP BY %s ORDER BY COUNT(*) DESC LIMIT 10' % (k, k)
+    if A.shape == 'q33':
+        return 'SELECT %s, COUNT(*) AS c FROM hits GROUP BY %s ORDER BY c DESC LIMIT 10' % (k, k)
+    if A.shape == 'q34':
+        return 'SELECT 1, %s, COUNT(*) AS c FROM hits GROUP BY 1, %s ORDER BY c DESC LIMIT 10' % (k, k)
     if A.shape == 'q35':
         return ('SELECT %s, %s - 1, %s - 2, %s - 3, COUNT(*) AS c FROM hits GROUP BY %s, %s - 1, %s - 2, %s - 3 '
                 'ORDER BY c DESC LIMIT 10' % ((k,) * 8))
