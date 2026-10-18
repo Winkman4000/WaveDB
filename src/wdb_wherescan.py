@@ -1259,14 +1259,18 @@ def _scan_eq19(seg, col, code, lo, hi):
                              np.int64(code), np.int64(b0), np.int64(b1), lid)
     else:
         _WK.e19_eq_blocks(dw, gb, c['e19gw'], dc, c['e19doff'], np.int64(code), np.int64(b0), np.int64(b1), lid)
-    out = np.empty(1024, np.int64)
-    k = _WK.e19_rows_eq(pw, np.int64(BR), np.int64(N), c['e19lb'], c['e19poff'], lid,
-                        np.int64(b0), np.int64(b1), np.int64(lo), np.int64(hi), out)
-    if k > out.size:                                   # more rows than the first guess: once more, sized
-        out = np.empty(k, np.int64)
+    if os.environ.get('WDB_E19_PAR', '1') != '0':
+        pos = _WK.e19_rows_eq_all(pw, np.int64(BR), np.int64(N), c['e19lb'], c['e19poff'], lid,
+                                  np.int64(b0), np.int64(b1), np.int64(lo), np.int64(hi))
+    else:
+        out = np.empty(1024, np.int64)
         k = _WK.e19_rows_eq(pw, np.int64(BR), np.int64(N), c['e19lb'], c['e19poff'], lid,
                             np.int64(b0), np.int64(b1), np.int64(lo), np.int64(hi), out)
-    pos = out[:k].copy()
+        if k > out.size:                               # more rows than the first guess: once more, sized
+            out = np.empty(k, np.int64)
+            k = _WK.e19_rows_eq(pw, np.int64(BR), np.int64(N), c['e19lb'], c['e19poff'], lid,
+                                np.int64(b0), np.int64(b1), np.int64(lo), np.int64(hi), out)
+        pos = out[:k].copy()
     if pos.size <= 4_000_000:                          # the codes at the hits, for codes_at (as enc 3/18)
         seg.__dict__.setdefault('_scan_codes', {})[col] = (pos, np.full(pos.size, code, np.int64))
     return pos

@@ -6114,6 +6114,67 @@ def e19_rows_eq(pw, BR, N, lb, poff, lid, b0, b1, lo, hi, out):
     return k
 
 
+def e19_rows_eq_all(pw, BR, N, lb, poff, lid, b0, b1, lo, hi):
+    """THE ROW WALK ON EVERY CORE (2026-10-18, the Q14 board): the rows in [lo, hi) of the blocks with
+    lid >= 0 whose pointer is that local id, as a sorted int64 array. e19_rows_eq walked the touched blocks one
+    after another on one core -- the cost was the blocks a value is spread over, not its rows (UserID rank 3:
+    7,584 rows in 1,069 of 1,526 blocks, 131 ms; IPNetworkID: every value in nearly all 6,104 blocks, 190-244 ms,
+    where the parallel full decode is 60-105). Here: the touched blocks, each counted on its own core, the
+    offsets, then each block written in place -- ascending, as before."""
+    tb = (np.flatnonzero(np.asarray(lid[b0:b1]) >= 0) + b0).astype(np.int64)
+    if tb.size == 0:
+        return np.empty(0, np.int64)
+    cnt = np.zeros(tb.size, np.int64)
+    _e19_rows_count_nb(pw, np.int64(BR), np.int64(N), lb, poff, lid, tb, np.int64(lo), np.int64(hi), cnt)
+    offs = np.zeros(tb.size + 1, np.int64)
+    np.cumsum(cnt, out=offs[1:])
+    out = np.empty(int(offs[-1]), np.int64)
+    _e19_rows_write_nb(pw, np.int64(BR), np.int64(N), lb, poff, lid, tb, np.int64(lo), np.int64(hi), offs, out)
+    return out
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def _e19_rows_count_nb(pw, BR, N, lb, poff, lid, tb, lo, hi, cnt):
+    for t in prange(tb.size):
+        b = tb[t]
+        j = lid[b]
+        l = np.int64(lb[b]); r0 = b * BR; r1 = min(r0 + BR, N)
+        a = max(r0, lo); e = min(r1, hi)
+        if e <= a:
+            continue
+        if l == 0:                                       # a one-value block: every row is that value
+            cnt[t] = e - a
+            continue
+        pos = poff[b] * 64 + (a - r0) * l
+        k = 0
+        for i in range(a, e):
+            if _e19_get(pw, pos, l) == j:
+                k += 1
+            pos += l
+        cnt[t] = k
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def _e19_rows_write_nb(pw, BR, N, lb, poff, lid, tb, lo, hi, offs, out):
+    for t in prange(tb.size):
+        b = tb[t]
+        j = lid[b]
+        l = np.int64(lb[b]); r0 = b * BR; r1 = min(r0 + BR, N)
+        a = max(r0, lo); e = min(r1, hi)
+        k = offs[t]
+        if e <= a:
+            continue
+        if l == 0:
+            for i in range(a, e):
+                out[k] = i; k += 1
+            continue
+        pos = poff[b] * 64 + (a - r0) * l
+        for i in range(a, e):
+            if _e19_get(pw, pos, l) == j:
+                out[k] = i; k += 1
+            pos += l
+
+
 @njit(cache=True, parallel=True, nogil=True)
 def e19_gather(pw, dw, BR, gbits, lb, gw, dcnt, poff, doff, rows, starts, out):
     """codes at sorted rows, grouped by block (starts: the group boundaries). A block's
