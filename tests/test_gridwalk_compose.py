@@ -96,3 +96,40 @@ def test_secondary_order_and_switch():
         assert GW._COMPOSED == c0
     finally:
         GW._COMPOSE[0] = True
+
+
+def test_axis_filter_composed():
+    """a WHERE '=' / '<>' on one of the two keys (the Q14 shape): composed with the filter applied to the cells,
+    dense and flat, both orders of the keys -- the counts equal pandas on the filtered rows, and an unknown
+    literal or a filter on a third column is not gridwalk's"""
+    db, df, _d = _fixture()
+    cases = [('tiny', 'bin', 'bin', 0), ('skew', 'tiny', 'tiny', 3), ('word', 'skew', 'word', "''"),
+             ('wide', 'tiny', 'tiny', 5), ('bin', 'wide', 'bin', 1)]
+    for flat in (False, True):
+        old = wdb_bound.DENSE_MAX
+        if flat:
+            wdb_bound.DENSE_MAX = 1000
+        try:
+            for a, b, f, lit in cases:
+                for op in ('<>', '='):
+                    for lim in (1, 10):
+                        q = ('SELECT %s, %s, COUNT(*) AS c FROM t WHERE %s %s %s GROUP BY %s, %s ORDER BY c DESC LIMIT %d'
+                             % (a, b, f, op, lit, a, b, lim))
+                        c0 = GW._COMPOSED
+                        got = [tuple(x.decode() if isinstance(x, (bytes, bytearray)) else x for x in r)
+                               for r in _rows(db.run(q))]
+                        v = '' if lit == "''" else int(lit)
+                        sub = df[df[f] != v] if op == '<>' else df[df[f] == v]
+                        want = sorted(sub.groupby([a, b]).size().sort_values(ascending=False).head(lim).tolist())
+                        assert sorted(int(r[-1]) for r in got) == want, (a, b, f, op, lim, flat, got)
+                        cnt = sub.groupby([a, b]).size()
+                        for r in got:
+                            assert cnt[(r[0], r[1])] == int(r[-1]), (q, r)
+                        if f != 'word' and op == '<>':
+                            assert GW._COMPOSED == c0 + 1, ('not composed', q)
+        finally:
+            wdb_bound.DENSE_MAX = old
+    c0 = GW._COMPOSED
+    db.run("SELECT tiny, bin, COUNT(*) AS c FROM t WHERE skew <> 3 GROUP BY tiny, bin ORDER BY c DESC LIMIT 10")
+    db.run("SELECT tiny, bin, COUNT(*) AS c FROM t WHERE bin <> 9 GROUP BY tiny, bin ORDER BY c DESC LIMIT 10")
+    assert GW._COMPOSED == c0, 'a third-column filter or an absent literal was composed'

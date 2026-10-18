@@ -61,6 +61,30 @@ def _litval(node):
     return None
 
 
+def _time_units(seg, col, val):
+    """A literal for a time/date column (dt 3) as an int in the column's stored unit, or None when no stored
+    value can equal it. A numeric literal is native units (wdb_sql._lit_for_col's convention); text, bytes,
+    dates and datetimes are parsed. Raises ValueError on text that is not a time."""
+    import datetime as _dtm
+    unit = seg.unit(col)
+    if isinstance(val, (bool, np.bool_)):
+        raise ValueError('boolean literal for a time column')
+    if isinstance(val, (int, np.integer)):
+        return int(val)
+    if isinstance(val, (float, np.floating)):
+        return int(val) if float(val).is_integer() else None
+    if isinstance(val, bytes):
+        val = val.decode('utf-8', 'surrogatepass')
+    if isinstance(val, str):
+        t = np.datetime64(val.strip().replace(' ', 'T'))
+    elif isinstance(val, (np.datetime64, _dtm.datetime, _dtm.date)):
+        t = np.datetime64(val)
+    else:
+        raise ValueError('unsupported literal for a time column: %r' % (val,))
+    iv = int(t.astype('datetime64[%s]' % unit).view('int64'))
+    return iv if np.datetime64(iv, unit) == t else None
+
+
 def _code_of(seg, col, val):
     """Dict code of a literal, or None when absent. Dicts are value-sorted: mode 2 answers by
     searchsorted over the int dict; string dicts by fetch-bisect (O(log V) point fetches, each
@@ -69,6 +93,18 @@ def _code_of(seg, col, val):
     V = int(c['V']) - (1 if c['has_null'] else 0)
     if V <= 0:
         return None
+    if c['dt'] == 3:
+        # A TIME/DATE LITERAL IN THE COLUMN'S STORED UNITS (2026-10-17, the Q14 board): EventTime <> '2013-07-21
+        # 19:37:51' reached the int lookup as text, int() failed, and None read as "absent" -- '<>' then kept
+        # every row (a wrong answer) and the composed reads declined. The text is parsed to the column's unit;
+        # an unparseable literal raises (never guessed absent); a value finer than the unit is absent.
+        val = _time_units(seg, col, val)
+        if val is None:
+            return None
+        if c['mode'] != 2:
+            d = np.asarray(seg._typed_dict(col))[:V]
+            k = int(np.searchsorted(d, val))
+            return k if k < V and int(d[k]) == val else None
     if c['mode'] == 2:
         try:
             iv = int(val)
@@ -1062,6 +1098,18 @@ def detect(seg, tree, col_map):
                 return None
     lim = wdb_sql._limit(tree)
     off = wdb_sql._offset(tree) or 0
+    # THE COMPOSED COUNT OUTRANKS THE SCAN (2026-10-17, the Q14 board): two keys, COUNT only, ordered by the
+    # count, the WHERE one '=' / '<>' on one of the keys -- gridwalk's composed count applies that filter to
+    # the counted cells (exact, every core); this scan walked the survivors on one key's frames and passed the
+    # board's 20 s cap on 30 of the Q14 samples (IsOldCounter x ClientEventTime 30 s, DuckDB 0.3 s)
+    if len(keys) == 2 and order is not None:
+        try:
+            import wdb_gridwalk
+            gsp = wdb_gridwalk.detect(seg, tree, col_map)
+            if gsp is not None and gsp.get('afilter') is not None:
+                return None
+        except Exception:
+            pass
     return {'spans': spans, 'eqs': eqs, 'flags': flags, 'ins': ins, 'likes': likes,
             'nulls': nulls, 'ors': ors, 'sflags': sflags, 'drive_eq': drive_eq,
             'drive_like': drive_like, 'drive_or': drive_or, 'drive_sf': drive_sf,

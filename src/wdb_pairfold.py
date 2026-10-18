@@ -235,12 +235,17 @@ def execute(seg, spec):
     x1 = scols[0] if scols else spec['a']
     x2 = scols[1] if len(scols) > 1 else x1
     VA = int(seg.cols[spec['a']]['V'])
+    # THE SUMS' VALUE TABLES, once (2026-10-17): with no SUM/AVG the payload is never read, so no table is
+    # decoded -- the first version decoded the small key's values as numbers anyway and a TEXT key crashed
+    # (MobilePhoneModel x SearchPhrase, COUNT only, WHERE SearchPhrase <> '')
+    dv1 = _dv(seg, x1) if scols else np.zeros(max(1, VA), np.float64)
+    dv2 = _dv(seg, x2) if len(scols) > 1 else dv1
     if _DENSE[0] and VA * BV <= DENSE_MAX:
         # THE SMALL PAIR SPACE: every pair gets its own slot, counted exactly -- no census, no
         # prune, no certificate needed, no buckets, no sort
         ac9 = np.asarray(seg._raw_codes(spec['a']))
         cnt, s1, s2 = _WK.pf_dense(pos, ac9, bc9, np.asarray(seg._raw_codes(x1)), np.asarray(seg._raw_codes(x2)),
-                                   _dv(seg, x1), _dv(seg, x2), VA, VA * BV)
+                                   dv1, dv2, VA, VA * BV)
         nzk = np.flatnonzero(cnt)
         ucnt = cnt[nzk]; us1 = s1[nzk]; us2 = s2[nzk]
         ukey = ((nzk // VA) << spec['abits']) | (nzk % VA)
@@ -291,7 +296,7 @@ def execute(seg, spec):
         us2 = np.zeros(n, np.float64)
         ukey = np.zeros(n, np.int64)
         nruns = np.zeros(1 << 12, np.int64)
-        _WK.pr_fold2(key, pay, offs, SH, spec['abits'], _dv(seg, x1), _dv(seg, x2),    # a heavy bucket is counted, not sorted
+        _WK.pr_fold2(key, pay, offs, SH, spec['abits'], dv1, dv2,    # a heavy bucket is counted, not sorted
                      ucnt, us1, us2, ukey, nruns)
         live = np.zeros(n, bool)
         for b in range(nruns.size):

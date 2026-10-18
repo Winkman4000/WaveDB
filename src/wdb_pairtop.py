@@ -23,6 +23,7 @@ def detect(seg, tree, col_map):
             or tree.args.get('having') or tree.args.get('distinct'):
         return None
     fcol = None
+    fgen = None                                  # (col, neg, literal node): one '=' / '<>' on any column
     w9 = tree.args.get('where')
     if w9 is not None:
         n9 = w9.this
@@ -30,6 +31,13 @@ def detect(seg, tree, col_map):
                 and isinstance(n9.expression, E.Literal)
                 and str(n9.expression.this) == ''):
             fcol = (col_map or {}).get(n9.this.name, n9.this.name)
+        elif isinstance(n9, (E.NEQ, E.EQ)):
+            l9, r9 = n9.this, n9.expression
+            if not isinstance(l9, E.Column):
+                l9, r9 = r9, l9
+            if not isinstance(l9, E.Column):
+                return None
+            fgen = ((col_map or {}).get(l9.name, l9.name), isinstance(n9, E.NEQ), r9)
         else:
             return None
     g = tree.args.get('group')
@@ -103,8 +111,29 @@ def detect(seg, tree, col_map):
     if fcol is not None:
         fc9 = seg.cols.get(fcol)
         if fc9 is None or fc9.get('code_enc') not in (8, 9) or fcol in (a, b):
-            return None                      # the prune rides the sparse dress
-    return {'a': a, 'b': b, 'aggs': aggs, 'lim': lim, 'fcol': fcol,
+            # THE GENERAL FILTER takes '' on any other column too (2026-10-17)
+            fgen = (fcol, True, w9.this.expression)
+            fcol = None
+    if fgen is not None:
+        # THE GENERAL FILTER (2026-10-17, the Q14 board): one '=' / '<>' between any column and a literal is
+        # applied by the column's CODE at the survivor rows (and at the filler pool) -- the singleton law is
+        # untouched: a pair that repeats among the admitted rows repeats among all rows. GoodEvent x WatchID
+        # WHERE WatchID <> ... had fallen to gridwalk's flat lane, 100M near-unique pairs counted (5-17 s)
+        import wdb_wherescan as WS
+        gc9 = seg.cols.get(fgen[0])
+        if gc9 is None or gc9.get('has_null') or gc9.get('mode') == 4:
+            return None
+        v9 = WS._litval(fgen[2])
+        if v9 is None:
+            return None
+        try:
+            code9 = WS._code_of(seg, fgen[0], v9)
+        except Exception:
+            return None
+        if code9 is None:
+            return None                          # never guess a literal absent
+        fgen = (fgen[0], fgen[1], int(code9))
+    return {'a': a, 'b': b, 'aggs': aggs, 'lim': lim, 'fcol': fcol, 'fgen': fgen,
             'proj': tree.expressions}
 
 
@@ -198,6 +227,12 @@ def _prune(seg, spec, ridx):
     """Jackson's order: reduce to the exception rows, THEN prune blanks by
     ABSENCE -- a row missing from the filter column's plane is '' and is
     invisible to the query."""
+    fg = spec.get('fgen')
+    if fg is not None:
+        if ridx.size == 0:
+            return ridx
+        c9 = _pt_codes(seg, fg[0], ridx)
+        return ridx[(c9 != fg[2]) if fg[1] else (c9 == fg[2])]
     fcol = spec.get('fcol')
     if fcol is None or ridx.size == 0:
         return ridx
@@ -209,6 +244,11 @@ def _prune(seg, spec, ridx):
 
 def _fpool(seg, spec):
     """count-1 filler must come from rows the filter admits."""
+    fg = spec.get('fgen')
+    if fg is not None:
+        p9 = np.arange(min(int(seg.N), 262144), dtype=np.int64)
+        c9 = _pt_codes(seg, fg[0], p9)
+        return p9[(c9 != fg[2]) if fg[1] else (c9 == fg[2])]
     fcol = spec.get('fcol')
     if fcol is None:
         return None
@@ -242,7 +282,7 @@ def _finish(seg, spec, ridx, fpool=None):
     global _HITS
     a, b, k = spec['a'], spec['b'], spec['lim']
     N = int(seg.N)
-    sh2 = _pt2_load(seg, a, b)
+    sh2 = _pt2_load(seg, a, b) if spec.get('fgen') is None else None
     if sh2 is not None:
         return _finish_v2(seg, spec, sh2, fpool)
     acr = _pt_codes(seg, a, ridx)                        # position IS identity:
@@ -256,7 +296,7 @@ def _finish(seg, spec, ridx, fpool=None):
         np.not_equal(key[1:], key[:-1], out=brk[1:])
     st = np.flatnonzero(brk)
     gcnt = np.diff(np.append(st, key.size))
-    if spec.get('fcol') is None and key.size:
+    if spec.get('fcol') is None and spec.get('fgen') is None and key.size:
         # NEST THE DIFFERENTIATOR: repeated pairs are a minority of the
         # exceptions -- partition and store the grouping + codes; future
         # queries (filtered included) never open a column again.
@@ -285,6 +325,8 @@ def _finish(seg, spec, ridx, fpool=None):
             else np.arange(min(N, 262144), dtype=np.int64)
         head = np.setdiff1d(pool9, ridx, assume_unique=True)
         singles = head[:n_fill]
+        if singles.size < n_fill and spec.get('fgen') is not None:
+            return None                          # the pool's admitted rows can't fill the LIMIT: hand on
         sc1 = _pt_codes(seg, a, singles)
         sc2 = _pt_codes(seg, b, singles)
         for j9, r9 in enumerate(singles.tolist()):

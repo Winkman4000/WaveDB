@@ -241,6 +241,13 @@ def _build_mask(seg, pcol, op, lit):
     (O(1) for empty string / int dicts -- no full-dict materialize); only a non-empty string
     literal falls back to the full sorted-dict searchsorted."""
     dt = seg.cols[pcol].get('dt')
+    if dt == 3:                                  # a time/date literal: the stored units' code (wherescan's lookup);
+        import wdb_wherescan as WS               # text never reaches the int dict (2026-10-17, EventTime <> '...')
+        code = WS._code_of(seg, pcol, lit)
+        code = -1 if code is None else int(code)
+        codes = seg._raw_codes(pcol)
+        if op == '=': return (codes == code) if code >= 0 else np.zeros(codes.size, dtype=bool)
+        return (codes != code) if code >= 0 else np.ones(codes.size, dtype=bool)
     key = lit.encode('utf-8', 'surrogatepass') if (dt == 1 and isinstance(lit, str)) else lit
     code = wdb_compound._code_of(seg, pcol, key)
     if code is None:                             # non-empty string literal: fall back to full dict

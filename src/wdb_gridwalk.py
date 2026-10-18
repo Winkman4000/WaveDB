@@ -220,7 +220,7 @@ _COMPOSE = [__import__('os').environ.get('WDB_GRIDWALK_COMPOSE', '1') != '0']
 _COMPOSED = 0             # top-K answers by the composed atoms (no structure built)
 
 
-def _compose_top(seg, cols, lim):
+def _compose_top(seg, cols, lim, afilter=None):
     """THE PAIR COUNT FROM THE ATOMS (2026-10-15, the Q16 board): the canonical top `lim` cells (count DESC,
     gid ASC, gid = codeA * Vb + codeB over the name-sorted columns) WITHOUT building the structure -- the
     structure lives one query (qmem) and its build was the whole bill: codes copied to 8 bytes and glued
@@ -230,6 +230,11 @@ def _compose_top(seg, cols, lim):
       possible pairs <= DENSE_MAX: radix_acc glues the stored-width codes, bincount_par tallies the cells;
       otherwise the flat lane (pack_u64 / flat_scatter / flat_count) counts only the pairs that occur;
     then only the cells reaching the lim-th count (ties kept) are sorted canonically.
+    THE AXIS FILTER (2026-10-17, the Q14 board): a WHERE that is one '=' / '<>' on ONE of the two keys
+    (afilter = (column, neg, code)) is applied to the cells, not the rows -- the dense table's row or column of
+    that code is kept alone ('=') or zeroed ('<>'); the flat lane counts only the rows it keeps. Exact: a pair's
+    count is all its rows, and the filter takes a pair whole or not at all. (heavypair answered these by
+    sorting every pair of all 100M rows each query -- 2-10 s -- because its stored sidecar is off.)
     Returns (sel_gid, sel_cnt, Vb) or None (the structure build answers, as before)."""
     import os, time
     import wdb_kernels, wdb_bound
@@ -259,6 +264,21 @@ def _compose_top(seg, cols, lim):
         tick('glue')
         cells = wdb_kernels.bincount_par(comp, prod)
         del comp
+        if afilter is not None:
+            fcol, fneg, fcode = afilter
+            grid = np.asarray(cells).reshape(Va, Vb)
+            if fcol == a:
+                if fneg:
+                    grid[fcode, :] = 0
+                else:
+                    row = grid[fcode, :].copy(); grid[:] = 0; grid[fcode, :] = row
+            else:
+                if fneg:
+                    grid[:, fcode] = 0
+                else:
+                    col = grid[:, fcode].copy(); grid[:] = 0; grid[:, fcode] = col
+            cells = grid.reshape(-1)
+            tick('axis filter')
         gid = np.flatnonzero(cells)
         cnt = np.asarray(cells[gid], np.int64)
         tick('tally(%d cells, %d occur)' % (prod, gid.size))
@@ -267,7 +287,13 @@ def _compose_top(seg, cols, lim):
             keep = cnt >= ck
             gid = gid[keep]; cnt = cnt[keep]
     else:
-        got = wdb_bound._flat_candidates([ca, cb], [Va, Vb], int(lim), tick)
+        keep = None
+        if afilter is not None:
+            fcol, fneg, fcode = afilter
+            fc9 = ca if fcol == a else cb
+            keep = (fc9 != fcode) if fneg else (fc9 == fcode)
+            tick('axis filter')
+        got = wdb_bound._flat_candidates([ca, cb], [Va, Vb], int(lim), tick, keep=keep)
         if got is None:
             if bill:
                 print('GRIDWALK BILL: ' + ' '.join(T) + ' -> structure', flush=True)
@@ -350,7 +376,7 @@ def detect(seg, tree, col_map):
     if not P.no_having(tree):          return None
     if not P.has_limit(tree):          return None
     if wdb_sql._offset(tree):          return None
-    if P.has_where(tree):              return None
+    where = tree.args.get('where') if P.has_where(tree) else None
     group = tree.args.get('group')
     if group is None or len(group.expressions) != 2:
         return None
@@ -413,9 +439,44 @@ def detect(seg, tree, col_map):
     for col in cols:                       # full value dict (SearchPhrase's dict is ~12 GB / 12.8 s to
         if seg.cols[col].get('mode') == 4:  # materialize, for 10 winners). Metadata-only gate here.
             return None
+    afilter = None
+    if where is not None:
+        # only the composed count can apply it: COUNT alone, ordered by count, a LIMIT the head serves
+        if payphys or unordered or wdb_sql._limit(tree) > _HEAD_N or not _COMPOSE[0]:
+            return None
+        afilter = _axis_filter(seg, where, cols, col_map)
+        if afilter is None:
+            return None
     return {'cols': cols, 'ci': ci, 'lim': wdb_sql._limit(tree), 'proj': proj,
             'knames': knames, 'V': Vs, 'order': tree.args.get('order'), 'unordered': unordered,
-            'payphys': payphys}
+            'payphys': payphys, 'afilter': afilter}
+
+
+def _axis_filter(seg, where, cols, col_map):
+    """(column, neg, code) for a WHERE that is one '=' / '<>' between one of the two keys and a literal; None
+    otherwise -- and None when the literal's code can't be found (never guess it absent)"""
+    import wdb_wherescan as WS
+    n = where.this if isinstance(where, E.Where) else where
+    if not isinstance(n, (E.EQ, E.NEQ)):
+        return None
+    l, r = n.this, n.expression
+    if not isinstance(l, E.Column):
+        l, r = r, l
+    if not isinstance(l, E.Column):
+        return None
+    col = col_map.get(l.name, l.name) if col_map else l.name
+    if col not in cols or seg.cols[col].get('has_null'):
+        return None
+    val = WS._litval(r)
+    if val is None:
+        return None
+    try:
+        code = WS._code_of(seg, col, val)
+    except Exception:
+        return None
+    if code is None:
+        return None
+    return (col, isinstance(n, E.NEQ), int(code))
 
 
 def execute(seg, spec):
@@ -431,7 +492,11 @@ def execute(seg, spec):
         return None
     a, b = sorted(cols)
     composed = None
-    if (_COMPOSE[0] and not spec.get('payphys') and not spec.get('unordered') and lim <= _HEAD_N
+    if spec.get('afilter') is not None:
+        composed = _compose_top(seg, cols, lim, spec['afilter'])
+        if composed is None:
+            return None                      # the structure can't apply a filter: hand on
+    elif (_COMPOSE[0] and not spec.get('payphys') and not spec.get('unordered') and lim <= _HEAD_N
             and _CACHE.get((seg.path, (a, b), int(seg.N))) is None):
         composed = _compose_top(seg, cols, lim)
     if composed is not None:

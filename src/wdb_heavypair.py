@@ -215,6 +215,14 @@ def _axis_filter(seg, where_node, cols, col_map):
     c = seg.cols[phys]
     kind = 'i' if c['dt'] == 0 else ('f' if c['dt'] == 2 else ('i' if c['dt'] == 3 else 'S'))
     v = wdb_sql._lit_for_col(seg, phys, lit, kind)
+    if c['dt'] == 3:                         # a time literal, exactly (2026-10-17): '... 19:37:51.5' had been
+        import wdb_wherescan as WS           # truncated onto 19:37:51 -- '<>' then dropped a value DuckDB keeps
+        try:
+            v = WS._time_units(seg, phys, WS._litval(lit))
+        except Exception:
+            return None
+        if v is None:                        # finer than the stored unit: no stored value equals it
+            return (phys, isinstance(n, E.NEQ), np.zeros(0, np.int64))
     if c['dt'] not in (0, 2, 3) and isinstance(v, int):
         v = str(v).encode()
     try:

@@ -196,6 +196,43 @@ def test_q30_shape_dense_and_buckets_legal_against_duck():
         shutil.rmtree(d, ignore_errors=True); os.remove(pq)
 
 
+def test_count_only_text_key_with_filter():
+    """COUNT only, a filter, the smaller key TEXT (the Q14 shape, MobilePhoneModel x SearchPhrase): no payload
+    is decoded -- the answer is a legal top-k, and it is pairfold's"""
+    rng = np.random.default_rng(14); n = 300_000
+    p = np.array(['phrase %05d' % v for v in rng.integers(1, 20_001, n)], dtype=object)
+    p[rng.random(n) < 0.85] = ''
+    m = np.array(['model %d' % v for v in rng.integers(0, 40, n)], dtype=object)
+    df = pd.DataFrame({'m': m, 'p': p})
+    t9 = uuid.uuid4().hex[:8]
+    d = os.path.join(TMP, f'pft_{t9}'); pq = os.path.join(TMP, f'pft_{t9}.parquet')
+    df.to_parquet(pq, index=False)
+    os.makedirs(d); Catalog.create(d)
+    out = os.path.join(d, 'hits_0.wdb')
+    with _env(WDB_SEQ_NARROW_OK='0'):
+        wdb_encode.encode(pq, out, stream=True)
+    seg = Segment(out); cat = Catalog.open(d)
+    tn = {0: 'int', 1: 'str', 2: 'float'}
+    cat.data['tables']['hits'] = {'schema': [[c, tn.get(seg.cols[c].get('dt'), 'str')]
+                                             for c in wdb_encode.input_column_order(pq, seg.order)],
+                                  'segments': ['hits_0.wdb'], 'mode': 'segment'}
+    cat.save()
+    try:
+        db = Database.open(d)
+        truth = {(a, b): int(c) for a, b, c in duckdb.connect().execute(
+            f"SELECT m, p, COUNT(*) FROM '{pq}' WHERE p <> '' GROUP BY m, p").fetchall()}
+        h0 = wdb_pairfold._HITS
+        rows = db.run("SELECT m, p, COUNT(*) AS c FROM hits WHERE p <> '' GROUP BY m, p ORDER BY c DESC LIMIT 10")[0]
+        assert wdb_pairfold._HITS == h0 + 1, 'pairfold did not serve'
+        want = sorted(truth.values(), reverse=True)[:10]
+        assert [int(r[2]) for r in rows] == want, (rows, want)
+        for a, b, c in rows:
+            a = a.decode() if isinstance(a, bytes) else a; b = b.decode() if isinstance(b, bytes) else b
+            assert truth[(a, b)] == int(c), (a, b, c)
+    finally:
+        shutil.rmtree(d, ignore_errors=True); os.remove(pq)
+
+
 def test_near_unique_partner_is_handed_on():
     """a partner with a value per ~row (WatchID) is not pairfold's: the pair is handed on (pairtop's walk),
     and the answer that comes back is still a legal top-k"""
