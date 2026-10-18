@@ -220,6 +220,46 @@ _COMPOSE = [__import__('os').environ.get('WDB_GRIDWALK_COMPOSE', '1') != '0']
 _COMPOSED = 0             # top-K answers by the composed atoms (no structure built)
 
 
+_GRAB_MAX = [int(__import__('os').environ.get('WDB_GW_GRAB_MAX', str(1 << 20)))]
+_GRABBED = 0
+
+
+def _grab_top(seg, a, b, Va, Vb, lim, afilter, tick):
+    """THE GRAB (2026-10-18, the Q14 board; Jackson: "is just grabbing the 1M faster than removing the 99M"):
+    the axis filter's survivors are found from the filter key's codes alone; when they number at most GRAB_MAX,
+    the other key is read AT those rows (seg.codes_at: the encodings' point reads) and only they are counted --
+    the remove lane decodes both keys whole, counts all 100M rows, then drops the filtered cells. A filter key
+    holding one value answers from its dictionary: '<>' that value keeps no row. Returns the canonical top
+    (sel_gid, sel_cnt, Vb), or None (the remove lane answers)."""
+    global _GRABBED
+    fcol, fneg, fcode = afilter
+    c = seg.cols[fcol]
+    if int(c['V']) - (1 if c.get('has_null') else 0) == 1 and int(fcode) == 0 and fneg:
+        tick('grab: one-value key, nothing kept')
+        _GRABBED += 1
+        return np.empty(0, np.int64), np.empty(0, np.int64), Vb
+    cf = np.ascontiguousarray(seg._raw_codes(fcol))
+    m = (cf != fcode) if fneg else (cf == fcode)
+    S = int(np.count_nonzero(m))
+    tick('grab survivors(%d)' % S)
+    if S > _GRAB_MAX[0]:
+        return None
+    _GRABBED += 1
+    if S == 0:
+        return np.empty(0, np.int64), np.empty(0, np.int64), Vb
+    pos = np.flatnonzero(m).astype(np.int64)
+    other = b if fcol == a else a
+    co = np.asarray(seg.codes_at(other, pos)).astype(np.int64)
+    cfp = cf[pos].astype(np.int64)
+    tick('grab read %s at %d rows' % (other, S))
+    ka, kb = (cfp, co) if fcol == a else (co, cfp)
+    u, cnt = np.unique(ka * Vb + kb, return_counts=True)
+    cnt = cnt.astype(np.int64)
+    o = np.lexsort((u, -cnt))[:lim]                   # the canonical prefix: count DESC, gid ASC
+    tick('grab count(%d pairs)' % u.size)
+    return u[o].astype(np.int64), cnt[o], Vb
+
+
 def _compose_top(seg, cols, lim, afilter=None):
     """THE PAIR COUNT FROM THE ATOMS (2026-10-15, the Q16 board): the canonical top `lim` cells (count DESC,
     gid ASC, gid = codeA * Vb + codeB over the name-sorted columns) WITHOUT building the structure -- the
@@ -250,6 +290,12 @@ def _compose_top(seg, cols, lim, afilter=None):
     Va = int(seg.cols[a]['V']); Vb = int(seg.cols[b]['V'])
     if Va <= 0 or Vb <= 0:
         return None
+    if afilter is not None:
+        got = _grab_top(seg, a, b, Va, Vb, int(lim), afilter, tick)
+        if got is not None:
+            if bill:
+                print('GRIDWALK BILL: ' + ' '.join(T), flush=True)
+            return got
     ca = np.ascontiguousarray(seg._raw_codes(a)); cb = np.ascontiguousarray(seg._raw_codes(b))
     if ca.size == 0:
         return None
