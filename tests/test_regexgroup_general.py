@@ -80,6 +80,31 @@ def test_regexgroup_every_column_both_forms():
     assert RG._RE2ROAD > roads[1], 'the RE2 road must have answered'
 
 
+def test_regexgroup_identity_labels():
+    """the identity road (an unmatched value is its own label) and the copying road give DuckDB's answers;
+    the fixture holds bare hosts ('h12.ru') equal to captures of 'http://h12.ru/...', so the byte check runs"""
+    db, pq = _fixture()
+    sqls = [s for s in _sqls() if s.startswith('SELECT REGEXP_REPLACE(u, ' + PATS[0][0])]
+    old = RG.IDENTITY
+    try:
+        for on in (True, False):
+            RG.IDENTITY = on
+            n0 = RG._IDROAD
+            for seg in _segs(db):
+                seg.__dict__.pop('_rg_memo', None)
+            for sql in sqls:
+                got = db.run(sql)[0]
+                assert _norm(got) == _norm(_duck(pq, sql)), (on, sql)
+            assert (RG._IDROAD > n0) == on, (on, RG._IDROAD, n0)
+    finally:
+        RG.IDENTITY = old
+
+
+def _segs(db):
+    import gc, wdb_engine
+    return [o for o in gc.get_objects() if isinstance(o, wdb_engine.Segment)]
+
+
 def test_regexgroup_limit_without_having():
     """no HAVING: every group survives, and the LIMIT cut is taken before any label becomes a string. A tie
     at the LIMIT is legal when every row is a real group and the ordering column carries DuckDB's values."""

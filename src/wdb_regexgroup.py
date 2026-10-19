@@ -246,7 +246,7 @@ def _load_sidecar(seg, col, spec):
 
 def _save_sidecar(seg, col, spec, lens, lab_ids, uniq, empty_code):
     p = _sidecar_path(seg, col, spec)
-    if not p: return
+    if not p or isinstance(uniq, _IdLabels): return   # identity labels: the names ARE the dictionary
     import wdb_sidecar
     if not wdb_sidecar.may_build(p):
         return                                   # THE VANILLA LAW, asked FIRST: the payload below
@@ -436,6 +436,119 @@ def _derive_runs_one_read(seg, col, spec, pcl):
     return counts, lens, lab_ids, _Labels(blob, offs, rep[:G]), empty_code
 
 
+class _IdLabels:
+    """THE IDENTITY LABELS' names: group g < G is a matched capture (bytes in the blob); group G + k is the
+    unmatched value at code self_codes[k], read from the dictionary only if it is returned"""
+    def __init__(self, blob, offs, rep, self_codes, seg, col):
+        self.blob = blob; self.offs = offs; self.rep = rep; self.sc = self_codes; self.seg = seg; self.col = col
+    def __len__(self):
+        return int(self.rep.size + self.sc.size)
+    def __getitem__(self, g):
+        g = int(g); G = int(self.rep.size)
+        if g < G:
+            r = int(self.rep[g])
+            return self.blob[int(self.offs[r]):int(self.offs[r + 1])].tobytes()
+        v = self.seg.fetch(self.col, int(self.sc[g - G]))
+        return v if isinstance(v, (bytes, bytearray)) else str(v).encode('utf-8')
+
+
+ID_MAX_HITS = 50_000                             # past this many hash hits to check byte for byte: the old road
+IDENTITY = True                                  # the identity road first (tests turn it off to compare)
+
+
+def _derive_runs_identity(seg, col, spec, pcl):
+    """THE IDENTITY LABELS (Jackson, 2026-10-19): a value the pattern does not match keeps itself as its
+    label, and a dictionary's values are already distinct -- so those labels are never copied, hashed as a
+    blob or grouped (Title and SearchPhrase: nearly every value). Matched captures are grouped exactly as
+    before (label_groups_par); each unmatched value is its own group unless a capture equals it, which is
+    asked by hash (probe_sorted_id) and settled byte for byte against the dictionary for the few hits.
+    One read of the three streams per chunk (wdb_kernels.fc3_prefruns_id). None (the caller falls back)
+    on any other layout or surprise."""
+    import wdb_kernels as WK, wdb_strings, wdb_engine
+    c = seg.cols.get(col)
+    if c is None or c.get('R') is None or not c.get('chunked') or not c.get('fc3'):
+        return None
+    R = int(c['R']); nd = int(c.get('n_dict', c['V']))
+    strlen = spec.get('lenfn') == 'STRLEN'
+    lens = np.zeros(nd, np.int64)
+    ent = np.empty(nd, np.int64); eh = np.empty(nd, np.uint64)   # each chunk writes its own slice
+    plan = wdb_strings._chunk_plan(seg, col)
+
+    def _one(p):
+        j, lo, n, _rl = p
+        h = seg.fc_part(c, j, 'h'); hv = h.view(np.uint16); t = seg.fc_part(c, j, 't')
+        if hv.size != 2 * n or lo + n > nd:
+            return None
+        if strlen:
+            lens[lo:lo + n] = hv[0::2].astype(np.int64) + hv[1::2]
+        else:
+            m = seg.fc_part(c, j, 'm')
+            if int(WK.fc3_charlens(hv, m.view(np.uint64), np.int64(R), lens[lo:lo + n])) != n:
+                return None
+        cap = n + 2; lcap = t.size + (1 << 16)
+        for _try in range(5):                    # captures can outgrow the text: retry, tripled
+            labuf = np.empty(lcap, np.uint8); laboff = np.empty(cap + 1, np.int64)
+            mh = np.empty(cap, np.uint64); meta = np.zeros(1, np.int64)
+            nr = int(WK.fc3_prefruns_id(hv, t, np.int64(R), pcl[0], pcl[1], pcl[2], ent[lo:lo + n], eh[lo:lo + n],
+                                        labuf, laboff, mh, meta))
+            if int(meta[0]) != -1:
+                break
+            lcap *= 3
+        if int(meta[0]) != n:
+            return None
+        return lo, n, labuf[:int(laboff[nr])].copy(), laboff[:nr + 1].copy(), mh[:nr].copy(), nr
+
+    parts = list(wdb_engine._leaf_pool().map(_one, plan))
+    if not parts or any(p is None for p in parts):
+        return None
+    cstart = np.array([p[0] for p in parts] + [parts[-1][0] + parts[-1][1]], np.int64)
+    if cstart[0] != 0 or cstart[-1] != nd or np.any(np.diff(cstart) != np.array([p[1] for p in parts])):
+        return None                              # layout surprise: fail closed
+    nrs = np.array([p[5] for p in parts], np.int64)
+    run_base = np.zeros(nrs.size + 1, np.int64); np.cumsum(nrs, out=run_base[1:])
+    blob = np.concatenate([p[2] for p in parts]) if run_base[-1] else np.zeros(1, np.uint8)
+    lb = np.array([p[3][-1] for p in parts], np.int64)
+    byte_base = np.zeros(lb.size + 1, np.int64); np.cumsum(lb, out=byte_base[1:])
+    offs = np.concatenate([p[3][:-1] + byte_base[k] for k, p in enumerate(parts)] + [byte_base[-1:]])
+    mh = np.concatenate([p[4] for p in parts])
+    nrun = int(run_base[-1])
+    gid = np.empty(nrun, np.int64); rep = np.empty(nrun, np.int64)
+    G = int(WK.label_groups_par(blob, offs, mh, gid, rep)) if nrun else 0
+    rep = rep[:G]
+    lab_ids = np.empty(nd, np.int64); sc = np.empty(nd, np.int64)
+    ns = int(WK.id_assign(ent, cstart, run_base[:-1].copy(), gid, np.int64(G), lab_ids, sc))
+    sc = sc[:ns]                                 # the unmatched values: each its own group G + k ...
+    if ns and G:                                 # ... unless a capture equals it
+        gh = mh[rep]; o = np.argsort(gh); ghs = np.ascontiguousarray(gh[o])
+        hit = np.empty(nd, np.int64); WK.probe_sorted_id(ghs, eh, ent, hit)
+        hk = np.flatnonzero(hit >= 0)
+        if hk.size > ID_MAX_HITS:
+            return None
+        for code in hk:
+            code = int(code); v = seg.fetch(col, code)
+            v = v if isinstance(v, (bytes, bytearray)) else str(v).encode('utf-8')
+            i = int(hit[code])
+            while i > 0 and ghs[i - 1] == eh[code]:
+                i -= 1                           # every capture group sharing the hash
+            while i < ghs.size and ghs[i] == eh[code]:
+                g = int(o[i]); r = int(rep[g])
+                if blob[int(offs[r]):int(offs[r + 1])].tobytes() == bytes(v):
+                    lab_ids[code] = g
+                    break
+                i += 1
+    counts = _code_counts(seg, col)
+    empty_code = None
+    e = np.nonzero(lens == 0)[0]
+    if e.size:
+        empty_code = int(e[0])
+    global _IDROAD
+    _IDROAD += 1
+    return counts, lens, lab_ids, _IdLabels(blob, offs, rep, sc, seg, col), empty_code
+
+
+_IDROAD = 0
+
+
 def _derive_runs(seg, col, spec, pcl):
     """Jackson's prefix-run road for a prefix-class pattern: the sorted front-coded dict keeps
     values with the same beginning ADJACENT, so the label is constant while the copy-prefix
@@ -570,7 +683,9 @@ def _derive(seg, col, spec):
     import pandas as pd
     pcl = _prefix_class(spec.get('pat'), spec.get('rep'))      # by structure: the prefix class
     if pcl is not None:
-        r9 = _derive_runs_one_read(seg, col, spec, pcl)
+        r9 = _derive_runs_identity(seg, col, spec, pcl) if IDENTITY else None
+        if r9 is None:
+            r9 = _derive_runs_one_read(seg, col, spec, pcl)
         if r9 is None:
             r9 = _derive_runs(seg, col, spec, pcl)
         if r9 is not None:

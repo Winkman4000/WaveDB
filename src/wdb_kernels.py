@@ -7164,6 +7164,140 @@ def fc3_prefruns(hdr16, text, R, nl_free, pfx, pfo, d, brk, hend, labuf, laboff,
     return nr
 
 
+@njit(inline='always')
+def _fmix64(h):
+    h ^= h >> np.uint64(33)
+    h *= np.uint64(0xff51afd7ed558ccd)
+    h ^= h >> np.uint64(33)
+    h *= np.uint64(0xc4ceb9fe1a85ec53)
+    h ^= h >> np.uint64(33)
+    return h
+
+
+@njit(nogil=True, cache=True)
+def seq_hash(blob, offs, out):
+    """the IDENTITY LABELS' hash of each blob[offs[r]:offs[r+1]] (byte-sequential FNV-1a, the length, murmur's
+    finaliser): the same function fc3_prefruns_id computes on the fly from its prefix states"""
+    for r in range(out.size):
+        h = np.uint64(14695981039346656037)
+        for i in range(offs[r], offs[r + 1]):
+            h = (h ^ np.uint64(blob[i])) * np.uint64(1099511628211)
+        out[r] = _fmix64(h ^ np.uint64(offs[r + 1] - offs[r]))
+
+
+@njit(nogil=True, cache=True)
+def fc3_prefruns_id(hdr16, text, R, pfx, pfo, d, ent, eh, labuf, laboff, mh, meta):
+    """THE IDENTITY LABELS (Jackson, 2026-10-19): fc3_prefruns' law for a prefix-class pattern, except that a
+    value the pattern does not match keeps ITSELF as its label -- and the values of a dictionary are already
+    distinct, so such a label is never copied, and needs no grouping against the others: only its hash is
+    kept (eh[i]; ent[i] = -1), for the one question left -- does some matched capture equal it?
+    Matched values form runs as before (ent[i] = the run, labels in labuf/laboff, each run's hash in mh).
+    Both decisions are inherited the same way: an entry sharing more than H bytes with the one before (H =
+    the last position the head's decision read) is decided as the head was; a matched run also needs a
+    newline-clean suffix ('.*$'). The value is kept current incrementally (each entry writes its suffix),
+    with the hash state after every prefix length (hst), so a value's hash costs what it does not share with
+    the last hashed value, not its length; a matched value is never hashed.
+    meta[0] = n on success, -1 when labuf / laboff overflow (the caller retries larger)."""
+    n = hdr16.size // 2
+    prev = np.zeros(131072, np.uint8)
+    hst = np.zeros(131073, np.uint64)
+    P = np.uint64(1099511628211)
+    hst[0] = np.uint64(14695981039346656037)
+    mode = 0; H = np.int64(-2); nr = np.int64(0); lw = np.int64(0); t = np.int64(0)
+    hv = np.int64(0)                             # hst[0..hv] hold the current value's prefix states
+    for i in range(n):
+        cp = np.int64(hdr16[2 * i]); sl = np.int64(hdr16[2 * i + 1])
+        if i % R == 0:
+            cp = np.int64(0); mode = 0
+        plen = cp + sl
+        nl = False
+        for q in range(sl):
+            b = text[t + q]
+            prev[cp + q] = b
+            if b == 10:
+                nl = True
+        t += sl
+        if hv > cp:
+            hv = cp                              # states past the shared prefix belonged to the last value
+        if mode != 0 and cp > H:
+            if mode == 2:
+                for q in range(hv, plen):        # a value's hash: only the states it does not share
+                    hst[q + 1] = (hst[q] ^ np.uint64(prev[q])) * P
+                hv = plen
+                ent[i] = -1; eh[i] = _fmix64(hst[plen] ^ np.uint64(plen))
+                continue
+            if not nl:
+                ent[i] = nr - 1
+                continue
+        hs, he, h9 = _pref_match(prev, plen, pfx, pfo, d)
+        H = h9
+        if hs < 0:
+            mode = 2
+            for q in range(hv, plen):
+                hst[q + 1] = (hst[q] ^ np.uint64(prev[q])) * P
+            hv = plen
+            ent[i] = -1; eh[i] = _fmix64(hst[plen] ^ np.uint64(plen))
+            continue
+        mode = 1
+        L = he - hs
+        if lw + L > labuf.size or nr + 1 >= laboff.size:
+            meta[0] = -1
+            return nr
+        laboff[nr] = lw
+        h = np.uint64(14695981039346656037)
+        for q in range(L):
+            b = prev[hs + q]
+            labuf[lw + q] = b
+            h = (h ^ np.uint64(b)) * P
+        mh[nr] = _fmix64(h ^ np.uint64(L))
+        lw += L
+        ent[i] = nr
+        nr += 1
+    laboff[nr] = lw
+    meta[0] = n
+    return nr
+
+
+@njit(cache=True, nogil=True)
+def id_assign(ent, cstart, cbase, gid, G, lab, sc):
+    """the identity labels' group of every value: a matched value (ent >= 0, a run local to its chunk; chunk j
+    holds values cstart[j]..cstart[j+1] and its runs start at cbase[j]) takes its run's group; an unmatched one
+    the next own group G, G + 1, ... in code order (sc[k] = the code of own group G + k). Returns how many."""
+    k = np.int64(0)
+    for j in range(cstart.size - 1):
+        b = cbase[j]
+        for i in range(cstart[j], cstart[j + 1]):
+            e = ent[i]
+            if e >= 0:
+                lab[i] = gid[e + b]
+            else:
+                lab[i] = G + k
+                sc[k] = i
+                k += 1
+    return k
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def probe_sorted_id(keys, q, ent, out):
+    """out[i] = an index k with keys[k] == q[i] (keys ascending), or -1; asked only where ent[i] < 0 (the
+    identity labels' unmatched values): a binary search per value, in parallel"""
+    m = keys.size
+    for i in prange(q.size):
+        out[i] = -1
+        if ent[i] >= 0:
+            continue
+        v = q[i]; lo = 0; hi = m
+        while lo < hi:
+            mid = (lo + hi) >> 1
+            if keys[mid] < v:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo < m and keys[lo] == v:
+            out[i] = lo
+
+
+
 # ---------------------------------------------------------------------------------------------
 # tag 20 = THE BACK-REFERENCE (Jackson, 2026-09-24): an operator-declared HASH column. Per block of
 # BR rows (blocks start on a byte; a start table), per row: bit 0 = flag. Flag 0: the code's `bits`
