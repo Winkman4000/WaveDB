@@ -159,6 +159,101 @@ def test_nullable_target_on_every_key_lane():
         GD.DENSE_CELLS, GD.MARK_MAX = old
 
 
+def test_heavy_groups_counted_apart():
+    """THE HEAVY GROUPS (2026-10-19): a key value holding most rows (no WHERE: the open form) is counted on
+    every core apart from the key lanes' buckets -- on the marker and the sort walks, with and without a
+    filter removing another value, with NULL targets"""
+    old = (GD.DENSE_CELLS, GD.MARK_MAX, GD.HEAVY_MIN_N, GD.PRESENCE_CELLS, GD.PRESENCE_GROUPS)
+    try:
+        GD.DENSE_CELLS = 0; GD.HEAVY_MIN_N = 0; GD.PRESENCE_CELLS = 0; GD.PRESENCE_GROUPS = 0
+        for mark in (True, False):
+            if not mark:
+                GD.MARK_MAX = 0
+            lane = 'keymark' if mark else 'keysort'
+            h0 = GD.HEAVY_HITS
+            g, w = _run("SELECT dom, COUNT(DISTINCT big) AS u FROM t GROUP BY dom", lane)
+            assert sorted(g) == sorted(w) and GD.HEAVY_HITS == h0 + 1, (lane, sorted(g)[:3], sorted(w)[:3])
+            g, w = _run("SELECT small, COUNT(DISTINCT wide) AS u FROM t GROUP BY small ORDER BY u DESC, small LIMIT 10", lane)
+            assert g == w, (lane, g, w)
+            _full('small', 'wide', '3', lane)                        # the filter takes another value; 7 stays heavy
+            _full('dom', 'big', '5', lane)
+        import test_groupdistinct_filter as F
+        GD.MARK_MAX = old[1]
+        F._case(200_000, 0.3, 50_000, null_share=0.1)
+    finally:
+        GD.DENSE_CELLS, GD.MARK_MAX, GD.HEAVY_MIN_N, GD.PRESENCE_CELLS, GD.PRESENCE_GROUPS = old
+
+
+def test_presence_lane_few_groups():
+    """a handful of groups over a wide target, or any groups whose presence rows fit one shared table: each
+    group a presence row (2026-10-19)"""
+    old = (GD.DENSE_CELLS, GD.HEAVY_MIN_N)
+    try:
+        GD.DENSE_CELLS = 0; GD.HEAVY_MIN_N = 0
+        _full('tiny', 'wide', '2', 'presence')
+        _full('small', 'wide', '7', 'presence')                       # 40 groups x 250K targets: one table
+        _top('big', 'small', '5', 'presence')                         # 200K groups x 40 targets
+        g, w = _run("SELECT tiny, COUNT(DISTINCT big) AS u FROM t GROUP BY tiny", 'presence')
+        assert sorted(g) == sorted(w)
+        g, w = _run("SELECT one, COUNT(DISTINCT wide) AS u FROM t GROUP BY one", 'presence')
+        assert sorted(g) == sorted(w)
+        rng = np.random.default_rng(3)                                 # a NULL-able target; one group all NULL
+        n = 120_000
+        k = rng.integers(0, 4, n)
+        u = pd.array(rng.integers(0, 60_000, n), dtype='Int64')
+        u[rng.random(n) < 0.2] = pd.NA
+        u[k == 3] = pd.NA
+        seg, pq = helpers.roundtrip(pd.DataFrame({'k': k, 'u': u}))
+        sql = "SELECT k, COUNT(DISTINCT u) AS c FROM t GROUP BY k"
+        tree = sqlglot.parse_one(sql)
+        b0 = GD.LANES.get('presence', 0)
+        got = GD.execute(seg, GD.detect(seg, tree, None), tree)
+        assert GD.LANES.get('presence', 0) == b0 + 1
+        want = duckdb.sql(sql.replace('FROM t', "FROM '%s'" % pq)).fetchall()
+        assert sorted((int(a), int(b)) for a, b in got[0]) == sorted((int(a), int(b)) for a, b in want)
+    finally:
+        GD.DENSE_CELLS, GD.HEAVY_MIN_N = old
+
+
+def test_packed_scatter_equals_two_array_scatter():
+    """the scatter lane's one-u32-per-row form counts what the (target, group) two-array form counts"""
+    import wdb_kernels as WK
+    rng = np.random.default_rng(8)
+    for VR, VT, n in ((9040, 1 << 20, 400_000), (3, 70_000, 200_000), (60_000, 300_000, 500_000)):
+        grp = rng.integers(0, VR, n).astype(np.uint16 if VR < 65536 else np.uint32)
+        tgt = (rng.integers(0, VT, n) ** 1).astype(np.uint32)
+        tgt[: n // 3] = rng.integers(0, 50, n // 3)                       # a few targets shared by many rows
+        SH = max(1, int(VT - 1).bit_length() - 12)
+        GB = max(1, int(VR - 1).bit_length())
+        assert SH + GB <= 32
+        ku, kr, offs = WK.gd_pass1(tgt, grp, np.int64(SH), np.int64(8))
+        a = WK.gd_pass2_count(ku, kr, offs, np.int64(SH), np.int64(VR))
+        pk, offs2 = WK.gd_pass1_packed(tgt, grp, np.int64(SH), np.int64(GB), np.int64(8))
+        b = WK.gd_pass2_packed(pk, offs2, np.int64(SH), np.int64(GB), np.int64(VR))
+        want = np.bincount(np.unique(grp.astype(np.int64) * VT + tgt) // VT, minlength=VR)
+        assert np.array_equal(a, want) and np.array_equal(b, want), (VR, VT)
+
+
+def test_topk_capped_census():
+    """gd_topk with counts past its census width: the tall counts are picked apart, exactly the full
+    sort's first k (count descending, code ascending), with the filtered group left out"""
+    import wdb_kernels as WK
+    rng = np.random.default_rng(5)
+    old = WK.GD_TOPK_CAP
+    try:
+        WK.GD_TOPK_CAP = 50
+        for _ in range(20):
+            runs = rng.integers(-1, 120, 3000).astype(np.int32)
+            ec = int(rng.integers(-1, 3000))
+            for k in (1, 3, 10, 40, 200):
+                got = list(WK.gd_topk(runs, ec, k))
+                idx = [i for i in range(runs.size) if runs[i] >= 0 and i != ec]
+                want = sorted(idx, key=lambda i: (-int(runs[i]), i))[:k]
+                assert got == want, (k, ec, got[:5], want[:5])
+    finally:
+        WK.GD_TOPK_CAP = old
+
+
 def test_survivor_road_when_the_removed_group_dominates():
     """the filter keeps ~1%: the counted column is read at the survivors only"""
     h0 = GD.SURVIVOR_HITS

@@ -94,6 +94,57 @@ def test_decline_no_distinct():          # no COUNT(DISTINCT) -> cube/fused path
     _declined("SELECT g, COUNT(*), SUM(amt) FROM t GROUP BY g")
 
 
+_BIG = None
+def _big():
+    """many groups (the order cut takes over past 8 x LIMIT), a heavy key value, a wide distinct target"""
+    global _BIG
+    if _BIG is not None: return _BIG
+    con = duckdb.connect()
+    d = os.path.join(tempfile.gettempdir(), f'gmixbig_{uuid.uuid4().hex[:8]}'); os.makedirs(d, exist_ok=True)
+    con.execute("CREATE TABLE t AS SELECT i AS id, CASE WHEN i % 3 = 0 THEN 0 ELSE (i * 7919) % 5000 END AS k, "
+                "(i * 104729) % 40000 AS w, (i % 4) AS adv, CAST((i % 50) + 1 AS DOUBLE) AS amt FROM range(200000) t(i)")
+    db = Database.create(d)
+    pq = os.path.join(d, 't.parquet'); con.execute(f"COPY (SELECT * FROM t ORDER BY id) TO '{pq}' (FORMAT parquet)")
+    db.cat.add_table('t', [['id', 'int'], ['k', 'int'], ['w', 'int'], ['adv', 'int'], ['amt', 'float']])
+    wdb_encode.encode(pq, os.path.join(d, 't_0.wdb')); db.cat.add_segment('t', 't_0.wdb')
+    _BIG = (db, con)
+    return _BIG
+
+
+def test_order_cut_many_groups():
+    """THE ORDER BEFORE THE ROWS (2026-10-19): with a LIMIT, groupmix builds rows only for the groups the
+    LIMIT can return -- by a count, a sum, an average, the distinct count or the key, ascending or
+    descending, one ORDER BY term (a tie at the LIMIT: any tied group is legal) or two (exact)"""
+    import wdb_groupdistinct as GD
+    db, con = _big()
+    sel = "SELECT k, COUNT(*) AS c, SUM(adv) AS sa, AVG(amt) AS a, COUNT(DISTINCT w) AS u FROM t GROUP BY k "
+    old = GD.HEAVY_MIN_N, gm.LATE, gm.LATE_SHARE
+    try:
+        for hv, late in ((old[0], True), (0, True), (0, False)):   # heavy values apart or not; the late fold
+            GD.HEAVY_MIN_N = hv; gm.LATE = late; gm.LATE_SHARE = 1    # (the fixture's top groups are 1/3)
+            l0 = gm.LATE_HITS
+            db.run(sel + 'ORDER BY c DESC LIMIT 3')
+            assert (gm.LATE_HITS == l0 + 1) == late
+            for ob, oi in (('c DESC', 1), ('sa DESC', 2), ('a ASC', 3), ('u DESC', 4), ('k DESC', 0), ('u ASC', 4)):
+                q = sel + 'ORDER BY %s LIMIT 7' % ob
+                h0 = gm._HITS
+                got = _norm(db.run(q)[0])
+                assert gm._HITS == h0 + 1, q
+                full = set(_norm([tuple(r) for r in con.execute(sel).fetchall()]))
+                exp = _norm([tuple(r) for r in con.execute(q).fetchall()])
+                assert len(got) == len(exp) and set(got) <= full, (q, got[:3], exp[:3])
+                assert [r[oi] for r in got] == [r[oi] for r in exp], (q, got, exp)
+            q = sel + 'ORDER BY c DESC, k LIMIT 9'
+            assert _norm(db.run(q)[0]) == _norm([tuple(r) for r in con.execute(q).fetchall()]), q
+        gm.LATE_SHARE = 8; gm.LATE = True                              # the gate: the top groups hold 1/3
+        l0 = gm.LATE_HITS
+        q = sel + 'ORDER BY c DESC, k LIMIT 3'
+        assert _norm(db.run(q)[0]) == _norm([tuple(r) for r in con.execute(q).fetchall()]), q
+        assert gm.LATE_HITS == l0
+    finally:
+        GD.HEAVY_MIN_N, gm.LATE, gm.LATE_SHARE = old
+
+
 def test_groupmix_consumes_materialized_sidecar():
     """When the (group, distinct-target) pair is materialized, groupmix reads the sidecar's per-group
     counts instead of walking -- same answer, no walk. Uses its own db so the shared fixture is untouched."""

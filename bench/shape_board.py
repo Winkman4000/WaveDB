@@ -14,6 +14,8 @@ Shapes (slot 1 = 'k', slot 2 = 'd' in the records):
   q28  SELECT REGEXP_REPLACE(S, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS k, AVG(length(S)) AS l, COUNT(*) AS c,
        MIN(S) FROM hits WHERE S <> '' GROUP BY k HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25
        (one slot, text columns only; form 'open' drops the WHERE)
+  q9   SELECT K, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), COUNT(DISTINCT D) FROM hits GROUP BY K
+       ORDER BY c DESC LIMIT 10      (Q8 is q13's form 'open'; Q10 and Q13 its filtered form)
 A profile is a column's passport (mode, code encoding, type) plus its V class (bench/q13_profiles.py); one
 representative column stands for each profile (the original's own columns pinned), and the board runs every
 ordered pair of representatives.
@@ -83,6 +85,7 @@ SHAPES = {
     'q34': {'orig': ('URL',), 'qnum': 34, 'forms': 'plain'},
     'q27': {'orig': ('CounterID', 'URL'), 'qnum': 27, 'forms': 'filtered,open', 'text_d': True},
     'q28': {'orig': ('Referer',), 'qnum': 28, 'forms': 'filtered,open', 'text_k': True},
+    'q9': {'orig': ('RegionID', 'UserID'), 'qnum': 9, 'forms': 'plain'},
 }
 SH = SHAPES[A.shape]
 if 'qnum' in SH:
@@ -172,6 +175,9 @@ def sql_of(k, d, form):
         return (r"SELECT REGEXP_REPLACE(%s, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS k, AVG(length(%s)) AS l, "
                 r"COUNT(*) AS c, MIN(%s) FROM hits%s GROUP BY k HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25"
                 % (k, k, k, where))
+    if A.shape == 'q9':
+        return ('SELECT %s, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), COUNT(DISTINCT %s) FROM hits '
+                'GROUP BY %s ORDER BY c DESC LIMIT 10' % (k, d, k))
     if A.shape == 'q34':
         return 'SELECT 1, %s, COUNT(*) AS c FROM hits GROUP BY 1, %s ORDER BY c DESC LIMIT 10' % (k, k)
     if A.shape == 'q35':

@@ -2978,6 +2978,93 @@ def _gd_pass2_count_nb(ku, kr, offs, SH, VR, T):
     return total
 
 
+@njit(nogil=True, parallel=True, cache=True)
+def gd_pass1_packed(uc, rc, SH, GB, T):
+    """gd_pass1 writing ONE u32 per row (2026-10-19, Q8): the target's low SH bits above the group's GB bits
+    (the target's top bits are the bucket, so the low bits are all pass 2 needs of it). Half the scatter's
+    writes and pass 2's reads of the two-array form; the caller checks SH + GB <= 32."""
+    n = uc.size
+    NB = 1 << 12
+    pc = np.zeros((T, NB + 16), np.int64)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        for i in range(lo, hi):
+            pc[t, np.int64(uc[i]) >> SH] += 1
+    offs = np.zeros(NB + 1, np.int64)
+    for b in range(NB):
+        s = 0
+        for t in range(T):
+            v = pc[t, b]
+            pc[t, b] = s
+            s += v
+        offs[b + 1] = offs[b] + s
+    pk = np.empty(n, np.uint32)
+    LM = (np.int64(1) << SH) - 1
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        cur = np.empty(NB, np.int64)
+        for b in range(NB):
+            cur[b] = offs[b] + pc[t, b]
+        for i in range(lo, hi):
+            u = np.int64(uc[i])
+            b = u >> SH
+            p = cur[b]
+            pk[p] = np.uint32(((u & LM) << GB) | np.int64(rc[i]))
+            cur[b] = p + 1
+    return pk, offs
+
+
+def gd_pass2_packed(pk, offs, SH, GB, VR):
+    """pass 2 of the packed scatter, on every vCPU (as gd_pass2_count)"""
+    return run_wide(_gd_pass2_packed_nb, pk, offs, SH, GB, VR, pass_t=True)
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _gd_pass2_packed_nb(pk, offs, SH, GB, VR, T):
+    NB = offs.size - 1
+    LOW = np.int64(1) << SH
+    GM = (np.int64(1) << GB) - 1
+    ans = np.zeros((T, VR + 16), np.int64)
+    for t in prange(T):
+        cnt = np.zeros(LOW + 1, np.int64)
+        seen = np.full(VR, -1, np.int64)
+        for b in range(NB * t // T, NB * (t + 1) // T):
+            lo = offs[b]
+            hi = offs[b + 1]
+            if hi <= lo:
+                continue
+            for u in range(LOW + 1):
+                cnt[u] = 0
+            for i in range(lo, hi):
+                cnt[(np.int64(pk[i]) >> GB) + 1] += 1
+            for u in range(LOW):
+                cnt[u + 1] += cnt[u]
+            cur = cnt[:LOW].copy()
+            lr = np.empty(hi - lo, np.uint32)
+            for i in range(lo, hi):
+                x = np.int64(pk[i])
+                u = x >> GB
+                lr[cur[u]] = np.uint32(x & GM)
+                cur[u] += 1
+            mk = b * LOW                                 # a marker unique to (bucket, low bits): never cleared
+            for u in range(LOW):
+                m = mk + u
+                for i in range(cnt[u], cnt[u + 1]):
+                    r = np.int64(lr[i])
+                    if seen[r] != m:
+                        seen[r] = m
+                        ans[t, r] += 1
+    total = np.zeros(VR, np.int64)
+    for r in prange(VR):
+        s = 0
+        for t in range(T):
+            s += ans[t, r]
+        total[r] = s
+    return total
+
+
 def gd_dense(grp, tgt, KV, VT, tnull):
     """THE Q13 BOARD'S DENSE LANE (2026-10-13): per-group COUNT(DISTINCT target) when the (group x
     target) cell table is small -- per-thread presence boards (T x KV x VT bytes), filled in one
@@ -3070,6 +3157,136 @@ def gd_pass1_skip(uc, rc, SH, T, skip):
             kr[p] = rc[i]
             cur[b] = p + 1
     return ku, kr, offs
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def gd_pass1_skipmask(uc, rc, SH, T, skipm):
+    """gd_pass1_skip with a set of key codes left out (skipm[code] = 1): the filtered group AND the heavy
+    groups (counted apart on every core by gd_heavy), so no bucket carries one giant group to one thread"""
+    n = uc.size
+    NB = 1 << 12
+    pc = np.zeros((T, NB + 16), np.int64)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        for i in range(lo, hi):
+            u = np.int64(uc[i])
+            if skipm[u] == 0:
+                pc[t, u >> SH] += 1
+    offs = np.zeros(NB + 1, np.int64)
+    for b in range(NB):
+        s = 0
+        for t in range(T):
+            v = pc[t, b]
+            pc[t, b] = s
+            s += v
+        offs[b + 1] = offs[b] + s
+    m = offs[NB]
+    ku = np.empty(m, np.uint32)
+    kr = np.empty(m, np.uint32)
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        cur = np.empty(NB, np.int64)
+        for b in range(NB):
+            cur[b] = offs[b] + pc[t, b]
+        for i in range(lo, hi):
+            u = np.int64(uc[i])
+            if skipm[u] != 0:
+                continue
+            b = u >> SH
+            p = cur[b]
+            ku[p] = uc[i]
+            kr[p] = rc[i]
+            cur[b] = p + 1
+    return ku, kr, offs
+
+
+def gd_heavy(grp, tgt, hidx, H, VT, tnull):
+    """THE HEAVY GROUPS (2026-10-19, the Q8 board's open form): COUNT(DISTINCT target) of the few groups
+    that hold most rows (SearchPhrase's '' is 87% of hits), counted on every core instead of as one run on
+    one thread: one parallel pass marks each heavy group's targets in its own presence row (H x VT bytes;
+    two threads writing the same 1 race harmlessly), then the rows are counted in parallel slices.
+    hidx[code] = the group's heavy index, or -1."""
+    return _gd_heavy_nb(grp, tgt, hidx, np.int64(H), np.int64(VT), np.int64(tnull), _nt())
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _gd_heavy_nb(grp, tgt, hidx, H, VT, tnull, T):
+    n = grp.size
+    tab = np.zeros(H * VT, np.uint8)
+    for t in prange(T):
+        for i in range(n * t // T, n * (t + 1) // T):
+            h = hidx[np.int64(grp[i])]
+            if h >= 0:
+                v = np.int64(tgt[i])
+                if v != tnull:
+                    x = h * VT + v
+                    if tab[x] == 0:                      # read first: a store to a line every thread holds
+                        tab[x] = 1                       # bounces it between cores even when the byte is
+                                                         # already 1 (Robotness x SocialSourcePage 0.31 -> 0.69 s)
+    part = np.zeros((T, H + 16), np.int64)
+    for t in prange(T):
+        for h in range(H):
+            c = 0
+            base = h * VT
+            for v in range(VT * t // T, VT * (t + 1) // T):
+                c += tab[base + v]
+            part[t, h] = c
+    out = np.zeros(H, np.int64)
+    for h in range(H):
+        s = 0
+        for t in range(T):
+            s += part[t, h]
+        out[h] = s
+    return out
+
+
+def rows_of_groups(grp, sel, gmax):
+    """THE LATE FOLD'S ROWS (2026-10-19): the rows whose group code is in `sel` (sorted, few), in row order,
+    with each row's index into sel -- one parallel pass over the codes against a bitset of the chosen
+    groups (gmax/8 bytes: 12.5 MB for WatchID's 100M), a binary search only for the rows that match"""
+    sel = np.ascontiguousarray(np.asarray(sel, np.int64))
+    bits = np.zeros((int(gmax) >> 3) + 1, np.uint8)
+    np.bitwise_or.at(bits, sel >> 3, (np.int64(1) << (sel & 7)).astype(np.uint8))
+    return _rows_of_groups_nb(grp, sel, bits, _nt())
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def _rows_of_groups_nb(grp, sel, bits, T):
+    n = grp.size
+    cnt = np.zeros((T + 1) * 8, np.int64)            # one cache line per thread's count
+    for t in prange(T):
+        c = 0
+        for i in range(n * t // T, n * (t + 1) // T):
+            g = np.int64(grp[i])
+            if (bits[g >> 3] >> (g & 7)) & 1:
+                c += 1
+        cnt[(t + 1) * 8] = c
+    base = np.zeros(T + 1, np.int64)
+    for t in range(T):
+        base[t + 1] = base[t] + cnt[(t + 1) * 8]
+    m = base[T]
+    rows = np.empty(m, np.int64)
+    sub = np.empty(m, np.int32)
+    G = sel.size
+    for t in prange(T):
+        p = base[t]
+        for i in range(n * t // T, n * (t + 1) // T):
+            g = np.int64(grp[i])
+            if (bits[g >> 3] >> (g & 7)) & 1:
+                lo = 0
+                hi = G - 1
+                while lo < hi:
+                    mid = (lo + hi) >> 1
+                    if sel[mid] < g:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                rows[p] = i
+                sub[p] = lo
+                p += 1
+    return rows, sub
 
 
 def gd_bucket_order(offs, T):
@@ -3179,22 +3396,35 @@ def _gd_keymark_nb(ku, kr, offs, order, SH, KV, VT, tnull, mark, T):
     return out
 
 
+GD_TOPK_CAP = 1 << 16       # gd_topk's census width; counts above it are picked apart
+
+
 def gd_topk(runs, ecode, k):
     """THE PICK over a per-group count array (-1 = absent): the k groups by count descending, code
     ascending -- exactly the full sort's first k -- without the full sort, the 100M-wide nonzero /
     maximum / partition passes a near-unique key paid (WatchID: ~1 s of numpy). One parallel census of
     the counts finds the k-th count; one walk in code order takes everything above it and the
-    lowest codes on it. None when the counts are too tall for a census (the caller sorts)."""
+    lowest codes on it. Counts taller than GD_TOPK_CAP are settled apart (the capped census)."""
     T = int(_nt())
     mx = _gd_max_nb(runs, np.int64(ecode), np.int64(T))
     if mx < 0:
         return np.empty(0, np.int64)
-    if mx > (1 << 22):
-        return None
-    hist = _gd_hist_nb(runs, np.int64(ecode), np.int64(mx), np.int64(T))
     need = int(k)
-    kth = int(mx)
     above = 0
+    if mx > GD_TOPK_CAP:
+        # THE CAPPED CENSUS (2026-10-19): a heavy group can count millions of distinct targets, and a
+        # histogram as wide as that cost more than the pick (16 threads x 2.5M slots). Counts past the cap
+        # are few (each holds > CAP targets) and are settled among themselves.
+        hi = np.flatnonzero(runs > GD_TOPK_CAP)
+        if 0 <= ecode < runs.size:
+            hi = hi[hi != ecode]
+        if hi.size >= need:
+            o = np.argsort(-np.asarray(runs)[hi].astype(np.int64), kind='stable')
+            return np.ascontiguousarray(hi[o[:need]].astype(np.int64))
+        above = int(hi.size)
+        mx = GD_TOPK_CAP
+    hist = _gd_hist_nb(runs, np.int64(ecode), np.int64(mx), np.int64(T))
+    kth = int(mx)
     while kth > 0 and above + int(hist[kth]) < need:
         above += int(hist[kth]); kth -= 1
     if kth == 0 and above + int(hist[0]) < need:
@@ -3228,7 +3458,7 @@ def _gd_hist_nb(runs, ecode, mx, T):
         hi = (t + 1) * n // T
         for i in range(lo, hi):
             v = np.int64(runs[i])
-            if v >= 0 and i != ecode:
+            if v >= 0 and v <= mx and i != ecode:        # past mx: the capped census settles those apart
                 part[t, v] += 1
     out = np.zeros(mx + 1, np.int64)
     for v in range(mx + 1):

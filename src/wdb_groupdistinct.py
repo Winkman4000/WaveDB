@@ -390,6 +390,120 @@ def detect(seg, tree, col_map, _allow_group_filter=False):
     return kcol, tcol, ci, ki, proj, excl
 
 
+HEAVY_STRIDE = 64      # the sample that finds heavy groups: every 64th row
+HEAVY_SHARE = 64       # a group holding more than 1/64 of the rows is heavy: counted apart, on every core
+HEAVY_MAX = 16
+HEAVY_MIN_N = 4_000_000  # below this many rows one thread finishes any group quickly (tests lower it)
+HEAVY_CELLS = 1 << 30  # heavy groups x target space, in bytes of presence table
+HEAVY_HITS = 0         # telemetry: answers whose key lane counted heavy groups apart
+PRESENCE_GROUPS = 16   # the presence lane: at most this many groups, each a presence row over the targets,
+PRESENCE_CELLS = 1 << 26   # or any number of groups whose rows fit one shared table this size (bytes)
+PACKED = True          # the scatter lane's one-u32-per-row form (tests turn it off to compare)
+
+
+def _heavy_groups(grp, VRk, N, ecode):
+    """The groups holding more than N / HEAVY_SHARE rows, estimated from a strided sample (heaviness only
+    picks how a group is counted, never what is counted), at most HEAVY_MAX of them, the filtered one
+    excluded"""
+    s = np.asarray(grp[::HEAVY_STRIDE])
+    if s.size == 0:
+        return np.empty(0, np.int64)
+    if VRk <= (1 << 26):
+        c = np.bincount(s.astype(np.int64, copy=False), minlength=VRk)
+        cand = np.flatnonzero(c * HEAVY_STRIDE > N // HEAVY_SHARE)
+        cc = c[cand]
+    else:
+        u, cc0 = np.unique(s, return_counts=True)
+        keep = cc0 * HEAVY_STRIDE > N // HEAVY_SHARE
+        cand, cc = u[keep].astype(np.int64), cc0[keep]
+    if ecode is not None:
+        cc = cc[cand != ecode]; cand = cand[cand != ecode]
+    if cand.size > HEAVY_MAX:
+        cand = cand[np.argsort(-cc, kind='stable')[:HEAVY_MAX]]
+    return np.sort(cand)
+
+
+def lane_runs(grp, tgt, tnull, VRk, VTt, ecode=None):
+    """THE Q13 BOARD'S LANES (2026-10-13), shared with group_mix (2026-10-19): per-group COUNT(DISTINCT)
+    by a walk the two columns' profiles pick --
+      DENSE   (groups x targets) cells small: per-thread presence boards, one parallel pass;
+      SCATTER few groups, a big target space: MSD by target + a group marker table (Q8/Q9's lane);
+      KEYMARK the target space fits a per-thread marker table: MSD by group, one linear marker walk;
+      KEYSORT anything else: MSD by group, each group's own run sorted (no table at all).
+    On the key lanes the heavy groups (one value holding most rows: the open form's '' or 0) are counted
+    apart on every core (gd_heavy) -- left in, a heavy group is one bucket on one thread (SearchPhrase x
+    UserID with no WHERE: 7.5 s). Returns (lane, runs): runs[g] = the distinct count, -1 = group absent;
+    a group whose targets are all NULL is present with 0. The filtered group (ecode) may hold anything."""
+    global HEAVY_HITS
+    import wdb_kernels as _WK
+    N = grp.shape[0]
+    lane = None
+    if _HAVE_NUMBA:
+        if VRk * VTt <= DENSE_CELLS:
+            lane = 'dense'
+        elif N > HEAVY_MIN_N and ((VRk <= PRESENCE_GROUPS and VRk * VTt <= HEAVY_CELLS)
+                                  or VRk * VTt <= PRESENCE_CELLS):
+            lane = 'presence'
+        elif tnull < 0 and N > 4_000_000 and VRk <= 262_144 and VTt > 65_536:
+            lane = 'scatter'
+        elif VTt <= MARK_MAX and VRk < (1 << 31):
+            lane = 'keymark'
+        elif VRk < (1 << 31) and VTt < (1 << 32):
+            lane = 'keysort'
+    LANES[lane] = LANES.get(lane, 0) + 1
+    grp = np.ascontiguousarray(grp); tgt = np.ascontiguousarray(tgt)
+    if lane == 'dense':
+        dist, rowsper = _WK.gd_dense(grp, tgt, VRk, VTt, tnull)
+        return lane, np.where(rowsper > 0, dist, -1)
+    if lane == 'presence':
+        # A HANDFUL OF GROUPS over a wide target (GoodEvent's 1 value x SearchPhrase): every group is a heavy
+        # one -- one parallel pass marks presence rows, no scatter (the scatter lane: 0.67 s vs DuckDB 0.55)
+        dist = _WK.gd_heavy(grp, tgt, np.arange(VRk, dtype=np.int32), VRk, VTt, tnull)
+        rowsper = _WK.bincount_par(grp, VRk) if tnull >= 0 else dist
+        return lane, np.where(np.asarray(rowsper) > 0, dist, -1)
+    if lane == 'scatter':
+        SH = max(1, VTt.bit_length() - 12)
+        GB = max(1, int(VRk - 1).bit_length())
+        if SH + GB <= 32 and PACKED:
+            # one u32 per row: the target's low bits over the group (Q8: RegionID's 14 bits + UserID's 13)
+            pk, offs = _WK.gd_pass1_packed(tgt, grp, np.int64(SH), np.int64(GB), np.int64(8))
+            counts = _WK.gd_pass2_packed(pk, offs, np.int64(SH), np.int64(GB), np.int64(VRk))
+            del pk
+        else:
+            ku, kr, offs = _WK.gd_pass1(tgt, grp, np.int64(SH), np.int64(8))
+            counts = _WK.gd_pass2_count(ku, kr, offs, np.int64(SH), np.int64(VRk))
+            del ku, kr
+        return lane, np.where(counts > 0, counts, -1)    # no nulls on this lane: count > 0 iff present
+    if lane in ('keymark', 'keysort'):
+        SH = max(0, VRk.bit_length() - 12)
+        heavy = _heavy_groups(grp, VRk, N, ecode) if N > HEAVY_MIN_N else np.empty(0, np.int64)
+        if heavy.size and heavy.size * VTt <= HEAVY_CELLS:
+            skipm = np.zeros(VRk, np.uint8)
+            skipm[heavy] = 1
+            if ecode is not None:
+                skipm[ecode] = 1
+            ku, kr, offs = _WK.gd_pass1_skipmask(grp, tgt, np.int64(SH), np.int64(8), skipm)
+            runs = _WK.gd_keymark(ku, kr, offs, SH, VRk, VTt, tnull, mark=(lane == 'keymark'))
+            del ku, kr
+            hidx = np.full(VRk, -1, np.int32)
+            hidx[heavy] = np.arange(heavy.size, dtype=np.int32)
+            runs[heavy] = _WK.gd_heavy(grp, tgt, hidx, heavy.size, VTt, tnull)
+            HEAVY_HITS += 1
+            return lane, runs
+        ku, kr, offs = _WK.gd_pass1_skip(grp, tgt, np.int64(SH), np.int64(8),
+                                         np.int64(-1 if ecode is None else ecode))
+        runs = _WK.gd_keymark(ku, kr, offs, SH, VRk, VTt, tnull, mark=(lane == 'keymark'))
+        return lane, runs
+    if VRk * VTt >= (1 << 62):                           # pack would overflow int64 -> decline
+        return lane, None
+    keep = (tgt != tnull) if tnull >= 0 else slice(None)
+    key = grp[keep].astype(np.int64) * VTt + tgt[keep].astype(np.int64)
+    uq = np.unique(key)
+    counts = np.bincount((uq // VTt).astype(np.int64), minlength=VRk)
+    present = np.bincount(grp.astype(np.int64), minlength=VRk) > 0
+    return lane, np.where(present, counts, -1)
+
+
 def execute(seg, det, tree):
     """THE READ: per-group COUNT(DISTINCT) via one code-hash walk. May decline (None) on
     measured conditions (mismatched lengths, pack overflow)."""
@@ -512,6 +626,7 @@ def execute(seg, det, tree):
     # emits as a time -- and point-fetched from a big dictionary)
     grp = np.ascontiguousarray(np.asarray(seg._raw_codes(kcol)))
     tinfo = None
+    t_codes = False
     tc0 = seg.cols.get(tcol)
     if _ecode is not None and tc0 is not None and tc0.get('mode') in (0, 1, 2) and grp.size:
         # THE SURVIVOR ROAD (2026-10-13): when the removed group is nearly every row (IsOldCounter's 0,
@@ -524,6 +639,7 @@ def execute(seg, det, tree):
             grp = np.ascontiguousarray(grp[rows9])
             tgt9 = np.ascontiguousarray(np.asarray(seg.codes_at(tcol, rows9)))
             tinfo = (tgt9, (int(tc0['V']) - 1) if tc0.get('has_null') else -1, None)
+            t_codes = True
             SURVIVOR_HITS += 1
         del keep
     if tinfo is None:
@@ -538,79 +654,43 @@ def execute(seg, det, tree):
     # big target space -> MSD 2-pass scatter groups rows by target, then an
     # L1-resident marker table counts each target's first touch of every key.
     # Measured on a-cd-grp: 2.4s walk -> ~0.65s, exact. All transient: cold-truth.
-    if N and (int(grp.min()) < 0):
-        return None                                      # group ids are codes or bare values >= 0 here
-    if N and tgt.dtype.kind == 'i' and int(tgt.min()) < 0:
-        lo9 = int(tgt.min())                             # raw-value targets below zero: distinctness is all
-        tgt = tgt.astype(np.int64) - lo9                 # that matters, so shift them onto >= 0
-        tnull = tnull - lo9 if tnull >= 0 else -1
-    VRk = int(grp.max()) + 1 if N else 0
-    VTt = int(tgt.max()) + 1 if N else 0
+    # the key is its dictionary code: [0, V) by construction -- no min / max passes over 100M rows (four of
+    # them cost ~0.1 s of every query in this family); a target read as codes likewise
+    VRk = int(kc0['V']) if N else 0
+    t_codes = t_codes or _tdecode is not None            # dictionary codes (raw ids carry no decode)
+    if t_codes and tc0 is not None and tc0.get('V'):
+        VTt = int(tc0['V']) if N else 0
+    else:
+        if N and tgt.dtype.kind == 'i' and int(tgt.min()) < 0:
+            lo9 = int(tgt.min())                         # raw-value targets below zero: distinctness is all
+            tgt = tgt.astype(np.int64) - lo9             # that matters, so shift them onto >= 0
+            tnull = tnull - lo9 if tnull >= 0 else -1
+        VTt = int(tgt.max()) + 1 if N else 0
     names = [wdb_sql._alias(p) for p in proj]
     if N == 0:
         _HITS += 1
         return [], names
+    lane, runs = lane_runs(grp, tgt, tnull, VRk, VTt, _ecode)
+    if runs is None:
+        return None
+    if lane == 'scatter' and P.no_where(tree) and P.no_deleted_rows(seg):
+        import wdb_sidecar as _wsc9, os as _os9
+        if _wsc9.births_on(_os9.path.dirname(seg.path)):
+            keys = _keyvals(seg, kcol, np.arange(VRk, dtype=np.int64))
+            _gdc_save(seg, kcol, tcol, np.maximum(runs, 0), keys)   # birth-on-first-touch (switch-gated)
+        import wdb_shelves
+        wdb_shelves.record(seg, 'gdc', k=kcol, t=tcol)
     import wdb_kernels as _WK
-    # THE Q13 BOARD'S LANES (2026-10-13): the walk is chosen by the two columns' profiles --
-    #   DENSE   (groups x targets) cells small: per-thread presence boards, one parallel pass;
-    #   SCATTER few groups, a big target space: MSD by target + a group marker table (Q8/Q9's lane);
-    #   KEYMARK the target space fits a per-thread marker table: MSD by group, one linear marker walk;
-    #   KEYSORT anything else: MSD by group, each group's own run sorted (no table at all).
-    # Every lane is exact; a group whose targets are all NULL is present with count 0.
-    lane = None
-    if _HAVE_NUMBA:
-        if VRk * VTt <= DENSE_CELLS:
-            lane = 'dense'
-        elif tnull < 0 and N > 4_000_000 and VRk <= 262_144 and VTt > 65_536:
-            lane = 'scatter'
-        elif VTt <= MARK_MAX and VRk < (1 << 31):
-            lane = 'keymark'
-        elif VRk < (1 << 31) and VTt < (1 << 32):
-            lane = 'keysort'
-    LANES[lane] = LANES.get(lane, 0) + 1
-    if lane == 'dense':
-        counts, rowsper = _WK.gd_dense(np.ascontiguousarray(grp), np.ascontiguousarray(tgt), VRk, VTt, tnull)
-        present = np.flatnonzero(rowsper)
-    elif lane == 'scatter':
-        # THE SCATTER LANE (Jackson's reorganization): MSD 2-pass scatter groups rows by target, then an
-        # L1-resident marker table counts each target's first touch of every key (a-cd-grp 2.4 s -> 0.65 s)
-        SH = max(1, VTt.bit_length() - 12)
-        ku, kr, offs = _WK.gd_pass1(np.ascontiguousarray(tgt), np.ascontiguousarray(grp),
-                                    np.int64(SH), np.int64(8))
-        counts = _WK.gd_pass2_count(ku, kr, offs, np.int64(SH), np.int64(VRk))
-        del ku, kr
-        if P.no_where(tree) and P.no_deleted_rows(seg):
-            import wdb_sidecar as _wsc9, os as _os9
-            if _wsc9.births_on(_os9.path.dirname(seg.path)):
-                keys = _keyvals(seg, kcol, np.arange(VRk, dtype=np.int64))
-                _gdc_save(seg, kcol, tcol, counts, keys)  # birth-on-first-touch, gbc-style (switch-gated)
-            import wdb_shelves
-            wdb_shelves.record(seg, 'gdc', k=kcol, t=tcol)
-        present = np.flatnonzero(counts)                 # no nulls on this lane: count > 0 iff the group occurs
-    elif lane in ('keymark', 'keysort'):
-        SH = max(0, VRk.bit_length() - 12)
-        ku, kr, offs = _WK.gd_pass1_skip(np.ascontiguousarray(grp), np.ascontiguousarray(tgt),
-                                         np.int64(SH), np.int64(8), np.int64(-1 if _ecode is None else _ecode))
-        runs = _WK.gd_keymark(ku, kr, offs, SH, VRk, VTt, tnull, mark=(lane == 'keymark'))
-        del ku, kr
-    else:
-        if VRk * VTt >= (1 << 62):                       # pack would overflow int64 -> decline
-            return None
-        keep = (tgt != tnull) if tnull >= 0 else slice(None)
-        key = grp[keep].astype(np.int64) * VTt + tgt[keep].astype(np.int64)
-        uq = np.unique(key)
-        counts = np.bincount((uq // VTt).astype(np.int64), minlength=VRk)
-        present = np.flatnonzero(np.bincount(grp, minlength=VRk))
     lim = wdb_sql._limit(tree)
     sel = None
-    if lane in ('keymark', 'keysort'):                   # per-group counts, -1 = absent
-        if lim is not None and lim > 0:
-            sel = _WK.gd_topk(runs, -1 if _ecode is None else _ecode, int(lim))
-        counts = runs
-        if sel is None:
-            present = np.flatnonzero(runs >= 0)
-            counts = np.maximum(runs, 0)
+    counts = runs                                        # per-group counts, -1 = absent (every lane)
+    if lim is not None and lim > 0 and runs.size > (1 << 20):
+        # the census pick, for many groups only: its histogram is as wide as the largest count, and a few
+        # groups can each count millions (RegionID x UserID: 0.48 -> 1.1 s); numpy picks among few groups
+        sel = _WK.gd_topk(runs, -1 if _ecode is None else _ecode, int(lim))
     if sel is None:
+        present = np.flatnonzero(runs >= 0)
+        counts = np.maximum(runs, 0)
         if _ecode is not None:                           # WHERE key <> literal: that one group leaves
             present = present[present != _ecode]
         sel = _top_sel(counts, present, lim)

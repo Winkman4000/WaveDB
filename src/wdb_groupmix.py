@@ -49,6 +49,15 @@ def _sidecar_counts(db, table, segment_path, kcol, tcol, gmax):
         return None
 
 
+def _has_sidecar(db, table, kcol, tcol):
+    """a materialized (key, target) distinct shelf is registered: the stored answer path is asked first"""
+    try:
+        e = db.cat.gd_entry(table, kcol, tcol) if db is not None and table is not None else None
+        return e is not None and not e.get('excluded')
+    except Exception:
+        return False
+
+
 def detect(seg, tree, col_map):
     """Returns (kcol, tcol, ci, ki, folds, proj) or None. folds = list of (proj_index, kind, phys_col, dt);
     ci/ki index the COUNT(DISTINCT) and the bare key; kcol/tcol are col_map-resolved physical names."""
@@ -136,6 +145,11 @@ def execute(seg, det, tree, db=None, table=None, segment_path=None):
 
     # ---- foldables: per-group reductions on the CODE STREAMS (THE FOLD ON CODES) ----
     count = _WK.bincount_par(grp, gmax)
+    if kc.get('mode') in (0, 1, 2) and not kc.get('has_null') and LATE and not _has_sidecar(db, table, kcol, tcol):
+        late = _late_rows(seg, tree, proj, folds, ci, ki, tcol, grp, gmax, count, kdecode)
+        if late is not None:
+            _HITS += 1
+            return late, names
     sums = {}                                            # proj_index -> per-group sum (float64)
     for (i, kind, pc, dt) in folds:
         if kind[0] in ('SUM', 'AVG'):
@@ -166,38 +180,38 @@ def execute(seg, det, tree, db=None, table=None, segment_path=None):
         distinct = np.where(ok, dcnt[np.clip(tab, 0, max(0, dcnt.size - 1))], 0)
     if distinct is None:                                 # not materialized -> decode target and walk
         tc = seg.cols[tcol]
+        t_codes = False
         if tc.get('mode') in (0, 1, 2) and not tc.get('has_null'):
             tgt = np.ascontiguousarray(np.asarray(seg._raw_codes(tcol))); tnull = -1   # codes as stored, no astype
+            t_codes = True
         else:
             tinfo = gd._ids(seg, tcol)
             if tinfo is None:
                 return None
             tgt, tnull, _td = tinfo
+            t_codes = _td is not None
         if grp.shape[0] != tgt.shape[0]:
             return None
-        k = int(tgt.max()) + 1
+        if t_codes and tc.get('V'):
+            k = int(tc['V'])                             # codes: [0, V), no min / max passes
+        else:
+            if tgt.dtype.kind == 'i' and tgt.size and int(tgt.min()) < 0:
+                lo9 = int(tgt.min())                     # raw-value targets below zero: shift onto >= 0
+                tgt = tgt.astype(np.int64) - lo9
+                tnull = tnull - lo9 if tnull >= 0 else -1
+            k = int(tgt.max()) + 1
         if gmax * k >= (1 << 62):                        # pair-id would overflow int64 -> decline
             return None
-        VRk9 = int(gmax)
-        if gd._HAVE_NUMBA and tnull < 0 and N > 4_000_000 and 0 < VRk9 <= 262_144 and k > 65_536:
-            # THE SCATTER LANE, shared with the groupdistinct read (vanilla law's find: Q09 with no
-            # gdc on disk ran the serial code-hashing walk, 2.09 s of a 3.6 s query). MSD 2-pass
-            # scatter by target, L1 marker table per bucket, parallel: measured 2.4 s -> 0.65 s there.
-            import wdb_kernels as _WK
-            SH9 = max(1, int(k).bit_length() - 12)
-            ku9, kr9, offs9 = _WK.gd_pass1(np.ascontiguousarray(tgt), np.ascontiguousarray(grp),
-                                           np.int64(SH9), np.int64(8))     # the kernel widens per row: no copies
-            distinct = _WK.gd_pass2_count(ku9, kr9, offs9, np.int64(SH9), np.int64(VRk9))
-        elif gd._HAVE_NUMBA:
-            capbits = max(20, min(28, int(np.ceil(np.log2(max(N, 2)))) + 1))
-            distinct = gd._walk(grp, tgt, np.int64(k), gmax, np.int64(tnull), capbits)
-        else:
-            keep = (tgt != tnull) if tnull >= 0 else slice(None)
-            key = grp[keep].astype(np.int64) * k + tgt[keep].astype(np.int64)
-            uq = np.unique(key)
-            distinct = np.bincount((uq // k).astype(np.int64), minlength=gmax)
+        # THE Q13 BOARD'S LANES, shared (2026-10-19, the Q9 board): dense / scatter / keymark / keysort with
+        # the heavy groups counted apart -- the serial code-hashing walk served every key that was not
+        # small x wide (ClientEventTime x RefererHash 21 s; OriginalURL keys past the board's 60 s)
+        _lane, runs = gd.lane_runs(grp, tgt, tnull, int(gmax), k)
+        if runs is None:
+            return None
+        distinct = np.maximum(runs, 0)
 
     present = np.nonzero(count)[0]                        # a group occurs iff it has >=1 row
+    present = _order_cut(present, proj, folds, tree, ci, ki, count, sums, distinct)
 
     # ---- assemble in projection order ----
     rows = []
@@ -219,6 +233,187 @@ def execute(seg, det, tree, db=None, table=None, segment_path=None):
     rows = workers.finalize(rows, proj, tree.args.get('order'), wdb_sql._limit(tree))
     _HITS += 1
     return rows, names
+
+
+LATE = True                # the late fold first (tests turn it off to compare)
+LATE_MAX_GROUPS = 4096     # past this many selected groups (a multi-term ORDER BY tying a plateau): the full fold
+LATE_HITS = 0
+LATE_SHARE = 8             # the late fold reads at most 1/8 of the rows
+
+
+def _order_term(o0, proj):
+    """(projection index, descending) of an ORDER BY term naming a projection by alias or by expression"""
+    if not isinstance(o0, E.Ordered):
+        return None, False
+    tgt = o0.this
+    tsql = tgt.sql() if hasattr(tgt, 'sql') else None
+    for i, p in enumerate(proj):
+        inner = p.this if isinstance(p, E.Alias) else p
+        if (isinstance(tgt, E.Column) and tgt.name == wdb_sql._alias(p)) or (tsql is not None and inner.sql() == tsql):
+            return i, bool(o0.args.get('desc'))
+    return None, False
+
+
+def _late_rows(seg, tree, proj, folds, ci, ki, tcol, grp, gmax, count, kdecode):
+    """THE LATE FOLD (2026-10-19, the Q9 board): when the ORDER BY needs only the row counts or the key, the
+    LIMIT's groups are chosen first, and every other aggregate -- the sums, the averages, the distinct
+    count -- is computed only over those groups' rows. Q9 orders by COUNT(*): a 100M-group key (WatchID)
+    folded two sums over 100M groups and walked 100M distinct runs to return 10 rows; a small key reads its
+    ten biggest groups' rows instead of all. One ORDER BY term: exactly `lim` groups by (value, code) --
+    at a tie the lowest codes, a legal answer; more terms: the whole plateau tied with the lim-th value.
+    None (the full fold answers) on anything else."""
+    global LATE_HITS
+    import wdb_kernels as _WK
+    import wdb_window as WN
+    lim = wdb_sql._limit(tree)
+    order = tree.args.get('order')
+    if lim is None or order is None or not order.expressions:
+        return None
+    pi, desc = _order_term(order.expressions[0], proj)
+    if pi is None:
+        return None
+    kind = 'KEY' if pi == ki else next((f[1][0] for f in folds if f[0] == pi), None)
+    if kind not in ('KEY', 'COUNT_STAR'):
+        return None
+    need = int(lim) + int(wdb_sql._offset(tree) or 0)
+    if need <= 0:
+        return None
+    single = len(order.expressions) == 1
+    count = np.asarray(count)
+    if kind == 'COUNT_STAR' and desc and single:
+        sel = np.asarray(_WK.gd_topk(count, -1, need), np.int64)      # count desc, code asc
+        sel = sel[count[sel] > 0]
+    else:
+        present = np.flatnonzero(count)
+        v = count[present].astype(np.float64) if kind == 'COUNT_STAR' else present.astype(np.float64)
+        if desc:
+            v = -v
+        if present.size > need:
+            kth = np.partition(v, need - 1)[need - 1]
+            above = np.flatnonzero(v < kth)
+            on = np.flatnonzero(v == kth)
+            if single:
+                on = on[:max(0, need - above.size)]
+            sel = present[np.concatenate([above, on])]
+        else:
+            sel = present
+    if sel.size > LATE_MAX_GROUPS:
+        return None
+    sel = np.sort(sel).astype(np.int64)
+    G = int(sel.size)
+    N = grp.shape[0]
+    if G == 0:
+        LATE_HITS += 1
+        return []
+    if int(count[sel].sum()) * LATE_SHARE > N:
+        return None                                      # the chosen groups hold much of the table (Q9's ten
+                                                         # biggest regions): gathering their rows from every
+                                                         # column costs more than the full fold (0.62 -> 1.05 s)
+    rows, sub = _WK.rows_of_groups(grp, sel, int(gmax))
+    small = rows.size * 64 <= N                          # few rows: read the other columns at them only
+
+    def codes_at(col):
+        return np.asarray(seg.codes_at(col, rows)) if small else np.asarray(seg._raw_codes(col))[rows]
+
+    sums = {}
+    for (i, kd, pc, dt) in folds:
+        if kd[0] in ('SUM', 'AVG'):
+            fc = seg.cols[pc]
+            if fc.get('mode') in (0, 1, 2) and dt == 0:
+                dv = np.asarray(WN._int_table(seg, pc), dtype=np.float64)
+                if dv.size < int(fc['V']):
+                    dv = np.concatenate([dv, np.zeros(int(fc['V']) - dv.size, np.float64)])
+                vals = dv[codes_at(pc).astype(np.int64)]
+            else:
+                vals = np.asarray(seg.values(pc)).astype(np.float64, copy=False)[rows]
+            sums[i] = np.bincount(sub, weights=vals, minlength=G)
+    tc = seg.cols[tcol]
+    if tc.get('mode') in (0, 1, 2):
+        tgt = np.ascontiguousarray(codes_at(tcol))
+        tnull = (int(tc['V']) - 1) if tc.get('has_null') else -1
+        k = int(tc['V'])
+    else:
+        tinfo = gd._ids(seg, tcol)
+        if tinfo is None:
+            return None
+        tgt = np.ascontiguousarray(np.asarray(tinfo[0])[rows]); tnull = tinfo[1]
+        if tgt.dtype.kind == 'i' and tgt.size and int(tgt.min()) < 0:
+            lo9 = int(tgt.min()); tgt = tgt.astype(np.int64) - lo9
+            tnull = tnull - lo9 if tnull >= 0 else -1
+        k = int(tgt.max()) + 1 if tgt.size else 1
+    _lane, runs = gd.lane_runs(np.ascontiguousarray(sub), tgt, tnull, G, k)
+    if runs is None:
+        return None
+    distinct = np.maximum(runs, 0)
+    out = []
+    for j, g in enumerate(sel.tolist()):
+        row = [None] * len(proj)
+        row[ki] = wdb_sql._pyval(kdecode[g] if kdecode is not None else np.int64(g))
+        row[ci] = int(distinct[j])
+        cg = int(count[g])
+        for (i, kd, pc, dt) in folds:
+            if kd[0] == 'COUNT_STAR':
+                row[i] = cg
+            elif kd[0] == 'SUM':
+                s = sums[i][j]
+                row[i] = int(round(s)) if dt == 0 else float(s)
+            elif kd[0] == 'AVG':
+                row[i] = float(sums[i][j] / cg) if cg else None
+        out.append(tuple(row))
+    LATE_HITS += 1
+    return workers.finalize(out, proj, tree.args.get('order'), wdb_sql._limit(tree))
+
+
+def _order_cut(present, proj, folds, tree, ci, ki, count, sums, distinct):
+    """THE ORDER BEFORE THE ROWS (2026-10-19): with a LIMIT, only the groups that can be returned become
+    Python rows (a 100M-group key built 100M of them). The first ORDER BY term is evaluated per group as an
+    array; with one term the cut is exact -- the first `lim` by (value, code), so a tie at the LIMIT keeps the
+    lowest codes, a legal answer -- with more terms every group tied with the lim-th value is kept for
+    finalize to order. Anything else (an expression, no LIMIT): every present group, as before."""
+    lim = wdb_sql._limit(tree)
+    order = tree.args.get('order')
+    if lim is None or order is None or not order.expressions or present.size <= 8 * max(int(lim), 1):
+        return present
+    lim = int(lim) + int(wdb_sql._offset(tree) or 0)
+    o0 = order.expressions[0]
+    if not isinstance(o0, E.Ordered):
+        return present
+    tgt = o0.this
+    tsql = tgt.sql() if hasattr(tgt, 'sql') else None
+    pi = None
+    for i, p in enumerate(proj):
+        inner = p.this if isinstance(p, E.Alias) else p
+        if (isinstance(tgt, E.Column) and tgt.name == wdb_sql._alias(p)) or (tsql is not None and inner.sql() == tsql):
+            pi = i
+            break
+    if pi is None:
+        return present
+    if pi == ci:
+        v = np.asarray(distinct, np.float64)[present]
+    elif pi == ki:
+        v = present.astype(np.float64)                   # value-sorted codes: code order is value order
+    else:
+        f = [x for x in folds if x[0] == pi]
+        if not f:
+            return present
+        kind = f[0][1][0]
+        cg = np.asarray(count)[present].astype(np.float64)
+        if kind == 'COUNT_STAR':
+            v = cg
+        elif kind == 'SUM':
+            v = np.asarray(sums[pi])[present]
+        else:
+            v = np.asarray(sums[pi])[present] / np.maximum(cg, 1)
+    if o0.args.get('desc'):
+        v = -v
+    if np.isnan(v).any():
+        return present
+    kth = np.partition(v, lim - 1)[lim - 1]
+    above = np.flatnonzero(v < kth)
+    on = np.flatnonzero(v == kth)
+    if len(order.expressions) == 1:
+        on = on[:max(0, lim - above.size)]               # present is ascending: the lowest codes first
+    return present[np.sort(np.concatenate([above, on]))]
 
 
 def try_groupmix(seg, tree, col_map, db=None, table=None, segment_path=None):
