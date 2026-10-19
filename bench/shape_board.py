@@ -11,6 +11,9 @@ Shapes (slot 1 = 'k', slot 2 = 'd' in the records):
        GROUP BY K1, K2 ORDER BY c DESC LIMIT 10    (Q30/Q31; form 'open' drops the WHERE = Q32)
   q27  SELECT K, AVG(length(S)) AS l, COUNT(*) AS c FROM hits WHERE S <> '' GROUP BY K HAVING COUNT(*) > 100000
        ORDER BY l DESC LIMIT 25      (slot 2 = S, text columns only; form 'open' drops the WHERE)
+  q28  SELECT REGEXP_REPLACE(S, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS k, AVG(length(S)) AS l, COUNT(*) AS c,
+       MIN(S) FROM hits WHERE S <> '' GROUP BY k HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25
+       (one slot, text columns only; form 'open' drops the WHERE)
 A profile is a column's passport (mode, code encoding, type) plus its V class (bench/q13_profiles.py); one
 representative column stands for each profile (the original's own columns pinned), and the board runs every
 ordered pair of representatives.
@@ -79,6 +82,7 @@ SHAPES = {
     'q33': {'orig': ('URL',), 'qnum': 33, 'forms': 'plain'},
     'q34': {'orig': ('URL',), 'qnum': 34, 'forms': 'plain'},
     'q27': {'orig': ('CounterID', 'URL'), 'qnum': 27, 'forms': 'filtered,open', 'text_d': True},
+    'q28': {'orig': ('Referer',), 'qnum': 28, 'forms': 'filtered,open', 'text_k': True},
 }
 SH = SHAPES[A.shape]
 if 'qnum' in SH:
@@ -163,6 +167,11 @@ def sql_of(k, d, form):
         where = " WHERE %s <> ''" % d if form == 'filtered' else ''
         return ('SELECT %s, AVG(length(%s)) AS l, COUNT(*) AS c FROM hits%s GROUP BY %s HAVING COUNT(*) > 100000 '
                 'ORDER BY l DESC LIMIT 25' % (k, d, where, k))
+    if A.shape == 'q28':
+        where = " WHERE %s <> ''" % k if form == 'filtered' else ''
+        return (r"SELECT REGEXP_REPLACE(%s, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS k, AVG(length(%s)) AS l, "
+                r"COUNT(*) AS c, MIN(%s) FROM hits%s GROUP BY k HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25"
+                % (k, k, k, where))
     if A.shape == 'q34':
         return 'SELECT 1, %s, COUNT(*) AS c FROM hits GROUP BY 1, %s ORDER BY c DESC LIMIT 10' % (k, k)
     if A.shape == 'q35':
@@ -364,6 +373,8 @@ ks = A.k.split(',') if A.k else list(REPS.values())
 ds = A.d.split(',') if A.d else list(REPS.values())
 if SH.get('text_d'):                         # slot 2 takes a string function: text columns only
     ds = [c for c in ds if COLS[c]['dt'] == 'str']
+if SH.get('text_k'):                         # the one slot takes a string function: text columns only
+    ks = [c for c in ks if COLS[c]['dt'] == 'str']
 if SH.get('numeric'):
     ks = [c for c in ks if COLS[c]['dt'] == 'int' or c == ORIG_K]
 if SINGLE:

@@ -84,15 +84,15 @@ def detect(seg, tree, col_map):
     if not P.no_select_distinct(tree):  return None
     if not P.no_deleted_rows(seg):      return None
     where = tree.args.get('where')
-    if where is None:
-        return None
-    w = where.this
-    if not isinstance(w, E.NEQ) or not isinstance(w.this, E.Column):
-        return None
-    wcol = col_map.get(w.this.name, w.this.name) if col_map else w.this.name
-    wl = w.expression
-    if not (isinstance(wl, E.Literal) and wl.this == ''):
-        return None
+    wcol = None                          # no WHERE (the open form): the empty string is a value like any other
+    if where is not None:
+        w = where.this
+        if not isinstance(w, E.NEQ) or not isinstance(w.this, E.Column):
+            return None
+        wcol = col_map.get(w.this.name, w.this.name) if col_map else w.this.name
+        wl = w.expression
+        if not (isinstance(wl, E.Literal) and wl.this == ''):
+            return None
     proj = tree.expressions
     lenfn = 'LENGTH'
     rk = None; cols = {}
@@ -120,7 +120,7 @@ def detect(seg, tree, col_map):
     if rk is None:
         return None
     col = rk[1]
-    if col != wcol:                      return None
+    if wcol is not None and col != wcol: return None
     if not P.columns_exist(seg, col):    return None
     if seg._effective(col) is not None:  return None
     if seg.cols[col].get('mode') not in (0, 1):
@@ -159,7 +159,7 @@ def detect(seg, tree, col_map):
     lim = wdb_sql._limit(tree)
     return {'col': col, 'pat': rk[2], 'rep': rk[3], 'all': rk[4], 'rk_pi': rk[0], 'aggs': cols,
             'hmin': hmin, 'osel': osel, 'lim': lim, 'off': int(wdb_sql._offset(tree) or 0),
-            'proj': proj, 'lenfn': lenfn}
+            'proj': proj, 'lenfn': lenfn, 'filtered': wcol is not None}
 
 
 def _code_counts(seg, col):
@@ -425,9 +425,8 @@ def _derive_runs_one_read(seg, col, spec, pcl):
     offs = np.concatenate([p[2][:-1] + byte_base[k] for k, p in enumerate(parts)] + [byte_base[-1:]])
     nrun = int(run_base[-1])
     h = np.empty(nrun, np.uint64); WK.label_hash(blob, offs, h)
-    order = np.argsort(h)                        # bucket order only: groups are decided byte-exact
     gid = np.empty(nrun, np.int64); rep = np.empty(nrun, np.int64)
-    G = int(WK.label_groups(blob, offs, h, order, gid, rep))
+    G = int(WK.label_groups_par(blob, offs, h, gid, rep))   # groups decided byte-exact, on every core
     lab_ids = gid[ent_run]
     counts = _code_counts(seg, col)
     empty_code = None
@@ -530,14 +529,22 @@ def _derive_re2(seg, col, spec):
     V = int(off.size - 1)
     lens = (seg.dict_bytelens(col) if spec.get('lenfn') == 'STRLEN' else seg.dict_charlens(col))
     if lens is None:
-        return None
+        # a plain (unchunked) dictionary keeps no length table: count on the stream itself -- bytes, less the
+        # UTF-8 continuation bytes for characters (the Python road below forked a 6-process pool for this;
+        # forking a process that already holds the big columns cost ~0.4 s on a 1-value dictionary)
+        offs = np.asarray(off, np.int64)
+        lens = np.diff(offs)
+        if spec.get('lenfn') != 'STRLEN' and lens.size:
+            cs = np.zeros(offs[-1] + 1, np.int64)
+            np.cumsum((np.asarray(blob[:offs[-1]], np.uint8) & 0xC0) == 0x80, out=cs[1:])
+            lens = lens - (cs[offs[1:]] - cs[offs[:-1]])
     try:
         import pyarrow as pa, pyarrow.compute as pc
         arr = pa.LargeStringArray.from_buffers(V, pa.py_buffer(np.ascontiguousarray(off, np.int64)),
                                                pa.py_buffer(np.ascontiguousarray(blob)))
         rep = re.sub(r'\\g<(\d+)>', r'\\\1', spec['rep'])          # RE2 writes a group as \1
         mr = None if spec.get('all') else 1
-        nt = max(1, min(32, os.cpu_count() or 1)); step = max(1, -(-V // nt))
+        nt = max(1, min(32, os.cpu_count() or 1, V // 16384)); step = max(1, -(-V // nt))   # small: one slice
 
         def one(i):
             return pc.replace_substring_regex(arr.slice(i, min(step, V - i)), pattern=spec['pat'],
@@ -594,6 +601,8 @@ def _derive(seg, col, spec):
     _FORK_BS, _FORK_RX, _FORK_REP = bs, spec['pat'].encode(), spec['rep'].encode()
     _FORK_CNT = 0 if spec.get('all') else 1             # first match only, as DuckDB, unless 'g'
     try:
+        if len(bs) < 200_000:
+            raise RuntimeError('small: in this thread')   # a fork of a big process costs more than the work
         import multiprocessing as mp
         with mp.get_context('fork').Pool(6) as pool:      # COW: children inherit bs, no copy in
             V2 = len(bs); step = (V2 + 5) // 6
@@ -612,17 +621,29 @@ def _emit(seg, spec, counts, lens, lab_ids, uniq, empty_code):
     global _HITS
     col = spec['col']
     G = len(uniq)
-    w = counts.astype(np.int64)
-    if empty_code is not None:
-        w = w.copy(); w[empty_code] = 0              # WHERE col <> ''
-    gcnt = np.bincount(lab_ids, weights=w, minlength=G).astype(np.int64)
-    glen = np.bincount(lab_ids, weights=w * lens, minlength=G)
-    min_code = np.full(G, -1, np.int64)
-    import wdb_kernels as _WKe
-    _WKe.first_index(np.ascontiguousarray(lab_ids, dtype=np.int64), min_code)   # first code in code
-                                                     # order = MIN value (order is differentiation)
+    w = counts.astype(np.int64)                      # a copy (counts is memoised): safe to zero below
+    if empty_code is not None and spec.get('filtered', True):
+        w[empty_code] = 0                            # WHERE col <> ''
+    acc = np.zeros((G, 4), np.int64); acc[:, 2] = -1  # count, length sum, the first code that carries a row
+    import wdb_kernels as _WKe                       # (= the MIN value: order is differentiation; under the
+    n9 = min(len(lab_ids), len(w))                   # WHERE the empty value carries none, so it is never the MIN)
+    _WKe.label_fold(np.ascontiguousarray(lab_ids[:n9], dtype=np.int64), np.ascontiguousarray(w[:n9]),
+                    np.ascontiguousarray(lens[:n9], dtype=np.int64), acc)
+    gcnt = acc[:, 0]; glen = acc[:, 1]; min_code = acc[:, 2]
     keep = np.nonzero(gcnt > (spec['hmin'] or 0))[0] if spec['hmin'] is not None else np.nonzero(gcnt > 0)[0]
     keep = keep[gcnt[keep] > 0]
+    osel = spec['osel']
+    kind0 = None if osel is None else ('K' if osel == spec['rk_pi'] else spec['aggs'][osel][0])
+    if spec['lim'] is not None and kind0 != 'K':
+        # THE ORDER BEFORE THE LABELS: only the groups the LIMIT returns become strings (without a HAVING,
+        # every one of Title's 9.4M groups was a Python row before the sort). A stable descending order,
+        # as the row sort's reverse=True keeps equal keys in group order.
+        if kind0 is not None:
+            kv = {'AVG_LEN': lambda: glen[keep] / gcnt[keep], 'COUNT_STAR': lambda: gcnt[keep],
+                  'MIN_DICT': lambda: min_code[keep]}[kind0]()
+            keep = keep[np.argsort(-kv, kind='stable')]
+        keep = keep[spec['off']: spec['off'] + spec['lim']]
+        spec = dict(spec, off=0)
     rows = []
     for g in keep:
         lab = uniq[g]

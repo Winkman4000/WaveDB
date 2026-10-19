@@ -6716,12 +6716,29 @@ def plike_fc_serial(buf, restarts, R, V, n1, n2, keep):
 
 @njit(cache=True, parallel=True, nogil=True)
 def label_hash(blob, offs, out):
-    """FNV-1a 64 over each label blob[offs[r]:offs[r+1]] -- a bucket, never an identity"""
+    """a 64-bit hash of each label blob[offs[r]:offs[r+1]] -- a bucket, never an identity. Eight bytes per
+    multiply (byte-at-a-time FNV-1a was one dependent multiply per byte: 0.20 s over Title's 9.4M labels),
+    the length folded in, and murmur's finaliser so the top bits (the partition's) depend on every byte."""
     for r in prange(out.size):
-        h = np.uint64(14695981039346656037)
-        for i in range(offs[r], offs[r + 1]):
-            h ^= np.uint64(blob[i])
-            h *= np.uint64(1099511628211)
+        a = offs[r]; b = offs[r + 1]
+        h = np.uint64(14695981039346656037) ^ np.uint64(b - a)
+        i = a
+        while i + 8 <= b:
+            wd = (np.uint64(blob[i]) | (np.uint64(blob[i + 1]) << np.uint64(8)) | (np.uint64(blob[i + 2]) << np.uint64(16))
+                  | (np.uint64(blob[i + 3]) << np.uint64(24)) | (np.uint64(blob[i + 4]) << np.uint64(32))
+                  | (np.uint64(blob[i + 5]) << np.uint64(40)) | (np.uint64(blob[i + 6]) << np.uint64(48))
+                  | (np.uint64(blob[i + 7]) << np.uint64(56)))
+            h = (h ^ wd) * np.uint64(1099511628211)
+            h ^= h >> np.uint64(29)
+            i += 8
+        while i < b:
+            h = (h ^ np.uint64(blob[i])) * np.uint64(1099511628211)
+            i += 1
+        h ^= h >> np.uint64(33)
+        h *= np.uint64(0xff51afd7ed558ccd)
+        h ^= h >> np.uint64(33)
+        h *= np.uint64(0xc4ceb9fe1a85ec53)
+        h ^= h >> np.uint64(33)
         out[r] = h
 
 
@@ -6759,6 +6776,97 @@ def label_groups(blob, offs, h, order, gid, rep):
             gid[r] = found
         i = j
     return G
+
+
+def label_groups_par(blob, offs, h, gid, rep):
+    return _label_groups_par_nb(blob, offs, h, gid, rep, _nt())
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def _label_groups_par_nb(blob, offs, h, gid, rep, T):
+    """EXACT label groups on every core (label_groups' law, without its one-thread argsort of every hash:
+    0.58 s of SearchPhrase's 1.5 s under Q28's pattern, 0.98 s of Title's 2.9 s). Labels are partitioned by
+    the top 12 bits of their hash (per-thread counts, padded rows -> offsets -> scatter); each of the 4096
+    buckets is sorted by hash and grouped on its own, every equal-hash label compared BYTE FOR BYTE with
+    the bucket's representatives, so a collision never merges two labels. Group ids are numbered bucket
+    by bucket. gid[run] = group, rep[group] = a run carrying it. Returns the group count."""
+    n = h.size
+    NB = 1 << 12
+    SH = np.uint64(52)
+    pc = np.zeros((T, NB + 16), np.int64)
+    for t in prange(T):
+        for i in range(n * t // T, n * (t + 1) // T):
+            pc[t, np.int64(h[i] >> SH)] += 1
+    bo = np.zeros(NB + 1, np.int64)
+    for b in range(NB):
+        s = 0
+        for t in range(T):
+            v = pc[t, b]; pc[t, b] = s; s += v
+        bo[b + 1] = bo[b] + s
+    order = np.empty(n, np.int64)
+    for t in prange(T):
+        cur = np.empty(NB, np.int64)
+        for b in range(NB):
+            cur[b] = bo[b] + pc[t, b]
+        for i in range(n * t // T, n * (t + 1) // T):
+            b = np.int64(h[i] >> SH)
+            order[cur[b]] = i
+            cur[b] += 1
+    lg = np.zeros(NB, np.int64)
+    lrep = np.empty(n, np.int64)                  # bucket b's representatives at lrep[bo[b]:]
+    for b in prange(NB):
+        lo = bo[b]; m = bo[b + 1] - lo
+        if m == 0:
+            continue
+        hs = np.empty(m, np.uint64)
+        for k in range(m):
+            hs[k] = h[order[lo + k]]
+        o = np.argsort(hs)
+        G = 0; i = 0
+        while i < m:
+            hv = hs[o[i]]; j = i
+            while j < m and hs[o[j]] == hv:
+                j += 1
+            base = G
+            for q in range(i, j):
+                r = order[lo + o[q]]; found = -1
+                for g in range(base, G):
+                    if _label_eq(blob, offs, r, lrep[lo + g]):
+                        found = g
+                        break
+                if found < 0:
+                    lrep[lo + G] = r; found = G; G += 1
+                gid[r] = found
+            i = j
+        lg[b] = G
+    gb = np.zeros(NB + 1, np.int64)
+    for b in range(NB):
+        gb[b + 1] = gb[b] + lg[b]
+    for b in prange(NB):
+        lo = bo[b]; base = gb[b]
+        for k in range(lo, bo[b + 1]):
+            gid[order[k]] += base
+        for g in range(lg[b]):
+            rep[base + g] = lrep[lo + g]
+    return gb[NB]
+
+
+@njit(cache=True, nogil=True)
+def label_fold(lab, w, lens, acc):
+    """one pass over a dictionary's codes: per label group g, acc[g, 0] = the row count (+= w), acc[g, 1] =
+    the summed length (+= w * len), acc[g, 2] = the first code that carries a row (pre-filled with -1: in a
+    value-sorted dictionary, the group's MIN). One row per group, so a scattered group costs one cache line,
+    not three. Was two weighted bincounts, a product array and a first-index pass (0.19 s on SearchPhrase's
+    6.0M values, 0.30 s on Title's 9.4M)."""
+    for i in range(lab.size):
+        c = w[i]
+        if c == 0:
+            continue
+        g = lab[i]
+        acc[g, 0] += c
+        acc[g, 1] += c * lens[i]
+        if acc[g, 2] < 0:
+            acc[g, 2] = i
 
 
 @njit(cache=True, nogil=True)
