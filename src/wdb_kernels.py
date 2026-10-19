@@ -7680,3 +7680,78 @@ if HAVE_NUMBA:
                     lo += c * (v & M)
             outhi[t] = hi
             outlo[t] = lo
+
+
+# THE FLAG SCAN OVER DECODED CODES (2026-10-19, the LIKE board): the rows whose code's flag is set, in row order.
+# _scan_flag's fallback for encodings with no fused scanner (enc 10 / 9 / 2 ...) built arange(N) for the
+# range read, gathered, and indexed the flag on one thread: UTMContent LIKE '%x%' 250 ms flat, whatever the
+# needle, where the codes decode in 7-12 ms. Two parallel passes: count per lane, then each lane writes its own
+# stretch of the output.
+@njit(cache=True, parallel=True, nogil=True)
+def flag_count_lanes(cc, flag, cnts):
+    """cnts[t] = rows in lane t (of cnts.size equal stretches of cc) whose code has flag set"""
+    n = cc.size
+    T = cnts.size
+    for t in prange(T):
+        a = n * t // T
+        b = n * (t + 1) // T
+        s = 0
+        for i in range(a, b):
+            if flag[cc[i]]:
+                s += 1
+        cnts[t] = s
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def flag_fill_lanes(cc, flag, offs, base, out):
+    """out[offs[t]:offs[t+1]] = base + the rows of lane t whose code has flag set (offs from flag_count_lanes)"""
+    n = cc.size
+    T = offs.size - 1
+    for t in prange(T):
+        a = n * t // T
+        b = n * (t + 1) // T
+        w = offs[t]
+        for i in range(a, b):
+            if flag[cc[i]]:
+                out[w] = base + i
+                w += 1
+
+
+def flag_positions(cc, flag, base=0):
+    """np.flatnonzero(flag[cc]) + base, in parallel. flag covers every code in cc."""
+    cc = np.ascontiguousarray(cc)
+    flag = np.ascontiguousarray(flag, dtype=np.bool_)
+    T = int(_nt()) if cc.size >= (1 << 16) else 1
+    cnts = np.zeros(T, np.int64)
+    flag_count_lanes(cc, flag, cnts)
+    offs = np.zeros(T + 1, np.int64)
+    np.cumsum(cnts, out=offs[1:])
+    out = np.empty(int(offs[-1]), np.int64)
+    flag_fill_lanes(cc, flag, offs, np.int64(base), out)
+    return out
+
+
+# THE DENSE FACTORIZATION (2026-10-19, the LIKE board): a dictionary code IS a dense group id. wherescan's
+# GROUP BY sorted the survivors' key codes when their range passed 1M (np.unique: SearchPhrase's 6M codes
+# under Q21 with a one-letter needle, 60M rows, 1.4 s of argsort on one thread). The parallel census counts
+# the codes (bincount_par), the codes present are ranked, and each row's group is the rank of its code.
+@njit(cache=True, parallel=True, nogil=True)
+def rank_gather(a, lo, rank, inv):
+    """inv[i] = rank[a[i] - lo], in parallel"""
+    for i in prange(a.size):
+        inv[i] = rank[a[i] - lo]
+
+
+def dense_factorize(a, lo, span):
+    """(sorted values present, row -> group, rows per group) for integer a with every value in [lo, lo + span):
+    np.unique(a, return_inverse=True) plus its counts, without the sort"""
+    a = np.ascontiguousarray(a)
+    s = a if lo == 0 else (a - lo)
+    # past 4M codes the per-lane boards (16 x span x 4 bytes) outweigh the radix census, which has none
+    cnt_span = bincount_big(s, span) if span > (1 << 22) else bincount_par(s, span)
+    uvals = np.flatnonzero(cnt_span)
+    rank = np.empty(span, np.int64)
+    rank[uvals] = np.arange(uvals.size)
+    inv = np.empty(a.size, np.int64)
+    rank_gather(a, np.int64(lo), rank, inv)
+    return uvals + lo, inv, cnt_span[uvals].astype(np.int64)

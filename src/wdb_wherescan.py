@@ -301,7 +301,7 @@ def _scalar_flag(seg, sp, op, lit):
 
 def _like(node):
     """(col, needle, kind, negate) for `col [NOT] LIKE pat` -- kinds: contains '%x%',
-    prefix 'x%', suffix '%x'. No interior wildcards."""
+    prefix 'x%', suffix '%x' (no interior wildcards), general (any other pattern), all ('%' alone)."""
     neg = False
     n = node
     if isinstance(n, E.Not):
@@ -310,6 +310,10 @@ def _like(node):
         return None
     neg = neg or bool(n.args.get('negate'))      # sqlglot: NOT LIKE == Like(negate=True)
     pat = _litval(n.expression)
+    if isinstance(pat, str) and pat and pat.strip('%') == '':
+        # '%' (or '%%...'): every non-NULL value matches -- kind 'all' (2026-10-19, the LIKE board: it was refused
+        # here as too short, and Q21/Q23 with K LIKE '%' fell to the general path, past 30 s)
+        return n.this.name, '%', 'all', neg
     if not isinstance(pat, str) or len(pat) < 2:
         return None
     if pat.startswith('%') and pat.endswith('%'):
@@ -563,7 +567,7 @@ def _like_at(seg, col, needle, kind, cc):
         return _like_flags(seg, col, needle, kind)[cc]
     c0 = seg.cols.get(col) or {}
     nd = needle.encode() if isinstance(needle, str) else needle
-    if kind not in ('general', 'prefix', 'suffix') and 'restarts' in c0 and len(nd) >= 1 and cc.size:
+    if kind == 'contains' and 'restarts' in c0 and len(nd) >= 1 and cc.size:
         import wdb_strings
         V = int(c0['V'])
         pres = np.zeros(V, np.bool_); pres[cc] = True
@@ -601,7 +605,13 @@ def _like_flags_dict(seg, col, needle, kind='contains'):
         return memo[mk]
     nd = needle.encode() if isinstance(needle, str) else needle
     c0 = seg.cols.get(col) or {}
-    if kind not in ('general', 'prefix', 'suffix') and 'restarts' in c0 and len(nd) >= 1:
+    if kind == 'all':
+        # LIKE '%': every value of the dictionary matches (the NULL bin, past it, is padded False by _like_flags)
+        V0 = int(c0.get('V') or 0) - (1 if c0.get('has_null') else 0)
+        flag = np.ones(max(V0, 0), bool)
+        memo[mk] = flag
+        return flag
+    if kind == 'contains' and 'restarts' in c0 and len(nd) >= 1:
         # THE FRONT-CODED HAYSTACK (vanilla law's find): the old path decoded 18M URLs into Python
         # objects to join a haystack -- 19 s, every process. The kernel walks the dictionary's own
         # front-coded bytes: no objects, blocks in parallel, nothing born.
@@ -1455,8 +1465,19 @@ def _scan_flag(seg, col, flag, lo, hi):
         outS = np.zeros(max(1, int(offs[-1])), np.int64)
         _WK.bp0_scan_fill(bufS, int(c['cstart']), int(c['bits']), lo, hi, flagS, offs, outS, CH)
         return outS[:int(offs[-1])]
-    cc = np.asarray(seg._raw_codes_range(col, lo, hi))
-    return np.nonzero(flag[cc])[0] + lo
+    # THE GENERAL FLAG SCAN (2026-10-19, the LIKE board): encodings with no fused scanner above (enc 10 / 9 / 2 ...)
+    # built arange for the range read and indexed the flag on one thread -- UTMContent 250 ms flat for codes that
+    # decode in 7-12 ms. The whole column decodes once (kept for the codes_at that follow), the scan runs on
+    # every core.
+    if lo == 0 and hi >= int(seg.N):
+        cc = np.asarray(seg._raw_codes(col))
+    else:
+        cc = np.asarray(seg._raw_codes_range(col, lo, hi))
+    fl9 = np.asarray(flag, bool)
+    if cc.size >= (1 << 16) and cc.dtype.kind in 'iu' and fl9.size >= int(c.get('V') or 0) > 0:
+        import wdb_kernels as _WK
+        return _WK.flag_positions(cc, fl9, lo)
+    return np.nonzero(fl9[cc])[0] + lo
 
 
 def _or_union_flag(seg, atoms):
@@ -1528,6 +1549,25 @@ def _atom_mask(seg, a, pos, ccache):
     return np.zeros(pos.size, bool)
 
 
+_COUNT_CENSUS_V = 1 << 20   # COUNT + LIKE from the census up to this many values (past it the scan is cheaper)
+_DENSE_SPAN = 1 << 26    # a key's code range up to 64M (past 4M the census is the radix one: no per-lane boards)
+_DENSE_MIN_ROWS = 1 << 20   # the parallel factorization from this many rows (below, numpy's one pass is enough)
+_LATE_MIN_ROWS = 1 << 16    # the late aggregates from this many survivors
+
+
+def _fact_counts(a):
+    """(sorted values present, row -> group, rows per group): _fact_small plus the counts, in one pass when the
+    parallel dense road serves (a single dictionary key: its codes are the group ids)"""
+    if a.size >= _DENSE_MIN_ROWS and a.size:
+        amin = int(a.min()); amax = int(a.max())
+        span = amax - amin + 1
+        if span <= _DENSE_SPAN:
+            import wdb_kernels as _WK
+            return _WK.dense_factorize(a.astype(np.int64, copy=False), amin, span)
+    u, inv = _fact_small(a)
+    return u, inv, np.bincount(inv, minlength=u.size)
+
+
 def _fact_small(a):
     """np.unique(a, return_inverse=True) without the hidden sort: when the value range
     is narrow (derived keys like minute 0-59 or LENGTH 0-500, and composites over them),
@@ -1537,6 +1577,10 @@ def _fact_small(a):
         return np.unique(a, return_inverse=True)
     amin = int(a.min()); amax = int(a.max())
     span = amax - amin + 1
+    if span > (1 << 20) and span <= _DENSE_SPAN and a.size >= _DENSE_MIN_ROWS:
+        import wdb_kernels as _WK                # dictionary codes as group ids, in parallel (2026-10-19)
+        u, inv, _c = _WK.dense_factorize(a.astype(np.int64, copy=False), amin, span)
+        return u, inv
     if span > (1 << 20):
         return np.unique(a, return_inverse=True)
     shifted = (a - amin).astype(np.int64, copy=False)
@@ -1557,15 +1601,46 @@ def execute(seg, spec):
     lflags = [(col, _like_flags(seg, col, needle, kind) if i == dl else None, neg)
               for i, (col, needle, kind, neg) in enumerate(likes)] if likes else []
     _dn = None
+    pos_full = False      # pos is every row of the span: the first residual = / <> may scan instead (2026-10-19)
+    if (dl is not None and not spec.get('keys') and spec.get('mode') != 'rows' and len(likes) == 1
+            and spec.get('aggs') and all(a9[1] == 'COUNT_STAR' for a9 in spec['aggs'])
+            and not spec['eqs'] and not spec.get('ins') and not spec.get('nulls') and not spec.get('ors')
+            and not spec.get('sflags') and not spec['flags'] and lo == 0 and hi >= int(seg.N)):
+        # THE COUNT FROM THE CENSUS (2026-10-19, the LIKE board): COUNT(*) WHERE col LIKE p over a dictionary
+        # of at most ~1M values is the rows of the matching values -- the census of the codes, counted from the
+        # encoding itself where it can be (raw_census), with no row positions written. The scan wrote every hit's
+        # position to count them (HitColor LIKE '%5%': 80M positions, 366 ms; UTMContent 250 ms flat). Big
+        # dictionaries keep the scan: their census costs more than it (Q20 on URL: 480 ms against 150).
+        col9, fl9, _n9 = lflags[dl]
+        c9 = seg.cols[col9]
+        V9 = int(c9['V'])
+        n9 = None
+        if likes[dl][2] == 'all' and not c9.get('has_null'):
+            n9 = int(seg.N)                      # LIKE '%' over a column with no NULL: every row
+        elif V9 <= _COUNT_CENSUS_V:
+            cn9 = np.asarray(seg.raw_census(col9, V9))[:V9]
+            f9 = np.zeros(V9, bool)
+            m9 = min(V9, int(np.asarray(fl9).size))
+            f9[:m9] = np.asarray(fl9, bool)[:m9]
+            n9 = int(cn9[f9].sum())
+        if n9 is not None:
+            _HITS += 1
+            return [tuple(n9 for _a in spec['aggs'])], [wdb_sql._alias(p) for p in spec['proj']]
     if hi <= lo:
         pos = np.empty(0, np.int64)
+    elif dl is not None and not np.asarray(lflags[dl][1]).any():
+        pos = np.empty(0, np.int64)      # the driving LIKE matches no value: no row can pass (2026-10-19)
     elif de is not None:
         col, val, _op = spec['eqs'][de]
         code = _code_of(seg, col, val)
         pos = _scan_eq(seg, col, int(code), lo, hi) if code is not None else np.empty(0, np.int64)
     elif dl is not None:
         col, fl, _n = lflags[dl]
-        pos = _scan_flag(seg, col, fl, lo, hi)
+        if np.asarray(fl).all():
+            pos = np.arange(lo, hi, dtype=np.int64)   # every code matches (LIKE '%', no NULL): no scan to run
+            pos_full = True
+        else:
+            pos = _scan_flag(seg, col, fl, lo, hi)
     elif spec.get('drive_sf') is not None:
         sp2, op2, l2 = spec['sflags'][spec['drive_sf']]
         pos = _scan_flag(seg, sp2['col'], _scalar_flag(seg, sp2, op2, l2), lo, hi)
@@ -1608,6 +1683,7 @@ def execute(seg, spec):
                            negate=not _wn)
         else:
             pos = np.arange(lo, hi, dtype=np.int64)
+            pos_full = True
     # residual order is ours to choose (conjunction commutes): equalities before
     # inequalities (eq slashes survivors, neq barely trims), cheap dictionaries
     # before heavy ones -- the cte-chain lesson: testing a 6.5M-V string column
@@ -1615,6 +1691,7 @@ def execute(seg, spec):
     _res = sorted(range(len(spec['eqs'])),
                   key=lambda _i: (0 if spec['eqs'][_i][2] == '=' else 1,
                                   int(seg.cols.get(spec['eqs'][_i][0], {}).get('V') or 0)))
+    _eqcc = {}            # col -> (pos, its codes there): kept when no later filter moves pos (the GROUP BY key)
     for i in _res:
         col, val, op = spec['eqs'][i]
         if i == de or i == spec.get('drive_neq') or pos.size == 0: continue
@@ -1622,8 +1699,25 @@ def execute(seg, spec):
         if code is None:
             if op == '=': pos = np.empty(0, np.int64)
             continue
-        cc = np.asarray(seg.codes_at(col, pos)).astype(np.int64)
-        pos = pos[cc != code] if op == '<>' else pos[cc == code]
+        c_e = seg.cols.get(col) or {}
+        if pos_full and c_e.get('mode') in (0, 1, 2) and seg._effective(col) is None:
+            # THE RESIDUAL THAT SCANS (2026-10-19): nothing has filtered yet (a LIKE every value passes), so this
+            # filter reads the column through its own scanners -- SearchPhrase <> '' from the e8 planes' literals
+            # -- instead of gathering codes at every row and comparing them on one thread
+            if op == '=':
+                pos = _scan_eq(seg, col, int(code), lo, hi)
+            else:
+                fl_e = np.ones(int(c_e['V']), bool)
+                fl_e[int(code)] = False
+                if c_e.get('has_null'):
+                    fl_e[-1] = False             # SQL: NULL <> x is not TRUE
+                pos = _scan_flag(seg, col, fl_e, lo, hi)
+            pos_full = False
+            continue
+        cc = np.asarray(seg.codes_at(col, pos))
+        keep9 = (cc != code) if op == '<>' else (cc == code)
+        pos = pos[keep9]
+        _eqcc[col] = (pos, cc[keep9])
     for ii, (col, vals, ineg) in enumerate(spec.get('ins', ())):
         if ii == spec.get('drive_in') or pos.size == 0:
             continue
@@ -1796,8 +1890,11 @@ def execute(seg, spec):
         for s in srcs:
             if s in kcols: continue
             c = seg.cols[s]
+            _h9 = _eqcc.get(s)
             if c['mode'] == 4:
                 kcols[s] = np.asarray(seg._seq_decode(c))[pos]
+            elif _h9 is not None and _h9[0] is pos:
+                kcols[s] = _h9[1].astype(np.int64, copy=False)   # read already by the <> (2026-10-19)
             else:
                 kcols[s] = np.asarray(seg.codes_at(s, pos)).astype(np.int64)
     keyarr = []
@@ -1816,15 +1913,39 @@ def execute(seg, spec):
                     code = _code_of(seg, c, v)
                     m &= (kcols[c] == code) if code is not None else False
             keyarr.append((k, np.where(m, kcols[k['src']], -1)))
-    comp = np.zeros(pos.size, dtype=np.int64)
-    locals_ = []
-    for _k, a in keyarr:
-        u, inv = _fact_small(a)
-        comp = comp * u.size + inv
-        locals_.append(u)
-    g, ginv = _fact_small(comp)
-    cnt = np.bincount(ginv)
-    order = np.lexsort((g, -cnt)) if spec['ordered'] else np.arange(g.size)
+    if len(keyarr) == 1:
+        # ONE KEY (2026-10-19): its factorization is the grouping -- the composite's second factorization was the
+        # same pass again, and both sorted when the key's codes spanned past 1M (_fact_counts: dense, parallel)
+        u, ginv, cnt = _fact_counts(keyarr[0][1])
+        g = np.arange(u.size, dtype=np.int64)
+    else:
+        comp = np.zeros(pos.size, dtype=np.int64)
+        locals_ = []
+        for _k, a in keyarr:
+            u, inv = _fact_small(a)
+            comp = comp * u.size + inv
+            locals_.append(u)
+        g, ginv = _fact_small(comp)
+        cnt = np.bincount(ginv)
+    K9 = None if spec['lim'] is None else spec['off'] + spec['lim']
+    if spec['ordered'] and K9 is not None and not spec.get('having') and cnt.size > 4 * K9 + 64:
+        # THE CANDIDATES ONLY (2026-10-19): ORDER BY count LIMIT k needs the groups at or above the k-th count,
+        # ties included, ordered exactly as before (count descending, then group) -- not a sort of every group
+        cmax9 = int(cnt.max())
+        if K9 <= 0:
+            kth = cmax9 + 1
+        elif cmax9 <= (1 << 24):
+            # the k-th largest count from a count of the counts: one pass, no selection worst case
+            # (np.partition over 6M mostly-tied counts: 0.97 s under Q21 with K LIKE '%')
+            hist9 = np.bincount(cnt, minlength=cmax9 + 1)
+            above9 = np.cumsum(hist9[::-1])           # groups with count >= cmax9 - j
+            kth = cmax9 - int(np.searchsorted(above9, K9))
+        else:
+            kth = np.partition(cnt, cnt.size - K9)[cnt.size - K9]
+        cand = np.flatnonzero(cnt >= kth)
+        order = cand[np.lexsort((g[cand], -cnt[cand]))]
+    else:
+        order = np.lexsort((g, -cnt)) if spec['ordered'] else np.arange(g.size)
     if spec.get('having'):
         hmask = np.ones(cnt.size, bool)
         for hkind, hcol, hop, hval in spec['having']:
@@ -1844,13 +1965,30 @@ def execute(seg, spec):
             hmask &= m
         order = order[hmask[order]]
     sel = order[spec['off']: spec['off'] + spec['lim']] if spec['lim'] is not None else order[spec['off']:]
-    first = np.empty(cnt.size, np.int64)            # first row of every group, one pass,
+    # THE LATE AGGREGATES (2026-10-19, the LIKE board): the groups the answer returns are known once the counts
+    # are; every other aggregate is computed over THEIR rows only. Q21 with a one-letter needle gathered MIN(K)'s
+    # codes for 60M survivors and folded them with ufunc.at, to keep ten groups. From here pos / ginv / G are
+    # the returned groups' rows (sel_w: each returned group's local index); rep maps back to every survivor's row.
+    G_all = cnt.size
+    rix9 = None
+    if sel.size < G_all and pos.size >= _LATE_MIN_ROWS:
+        loc9 = np.full(G_all, -1, np.int64)
+        loc9[sel] = np.arange(sel.size, dtype=np.int64)
+        lg9 = loc9[ginv]
+        rix9 = np.flatnonzero(lg9 >= 0)
+        pos = pos[rix9]; ginv = lg9[rix9]
+        sel_w = np.arange(sel.size, dtype=np.int64)
+    else:
+        sel_w = sel
+    G = int(sel.size) if rix9 is not None else G_all
+    first = np.empty(G, np.int64)                   # first row of every group, one pass,
     first[ginv[::-1]] = np.arange(pos.size - 1, -1, -1, dtype=np.int64)   # no sort: reversed
-    rep = first[sel]                                # writes -- last write is the earliest row
+    rep = first[sel_w]                              # writes -- last write is the earliest row
+    if rix9 is not None:
+        rep = rix9[rep]                             # back to rows of every survivor (the key arrays' rows)
     # ONE gather per agg column over all pos, then every group's aggregate vectorized --
     # the per-group codes_at gathers re-decompressed the frames each group's scattered
     # members touch (gs-cube: 1,165 gathers, 8,773 zstd calls for a 4-column query).
-    G = cnt.size
     _cells = {}
     _gath = {}
     def _codes_all(col):
@@ -1911,6 +2049,7 @@ def execute(seg, spec):
     rows_out = []
     for i, gi in enumerate(sel):
         r = int(rep[i]); row = []
+        gl = int(sel_w[i])                           # the group's index among the aggregates' groups
         for _pi, kind_or_key in sorted(
                 [(pi, ('agg', kind, col)) for pi, kind, col in spec['aggs']] +
                 [(pi, ('key', kk, aa)) for (pi, kk), (_x, aa) in zip(spec['keys'], keyarr)]):
@@ -1920,18 +2059,18 @@ def execute(seg, spec):
                 if kind == 'COUNT_STAR':
                     row.append(int(cnt[gi]))
                 elif kind in ('COUNT_COL', 'COUNT_D'):
-                    row.append(int(_cells[_pi][gi]))
+                    row.append(int(_cells[_pi][gl]))
                 elif kind in ('MIN_DICT', 'MAX_DICT'):
-                    k2 = int(_cells[_pi][gi])
+                    k2 = int(_cells[_pi][gl])
                     if (kind == 'MAX_DICT' and k2 < 0) or \
                             (kind == 'MIN_DICT' and k2 == np.iinfo(np.int64).max):
                         row.append(None)             # a group whose every member was null
                     else:
                         row.append(wdb_sql._pyval(seg.fetch(col, k2)))
                 elif kind in ('SUM', 'MIN', 'MAX'):
-                    row.append(int(_cells[_pi][gi]))
+                    row.append(int(_cells[_pi][gl]))
                 else:                                # AVG
-                    row.append(float(_cells[_pi][gi]) / int(cnt[gi]))
+                    row.append(float(_cells[_pi][gl]) / int(cnt[gi]))
             else:
                 _t, kk, aa = kind_or_key
                 a = int(aa[r])

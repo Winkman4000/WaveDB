@@ -48,8 +48,6 @@ def detect(seg, tree, col_map):
         return None                              # negated likes stay with wherescan
     cm = col_map or {}
     col, needle, kind = cm.get(lk[0], lk[0]), lk[1], lk[2]
-    if kind != 'contains':
-        return None
     ox = tree.args.get('order'); lx = tree.args.get('limit')
     if ox is None or lx is None or len(ox.expressions) != 1:
         return None
@@ -68,7 +66,7 @@ def detect(seg, tree, col_map):
         return None
     if not _staircase_ok(seg, ocol):
         return None
-    return {'col': col, 'needle': needle, 'ocol': ocol, 'lim': lim}
+    return {'col': col, 'needle': needle, 'kind': kind, 'ocol': ocol, 'lim': lim}
 
 
 _FIRST_WINDOW = 1 << 18   # the walk's first window of rows (Q23's 10th hit sits at row 214,125)
@@ -82,18 +80,22 @@ def execute(seg, spec):
     the whole dictionary is decided once and the walk continues on its flag."""
     global _HITS
     col, needle, k = spec['col'], spec['needle'], spec['lim']
+    kind = spec.get('kind', 'contains')
     N = int(seg.N)
     c0 = seg.cols.get(col) or {}
     nd = needle.encode() if isinstance(needle, str) else needle
     flag = None; known = None; spent = 0.0
-    if 'restarts' in c0 and len(nd) >= 1:
+    if kind == 'contains' and 'restarts' in c0 and len(nd) >= 1:
         import wdb_strings
         known = np.zeros(int(c0['V']), np.int8)        # 0 undecided, 1 matches, 2 does not
     else:
-        flag = np.asarray(WS._like_flags(seg, col, needle, 'contains'))
-        if not flag.any():
-            _HITS += 1
-            return [], [c for c in seg.cols.keys()]
+        # EVERY PATTERN FORM (2026-10-19, the LIKE board): prefix / suffix / '_' / two-part / '%' were refused
+        # at detect and fell to the general path; the dictionary's flags answer any of them -- only the plain
+        # contains has the cheaper survivors road
+        flag = np.asarray(WS._like_flags(seg, col, needle, kind))
+    if flag is not None and not flag.any():
+        _HITS += 1
+        return [], [c for c in seg.cols.keys()]
     hits = []
     lo = 0; W = _FIRST_WINDOW
     while lo < N and len(hits) < k:
@@ -110,6 +112,8 @@ def execute(seg, spec):
                     spent += bill[0]
                 else:
                     flag = np.asarray(WS._like_flags(seg, col, needle, 'contains'))
+                    if not flag.any():
+                        break                    # decided whole: no value matches, the walk can stop
         m9 = np.flatnonzero(flag[cc]) if flag is not None else np.flatnonzero(known[cc] == 1)
         if m9.size:
             hits.extend((lo + m9).tolist())

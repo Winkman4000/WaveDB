@@ -17,6 +17,14 @@ Shapes (slot 1 = 'k', slot 2 = 'd' in the records):
   q9   SELECT K, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), COUNT(DISTINCT D) FROM hits GROUP BY K
        ORDER BY c DESC LIMIT 10      (Q8 is q13's form 'open'; Q10 and Q13 its filtered form)
   q3   SELECT AVG(K) FROM hits       (one slot, every int and float column)
+  q20  SELECT COUNT(*) FROM hits WHERE K LIKE 'pat'
+  q21  SELECT SearchPhrase, MIN(K), COUNT(*) AS c FROM hits WHERE K LIKE 'pat' AND SearchPhrase <> ''
+       GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10
+  q22  Q22 with K LIKE 'pat' in Title's place;  q22n  Q22 with K NOT LIKE 'pat' in URL's place
+  q23  SELECT * FROM hits WHERE K LIKE 'pat' ORDER BY EventTime LIMIT 10
+       (the LIKE shapes: one slot, text columns only; the form is the needle class from --needles
+       (bench/like_needles.py): hot/mid/low/rare/none selectivities, one/utf8/prefix/suffix/under/twopart/all
+       pattern forms, and 'orig', the submitted pattern on the submitted column)
 A profile is a column's passport (mode, code encoding, type) plus its V class (bench/q13_profiles.py); one
 representative column stands for each profile (the original's own columns pinned), and the board runs every
 ordered pair of representatives.
@@ -61,11 +69,13 @@ ap.add_argument('--no-escalate', action='store_true', help="a hash mismatch is r
                 "running the total-order form on WaveDB (minutes when every count ties); legal_check.py decides it")
 ap.add_argument('--wait-answers', type=float, default=0.0, help="WaveDB-only: wait up to this many seconds per "
                 "query for the DuckDB pod to save its answer (a board trailing a running --engines duck)")
+ap.add_argument('--needles', default='', help="like_needles.py output: the LIKE shapes' pattern per column and class")
 A = ap.parse_args()
 sys.path.insert(0, A.src)
 import duckdb, _cbnorm as N
 from _cbvalidate import total_order_sql
 
+LIKE_FORMS = 'orig,hot,mid,low,rare,none,one,utf8,prefix,suffix,under,twopart,all'
 # submitted times: benchmark/clickbench/results/20261006/c6a.4xlarge.json, [cold, hot1, hot2] -> cold, min(hot)
 SHAPES = {
     'q13': {'orig': ('SearchPhrase', 'UserID'), 'cold': 0.766963, 'hot': 0.498798, 'forms': 'filtered'},
@@ -88,6 +98,13 @@ SHAPES = {
     'q28': {'orig': ('Referer',), 'qnum': 28, 'forms': 'filtered,open', 'text_k': True},
     'q9': {'orig': ('RegionID', 'UserID'), 'qnum': 9, 'forms': 'plain'},
     'q3': {'orig': ('UserID',), 'qnum': 3, 'forms': 'plain', 'num_k': True},
+    # THE LIKE FAMILY (2026-10-19): the form is the needle class (bench/like_needles.py --needles); 'orig' is the
+    # submitted pattern on the submitted column only
+    'q20': {'orig': ('URL',), 'qnum': 20, 'like': '%google%', 'text_k': True, 'forms': LIKE_FORMS},
+    'q21': {'orig': ('URL',), 'qnum': 21, 'like': '%google%', 'text_k': True, 'forms': LIKE_FORMS},
+    'q22': {'orig': ('Title',), 'qnum': 22, 'like': '%Google%', 'text_k': True, 'forms': LIKE_FORMS},
+    'q22n': {'orig': ('URL',), 'qnum': 22, 'like': '%.google.%', 'text_k': True, 'forms': LIKE_FORMS},
+    'q23': {'orig': ('URL',), 'qnum': 23, 'like': '%google%', 'text_k': True, 'forms': LIKE_FORMS},
 }
 SH = SHAPES[A.shape]
 if 'qnum' in SH:
@@ -149,7 +166,35 @@ def literal(col):
     return "'%s'" % str(v).replace("'", "''")
 
 
+NEEDLES = json.load(open(A.needles)) if A.needles else {}
+
+
+def pattern(k, form):
+    """the LIKE shapes' pattern for column k and needle class form (None: the data has no such needle)"""
+    if form == 'orig':
+        return SH['like'] if k == ORIG_K else None
+    d = NEEDLES.get(k, {}).get(form)
+    return d['pat'] if d else None
+
+
 def sql_of(k, d, form):
+    if 'like' in SH:
+        p = pattern(k, form).replace("'", "''")
+        if A.shape == 'q20':
+            return "SELECT COUNT(*) FROM hits WHERE %s LIKE '%s'" % (k, p)
+        if A.shape == 'q21':
+            return ("SELECT SearchPhrase, MIN(%s), COUNT(*) AS c FROM hits WHERE %s LIKE '%s' AND SearchPhrase <> '' "
+                    "GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10" % (k, k, p))
+        if A.shape == 'q22':
+            return ("SELECT SearchPhrase, MIN(URL), MIN(Title), COUNT(*) AS c, COUNT(DISTINCT UserID) FROM hits "
+                    "WHERE %s LIKE '%s' AND URL NOT LIKE '%%.google.%%' AND SearchPhrase <> '' GROUP BY SearchPhrase "
+                    "ORDER BY c DESC LIMIT 10" % (k, p))
+        if A.shape == 'q22n':
+            return ("SELECT SearchPhrase, MIN(URL), MIN(Title), COUNT(*) AS c, COUNT(DISTINCT UserID) FROM hits "
+                    "WHERE Title LIKE '%%Google%%' AND %s NOT LIKE '%s' AND SearchPhrase <> '' GROUP BY SearchPhrase "
+                    "ORDER BY c DESC LIMIT 10" % (k, p))
+        if A.shape == 'q23':
+            return "SELECT * FROM hits WHERE %s LIKE '%s' ORDER BY EventTime LIMIT 10" % (k, p)
     if A.shape == 'q16':
         return 'SELECT %s, %s, COUNT(*) FROM hits GROUP BY %s, %s ORDER BY COUNT(*) DESC LIMIT 10' % (k, d, k, d)
     if A.shape == 'q18':
@@ -397,6 +442,8 @@ forms = (A.forms or SH['forms']).split(',')
 todo = [(k, d, f) for f in forms for k, d in pairs if (k, d, f) not in done]
 if A.pairs:                                  # THE STRAIN SAMPLE: a handful per strain instead of the grid
     todo = [(x['k'], x['d'], x['form']) for x in json.load(open(A.pairs)) if (x['k'], x['d'], x['form']) not in done]
+if 'like' in SH:                             # a needle class the column's data cannot fill is not a query
+    todo = [t for t in todo if pattern(t[0], t[2]) is not None]
 say('profiles %d  representatives %d  pairs %d x forms %d  ->  %d to run (%d already done)  timeout %gs'
     % (len(P['profiles']), len(REPS), len(pairs), len(forms), len(todo), len(done), A.timeout))
 say('shape %s  submitted: cold %.3fs  hot %.3fs' % (A.shape, SUBMITTED['cold'], SUBMITTED['hot']))

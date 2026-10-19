@@ -44,6 +44,7 @@ _RANKAT = [__import__('os').environ.get('WDB_RANKAT', '1') == '1'] # A/B: 0 rest
 _CENSUS = [__import__('os').environ.get('WDB_CENSUS_DRESS', '1') == '1'] # A/B: 0 restores decode + bincount for every census
 _VALSUM = [__import__('os').environ.get('WDB_E19_VALSUM', '1') == '1']   # A/B: 0 restores SUM/AVG of enc 19 by the full census
 _SORTGATHER = [__import__('os').environ.get('WDB_SORTGATHER', '1') == '1']  # A/B: 0 restores the general frame gathers (enc 3/18)
+_MANY_AT_SHIFT = int(__import__('os').environ.get('WDB_MANY_AT_SHIFT', '5'))   # codes_at decodes whole from N >> this rows
 _I2FOLD = [__import__('os').environ.get('WDB_I2FOLD', '1') == '1']   # A/B: 0 restores the inflated spine + numpy fold for exact SUM/AVG
 _LZ = [0]                 # program: (ZSTD_decompressDCtx address, create, free, lib) or None; 0 = not yet tried
 _E19CENSUS = [__import__('os').environ.get('WDB_E19_CENSUS', '1') == '1']   # A/B: 0 restores decode + boards for shelved enc 19
@@ -3147,6 +3148,11 @@ class Segment:
             lo13 = int(rows.min()); hi13 = int(rows.max()) + 1
             band13 = self._e13_band(nm, lo13, hi13)
             return band13[rows - lo13]
+        if c.get('code_enc', 0) in (8, 9, 10) and nm not in self._codes and rows.size >= (self.N >> _MANY_AT_SHIFT):
+            # THE MANY-ROW READ (2026-10-19, the LIKE board): the point reads are for a few rows. SearchPhrase's
+            # codes at 100M rows by rank: 2,858 ms; at 13M: 438 -- the whole column decodes in ~75-150 ms and the
+            # gather is one pass (kept in _codes for the reads that follow, dropped at query end like any decode)
+            return self._raw_codes(nm)[np.asarray(rows, np.int64)]
         if c.get('code_enc', 0) == 10:
             if nm in self._codes:                    # already decoded: gather free
                 return self._codes[nm][np.asarray(rows, np.int64)]
