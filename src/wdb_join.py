@@ -207,6 +207,7 @@ def _exact_scalar(db, tree):
         return cnts[col]
     N = int(seg.N)
     seqs = {}
+    i2s = {}                                         # column -> (exact sum, rows) from the frame fold
     row = []
     for kind, col in specs:
         if kind == 'COUNT_STAR':
@@ -232,6 +233,18 @@ def _exact_scalar(db, tree):
             # last code, V - 1) -- no value table needed; _int_table on a text dict raised
             cn = counts_of(col, int(c['V']) - (1 if c.get('has_null') else 0))
             row.append(int(cn.sum())); continue
+        if kind in ('SUM', 'AVG') and (col in i2s or (WN._nline(seg, col) is None and seg.i2_foldable(col))):
+            # THE FOLD THROUGH THE DICTIONARY'S OWN FRAMES (2026-10-19): the census, then counts x values
+            # folded chunk by chunk as libzstd inflates the dictionary -- no spine built (AVG(WatchID)
+            # 855 -> ~250 ms; AVG(UserID), Q3: the spine's inflate 75 ms + block value sum 51 ms became
+            # its census 46 ms + fold 18 ms)
+            if col not in i2s:
+                cn = counts_of(col, int(c.get('n_dict', c['V'])))
+                s = seg.i2_fold_sum(col, cn)
+                i2s[col] = None if s is None else (s, int(cn.sum()))
+            if i2s[col] is not None:
+                s, n = i2s[col]
+                row.append((s if n else None) if kind == 'SUM' else XI.exact_avg(s, n)); continue
         tab = WN._int_table(seg, col)
         if kind in ('SUM', 'AVG') and col not in cnts:
             # THE SUM FROM THE BLOCK DICTIONARIES (2026-10-01): enc 19 sums block by block, exact,

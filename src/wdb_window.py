@@ -191,19 +191,27 @@ def detect(seg, tree, col_map):
             'proj': proj}
 
 
+def _nline(seg, col):
+    """The .nline sidecar of col (code -> int64 value, memory-mapped), or None -- without inflating
+    anything: the check _int_table makes first, for callers choosing a road before the table."""
+    c = seg.cols[col]
+    if '_nline' not in c:
+        import os
+        p = os.path.realpath(seg.path) + '.nline.' + col   # segments reach files through
+        c['_nline'] = np.memmap(p, dtype='<i8', mode='r').view(np.ndarray) if os.path.exists(p) else None   # symlinks; ndarray view drops subclass gather tax
+    return c['_nline']
+
+
 def _int_table(seg, col):
     """code -> int64 value, exact. A flat .nline sidecar memmaps directly when present --
     the fixed number line: file layout IS the compute layout, the OS page cache owns the
     bytes, zero per-query rebuild. The map survives drop_derived lawfully (it IS a file,
     same class as seg.buf). Else _dict_ints when the layout has it, typed-dict otherwise.
     Never float64 -- values past 2**53 lose low bits there (caught live: UserID)."""
+    nl = _nline(seg, col)
+    if nl is not None:
+        return nl
     c = seg.cols[col]
-    if '_nline' not in c:
-        import os
-        p = os.path.realpath(seg.path) + '.nline.' + col   # segments reach files through
-        c['_nline'] = np.memmap(p, dtype='<i8', mode='r').view(np.ndarray) if os.path.exists(p) else None   # symlinks; ndarray view drops subclass gather tax
-    if c['_nline'] is not None:
-        return c['_nline']
     try:
         return np.asarray(seg._dict_ints(c), dtype=np.int64)
     except Exception:

@@ -7612,3 +7612,71 @@ def e20_gather(buf, base, BR, N, bits, boff, blocks, starts, rows, out):
         _e20_block(buf, (base + boff[b]) * 8, last + 1, bits, tmp, 0)
         for i in range(starts[j], starts[j + 1]):
             out[i] = tmp[rows[i] - b * BR]
+
+
+
+# THE FOLD THROUGH THE DICTIONARY'S OWN FRAMES (2026-10-19). An exact SUM over a big integer dictionary
+# used to inflate the whole chunked spine first (WatchID: 100M values, 800 MB written, ~0.5 s) and then
+# fold counts x values in numpy on one thread (0.26 s). Here each thread asks libzstd to inflate one
+# chunk at a time into its own small board (64 KB: stays in cache), turns the chunk's deltas into
+# values and folds them against the census on the spot. No Python runs per chunk and no fresh memory
+# is touched, so the threads scale: WatchID 97 ms, HID 64, UserID 18, URLHash 19 (pod, hot).
+# libzstd is reached through its address, passed in as an argument, so the kernel stays cacheable.
+if HAVE_NUMBA:
+    from numba.extending import intrinsic as _intrinsic
+    from numba.core import types as _nbt
+
+    @_intrinsic
+    def _zcall5(typingctx, fn, a, b, c, d, e):
+        """call the C function at address fn with five 64-bit arguments, returning a 64-bit value"""
+        sig = _nbt.uint64(_nbt.uint64, _nbt.uint64, _nbt.uint64, _nbt.uint64, _nbt.uint64, _nbt.uint64)
+
+        def codegen(context, builder, signature, args):
+            from llvmlite import ir as _ir
+            i64 = _ir.IntType(64)
+            fp = builder.inttoptr(args[0], _ir.FunctionType(i64, [i64] * 5).as_pointer())
+            return builder.call(fp, list(args[1:]))
+        return sig, codegen
+
+    @njit(cache=True, parallel=True)
+    def i2_fold(zfn, src, zabs, CH, cnt, dctx, scr, outhi, outlo, err):
+        """Exact fold of counts x values over a chunked integer dictionary, straight from its frames.
+        zfn: address of ZSTD_decompressDCtx; src: address of the mapped file; zabs[j]..zabs[j+1]: chunk
+        j's frame (file offsets); each chunk inflates to <= CH int64 deltas that restart at 0, so the
+        running sum within a chunk is the value. cnt: rows per code (its length bounds the codes folded:
+        a null code past the dictionary is never counted). dctx: one decompression context per lane;
+        scr: one board per lane, rows 2*CH wide (apart: no shared lines). Per lane the sum is kept in two
+        limbs -- counts x (value >> 32) and counts x (value & 2^32-1) -- each within int64 for up to
+        ~4e9 rows (wdb_exactint). err[t] = 1 when a frame does not inflate to whole int64s within CH."""
+        P = dctx.size
+        nch = zabs.size - 1
+        M = np.int64(0xFFFFFFFF)
+        nd = cnt.size
+        W = np.uint64(scr.shape[1] * 8)
+        cap = np.uint64(CH * 8)
+        base = np.uint64(scr.ctypes.data)
+        for t in prange(P):
+            a = nch * t // P
+            b = nch * (t + 1) // P
+            hi = np.int64(0)
+            lo = np.int64(0)
+            dst = base + np.uint64(t) * W
+            row = scr[t]
+            for j in range(a, b):
+                r = _zcall5(zfn, np.uint64(dctx[t]), dst, cap, np.uint64(src) + np.uint64(zabs[j]),
+                            np.uint64(zabs[j + 1] - zabs[j]))
+                if r > cap or r % np.uint64(8) != 0:
+                    err[t] = 1
+                    break
+                m = np.int64(r // np.uint64(8))
+                k0 = np.int64(j) * CH
+                if k0 + m > nd:
+                    m = nd - k0
+                v = np.int64(0)
+                for i in range(max(m, 0)):
+                    v += row[i]
+                    c = cnt[k0 + i]
+                    hi += c * (v >> 32)
+                    lo += c * (v & M)
+            outhi[t] = hi
+            outlo[t] = lo

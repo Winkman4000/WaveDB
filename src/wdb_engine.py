@@ -44,6 +44,8 @@ _RANKAT = [__import__('os').environ.get('WDB_RANKAT', '1') == '1'] # A/B: 0 rest
 _CENSUS = [__import__('os').environ.get('WDB_CENSUS_DRESS', '1') == '1'] # A/B: 0 restores decode + bincount for every census
 _VALSUM = [__import__('os').environ.get('WDB_E19_VALSUM', '1') == '1']   # A/B: 0 restores SUM/AVG of enc 19 by the full census
 _SORTGATHER = [__import__('os').environ.get('WDB_SORTGATHER', '1') == '1']  # A/B: 0 restores the general frame gathers (enc 3/18)
+_I2FOLD = [__import__('os').environ.get('WDB_I2FOLD', '1') == '1']   # A/B: 0 restores the inflated spine + numpy fold for exact SUM/AVG
+_LZ = [0]                 # program: (ZSTD_decompressDCtx address, create, free, lib) or None; 0 = not yet tried
 _E19CENSUS = [__import__('os').environ.get('WDB_E19_CENSUS', '1') == '1']   # A/B: 0 restores decode + boards for shelved enc 19
 
 
@@ -112,6 +114,30 @@ def _gather_pool():
 
 
 _WARM = [None, None]      # program: libc handle for mincore, the cold-read pool (never data)
+
+
+def _libzstd():
+    """The machine's libzstd for compiled kernels that inflate frames themselves (wdb_kernels.i2_fold):
+    (address of ZSTD_decompressDCtx, ZSTD_createDCtx, ZSTD_freeDCtx, the library), or None when it is
+    not installed. The zstd frame format is stable, so frames written by the python binding's bundled
+    zstd inflate here byte for byte. Loaded once per process (program, never data)."""
+    if _LZ[0] == 0:
+        import ctypes as _ct
+        _LZ[0] = None
+        for nm in ('libzstd.so.1', 'libzstd.so', 'libzstd.dylib', 'libzstd.1.dylib', 'zstd.dll', 'libzstd.dll'):
+            try:
+                lib = _ct.CDLL(nm)
+                lib.ZSTD_createDCtx.restype = _ct.c_void_p
+                lib.ZSTD_createDCtx.argtypes = []
+                lib.ZSTD_freeDCtx.restype = _ct.c_size_t
+                lib.ZSTD_freeDCtx.argtypes = [_ct.c_void_p]
+                lib.ZSTD_decompressDCtx.restype = _ct.c_size_t
+                _LZ[0] = (_ct.cast(lib.ZSTD_decompressDCtx, _ct.c_void_p).value,
+                          lib.ZSTD_createDCtx, lib.ZSTD_freeDCtx, lib)
+                break
+            except (OSError, AttributeError):
+                continue
+    return _LZ[0]
 
 
 def warm_mapped(base, fd, spans):
@@ -2383,6 +2409,53 @@ class Segment:
             _WK.e19_valsum(pw, dw, BR, N, np.int64(c['e19bits']), c['e19lb'], c['e19gw'], c['e19dc'], poff,
                            c['e19doff'], tab, np.int64(tab.size), hi, lo, nn)
         return int(hi.sum()) * (1 << 32) + int(lo.sum()), int(nn.sum())
+
+    def i2_foldable(self, nm):
+        """True when i2_fold_sum can answer for column nm: a chunked integer dictionary not yet inflated
+        (inflated, fold_counts over it is the cheaper road), numba and the machine's libzstd present."""
+        c = self.cols[nm]
+        if not _I2FOLD[0] or c.get('i2ch') is None or c.get('intvals') is not None:
+            return False
+        import wdb_kernels as _WK
+        return _WK.HAVE_NUMBA and _libzstd() is not None
+
+    def i2_fold_sum(self, nm, counts):
+        """THE FOLD THROUGH THE DICTIONARY'S OWN FRAMES (2026-10-19): exact sum(counts[k] * value[k]) as a
+        Python int over column nm's chunked integer dictionary, straight from its zstd frames
+        (wdb_kernels.i2_fold) -- the 100M-value spine is never built (AVG(WatchID): inflate 0.5 s + numpy
+        fold 0.26 s became 0.1 s). counts: rows per code; only the first n_dict (the non-null codes) are
+        folded. None when not i2_foldable, or a frame fails to inflate."""
+        if not self.i2_foldable(nm):
+            return None
+        import wdb_kernels as _WK
+        c = self.cols[nm]
+        nd = int(c.get('n_dict', c['V']))
+        cnt = np.asarray(counts)
+        if cnt.size < nd:
+            return None
+        cnt = np.ascontiguousarray(cnt[:nd], dtype=np.int64)
+        zo = np.asarray(c['i2zoffs'], np.int64); base = int(c['i2base']); CH = int(c['i2ch'])
+        self.warm_span(base + int(zo[0]), base + int(zo[-1]))     # cold: parallel large reads first
+        zfn, mk, free = _libzstd()[:3]
+        P = int(_WK._nt())
+        dctx = np.zeros(P, np.uint64)
+        try:
+            for t in range(P):
+                d = mk()
+                if not d:
+                    return None
+                dctx[t] = d
+            scr = np.empty((P, 2 * CH), np.int64)
+            oh = np.zeros(P, np.int64); ol = np.zeros(P, np.int64); err = np.zeros(P, np.int64)
+            _WK.i2_fold(np.uint64(zfn), np.uint64(self.buf.ctypes.data), zo + base, np.int64(CH), cnt,
+                        dctx, scr, oh, ol, err)
+        finally:
+            for d in dctx.tolist():
+                if d:
+                    free(d)
+        if err.any():
+            return None
+        return (sum(int(x) for x in oh) << 32) + sum(int(x) for x in ol)
     def code_counts(self, nm):
         """Per-code row counts (np.bincount of the code array), cached. Length V (includes the
         null bin at V-1 when has_null). Lets COUNT(*) WHERE P(col) be summed over the dictionary
