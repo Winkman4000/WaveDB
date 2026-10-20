@@ -32,13 +32,15 @@ def _fixture():
         'v' || ((i * 104729) %% 30011)::VARCHAR || CASE WHEN i %% 5 = 0 THEN 'abc' ELSE 'xy' END AS b,
         CASE WHEN i %% 13 = 0 THEN '' ELSE 'g' || (CAST(floor(3000 * pow(((i * 6007) %% 99989) / 99989.0, 3)) AS BIGINT))::VARCHAR END AS g,
         (i * 31) %% 7001 AS u,
-        TIMESTAMP '2013-07-01 00:00:00' + INTERVAL (i) SECOND AS ts
+        TIMESTAMP '2013-07-01 00:00:00' + INTERVAL (i) SECOND AS ts,
+        CASE WHEN (i * 7) %% 10 = 0 THEN 'p' || ((i * 13) %% 500)::VARCHAR ELSE '' END AS p
         FROM range(%d) r(i)""" % N)
     d = os.path.join(tempfile.gettempdir(), 'lkg_%s' % uuid.uuid4().hex[:8]); os.makedirs(d, exist_ok=True)
     pq = os.path.join(d, 't.parquet')
     con.execute("COPY (SELECT * FROM t ORDER BY id) TO '%s' (FORMAT parquet)" % pq)
     db = Database.create(d)
-    db.cat.add_table('t', [['id', 'int'], ['s', 'str'], ['b', 'str'], ['g', 'str'], ['u', 'int'], ['ts', 'datetime']])
+    db.cat.add_table('t', [['id', 'int'], ['s', 'str'], ['b', 'str'], ['g', 'str'], ['u', 'int'], ['ts', 'datetime'],
+                           ['p', 'str']])
     # the suite runner lets toys encode as sequences (WDB_SEQ_*): this fixture is the ClickBench storage, dictionaries
     saved = {k: os.environ.pop(k, None) for k in ('WDB_SEQ_NARROW_OK', 'WDB_SEQ_REPEATS_OK')}
     try:
@@ -127,11 +129,37 @@ def test_firstk_every_form():
         assert [tuple(_norm(v) for v in x) for x in w] == [tuple(_norm(v) for v in x) for x in d], (q, w[:2], d[:2])
 
 
+def test_potency_picks_the_driver():
+    """THE POTENCY PICK: a LIKE keeping ~45% of the rows and p <> '' keeping 10% -- the <> drives (the fixed ladder
+    drove on the LIKE); a LIKE keeping few rows still drives over a <> keeping most. Same answers with the pick off."""
+    db, con, _d = _fixture()
+    q1 = ("SELECT g, MIN(s), COUNT(*) AS c FROM t WHERE s LIKE '%a%' AND p <> '' AND g <> '' GROUP BY g "
+          "ORDER BY c DESC LIMIT 10")
+    q2 = ("SELECT g, MIN(b), COUNT(*) AS c FROM t WHERE b LIKE '%v1000%' AND g <> '' GROUP BY g "
+          "ORDER BY c DESC LIMIT 10")
+    for q, want in ((q1, 'p'), (q2, 'b')):
+        WS._POT_LAST[0] = None
+        w = _rows(db.run(q))
+        assert controller._SERVED[0] == 'wherescan', (q, controller._SERVED[0])
+        best = WS._POT_LAST[0][0] if WS._POT_LAST[0] else None
+        sp = WS.detect(db.open_segment(db.cat.segment_paths('t')[0], 't'), __import__('sqlglot').parse_one(q), None)
+        kind, i = best
+        col = sp['likes'][i][0] if kind == 'like' else sp['eqs'][i][0]
+        assert col == want, (q, best, WS._POT_LAST[0])
+        _legal(q, w, con, 2)
+        WS._POTENCY[0] = False
+        try:
+            assert _rows(db.run(q)) == w, q
+        finally:
+            WS._POTENCY[0] = True
+
+
 if __name__ == '__main__':
     try:
         test_count_every_form()
         test_grouped_like_every_form_new_and_old_roads()
         test_firstk_every_form()
+        test_potency_picks_the_driver()
         print('ok')
     finally:
         if _FIX is not None:

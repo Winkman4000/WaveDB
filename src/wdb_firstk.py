@@ -70,6 +70,7 @@ def detect(seg, tree, col_map):
 
 
 _FIRST_WINDOW = 1 << 18   # the walk's first window of rows (Q23's 10th hit sits at row 214,125)
+_SCAN_SWITCH_SHIFT = 5    # the walk turns into one scan of the rest when more than N >> this rows remain to read
 
 
 def execute(seg, spec):
@@ -118,6 +119,20 @@ def execute(seg, spec):
         if m9.size:
             hits.extend((lo + m9).tolist())
         lo = hi; W = _CHUNK
+        if len(hits) < k and lo < N:
+            # THE WALK THAT WOULD NOT STOP (2026-10-19, the LIKE board): the walk pays off when the k-th hit is
+            # near. At the hit rate seen so far, past _SCAN_SWITCH_SHIFT's share of the table still to read, one
+            # scan of the rest through the column's own scanner is cheaper than window after window of point reads
+            # (SearchPhrase LIKE a phrase two rows hold: 193 windows, 2.7 s; UTMTerm, a 10 ms decode: 127, 1.0 s)
+            rate = len(hits) / float(lo)
+            need = (k - len(hits)) / rate if rate > 0 else float('inf')
+            if need > (N >> _SCAN_SWITCH_SHIFT):
+                if flag is None:
+                    flag = np.asarray(WS._like_flags(seg, col, needle, kind))
+                if flag.any():
+                    rest = np.asarray(WS._scan_flag(seg, col, flag, lo, N), np.int64)
+                    hits.extend(rest[:k - len(hits)].tolist())
+                break
     sel = np.asarray(hits[:k], np.int64)
     cols = list(seg.cols.keys())
     def _colvals(cn):

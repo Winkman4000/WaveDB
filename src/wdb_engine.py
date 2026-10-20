@@ -3255,6 +3255,11 @@ class Segment:
                 _ok = _ix < _sp.size
                 if _ok.all() and np.array_equal(_sp[_ix], rows):
                     return _scc[_ix]
+        if c.get('code_enc', 0) == 3 and 'boffs' in c and nm not in self._codes and rows.size >= (self.N >> 3):
+            # THE MANY-ROW READ, enc 3 (2026-10-19): rows this many touch every frame anyway -- the whole decode is
+            # the same inflate without the per-frame gathers (HitColor at 13M rows 72 -> 44 ms, UserAgentMinor
+            # 89 -> 49, URL 169 -> 143), and it stays for the reads that follow
+            return self._raw_codes(nm)[rows]
         if c.get('code_enc', 0) == 18 and nm not in self._codes and rows.size < (self.N >> 2):
             # PACKED FRAMES, AT ROWS: inflate each touched frame to the byte its highest row needs,
             # gather by bit arithmetic; frames in lanes when there are many

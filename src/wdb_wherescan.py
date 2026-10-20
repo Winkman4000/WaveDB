@@ -1591,9 +1591,113 @@ def _fact_small(a):
     return (uvals + amin), rank[shifted]
 
 
+_POTENCY = [__import__('os').environ.get('WDB_WS_POTENCY', '1') == '1']   # A/B: 0 restores the fixed driver ladder
+_POT_BLOCKS, _POT_BLOCK = 32, 2048   # the sample: evenly spaced blocks of neighbouring rows (frames open once)
+_POT_SWITCH = 0.5           # the potency pick replaces the ladder's driver only when it keeps under half its rows
+_POT_LAST = [None]          # (driver kind, index, keep shares) of the last pick: the boards' witness
+
+
+def _pot_sample(seg, lo, hi):
+    n = hi - lo
+    if n <= _POT_BLOCKS * _POT_BLOCK:
+        return np.arange(lo, hi, dtype=np.int64)
+    starts = lo + (np.arange(_POT_BLOCKS, dtype=np.int64) * (n - _POT_BLOCK)) // (_POT_BLOCKS - 1)
+    return (starts[:, None] + np.arange(_POT_BLOCK, dtype=np.int64)[None, :]).ravel()
+
+
+def _pot_keep(seg, col, test, sample, cc_memo):
+    """share of the sampled rows a single-column filter keeps: test(codes) -> bool per code, over the codes of
+    the sampled rows (one read of each column's sample, shared by its filters). A ranking, not an answer: the
+    sample is _POT_BLOCKS blocks of _POT_BLOCK neighbouring rows spread over the span -- a frame-coded column
+    opens _POT_BLOCKS frames, a point-read column reads 64K rows, a census would cost up to a whole decode"""
+    if col not in cc_memo:
+        cc_memo[col] = np.asarray(seg.codes_at(col, sample)).astype(np.int64)
+    cc = cc_memo[col]
+    if cc.size == 0:
+        return 0.0
+    return float(np.count_nonzero(np.asarray(test(cc), bool))) / cc.size
+
+
+def _potency_pick(seg, spec, lo, hi):
+    """THE POTENCY PICK (2026-10-19, Jackson: "a failure of the potency based system to detect that search phrase
+    filter as an option"). The driver -- the one filter that scans the span and writes positions -- was chosen by
+    a fixed ladder (an '=', else the first LIKE, then OR / scalar / IN, and a '<>' only on enc 3/18 with nothing
+    else): Q21 with a one-letter needle drove on the LIKE that keeps 80% of the rows, wrote 80M positions, then
+    the residual SearchPhrase <> '' dropped 85% of them. Every positive LIKE, '=', '<>' and IN on a dictionary
+    column is a candidate here; each one's keep share is measured (_pot_keep), and the one keeping fewest rows
+    drives when it keeps under _POT_SWITCH of the ladder's driver. The ladder's driver then runs as a residual."""
+    if not _POTENCY[0] or hi - lo < (1 << 16):
+        return spec
+    if spec.get('drive_or') is not None or spec.get('drive_sf') is not None:
+        return spec
+    cands = []          # (kind, index, column, test(codes) -> keep)
+    for i, (col, needle, kind, neg) in enumerate(spec.get('likes', [])):
+        if not neg:
+            # the whole dictionary's flags (memoized for the query): the driver reuses them, and a LIKE moved to the
+            # residuals answers from them at once. Deciding only the sampled values cost more: 4,096 random URL
+            # codes open ~4,096 front-coded chunks (192 ms), where the whole decision is the driver's own cost anyway
+            cands.append(('like', i, col,
+                          lambda cc, col=col, needle=needle, kind=kind:
+                          np.asarray(_like_flags(seg, col, needle, kind), bool)[cc]))
+    for i, (col, val, op) in enumerate(spec['eqs']):
+        c2 = seg.cols.get(col) or {}
+        if c2.get('mode') not in (0, 1, 2) or seg._effective(col) is not None:
+            continue
+        def fe(cc, col=col, val=val, op=op, c2=c2):
+            code = _code_of(seg, col, val)
+            if code is None:
+                m = np.zeros(cc.size, bool) if op == '=' else np.ones(cc.size, bool)
+            else:
+                m = (cc == int(code)) if op == '=' else (cc != int(code))
+            if op == '<>' and c2.get('has_null'):
+                m &= cc != int(c2['V']) - 1      # SQL: NULL <> x is not TRUE
+            return m
+        cands.append(('eq', i, col, fe))
+    for i, (col, vals, ineg) in enumerate(spec.get('ins', ())):
+        c2 = seg.cols.get(col) or {}
+        if ineg or c2.get('mode') not in (0, 1, 2):
+            continue
+        cands.append(('in', i, col, lambda cc, col=col, vals=vals: np.isin(cc, _in_codes(seg, col, vals))))
+    if len(cands) < 2:
+        return spec
+    cur = (('eq', spec['drive_eq']) if spec.get('drive_eq') is not None else
+           ('like', spec['drive_like']) if spec.get('drive_like') is not None else
+           ('in', spec['drive_in']) if spec.get('drive_in') is not None else
+           ('eq', spec['drive_neq']) if spec.get('drive_neq') is not None else None)
+    sample = _pot_sample(seg, lo, hi)
+    cc_memo = {}
+    shares = {}
+    for kind, i, col, test in cands:
+        try:
+            shares[(kind, i)] = _pot_keep(seg, col, test, sample, cc_memo)
+        except Exception:
+            continue
+    if not shares:
+        return spec
+    best = min(shares, key=lambda k: shares[k])
+    cur_share = shares.get(cur, 1.0) if cur is not None else 1.0
+    _POT_LAST[0] = (best, cur, {('%s%d' % k): round(v, 4) for k, v in shares.items()})
+    if best == cur or shares[best] >= _POT_SWITCH * cur_share:
+        return spec
+    spec = dict(spec)
+    for k in ('drive_eq', 'drive_like', 'drive_in', 'drive_neq'):
+        spec[k] = None
+    kind, i = best
+    if kind == 'like':
+        spec['drive_like'] = i
+    elif kind == 'in':
+        spec['drive_in'] = i
+    elif spec['eqs'][i][2] == '=':
+        spec['drive_eq'] = i
+    else:
+        spec['drive_neq'] = i
+    return spec
+
+
 def execute(seg, spec):
     global _HITS
     lo, hi = _span_rows(seg, spec['spans'])
+    spec = _potency_pick(seg, spec, lo, hi)
     likes = spec.get('likes', [])
     de, dl = spec.get('drive_eq'), spec.get('drive_like')
     # only the DRIVING like decides its whole dictionary (it scans every row); every other like is
