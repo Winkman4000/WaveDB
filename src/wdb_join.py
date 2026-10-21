@@ -16,6 +16,10 @@ import wdb_sql
 import wdb_kernels, wdb_dml, wdb_agg, wdb_fkptr, wdb_exprjit, wdb_radix
 import wdb_groupexists
 import wdb_measure_runtime as RT
+_FUSE_POT = [os.environ.get('WDB_FUSE_POTENCY', '1') == '1']   # A/B: 0 restores census-or-0.5 conjunct scores
+_POT9_MIN_ROWS = 1 << 20  # measured only when the 64K-row sample is <= 1/16 of the rows the pred reads
+_POT9_LAST = [[]]        # (conjunct, prune, cost, how) of the last ordered WHERE: the witness
+_POT9_ROWS = [None]      # ...and how many rows its pred was to see
 
 _CMP = {E.EQ: '==', E.NEQ: '!=', E.GT: '>', E.LT: '<', E.GTE: '>=', E.LTE: '<='}
 
@@ -5972,26 +5976,178 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 if isinstance(n, E.And):
                     return _flat9(n.this) + _flat9(n.expression)
                 return [n]
+            # THE SHARED MEASUREMENT (2026-10-21; the potency pick's sample, wdb_wherescan._potency_pick, carried
+            # to the fused engine). Text conjuncts were a flat guess of 0.5 here even where the cascade, one step
+            # earlier, had judged them exactly (TPC-H Q5's r_name = 'ASIA' keeps 20%, Q7's nation IN 8%, Q21's
+            # SAUDI ARABIA 4%), and a conjunct over two columns (l_shipdate < l_commitdate, Q7's OR) was measured
+            # by no one. Now every conjunct's keep share is measured:
+            #   - ONE column, the whole fact table (the cascade did not run): EXACT from the census -- the rows of
+            #     the values the conjunct keeps over all rows; a text column through its code LUT;
+            #   - otherwise the rows the pred will actually see -- the cascade's survivors when it ran, else the
+            #     fact table -- sampled as wherescan samples (32 blocks of 2,048 neighbouring rows), every column
+            #     read on those rows (a parent's through its pointer), the conjunct evaluated there. At survivor
+            #     scale a conjunct the cascade already served keeps 100% and so fires last.
+            # WDB_FUSE_POTENCY=0 restores the census-or-0.5 score; _POT9_LAST is the witness.
+            _potc9 = {}
+            def _pot_rows9():
+                if 'rows' not in _potc9:
+                    import wdb_wherescan as _WS9
+                    nf9 = int(rows9.size) if rows9 is not None else int(seg_of[fact].N)
+                    _POT9_ROWS[0] = nf9
+                    if nf9 < _POT9_MIN_ROWS:
+                        # JACKSON'S RUNNING RULE on the measurement itself: the sample must be a small share of
+                        # what the pred reads, or measuring costs what any order could save (TPC-H SF10 Q19:
+                        # 77K survivors, a 65K-row sample over 30 leaves, +20 ms to order a pred of ~2 ms)
+                        _potc9['rows'] = np.empty(0, np.int64)
+                    else:
+                        pos9 = _WS9._pot_sample(None, 0, nf9)
+                        _potc9['rows'] = np.asarray(rows9)[pos9] if rows9 is not None else pos9
+                return _potc9['rows']
+            def _vb_ok9(nd, vb, cs9, cp9):
+                # one dictionary value against a single-text-column conjunct (the LUT road's own judge)
+                if isinstance(nd, E.Paren): return _vb_ok9(nd.this, vb, cs9, cp9)
+                if isinstance(nd, E.Or): return _vb_ok9(nd.this, vb, cs9, cp9) or _vb_ok9(nd.expression, vb, cs9, cp9)
+                if isinstance(nd, E.And): return _vb_ok9(nd.this, vb, cs9, cp9) and _vb_ok9(nd.expression, vb, cs9, cp9)
+                if isinstance(nd, E.Not): return not _vb_ok9(nd.this, vb, cs9, cp9)
+                if isinstance(nd, (E.EQ, E.NEQ)) and isinstance(nd.this, E.Column) and _is_lit(nd.expression):
+                    r9 = vb == _lit_bytes(cs9, cp9, nd.expression)
+                    return r9 if isinstance(nd, E.EQ) else (not r9)
+                if isinstance(nd, E.In) and isinstance(nd.this, E.Column) and nd.args.get('query') is None \
+                        and nd.expressions and all(_is_lit(x) for x in nd.expressions):
+                    return vb in [_lit_bytes(cs9, cp9, x) for x in nd.expressions]
+                if isinstance(nd, (E.Like, E.ILike)) and isinstance(nd.this, E.Column) \
+                        and isinstance(nd.expression, E.Literal) and nd.expression.is_string:
+                    r9 = _like_fn(cs9, cp9, nd.expression, isinstance(nd, E.ILike))(vb)
+                    return (not r9) if nd.args.get('negate') else r9
+                raise _FastUnsupported
+            def _leaf_lut9(nd, cs9, cp9):
+                # keep[code] for a conjunct on ONE column, over the whole dictionary (NULL bin False); None = unjudged
+                k9 = ('lut', id(cs9), cp9, nd.sql())
+                if k9 not in _potc9:
+                    c9 = cs9.cols.get(cp9) or {}
+                    V9 = int(c9.get('V') or 0)
+                    lut9 = None
+                    if c9.get('dt') == 1 and c9.get('mode') != 4 and cs9._overrides(cp9) is None and V9:
+                        # text: every value-identity dictionary the LUT road serves, the tiny inline (mode-5)
+                        # dimension included (nation names); its codes are _str_codes' own
+                        try:
+                            sc9 = _str_codes(cs9, cp9) if RT.code_lut_fits(V9) else None
+                        except _FastUnsupported:
+                            sc9 = None
+                        if sc9 is not None:
+                            n9 = max(max(sc9[1].values(), default=-1), sc9[2] if sc9[2] is not None else -1) + 1
+                            lut9 = np.zeros(max(V9, n9), bool)
+                            for vb9, cd9 in sc9[1].items():
+                                if _vb_ok9(nd, vb9, cs9, cp9): lut9[cd9] = True
+                            _potc9[('codes', id(cs9), cp9)] = sc9[0]
+                    elif c9.get('mode') in (0, 1, 2) and cs9._overrides(cp9) is None and V9:
+                        td9 = np.asarray(cs9._typed_dict(cp9))
+                        if td9.dtype.kind in 'iuf' and len(td9):
+                            kp9 = _dict_keep(nd, cs9, cp9, td9)
+                            if kp9 is not None:
+                                lut9 = np.zeros(max(V9, len(kp9)), bool)
+                                lut9[:len(kp9)] = np.asarray(kp9, bool)
+                    if lut9 is not None and c9.get('has_null') and c9.get('mode') in (0, 1, 2):
+                        lut9[V9 - 1] = False                 # NULL op x is never true
+                    _potc9[k9] = lut9
+                return _potc9[k9]
+            def _rows_of9(cptr9, fr9):
+                # the column's own rows under the sampled fact rows, and which fact rows have one
+                if cptr9 is None: return fr9, None
+                dr9 = np.asarray(cptr9)[fr9]
+                ok9 = dr9 >= 0
+                return (dr9, None) if ok9.all() else (np.where(ok9, dr9, 0), ok9)
+            def _vals_at9(col9, fr9):
+                cs9, cp9, cptr9 = resolve(col9)
+                c9 = cs9.cols.get(cp9) or {}
+                if c9.get('dt') == 1: raise _FastUnsupported          # text vs text: unjudged
+                dr9, ok9 = _rows_of9(cptr9, fr9)
+                if c9.get('mode') in (0, 1, 2) and cs9._overrides(cp9) is None:
+                    td9 = np.asarray(cs9._typed_dict(cp9))
+                    cd9 = np.asarray(cs9.codes_at(cp9, dr9)).astype(np.int64)
+                    nul9 = cd9 >= len(td9)
+                    if c9.get('has_null'): nul9 |= cd9 == int(c9['V']) - 1
+                    v9 = td9[np.minimum(cd9, len(td9) - 1)]
+                else:
+                    kc9 = (id(cs9), cp9)
+                    if kc9 not in _colmemo: _colmemo[kc9] = wdb_sql._col(cs9, cp9)
+                    a9, m9 = _colmemo[kc9]
+                    v9 = np.asarray(a9)[dr9]
+                    nul9 = np.asarray(m9)[dr9] if m9 is not None else np.zeros(dr9.size, bool)
+                if getattr(v9, 'dtype', None) is not None and v9.dtype.kind == 'M': v9 = v9.view('int64')
+                if ok9 is not None: nul9 = nul9 | ~ok9
+                return v9, nul9
+            def _ev_rows9(nd, fr9):
+                # the conjunct's truth on the sampled fact rows (a ranking, not an answer)
+                if isinstance(nd, E.Paren): return _ev_rows9(nd.this, fr9)
+                if isinstance(nd, E.And): return _ev_rows9(nd.this, fr9) & _ev_rows9(nd.expression, fr9)
+                if isinstance(nd, E.Or): return _ev_rows9(nd.this, fr9) | _ev_rows9(nd.expression, fr9)
+                if isinstance(nd, E.Not): return ~_ev_rows9(nd.this, fr9)
+                cols9 = list(nd.find_all(E.Column))
+                if cols9 and len({(c.table, c.name) for c in cols9}) == 1:
+                    cs9, cp9, cptr9 = resolve(cols9[0])
+                    lut9 = _leaf_lut9(nd, cs9, cp9)
+                    if lut9 is None: raise _FastUnsupported
+                    ks9 = ('scod', id(cs9), cp9, id(cptr9) if cptr9 is not None else None)
+                    if ks9 not in _potc9:                             # one read per column (and pointer)
+                        dr9, ok9 = _rows_of9(cptr9, fr9)
+                        fc9 = _potc9.get(('codes', id(cs9), cp9))    # a text column: _str_codes' own codes
+                        cd9 = (np.asarray(fc9)[dr9] if fc9 is not None
+                               else np.asarray(cs9.codes_at(cp9, dr9))).astype(np.int64)
+                        _potc9[ks9] = (cd9, ok9)
+                    cd9, ok9 = _potc9[ks9]
+                    m9 = lut9[np.clip(cd9, 0, lut9.size - 1)] & (cd9 >= 0) & (cd9 < lut9.size)
+                    return m9 if ok9 is None else (m9 & ok9)
+                if type(nd) in _OPS and isinstance(nd.this, E.Column) and isinstance(nd.expression, E.Column):
+                    for c9 in (nd.this, nd.expression):
+                        kv9 = ('sval', c9.table, c9.name)
+                        if kv9 not in _potc9: _potc9[kv9] = _vals_at9(c9, fr9)
+                    a9, an9 = _potc9[('sval', nd.this.table, nd.this.name)]
+                    b9, bn9 = _potc9[('sval', nd.expression.table, nd.expression.name)]
+                    return np.asarray(_OPS[type(nd)](a9, b9), bool) & ~an9 & ~bn9
+                raise _FastUnsupported
             def _potency9(n):
-                cost = 1.0; prune = 0.5
+                cost = 1.0; prune = 0.5; how9 = 'default'
                 try:
                     cols9 = list(n.find_all(E.Column))
                     if any(resolve(c)[2] is not None for c in cols9):
                         cost = 6.0
                     if wdb_groupexists.is_mark(n):    # the verdict's keep fraction is known exactly
                         return (1.0 - wdb_groupexists.lookup(n)[2]) / cost
-                    if len(cols9) == 1:
-                        cs9, cp9, _ = resolve(cols9[0])
-                        td9 = np.asarray(cs9._typed_dict(cp9))
-                        if td9.dtype.kind in 'iuf' and len(td9):
-                            keep9 = _dict_keep(n, cs9, cp9, td9)
-                            if keep9 is not None:
-                                cc9 = np.asarray(cs9.code_counts(cp9))[:len(keep9)]
+                    if not _FUSE_POT[0]:
+                        if len(cols9) == 1:
+                            cs9, cp9, _ = resolve(cols9[0])
+                            td9 = np.asarray(cs9._typed_dict(cp9))
+                            if td9.dtype.kind in 'iuf' and len(td9):
+                                keep9 = _dict_keep(n, cs9, cp9, td9)
+                                if keep9 is not None:
+                                    cc9 = np.asarray(cs9.code_counts(cp9))[:len(keep9)]
+                                    t9 = cc9.sum()
+                                    if t9:
+                                        prune = 1.0 - float(cc9[keep9].sum()) / t9; how9 = 'census'
+                    else:
+                        if (cols9 and rows9 is None and len({(c.table, c.name) for c in cols9}) == 1
+                                and not (isinstance(n, E.In) and n.args.get('query') is not None)):
+                            cs9, cp9, _ = resolve(cols9[0])
+                            lut9 = (_leaf_lut9(n, cs9, cp9)
+                                    if (cs9.cols.get(cp9) or {}).get('mode') in (0, 1, 2) else None)
+                            if lut9 is not None:
+                                cc9 = np.asarray(cs9.code_counts(cp9))
+                                cc9 = cc9[:lut9.size]
                                 t9 = cc9.sum()
                                 if t9:
-                                    prune = 1.0 - float(cc9[keep9].sum()) / t9
+                                    prune = 1.0 - float(cc9[lut9[:cc9.size]].sum()) / t9; how9 = 'census'
+                        if how9 == 'default' and cols9 and n.find(E.Select) is None:
+                            try:
+                                fr9 = _pot_rows9()
+                                if fr9.size:
+                                    prune = 1.0 - float(np.count_nonzero(_ev_rows9(n, fr9))) / fr9.size
+                                    how9 = 'sample'
+                            except _FastUnsupported:
+                                pass
                 except Exception:
                     pass
+                _POT9_LAST[0].append((n.sql()[:120], round(prune, 4), cost, how9))
                 return prune / cost
             conj9 = _flat9(where.this)
             if _resid_c9X is not None:
@@ -5999,6 +6155,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             if _plane_mask9 is not None and not conj9:
                 pred_body = None
             elif len(conj9) > 1:
+                _POT9_LAST[0] = []; _POT9_ROWS[0] = None
                 scored9 = [(_potency9(cn), build_pred(cn)) for cn in conj9]
                 scored9.sort(key=lambda x: -x[0])
                 pred_body = tuple(p for _, p in scored9)   # ordered conjuncts: the law rides to the codegen
