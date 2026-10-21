@@ -133,9 +133,13 @@ def _walk(seg, spec, need):
         return [], N
     hits = []
     lo = 0; W = _FIRST_WINDOW
+    stream = c0.get('code_enc', 0) == 1          # one zstd stream: reading on IS the scan, and it can stop early
     while lo < N and len(hits) < need:
         hi = min(N, lo + W)
-        cc = np.asarray(seg.codes_at(col, np.arange(lo, hi, dtype=np.int64)), np.int64)
+        if stream:
+            cc = seg.codes_head(col, hi)[lo:hi]              # the stream's own width: no widening copy
+        else:
+            cc = np.asarray(seg.codes_at(col, np.arange(lo, hi, dtype=np.int64)), np.int64)
         if flag is None:
             # THE ORDER IS THE FILTER (Jackson: the cheap filter before the expensive read): the LIKE is decided
             # only for the codes the walk meets; once the walk's running bill would pass the whole dictionary's,
@@ -155,11 +159,13 @@ def _walk(seg, spec, need):
         m9 = np.flatnonzero(flag[cc]) if flag is not None else np.flatnonzero(known[cc] == 1)
         if m9.size:
             hits.extend((lo + m9).tolist())
-        lo = hi; W = _CHUNK
-        if len(hits) < need and lo < N:
+        lo = hi; W = _CHUNK if not stream else min(4 * W, N)
+        if len(hits) < need and lo < N and not stream:
             # THE WALK THAT WOULD NOT STOP (2026-10-19, the LIKE board): at the hit rate seen so far, past
             # _SCAN_SWITCH_SHIFT's share of the table still to read, one scan of the rest through the column's own
-            # scanner is cheaper than window after window of point reads
+            # scanner is cheaper than window after window of point reads. NOT on a single stream (enc 1, 2026-10-21):
+            # there the scan inflates the whole stream from row 0 while the walk reads on and stops at the k-th hit
+            # (IsOldCounter's 10th kept row is at 7.4M of 100M: 94 -> ~10 ms)
             rate = len(hits) / float(lo)
             left = (need - len(hits)) / rate if rate > 0 else float('inf')
             if left > (N >> _SCAN_SWITCH_SHIFT):

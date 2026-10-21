@@ -37,6 +37,7 @@ _SEG_KEEP = _SEG_PROGRAM | _SEG_TIER1          # (the witness reads seg_keep()/c
 _POOL = None
 
 
+_ZLANES = [__import__('os').environ.get('WDB_ZLANES', '1') == '1']   # A/B: 0 = enc-3/18 decodes in the thread pool
 _PIPE3 = [__import__('os').environ.get('WDB_PIPE3', '1') == '1']   # A/B: 0 restores read-all-then-decode for enc-3
 _PIPE19 = [__import__('os').environ.get('WDB_PIPE19', '1') == '1'] # A/B: 0 restores warm_span-then-decode for enc 19
 _FWR = [__import__('os').environ.get('WDB_FW', '1') == '1']        # A/B: 0 restores the general-width readers (wdb_fw)
@@ -581,6 +582,7 @@ class Segment:
         sidecar loads (presence, override, cluster, cube: they lazy-reload on next touch).
         The memmap stays: it IS the file. cols/order/synth stay: file-shape metadata."""
         self._codes.clear(); self._resident.clear()
+        self.__dict__.pop('_e1pre', None)             # enc-1 prefixes read this query
         # THE SHELF: a decoded dictionary is V-scale vocabulary, not N-scale residue --
         # it survives the flush only while the process-wide shelf keeps it (byte
         # ceiling, LRU). Anything the shelf evicted is dropped here too.
@@ -1368,6 +1370,93 @@ class Segment:
                 list(ex.map(_lane, range(T)))
         return cc
 
+    def _e1_prefix(self, nm, c, need, wdt):
+        """enc 1: the stream's first `need` bytes as codes, read on from where this query's last read stopped"""
+        import zstandard as _z1, io as _io1
+        pre = self.__dict__.setdefault('_e1pre', {})
+        st = pre.get(nm)
+        if st is None:
+            rd = _z1.ZstdDecompressor().stream_reader(
+                _io1.BytesIO(memoryview(self.buf)[c['cstart']:c['cstart'] + c['czlen']]))
+            # the whole column's bytes, reserved (untouched pages cost nothing) and filled as the stream is read
+            st = pre[nm] = [rd, np.empty(int(self.N) * np.dtype(wdt).itemsize, np.uint8), 0]
+        rd, arr, fill = st
+        if fill < need:
+            want = min(arr.size, max(need, 2 * fill))         # read ahead: a walk's next window is near
+            mv = memoryview(arr)
+            while fill < want:
+                k = rd.readinto(mv[fill:want])
+                if not k:
+                    break
+                fill += k
+            st[2] = fill
+        return arr[:need].view(wdt)
+
+    def codes_head(self, nm, hi):
+        """the codes of rows [0, hi): an enc-1 stream's prefix (read on, never re-read) as is, else codes_at"""
+        c = self.cols[nm]
+        if c.get('code_enc', 0) == 1 and nm not in self._codes:
+            wdt1 = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
+            if hi * 2 <= int(self.N):
+                return self._e1_prefix(nm, c, hi * np.dtype(wdt1).itemsize, wdt1)
+        return np.asarray(self.codes_at(nm, np.arange(0, hi, dtype=np.int64)))
+
+    def _e3_compiled(self, c):
+        """enc 3, whole column, in compiled lanes (wdb_kernels.z3_frames); None when libzstd is absent, the span
+        is not resident (cold: the pipelined read+inflate overlaps the storage), or a frame fails to inflate"""
+        lz = _libzstd()
+        if lz is None or not _ZLANES[0]:
+            return None
+        wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
+        base = int(c['cstart']); bo = np.asarray(c['boffs'], np.int64)
+        if self._resident_share(base + int(bo[0]), base + int(bo[-1])) < 0.9:
+            return None
+        import wdb_kernels as _WK
+        cc = np.empty(self.N, dtype=wdt)
+        isz = np.dtype(wdt).itemsize
+        ok = self._zlanes(lambda zfn, dctx, err: _WK.z3_frames(
+            np.uint64(zfn), np.uint64(self.buf.ctypes.data), bo + base, dctx, np.uint64(cc.ctypes.data),
+            np.uint64(int(c['BR']) * isz), np.uint64(int(self.N) * isz), err))
+        return cc if ok else None
+
+    def _e18_compiled(self, c):
+        """enc 18, whole column, in compiled lanes (wdb_kernels.z18_frames); None as for _e3_compiled"""
+        lz = _libzstd()
+        if lz is None or not _ZLANES[0]:
+            return None
+        base = int(c['cstart']); po = np.asarray(c['poffs'], np.int64)
+        if self._resident_share(base + int(po[0]), base + int(po[-1])) < 0.9:
+            return None
+        import wdb_kernels as _WK
+        BR = int(c['BR']); bits = int(c['pbits'])
+        cc = np.empty(self.N, dtype=self._pk18_dtype(c))
+        P = int(_WK._nt())
+        scr = np.zeros((P, (BR * bits + 63) // 64 + 4), np.uint64)
+        ok = self._zlanes(lambda zfn, dctx, err: _WK.z18_frames(
+            np.uint64(zfn), np.uint64(self.buf.ctypes.data), po + base, dctx, scr, np.int64(bits),
+            np.int64(BR), np.int64(self.N), cc, err), P)
+        return cc if ok else None
+
+    def _zlanes(self, run, P=None):
+        """one zstd decompression context per lane around a compiled frame kernel; False on any frame error"""
+        import wdb_kernels as _WK
+        zfn, mk, free = _libzstd()[:3]
+        P = int(P or _WK._nt())
+        dctx = np.zeros(P, np.uint64)
+        err = np.zeros(P, np.int64)
+        try:
+            for t in range(P):
+                d = mk()
+                if not d:
+                    return False
+                dctx[t] = d
+            run(zfn, dctx, err)
+        finally:
+            for d in dctx.tolist():
+                if d:
+                    free(d)
+        return not err.any()
+
     def _resident_share(self, fb, fe):
         """share of the pages of [fb, fe) already in memory (mincore); -1 when it cannot tell"""
         import ctypes as _ct
@@ -1574,8 +1663,17 @@ class Segment:
                 cc[rem_idx] = tail
             self._codes[nm] = cc; return cc
         if c.get('code_enc', 0) == 1:                # zstd of byte-aligned codes (clustered/skewed)
-            raw = self._dz.decompress(self.buf[c['cstart']:c['cstart']+c['czlen']].tobytes())
             wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
+            # THE STREAM INTO ITS PLACE (2026-10-21): the one-shot decompress of a copy of the frame took 66 ms for
+            # IsOldCounter's 100M bytes; the stream read straight into the column's reserved array takes 8-11 (the
+            # same bytes, checked equal). A walk from the top that already read a prefix is read on from there.
+            isz1 = np.dtype(wdt).itemsize
+            self._e1_prefix(nm, c, int(self.N) * isz1, wdt)
+            st1 = self.__dict__.get('_e1pre', {}).pop(nm, None)
+            if st1 is not None and st1[2] == st1[1].size:
+                cc = st1[1].view(wdt)
+                self._codes[nm] = cc; return cc
+            raw = self._dz.decompress(self.buf[c['cstart']:c['cstart']+c['czlen']].tobytes())
             cc = np.frombuffer(raw, dtype=wdt)       # native width (was upcast to int64)
             self._codes[nm] = cc; return cc
         if c.get('code_enc', 0) == 17:               # RAW PACKED: one parallel unpack
@@ -1682,6 +1780,10 @@ class Segment:
                 _WK19.e19_decode(pw, dw, np.int64(c['e19BR']), np.int64(self.N), np.int64(c['e19bits']),
                                  c['e19lb'], c['e19gw'], c['e19dc'], c['e19poff'], c['e19doff'], cc)
             self._codes[nm] = cc; return cc
+        if c.get('code_enc', 0) == 3 and 'boffs' in c and c['mode'] not in (3, 4, 5, 6):
+            cc = self._e3_compiled(c)                # resident: compiled lanes (cold: the pipelined read below)
+            if cc is not None:
+                self._codes[nm] = cc; return cc
         if _pipe3:
             cc = self._e3_pipelined(c)
             self._codes[nm] = cc; return cc
@@ -1706,6 +1808,9 @@ class Segment:
                 _span(0, 1)
             self._codes[nm] = cc; return cc
         if c.get('code_enc', 0) == 18:               # PACKED FRAMES: inflate + unpack, fourteen lanes
+            cc = self._e18_compiled(c)               # resident: compiled lanes
+            if cc is not None:
+                self._codes[nm] = cc; return cc
             cc = np.empty(self.N, dtype=self._pk18_dtype(c))
             BR = c['BR']; nb = int(c['poffs'].size) - 1
             import wdb_kernels as _WK18
@@ -2890,6 +2995,31 @@ class Segment:
             if d < T:
                 out[d] += int(self.N) - n
             return out
+        if (c.get('code_enc', 0) == 3 and 'boffs' in c and nm not in self._codes and T <= (1 << 16)
+                and c['mode'] not in (3, 4, 5, 6) and _ZLANES[0] and _libzstd() is not None):
+            # enc 3: each frame inflates into its lane's board and is counted there (no 100M-code array)
+            base3 = int(c['cstart']); bo3 = np.asarray(c['boffs'], np.int64)
+            if self._resident_share(base3 + int(bo3[0]), base3 + int(bo3[-1])) >= 0.9:
+                isz3 = int(c['cwidth']); P3 = int(_WK._nt())
+                rowb3 = int(c['BR']) * isz3
+                scr3 = np.empty((P3, rowb3), np.uint8)
+                cnt3 = np.zeros((P3, T), np.int64)
+                ok3 = self._zlanes(lambda zfn, dctx, err: _WK.z3_low_count(
+                    np.uint64(zfn), np.uint64(self.buf.ctypes.data), bo3 + base3, dctx, scr3, np.int64(isz3),
+                    np.uint64(rowb3), np.uint64(int(self.N) * isz3), np.int64(T), cnt3, err), P3)
+                if ok3:
+                    return cnt3.sum(axis=0)
+        if c.get('code_enc', 0) == 20 and nm not in self._codes and T <= (1 << 16):
+            # the back-reference decodes block by block in each lane's board and counts there: no 100M-code array;
+            # a back-reference walk waits on memory latency, so it runs on every vCPU (run_wide), not the engine's
+            # 8-thread cap for bandwidth-bound boards (RefererHash: 101 -> ~60 ms)
+            P = int(_WK.wide_threads())
+            scr = np.empty((P, int(c['e20BR'])), np.int64)
+            cnt = np.zeros((P, T), np.int64)
+            _WK.run_wide(_WK.e20_low_count, np.frombuffer(self.buf, np.uint8), np.int64(c['cstart']),
+                         np.int64(c['e20BR']), np.int64(self.N), np.int64(c['e20bits']), c['e20boff'], np.int64(T),
+                         scr, cnt)
+            return cnt.sum(axis=0)
         codes = np.ascontiguousarray(np.asarray(self._raw_codes(nm)))
         return _WK.low_count(codes, np.int64(T), np.int64(16))
 
@@ -3233,18 +3363,19 @@ class Segment:
             _WK.bp0_gather(np.frombuffer(self.buf, np.uint8), int(c['cstart']),
                            int(c['bits']), rows0, out0)
             return out0
-        if c.get('code_enc', 0) == 1 and nm not in self._codes and rows.size <= 65536:
+        if c.get('code_enc', 0) == 1 and nm not in self._codes:
             # ONE FRAME, READ TO THE LAST ROW ASKED: enc-1 is a single zstd frame, and a point read
             # inflated all 100M codes (ParamPrice: 87 ms for ten rows). zstd streams, so the prefix
-            # up to the highest row is what is inflated -- the first ten hits of a scan are early rows
-            import zstandard as _z1, io as _io1
+            # up to the highest row is what is inflated -- the first ten hits of a scan are early rows.
+            # THE PREFIX KEPT (2026-10-21): a walk from the top asks window after window (firstk: 262K rows, then
+            # 512K at a time) -- each used to re-inflate from row 0, and any window past 64K rows inflated all
+            # 100M (IsOldCounter's walk to its 10th kept row at 7.4M: 60 ms -> ~6). The stream stays open for the
+            # query and is read on; past half the column the whole decode is as cheap, and is taken.
             wdt1 = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
             isz1 = np.dtype(wdt1).itemsize
             need1 = (int(rows.max()) + 1) * isz1
             if need1 * 2 <= int(self.N) * isz1:
-                raw1 = np.frombuffer(_z1.ZstdDecompressor().stream_reader(
-                    _io1.BytesIO(memoryview(self.buf)[c['cstart']:c['cstart'] + c['czlen']])).read(need1), dtype=wdt1)
-                return raw1[rows]
+                return self._e1_prefix(nm, c, need1, wdt1)[rows]
         _sc = self.__dict__.get('_scan_codes')
         if _sc is not None and nm in _sc and c.get('code_enc', 0) in (3, 18, 19) and nm not in self._codes:
             # THE SCANNED CODES: a frame scan on this column kept its codes at the hit positions; a

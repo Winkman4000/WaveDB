@@ -90,10 +90,19 @@ _HEAD = 1 << 18           # the head window: rows read from the top of the file 
 
 
 def _head_first(seg, col, code, need):
-    """need, when the file's first window alone holds `need` rows of `code`; else None"""
+    """need, when the file's first window alone holds `need` rows of `code`; else None. On a single zstd stream
+    (enc 1) the window grows x4 while it is under half the column: the stream is read on, never re-read, and
+    past half the whole decode is the same price (IsOldCounter <> 0: its 10th row sits at 7.4M of 100M)"""
     N = int(seg.N)
-    hc = np.asarray(seg.codes_at(col, np.arange(0, min(N, _HEAD), dtype=np.int64)), np.int64)
-    return need if int(np.count_nonzero(hc == code)) >= need else None
+    hi = min(N, _HEAD)
+    grow = seg.cols[col].get('code_enc') == 1
+    while True:
+        hc = seg.codes_head(col, hi)
+        if int(np.count_nonzero(hc == code)) >= need:
+            return need
+        if not grow or hi >= N or hi * 4 * 2 > N:
+            return None
+        hi *= 4
 
 
 def _counts_run(seg, col, lo, hi):

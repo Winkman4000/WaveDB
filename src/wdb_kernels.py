@@ -7615,6 +7615,27 @@ def e20_gather(buf, base, BR, N, bits, boff, blocks, starts, rows, out):
 
 
 
+@njit(cache=True, parallel=True, nogil=True)
+def e20_low_count(buf, base, BR, N, bits, boff, T, scr, cnt):
+    """THE LOW COUNT THROUGH THE BACK-REFERENCE (2026-10-21, Q25's last 2x): rows per code for codes 0..T-1 of an
+    enc-20 column without writing its 100M codes -- each lane decodes its blocks into its own board (scr[t], one
+    block: stays in cache) and counts there. The full decode's 400 MB of fresh pages were half its time
+    (RefererHash: e20_decode 105 ms + low_count 12). cnt: (lanes, T)."""
+    nb = boff.size - 1
+    P = scr.shape[0]
+    for t in prange(P):
+        a = nb * t // P
+        b = nb * (t + 1) // P
+        row = scr[t]
+        for blk in range(a, b):
+            n = min(BR, N - blk * BR)
+            _e20_block(buf, (base + boff[blk]) * 8, n, bits, row, 0)
+            for i in range(n):
+                v = row[i]
+                if v < T:
+                    cnt[t, v] += 1
+
+
 # THE FOLD THROUGH THE DICTIONARY'S OWN FRAMES (2026-10-19). An exact SUM over a big integer dictionary
 # used to inflate the whole chunked spine first (WatchID: 100M values, 800 MB written, ~0.5 s) and then
 # fold counts x values in numpy on one thread (0.26 s). Here each thread asks libzstd to inflate one
@@ -7680,6 +7701,112 @@ if HAVE_NUMBA:
                     lo += c * (v & M)
             outhi[t] = hi
             outlo[t] = lo
+
+
+# THE FRAME DECODE IN COMPILED LANES (2026-10-21, the Q25 board's last 2x): an enc-3 / enc-18 full decode ran its
+# frames through a Python thread pool -- one zstd call, one tobytes copy, one numpy slice per frame under the GIL:
+# UTMSource's 1,527 frames used 1.7 cores (127 ms wall, 219 ms CPU), ClientEventTime's 3.4. Here each lane asks
+# libzstd (through its address, as i2_fold) to inflate its own stretch of frames: enc 3 straight into the output's
+# bytes, enc 18 into the lane's board, unpacked on the spot. No Python runs per frame.
+if HAVE_NUMBA:
+    @njit(cache=True, parallel=True)
+    def z3_frames(zfn, src, zabs, dctx, dst, rowb, totb, err):
+        """enc 3: frame j (file bytes zabs[j]..zabs[j+1], absolute) inflates into dst + j*rowb, exactly
+        min(rowb, totb - j*rowb) bytes; err[t] = 1 when a frame inflates to any other size"""
+        P = dctx.size
+        nf = zabs.size - 1
+        for t in prange(P):
+            a = nf * t // P
+            b = nf * (t + 1) // P
+            for j in range(a, b):
+                off = np.uint64(j) * rowb
+                cap = rowb
+                if off + rowb > totb:
+                    cap = totb - off
+                r = _zcall5(zfn, np.uint64(dctx[t]), dst + off, cap, src + np.uint64(zabs[j]),
+                            np.uint64(zabs[j + 1] - zabs[j]))
+                if r != cap:
+                    err[t] = 1
+                    break
+
+    @njit(cache=True, parallel=True)
+    def z3_low_count(zfn, src, zabs, dctx, scr, isz, rowb, totb, T, cnt, err):
+        """enc 3: rows per code for codes 0..T-1, each frame inflated into the lane's board (scr[t], one frame: in
+        cache) and counted there -- no 100M-code array, no fresh pages (LocalEventTime's 400 MB of codes were a
+        third of its Q25 time). isz: bytes per code (1, 2, 4). cnt: (lanes, T)"""
+        P = dctx.size
+        nf = zabs.size - 1
+        W = np.uint64(scr.shape[1])
+        base = np.uint64(scr.ctypes.data)
+        for t in prange(P):
+            a = nf * t // P
+            b = nf * (t + 1) // P
+            dsts = base + np.uint64(t) * W
+            row = scr[t]
+            for j in range(a, b):
+                off = np.uint64(j) * rowb
+                cap = rowb
+                if off + rowb > totb:
+                    cap = totb - off
+                r = _zcall5(zfn, np.uint64(dctx[t]), dsts, cap, src + np.uint64(zabs[j]),
+                            np.uint64(zabs[j + 1] - zabs[j]))
+                if r != cap:
+                    err[t] = 1
+                    break
+                n = np.int64(cap) // isz
+                if isz == 1:
+                    for i in range(n):
+                        v = np.int64(row[i])
+                        if v < T:
+                            cnt[t, v] += 1
+                elif isz == 2:
+                    for i in range(n):
+                        v = np.int64(row[2 * i]) | (np.int64(row[2 * i + 1]) << 8)
+                        if v < T:
+                            cnt[t, v] += 1
+                else:
+                    for i in range(n):
+                        v = (np.int64(row[4 * i]) | (np.int64(row[4 * i + 1]) << 8)
+                             | (np.int64(row[4 * i + 2]) << 16) | (np.int64(row[4 * i + 3]) << 24))
+                        if v < T:
+                            cnt[t, v] += 1
+
+    @njit(cache=True, parallel=True)
+    def z18_frames(zfn, src, zabs, dctx, scr, bits, BR, N, out, err):
+        """enc 18: frame j inflates to its rows' codes bit-packed at `bits` (LE words) in the lane's board, then
+        unpacks into out[j*BR ...]; the board keeps 16 spare bytes past the cap for the straddling word"""
+        P = dctx.size
+        nf = zabs.size - 1
+        W = np.uint64(scr.shape[1] * 8)
+        cap = W - np.uint64(16)
+        base = np.uint64(scr.ctypes.data)
+        mask = (np.int64(1) << bits) - 1
+        for t in prange(P):
+            a = nf * t // P
+            b = nf * (t + 1) // P
+            dsts = base + np.uint64(t) * W
+            row = scr[t]
+            for j in range(a, b):
+                r = _zcall5(zfn, np.uint64(dctx[t]), dsts, cap, src + np.uint64(zabs[j]),
+                            np.uint64(zabs[j + 1] - zabs[j]))
+                if r > cap:
+                    err[t] = 1
+                    break
+                k0 = np.int64(j) * BR
+                n = BR
+                if k0 + BR > N:
+                    n = N - k0
+                if np.uint64(n) * np.uint64(bits) > r * np.uint64(8):
+                    err[t] = 1
+                    break
+                for i in range(n):
+                    bitpos = np.int64(i) * bits
+                    w = bitpos >> 6
+                    o = bitpos & 63
+                    v = np.int64(row[w] >> np.uint64(o))
+                    if o + bits > 64:
+                        v |= np.int64(row[w + 1] << np.uint64(64 - o))
+                    out[k0 + i] = v & mask
 
 
 # THE FLAG SCAN OVER DECODED CODES (2026-10-19, the LIKE board): the rows whose code's flag is set, in row order.
