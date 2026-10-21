@@ -178,7 +178,9 @@ def route_single_segment(ctx):
         # wherescan is the one structure read that applies OFFSET itself (it materializes the
         # full ordered group set and slices [off:off+lim]) -- let it try before the scan.
         # fused_agg last: it answers LIMIT + OFFSET rows in order and slices (wdb_join.table_agg's OFFSET window)
-        for rd in (R.gbcount, R.funnel, R.dict_count, R.wherescan, R.diskpair, R.fused_agg):   # the reads that apply OFFSET themselves
+        # sorted_proj and firstk slice [off:off+lim] themselves too (2026-10-21): the dictionary walk and the staircase
+        # walk read lim + off and drop the first off (SELECT UserID ... ORDER BY UserID LIMIT 10 OFFSET 3 was a 41 s scan)
+        for rd in (R.gbcount, R.funnel, R.dict_count, R.sorted_proj, R.firstk, R.wherescan, R.diskpair, R.fused_agg):   # the reads that apply OFFSET themselves
             spec = rd.detect(ctx)
             if spec is not None:
                 rows = rd.execute(ctx, spec)

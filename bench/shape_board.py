@@ -106,6 +106,30 @@ SHAPES = {
     'q22n': {'orig': ('URL',), 'qnum': 22, 'like': '%.google.%', 'text_k': True, 'forms': LIKE_FORMS},
     'q23': {'orig': ('URL',), 'qnum': 23, 'like': '%google%', 'text_k': True, 'forms': LIKE_FORMS},
 }
+# THE REMAINING TWENTY (2026-10-21): every query with no board yet gets a shape; the slot is the column the
+# query is about (the filter, the aggregate, the group key, the sort key). Q0 has no column and Q5 is q4's
+# shape (COUNT DISTINCT of one column); the dashboard (Q36-Q42) keeps its CounterID / date / flag filters
+# and puts the profile in the group key (Q39: in Dst's place; Q42: every time column x truncation unit).
+_DASH = ("CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31'")
+SHAPES.update({
+    'q1': {'orig': ('AdvEngineID',), 'qnum': 1, 'forms': 'plain'},
+    'q2': {'orig': ('AdvEngineID', 'ResolutionWidth'), 'qnum': 2, 'forms': 'plain', 'num_k': True, 'num_d': True},
+    'q4': {'orig': ('UserID',), 'qnum': 4, 'forms': 'plain'},
+    'q6': {'orig': ('EventDate',), 'qnum': 6, 'forms': 'plain'},
+    'q7': {'orig': ('AdvEngineID',), 'qnum': 7, 'forms': 'plain'},
+    'q17': {'orig': ('UserID', 'SearchPhrase'), 'qnum': 17, 'forms': 'plain'},
+    'q19': {'orig': ('UserID',), 'qnum': 19, 'forms': 'plain'},
+    'q24': {'orig': ('SearchPhrase',), 'qnum': 24, 'forms': 'plain'},
+    'q25': {'orig': ('SearchPhrase',), 'qnum': 25, 'forms': 'plain'},
+    'q26': {'orig': ('SearchPhrase',), 'qnum': 26, 'forms': 'plain'},
+    'q29': {'orig': ('ResolutionWidth',), 'qnum': 29, 'forms': 'plain', 'num_k': True},
+    'q36': {'orig': ('URL',), 'qnum': 36, 'forms': 'plain'},
+    'q38': {'orig': ('URL',), 'qnum': 38, 'forms': 'plain'},
+    'q39': {'orig': ('URL',), 'qnum': 39, 'forms': 'plain'},
+    'q40': {'orig': ('URLHash',), 'qnum': 40, 'forms': 'plain'},
+    'q41': {'orig': ('WindowClientWidth', 'WindowClientHeight'), 'qnum': 41, 'forms': 'plain'},
+    'q42': {'orig': ('EventTime',), 'qnum': 42, 'forms': 'minute,hour,day', 'time_k': True},
+})
 SH = SHAPES[A.shape]
 if 'qnum' in SH:
     try:
@@ -177,7 +201,68 @@ def pattern(k, form):
     return d['pat'] if d else None
 
 
+_POINT = {}
+
+
+def point(col):
+    """a value the column holds, as rare as the data has (Q19's '= literal' is a needle)"""
+    if col not in _POINT:
+        # its own connection: picking the literal is part of writing the query, allowed in a WaveDB-only run
+        # the column's RAREST value (ties: the smallest): Q19 asks for a needle -- a row's own value on a
+        # tiny-V column is millions of rows, and the variant would time the output, not the read
+        r = duckdb.connect().execute(HITS_CTE + " SELECT %s FROM hits WHERE %s IS NOT NULL GROUP BY 1 "
+                                     "ORDER BY COUNT(*), 1 LIMIT 1" % (col, col)).fetchone()
+        v = r[0] if r else COLS[col]['top']
+        _POINT[col] = (str(v) if COLS[col]['dt'] in ('int', 'float') and not isinstance(v, str)
+                       else "'%s'" % str(v).replace("'", "''"))
+    return _POINT[col]
+
+
 def sql_of(k, d, form):
+    if A.shape == 'q1':
+        return 'SELECT COUNT(*) FROM hits WHERE %s <> %s' % (k, literal(k))
+    if A.shape == 'q2':
+        return 'SELECT SUM(%s), COUNT(*), AVG(%s) FROM hits' % (k, d)
+    if A.shape == 'q4':
+        return 'SELECT COUNT(DISTINCT %s) FROM hits' % k
+    if A.shape == 'q6':
+        return 'SELECT MIN(%s), MAX(%s) FROM hits' % (k, k)
+    if A.shape == 'q7':
+        return 'SELECT %s, COUNT(*) FROM hits WHERE %s <> %s GROUP BY %s ORDER BY COUNT(*) DESC' % (k, k, literal(k), k)
+    if A.shape == 'q17':
+        return 'SELECT %s, %s, COUNT(*) FROM hits GROUP BY %s, %s LIMIT 10' % (k, d, k, d)
+    if A.shape == 'q19':
+        return 'SELECT %s FROM hits WHERE %s = %s' % (k, k, point(k))
+    if A.shape in ('q24', 'q25', 'q26'):
+        order = {'q24': 'EventTime', 'q25': k, 'q26': 'EventTime, %s' % k}[A.shape]
+        return 'SELECT %s FROM hits WHERE %s <> %s ORDER BY %s LIMIT 10' % (k, k, literal(k), order)
+    if A.shape == 'q29':
+        return 'SELECT %s FROM hits' % ', '.join(('SUM(%s)' % k) if i == 0 else ('SUM(%s + %d)' % (k, i))
+                                                 for i in range(90))
+    if A.shape == 'q36':
+        return ('SELECT %s, COUNT(*) AS PageViews FROM hits WHERE %s AND DontCountHits = 0 AND IsRefresh = 0 '
+                'AND %s <> %s GROUP BY %s ORDER BY PageViews DESC LIMIT 10' % (k, _DASH, k, literal(k), k))
+    if A.shape == 'q38':
+        return ('SELECT %s, COUNT(*) AS PageViews FROM hits WHERE %s AND IsRefresh = 0 AND IsLink <> 0 '
+                'AND IsDownload = 0 GROUP BY %s ORDER BY PageViews DESC LIMIT 10 OFFSET 1000' % (k, _DASH, k))
+    if A.shape == 'q39':
+        return ("SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN (SearchEngineID = 0 AND "
+                "AdvEngineID = 0) THEN Referer ELSE '' END AS Src, %s AS Dst, COUNT(*) AS PageViews FROM hits "
+                "WHERE %s AND IsRefresh = 0 GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst "
+                "ORDER BY PageViews DESC LIMIT 10 OFFSET 1000" % (k, _DASH))
+    if A.shape == 'q40':
+        return ('SELECT %s, EventDate, COUNT(*) AS PageViews FROM hits WHERE %s AND IsRefresh = 0 '
+                'AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465 GROUP BY %s, EventDate '
+                'ORDER BY PageViews DESC LIMIT 10 OFFSET 100' % (k, _DASH, k))
+    if A.shape == 'q41':
+        return ('SELECT %s, %s, COUNT(*) AS PageViews FROM hits WHERE %s AND IsRefresh = 0 AND DontCountHits = 0 '
+                'AND URLHash = 2868770270353813622 GROUP BY %s, %s ORDER BY PageViews DESC LIMIT 10 OFFSET 10000'
+                % (k, d, _DASH, k, d))
+    if A.shape == 'q42':
+        t = "DATE_TRUNC('%s', %s)" % (form, k)
+        return ("SELECT %s AS M, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-14' "
+                "AND EventDate <= '2013-07-15' AND IsRefresh = 0 AND DontCountHits = 0 GROUP BY %s ORDER BY %s "
+                "LIMIT 10 OFFSET 1000" % (t, t, t))
     if 'like' in SH:
         p = pattern(k, form).replace("'", "''")
         if A.shape == 'q20':
@@ -432,6 +517,10 @@ if SH.get('text_k'):                         # the one slot takes a string funct
     ks = [c for c in ks if COLS[c]['dt'] == 'str']
 if SH.get('num_k'):                          # AVG takes numbers: every int and float column
     ks = [c for c in ks if COLS[c]['dt'] in ('int', 'float')]
+if SH.get('num_d'):                          # slot 2 under AVG: numbers only
+    ds = [c for c in ds if COLS[c]['dt'] in ('int', 'float')]
+if SH.get('time_k'):                         # DATE_TRUNC: every time column (not only the representatives)
+    ks = [c for c in COLS if COLS[c]['dt'] == 'time']
 if SH.get('numeric'):
     ks = [c for c in ks if COLS[c]['dt'] == 'int' or c == ORIG_K]
 if SINGLE:
