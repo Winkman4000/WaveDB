@@ -181,11 +181,20 @@ def _exact_scalar(db, tree):
     specs = []
     for p in tree.expressions:
         ak = wdb_sql._agg_kind(p)
-        if ak is None:
-            return None
+        if ak is not None and ak[0] == 'SUM' and not isinstance(ak[1], str):
+            # THE AFFINE SUM (2026-10-21, Q29's board): SUM(col + k) is SUM(col) + k * COUNT(col), exact at any
+            # dictionary size -- wdb_affinesum serves dictionaries up to 1M values; past that the shape fell to
+            # the general path (WatchID, UserID, ClientEventTime, RefererHash, LocalEventTime: 10 s timeouts)
+            import wdb_affinesum as _AF9
+            inner9 = p.this if isinstance(p, E.Alias) else p
+            af9 = _AF9._affine(inner9)
+            if af9 is None:
+                return None
+            ak = ('SUMSHIFT:%d' % af9[1], af9[0])
         if ak[0] == 'COUNT_STAR':
             specs.append(('COUNT_STAR', None)); continue
-        if ak[0] not in ('SUM', 'AVG', 'MIN', 'MAX', 'COUNT') or not isinstance(ak[1], str):
+        if (ak[0] not in ('SUM', 'AVG', 'MIN', 'MAX', 'COUNT') and not ak[0].startswith('SUMSHIFT')) \
+                or not isinstance(ak[1], str):
             return None
         col = ak[1]
         c = seg.cols.get(col)
@@ -197,7 +206,12 @@ def _exact_scalar(db, tree):
             return None                              # seq nulls: keep the mature path
         if seg._effective(col) is not None:
             return None                              # UPDATE overrides falsify raw codes
-        if ak[0] in ('SUM', 'AVG', 'MIN', 'MAX') and c.get('dt') != 0:
+        if ak[0] in ('MIN', 'MAX') and c.get('dt') == 1 and c.get('mode') in (0, 1):
+            # TEXT MIN / MAX FROM THE DICTIONARY'S ENDS (2026-10-21, Q6's board): every dictionary is in value
+            # order and every code holds a row (no deletes: checked above), so MIN is code 0's value and MAX the
+            # last non-NULL code's -- two point reads. Text fell to the general path (OriginalURL 8.3 s, DuckDB 0.5)
+            specs.append(('T' + ak[0], col)); continue
+        if (ak[0] in ('SUM', 'AVG', 'MIN', 'MAX') or ak[0].startswith('SUMSHIFT')) and c.get('dt') != 0:
             return None                              # datetimes keep their typed emission
         specs.append((ak[0], col))
     import wdb_window as WN
@@ -213,30 +227,60 @@ def _exact_scalar(db, tree):
     seqs = {}
     i2s = {}                                         # column -> (exact sum, rows) from the frame fold
     row = []
+    sn9 = {}                                         # column -> (exact SUM, COUNT) for the affine sums
     for kind, col in specs:
         if kind == 'COUNT_STAR':
             row.append(N); continue
+        if kind in ('TMIN', 'TMAX'):
+            c9 = seg.cols[col]
+            nv9 = int(c9['V']) - (1 if c9.get('has_null') else 0)
+            row.append(None if nv9 <= 0 else wdb_sql._pyval(seg.fetch(col, 0 if kind == 'TMIN' else nv9 - 1)))
+            continue
+        if kind.startswith('SUMSHIFT'):
+            if col not in sn9:
+                s9 = _exact_scalar_one(seg, 'SUM', col, counts_of, seqs, i2s, cnts)
+                if not seg.cols[col].get('has_null'):
+                    n9 = N                           # no NULLs: every row counts (no value table for a COUNT)
+                elif i2s.get(col) is not None:
+                    n9 = i2s[col][1]
+                else:
+                    n9 = _exact_scalar_one(seg, 'COUNT', col, counts_of, seqs, i2s, cnts)
+                sn9[col] = (s9, n9)
+            s9, n9 = sn9[col]
+            k9 = int(kind.split(':', 1)[1])
+            row.append(None if not n9 else int(s9) + k9 * int(n9)); continue
+        row.append(_exact_scalar_one(seg, kind, col, counts_of, seqs, i2s, cnts))
+    global _FAST_HITS
+    _FAST_HITS += 1
+    return [tuple(row)], [wdb_sql._alias(p) for p in tree.expressions]
+
+
+def _exact_scalar_one(seg, kind, col, counts_of, seqs, i2s, cnts):
+    """one aggregate of _exact_scalar over one column (the body its loop had, returning the value)"""
+    import wdb_exactint as XI
+    import wdb_window as WN
+    N = int(seg.N)
+    if True:
         c = seg.cols[col]
         if c.get('mode') == 4:                       # sequence codec: decode once, exact fold
             if col not in seqs:
                 seqs[col] = np.asarray(seg._seq_decode(c))
             v = seqs[col]
             if kind == 'COUNT':
-                row.append(int(v.size))
+                return int(v.size)
             elif kind == 'MIN':
-                row.append(int(v.min()) if v.size else None)
+                return int(v.min()) if v.size else None
             elif kind == 'MAX':
-                row.append(int(v.max()) if v.size else None)
+                return int(v.max()) if v.size else None
             elif kind == 'SUM':
-                row.append(XI.fold_values(v) if v.size else None)
+                return XI.fold_values(v) if v.size else None
             else:
-                row.append(XI.exact_avg(XI.fold_values(v), int(v.size)))
-            continue
+                return XI.exact_avg(XI.fold_values(v), int(v.size))
         if kind == 'COUNT' and c.get('dt') != 0:
             # COUNT(text/float column): the non-null codes are the dictionary's own (a NULL is the
             # last code, V - 1) -- no value table needed; _int_table on a text dict raised
             cn = counts_of(col, int(c['V']) - (1 if c.get('has_null') else 0))
-            row.append(int(cn.sum())); continue
+            return int(cn.sum())
         if kind in ('SUM', 'AVG') and (col in i2s or (WN._nline(seg, col) is None and seg.i2_foldable(col))):
             # THE FOLD THROUGH THE DICTIONARY'S OWN FRAMES (2026-10-19): the census, then counts x values
             # folded chunk by chunk as libzstd inflates the dictionary -- no spine built (AVG(WatchID)
@@ -248,7 +292,7 @@ def _exact_scalar(db, tree):
                 i2s[col] = None if s is None else (s, int(cn.sum()))
             if i2s[col] is not None:
                 s, n = i2s[col]
-                row.append((s if n else None) if kind == 'SUM' else XI.exact_avg(s, n)); continue
+                return (s if n else None) if kind == 'SUM' else XI.exact_avg(s, n)
         tab = WN._int_table(seg, col)
         if kind in ('SUM', 'AVG') and col not in cnts:
             # THE SUM FROM THE BLOCK DICTIONARIES (2026-10-01): enc 19 sums block by block, exact,
@@ -256,20 +300,17 @@ def _exact_scalar(db, tree):
             vs = seg.e19_value_sum(col, tab)
             if vs is not None:
                 s, n = vs
-                row.append((s if n else None) if kind == 'SUM' else XI.exact_avg(s, n)); continue
+                return (s if n else None) if kind == 'SUM' else XI.exact_avg(s, n)
         cn = counts_of(col, tab.size)
         if kind == 'COUNT':
-            row.append(int(cn.sum())); continue
+            return int(cn.sum())
         if kind in ('MIN', 'MAX'):
             nz = np.flatnonzero(cn)
-            row.append(None if nz.size == 0
-                       else int(tab[int(nz[0] if kind == 'MIN' else nz[-1])])); continue
+            return (None if nz.size == 0
+                    else int(tab[int(nz[0] if kind == 'MIN' else nz[-1])]))
         n = int(cn.sum())
         s = XI.fold_counts(cn, tab)
-        row.append((s if n else None) if kind == 'SUM' else XI.exact_avg(s, n))
-    global _FAST_HITS
-    _FAST_HITS += 1
-    return [tuple(row)], [wdb_sql._alias(p) for p in tree.expressions]
+        return (s if n else None) if kind == 'SUM' else XI.exact_avg(s, n)
 
 
 def _sum_overflow_gate(db, tree):
