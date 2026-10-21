@@ -1190,6 +1190,51 @@ def _span_rows(seg, spans):
     return lo, max(lo, hi)
 
 
+_BP0EQ = [os.environ.get('WDB_BP0_EQ', '1') != '0']
+
+
+def _keep_eq_codes(seg, col, pos, code, negate):
+    """the codes at an equality scan's hits are the code itself: kept for codes_at (as the frame scans keep theirs),
+    so the projection that follows reads no frame -- ClientEventTime = k's scan took 27 ms of the query's 85 without"""
+    if not negate and pos.size <= 4_000_000:
+        seg.__dict__.setdefault('_scan_codes', {})[col] = (pos, np.full(pos.size, code, np.int64))
+    return pos
+
+
+def _scan_eq18_lanes(seg, c, code, lo, hi, negate):
+    """THE ONE-CODE SCAN IN COMPILED LANES (2026-10-21, Q19's board): enc 18's frames inflate through libzstd inside
+    the kernel and their codes are tested against the one code as they unpack (wdb_kernels.z18_eq_count / _fill);
+    the frame scan below inflated through Python's zstandard on a thread pool and tested a flag table. None (the
+    caller scans as before) without libzstd, with frames not yet in memory, or on a frame error."""
+    import wdb_engine as _EN
+    import wdb_kernels as _WK
+    if _EN._libzstd() is None or not _EN._ZLANES[0]:
+        return None
+    base = int(c['cstart']); po = np.asarray(c['poffs'], np.int64)
+    BR = int(c['BR']); bits = int(c['pbits'])
+    j0, j1 = lo // BR, (hi - 1) // BR + 1
+    if seg._resident_share(base + int(po[j0]), base + int(po[j1])) < 0.9:
+        return None
+    P = int(_WK.wide_threads())
+    scr = np.zeros((P, (BR * bits + 63) // 64 + 4), np.uint64)
+    cnt = np.zeros(j1 - j0, np.int64)
+    src = np.uint64(seg.buf.ctypes.data); zabs = po + base
+    ok = seg._zlanes(lambda zfn, dctx, err: _WK.run_wide(_WK.z18_eq_count, np.uint64(zfn), src, zabs, np.int64(j0),
+                     np.int64(j1), dctx, scr, np.int64(bits), np.int64(BR), np.int64(seg.N), np.int64(lo),
+                     np.int64(hi), np.int64(code), np.bool_(negate), cnt, err), P)
+    if not ok:
+        return None
+    offs = np.zeros(cnt.size + 1, np.int64)
+    np.cumsum(cnt, out=offs[1:])
+    out = np.empty(max(1, int(offs[-1])), np.int64)
+    ok = seg._zlanes(lambda zfn, dctx, err: _WK.run_wide(_WK.z18_eq_fill, np.uint64(zfn), src, zabs, np.int64(j0),
+                     np.int64(j1), dctx, scr, np.int64(bits), np.int64(BR), np.int64(seg.N), np.int64(lo),
+                     np.int64(hi), np.int64(code), np.bool_(negate), offs, out, err), P)
+    if not ok:
+        return None
+    return out[:int(offs[-1])]
+
+
 def _scan_eq(seg, col, code, lo, hi, negate=False):
     """Positions in [lo, hi) where the column's code equals (or differs from) `code`.
     enc=3: parallel decompress of the frames covering the span; other encodings fall back to the
@@ -1203,6 +1248,10 @@ def _scan_eq(seg, col, code, lo, hi, negate=False):
             return p9[a9:b9].astype(np.int64)
         return p9.astype(np.int64)
     c = seg.cols[col]
+    if c.get('code_enc', 0) == 18 and col not in seg._codes and _BP0EQ[0] and (hi - lo) >= (1 << 16):
+        p18 = _scan_eq18_lanes(seg, c, int(code), lo, hi, negate)
+        if p18 is not None:
+            return _keep_eq_codes(seg, col, p18, int(code), negate)
     if c.get('code_enc', 0) == 18 and col not in seg._codes:
         V18 = 1 << int(c['pbits'])                   # every code the stream can hold
         flag18 = np.full(V18, bool(negate), np.bool_)
@@ -1222,6 +1271,43 @@ def _scan_eq(seg, col, code, lo, hi, negate=False):
         p19 = _scan_eq19(seg, col, int(code), lo, hi)
         if p19 is not None:
             return p19
+    if c.get('code_enc', 0) == 20 and col not in seg._codes and (hi - lo) >= (1 << 16) and _BP0EQ[0]:
+        # THE ONE-CODE SCAN THROUGH THE BACK-REFERENCE (2026-10-21, Q19's board): the full decode wrote 100M codes to
+        # compare them with one (RefererHash = k: 0.12 s for one row, DuckDB 0.036 s); the walk keeps the hits of
+        # one block on its lane's board, and a second walk writes positions for the blocks that hold any
+        import wdb_kernels as _WK
+        BR20 = int(c['e20BR']); b0 = lo // BR20; b1 = (hi - 1) // BR20 + 1
+        P20 = int(_WK.wide_threads())
+        scr20 = np.empty((P20, BR20), np.bool_)
+        cnt20 = np.zeros(b1 - b0, np.int64)
+        args20 = (np.frombuffer(seg.buf, np.uint8), np.int64(c['cstart']), np.int64(BR20), np.int64(seg.N),
+                  np.int64(c['e20bits']), c['e20boff'], np.int64(lo), np.int64(hi), np.int64(code), np.bool_(negate),
+                  scr20)
+        _WK.run_wide(_WK.e20_eq_count, *(args20 + (cnt20,)))
+        off20 = np.zeros(cnt20.size + 1, np.int64)
+        np.cumsum(cnt20, out=off20[1:])
+        out20 = np.empty(max(1, int(off20[-1])), np.int64)
+        _WK.run_wide(_WK.e20_eq_fill, *(args20 + (off20, out20)))
+        return _keep_eq_codes(seg, col, out20[:int(off20[-1])], int(code), negate)
+    if (c.get('code_enc', 0) == 0 and 'boffs' not in c and c.get('bits') and 0 < int(c['bits']) <= 32
+            and col not in seg._codes and (hi - lo) >= (1 << 16) and _BP0EQ[0]):
+        # THE ONE-CODE SCAN ON THE PACKED BITS (2026-10-21, Q19's board): plain bitpack had no equality scanner, so
+        # one code decoded every row of the span into an array and compared it (WatchID = k: 100M codes, 400 MB,
+        # 0.18 s for one row, DuckDB 0.034 s). The tile reader tests each packed code against the one target in a
+        # register; a second pass writes positions for the chunks that hold any. WDB_BP0_EQ=0 restores the decode.
+        import wdb_kernels as _WK
+        bufE = np.frombuffer(seg.buf, np.uint8)
+        CH = 1 << 18
+        nch = (hi - lo + CH - 1) // CH
+        cntE = np.zeros(nch, np.int64)
+        argsE = (bufE, np.int64(c['cstart']), np.int64(c['bits']), np.int64(lo), np.int64(hi), np.int64(code),
+                 np.bool_(negate))
+        _WK.run_wide(_WK.bp0_eq_count, *(argsE + (cntE, np.int64(CH))))
+        offE = np.zeros(nch + 1, np.int64)
+        np.cumsum(cntE, out=offE[1:])
+        outE = np.empty(max(1, int(offE[-1])), np.int64)
+        _WK.run_wide(_WK.bp0_eq_fill, *(argsE + (offE, outE, np.int64(CH))))
+        return _keep_eq_codes(seg, col, outE[:int(offE[-1])], int(code), negate)
     cc = np.asarray(seg._raw_codes_range(col, lo, hi))
     h = np.nonzero(cc != code)[0] if negate else np.nonzero(cc == code)[0]
     return h + lo

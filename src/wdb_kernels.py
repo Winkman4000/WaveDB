@@ -1812,6 +1812,61 @@ def bp0_scan_fill(buf, base, bits, lo, hi, flag, offs, out, CH):
 
 
 @njit(nogil=True, parallel=True, cache=True)
+def bp0_eq_count(buf, base, bits, lo, hi, target, neg, counts, CH):
+    """THE ONE-CODE SCAN ON THE PACKED BITS (2026-10-21, Q19's board), pass 1: rows of [lo, hi) whose plain-bitpack
+    code equals `target` (differs from it, `neg`), counted per chunk. bp0_scan_count's tile reader with the test made
+    against one code held in a register -- no flag table (a WatchID table is 100M entries, looked up at random)."""
+    mask = (np.int64(1) << bits) - 1
+    for cix in prange(counts.size):
+        a = lo + cix * CH
+        b = min(hi, a + CH)
+        bo = a * bits
+        p = base + (bo >> 3)
+        acc = np.uint64(buf[p]) & np.uint64(0xFF >> (bo & 7))
+        nb = 8 - (bo & 7)
+        p += 1
+        cnt = 0
+        for i in range(a, b):
+            while nb < bits:
+                acc = (acc << np.uint64(8)) | np.uint64(buf[p])
+                p += 1
+                nb += 8
+            nb -= bits
+            if ((np.int64(acc >> np.uint64(nb)) & mask) == target) != neg:
+                cnt += 1
+            acc &= (np.uint64(1) << np.uint64(nb)) - np.uint64(1)
+        counts[cix] = cnt
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def bp0_eq_fill(buf, base, bits, lo, hi, target, neg, offs, out, CH):
+    """Pass 2: the positions, into each chunk's own slice of `out`. A chunk pass 1 found empty is not read again, so
+    a rare code costs the one pass."""
+    mask = (np.int64(1) << bits) - 1
+    for cix in prange(offs.size - 1):
+        if offs[cix + 1] == offs[cix]:
+            continue
+        a = lo + cix * CH
+        b = min(hi, a + CH)
+        bo = a * bits
+        p = base + (bo >> 3)
+        acc = np.uint64(buf[p]) & np.uint64(0xFF >> (bo & 7))
+        nb = 8 - (bo & 7)
+        p += 1
+        w9 = offs[cix]
+        for i in range(a, b):
+            while nb < bits:
+                acc = (acc << np.uint64(8)) | np.uint64(buf[p])
+                p += 1
+                nb += 8
+            nb -= bits
+            if ((np.int64(acc >> np.uint64(nb)) & mask) == target) != neg:
+                out[w9] = i
+                w9 += 1
+            acc &= (np.uint64(1) << np.uint64(nb)) - np.uint64(1)
+
+
+@njit(nogil=True, parallel=True, cache=True)
 def bp0_decode(buf, base, bits, N, out):
     """Plain bitpack FULL decode, TILE-READER: every packed byte loads
     exactly once into a rolling accumulator; one shift+mask per value.
@@ -7636,6 +7691,80 @@ def e20_low_count(buf, base, BR, N, bits, boff, T, scr, cnt):
                     cnt[t, v] += 1
 
 
+
+@njit(cache=True, parallel=True, nogil=True)
+def e20_eq_count(buf, base, BR, N, bits, boff, lo, hi, t, neg, scr, cnt):
+    """THE ONE-CODE SCAN THROUGH THE BACK-REFERENCE (2026-10-21, Q19's board), pass 1: rows of [lo, hi) whose enc-20
+    code equals `t` (differs, `neg`), counted per block of the span. A code enters a block only as a literal, and a
+    back-reference copies an earlier row: a row is a hit when it is the literal t or points back at a hit. The hits
+    live on each lane's own board (scr[lane], one block: stays in cache), so the 100M codes are never written (the
+    full decode + compare took RefererHash = k to 0.12 s for one row, DuckDB 0.036 s). cnt: one slot per block."""
+    b0 = lo // BR
+    nbk = cnt.size
+    P = scr.shape[0]
+    vm = np.uint64((1 << bits) - 1)
+    for L in prange(P):
+        a = nbk * L // P
+        b = nbk * (L + 1) // P
+        hit = scr[L]
+        for j in range(a, b):
+            blk = b0 + j
+            r0 = blk * BR
+            n = min(BR, N - r0)
+            p = (base + boff[blk]) * 8
+            c = 0
+            for i in range(n):
+                w = _e20_load(buf, p >> 3) >> np.uint64(p & 7)
+                if (w & np.uint64(1)) == 0:
+                    h = np.int64((w >> np.uint64(1)) & vm) == t
+                    p += 1 + bits
+                else:
+                    k = np.int64((w >> np.uint64(1)) & np.uint64(15))
+                    g = (np.int64(1) << k) | np.int64((w >> np.uint64(5)) & np.uint64((1 << k) - 1))
+                    h = hit[i - g]
+                    p += 5 + k
+                hit[i] = h
+                if h != neg and r0 + i >= lo and r0 + i < hi:
+                    c += 1
+            cnt[j] = c
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def e20_eq_fill(buf, base, BR, N, bits, boff, lo, hi, t, neg, scr, offs, out):
+    """Pass 2: the positions, block by block into its own slice of `out`; a block pass 1 found empty is skipped, so a
+    rare code costs the one walk."""
+    b0 = lo // BR
+    nbk = offs.size - 1
+    P = scr.shape[0]
+    vm = np.uint64((1 << bits) - 1)
+    for L in prange(P):
+        a = nbk * L // P
+        b = nbk * (L + 1) // P
+        hit = scr[L]
+        for j in range(a, b):
+            if offs[j + 1] == offs[j]:
+                continue
+            blk = b0 + j
+            r0 = blk * BR
+            n = min(BR, N - r0)
+            p = (base + boff[blk]) * 8
+            w9 = offs[j]
+            for i in range(n):
+                w = _e20_load(buf, p >> 3) >> np.uint64(p & 7)
+                if (w & np.uint64(1)) == 0:
+                    h = np.int64((w >> np.uint64(1)) & vm) == t
+                    p += 1 + bits
+                else:
+                    k = np.int64((w >> np.uint64(1)) & np.uint64(15))
+                    g = (np.int64(1) << k) | np.int64((w >> np.uint64(5)) & np.uint64((1 << k) - 1))
+                    h = hit[i - g]
+                    p += 5 + k
+                hit[i] = h
+                if h != neg and r0 + i >= lo and r0 + i < hi:
+                    out[w9] = r0 + i
+                    w9 += 1
+
+
 # THE FOLD THROUGH THE DICTIONARY'S OWN FRAMES (2026-10-19). An exact SUM over a big integer dictionary
 # used to inflate the whole chunked spine first (WatchID: 100M values, 800 MB written, ~0.5 s) and then
 # fold counts x values in numpy on one thread (0.26 s). Here each thread asks libzstd to inflate one
@@ -7807,6 +7936,94 @@ if HAVE_NUMBA:
                     if o + bits > 64:
                         v |= np.int64(row[w + 1] << np.uint64(64 - o))
                     out[k0 + i] = v & mask
+
+
+    @njit(cache=True, parallel=True)
+    def z18_eq_count(zfn, src, zabs, j0, j1, dctx, scr, bits, BR, N, lo, hi, t, neg, cnt, err):
+        """THE ONE-CODE SCAN IN COMPILED LANES (2026-10-21, Q19's board), enc 18, pass 1: frames j0 .. j1-1 inflate in
+        the lane's board (as z18_frames) and their rows in [lo, hi) are tested against the one code `t` (differ,
+        `neg`) as they unpack -- counted per frame, nothing written. The scan it replaces inflated every frame through
+        Python's zstandard on a thread pool (ClientEventTime = k: 0.14 s for one row, DuckDB 0.041 s)."""
+        P = dctx.size
+        nf = j1 - j0
+        W = np.uint64(scr.shape[1] * 8)
+        cap = W - np.uint64(16)
+        base = np.uint64(scr.ctypes.data)
+        mask = (np.int64(1) << bits) - 1
+        for L in prange(P):
+            a = nf * L // P
+            b = nf * (L + 1) // P
+            dsts = base + np.uint64(L) * W
+            row = scr[L]
+            for q in range(a, b):
+                j = j0 + q
+                r = _zcall5(zfn, np.uint64(dctx[L]), dsts, cap, src + np.uint64(zabs[j]),
+                            np.uint64(zabs[j + 1] - zabs[j]))
+                if r > cap:
+                    err[L] = 1
+                    break
+                k0 = np.int64(j) * BR
+                n = BR
+                if k0 + BR > N:
+                    n = N - k0
+                if np.uint64(n) * np.uint64(bits) > r * np.uint64(8):
+                    err[L] = 1
+                    break
+                i0 = max(np.int64(0), lo - k0)
+                i1 = min(n, hi - k0)
+                c = 0
+                for i in range(i0, i1):
+                    bitpos = np.int64(i) * bits
+                    w = bitpos >> 6
+                    o = bitpos & 63
+                    v = np.int64(row[w] >> np.uint64(o))
+                    if o + bits > 64:
+                        v |= np.int64(row[w + 1] << np.uint64(64 - o))
+                    if ((v & mask) == t) != neg:
+                        c += 1
+                cnt[q] = c
+
+    @njit(cache=True, parallel=True)
+    def z18_eq_fill(zfn, src, zabs, j0, j1, dctx, scr, bits, BR, N, lo, hi, t, neg, offs, out, err):
+        """Pass 2: the frames pass 1 found holding any hit inflate again and write their positions into their own
+        slices of `out`; a rare code re-reads one frame."""
+        P = dctx.size
+        nf = j1 - j0
+        W = np.uint64(scr.shape[1] * 8)
+        cap = W - np.uint64(16)
+        base = np.uint64(scr.ctypes.data)
+        mask = (np.int64(1) << bits) - 1
+        for L in prange(P):
+            a = nf * L // P
+            b = nf * (L + 1) // P
+            dsts = base + np.uint64(L) * W
+            row = scr[L]
+            for q in range(a, b):
+                if offs[q + 1] == offs[q]:
+                    continue
+                j = j0 + q
+                r = _zcall5(zfn, np.uint64(dctx[L]), dsts, cap, src + np.uint64(zabs[j]),
+                            np.uint64(zabs[j + 1] - zabs[j]))
+                if r > cap:
+                    err[L] = 1
+                    break
+                k0 = np.int64(j) * BR
+                n = BR
+                if k0 + BR > N:
+                    n = N - k0
+                i0 = max(np.int64(0), lo - k0)
+                i1 = min(n, hi - k0)
+                w9 = offs[q]
+                for i in range(i0, i1):
+                    bitpos = np.int64(i) * bits
+                    w = bitpos >> 6
+                    o = bitpos & 63
+                    v = np.int64(row[w] >> np.uint64(o))
+                    if o + bits > 64:
+                        v |= np.int64(row[w + 1] << np.uint64(64 - o))
+                    if ((v & mask) == t) != neg:
+                        out[w9] = k0 + i
+                        w9 += 1
 
 
 # THE FLAG SCAN OVER DECODED CODES (2026-10-19, the LIKE board): the rows whose code's flag is set, in row order.
