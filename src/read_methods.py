@@ -116,6 +116,11 @@ coscan = Read('coscan',
               lambda c, spec: wdb_coscan.execute(c.seg, spec),
               'fused conjunctive COUNT: blockstats veto + one block walk, all predicates together')
 
+echo = Read('echo',
+            lambda c: __import__('wdb_echo').detect(c.seg, c.tree, c.cmap),
+            lambda c, spec: __import__('wdb_echo').execute(c.seg, spec),
+            'SELECT c WHERE c = lit: the literal repeated by its code count, no row read (disk-only)')
+
 wherescan = Read('wherescan',
                  lambda c: wdb_wherescan.detect(c.seg, c.tree, c.cmap),
                  lambda c, spec: wdb_wherescan.execute(c.seg, spec),

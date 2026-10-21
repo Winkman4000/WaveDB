@@ -180,7 +180,7 @@ def route_single_segment(ctx):
         # fused_agg last: it answers LIMIT + OFFSET rows in order and slices (wdb_join.table_agg's OFFSET window)
         # sorted_proj and firstk slice [off:off+lim] themselves too (2026-10-21): the dictionary walk and the staircase
         # walk read lim + off and drop the first off (SELECT UserID ... ORDER BY UserID LIMIT 10 OFFSET 3 was a 41 s scan)
-        for rd in (R.gbcount, R.funnel, R.dict_count, R.sorted_proj, R.firstk, R.wherescan, R.diskpair, R.fused_agg):   # the reads that apply OFFSET themselves
+        for rd in (R.gbcount, R.funnel, R.dict_count, R.sorted_proj, R.firstk, R.echo, R.wherescan, R.diskpair, R.fused_agg):   # the reads that apply OFFSET themselves
             spec = rd.detect(ctx)
             if spec is not None:
                 rows = rd.execute(ctx, spec)
@@ -230,6 +230,12 @@ def route_single_segment(ctx):
             rows = R.firstk.execute(ctx, spec)
             if rows is not None:
                 _plan_store(ctx, R.firstk.name, spec); _SERVED[0] = R.firstk.name;  _PATH_SINK(ctx, R.firstk.name) if _PATH_SINK is not None else None
+                return rows
+        spec = R.echo.detect(ctx)            # SELECT c WHERE c = lit: the literal x its code's count (Q19's lane)
+        if spec is not None:
+            rows = R.echo.execute(ctx, spec)
+            if rows is not None:
+                _plan_store(ctx, R.echo.name, spec); _SERVED[0] = R.echo.name;  _PATH_SINK(ctx, R.echo.name) if _PATH_SINK is not None else None
                 return rows
         spec = R.wherescan.detect(ctx)       # rows mode: WHERE + ORDER BY cluster col LIMIT k
         if spec is not None:

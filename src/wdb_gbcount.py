@@ -405,7 +405,7 @@ def _echo_detect(seg, tree, col_map):
         except Exception:
             return None
     return {'echo': True, 'col': col, 'lit': node.expression.this,
-            'lim': lim, 'proj': proj}
+            'lim': lim, 'proj': proj, 'off': int(wdb_sql._offset(tree) or 0)}
 
 
 def detect(seg, tree, col_map):
@@ -549,7 +549,10 @@ def execute(seg, spec):
             v = wdb_sql._pyval(seg.fetch(spec['col'], int(kc)))   # off-shelf = 1 row
             if isinstance(v, (bytes, bytearray)):
                 v = v.decode('utf-8', 'replace')
-            n = cnt if spec['lim'] is None else min(cnt, spec['lim'])
+            # OFFSET first (2026-10-21, the echo test): it was dropped -- `... WHERE a = 31 OFFSET 69997` gave 70,001
+            # rows for DuckDB's 4, `LIMIT 10 OFFSET 69997` 10 for 4 (the controller hands OFFSET queries to this read)
+            n = max(0, cnt - int(spec.get('off') or 0))
+            n = n if spec['lim'] is None else min(n, spec['lim'])
             rows = [(v,)] * n
         _HITS += 1
         return rows, [wdb_sql._alias(p) for p in spec['proj']]
