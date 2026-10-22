@@ -1867,6 +1867,105 @@ def bp0_eq_fill(buf, base, bits, lo, hi, target, neg, offs, out, CH):
 
 
 @njit(nogil=True, parallel=True, cache=True)
+def bp0_frame_tally(buf, base, bits, N, SH, cnt, csum):
+    """THE REPEATS-PER-FRAME FOLD, step 1 (2026-10-21, Jackson's switch, Q29's WatchID): per lane, per dictionary
+    frame (code >> SH), the rows whose plain-bitpack code falls in it and the sum of those codes. cnt / csum: (lanes,
+    frames) boards -- 12,207 frames x 2 numbers per lane, in cache, where a census board is 100M counters."""
+    P = cnt.shape[0]
+    mask = (np.int64(1) << bits) - 1
+    for t in prange(P):
+        a = N * t // P
+        b = N * (t + 1) // P
+        if a >= b:
+            continue
+        bo = a * bits
+        p = base + (bo >> 3)
+        acc = np.uint64(buf[p]) & np.uint64(0xFF >> (bo & 7))
+        nb = 8 - (bo & 7)
+        p += 1
+        for i in range(a, b):
+            while nb < bits:
+                acc = (acc << np.uint64(8)) | np.uint64(buf[p])
+                p += 1
+                nb += 8
+            nb -= bits
+            k = np.int64(acc >> np.uint64(nb)) & mask
+            f = k >> SH
+            cnt[t, f] += 1
+            csum[t, f] += k
+            acc &= (np.uint64(1) << np.uint64(nb)) - np.uint64(1)
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def bp0_frame_collect(buf, base, bits, N, SH, crowd, offs, out):
+    """step 2's crowded frames: each lane writes the codes of its rows that fall in a crowded frame (crowd[f]) at
+    offs[lane, f] onward -- the same lane split as bp0_frame_tally, so its counts place every lane's slice"""
+    P = offs.shape[0]
+    mask = (np.int64(1) << bits) - 1
+    for t in prange(P):
+        a = N * t // P
+        b = N * (t + 1) // P
+        if a >= b:
+            continue
+        bo = a * bits
+        p = base + (bo >> 3)
+        acc = np.uint64(buf[p]) & np.uint64(0xFF >> (bo & 7))
+        nb = 8 - (bo & 7)
+        p += 1
+        for i in range(a, b):
+            while nb < bits:
+                acc = (acc << np.uint64(8)) | np.uint64(buf[p])
+                p += 1
+                nb += 8
+            nb -= bits
+            k = np.int64(acc >> np.uint64(nb)) & mask
+            f = k >> SH
+            if crowd[f]:
+                out[offs[t, f]] = k
+                offs[t, f] += 1
+            acc &= (np.uint64(1) << np.uint64(nb)) - np.uint64(1)
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def frame_extras_count(out, fst, k0s, nfs, CH, nx, bad):
+    """step 2 for the crowded frames, pass 1: crowded frame g's codes sit at out[fst[g] .. fst[g+1]] (grouped by
+    bp0_frame_collect); they are counted on the frame's own board (CH spots: in cache) and nx[g] gets how many of its
+    codes repeat. bad[g] = 1 when one of its codes holds no row or a code falls outside it (not this shape)."""
+    for g in prange(k0s.size):
+        board = np.zeros(CH, np.int64)
+        for i in range(fst[g], fst[g + 1]):
+            j = out[i] - k0s[g]
+            if j < 0 or j >= nfs[g]:
+                bad[g] = 1
+            else:
+                board[j] += 1
+        x = 0
+        for j in range(nfs[g]):
+            if board[j] == 0:
+                bad[g] = 1
+            elif board[j] >= 2:
+                x += 1
+        nx[g] = x
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def frame_extras_fill(out, fst, k0s, nfs, CH, xo, xcode, xmult):
+    """pass 2: crowded frame g's repeated codes and their extra rows (count - 1), in code order, at xo[g] onward"""
+    for g in prange(k0s.size):
+        board = np.zeros(CH, np.int64)
+        for i in range(fst[g], fst[g + 1]):
+            j = out[i] - k0s[g]
+            if j >= 0 and j < nfs[g]:
+                board[j] += 1
+        w = xo[g]
+        for j in range(nfs[g]):
+            if board[j] >= 2:
+                xcode[w] = k0s[g] + j
+                xmult[w] = board[j] - 1
+                w += 1
+
+
+@njit(nogil=True, parallel=True, cache=True)
 def bp0_decode(buf, base, bits, N, out):
     """Plain bitpack FULL decode, TILE-READER: every packed byte loads
     exactly once into a rolling accumulator; one shift+mask per value.
@@ -7828,6 +7927,52 @@ if HAVE_NUMBA:
                     c = cnt[k0 + i]
                     hi += c * (v >> 32)
                     lo += c * (v & M)
+            outhi[t] = hi
+            outlo[t] = lo
+
+
+    @njit(cache=True, parallel=True)
+    def i2_fold_sparse(zfn, src, zabs, CH, nd, xptr, xcode, xmult, dctx, scr, outhi, outlo, err):
+        """step 3 of the repeats-per-frame fold: every value of the chunked integer dictionary once (as i2_fold with
+        every count 1, but no 100M-long count array), plus xmult[q] more times the value at code xcode[q] -- the
+        repeats, sorted by code, frame j's at xptr[j] .. xptr[j+1]. Two limbs per lane, as i2_fold."""
+        P = dctx.size
+        nch = zabs.size - 1
+        M = np.int64(0xFFFFFFFF)
+        W = np.uint64(scr.shape[1] * 8)
+        cap = np.uint64(CH * 8)
+        base = np.uint64(scr.ctypes.data)
+        for t in prange(P):
+            a = nch * t // P
+            b = nch * (t + 1) // P
+            hi = np.int64(0)
+            lo = np.int64(0)
+            dst = base + np.uint64(t) * W
+            row = scr[t]
+            for j in range(a, b):
+                r = _zcall5(zfn, np.uint64(dctx[t]), dst, cap, np.uint64(src) + np.uint64(zabs[j]),
+                            np.uint64(zabs[j + 1] - zabs[j]))
+                if r > cap or r % np.uint64(8) != 0:
+                    err[t] = 1
+                    break
+                m = np.int64(r // np.uint64(8))
+                k0 = np.int64(j) * CH
+                if k0 + m > nd:
+                    m = nd - k0
+                q = xptr[j]
+                qe = xptr[j + 1]
+                v = np.int64(0)
+                for i in range(max(m, 0)):
+                    v += row[i]
+                    c = np.int64(1)
+                    while q < qe and xcode[q] == k0 + i:
+                        c += xmult[q]
+                        q += 1
+                    hi += c * (v >> 32)
+                    lo += c * (v & M)
+                if q != qe:
+                    err[t] = 1                       # a repeat code past the frame's values: not this dictionary
+                    break
             outhi[t] = hi
             outlo[t] = lo
 

@@ -281,6 +281,10 @@ def _exact_scalar_one(seg, kind, col, counts_of, seqs, i2s, cnts):
             # last code, V - 1) -- no value table needed; _int_table on a text dict raised
             cn = counts_of(col, int(c['V']) - (1 if c.get('has_null') else 0))
             return int(cn.sum())
+        if kind in ('SUM', 'AVG') and col not in i2s:
+            rp9 = seg.rpf_sum(col)                   # THE REPEATS-PER-FRAME FOLD: a near-unique column, no census
+            if rp9 is not None:
+                i2s[col] = rp9
         if kind in ('SUM', 'AVG') and (col in i2s or (WN._nline(seg, col) is None and seg.i2_foldable(col))):
             # THE FOLD THROUGH THE DICTIONARY'S OWN FRAMES (2026-10-19): the census, then counts x values
             # folded chunk by chunk as libzstd inflates the dictionary -- no spine built (AVG(WatchID)

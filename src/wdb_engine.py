@@ -37,7 +37,10 @@ _SEG_KEEP = _SEG_PROGRAM | _SEG_TIER1          # (the witness reads seg_keep()/c
 _POOL = None
 
 
-_ZLANES = [__import__('os').environ.get('WDB_ZLANES', '1') == '1']   # A/B: 0 = enc-3/18 decodes in the thread pool
+_ZLANES = [__import__('os').environ.get('WDB_ZLANES', '1') == '1']
+_RPF = [__import__('os').environ.get('WDB_RPF', '1') != '0']      # the repeats-per-frame fold
+_RPF_MAX = [float(__import__('os').environ.get('WDB_RPF_MAX', '1.0'))]   # its switch: repeats per frame below this
+_RPF_HITS = 0   # A/B: 0 = enc-3/18 decodes in the thread pool
 _PIPE3 = [__import__('os').environ.get('WDB_PIPE3', '1') == '1']   # A/B: 0 restores read-all-then-decode for enc-3
 _PIPE19 = [__import__('os').environ.get('WDB_PIPE19', '1') == '1'] # A/B: 0 restores warm_span-then-decode for enc 19
 _FWR = [__import__('os').environ.get('WDB_FW', '1') == '1']        # A/B: 0 restores the general-width readers (wdb_fw)
@@ -2524,6 +2527,108 @@ class Segment:
             return False
         import wdb_kernels as _WK
         return _WK.HAVE_NUMBA and _libzstd() is not None
+
+    def rpf_sum(self, nm):
+        """THE REPEATS-PER-FRAME FOLD (Jackson, 2026-10-21, Q29's WatchID): (exact SUM, rows) of a big integer
+        dictionary column with almost no repeated values, with no census; None when the switch is off.
+
+        THE SWITCH -- repeats per frame, RPF = (N - V) / F: rows that repeat a value someone already holds, over the
+        dictionary's frames (F of CH values each). Every column carries it in its own numbers. Below the line most
+        frames hold no repeat and the rest hold one; the census (one counter per value, 100M of them for WatchID,
+        hit at random: ~200 ms) is not needed. WatchID: 4 repeats / 12,207 frames = 0.0003; the next column, HID,
+        1,863.
+
+        THE ORDERING:
+          1. one walk of the codes keeps, per frame, its rows and the sum of their codes (bp0_frame_tally);
+          2. a frame with no repeats holds exactly its n codes once, code sum k0 + (k0+1) + ... + (k0+n-1); the
+             difference is its extra rows e and extra code sum d. e = 0: nothing; e = 1: d IS the repeated code;
+             e >= 2: crowded -- its rows' codes are collected (bp0_frame_collect) and counted on their own;
+          3. one pass through the dictionary's frames adds every value once plus each repeat's value as many more
+             times as it repeats (i2_fold_sparse).
+        Exact: no NULLs, no deletes / overrides (the caller's checks), and every frame's arithmetic must agree
+        (a frame with fewer rows than codes, or repeats that do not add up to N - V, declines).
+        WDB_RPF=0 declines; WDB_RPF_MAX is the line (default 1.0: the sweep's fold won at every point to 0.82 repeats per frame, the paths crossed near 1.8)."""
+        c = self.cols[nm]
+        if (not _RPF[0] or c.get('mode') != 2 or c.get('has_null') or c.get('dt', 0) != 0
+                or c.get('code_enc', 0) != 0 or 'boffs' in c or not c.get('bits') or nm in self._codes
+                or not self.i2_foldable(nm)):
+            return None
+        bits = int(c['bits']); CH = int(c['i2ch'])
+        if not (0 < bits <= 32) or CH <= 0 or (CH & (CH - 1)):
+            return None
+        SH = CH.bit_length() - 1
+        zo = np.asarray(c['i2zoffs'], np.int64); F = int(zo.size) - 1
+        nd = int(c.get('n_dict', c['V'])); N = int(self.N)
+        if F <= 0 or N < nd or F * CH < nd or (N - nd) / F >= _RPF_MAX[0]:
+            return None                                  # THE SWITCH: too many repeats per frame -> the census
+        import wdb_kernels as _WK
+        P = int(_WK.wide_threads())
+        buf8 = np.frombuffer(self.buf, np.uint8)
+        cnt = np.zeros((P, F), np.int64); csum = np.zeros((P, F), np.int64)
+        _WK.run_wide(_WK.bp0_frame_tally, buf8, np.int64(c['cstart']), np.int64(bits), np.int64(N), np.int64(SH),
+                     cnt, csum)
+        rows = cnt.sum(axis=0); sums = csum.sum(axis=0)
+        f = np.arange(F, dtype=np.int64)
+        n_f = np.clip(nd - f * CH, 0, CH)
+        e = rows - n_f
+        d = sums - (n_f * (f * CH) + n_f * (n_f - 1) // 2)
+        if (e < 0).any():
+            return None                                  # a code with no row: not the shape the arithmetic assumes
+        one = np.flatnonzero(e == 1)
+        x1 = d[one]
+        if ((x1 < one * CH) | (x1 >= one * CH + n_f[one])).any():
+            return None
+        xc = [x1]; xm = [np.ones(x1.size, np.int64)]
+        cf = np.flatnonzero(e >= 2)
+        if cf.size:
+            crowd = e >= 2
+            fstart = np.concatenate(([0], np.cumsum(rows[cf])[:-1])).astype(np.int64)
+            lanes = cnt[:, cf]
+            offs = np.zeros((P, F), np.int64)
+            offs[:, cf] = fstart[None, :] + (np.cumsum(lanes, axis=0) - lanes)
+            out = np.empty(int(rows[cf].sum()), np.int64)
+            _WK.run_wide(_WK.bp0_frame_collect, buf8, np.int64(c['cstart']), np.int64(bits), np.int64(N),
+                         np.int64(SH), crowd, offs, out)
+            # each crowded frame counted on its own board of CH spots (in cache), not one sort of all their codes
+            # (np.unique of 20M codes was 1.2 s at 0.8 repeats per frame)
+            fst = np.concatenate(([0], np.cumsum(rows[cf]))).astype(np.int64)
+            k0s = (cf * CH).astype(np.int64); nfs = n_f[cf].astype(np.int64)
+            nx = np.zeros(cf.size, np.int64); bad = np.zeros(cf.size, np.int64)
+            _WK.run_wide(_WK.frame_extras_count, out, fst, k0s, nfs, np.int64(CH), nx, bad)
+            if bad.any():
+                return None                              # a crowded frame missing a code: decline
+            xo = np.concatenate(([0], np.cumsum(nx))).astype(np.int64)
+            xc2 = np.empty(int(xo[-1]), np.int64); xm2 = np.empty(int(xo[-1]), np.int64)
+            _WK.run_wide(_WK.frame_extras_fill, out, fst, k0s, nfs, np.int64(CH), xo, xc2, xm2)
+            xc.append(xc2); xm.append(xm2)
+        xcode = np.concatenate(xc).astype(np.int64); xmult = np.concatenate(xm).astype(np.int64)
+        if int(xmult.sum()) != N - nd:
+            return None                                  # the repeats must account for every extra row
+        o = np.argsort(xcode, kind='stable'); xcode = xcode[o]; xmult = xmult[o]
+        xptr = np.searchsorted(xcode, np.arange(F + 1, dtype=np.int64) * CH).astype(np.int64)
+        base = int(c['i2base'])
+        self.warm_span(base + int(zo[0]), base + int(zo[-1]))
+        zfn, mk, free = _libzstd()[:3]
+        dctx = np.zeros(P, np.uint64)
+        try:
+            for t in range(P):
+                dd = mk()
+                if not dd:
+                    return None
+                dctx[t] = dd
+            scr = np.empty((P, 2 * CH), np.int64)
+            oh = np.zeros(P, np.int64); ol = np.zeros(P, np.int64); err = np.zeros(P, np.int64)
+            _WK.run_wide(_WK.i2_fold_sparse, np.uint64(zfn), np.uint64(self.buf.ctypes.data), zo + base,
+                         np.int64(CH), np.int64(nd), xptr, xcode, xmult, dctx, scr, oh, ol, err)
+        finally:
+            for dd in dctx.tolist():
+                if dd:
+                    free(dd)
+        if err.any():
+            return None
+        global _RPF_HITS
+        _RPF_HITS += 1
+        return (sum(int(x) for x in oh) << 32) + sum(int(x) for x in ol), N
 
     def i2_fold_sum(self, nm, counts):
         """THE FOLD THROUGH THE DICTIONARY'S OWN FRAMES (2026-10-19): exact sum(counts[k] * value[k]) as a
