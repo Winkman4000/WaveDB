@@ -8410,3 +8410,115 @@ def dense_factorize(a, lo, span):
     inv = np.empty(a.size, np.int64)
     rank_gather(a, np.int64(lo), rank, inv)
     return uvals + lo, inv, cnt_span[uvals].astype(np.int64)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# THE RUN ORDER (2026-10-22, Q7's WatchID): an answer ordered by count descending, then code ascending, is one run per
+# count value, each run "the squares with that count, left to right". The biggest run is left unwritten -- the census
+# board read left to right is already its order -- and only the squares outside it are sorted. WatchID: 99,997,493
+# groups, the biggest count 2; count_desc_order over every square took 0.65-0.91 s on one thread, the gathers of the
+# values and counts in that order 0.3-0.9 s more, for a caller that fetches 10,001 rows.
+
+@njit(cache=True, parallel=True, nogil=True)
+def _count_hist_nb(cn, CAP, T):
+    n = cn.shape[0]
+    part = np.zeros((T, CAP + 16), np.int64)        # rows 128+ bytes apart: no two threads share a counter's line
+    for t in prange(T):
+        for i in range(n * t // T, n * (t + 1) // T):
+            v = cn[i]
+            if v > 0:
+                if v <= CAP:
+                    part[t, v] += 1
+                else:
+                    part[t, CAP + 1] += 1
+    out = np.zeros(CAP + 2, np.int64)
+    for t in range(T):
+        for j in range(CAP + 2):
+            out[j] += part[t, j]
+    return out
+
+
+def count_hist(cn, cap=64):
+    """squares per count, one parallel pass: out[v] = squares with count v for v in 1..cap, out[cap + 1] = squares
+    with a count above cap, out[0] unused"""
+    return _count_hist_nb(cn, np.int64(cap), _nt())
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def _off_run_nb(cn, c, T):
+    n = cn.shape[0]
+    cnt = np.zeros(T, np.int64)
+    for t in prange(T):
+        k = 0
+        for i in range(n * t // T, n * (t + 1) // T):
+            v = cn[i]
+            if v > 0 and v != c:
+                k += 1
+        cnt[t] = k
+    off = np.zeros(T + 1, np.int64)
+    for t in range(T):
+        off[t + 1] = off[t] + cnt[t]
+    out = np.empty(off[T], np.int64)
+    for t in prange(T):
+        p = off[t]
+        for i in range(n * t // T, n * (t + 1) // T):
+            v = cn[i]
+            if v > 0 and v != c:
+                out[p] = i
+                p += 1
+    return out
+
+
+def off_run(cn, c):
+    """the live squares (count > 0) whose count is not c, ascending -- two parallel passes (count, then place)"""
+    return _off_run_nb(cn, np.int64(c), _nt())
+
+
+@njit(cache=True, nogil=True)
+def run_take(cn, c, pos, out):
+    """the next out.size squares at or after pos whose count is c, into out; returns the square after the last one
+    taken (the next call's pos). Fewer found than asked: the caller's count was wrong (the run is exactly its size)."""
+    n = cn.shape[0]
+    k = out.shape[0]
+    j = 0
+    i = pos
+    while j < k and i < n:
+        if cn[i] == c:
+            out[j] = i
+            j += 1
+        i += 1
+    return i
+
+
+@njit(cache=True, nogil=True)
+def run_skip(cn, c, pos, k):
+    """the square after the k-th square at or after pos whose count is c (a fetch that starts further on)"""
+    n = cn.shape[0]
+    j = 0
+    i = pos
+    while j < k and i < n:
+        if cn[i] == c:
+            j += 1
+        i += 1
+    return i
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def _copy_live_nb(src, out, T):
+    n = out.shape[0]
+    cnt = np.zeros(T, np.int64)
+    for t in prange(T):
+        k = 0
+        for i in range(n * t // T, n * (t + 1) // T):
+            v = src[i]
+            out[i] = v
+            if v > 0:
+                k += 1
+        cnt[t] = k
+    return cnt.sum()
+
+
+def copy_live(src, out):
+    """out[:] = src[:out.size] in parallel, returning how many are above zero -- the census board's copy and its
+    live count in one pass (WatchID: np's one-thread copy 88 ms, then cn > 0 and count_nonzero 37 ms)"""
+    return _copy_live_nb(src, out, _nt())

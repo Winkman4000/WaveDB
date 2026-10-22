@@ -229,3 +229,85 @@ class Cursor:
 
     to_arrow_table = arrow
     fetch_arrow_table = arrow
+
+
+class RunOrder:
+    """THE RUN ORDER (2026-10-22): the codes of an answer ordered by count descending, then code ascending, without
+    writing its biggest run. Rows 0..A-1 are `head` (the squares with a count above the run's, sorted), rows A..A+R-1
+    are the run (the R squares of the board whose count is c, left to right: the board's own order), rows A+R.. are
+    `tail` (the squares with a count below c, sorted). A fetch inside the run walks the board from where the last one
+    stopped; a fetch that goes back starts the walk over. The last range asked is kept, so every column of one batch
+    reads the same codes from one walk."""
+
+    def __init__(self, board, c, head, R, tail):
+        self.b = board
+        self.c = np.int64(c)
+        self.head = head
+        self.tail = tail
+        self.A = int(head.size)
+        self.R = int(R)
+        self.n = self.A + self.R + int(tail.size)
+        self._row = 0                 # the walker: run row _row is the first square of count c at or after _pos
+        self._pos = 0
+        self._last = None
+
+    def _run(self, lo, hi):
+        import wdb_kernels as K
+        if lo < self._row:
+            self._row, self._pos = 0, 0
+        if lo > self._row:
+            self._pos = int(K.run_skip(self.b, self.c, np.int64(self._pos), np.int64(lo - self._row)))
+            self._row = lo
+        out = np.empty(hi - lo, np.int64)
+        self._pos = int(K.run_take(self.b, self.c, np.int64(self._pos), out))
+        self._row = hi
+        return out
+
+    def codes(self, lo, hi):
+        """the codes of answer rows lo..hi-1"""
+        hi = min(int(hi), self.n)
+        lo = max(0, int(lo))
+        if hi <= lo:
+            return np.empty(0, np.int64)
+        if self._last is not None and self._last[0] == lo and self._last[1] == hi:
+            return self._last[2]
+        A, R = self.A, self.R
+        parts = []
+        if lo < A:
+            parts.append(self.head[lo:min(hi, A)])
+        a, b = max(lo, A), min(hi, A + R)
+        if a < b:
+            parts.append(self._run(a - A, b - A))
+        a = max(lo, A + R)
+        if a < hi:
+            parts.append(self.tail[a - A - R:hi - A - R])
+        out = parts[0] if len(parts) == 1 else np.concatenate(parts)
+        self._last = (lo, hi, out)
+        return out
+
+
+class OrderedColumn:
+    """a column read through a RunOrder: f(codes) -> the rows' values (an array, or a list for text decoded per
+    batch); py(values) -> Python values (default: tolist)"""
+
+    def __init__(self, order, f, py=None, lazy=False):
+        self.o = order
+        self.f = f
+        self.py = py
+        self.lazy = lazy
+        self.n = order.n
+
+    def take(self, lo, hi):
+        v = self.f(self.o.codes(lo, hi))
+        if self.py is not None:
+            return self.py(v)
+        return v.tolist() if isinstance(v, np.ndarray) else list(v)
+
+    def array(self, lo=0, hi=None):
+        hi = self.n if hi is None else hi
+        v = self.f(self.o.codes(lo, hi))
+        if isinstance(v, np.ndarray):
+            return v
+        out = np.empty(len(v), dtype=object)
+        out[:] = v
+        return out

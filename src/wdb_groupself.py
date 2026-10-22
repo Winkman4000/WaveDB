@@ -23,6 +23,11 @@ _HITS = 0
 _NOLIM_MAX = 4096                    # without a LIMIT, at most this many groups (one point-fetch each)
 _BULK = [__import__('os').environ.get('WDB_GS_BULK', '1') != '0']   # past it: the bulk path
 _LAZY_TEXT_V = 1 << 18            # a text dictionary past this decodes per fetched batch (the cursor)
+_RUN = [__import__('os').environ.get('WDB_GS_RUN', '1') != '0']    # the run order (the cursor's answer)
+_RUN_MIN = [int(__import__('os').environ.get('WDB_GS_RUN_MIN', str(1 << 16)))]   # the biggest run's squares, at least
+HAVE_COPY_LIVE = __import__('os').environ.get('WDB_GS_COPY_LIVE', '1') != '0'
+_COPY_LIVE_MIN = [1 << 22]          # squares: below it np's copy is as quick as a thread launch
+_RUN_CAP = 64                     # the histogram's counts 1..64 (a run of bigger counts is never millions of squares)
 
 
 def _term(cj, col):
@@ -172,8 +177,19 @@ def execute(seg, spec):
     c = seg.cols[col]
     V = int(c['V'])
     # THE CENSUS FROM THE DRESS (2026-10-01): was np.bincount -- one thread -- over the decoded codes
-    cn = np.asarray(seg.raw_census(col, V), np.int64)[:V].copy()
+    rc = np.asarray(seg.raw_census(col, V))
+    npos = None                      # the live squares (count > 0), when counted in the copy and kept exact since
+    if HAVE_COPY_LIVE and V >= _COPY_LIVE_MIN[0] and rc.dtype == np.int64 and rc.ndim == 1 and rc.size >= V:
+        # THE COPY AND ITS COUNT IN ONE PASS (2026-10-22, WatchID): np's copy is one thread (88 ms over 100M squares),
+        # then cn > 0 and count_nonzero another 37 ms -- one parallel pass gives both
+        import wdb_kernels
+        cn = np.empty(V, np.int64)
+        npos = int(wdb_kernels.copy_live(rc, cn))
+    else:
+        cn = np.asarray(rc, np.int64)[:V].copy()
     if c.get('has_null'):
+        if npos is not None and cn[V - 1] > 0:
+            npos -= 1
         cn[V - 1] = 0                # terms present (detect gate): every op excludes NULL
     for op, vals in spec['terms']:
         kcs = [WS._code_of(seg, col, v) for v in vals]
@@ -183,9 +199,12 @@ def execute(seg, spec):
                 if k is not None:
                     keep[k] = True
             cn = np.where(keep, cn, 0)
+            npos = None
         else:                        # nin: sweep the named squares
             for k in kcs:
                 if k is not None:
+                    if npos is not None and cn[k] > 0:
+                        npos -= 1
                     cn[k] = 0
     rep = None
     if spec.get('lower'):
@@ -199,12 +218,17 @@ def execute(seg, spec):
         cg = np.zeros(rep.size, np.int64)
         np.add.at(cg, np.asarray(mp), cn)
         cn = cg
-    live = cn > 0
-    if spec['having'] is not None:
-        op, val = spec['having']
-        live &= (cn > val) if op == '>' else (cn >= val) if op == '>=' else \
-                (cn < val) if op == '<' else (cn <= val) if op == '<=' else (cn == val)
-    nlive = int(np.count_nonzero(live))     # counted, not listed: a near-unique key has V live squares
+        npos = None
+    live = None
+    if spec['having'] is None and npos is not None:
+        nlive = npos                 # counted in the copy; live is cn > 0 itself (dead squares hold 0)
+    else:
+        live = cn > 0
+        if spec['having'] is not None:
+            op, val = spec['having']
+            live &= (cn > val) if op == '>' else (cn >= val) if op == '>=' else \
+                    (cn < val) if op == '<' else (cn <= val) if op == '<=' else (cn == val)
+        nlive = int(np.count_nonzero(live))     # counted, not listed: a near-unique key has V live squares
     hdrs = [wdb_sql._alias(p) for p in spec['proj']]
     if nlive == 0:
         _HITS += 1
@@ -213,7 +237,10 @@ def execute(seg, spec):
         if (rep is not None or not _BULK[0] or spec['ki'] not in (0, 1) or spec['ci'] != 1 - spec['ki']
                 or not _bulk_order_ok(spec)):   # ORDER BY the count alone, or then the key ascending: our order
             return None              # every group, one point-fetch each: the scan path's job
-        return _bulk_rows(seg, col, c, np.where(live, cn, 0), nlive, spec, hdrs)
+        # without a HAVING the board is cn itself (a dead square already holds 0): no third V-sized array
+        return _bulk_rows(seg, col, c, cn if live is None else np.where(live, cn, 0), nlive, spec, hdrs)
+    if live is None:
+        live = cn > 0
     k = nlive if spec['lim'] is None else min(spec['lim'], nlive)
     if nlive > k and len(spec['order'].expressions) == 1:
         # THE CANONICAL TOP (2026-10-18): ORDER BY the count alone -- a tie at the LIMIT is SQL's to leave
@@ -294,6 +321,11 @@ def _bulk_rows(seg, col, c, board, nlive, spec, hdrs):
     cols_ok = wdb_result.WANT[0] and type(seg).__name__ == 'Segment'
     if not cols_ok:
         wdb_govern.ask(nlive, 2, 'grouped result')      # Python rows: the working-set guard names a result too big
+    if cols_ok and _RUN[0]:
+        out = _run_columns(seg, col, c, board, nlive, spec, hdrs)
+        if out is not None:
+            _HITS += 1
+            return out, hdrs
     mx = int(board.max())
     if mx > 16 * board.size:
         # one huge count against few groups: the buckets would outnumber the squares -- sort the live squares instead
@@ -374,3 +406,54 @@ def _bulk_order_ok(spec):
     if isinstance(t, E.Column) and (t.name == kname or (isinstance(inner, E.Column) and t.name == inner.name)):
         return True
     return False
+
+
+def _run_columns(seg, col, c, board, nlive, spec, hdrs):
+    """THE RUN ORDER'S ANSWER (2026-10-22, WatchID): the answer ordered by count descending, then code ascending, is one
+    run per count value -- each run the squares with that count, left to right on the board (the dictionary is
+    value-sorted, so code order is value order). The biggest run is never written: its rows are the board read left
+    to right, walked per fetched batch (wdb_result.RunOrder); only the squares outside it are collected (one parallel
+    pass) and sorted. Its count is the one number the switch reads: R, the squares in the biggest run among counts
+    1.._RUN_CAP, from one parallel histogram pass. R below _RUN_MIN declines (count_desc_order over the board, as
+    before). WatchID: count_desc_order 0.65-0.91 s + value / count gathers 0.3-0.9 s over 100M squares -> this.
+    None: not a shape handled here."""
+    import wdb_kernels, wdb_result as WR
+    if c.get('mode') not in (0, 1, 2) or seg._effective(col) is not None or c.get('aux') == 9:
+        return None
+    dt = c.get('dt')
+    if dt not in (0, 1, 2, 3) or (dt == 1 and int(c['V']) <= _LAZY_TEXT_V):
+        return None                  # a small text dictionary decodes whole in the query (_columns)
+    h = wdb_kernels.count_hist(board, _RUN_CAP)
+    cs = int(np.argmax(h[1:_RUN_CAP + 1])) + 1
+    R = int(h[cs])
+    if R < _RUN_MIN[0]:
+        return None
+    rest = wdb_kernels.off_run(board, cs)
+    if rest.size:
+        rc = board[rest]
+        if int(rc.max()) > 16 * rest.size:
+            o = np.argsort(-rc, kind='stable')               # few squares, a huge count: sort them
+        else:
+            o = wdb_kernels.count_desc_order(rc)             # count descending, then position (= code) ascending
+        rest = rest[o]
+        A = int(np.count_nonzero(rc[o] > cs))                # the counts above the run's come first
+    else:
+        A = 0
+    order = WR.RunOrder(board, cs, rest[:A], R, rest[A:])
+    if order.n != nlive:
+        return None                  # never: every live square is in the run or outside it
+    if dt in (0, 2):
+        td = np.asarray(seg._typed_dict(col))
+        kcol = WR.OrderedColumn(order, lambda k, _td=td: _td[k])
+    elif dt == 3:
+        unit = seg.unit(col)
+        td = np.asarray(seg._typed_dict(col), np.int64)
+        kcol = WR.OrderedColumn(order, lambda k, _td=td, _u=unit: _td[k].astype('datetime64[%s]' % _u),
+                                py=(lambda s: s.tolist()) if unit == 'D' else (lambda s: s.astype('datetime64[us]').tolist()))
+    else:
+        def _dec(k):
+            return [wdb_sql._pyval(seg.fetch(col, int(g))) for g in k.tolist()]
+        kcol = WR.OrderedColumn(order, _dec, py=list, lazy=True)
+    ccol = WR.OrderedColumn(order, lambda k, _b=board: _b[k])
+    cols = [kcol, ccol] if spec['ki'] == 0 else [ccol, kcol]
+    return WR.Columns(hdrs, cols)
