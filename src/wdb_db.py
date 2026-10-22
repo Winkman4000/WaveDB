@@ -644,6 +644,23 @@ class Database:
         for lo in range(0, len(rows), br):
             yield names, rows[lo:lo + br]
 
+    def execute(self, sql, escalate=None):
+        """THE CURSOR (2026-10-22): run sql and return a wdb_result.Cursor -- PEP 249's description / rowcount /
+        fetchone / fetchmany / fetchall / iteration, plus fetchnumpy, arrow, fetch_record_batch and df, as DuckDB's
+        and ClickHouse's Python clients answer. Reads that can answer in columns do (Python rows are built only for
+        the rows fetched); every other answer is wrapped as run() returns it. run() is unchanged: it is fetchall."""
+        import wdb_result
+        prev = wdb_result.WANT[0]
+        wdb_result.WANT[0] = getattr(self, '_qdepth', 0) == 0
+        try:
+            res = self.run(sql, escalate)
+        finally:
+            wdb_result.WANT[0] = prev
+        rows, names = res if (isinstance(res, tuple) and len(res) == 2) else (res, None)
+        if names is None and isinstance(rows, wdb_result.Columns):
+            names = rows.names
+        return wdb_result.Cursor(rows, names, db=self)
+
     def run(self, sql, escalate=None):
         """Depth-guarded: recursive runs (subquery rewrites, join sub-queries) share
         memory within one outer query; at depth 0 wdb_qmem.flush forgets everything
@@ -652,6 +669,10 @@ class Database:
             self.refresh()                                   # another process may have rewritten the table
             wdb_sidecar.sentinel_before(self.cat.dbdir)      # THE SWITCH off: the directory must not grow
         import wdb_qmem, os as _os9
+        _want9 = None
+        if getattr(self, '_qdepth', 0) > 0:
+            import wdb_result as _wr9                        # a nested run (subquery, rewrite): its caller wants rows
+            _want9 = _wr9.WANT[0]; _wr9.WANT[0] = False
         _bill9 = _os9.environ.get('WDB_JOIN_BILL')
         if _bill9:
             import time as _t9
@@ -674,6 +695,8 @@ class Database:
                 r9 = self._star_in_declared_order(sql, r9)
             return r9
         finally:
+            if _want9 is not None:
+                _wr9.WANT[0] = _want9
             self._qdepth -= 1
             if self._qdepth == 0:
                 if _bill9:

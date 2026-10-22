@@ -72,4 +72,7 @@ def execute(seg, spec):
     if isinstance(v, (bytes, bytearray)):
         v = v.decode('utf-8', 'replace')
     _HITS += 1
+    import wdb_result
+    if wdb_result.WANT[0]:
+        return wdb_result.Columns(names, [wdb_result.ConstColumn(v, n)]), names   # the cursor: no 100M-row list
     return [(v,)] * n, names

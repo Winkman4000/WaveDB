@@ -22,6 +22,7 @@ E = wdb_sql.E
 _HITS = 0
 _NOLIM_MAX = 4096                    # without a LIMIT, at most this many groups (one point-fetch each)
 _BULK = [__import__('os').environ.get('WDB_GS_BULK', '1') != '0']   # past it: the bulk path
+_LAZY_TEXT_V = 1 << 18            # a text dictionary past this decodes per fetched batch (the cursor)
 
 
 def _term(cj, col):
@@ -210,7 +211,7 @@ def execute(seg, spec):
         return [], hdrs
     if spec['lim'] is None and nlive > _NOLIM_MAX:
         if (rep is not None or not _BULK[0] or spec['ki'] not in (0, 1) or spec['ci'] != 1 - spec['ki']
-                or len(spec['order'].expressions) != 1):   # ORDER BY the count alone: ties are SQL's to leave
+                or not _bulk_order_ok(spec)):   # ORDER BY the count alone, or then the key ascending: our order
             return None              # every group, one point-fetch each: the scan path's job
         return _bulk_rows(seg, col, c, np.where(live, cn, 0), nlive, spec, hdrs)
     k = nlive if spec['lim'] is None else min(spec['lim'], nlive)
@@ -289,8 +290,10 @@ def _bulk_rows(seg, col, c, board, nlive, spec, hdrs):
     built in their final order, so finalize's re-sort is skipped. The working-set guard still names a result too big to
     hold as Python rows (WatchID's 100M groups). WDB_GS_BULK=0 declines as before."""
     global _HITS
-    import wdb_govern, wdb_kernels
-    wdb_govern.ask(nlive, 2, 'grouped result')
+    import wdb_govern, wdb_kernels, wdb_result
+    cols_ok = wdb_result.WANT[0] and type(seg).__name__ == 'Segment'
+    if not cols_ok:
+        wdb_govern.ask(nlive, 2, 'grouped result')      # Python rows: the working-set guard names a result too big
     mx = int(board.max())
     if mx > 16 * board.size:
         # one huge count against few groups: the buckets would outnumber the squares -- sort the live squares instead
@@ -299,6 +302,13 @@ def _bulk_rows(seg, col, c, board, nlive, spec, hdrs):
         sel = idx[np.argsort(-board[idx], kind='stable')]
     else:
         sel = wdb_kernels.count_desc_order(board)
+    if cols_ok:
+        # THE CURSOR'S ANSWER (2026-10-22): columns, Python values built per fetched batch (wdb_result)
+        out = _columns(seg, col, c, sel, board[sel], spec, hdrs)
+        if out is not None:
+            _HITS += 1
+            return out, hdrs
+        wdb_govern.ask(nlive, 2, 'grouped result')
     vals = _bulk_values(seg, col, c, sel)
     if vals is None:
         return None
@@ -306,3 +316,61 @@ def _bulk_rows(seg, col, c, board, nlive, spec, hdrs):
     rows = list(zip(vals, cnt)) if spec['ki'] == 0 else list(zip(cnt, vals))
     _HITS += 1
     return rows, hdrs
+
+
+def _columns(seg, col, c, sel, cnt_arr, spec, hdrs):
+    """the bulk path's answer in columns (wdb_result.Columns), for db.execute: numbers and times as arrays (their
+    Python values built per fetched batch), text decoded from the dictionary per fetched batch -- a 20M-group text
+    answer decodes the rows a caller fetches, not 20M strings. None: not a shape handled here."""
+    import wdb_result as WR
+    if c.get('mode') not in (0, 1, 2) or seg._effective(col) is not None or c.get('aux') == 9:
+        return None
+    dt = c.get('dt')
+    if dt in (0, 2):
+        kcol = WR.ArrayColumn(np.asarray(seg._typed_dict(col))[sel])
+    elif dt == 3:
+        unit = seg.unit(col)
+        a = np.asarray(seg._typed_dict(col), np.int64)[sel].astype('datetime64[%s]' % unit)
+        kcol = WR.ArrayColumn(a, py=(lambda s: s.tolist()) if unit == 'D' else (lambda s: s.astype('datetime64[us]').tolist()))
+    elif dt == 1 and int(c['V']) <= _LAZY_TEXT_V:
+        # a small dictionary decodes whole faster than a batch of point fetches (SocialSourcePage, 63K values: 0.15 s
+        # through point fetches, 0.04 s whole) -- in the query, as the rows path does
+        vals = _bulk_values(seg, col, c, sel)
+        if vals is None:
+            return None
+        arr = np.empty(len(vals), dtype=object)
+        arr[:] = vals
+        kcol = WR.ArrayColumn(arr, py=list)
+    elif dt == 1:
+        def _dec(lo, hi, _sel=sel):
+            out = []
+            for g in _sel[lo:hi].tolist():
+                out.append(wdb_sql._pyval(seg.fetch(col, int(g))))
+            return out
+        kcol = WR.LazyColumn(int(sel.size), _dec)
+    else:
+        return None
+    ccol = WR.ArrayColumn(cnt_arr)
+    cols = [kcol, ccol] if spec['ki'] == 0 else [ccol, kcol]
+    return WR.Columns(hdrs, cols)
+
+
+def _bulk_order_ok(spec):
+    """the bulk path's order is count descending, then code ascending -- the key's value ascending, the dictionary being
+    value-sorted. It serves ORDER BY the count alone (ties are SQL's to leave) and ORDER BY the count, then the key
+    ascending (the board's tie-break form: Title's had fallen to the row path and timed out)."""
+    ex = spec['order'].expressions
+    if len(ex) == 1:
+        return True
+    if len(ex) != 2:
+        return False
+    o = ex[1]
+    if not isinstance(o, E.Ordered) or o.args.get('desc'):
+        return False
+    t = o.this
+    kp = spec['proj'][spec['ki']]
+    kname = wdb_sql._alias(kp)
+    inner = kp.this if isinstance(kp, E.Alias) else kp
+    if isinstance(t, E.Column) and (t.name == kname or (isinstance(inner, E.Column) and t.name == inner.name)):
+        return True
+    return False

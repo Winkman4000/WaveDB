@@ -462,7 +462,7 @@ class Wave:
         return json.loads(line) if line else {'err': 'worker died'}
 
     def ask(self, sql, runs, timeout):
-        self.p.stdin.write(json.dumps({'sql': sql, 'runs': runs}) + '\n'); self.p.stdin.flush()
+        self.p.stdin.write(json.dumps({'sql': sql, 'runs': runs, 'fetch': MAX_ROWS + 1}) + '\n'); self.p.stdin.flush()
         r = self._read(timeout * runs)
         if r is None:
             self.p.kill(); self.p.wait(); self.start()

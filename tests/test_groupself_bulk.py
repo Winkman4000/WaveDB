@@ -88,10 +88,20 @@ def test_swapped_projection_having_not_in():
         assert got == _rows(con.execute(q + tot).fetchall()), (q, got[:3])
 
 
+def test_key_ascending_tie_break_serves():
+    _db, con, _seg = _fixture()
+    for q in ("SELECT s, COUNT(*) FROM t WHERE s <> 'v3' GROUP BY s ORDER BY COUNT(*) DESC, s",
+              "SELECT s AS k, COUNT(*) AS c FROM t WHERE s <> 'v3' GROUP BY s ORDER BY c DESC, k ASC",
+              "SELECT tm, COUNT(*) FROM t WHERE tm <> '2013-07-01 00:37:00' GROUP BY tm ORDER BY COUNT(*) DESC, tm"):
+        spec, got = _gs(q)
+        assert got is not None and len(got) > GS._NOLIM_MAX, q
+        assert got == _rows(con.execute(q).fetchall()), (q, got[:3])
+
+
 def test_two_order_terms_and_switch_off_decline():
     q = "SELECT s, COUNT(*) FROM t WHERE s <> 'v3' GROUP BY s ORDER BY COUNT(*) DESC, s DESC"
     spec, got = _gs(q)
-    assert spec is not None and got is None                    # more order terms: not the bulk path's order
+    assert spec is not None and got is None                    # the key descending: not the bulk path's order
     old = GS._BULK[0]
     try:
         GS._BULK[0] = False

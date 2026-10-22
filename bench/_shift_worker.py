@@ -2,7 +2,7 @@
 stdin/stdout as JSON lines. The parent kills and restarts it when a query overruns its timeout,
 so a pathological variant costs one restart, not the run.
 
-request:  {"sql": ..., "runs": n}
+request:  {"sql": ..., "runs": n, "fetch": rows (optional: execute + fetchmany, as the DuckDB side)}
 reply:    {"times": [s, ...], "hash": md5, "nrows": n, "read": winning read}  or  {"err": ...}
 argv: src_dir db_dir
 """
@@ -29,15 +29,27 @@ for line in sys.stdin:
         times = []
         rows = None
         read = None
+        nrows = None
+        fetch = req.get('fetch')
         for _ in range(int(req.get('runs', 1))):
             controller._SERVED[0] = None
             t0 = time.perf_counter()
-            res = db.run(req['sql'])
+            if fetch and hasattr(db, 'execute'):
+                # THE CURSOR, AS THE DUCKDB SIDE IS ASKED (2026-10-22): execute + fetchmany(fetch), timed and hashed
+                # on the same rows DuckDB's side fetches -- a 20M-row answer is not built as 20M Python rows
+                cur = db.execute(req['sql'])
+                got = cur.fetchmany(int(fetch))
+                n_all = cur.rowcount
+            else:
+                res = db.run(req['sql'])
             times.append(time.perf_counter() - t0)
             read = controller._SERVED[0]
             if rows is None:
-                rows = rows_of(res)
-        out = {'times': times, 'hash': N.limit_hash(rows), 'nrows': len(rows), 'read': read or '(outside read order)'}
+                if fetch and hasattr(db, 'execute'):
+                    rows, nrows = got, n_all
+                else:
+                    rows = rows_of(res); nrows = len(rows)
+        out = {'times': times, 'hash': N.limit_hash(rows), 'nrows': nrows, 'read': read or '(outside read order)'}
     except Exception as e:
         out = {'err': '%s: %s' % (type(e).__name__, str(e)[:160])}
     print(json.dumps(out), flush=True)

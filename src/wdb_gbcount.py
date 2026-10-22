@@ -553,6 +553,11 @@ def execute(seg, spec):
             # rows for DuckDB's 4, `LIMIT 10 OFFSET 69997` 10 for 4 (the controller hands OFFSET queries to this read)
             n = max(0, cnt - int(spec.get('off') or 0))
             n = n if spec['lim'] is None else min(n, spec['lim'])
+            import wdb_result
+            if wdb_result.WANT[0]:
+                _HITS += 1
+                hd9 = [wdb_sql._alias(p) for p in spec['proj']]
+                return wdb_result.Columns(hd9, [wdb_result.ConstColumn(v, n)]), hd9
             rows = [(v,)] * n
         _HITS += 1
         return rows, [wdb_sql._alias(p) for p in spec['proj']]
