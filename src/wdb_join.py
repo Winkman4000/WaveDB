@@ -285,6 +285,10 @@ def _exact_scalar_one(seg, kind, col, counts_of, seqs, i2s, cnts):
             rp9 = seg.rpf_sum(col)                   # THE REPEATS-PER-FRAME FOLD: a near-unique column, no census
             if rp9 is not None:
                 i2s[col] = rp9
+            else:
+                rs9 = seg.e20_read_sum(col)          # THE READ-VALUES SUM: a back-reference column, no census
+                if rs9 is not None:
+                    i2s[col] = rs9
         if kind in ('SUM', 'AVG') and (col in i2s or (WN._nline(seg, col) is None and seg.i2_foldable(col))):
             # THE FOLD THROUGH THE DICTIONARY'S OWN FRAMES (2026-10-19): the census, then counts x values
             # folded chunk by chunk as libzstd inflates the dictionary -- no spine built (AVG(WatchID)

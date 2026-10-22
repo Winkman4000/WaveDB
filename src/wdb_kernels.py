@@ -7929,6 +7929,53 @@ def e20_eq_list(buf, base, BR, N, bits, boff, blocks, lo, hi, t, offs, out, fill
             offs[j + 1] = c
 
 
+
+@njit(cache=True, parallel=True, nogil=True)
+def e20_read_sum(buf, base, BR, N, bits, boff, tab, outhi, outlo):
+    """THE READ-VALUES SUM THROUGH THE BACK-REFERENCE (2026-10-21/22, Q29's RefererHash): exact SUM of an enc-20 column
+    from its unzipped dictionary `tab`, with no census. Per lane, per block: one walk gives each literal a weight (1, plus
+    1 for every row whose root it is -- a back-reference's root is the root of the row it points to); then, in a loop of
+    its own, the block's literals read tab[code] x weight. The reads wait on nothing, so they overlap; inside the walk
+    they stalled the row-to-row chain (225 ms against 39). Two limbs per lane, as i2_fold. outhi / outlo: one per lane."""
+    nb = boff.size - 1
+    P = outhi.size
+    vm = np.uint64((1 << bits) - 1)
+    M = np.int64(0xFFFFFFFF)
+    for t in prange(P):
+        a = nb * t // P
+        e = nb * (t + 1) // P
+        root = np.empty(BR, np.int32)
+        code = np.empty(BR, np.int64)
+        wt = np.empty(BR, np.int64)
+        hi = np.int64(0)
+        lo = np.int64(0)
+        for b in range(a, e):
+            n = min(BR, N - b * BR)
+            p = (base + boff[b]) * 8
+            nl = 0
+            for i in range(n):
+                w = _e20_load(buf, p >> 3) >> np.uint64(p & 7)
+                if (w & np.uint64(1)) == 0:
+                    code[nl] = np.int64((w >> np.uint64(1)) & vm)
+                    wt[nl] = 1
+                    root[i] = nl
+                    nl += 1
+                    p += 1 + bits
+                else:
+                    k = np.int64((w >> np.uint64(1)) & np.uint64(15))
+                    g = (np.int64(1) << k) | np.int64((w >> np.uint64(5)) & np.uint64((1 << k) - 1))
+                    r = root[i - g]
+                    root[i] = r
+                    wt[r] += 1
+                    p += 5 + k
+            for j in range(nl):
+                v = tab[code[j]]
+                hi += wt[j] * (v >> 32)
+                lo += wt[j] * (v & M)
+        outhi[t] = hi
+        outlo[t] = lo
+
+
 # THE FOLD THROUGH THE DICTIONARY'S OWN FRAMES (2026-10-19). An exact SUM over a big integer dictionary
 # used to inflate the whole chunked spine first (WatchID: 100M values, 800 MB written, ~0.5 s) and then
 # fold counts x values in numpy on one thread (0.26 s). Here each thread asks libzstd to inflate one
@@ -8040,6 +8087,33 @@ if HAVE_NUMBA:
                     break
             outhi[t] = hi
             outlo[t] = lo
+
+
+    @njit(cache=True, parallel=True)
+    def i2_inflate(zfn, src, zabs, CH, dctx, out, err):
+        """a chunked integer dictionary unzipped into out (len >= frames x CH) in compiled lanes: each lane asks libzstd to
+        inflate its frames straight into out (int64 deltas restarting at 0 per frame), then runs the sum in place --
+        RefererHash's 21.6M values in 22 ms, where the one-thread spine took 247. err[t] = 1 as i2_fold."""
+        P = dctx.size
+        nch = zabs.size - 1
+        base = np.uint64(out.ctypes.data)
+        cap = np.uint64(CH * 8)
+        for t in prange(P):
+            a = nch * t // P
+            b = nch * (t + 1) // P
+            for j in range(a, b):
+                dst = base + np.uint64(j) * cap
+                r = _zcall5(zfn, np.uint64(dctx[t]), dst, cap, np.uint64(src) + np.uint64(zabs[j]),
+                            np.uint64(zabs[j + 1] - zabs[j]))
+                if r > cap or r % np.uint64(8) != 0:
+                    err[t] = 1
+                    break
+                m = np.int64(r // np.uint64(8))
+                k0 = np.int64(j) * CH
+                v = np.int64(0)
+                for i in range(m):
+                    v += out[k0 + i]
+                    out[k0 + i] = v
 
 
 # THE FRAME DECODE IN COMPILED LANES (2026-10-21, the Q25 board's last 2x): an enc-3 / enc-18 full decode ran its

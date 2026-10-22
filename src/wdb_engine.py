@@ -40,7 +40,10 @@ _POOL = None
 _ZLANES = [__import__('os').environ.get('WDB_ZLANES', '1') == '1']
 _RPF = [__import__('os').environ.get('WDB_RPF', '1') != '0']      # the repeats-per-frame fold
 _RPF_MAX = [float(__import__('os').environ.get('WDB_RPF_MAX', '1.0'))]   # its switch: repeats per frame below this
-_RPF_HITS = 0   # A/B: 0 = enc-3/18 decodes in the thread pool
+_RPF_HITS = 0
+_E20RS = [__import__('os').environ.get('WDB_E20_READSUM', '1') != '0']   # the read-values sum (enc 20)
+_E20RS_MIN = [int(__import__('os').environ.get('WDB_E20_READSUM_MIN', '0'))]   # a dictionary-size floor (the sweep found none)
+_E20RS_HITS = 0   # A/B: 0 = enc-3/18 decodes in the thread pool
 _PIPE3 = [__import__('os').environ.get('WDB_PIPE3', '1') == '1']   # A/B: 0 restores read-all-then-decode for enc-3
 _PIPE19 = [__import__('os').environ.get('WDB_PIPE19', '1') == '1'] # A/B: 0 restores warm_span-then-decode for enc 19
 _FWR = [__import__('os').environ.get('WDB_FW', '1') == '1']        # A/B: 0 restores the general-width readers (wdb_fw)
@@ -2527,6 +2530,45 @@ class Segment:
             return False
         import wdb_kernels as _WK
         return _WK.HAVE_NUMBA and _libzstd() is not None
+
+    def e20_read_sum(self, nm):
+        """THE READ-VALUES SUM (Jackson's order of operations, 2026-10-22, Q29's RefererHash): (exact SUM, rows) of a
+        back-reference (enc 20) integer column, or None. SUM needs the values added, not counts: the census wrote a mark
+        per row on a board of V counters hit at random (RefererHash: 194 ms for 21.6M counters) and then multiplied.
+        Here (1) the dictionary unzips into an array in compiled lanes (i2_inflate, 22 ms) and (2) each block is walked
+        once to weigh its literals by the rows that lead back to them, then reads value x weight per literal in a loop
+        of its own (e20_read_sum) -- reads overlap where writes collide. RefererHash: census + fold 208 ms -> 113.
+        THE SWITCH: SUM / AVG over enc 20 with a chunked integer dictionary, no NULLs, codes not decoded already (then
+        the census over them is the cheaper road). The size sweep (20M-row columns, census + fold vs this, all exact):
+        64K values 22.2 vs 19.0 ms, 256K 21.5 vs 16.1, 1M 26.2 vs 15.2, 4M 66.1 vs 19.8, 9.5M 124.3 vs 45.6 -- never
+        slower, so no size line (WDB_E20_READSUM_MIN can set one). WDB_E20_READSUM=0 declines."""
+        c = self.cols[nm]
+        if (not _E20RS[0] or c.get('code_enc') != 20 or c.get('mode') != 2 or c.get('has_null')
+                or c.get('dt', 0) != 0 or nm in self._codes or not self.i2_foldable(nm)):
+            return None
+        nd = int(c.get('n_dict', c['V']))
+        if nd < _E20RS_MIN[0]:
+            return None
+        import wdb_kernels as _WK
+        CH = int(c['i2ch']); zo = np.asarray(c['i2zoffs'], np.int64); nch = int(zo.size) - 1
+        if nch * CH < nd:
+            return None
+        base = int(c['i2base'])
+        self.warm_span(base + int(zo[0]), base + int(zo[-1]))
+        P = int(_WK.wide_threads())
+        tab = np.empty(nch * CH, np.int64)
+        ok = self._zlanes(lambda zfn, dctx, err: _WK.run_wide(
+            _WK.i2_inflate, np.uint64(zfn), np.uint64(self.buf.ctypes.data), zo + base, np.int64(CH), dctx, tab, err), P)
+        if not ok:
+            return None
+        boff = np.asarray(c['e20boff'], np.int64)
+        self.warm_span(int(c['cstart']) + int(boff[0]), int(c['cstart']) + int(boff[-1]))
+        oh = np.zeros(P, np.int64); ol = np.zeros(P, np.int64)
+        _WK.run_wide(_WK.e20_read_sum, np.frombuffer(self.buf, np.uint8), np.int64(c['cstart']), np.int64(c['e20BR']),
+                     np.int64(self.N), np.int64(c['e20bits']), boff, tab, oh, ol)
+        global _E20RS_HITS
+        _E20RS_HITS += 1
+        return (sum(int(x) for x in oh) << 32) + sum(int(x) for x in ol), int(self.N)
 
     def rpf_sum(self, nm):
         """THE REPEATS-PER-FRAME FOLD (Jackson, 2026-10-21, Q29's WatchID): (exact SUM, rows) of a big integer
