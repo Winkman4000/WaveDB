@@ -5449,6 +5449,33 @@ def _big_census_nb(codes, SH, T, out):
                 out[c] += 1
 
 
+@njit(cache=True, nogil=True)
+def count_desc_order(cn):
+    """THE COUNT ORDER IN TWO PASSES (2026-10-22, Q7's board): the squares with cn > 0, by count descending and, within
+    a count, by code ascending (a value-sorted dictionary: value ascending) -- counts are small integers, so one pass
+    buckets them and one places the squares: linear, where a sort of 17.6M groups took 744 ms (this: 104)."""
+    mx = 0
+    for v in cn:
+        if v > mx:
+            mx = v
+    h = np.zeros(mx + 2, np.int64)
+    for v in cn:
+        if v > 0:
+            h[v] += 1
+    off = np.zeros(mx + 2, np.int64)
+    s = 0
+    for v in range(mx, 0, -1):
+        off[v] = s
+        s += h[v]
+    out = np.empty(s, np.int64)
+    for i in range(cn.size):
+        v = cn[i]
+        if v > 0:
+            out[off[v]] = i
+            off[v] += 1
+    return out
+
+
 def bincount_par(codes, minlength):
     """THE PARALLEL CENSUS: np.bincount of 100M codes is one thread for 300 ms (plus an astype
     copy); this is per-thread boards and a reduce, measured ~60 ms. Boards cost T*V*4 bytes, so

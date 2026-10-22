@@ -21,6 +21,7 @@ import wdb_wherescan as WS
 E = wdb_sql.E
 _HITS = 0
 _NOLIM_MAX = 4096                    # without a LIMIT, at most this many groups (one point-fetch each)
+_BULK = [__import__('os').environ.get('WDB_GS_BULK', '1') != '0']   # past it: the bulk path
 
 
 def _term(cj, col):
@@ -208,7 +209,10 @@ def execute(seg, spec):
         _HITS += 1
         return [], hdrs
     if spec['lim'] is None and nlive > _NOLIM_MAX:
-        return None                  # every group, one point-fetch each: the scan path's job
+        if (rep is not None or not _BULK[0] or spec['ki'] not in (0, 1) or spec['ci'] != 1 - spec['ki']
+                or len(spec['order'].expressions) != 1):   # ORDER BY the count alone: ties are SQL's to leave
+            return None              # every group, one point-fetch each: the scan path's job
+        return _bulk_rows(seg, col, c, np.where(live, cn, 0), nlive, spec, hdrs)
     k = nlive if spec['lim'] is None else min(spec['lim'], nlive)
     if nlive > k and len(spec['order'].expressions) == 1:
         # THE CANONICAL TOP (2026-10-18): ORDER BY the count alone -- a tie at the LIMIT is SQL's to leave
@@ -243,5 +247,62 @@ def execute(seg, spec):
         row[spec['ci']] = int(cn[g])
         rows.append(tuple(row))
     rows = workers.finalize(rows, spec['proj'], spec['order'], spec['lim'])
+    _HITS += 1
+    return rows, hdrs
+
+
+def _bulk_values(seg, col, c, sel):
+    """The values of codes `sel` in bulk, as the per-group fetch would give them (wdb_sql._pyval of seg.fetch): ints and
+    floats from the typed dictionary, times through datetime64 of the column's unit (a day -> date, finer -> datetime),
+    text decoded from bytes. None: not a shape handled here (the caller declines)."""
+    if c.get('mode') not in (0, 1, 2) or seg._effective(col) is not None:
+        return None
+    dt = c.get('dt')
+    td = seg._typed_dict(col)
+    if dt in (0, 2):
+        if c.get('aux') == 9:
+            return None
+        return np.asarray(td)[sel].tolist()
+    if dt == 3:
+        unit = seg.unit(col)
+        a = np.asarray(td, np.int64)[sel].astype('datetime64[%s]' % unit)
+        return a.tolist() if unit == 'D' else a.astype('datetime64[us]').tolist()
+    if dt == 1:
+        out = []
+        for v in (td[sel] if isinstance(td, np.ndarray) else [td[i] for i in sel.tolist()]):
+            if isinstance(v, (bytes, bytearray)):
+                try:
+                    v = v.decode('utf-8', 'surrogatepass')
+                except Exception:
+                    pass
+            out.append(v)
+        return out
+    return None
+
+
+def _bulk_rows(seg, col, c, board, nlive, spec, hdrs):
+    """THE COUNTING PATH WITHOUT A CAP (2026-10-22, Q7's board): GROUP BY K ORDER BY COUNT(*) with no LIMIT and more than
+    _NOLIM_MAX groups. It declined (one point-fetch per group), and the shape fell to wherescan's row-level grouping:
+    ResponseEndTiming's 28K groups 0.68 s (DuckDB 0.077), LocalEventTime / ClientEventTime / UserID / RefererHash past
+    10 s. Here the board is ordered by count in two linear passes (wdb_kernels.count_desc_order: count descending, code
+    ascending -- the small path's argsort order) and the winners' values come from the dictionary in bulk. The rows are
+    built in their final order, so finalize's re-sort is skipped. The working-set guard still names a result too big to
+    hold as Python rows (WatchID's 100M groups). WDB_GS_BULK=0 declines as before."""
+    global _HITS
+    import wdb_govern, wdb_kernels
+    wdb_govern.ask(nlive, 2, 'grouped result')
+    mx = int(board.max())
+    if mx > 16 * board.size:
+        # one huge count against few groups: the buckets would outnumber the squares -- sort the live squares instead
+        # (count descending, code ascending: the same order)
+        idx = np.flatnonzero(board > 0)
+        sel = idx[np.argsort(-board[idx], kind='stable')]
+    else:
+        sel = wdb_kernels.count_desc_order(board)
+    vals = _bulk_values(seg, col, c, sel)
+    if vals is None:
+        return None
+    cnt = board[sel].tolist()
+    rows = list(zip(vals, cnt)) if spec['ki'] == 0 else list(zip(cnt, vals))
     _HITS += 1
     return rows, hdrs
