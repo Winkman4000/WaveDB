@@ -7864,6 +7864,71 @@ def e20_eq_fill(buf, base, BR, N, bits, boff, lo, hi, t, neg, scr, offs, out):
                     w9 += 1
 
 
+
+@njit(cache=True, parallel=True, nogil=True)
+def e20_pattern_blocks(buf, base, boff, blocks, bits, P, table, cand):
+    """THE DIFFERENTIATION PATH, step 1 (Jackson, 2026-10-21): which blocks b0 .. b1-1 of a back-reference column can
+    hold code t, found by searching their raw bytes for t's literal, the (bits+1)-bit pattern P = t << 1, without
+    parsing a row. Wherever P starts (bit o of byte B), bytes B+1 and B+2 lie wholly inside it (needs bits >= 23);
+    table[16 bits of bytes X, X+1] holds which starting bits o those 16 bits can be; only then is the whole
+    pattern tested. cand[j] = 1: block blocks[j] may hold t (a stray match costs one block's walk, never a row).
+    A block within 8 bytes of the buffer's end is always a candidate (the search never reads past it)."""
+    M = np.uint64((1 << (bits + 1)) - 1)
+    L = buf.size
+    for j in prange(blocks.size):
+        b = blocks[j]
+        s = base + boff[b]; e = base + boff[b + 1]
+        if e + 8 > L:
+            cand[j] = 1
+            continue
+        found = 0
+        for X in range(s + 1, e):
+            m = table[np.int64(buf[X]) | (np.int64(buf[X + 1]) << 8)]
+            if m != 0:
+                B = X - 1
+                w = np.uint64(0)
+                for k in range(5):
+                    w |= np.uint64(buf[B + k]) << np.uint64(8 * k)
+                for o in range(8):
+                    if (m >> o) & 1 and ((w >> np.uint64(o)) & M) == P:
+                        found = 1
+        cand[j] = found
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def e20_eq_list(buf, base, BR, N, bits, boff, blocks, lo, hi, t, offs, out, fill):
+    """step 2: the exact walk (e20_eq_count's) of only the listed blocks. fill = False: rows in [lo, hi) holding t,
+    per listed block, into offs[j + 1]; fill = True: their positions at offs[j] onward in out"""
+    vm = np.uint64((1 << bits) - 1)
+    for j in prange(blocks.size):
+        blk = blocks[j]
+        r0 = blk * BR
+        n = min(BR, N - r0)
+        p = (base + boff[blk]) * 8
+        hit = np.zeros(n, np.bool_)
+        c = 0
+        w9 = offs[j]
+        for i in range(n):
+            w = _e20_load(buf, p >> 3) >> np.uint64(p & 7)
+            if (w & np.uint64(1)) == 0:
+                h = np.int64((w >> np.uint64(1)) & vm) == t
+                p += 1 + bits
+            else:
+                k = np.int64((w >> np.uint64(1)) & np.uint64(15))
+                g = (np.int64(1) << k) | np.int64((w >> np.uint64(5)) & np.uint64((1 << k) - 1))
+                h = hit[i - g]
+                p += 5 + k
+            hit[i] = h
+            if h and r0 + i >= lo and r0 + i < hi:
+                if fill:
+                    out[w9] = r0 + i
+                    w9 += 1
+                else:
+                    c += 1
+        if not fill:
+            offs[j + 1] = c
+
+
 # THE FOLD THROUGH THE DICTIONARY'S OWN FRAMES (2026-10-19). An exact SUM over a big integer dictionary
 # used to inflate the whole chunked spine first (WatchID: 100M values, 800 MB written, ~0.5 s) and then
 # fold counts x values in numpy on one thread (0.26 s). Here each thread asks libzstd to inflate one
