@@ -68,7 +68,7 @@ _READ_ORDER = (
     R.smallk,              # narrow-key pair/triple boards (the small-K weapon)             # two-key COUNT(*) top-K via grid filled-cell + count-ordered head (opt-in)
     R.sumtopk,             # single big-key SUM top-K: one kernel, k label decodes
     R.distinctlim,         # DISTINCT-LIMIT early exit: stops at n pairs, streams never fully read
-    R.diskpair,             # disk-only pair GROUP BY: scan-merge floor beneath the structures
+    R.diskpair,             # disk-only bare SELECT DISTINCT (its COUNT top-K lane retired 2026-10-23)
     R.countpos,             # two-key COUNT(*) top-K via per-row count-class presence-scan (opt-in)
     R.heavypair,            # two-key COUNT(*) top-N from a count-sorted pair sidecar
     R.scanpair,             # two-key COUNT(*) top-N, high-card non-key filter via code-space scan

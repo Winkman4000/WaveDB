@@ -1,7 +1,7 @@
 """
 wdb_smallk -- the small-K weapon: GROUP BY 2-3 narrow keys + COUNT(*), answered by
 one fused pass over raw code streams onto a composite bean board. The router's twin
-gates: diskpair owns wide dictionaries; this owns products up to _CAP cells. Built
+gates: wide dictionaries go on to the general reads; this owns products up to _CAP cells. Built
 the day the ten-worst-ratios list showed pair/triple counting at the pandas desk.
 Also serves ROLLUP/CUBE for free: groupsets' finest sub-query re-enters db.run and
 lands here.
@@ -73,7 +73,7 @@ def detect(seg, tree, col_map):
     for v in spans:
         total *= v
     if total > _CAP:
-        return None                                  # wide territory: diskpair's desk
+        return None                                  # wide territory: the general reads (wdb_bound)
     od = tree.args.get('order')
     desc = None
     if od is not None:

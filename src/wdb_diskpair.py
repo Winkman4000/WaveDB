@@ -1,23 +1,22 @@
-"""diskpair: disk-only N-key GROUP BY COUNT top-K -- the scan-merge read.
+"""diskpair: disk-only bare SELECT DISTINCT over 1-4 keys -- the scan-merge read.
 
-The proof that pair structures are optional, generalized to any key count. The bare shape
-(SELECT k1..kN, COUNT(*) GROUP BY k1..kN ORDER BY count DESC LIMIT k, no WHERE) is answered by
-streaming the blocked (enc=3) code frames -- never touching the codes cache, never consulting a
-structure. Measured: Q16 (2-key) 0.70-0.84 s vs DuckDB 0.79-0.89, exact, wins.
+THE COUNT LANE RETIRED (2026-10-23, Jackson). This read was built for SELECT k1..kN, COUNT(*) GROUP BY ...
+ORDER BY COUNT(*) DESC LIMIT k, before the census, the heavy split, the flat bucket scan (wdb_bound) and the
+fused counts existed. Measured against the read behind it (fused_agg -> wdb_bound) on every count query it
+claimed, same counts each time: ResponseEndTiming x minute x Robotness 1.362 -> 0.740 s, Referer x minute x
+TraficSourceID 2.230 -> 1.005, ResponseStartTiming x minute x SilverlightVersion1 1.471 -> 0.379, minute x
+Robotness 0.641 -> 0.252, ResponseEndTiming x Robotness x PageCharset 1.155 -> 0.776 (dpvs.py, dpvs2.py). Its
+one-thread bill (dpprof.py): the frames' decompress 4%, the minute by a binary search per row 22%, the i64 key
+fold 8%, the concatenate 5%, np.unique's sort 61% -- nowhere near the bytes' floor. It now declines every
+aggregate; the count queries go to the general reads.
 
-Keys may be blocked dict columns or ONE derived minute-of(EventTime) key: the stair column's
-step rows give each block's codes by searchsorted (no decode), and a 1.4M-entry code->minute
-table (dict seconds // 60 % 60) turns them into the derived key -- the stripe insight: row
-position IS the timestamp, so the third key is nearly free.
-
-Pipeline: parallel per-thread block scan -> progressive radix key fold (declines if the key
-space overflows i64) -> [2-key only] NORM SPLIT: a dominant first-block code (SearchPhrase's ''
-at 86.8%) collapses its rows to the other key: dense bincount lane, vectorized merge -> per-
-thread sorted partials -> wdb_kernels.kway_topk: numba loser-tree merge streaming equal-key
-accumulation into a top-K heap, merged stream never materialized -> winners decoded by fetches.
-
-Placement: AFTER gridwalk. Resident structures answer in ~2.5 ms and should; this is the floor
-beneath them. Residency stays a promotion, never a requirement.
+What stays: bare DISTINCT (no GROUP BY / ORDER BY, LIMIT optional), which still beats the general path
+(DISTINCT ResponseEndTiming, Robotness 1.145 s vs 2.370; DuckDB 0.314 -- both behind, the dense grid's next).
+The blocked (enc=3) code frames are streamed -- never touching the codes cache -- keys may be blocked dict
+columns, a scalar over one, or ONE derived minute-of(EventTime) key off the stair column's step rows (the
+1.4M-entry code->minute table: row position IS the timestamp). Parallel per-thread block scan -> mixed-radix
+i64 key fold (declines if the key space overflows i64) -> per-thread np.unique (a dense mark when the key
+space is small) -> one merge -> decode.
 """
 import numpy as np
 import zstandard as zstd
@@ -31,9 +30,8 @@ import wdb_scalar
 _ENABLED = True
 _HITS = 0
 _SCAN_THREADS = 14
-_NORM_MIN_SHARE = 0.5
 _MAX_KEYS = 4
-_DENSE_KS = 1 << 22        # key spaces up to this many slots are counted in place (one int64 array per worker)
+_DENSE_KS = 1 << 22        # key spaces up to this many slots are marked in place (one int64 array per worker)
 
 
 def enable():
@@ -69,23 +67,19 @@ def detect(seg, tree, col_map):
         if _n5 in seg.cols and seg.cols[_n5].get('code_enc') in (5, 6):
             return None
     if not _ENABLED:                    return None
+    if not tree.args.get('distinct'):   return None     # the count lane is retired (docstring)
     if not P.no_joins(tree):            return None
-    distinct = bool(tree.args.get('distinct'))
-    if not distinct and not P.no_select_distinct(tree):
-        return None
     if not P.no_having(tree):           return None
     if not P.no_deleted_rows(seg):      return None
     if tree.args.get('where') is not None:
         return None
+    if tree.args.get('group') is not None or tree.args.get('order') is not None:
+        return None                      # bare DISTINCT only (no group/order); LIMIT optional
     proj = tree.expressions
-    keys, cnt_pi = [], None
+    keys = []
     for pi, p in enumerate(proj):
-        ak = wdb_sql._agg_kind(p)
-        if ak is not None:
-            if ak[0] != 'COUNT_STAR' or cnt_pi is not None:
-                return None
-            cnt_pi = pi
-            continue
+        if wdb_sql._agg_kind(p) is not None:
+            return None                  # keys only, no aggregates
         mk = _minute_key(p, seg, col_map)
         if mk is not None:
             keys.append((pi, mk))
@@ -107,11 +101,8 @@ def detect(seg, tree, col_map):
         if c.get('mode') not in (0, 1, 2) or c.get('code_enc') != 3:
             return None
         keys.append((pi, {'kind': 'col', 'src': col, 'V': int(c['V'])}))
-    if distinct:
-        if cnt_pi is not None or not (1 <= len(keys) <= _MAX_KEYS):
-            return None                  # DISTINCT mode: keys only, no aggregates
-    elif cnt_pi is None or not (1 <= len(keys) <= _MAX_KEYS):
-        return None                      # single-key: the fold degenerates, the merge still applies
+    if not (1 <= len(keys) <= _MAX_KEYS):
+        return None
     if sum(1 for _pi, k in keys if k['kind'] == 'minute') > 1:
         return None
     span = 1
@@ -119,44 +110,9 @@ def detect(seg, tree, col_map):
         span *= k['V']
         if span > (1 << 62):
             return None                 # composite would overflow the i64 key fold
-    group = tree.args.get('group')
-    if distinct:
-        if group is not None or tree.args.get('order') is not None:
-            return None                  # v1: bare DISTINCT (no group/order); LIMIT optional
-        lim = wdb_sql._limit(tree)
-        return {'keys': keys, 'cnt_pi': None, 'distinct': True,
-                'lim': None if lim is None else int(lim),
-                'off': int(wdb_sql._offset(tree) or 0), 'proj': proj}
-    if group is None or len(group.expressions) != len(keys):
-        return None
-    order = tree.args.get('order')
-    if order is None or len(order.expressions) != 1:
-        return None
-    oe = order.expressions[0]
-    if not oe.args.get('desc'):
-        return None
-    onm = oe.this
-    if isinstance(onm, E.Column):
-        if onm.name not in (wdb_sql._alias(proj[cnt_pi]), 'COUNT', 'count'):
-            return None
-    elif wdb_sql._agg_kind(onm) is None or wdb_sql._agg_kind(onm)[0] != 'COUNT_STAR':
-        return None
     lim = wdb_sql._limit(tree)
-    if lim is None or lim <= 0 or lim > 10000:
-        return None
-    off = wdb_sql._offset(tree) or 0
-    return {'keys': keys, 'cnt_pi': cnt_pi, 'lim': int(lim), 'off': int(off), 'proj': proj}
-
-
-def _modal_share(seg, col):
-    c = seg.cols[col]
-    dz = zstd.ZstdDecompressor()
-    bo = c['boffs']; base = c['cstart']
-    wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
-    raw = np.frombuffer(dz.decompress(seg.buf[base + int(bo[0]):base + int(bo[1])].tobytes()), dtype=wdt)
-    bc = np.bincount(raw)
-    m = int(bc.argmax())
-    return m, bc[m] / raw.size
+    return {'keys': keys, 'lim': None if lim is None else int(lim),
+            'off': int(wdb_sql._offset(tree) or 0), 'proj': proj}
 
 
 def _block_geometry(seg, keys):
@@ -212,25 +168,15 @@ def execute(seg, spec):
             c = seg.cols[k['src']]
             readers.append(('col', (c['boffs'], c['cstart'],
                                     {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']])))
-    # norm lane: 2 plain dict keys only (counting aid -- DISTINCT has no counts to split)
-    norm_idx = -1; norm_code = -1
-    if not spec.get('distinct') and len(keys) == 2 and all(k['kind'] == 'col' for _pi, k in keys):
-        m0, s0 = _modal_share(seg, keys[0][1]['src'])
-        m1, s1 = _modal_share(seg, keys[1][1]['src'])
-        if s1 >= _NORM_MIN_SHARE and s1 >= s0:
-            norm_idx, norm_code = 1, m1
-        elif s0 >= _NORM_MIN_SHARE:
-            norm_idx, norm_code = 0, m0
     radix = [k['V'] for _pi, k in keys]
     KS = 1
     for _r9 in radix:
         KS *= int(_r9)
     buf = seg.buf
-    K10 = spec['off'] + (spec['lim'] or 0)   # unused in DISTINCT mode (lim may be None)
 
     def work(js):
         dz = zstd.ZstdDecompressor()
-        norm_vals, exc = [], []
+        exc = []
         for j in js:
             a, b = j * BR, min(N, (j + 1) * BR)
             cols = []
@@ -256,110 +202,54 @@ def execute(seg, spec):
             key = cols[0].astype(np.int64)
             for ci in range(1, len(cols)):
                 key = key * radix[ci] + cols[ci]
-            if norm_idx >= 0:
-                nm = cols[norm_idx] == norm_code
-                oth = cols[1 - norm_idx]
-                norm_vals.append(np.asarray(oth[nm]))
-                exc.append(key[~nm])
-            else:
-                exc.append(key)
-        tab = (np.bincount(np.concatenate(norm_vals), minlength=radix[1 - norm_idx]).astype(np.int32)
-               if norm_idx >= 0 and norm_vals else None)
+            exc.append(key)
         ek = np.concatenate(exc) if exc else np.empty(0, np.int64)
         if 0 < KS <= _DENSE_KS and ek.size > KS // 4:
-            # THE DENSE COUNT (2026-10-05): a key space this small is counted in place, no sort -- np.unique
+            # THE DENSE COUNT (2026-10-05): a key space this small is marked in place, no sort -- np.unique
             # sorted each worker's ~6M keys (a third of GROUP BY SUBSTR(URL, 1, 20) once the keys were cheap)
             acc = np.zeros(KS, np.int64)
             K.count_into(ek, acc)
-            g = np.flatnonzero(acc)
-            return tab, g, acc[g]
-        g, c = np.unique(ek, return_counts=True)
-        return tab, g, c.astype(np.int64)
+            return np.flatnonzero(acc)
+        return np.unique(ek)
 
     W = min(_SCAN_THREADS, NB) or 1
     with ThreadPoolExecutor(W) as ex:
         parts = list(ex.map(work, np.array_split(np.arange(NB), W)))
-    if spec.get('distinct'):
-        uniq = np.unique(np.concatenate([p[1] for p in parts]))
-        if spec['off'] or spec['lim'] is not None:
-            end = None if spec['lim'] is None else spec['off'] + spec['lim']
-            uniq = uniq[spec['off']: end]
-        # decompose composites into per-key code columns
-        comp = uniq
-        keycodes = []
-        for ci in range(len(keys) - 1, -1, -1):
-            keycodes.append(comp % radix[ci]); comp = comp // radix[ci]
-        keycodes.reverse()
-        # decode: point fetches when small, one bulk dict gather per column when large
-        BULK = uniq.size > 10000
-        colvals = []
-        for (pi, k), codes in zip(keys, keycodes):
-            if k['kind'] == 'minute':
-                colvals.append(codes.astype(np.int64))
-            elif k['kind'] == 'scalar':
-                svals = wdb_scalar.surrogate(seg, k['spec'])[1]
-                colvals.append([svals[int(c)] for c in codes] if not BULK
-                               else np.array(svals, dtype=object)[codes])
-            elif BULK:
-                dvals = np.array(seg._typed_dict(k['src']), dtype=object)
-                colvals.append(dvals[codes])
-            else:
-                colvals.append([wdb_sql._pyval(seg.fetch(k['src'], int(c))) for c in codes])
-        out = []
-        for ri in range(uniq.size):
-            row = [None] * len(spec['proj'])
-            for (pi, k), cv in zip(keys, colvals):
-                v = cv[ri]
-                if isinstance(v, (bytes, bytearray)):
-                    v = v.decode('utf-8', 'replace')
-                elif hasattr(v, 'item'):
-                    v = v.item()
-                row[pi] = v
-            out.append(tuple(row))
-        global _HITS
-        _HITS += 1
-        return out, [wdb_sql._alias(p) for p in spec['proj']]
-    kk = np.concatenate([p[1] for p in parts])
-    vv = np.concatenate([p[2] for p in parts])
-    offs = np.zeros(len(parts) + 1, np.int64)
-    np.cumsum([p[1].size for p in parts], out=offs[1:])
-    tc, tk = K.kway_topk(kk, vv, offs, K10)
-    cand = [(int(tc[i]), int(tk[i])) for i in range(K10) if tc[i] > 0]
-    if norm_idx >= 0:
-        etab = None
-        for p in parts:
-            if p[0] is not None:
-                etab = p[0] if etab is None else etab + p[0]
-        if etab is not None:
-            if K.HAVE_NUMBA:
-                ec, ek2 = K.top10_i32(etab, K10)
-            else:
-                ti = np.argpartition(-etab, min(K10, etab.size - 1))[:K10]
-                ec, ek2 = etab[ti].astype(np.int64), ti.astype(np.int64)
-            for i in range(len(ec)):
-                if ec[i] > 0:
-                    oc = int(ek2[i])
-                    comp = (oc * radix[1] + norm_code) if norm_idx == 1 else (norm_code * radix[1] + oc)
-                    cand.append((int(ec[i]), comp))
-    cand.sort(key=lambda x: (-x[0], x[1]))
-    cand = cand[spec['off']: spec['off'] + spec['lim']]
+    uniq = np.unique(np.concatenate(parts))
+    if spec['off'] or spec['lim'] is not None:
+        end = None if spec['lim'] is None else spec['off'] + spec['lim']
+        uniq = uniq[spec['off']: end]
+    # decompose composites into per-key code columns
+    comp = uniq
+    keycodes = []
+    for ci in range(len(keys) - 1, -1, -1):
+        keycodes.append(comp % radix[ci]); comp = comp // radix[ci]
+    keycodes.reverse()
+    # decode: point fetches when small, one bulk dict gather per column when large
+    BULK = uniq.size > 10000
+    colvals = []
+    for (pi, k), codes in zip(keys, keycodes):
+        if k['kind'] == 'minute':
+            colvals.append(codes.astype(np.int64))
+        elif k['kind'] == 'scalar':
+            svals = wdb_scalar.surrogate(seg, k['spec'])[1]
+            colvals.append([svals[int(c)] for c in codes] if not BULK
+                           else np.array(svals, dtype=object)[codes])
+        elif BULK:
+            dvals = np.array(seg._typed_dict(k['src']), dtype=object)
+            colvals.append(dvals[codes])
+        else:
+            colvals.append([wdb_sql._pyval(seg.fetch(k['src'], int(c))) for c in codes])
     out = []
-    for n, comp in cand:
-        parts_k = []
-        rem = comp
-        for ci in range(len(keys) - 1, -1, -1):
-            parts_k.append(rem % radix[ci]); rem //= radix[ci]
-        parts_k.reverse()
+    for ri in range(uniq.size):
         row = [None] * len(spec['proj'])
-        for (pi, k), code in zip(keys, parts_k):
-            if k['kind'] == 'minute':
-                row[pi] = int(code)
-            elif k['kind'] == 'scalar':
-                v = wdb_scalar.surrogate(seg, k['spec'])[1][int(code)]
-                row[pi] = v.item() if hasattr(v, 'item') else v
-            else:
-                row[pi] = wdb_sql._pyval(seg.fetch(k['src'], int(code)))
-        row[spec['cnt_pi']] = n
+        for (pi, k), cv in zip(keys, colvals):
+            v = cv[ri]
+            if isinstance(v, (bytes, bytearray)):
+                v = v.decode('utf-8', 'replace')
+            elif hasattr(v, 'item'):
+                v = v.item()
+            row[pi] = v
         out.append(tuple(row))
     _HITS += 1
     return out, [wdb_sql._alias(p) for p in spec['proj']]
