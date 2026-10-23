@@ -101,7 +101,10 @@ def test_gridwalk_bulk_path_beyond_head():
     WaveDB-without-gridwalk and the pandas ground truth."""
     d = os.path.join(tempfile.gettempdir(), f'gwb_{uuid.uuid4().hex[:8]}')
     old_head = GW._HEAD_N
-    try:
+    import wdb_sampletop as _ST
+    old_census = _ST._CENSUS[0]
+    _ST._CENSUS[0] = False                               # the census road serves this shape first (4fa2074): this
+    try:                                                 # test is about gridwalk's bulk, so the road stands aside
         db, seg, df = _build(d)
         GW._HEAD_N = 2                                   # head holds 2; LIMIT>2 -> bulk
         GW._CACHE.clear()                                # drop any head-200k cache from prior tests
@@ -117,6 +120,7 @@ def test_gridwalk_bulk_path_beyond_head():
             assert _ident_above(on) == _ident_above(off), f'bulk L{lim} identity on!=off'
     finally:
         GW._HEAD_N = old_head; GW._CACHE.clear(); GW.enable(); shutil.rmtree(d, ignore_errors=True)
+        _ST._CENSUS[0] = old_census
 
 
 def test_gridwalk_bulk_codec_roundtrip():

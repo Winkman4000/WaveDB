@@ -22,14 +22,14 @@ def _serve(q, full_ns=1e6):
     _db, _con, seg = F._fixture()
     spec = ST.detect(seg, sqlglot.parse_one(q, read='duckdb'), {})
     assert spec is not None and spec.get('road') == 'census', (q, spec and spec.get('road'))
-    old = ST._FULL_NS[0], ST._FULL_WIDE_NS[0]
-    ST._FULL_NS[0] = ST._FULL_WIDE_NS[0] = full_ns
+    old = ST._FULL_SCALE[0]
+    ST._FULL_SCALE[0] = full_ns                   # the full count's price scaled: huge -> the road, tiny -> decline
     try:
         h0 = ST._CENSUS_HITS
         out = ST.execute(seg, spec)
         return spec, out, ST._CENSUS_HITS - h0
     finally:
-        ST._FULL_NS[0], ST._FULL_WIDE_NS[0] = old
+        ST._FULL_SCALE[0] = old
 
 
 def _legal(a, b, rows, k):
@@ -92,8 +92,11 @@ def test_cost_model_frames_and_rows():
     fake.cols['x']['V'] = 100
     fake.cols['y'] = dict(fake.cols['x'], V=50_000_000)
     assert ST._road_pays(fake, 'x', 'x', 10, 0.0, 10) and not ST._road_pays(fake, 'x', 'x', 10 ** 8, 0.2, 10)
-    # the full count's cost from the two keys' values: dense board (101 x 101 cells) vs past it (50M x 101)
+    # the full count's cost from the two keys: dense board (101 x 101 cells) -- both decodes + the grid's count -- vs
+    # past it (50M x 101)
     assert ST._full_cost(fake, 'x', 'x') < ST._full_cost(fake, 'y', 'x')
+    assert abs(ST._full_cost(fake, 'x', 'x') - (2 * 0.27e-9 * 1e8 + 0.027 + 101 * 101 * 28e-9)) < 1e-6
+    assert ST._count_cost(1 << 22) < ST._count_cost((1 << 22) + 1) + 0.05     # the radix path past the fused line
     assert ST._road_pays(fake, 'y', 'x', 10, 0.4, 10) and not ST._road_pays(fake, 'x', 'x', 10, 0.4, 10)
 
 

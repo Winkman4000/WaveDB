@@ -308,8 +308,6 @@ _COST_DEFAULT = (100.0, 6500.0, 15.0, 0.015)
 _COUNT_NS = 6.0                   # the count per row read (board), measured beside a cheap partner
 _FIND_NS = 1.0                    # + per row, per halving: which drawn value a row holds (a search of m values;
                                   # the real road draws m <= k values)
-_FULL_NS = [float(os.environ.get('WDB_SAMPLE_FULL_NS', '3.7'))]   # the full count's cost per table row: the dense
-                                                                  # grid counts measured 3.7-5.5 ns (the cheapest 0.37 s)
 
 
 def _read_cost(seg, col, R):
@@ -331,25 +329,58 @@ def _read_cost(seg, col, R):
     return t
 
 
+_ROAD_FIXED = 0.015               # the road's own setup and emit (draw, flag, values_at), measured beside its parts
+
+
 def _road_cost(seg, b, a, R, t_census, m):
-    """the road past its census: one scan of the picker (a whole-column pass, estimated as the census just paid),
-    both keys read at the R rows, the count (each row's drawn value found among m: log2(m) halvings)"""
+    """the road past its census: one scan of the picker -- a whole-column pass: the census just paid, or the picker's
+    whole decode when the census came cheaper (a stored count; the flag scan still decodes) -- both keys read at the
+    R rows, the count (each row's drawn value found among m: log2(m) halvings), the fixed part"""
     find = _FIND_NS * max(1.0, float(np.log2(max(2, int(m)))))
-    return t_census + _read_cost(seg, b, R) + _read_cost(seg, a, R) + R * (_COUNT_NS + find) * 1e-9
+    scan = max(t_census, _decode_cost(seg, b))
+    return _ROAD_FIXED + scan + _read_cost(seg, b, R) + _read_cost(seg, a, R) + R * (_COUNT_NS + find) * 1e-9
 
 
 _FULL_WIDE_NS = [float(os.environ.get('WDB_SAMPLE_FULL_WIDE_NS', '45'))]   # past the dense board: the full count
                                                     # measured 49-86 ns per table row (Title / Referer / UserID / WatchID /
                                                     # RefererHash x IsMobile, 4.9-8.6 s)
 _DENSE_CELLS = 1 << 24            # gridwalk's dense board: (values of a) x (values of b) up to 16.7M cells
+_FULL_SCALE = [1.0]               # a test's lever on the full count's price
+# THE DENSE FULL COUNT, PRICED (2026-10-23, after gridwalk's build went to every core -- ba4bb89): it is the two
+# keys' whole decodes plus the grid's count (gsweep.py, the 70-pair sample timed both ways, plans re-keyed):
+#   decode, ns per row by encoding and width (<= 16 bits, wider), measured with caches flushed: enc 0 0.07 / 0.38
+#   (WatchID), 1 0.08, 2 0.06-0.08 / 0.43 (EventTime), 3 0.08-0.27 / 0.63-0.73, 5 0.35-0.39, 8 0.60, 9 0.20-0.24,
+#   10 0.08-0.24, 17 0.23-0.26, 18 0.48-0.54, 19 0.16 / 0.29-0.39, 20 1.05 -- the dearest of each bucket taken;
+#   the count: full - both decodes = 0.024-0.035 s to ~100K cells, 0.074-0.092 at 0.5-1.6M, 0.17-0.26 at 4.3-7.3M --
+#   the fused count's curve (fusesweep.py: ~28 ns a cell past its fixed part) to 4M cells, the radix path past it.
+_DEC_NS = {0: (0.07, 0.38), 1: (0.08, 0.08), 2: (0.08, 0.43), 3: (0.27, 0.73), 5: (0.39, 0.39), 8: (0.60, 0.60),
+           9: (0.24, 0.24), 10: (0.24, 0.24), 17: (0.26, 0.26), 18: (0.54, 0.54), 19: (0.16, 0.39), 20: (1.05, 1.05)}
+_DEC_DEFAULT = (0.60, 1.10)
+
+
+def _decode_cost(seg, col):
+    """seconds to decode col whole: ns per row by encoding and width (<= 16 bits / wider)"""
+    c = seg.cols[col]
+    lo, hi = _DEC_NS.get(int(c.get('code_enc') or 0), _DEC_DEFAULT)
+    return (hi if int(c.get('bits') or 0) > 16 else lo) * 1e-9 * int(seg.N)
+
+
+def _count_cost(cells):
+    """seconds for the dense grid's count: the fused count to 4M cells, the radix path past it"""
+    if cells <= (1 << 22):
+        return 0.027 + cells * 28e-9
+    return 0.17 + cells * 5e-9
 
 
 def _full_cost(seg, b, a):
-    """the full count's cost, from the two keys' value counts: the dense grid count when its board fits (measured
-    0.37-0.70 s, 3.7-7 ns per table row; the cheapest taken), else the wide count"""
+    """the full count's cost from the two keys: dense -- both decodes + the grid's count; past the dense board -- the
+    wide count's measured cost per table row"""
     cells = (int(seg.cols[b]['V']) + 1) * (int(seg.cols[a]['V']) + 1)
-    ns = _FULL_NS[0] if cells <= _DENSE_CELLS else _FULL_WIDE_NS[0]
-    return ns * 1e-9 * int(seg.N)
+    if cells <= _DENSE_CELLS:
+        t = _decode_cost(seg, b) + _decode_cost(seg, a) + _count_cost(cells)
+    else:
+        t = _FULL_WIDE_NS[0] * 1e-9 * int(seg.N)
+    return t * _FULL_SCALE[0]
 
 
 def _road_pays(seg, b, a, R, t_census, m):
