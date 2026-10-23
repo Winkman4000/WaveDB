@@ -271,6 +271,21 @@ def _grab_limit(N, dense):
     return _GRAB_MAX[0] if _GRAB_MAX[0] >= 0 else int(_GRAB_SHARE[0 if dense else 1] * N)
 
 
+def _grab_at(seg, other, S, N):
+    """would the grab read `other` at its S survivors' rows (True), or decode it whole (False)? A zstd stream decodes
+    whole; a frame-coded key reads at rows while the frames S scattered rows touch cost less than the whole decode
+    (the census road's model); any other key at rows while S <= N / GRAB_AT_DIV"""
+    oc = seg.cols[other]
+    enc = oc.get('code_enc', 0)
+    if enc in GRAB_STREAM:
+        return False
+    BR = int(oc.get('BR') or oc.get('e20BR') or 0) if enc in (3, 18, 20) else 0
+    if BR > 0:
+        import wdb_sampletop as _ST
+        return _ST._read_cost(seg, other, S) <= _ST._decode_cost(seg, other)
+    return S * GRAB_AT_DIV <= N
+
+
 def _grab_top(seg, a, b, Va, Vb, lim, afilter, tick):
     """THE GRAB (2026-10-18, the Q14 board; Jackson: "is just grabbing the 1M faster than removing the 99M"):
     the axis filter's survivors are found from the filter key's codes alone, the other key is read only for them,
@@ -294,6 +309,19 @@ def _grab_top(seg, a, b, Va, Vb, lim, afilter, tick):
         _GRABBED += 1
         return np.empty(0, np.int64), np.empty(0, np.int64), Vb
     N = int(seg.N)
+    if Va * Vb <= _FUSED_MAX[0] and _DENSE_PAR[0] and type(seg).__name__ == 'Segment':
+        # THE CALL BEFORE THE WORK: the survivors' count from the filter key's census (no mask, no positions), and the
+        # grab declines at once when it would decode the other key whole -- the remove lane's fused count wins there
+        # (below). The mask and positions it skips were 114 ms of IsRefresh x MobilePhone's 165.
+        Vf = int(c['V'])
+        cnf = np.asarray(seg.raw_census(fcol, Vf))[:Vf]
+        hit = int(cnf[int(fcode)]) if 0 <= int(fcode) < Vf else 0
+        nul = int(cnf[Vf - 1]) if c.get('has_null') else 0
+        S0 = (N - hit - nul) if fneg else hit
+        other0 = b if fcol == a else a
+        if not _grab_at(seg, other0, S0, N):
+            tick('grab: the other key decodes whole -- the remove lane counts (census: %d kept)' % S0)
+            return None
     cf = np.ascontiguousarray(seg._raw_codes(fcol))
     m = (cf != fcode) if fneg else (cf == fcode)
     S = int(np.count_nonzero(m))
@@ -308,14 +336,33 @@ def _grab_top(seg, a, b, Va, Vb, lim, afilter, tick):
     oc = seg.cols[other]
     enc = oc.get('code_enc', 0)
     BR = int(oc.get('BR') or oc.get('e20BR') or 0) if enc in (3, 18, 20) else 0
+    fused = Va * Vb <= _FUSED_MAX[0] and _DENSE_PAR[0]
     if enc in GRAB_STREAM:
         at = False
     elif BR > 0:
         fr = pos // BR
         touched = 1 + int(np.count_nonzero(fr[1:] != fr[:-1]))
-        at = touched <= GRAB_FRAMES * ((N + BR - 1) // BR)
+        if fused:
+            # THE FRAMES PRICED (2026-10-23): at rows only while the frames the survivors touch cost less than the
+            # whole decode (the census road's model: frames x frame cost + rows x row cost, vs the encoding's decode
+            # per row) -- Robotness x ParamOrderID's 2,263 survivors touched ~1,180 of 1,526 frames, 59 ms of reads
+            # against a 19 ms decode
+            import wdb_sampletop as _ST
+            at = _ST._read_cost(seg, other, S) <= _ST._decode_cost(seg, other)
+        else:
+            at = touched <= GRAB_FRAMES * ((N + BR - 1) // BR)
     else:
         at = S * GRAB_AT_DIV <= N
+    if fused and not at:
+        # THE GRAB'S LINE MOVED (2026-10-23, grabsweep.py, the Q14 sample's dense pairs): with the fused count the
+        # remove lane (both keys decoded, every row counted on per-thread boards, the filtered cells zeroed) beat the
+        # grab wherever the grab had to decode the other key whole anyway -- the decode is the same, and two gathers
+        # of S rows cost more than counting N: IsRefresh x MobilePhone (7.2% kept) 0.147 -> 0.080 s, UserAgentMajor x
+        # MobilePhone 0.203 -> 0.128, EventDate x IsMobile (10.2%) 0.106 -> 0.072; at rows the grab still wins
+        # (UserAgentMajor x IsOldCounter 0.033 vs 0.097)
+        tick('grab: the other key decodes whole -- the remove lane counts')
+        _GRABBED -= 1
+        return None
     if at:
         co = np.ascontiguousarray(seg.codes_at(other, pos))
         how = 'at rows'
@@ -331,10 +378,7 @@ def _grab_top(seg, a, b, Va, Vb, lim, afilter, tick):
         gid = u.astype(np.int64); cnt = cnt.astype(np.int64)
         tick('grab count sorted(%d pairs)' % gid.size)
     elif prod <= wdb_bound.DENSE_MAX:
-        comp = np.empty(S, np.int64)
-        wdb_kernels.radix_acc(comp, ka, Va, True)
-        wdb_kernels.radix_acc(comp, kb, Vb, False)
-        cells = wdb_kernels.bincount_par(comp, prod)
+        cells = _dense_cells(ka, kb, Va, Vb)
         gid = np.flatnonzero(cells); cnt = np.asarray(cells[gid], np.int64)
         ck = wdb_bound._kth_largest(cnt, lim) if gid.size > lim else 0
         if ck > 0:
@@ -352,6 +396,22 @@ def _grab_top(seg, a, b, Va, Vb, lim, afilter, tick):
             tick('grab count flat(%d candidates)' % gid.size)
     o = np.lexsort((gid, -cnt))[:lim]                 # the canonical prefix: count DESC, gid ASC
     return gid[o], cnt[o], Vb
+
+
+def _dense_cells(ca, cb, Va, Vb):
+    """the dense grid's cell counts, cell a x Vb + b, on every core: the fused count (grid2's kernel, no key written)
+    up to _FUSED_MAX cells, radix_acc + bincount_par past it (THE COUNT FUSED, 2026-10-23: _build's line, measured by
+    fusesweep.py; the count-ordered and the grab's counts are its siblings -- AdvEngineID x JavaEnable's top 10 was
+    0.16-0.20 s on the two radix passes vs DuckDB 0.08)"""
+    import wdb_kernels
+    prod = int(Va) * int(Vb)
+    if prod <= _FUSED_MAX[0] and _DENSE_PAR[0]:
+        ca = np.ascontiguousarray(ca); cb = np.ascontiguousarray(cb)
+        return np.asarray(wdb_kernels.grid2_count(ca, cb, ca, np.int64(-1), np.int64(Vb), np.int64(prod)))
+    comp = np.empty(ca.size, np.int64)
+    wdb_kernels.radix_acc(comp, ca, Va, True)
+    wdb_kernels.radix_acc(comp, cb, Vb, False)
+    return np.asarray(wdb_kernels.bincount_par(comp, prod))
 
 
 def _compose_top(seg, cols, lim, afilter=None):
@@ -398,12 +458,8 @@ def _compose_top(seg, cols, lim, afilter=None):
     tick('codes(%s,%s)' % (ca.dtype, cb.dtype))
     prod = Va * Vb
     if prod <= wdb_bound.DENSE_MAX:
-        comp = np.empty(ca.size, np.int64)
-        wdb_kernels.radix_acc(comp, ca, Va, True)
-        wdb_kernels.radix_acc(comp, cb, Vb, False)
-        tick('glue')
-        cells = wdb_kernels.bincount_par(comp, prod)
-        del comp
+        cells = _dense_cells(ca, cb, Va, Vb)
+        tick('cells')
         if afilter is not None:
             fcol, fneg, fcode = afilter
             grid = np.asarray(cells).reshape(Va, Vb)
