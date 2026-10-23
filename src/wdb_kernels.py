@@ -8522,3 +8522,34 @@ def copy_live(src, out):
     """out[:] = src[:out.size] in parallel, returning how many are above zero -- the census board's copy and its
     live count in one pass (WatchID: np's one-thread copy 88 ms, then cn > 0 and count_nonzero 37 ms)"""
     return _copy_live_nb(src, out, _nt())
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def _off_value_gather_nb(ch, co, top, T):
+    n = ch.shape[0]
+    cnt = np.zeros(T, np.int64)
+    for t in prange(T):
+        k = 0
+        for i in range(n * t // T, n * (t + 1) // T):
+            if np.int64(ch[i]) != top:
+                k += 1
+        cnt[t] = k
+    off = np.zeros(T + 1, np.int64)
+    for t in range(T):
+        off[t + 1] = off[t] + cnt[t]
+    lh = np.empty(off[T], ch.dtype)
+    lo = np.empty(off[T], co.dtype)
+    for t in prange(T):
+        p = off[t]
+        for i in range(n * t // T, n * (t + 1) // T):
+            if np.int64(ch[i]) != top:
+                lh[p] = ch[i]
+                lo[p] = co[i]
+                p += 1
+    return lh, lo
+
+
+def off_value_gather(ch, co, top):
+    """the rows where ch is not `top`: their ch and co codes, in row order, in two parallel passes (count, then
+    place) -- no mask, no positions (THE HEAVY SPLIT's light rows, 2026-10-23)"""
+    return _off_value_gather_nb(np.ascontiguousarray(ch), np.ascontiguousarray(co), np.int64(top), _nt())

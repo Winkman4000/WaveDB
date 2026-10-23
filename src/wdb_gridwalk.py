@@ -271,6 +271,19 @@ def _grab_limit(N, dense):
     return _GRAB_MAX[0] if _GRAB_MAX[0] >= 0 else int(_GRAB_SHARE[0 if dense else 1] * N)
 
 
+def _grab_reads_at(seg, a, b, afilter):
+    """would the grab read the other key at its survivors' rows (the cheap grab)? -- the survivors from the filter
+    key's census, then _grab_at"""
+    fcol, fneg, fcode = afilter
+    N = int(seg.N)
+    # the survivors estimated from a strided sample of the filter key's codes -- decoded whole by either road anyway
+    # (a census of RefererHash's 21.6M values to learn this cost ~0.2 s)
+    cf = np.asarray(seg._raw_codes(fcol))
+    smp = cf[::max(1, N // 65536)]
+    share = float(np.count_nonzero((smp != fcode) if fneg else (smp == fcode))) / max(1, smp.size)
+    return _grab_at(seg, b if fcol == a else a, int(share * N), N)
+
+
 def _grab_at(seg, other, S, N):
     """would the grab read `other` at its S survivors' rows (True), or decode it whole (False)? A zstd stream decodes
     whole; a frame-coded key reads at rows while the frames S scattered rows touch cost less than the whole decode
@@ -444,6 +457,21 @@ def _compose_top(seg, cols, lim, afilter=None):
     Va = int(seg.cols[a]['V']); Vb = int(seg.cols[b]['V'])
     if Va <= 0 or Vb <= 0:
         return None
+    if afilter is not None and Va * Vb > wdb_bound.DENSE_MAX and _HEAVY_TOP[0] and type(seg).__name__ == 'Segment' \
+            and not _grab_reads_at(seg, a, b, afilter):
+        # past the dense board a heavy value splits the pair before the grab (the split applies the filter on both
+        # sides, and its light rows are the heavier key's few others -- SocialSourcePage x SendTiming <> 0: 6.1M
+        # survivors gathered by the grab, against SocialSourcePage's non-empty rows)
+        ca0 = np.ascontiguousarray(seg._raw_codes(a)); cb0 = np.ascontiguousarray(seg._raw_codes(b))
+        if ca0.dtype.kind in 'iu' and cb0.dtype.kind in 'iu':
+            hg = _heavy_top(seg, a, b, ca0, cb0, Va, Vb, int(lim), afilter, tick)
+            if hg is not None:
+                gid, cnt = hg
+                o = np.lexsort((gid, -cnt))[:lim]
+                tick('pick(%d candidates)' % gid.size)
+                if bill:
+                    print('GRIDWALK BILL: ' + ' '.join(T), flush=True)
+                return gid[o], cnt[o], Vb
     if afilter is not None:
         got = _grab_top(seg, a, b, Va, Vb, int(lim), afilter, tick)
         if got is not None:
@@ -483,19 +511,24 @@ def _compose_top(seg, cols, lim, afilter=None):
             keep = cnt >= ck
             gid = gid[keep]; cnt = cnt[keep]
     else:
-        keep = None
-        if afilter is not None:
-            fcol, fneg, fcode = afilter
-            fc9 = ca if fcol == a else cb
-            keep = (fc9 != fcode) if fneg else (fc9 == fcode)
-            tick('axis filter')
-        got = wdb_bound._flat_candidates([ca, cb], [Va, Vb], int(lim), tick, keep=keep)
-        if got is None:
-            if bill:
-                print('GRIDWALK BILL: ' + ' '.join(T) + ' -> structure', flush=True)
-            return None
-        uk, cnt = got
-        gid = uk[:, 0].astype(np.int64) * Vb + uk[:, 1].astype(np.int64)
+        hg = _heavy_top(seg, a, b, ca, cb, Va, Vb, int(lim), afilter, tick) \
+            if _HEAVY_TOP[0] and type(seg).__name__ == 'Segment' else None
+        if hg is not None:
+            gid, cnt = hg
+        else:
+            keep = None
+            if afilter is not None:
+                fcol, fneg, fcode = afilter
+                fc9 = ca if fcol == a else cb
+                keep = (fc9 != fcode) if fneg else (fc9 == fcode)
+                tick('axis filter')
+            got = wdb_bound._flat_candidates([ca, cb], [Va, Vb], int(lim), tick, keep=keep)
+            if got is None:
+                if bill:
+                    print('GRIDWALK BILL: ' + ' '.join(T) + ' -> structure', flush=True)
+                return None
+            uk, cnt = got
+            gid = uk[:, 0].astype(np.int64) * Vb + uk[:, 1].astype(np.int64)
     o = np.lexsort((gid, -cnt))[:lim]                 # the canonical prefix: count DESC, gid ASC
     tick('pick(%d candidates)' % gid.size)
     if bill:
@@ -794,3 +827,102 @@ def try_gridwalk(seg, tree, col_map):
     if spec is None:
         return None
     return execute(seg, spec)
+
+
+_HEAVY_TOP = [__import__('os').environ.get('WDB_GW_HEAVY', '1') != '0']
+_HEAVY_SHARE = [float(__import__('os').environ.get('WDB_GW_HEAVY_SHARE', '0.5'))]   # the heavy value's rows, at least
+_HEAVY_HITS = 0
+
+
+def _heavy_top(seg, a, b, ca, cb, Va, Vb, lim, afilter, tick):
+    """THE HEAVY SPLIT IN THE COMPOSITION (2026-10-23, the Q16 board: SendTiming x OpenstatAdID / OpenstatAdID x
+    SocialSourcePage / SocialSourcePage x SendTiming at 0.54-0.58 s vs DuckDB 0.15 -- '' holds 99.5% of OpenstatAdID's
+    rows, so the flat lane's buckets had one huge bucket on one core; the 10-15 note: "put the heavy-value split into
+    the composition"). A pair past the dense board whose key h has one value holding most rows: the rows on that value
+    differ only in the other key o, so their groups are (top, o) and their counts are o's census less o's count over
+    the remaining (light) rows; the light rows -- few -- are gathered and grouped exactly. The two sets of groups are
+    disjoint (a light row is off the heavy value). The filter (one = / <> on a key) applies to both sides.
+    Returns (gid, cnt) of candidate cells (gid = a x Vb + b), or None (the flat lane answers)."""
+    global _HEAVY_HITS
+    import wdb_kernels
+    n = int(ca.size)
+    best = None
+    st = max(1, n // 65536)
+    for h, ch, Vh, o, co, Vo in ((a, ca, Va, b, cb, Vb), (b, cb, Vb, a, ca, Va)):
+        if Vo > (1 << 24):
+            continue                                    # the other key's census board must be dense
+        # the heavy value from a strided sample of the codes already decoded (a census of a 21M-value key to learn
+        # it holds no heavy value cost ~0.2 s); the light rows are counted exactly below
+        smp = np.asarray(ch[::st])
+        uv, uc = np.unique(smp, return_counts=True)       # not bincount: a board of the key's whole range per sample
+        j = int(np.argmax(uc))
+        top = int(uv[j])
+        share = float(uc[j]) / max(1, smp.size)
+        if share < _HEAVY_SHARE[0]:
+            continue
+        if best is None or share > best[0]:             # the heavier value: the fewest light rows left
+            best = (share, h, ch, Vh, o, co, Vo, top)
+    for _one in ((best,) if best is not None else ()):
+        _sh, h, ch, Vh, o, co, Vo, top = _one
+        lh, lo = wdb_kernels.off_value_gather(ch, co, top)   # the light rows' codes, one parallel pass
+        if lo.size > (1.0 - _HEAVY_SHARE[0]) * n:
+            return None                                  # the sample erred: not a heavy value
+        cnh = None
+        # heavy cells: o's census less o's light rows -- none at all when the filter removes the heavy value itself
+        gone = afilter is not None and afilter[0] == h and ((afilter[1] and int(afilter[2]) == top) or
+                                                             (not afilter[1] and int(afilter[2]) != top))
+        if gone:
+            hv = np.zeros(Vo, np.int64)
+        else:
+            hv = np.asarray(seg.raw_census(o, Vo), np.int64)[:Vo].copy()
+            hv -= np.bincount(lo, minlength=Vo)[:Vo]
+        lkeep = None
+        if afilter is not None:
+            fcol, fneg, fcode = afilter
+            if fcol == o:
+                if fneg:
+                    hv[fcode] = 0
+                    lkeep = lo != fcode
+                else:
+                    keepv = hv[fcode]; hv[:] = 0; hv[fcode] = keepv
+                    lkeep = lo == fcode
+            else:                                        # the filter is on the heavy key
+                if (fneg and fcode == top) or (not fneg and fcode != top):
+                    hv[:] = 0
+                lkeep = (lh != fcode) if fneg else (lh == fcode)
+        if lkeep is not None:
+            lo = lo[lkeep]; lh = lh[lkeep]
+        tick('heavy %s (%d of %d rows on one value; %d light)' % (h, n - int(lh.size), n, lo.size))
+        hz = np.flatnonzero(hv)
+        hc = hv[hz]
+        if hz.size > lim:
+            # only heavy cells reaching their own lim-th count can reach the answer's (ties kept): Title's 9.4M
+            # values were all sorted as candidates
+            import wdb_bound
+            ck = wdb_bound._kth_largest(hc, lim)
+            keep = hc >= ck
+            hz = hz[keep]; hc = hc[keep]
+        ka_h = np.full(hz.size, top, np.int64) if h == a else hz.astype(np.int64)
+        kb_h = hz.astype(np.int64) if h == a else np.full(hz.size, top, np.int64)
+        if lo.size and lo.size <= GRAB_SORT_MAX:
+            la, lb = (lh, lo) if h == a else (lo, lh)
+            u, lc = np.unique(la.astype(np.int64) * Vb + lb.astype(np.int64), return_counts=True)
+        elif lo.size:
+            # many light rows: the flat lane's candidates on the gathered light rows alone (their top lim, ties kept,
+            # reach the answer's top lim exactly as in wdb_bound._heavy_split)
+            import wdb_bound
+            la, lb = (lh, lo) if h == a else (lo, lh)
+            got = wdb_bound._flat_candidates([np.ascontiguousarray(la), np.ascontiguousarray(lb)], [Va, Vb],
+                                             int(lim), tick)
+            if got is None:
+                return None
+            uk, lc = got
+            u = uk[:, 0].astype(np.int64) * Vb + uk[:, 1].astype(np.int64)
+        else:
+            u = np.empty(0, np.int64); lc = np.empty(0, np.int64)
+        gid = np.concatenate([ka_h * Vb + kb_h, u.astype(np.int64)])
+        cnt = np.concatenate([hc.astype(np.int64), lc.astype(np.int64)])
+        tick('heavy cells(%d) light groups(%d)' % (hz.size, u.size))
+        _HEAVY_HITS += 1
+        return gid, cnt
+    return None
