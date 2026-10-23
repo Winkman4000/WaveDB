@@ -36,6 +36,12 @@ _ENABLED = True           # live by default: gridwalk is the primary 2-key COUNT
 _HEAD_N = 200000          # count-ordered head depth; serves any LIMIT up to this, declines beyond
 _ONES_N = 1024            # singleton fill head: the _ONES_N smallest count-1 gids, for LIMIT > nheavy
 _BINC_MAX = 1 << 24     # composite spaces up to 16.7M cells go by bincount (128 MB transient, query-scoped)
+_DENSE_PAR = [__import__('os').environ.get('WDB_GW_DENSE_PAR', '1') != '0']   # the dense build on every core
+_FUSED_MAX = [int(__import__('os').environ.get('WDB_GW_FUSED_MAX', str(1 << 22)))]   # cells: the fused count's
+# line, measured (fusesweep.py, _build both ways on real pairs): fused 0.022-0.028 s up to 252K cells against the
+# radix path's flat 0.11-0.12; 1.07M 0.041 vs 0.130; 1.94M 0.082 vs 0.153; 3.96M 0.121 vs 0.161; 7.97M 0.161 vs
+# 0.149; 16.1M 0.297 vs 0.176 -- the boards (T x cells x 8 B) grow, the key pass does not. Crossing ~6M; at 4M the
+# boards are 512 MB on 16 threads, under the radix path's 800 MB key + its own boards
 _POS_MAX = 8192           # store member-row positions when total stored cells <= this (payload O(K))
 _POSROWS_MAX = 1 << 16    # ...AND their member rows <= this: positions cost bytes per ROW, and a
                           # low-card pair's handful of cells holds ALL 100M rows (measured 1.5 GB!)
@@ -170,19 +176,42 @@ def _build(seg, cols):
     Returns (head_gid, head_cnt, Vb, nheavy, bulk|None, ones, pos|None, nd) or None; nd is the pair's
     FULL distinct-cell count (heavy + singletons), recorded for the survey's FD post-pass."""
     a, b = sorted(cols)
-    ca = seg._raw_codes(a).astype(np.int64); cb = seg._raw_codes(b).astype(np.int64)
-    if ca.size == 0:
+    ca0 = np.ascontiguousarray(seg._raw_codes(a)); cb0 = np.ascontiguousarray(seg._raw_codes(b))
+    if ca0.size == 0:
         return None
-    Vb = int(cb.max()) + 1
-    key = ca * Vb + cb
-    Va = int(ca.max()) + 1
-    if Va * Vb <= _BINC_MAX:             # small composite space: bincount the grid directly --
-        full = np.bincount(key, minlength=Va * Vb)   # no 100M sort (np.unique sorts)
-        gid_all = np.flatnonzero(full)               # ascending = unique's code order
+    Vb = int(cb0.max()) + 1                          # the stored-width codes' own max (the cell ids' radix)
+    Va = int(ca0.max()) + 1
+    if Va * Vb <= _BINC_MAX and ca0.dtype.kind in 'iu' and cb0.dtype.kind in 'iu' and _DENSE_PAR[0]:
+        # THE GRID ON EVERY CORE (2026-10-23, Q17's tiny x tiny pairs: JavaEnable x Income 0.39 s vs DuckDB 0.09).
+        # The build was numpy glue on one thread: two int64 copies of 100M codes (0.12 s), the key a x Vb + b as a
+        # new array, a one-thread bincount (0.21 s with the glue) -- 17 ms of it was the decode. The composed count's
+        # own atoms instead: radix_acc glues the stored-width codes into the key in place, bincount_par tallies the
+        # cells on per-thread boards. The same key and the same cells (a x Vb + b).
+        import wdb_kernels
+        if Va * Vb <= _FUSED_MAX[0]:
+            # THE COUNT FUSED (2026-10-23): a small grid is counted straight from the two code arrays on per-thread
+            # boards (grid2's kernel) -- the key is never written: radix_acc's two passes over an 800 MB key were
+            # 68 ms of JavaEnable x Income's 125. The key is built below only if the member positions need it.
+            key = None
+            full = np.asarray(wdb_kernels.grid2_count(ca0, cb0, ca0, np.int64(-1), np.int64(Vb), np.int64(Va * Vb)))
+        else:
+            key = np.empty(ca0.size, np.int64)
+            wdb_kernels.radix_acc(key, ca0, Va, True)
+            wdb_kernels.radix_acc(key, cb0, Vb, False)
+            full = np.asarray(wdb_kernels.bincount_par(key, Va * Vb))
+        gid_all = np.flatnonzero(full)
         cnt_all = full[gid_all]
         del full
     else:
-        gid_all, cnt_all = np.unique(key, return_counts=True)   # filled cells, code order
+        ca = ca0.astype(np.int64); cb = cb0.astype(np.int64)
+        key = ca * Vb + cb
+        if Va * Vb <= _BINC_MAX:             # small composite space: bincount the grid directly --
+            full = np.bincount(key, minlength=Va * Vb)   # no 100M sort (np.unique sorts)
+            gid_all = np.flatnonzero(full)               # ascending = unique's code order
+            cnt_all = full[gid_all]
+            del full
+        else:
+            gid_all, cnt_all = np.unique(key, return_counts=True)   # filled cells, code order
     nd = int(gid_all.size)               # the pair's FULL distinct count -- the survey's FD input
     heavy = cnt_all >= 2
     gid = gid_all[heavy]; cnt = cnt_all[heavy]
@@ -205,6 +234,8 @@ def _build(seg, cols):
     nmember = int(cnt.sum()) + int(ones.size)    # positions scale with MEMBER ROWS, not cells --
     if 0 < stored.size <= _POS_MAX and nmember <= _POSROWS_MAX:   # a low-card pair's few cells hold ALL rows
         st = np.sort(stored)
+        if key is None:                  # the fused count wrote no key: built here, for the positions only
+            key = ca0.astype(np.int64) * Vb + cb0.astype(np.int64)
         p = np.searchsorted(st, key)
         valid = p < st.size
         p2 = np.where(valid, p, 0)
