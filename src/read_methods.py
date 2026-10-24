@@ -28,6 +28,7 @@ import wdb_wherescan
 import wdb_coscan
 import wdb_diskpair
 import wdb_counted
+import wdb_complement
 import wdb_distinctlim
 import wdb_sumtopk
 import wdb_grid2
@@ -240,6 +241,11 @@ distinctlim = Read('distinctlim',
                    lambda c: wdb_distinctlim.detect(c.seg, c.tree, c.cmap),
                    lambda c, spec: wdb_distinctlim.execute(c.seg, spec),
                    'DISTINCT (hour, key) LIMIT n: stair-ridden block walk, early exit')
+
+complement = Read('complement',
+                  lambda c: wdb_complement.detect(c.seg, c.tree, c.cmap),
+                  lambda c, spec: wdb_complement.execute(c.seg, spec),
+                  "COUNT(*) WHERE k <> v as N - rows(k = v) - NULLs, from the census or v's equality scan")
 
 counted_distinct = Read('counted_distinct',
                         lambda c: wdb_counted.detect(c),

@@ -54,6 +54,7 @@ _READ_ORDER = (
     R.grid2,               # plain 2-key COUNT grid: one fused pass, narrow detect
     R.firstk,               # staircase early-exit: LIKE + ORDER BY stair LIMIT k, pops only the answer window
     R.funnel,               # selective funnel: plist start, crumb hygiene, code-space group
+    R.complement,           # COUNT(*) WHERE k <> v: N - rows(k = v) - NULLs (Q1; wdb_complement)
     R.wherescan,            # conjunctive WHERE: stair spans + blocked-frame predicate scan, disk-only
     R.pairfold,
     R.affinegroup,
