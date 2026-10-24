@@ -1,6 +1,7 @@
 """THE COUNT LANE RETIRED (2026-10-23): diskpair declines every aggregate -- the count top-K queries it used to claim
 go to the general reads (fused_agg -> wdb_bound), which beat it on every measured pair -- and keeps answering bare
-SELECT DISTINCT over its blocked keys. Every answer, either way, is DuckDB's."""
+SELECT DISTINCT over its blocked keys. ONE PLAIN COLUMN (2026-10-24) goes to the general reads too (5-15x faster);
+one derived key (a scalar, the minute) stays. Every answer, either way, is DuckDB's."""
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import sqlglot
@@ -61,20 +62,26 @@ def test_counts_and_distincts_legal_against_duckdb():
         assert sorted((int(x[-1]) for x in rows), reverse=True) == want, q
     assert framed, 'the fixture frames no key'          # which keys the encoder frames varies by run settings
     f0 = framed[0]
+    one = 'SELECT DISTINCT %s FROM t' % f0
+    der = 'SELECT DISTINCT %s + 1 AS x FROM t' % f0
     for q in ('SELECT DISTINCT a, b FROM t', 'SELECT DISTINCT b, c FROM t', 'SELECT DISTINCT a, b, c FROM t',
-              'SELECT DISTINCT a, c FROM t', 'SELECT DISTINCT b FROM t', 'SELECT DISTINCT %s FROM t' % f0):
+              'SELECT DISTINCT a, c FROM t', 'SELECT DISTINCT b FROM t', one, der):
         h0 = DP._HITS
         r = db.run(q)
         rows = r[0] if isinstance(r, tuple) else r
         assert sorted(map(tuple, rows)) == sorted(con.execute(q).fetchall()), q
-        if q == 'SELECT DISTINCT %s FROM t' % f0:
-            assert DP._HITS > h0, q                      # the DISTINCT lane still serves its framed keys
-    for q, full in (('SELECT DISTINCT %s FROM t LIMIT 5' % f0, 'SELECT DISTINCT %s FROM t' % f0),
+        if q == one:
+            assert DP._HITS == h0, q                     # one plain column: the general reads (2026-10-24)
+        if q == der:
+            assert DP._HITS > h0, q                      # one derived key over a framed column: still here
+    for q, full in ((der + ' LIMIT 5', der), (one + ' LIMIT 5', one),
                     ('SELECT DISTINCT a, b FROM t LIMIT 10', 'SELECT DISTINCT a, b FROM t')):
         h0 = DP._HITS
         r = db.run(q)
-        if q.startswith('SELECT DISTINCT %s FROM' % f0):
+        if q.startswith(der):
             assert DP._HITS > h0, q
+        if q.startswith(one + ' '):
+            assert DP._HITS == h0, q
         rows = r[0] if isinstance(r, tuple) else r
         n = int(q.rsplit(' ', 1)[1])
         allp = set(con.execute(full).fetchall())

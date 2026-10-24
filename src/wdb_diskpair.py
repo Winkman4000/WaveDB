@@ -1,4 +1,4 @@
-"""diskpair: disk-only bare SELECT DISTINCT over 1-4 keys -- the scan-merge read.
+"""diskpair: disk-only bare SELECT DISTINCT over 2-4 keys or one derived key -- the scan-merge read.
 
 THE COUNT LANE RETIRED (2026-10-23, Jackson). This read was built for SELECT k1..kN, COUNT(*) GROUP BY ...
 ORDER BY COUNT(*) DESC LIMIT k, before the census, the heavy split, the flat bucket scan (wdb_bound) and the
@@ -10,8 +10,15 @@ one-thread bill (dpprof.py): the frames' decompress 4%, the minute by a binary s
 fold 8%, the concatenate 5%, np.unique's sort 61% -- nowhere near the bytes' floor. It now declines every
 aggregate; the count queries go to the general reads.
 
-What stays: bare DISTINCT (no GROUP BY / ORDER BY, LIMIT optional), which still beats the general path
-(DISTINCT ResponseEndTiming, Robotness 1.145 s vs 2.370; DuckDB 0.314 -- both behind, the dense grid's next).
+ONE PLAIN COLUMN RETIRED TOO (2026-10-24, Jackson): DISTINCT over a single dict column is 5-15x faster on the
+general reads on all 38 enc-3 columns measured, bare and LIMIT 10, the same answers (dpvs3.py): CounterID 0.352 ->
+0.041 s, FetchTiming 0.341 -> 0.045, WindowName 0.445 -> 0.078, LocalEventTime 1.247 -> 0.338, Referer 27.4 ->
+11.0, URL 28.0 -> 10.0. A single DERIVED key stays here -- the general path has no dictionary-level DISTINCT for
+it: extract(minute FROM EventTime) 0.374 s here vs 60.6 s; ResponseEndTiming + 1 0.457 vs 61.1 (dpvs4.py).
+
+What stays: bare DISTINCT (no GROUP BY / ORDER BY, LIMIT optional) over 2-4 keys, or over one derived key, which
+still beats the general path (DISTINCT ResponseEndTiming, Robotness 1.145 s vs 2.370; DuckDB 0.314 -- both
+behind, the dense grid's next).
 The blocked (enc=3) code frames are streamed -- never touching the codes cache -- keys may be blocked dict
 columns, a scalar over one, or ONE derived minute-of(EventTime) key off the stair column's step rows (the
 1.4M-entry code->minute table: row position IS the timestamp). Parallel per-thread block scan -> mixed-radix
@@ -103,6 +110,8 @@ def detect(seg, tree, col_map):
         keys.append((pi, {'kind': 'col', 'src': col, 'V': int(c['V'])}))
     if not (1 <= len(keys) <= _MAX_KEYS):
         return None
+    if len(keys) == 1 and keys[0][1]['kind'] == 'col':
+        return None                      # one plain column: the general reads (docstring, 2026-10-24)
     if sum(1 for _pi, k in keys if k['kind'] == 'minute') > 1:
         return None
     span = 1
