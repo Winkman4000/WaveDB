@@ -18,7 +18,10 @@ only at two places:
      scan); when no read takes it, diskpair answers as before (length(URL)'s case).
   2. BEFORE THE GENERAL SCAN, for any bare DISTINCT nothing took: the counted form through the read order, the
      general scan included -- its GROUP BY path, not its DISTINCT path (1.1 s against 64).
-WDB_COUNTED_DISTINCT=0 turns both off."""
+WDB_COUNTED_DISTINCT=0 turns both off.
+
+THE KEYS-ONLY GROUP BY (2026-10-24, the GROUP BY holes): SELECT k FROM t GROUP BY k with no aggregate is the same
+question again -- before the general scan it is asked with a hidden COUNT(*) (fallback), the count dropped."""
 import os
 import sqlglot.expressions as E
 
@@ -49,6 +52,39 @@ def bare_distinct(tree):
         if nd.find(E.AggFunc) is not None or nd.find(E.Window) is not None:
             return False
     return True
+
+
+def keys_only_group(tree):
+    """SELECT keys FROM t [WHERE] GROUP BY keys -- no aggregate anywhere, no HAVING, no DISTINCT, no ROLLUP / CUBE /
+    GROUPING SETS / GROUP BY ALL, no window, no star"""
+    if not isinstance(tree, E.Select) or tree.args.get('distinct') is not None:
+        return False
+    g = tree.args.get('group')
+    if g is None or not g.expressions or tree.args.get('having') is not None:
+        return False
+    if g.args.get('all') or g.args.get('rollup') or g.args.get('cube') or g.args.get('grouping_sets'):
+        return False
+    if not tree.expressions:
+        return False
+    for p in tree.expressions:
+        nd = p.this if isinstance(p, E.Alias) else p
+        if isinstance(nd, E.Star) or nd.find(E.Star) is not None:
+            return False
+        if nd.find(E.AggFunc) is not None or nd.find(E.Window) is not None:
+            return False
+    o = tree.args.get('order')
+    if o is not None and (o.find(E.AggFunc) is not None or o.find(E.Window) is not None):
+        return False
+    return True
+
+
+def counted_group_ctx(ctx):
+    """a keys-only GROUP BY's counted request: the same tree, COUNT(*) projected last under a hidden name"""
+    import read_methods
+    t = ctx.tree.copy()
+    t.set('expressions', list(t.expressions) +
+          [E.Alias(this=E.Count(this=E.Star()), alias=E.Identifier(this=_HIDDEN, quoted=False))])
+    return read_methods.ReadContext(ctx.db, ctx.name, ctx.seg, ctx.path, t, ctx.cmap, t.sql(), ctx.esc)
 
 
 def counted_ctx(ctx):
@@ -124,10 +160,18 @@ def execute(ctx, spec):
 
 
 def fallback(ctx):
-    """before the general scan: a bare DISTINCT nothing took -> (result, read name) or None"""
-    if not enabled() or not bare_distinct(ctx.tree):
+    """before the general scan: a bare DISTINCT, or a keys-only GROUP BY (2026-10-24: the general scan's GROUP BY with no
+    aggregate -- the minute 8.8 s, ResponseEndTiming x minute 14.3, SearchPhrase 116.8 -- against COUNT(*)'s stair
+    0.016), nothing took -> (result, read name) or None"""
+    if not enabled():
         return None
-    got = walk(counted_ctx(ctx), scan=True)
+    if bare_distinct(ctx.tree):
+        c2 = counted_ctx(ctx)
+    elif keys_only_group(ctx.tree):
+        c2 = counted_group_ctx(ctx)
+    else:
+        return None
+    got = walk(c2, scan=True)
     if got is None:
         return None
     res, name = got

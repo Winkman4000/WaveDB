@@ -1866,6 +1866,67 @@ def _potency_pick(seg, spec, lo, hi):
     return spec
 
 
+_COL_EMIT_MIN = 10000      # past this many groups the answer is emitted by column (THE COLUMNAR EMISSION)
+
+
+def _key_values(seg, kk, a):
+    """one key's values for the returned groups, exactly as the per-group loop emits them: a sequence column's own
+    values, a scalar's surrogate values, a CASE key's default for -1, else seg.values_at -- [_pyval(fetch(code))]
+    by contract, each front-coded block walked once (the point fetches were 223 s of 232 for SearchPhrase's 5.9M
+    groups: ~65 Python steps per value, 17 us against values_at's 1 us)"""
+    if kk['kind'] == 'scalar':
+        sv = wdb_scalar.surrogate(seg, kk['spec'])[1]
+        sv = np.asarray(sv, dtype=object) if not isinstance(sv, np.ndarray) else sv
+        vals = sv[a]
+        return vals.tolist() if isinstance(vals, np.ndarray) else list(vals)
+    src = kk['src']; c = seg.cols[src]
+    if kk['kind'] == 'case':
+        dflt = kk['default'] if isinstance(kk['default'], str) else str(kk['default'])
+        out = np.empty(a.size, dtype=object)
+        neg = a < 0
+        out[neg] = dflt
+        if (~neg).any():
+            live = a[~neg].astype(np.int64)
+            vals = live.tolist() if c['mode'] == 4 else seg.values_at(src, live)
+            out[~neg] = np.array(list(vals) + [None], dtype=object)[:-1]
+        return out.tolist()
+    if c['mode'] == 4:
+        return a.astype(np.int64).tolist()
+    return seg.values_at(src, a.astype(np.int64))
+
+
+def _emit_columns(seg, spec, keyarr, sel, sel_w, rep, cnt, cells):
+    """THE COLUMNAR EMISSION (2026-10-24, the GROUP BY holes): the per-group loop below sorted a list and point-fetched
+    every key value of every group -- SearchPhrase, COUNT(*) WHERE IsRefresh = 0 GROUP BY SearchPhrase was 102.6 s for
+    5.9M groups, 223 s of a profiled 232 in the point fetches. Here every projected column is one array over the
+    returned groups, each front-coded dictionary block walked once, the same values the loop emits (seg.values_at: the loop's _pyval(fetch) by contract); a ColRows past COL_GATE
+    (wdb_colresult), tuples below."""
+    import wdb_colresult as CR
+    n = int(sel.size)
+    byp = {}
+    for pi, kind, col in spec['aggs']:
+        if kind == 'COUNT_STAR':
+            byp[pi] = cnt[sel].astype(np.int64).tolist()
+        elif kind in ('COUNT_COL', 'COUNT_D', 'SUM', 'MIN', 'MAX'):
+            byp[pi] = np.asarray(cells[pi])[sel_w].astype(np.int64).tolist()
+        elif kind in ('MIN_DICT', 'MAX_DICT'):
+            k2 = np.asarray(cells[pi])[sel_w].astype(np.int64)
+            dead = (k2 < 0) if kind == 'MAX_DICT' else (k2 == np.iinfo(np.int64).max)
+            out = np.empty(n, dtype=object)
+            if (~dead).any():
+                out[~dead] = np.array(list(seg.values_at(col, k2[~dead])) + [None], dtype=object)[:-1]
+            out[dead] = None
+            byp[pi] = out.tolist()
+        else:                                            # AVG
+            byp[pi] = (np.asarray(cells[pi], dtype=np.float64)[sel_w] / cnt[sel]).tolist()
+    for (pi, kk), (_x, aa) in zip(spec['keys'], keyarr):
+        byp[pi] = _key_values(seg, kk, np.asarray(aa)[rep])
+    cols = [byp[pi] for pi in sorted(byp)]
+    if n > CR.COL_GATE:
+        return CR.ColRows([('arr', cl) for cl in cols], n)
+    return list(zip(*cols))
+
+
 def execute(seg, spec):
     global _HITS
     lo, hi = _span_rows(seg, spec['spans'])
@@ -2322,6 +2383,9 @@ def execute(seg, spec):
                 _cells[pi3] = acc
             else:
                 _cells[pi3] = np.bincount(ginv, weights=v3.astype(np.float64), minlength=G)
+    if sel.size > _COL_EMIT_MIN:
+        _HITS += 1
+        return _emit_columns(seg, spec, keyarr, sel, sel_w, rep, cnt, _cells), [wdb_sql._alias(p) for p in spec['proj']]
     rows_out = []
     for i, gi in enumerate(sel):
         r = int(rep[i]); row = []

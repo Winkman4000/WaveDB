@@ -199,8 +199,9 @@ def route_single_segment(ctx):
             if rows is not None:
                 _plan_store(ctx, read.name, spec); _SERVED[0] = read.name;  _PATH_SINK(ctx, read.name) if _PATH_SINK is not None else None
                 return rows
-        # THE COUNTED DISTINCT, before the general scan (wdb_counted): a bare DISTINCT nothing took is asked again as
-        # GROUP BY + COUNT(*) -- the general scan's GROUP BY path, not its DISTINCT path (1.1 s against 64)
+        # THE COUNTED FORM, before the general scan (wdb_counted): a bare DISTINCT or a keys-only GROUP BY nothing took
+        # is asked again with COUNT(*) -- the reads built for counts (DISTINCT: 1.1 s against 64; GROUP BY minute with
+        # no aggregate: the stair's 0.016 s against the scan's 8.8)
         import wdb_counted
         _cd = wdb_counted.fallback(ctx)
         if _cd is not None:
