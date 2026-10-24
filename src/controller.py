@@ -68,6 +68,7 @@ _READ_ORDER = (
     R.smallk,              # narrow-key pair/triple boards (the small-K weapon)             # two-key COUNT(*) top-K via grid filled-cell + count-ordered head (opt-in)
     R.sumtopk,             # single big-key SUM top-K: one kernel, k label decodes
     R.distinctlim,         # DISTINCT-LIMIT early exit: stops at n pairs, streams never fully read
+    R.counted_distinct,     # diskpair's DISTINCT shapes asked as GROUP BY + COUNT(*), the count dropped (wdb_counted)
     R.diskpair,             # disk-only bare SELECT DISTINCT, 2-4 keys or one derived key (COUNT lane retired 10-23)
     R.countpos,             # two-key COUNT(*) top-K via per-row count-class presence-scan (opt-in)
     R.heavypair,            # two-key COUNT(*) top-N from a count-sorted pair sidecar
@@ -198,6 +199,13 @@ def route_single_segment(ctx):
             if rows is not None:
                 _plan_store(ctx, read.name, spec); _SERVED[0] = read.name;  _PATH_SINK(ctx, read.name) if _PATH_SINK is not None else None
                 return rows
+        # THE COUNTED DISTINCT, before the general scan (wdb_counted): a bare DISTINCT nothing took is asked again as
+        # GROUP BY + COUNT(*) -- the general scan's GROUP BY path, not its DISTINCT path (1.1 s against 64)
+        import wdb_counted
+        _cd = wdb_counted.fallback(ctx)
+        if _cd is not None:
+            _SERVED[0] = 'counted:' + str(_cd[1]);  _PATH_SINK(ctx, _SERVED[0]) if _PATH_SINK is not None else None
+            return _cd[0]
     else:
         # non-agg projection: the value-sorted dict read, then the cluster-ordered
         # top-K read, else the scan

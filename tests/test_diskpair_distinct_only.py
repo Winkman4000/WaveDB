@@ -6,6 +6,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import sqlglot
 import wdb_diskpair as DP
+import wdb_counted as WC
 
 _FX = None
 
@@ -66,20 +67,20 @@ def test_counts_and_distincts_legal_against_duckdb():
     der = 'SELECT DISTINCT %s + 1 AS x FROM t' % f0
     for q in ('SELECT DISTINCT a, b FROM t', 'SELECT DISTINCT b, c FROM t', 'SELECT DISTINCT a, b, c FROM t',
               'SELECT DISTINCT a, c FROM t', 'SELECT DISTINCT b FROM t', one, der):
-        h0 = DP._HITS
+        h0 = DP._HITS; c0 = WC._HITS[0]
         r = db.run(q)
         rows = r[0] if isinstance(r, tuple) else r
         assert sorted(map(tuple, rows)) == sorted(con.execute(q).fetchall()), q
         if q == one:
             assert DP._HITS == h0, q                     # one plain column: the general reads (2026-10-24)
-        if q == der:
-            assert DP._HITS > h0, q                      # one derived key over a framed column: still here
+        if q == der:                                 # one derived key over a framed column: diskpair's shape --
+            assert DP._HITS > h0 or WC._HITS[0] > c0, q  # answered here or by the counted form ahead of it (10-24)
     for q, full in ((der + ' LIMIT 5', der), (one + ' LIMIT 5', one),
                     ('SELECT DISTINCT a, b FROM t LIMIT 10', 'SELECT DISTINCT a, b FROM t')):
-        h0 = DP._HITS
+        h0 = DP._HITS; c0 = WC._HITS[0]
         r = db.run(q)
         if q.startswith(der):
-            assert DP._HITS > h0, q
+            assert DP._HITS > h0 or WC._HITS[0] > c0, q
         if q.startswith(one + ' '):
             assert DP._HITS == h0, q
         rows = r[0] if isinstance(r, tuple) else r

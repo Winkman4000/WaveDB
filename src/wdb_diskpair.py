@@ -139,21 +139,30 @@ def _block_geometry(seg, keys):
     return 0, 0
 
 
-def execute(seg, spec):
-    global _HITS
+def answers(seg, spec):
+    """whether execute will answer this spec: a block geometry exists and THE GRID LAW holds -- every blocked
+    (enc=3) key column shares the segment's block geometry; an encode where candidates won at different frame
+    sizes (EventTime at 524,288 rows, SearchEngineID at 65,536 -- the code-stream level changed which tag won;
+    IsMobile at 524,288 beside RegionID's 65,536) declines by name instead of broadcasting two grids together
+    (g-exyear2, 2026-09-12). wdb_counted asks this before taking diskpair's shapes (2026-10-24)."""
     keys = spec['keys']
     NB, BR = _block_geometry(seg, keys)
     if NB == 0:
-        return None
-    # THE GRID LAW: every blocked (enc=3) key column must share the segment's block geometry;
-    # an encode where candidates won at different frame sizes (EventTime at 524,288 rows,
-    # SearchEngineID at 65,536 -- the code-stream level changed which tag won) declines by
-    # name instead of broadcasting two grids together (g-exyear2, 2026-09-12)
+        return False
     for _pi, k in keys:
         if k['kind'] in ('col', 'scalar'):
             c = seg.cols.get(k['src'])
             if c is not None and c.get('code_enc') == 3 and int(c['BR']) != BR:
-                return None
+                return False
+    return True
+
+
+def execute(seg, spec):
+    global _HITS
+    keys = spec['keys']
+    if not answers(seg, spec):
+        return None
+    NB, BR = _block_geometry(seg, keys)
     N = int(seg.N)
     # per-key block readers
     readers = []

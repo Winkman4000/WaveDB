@@ -27,6 +27,7 @@ import wdb_blockstats
 import wdb_wherescan
 import wdb_coscan
 import wdb_diskpair
+import wdb_counted
 import wdb_distinctlim
 import wdb_sumtopk
 import wdb_grid2
@@ -240,10 +241,15 @@ distinctlim = Read('distinctlim',
                    lambda c, spec: wdb_distinctlim.execute(c.seg, spec),
                    'DISTINCT (hour, key) LIMIT n: stair-ridden block walk, early exit')
 
+counted_distinct = Read('counted_distinct',
+                        lambda c: wdb_counted.detect(c),
+                        lambda c, spec: wdb_counted.execute(c, spec),
+                        "bare DISTINCT diskpair would take, asked as GROUP BY + COUNT(*) with the count dropped")
+
 diskpair = Read('diskpair',
                 lambda c: wdb_diskpair.detect(c.seg, c.tree, c.cmap),
                 lambda c, spec: wdb_diskpair.execute(c.seg, spec),
-                'disk-only 2-key GROUP BY count top-K: blocked-frame scan + norm split + k-way merge')
+                'disk-only bare SELECT DISTINCT over 2-4 keys or one derived key: blocked-frame scan + merge')
 
 pairagg = Read('pairagg',
                lambda c: wdb_pairagg.detect(c.seg, c.tree, c.cmap),
