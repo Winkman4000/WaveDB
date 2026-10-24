@@ -1248,6 +1248,12 @@ def _scan_eq(seg, col, code, lo, hi, negate=False):
             return p9[a9:b9].astype(np.int64)
         return p9.astype(np.int64)
     c = seg.cols[col]
+    if int(c.get('code_enc', 0) or 0) == 10:
+        # enc 10 reads its own blocks even when the decoded codes are held: searching 100M held codes costs more
+        # than walking the blocks (a run is a range, a 1-bit block skips its empty bytes)
+        p = _eq_e10(seg, col, c, int(code), lo, hi, negate)
+        if p is not None:
+            return p
     if col not in seg._codes:
         # THE JUMP TABLE (Jackson, 2026-10-21): the column's encoding picks its scanners; each answers or declines
         # (None) and the next is tried; the decode-and-compare below is the floor under all of them
@@ -1387,8 +1393,24 @@ def _eq_e0_packed(seg, col, c, code, lo, hi, negate):
 
 
 # THE JUMP TABLE: encoding -> its equality scanners, in the order they are tried
+_E10EQ = [os.environ.get('WDB_E10_EQ', '1') != '0']
+
+
+def _eq_e10(seg, col, c, code, lo, hi, negate):
+    """enc 10 straight from its blocks (wdb_kernels.bp10_eq_pos, 2026-10-24)"""
+    bits = int(c.get('pXbits') or 0)
+    if not _E10EQ[0] or not 1 <= bits <= 16 or (hi - lo) < (1 << 16):
+        return None
+    import wdb_kernels as _WK
+    dirX = np.frombuffer(seg.buf, np.int64, int(c['pXnblk']), c['pXdir'])
+    return _WK.bp10_eq_pos(np.frombuffer(seg.buf, np.uint8), np.ascontiguousarray(dirX), np.int64(c['pXpay']),
+                           np.int64(bits), np.int64(c['pXn']), np.int64(lo), np.int64(hi), np.int64(code),
+                           bool(negate))
+
+
 _EQ_TABLE = {
     0: (_eq_e0_packed,),
+    10: (_eq_e10,),
     3: (_eq_e3,),
     18: (_eq_e18_lanes, _eq_e18_frames),
     19: (_eq_e19,),
@@ -1875,10 +1897,13 @@ def _key_values(seg, kk, a):
     by contract, each front-coded block walked once (the point fetches were 223 s of 232 for SearchPhrase's 5.9M
     groups: ~65 Python steps per value, 17 us against values_at's 1 us)"""
     if kk['kind'] == 'scalar':
+        # each surrogate value as the per-group loop emits it (v.item() for a numpy scalar): the value list holds
+        # numpy ints for the arithmetic and length scalars, and an object array's tolist hands them back as numpy
+        # ints (np.int64(5), not 5) -- converted once per distinct value, then indexed (fixed 2026-10-24)
         sv = wdb_scalar.surrogate(seg, kk['spec'])[1]
-        sv = np.asarray(sv, dtype=object) if not isinstance(sv, np.ndarray) else sv
-        vals = sv[a]
-        return vals.tolist() if isinstance(vals, np.ndarray) else list(vals)
+        conv = np.empty(len(sv), dtype=object)
+        conv[:] = [v.item() if hasattr(v, 'item') else v for v in sv]
+        return conv[np.asarray(a, np.int64)].tolist()
     src = kk['src']; c = seg.cols[src]
     if kk['kind'] == 'case':
         dflt = kk['default'] if isinstance(kk['default'], str) else str(kk['default'])
@@ -1927,10 +1952,149 @@ def _emit_columns(seg, spec, keyarr, sel, sel_w, rep, cnt, cells):
     return list(zip(*cols))
 
 
+_EXC_ROUTE = [os.environ.get('WDB_WS_EXCEPTIONS', '1') != '0']
+_COUNT_BOARD = [os.environ.get('WDB_WS_COUNTBOARD', '1') != '0']
+_EXC_HITS = 0
+_BOARD_HITS = 0
+
+
+def _count_key(seg, spec):
+    """the one key of a COUNT-only GROUP BY counted by code -> (key spec, source column, ids, surrogate or None):
+    a dictionary column (ids = its codes) or a scalar over one (ids = the surrogate's sorted value ids)"""
+    if spec.get('mode') != 'group' or len(spec['keys']) != 1:
+        return None
+    if any(a[1] != 'COUNT_STAR' for a in spec['aggs']):
+        return None
+    if any(h[0] != 'COUNT_STAR' for h in (spec.get('having') or ())):
+        return None
+    _pi, k = spec['keys'][0]
+    if k['kind'] not in ('col', 'scalar'):
+        return None
+    c = seg.cols[k['src']]
+    if c.get('mode') not in (0, 1, 2) or seg._effective(k['src']) is not None:
+        return None
+    if k['kind'] == 'col':
+        return k, k['src'], int(c['V']), None
+    surr, svals = wdb_scalar.surrogate(seg, k['spec'])
+    surr = np.asarray(surr, np.int64)
+    if surr.size < int(c['V']):
+        return None
+    return k, k['src'], len(svals), surr
+
+
+def _exceptions_counts(seg, spec, lo, hi, ck):
+    """THE EXCEPTIONS ROAD (2026-10-24, Jackson: "if the filter is only getting rid of 10% of the rows and then we
+    list 90M things that will be rough -- list the exceptions instead"). COUNT(*) WHERE filters GROUP BY k is
+        k's census over every row  -  k's census over the rows some filter fails,
+    and the filters' own censuses say, before any scan, how many rows each keeps: the exceptions (at most the sum of
+    the failing counts) are listed instead of the survivors (at least the smallest keeping count) whenever they are
+    fewer. Measured (excproto.py, same counts): RegionID WHERE IsRefresh = 0 (93.3% kept) 0.550 -> 0.228 s,
+    DontCountHits = 0 0.486 -> 0.278, AdvEngineID = 0 0.528 -> 0.149, SearchPhrase / UserID by IsRefresh 0.64 /
+    0.78 -> 0.34 / 0.35; SearchPhrase WHERE TraficSourceID = 0 (18.3% kept) keeps the survivors (0.49 vs 1.17).
+    = / <> filters only, the whole table (no span), COUNT only -- subtraction undoes a count; MIN / MAX it cannot."""
+    if not _EXC_ROUTE[0] or lo != 0 or hi < int(seg.N) or not spec['eqs']:
+        return None
+    if spec['flags'] or spec['ins'] or spec['likes'] or spec['nulls'] or spec['ors'] or spec['sflags']:
+        return None
+    N = int(seg.N)
+    fails, keeps, parts = 0, N, []
+    for col, val, op in spec['eqs']:
+        c = seg.cols[col]
+        V = int(c['V'])
+        code = _code_of(seg, col, val)
+        cen = np.asarray(seg.raw_census(col, V))[:V]
+        nullc = V - 1 if c.get('has_null') else None
+        if op == '=':
+            kept = int(cen[code]) if code is not None else 0
+        else:                                        # SQL: NULL <> x is not TRUE
+            kept = N - (int(cen[code]) if code is not None else 0) - (int(cen[nullc]) if nullc is not None else 0)
+        fails += N - kept
+        keeps = min(keeps, kept)
+        parts.append((col, code, op, nullc))
+    if fails >= keeps:
+        return None                                  # the survivors are the smaller list: the scan below
+    import wdb_kernels as _WKu
+    xpos = None
+    for col, code, op, nullc in parts:
+        if op == '=':
+            p = _scan_eq(seg, col, int(code), 0, N, negate=True)        # every row not holding the code, NULLs too
+        else:
+            ps = []
+            if code is not None:
+                ps.append(_scan_eq(seg, col, int(code), 0, N))
+            if nullc is not None and nullc != code:
+                ps.append(_scan_eq(seg, col, int(nullc), 0, N))
+            p = (ps[0] if len(ps) == 1 else _WKu.union_sorted(np.asarray(ps[0], np.int64), np.asarray(ps[1], np.int64))
+                 if ps else np.empty(0, np.int64))
+        p = np.asarray(p, np.int64)
+        xpos = p if xpos is None else _WKu.union_sorted(xpos, p)      # the scans hand back ascending positions
+    k, src, nid, surr = ck
+    Vs = int(seg.cols[src]['V'])
+    cen = np.asarray(seg.raw_census(src, Vs))[:Vs].astype(np.int64)
+    if xpos.size:
+        xc = np.asarray(seg.codes_at(src, xpos)).astype(np.int64)
+        cen = cen - np.bincount(xc, minlength=Vs)[:Vs]
+    if surr is None:
+        return cen
+    return np.rint(np.bincount(surr[:Vs], weights=cen, minlength=nid)).astype(np.int64)
+
+
+def _kth_count(cnt, K9):
+    """the K9-th largest count, ties kept (the GROUP BY tail's count of the counts)"""
+    cmax9 = int(cnt.max())
+    if K9 <= 0:
+        return cmax9 + 1
+    if cmax9 <= (1 << 24):
+        hist9 = np.bincount(cnt, minlength=cmax9 + 1)
+        above9 = np.cumsum(hist9[::-1])
+        return cmax9 - int(np.searchsorted(above9, K9))
+    return np.partition(cnt, cnt.size - K9)[cnt.size - K9]
+
+
+def _emit_counts(seg, spec, k, counts):
+    """a COUNT-only GROUP BY's answer from its counts by id (codes, or a scalar's sorted value ids): the groups are
+    the ids with rows; HAVING on the count, then the order the GROUP BY tail below gives (count descending, then
+    id ascending -- its factorised groups in code order), the LIMIT window, keys through _key_values"""
+    import wdb_colresult as CR
+    counts = np.asarray(counts, np.int64)
+    g = np.flatnonzero(counts)
+    cnt = counts[g]
+    for _hk, _hc, hop, hval in (spec.get('having') or ()):
+        a = cnt.astype(np.float64)
+        m = (a > hval if hop == '>' else a >= hval if hop == '>=' else a < hval if hop == '<' else
+             a <= hval if hop == '<=' else a == hval if hop == '=' else a != hval)
+        g = g[m]; cnt = cnt[m]
+    K9 = None if spec['lim'] is None else spec['off'] + spec['lim']
+    if spec['ordered'] and g.size:
+        if K9 is not None and cnt.size > 4 * K9 + 64:
+            cand = np.flatnonzero(cnt >= _kth_count(cnt, K9))
+            order = cand[np.lexsort((g[cand], -cnt[cand]))]
+        else:
+            order = np.lexsort((g, -cnt))
+    else:
+        order = np.arange(g.size)
+    sel = order[spec['off']: spec['off'] + spec['lim']] if spec['lim'] is not None else order[spec['off']:]
+    byp = {spec['keys'][0][0]: _key_values(seg, k, g[sel])}
+    for pi, _kind, _c in spec['aggs']:
+        byp[pi] = cnt[sel].tolist()
+    cols = [byp[pi] for pi in sorted(byp)]
+    hdr = [wdb_sql._alias(p) for p in spec['proj']]
+    n = int(sel.size)
+    if n > CR.COL_GATE:
+        return CR.ColRows([('arr', cl) for cl in cols], n), hdr
+    return list(zip(*cols)) if cols else [], hdr
+
+
 def execute(seg, spec):
-    global _HITS
+    global _HITS, _EXC_HITS, _BOARD_HITS
     lo, hi = _span_rows(seg, spec['spans'])
     spec = _potency_pick(seg, spec, lo, hi)
+    _ck9 = _count_key(seg, spec)
+    if _ck9 is not None:
+        _xc9 = _exceptions_counts(seg, spec, lo, hi, _ck9)
+        if _xc9 is not None:
+            _HITS += 1; _EXC_HITS += 1
+            return _emit_counts(seg, spec, _ck9[0], _xc9)
     likes = spec.get('likes', [])
     de, dl = spec.get('drive_eq'), spec.get('drive_like')
     # only the DRIVING like decides its whole dictionary (it scans every row); every other like is
@@ -2250,6 +2414,16 @@ def execute(seg, spec):
                     code = _code_of(seg, c, v)
                     m &= (kcols[c] == code) if code is not None else False
             keyarr.append((k, np.where(m, kcols[k['src']], -1)))
+    if _ck9 is not None and _COUNT_BOARD[0]:
+        # THE COUNT BOARD (2026-10-24): one key, COUNT only -- the groups are the ids with rows, counted on a board by
+        # id; the factorise below (0.47 s of a 90M-survivor key) and the first-row walk are not needed
+        a9 = np.asarray(keyarr[0][1], np.int64)
+        nid9 = _ck9[2]
+        if a9.size == 0 or int(a9.max()) < nid9:
+            import wdb_kernels as _WK
+            c9 = (_WK.bincount_par(a9, nid9) if (nid9 <= (1 << 22) and a9.size) else np.bincount(a9, minlength=nid9))
+            _HITS += 1; _BOARD_HITS += 1
+            return _emit_counts(seg, spec, _ck9[0], np.asarray(c9, np.int64)[:nid9])
     if len(keyarr) == 1:
         # ONE KEY (2026-10-19): its factorization is the grouping -- the composite's second factorization was the
         # same pass again, and both sorted when the key's codes spanned past 1M (_fact_counts: dense, parallel)

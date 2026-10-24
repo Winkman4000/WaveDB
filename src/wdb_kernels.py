@@ -2245,6 +2245,133 @@ def bp10_decode(buf, dirX, pay, bits, N, out):
 
 
 @njit(nogil=True, cache=True)
+def _bp10_blk(buf, dirX, pay, bits, b, a0, a1, code, negate, out, w, write):
+    """rows [a0, a1) of enc-10 block b whose code equals `code` (differs from it, when negate): counted, or
+    written as row numbers at out[w:] (bp10_eq_pos's two passes)"""
+    B = 4096
+    o = pay + (dirX[b] >> 1)
+    base = b * B
+    n = np.int64(0)
+    if dirX[b] & 1:                                  # run tokens: a matching run is one range of rows
+        nr = np.int64(buf[o]) | (np.int64(buf[o + 1]) << 8)
+        p = o + 2
+        r = base
+        for _ in range(nr):
+            cnt = np.int64(buf[p]) | (np.int64(buf[p + 1]) << 8)
+            val = np.int64(buf[p + 2]) | (np.int64(buf[p + 3]) << 8)
+            p += 4
+            e = r + cnt
+            if (val == code) != negate:
+                s0 = r if r > a0 else a0
+                s1 = e if e < a1 else a1
+                if s1 > s0:
+                    if write:
+                        for rr in range(s0, s1):
+                            out[w + n] = rr
+                            n += 1
+                    else:
+                        n += s1 - s0
+            r = e
+            if r >= a1:
+                break
+        return n
+    if bits == 1 and a0 == base and a1 == base + B:  # a whole 1-bit block: byte by byte, empty bytes skipped
+        if code > 1:
+            if not negate:
+                return n
+            for rr in range(a0, a1):                 # no row holds the code: every row differs
+                if write:
+                    out[w + n] = rr
+                n += 1
+            return n
+        t = code ^ (1 if negate else 0)
+        for i in range(B >> 3):
+            x = np.int64(buf[o + i])
+            m = x if t == 1 else ((~x) & 0xFF)
+            if m == 0:
+                continue
+            for j in range(8):
+                if (m >> (7 - j)) & 1:
+                    if write:
+                        out[w + n] = base + i * 8 + j
+                    n += 1
+        return n
+    for rr in range(a0, a1):                         # bit-pack, MSB first: bp10_decode's walk
+        idx0 = (rr - base) * bits
+        v = np.int64(0)
+        for bi in range(bits):
+            idx = idx0 + bi
+            v = (v << 1) | ((np.int64(buf[o + (idx >> 3)]) >> (7 - (idx & 7))) & 1)
+        if (v == code) != negate:
+            if write:
+                out[w + n] = rr
+            n += 1
+    return n
+
+
+
+@njit(nogil=True, cache=True)
+def union_sorted(a, b):
+    """the union of two ascending position lists, ascending, each position once: one two-pointer pass
+    (np.union1d hashed and sorted 16M exceptions: 11.2 s of a 11.6 s query, 2026-10-24)"""
+    out = np.empty(a.size + b.size, np.int64)
+    i = 0; j = 0; n = 0
+    while i < a.size and j < b.size:
+        x = a[i]; y = b[j]
+        if x < y:
+            out[n] = x; i += 1
+        elif y < x:
+            out[n] = y; j += 1
+        else:
+            out[n] = x; i += 1; j += 1
+        n += 1
+    while i < a.size:
+        out[n] = a[i]; i += 1; n += 1
+    while j < b.size:
+        out[n] = b[j]; j += 1; n += 1
+    return out[:n]
+
+@njit(nogil=True, parallel=True, cache=True)
+def bp10_eq_pos(buf, dirX, pay, bits, N, lo, hi, code, negate):
+    """THE ENC-10 SCAN (2026-10-24, Jackson's exceptions road): the rows of [lo, hi) whose code equals `code`
+    (differs, when negate), straight from the blocks -- each block counted in parallel, then each written at its
+    offset; a matching run is a range, a 1-bit block skips its empty bytes. wherescan decoded the whole column
+    to 100M codes and searched them (IsRefresh's exceptions: 0.20 s)."""
+    B = 4096
+    k0 = lo // B
+    k1 = (hi + B - 1) // B
+    nb = k1 - k0
+    cnts = np.zeros(nb + 1, np.int64)
+    dummy = np.empty(0, np.int64)
+    for kb in prange(nb):
+        b = k0 + kb
+        a0 = b * B
+        if a0 < lo:
+            a0 = lo
+        a1 = (b + 1) * B
+        if a1 > hi:
+            a1 = hi
+        if a1 > N:
+            a1 = N
+        cnts[kb + 1] = _bp10_blk(buf, dirX, pay, bits, b, a0, a1, code, negate, dummy, 0, False)
+    for kb in range(nb):
+        cnts[kb + 1] += cnts[kb]
+    out = np.empty(cnts[nb], np.int64)
+    for kb in prange(nb):
+        b = k0 + kb
+        a0 = b * B
+        if a0 < lo:
+            a0 = lo
+        a1 = (b + 1) * B
+        if a1 > hi:
+            a1 = hi
+        if a1 > N:
+            a1 = N
+        _bp10_blk(buf, dirX, pay, bits, b, a0, a1, code, negate, out, cnts[kb], True)
+    return out
+
+
+@njit(nogil=True, cache=True)
 def gather_frame(raw, rows, j0, out):
     """out[i] = raw[rows[i] - j0]: one frame's rows picked from its inflated codes (nogil: the lanes of a
     sorted gather run it side by side, each into its own slice of the output)"""
