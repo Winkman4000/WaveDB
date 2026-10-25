@@ -198,6 +198,11 @@ pairdistinct = Read('pairdistinct',
                     lambda c: wdb_pairdistinct.detect(c.seg, c.tree, c.cmap),
                     lambda c, spec: wdb_pairdistinct.execute(c.seg, spec))
 
+import wdb_pairusers
+pairusers = Read('pairusers',
+                 lambda c: wdb_pairusers.detect(c.seg, c.tree, c.cmap),
+                 lambda c, spec: wdb_pairusers.execute(c.seg, spec))
+
 import wdb_septop
 septop = Read('septop',
               lambda c: wdb_septop.detect(c.seg, c.tree, c.cmap),

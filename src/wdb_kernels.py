@@ -2709,6 +2709,53 @@ def pd_stamp(pidx, uid, V, npairs):
     return cnt
 
 
+@njit(nogil=True, parallel=True, cache=True)
+def band_hist(codes, B, sh, T):
+    """THE BAND COUNT (wdb_pairusers' near-unique case): rows per band of 2^sh codes, T slices summed"""
+    n = codes.size
+    step = (n + T - 1) // T
+    h = np.zeros((T, B), np.int64)
+    for t in prange(T):
+        lo = t * step
+        hi = min(n, lo + step)
+        for i in range(lo, hi):
+            h[t, np.int64(codes[i]) >> sh] += 1
+    out = np.zeros(B, np.int64)
+    for t in range(T):
+        for b in range(B):
+            out[b] += h[t, b]
+    return out
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def band_rows(codes, flag, sh, T):
+    """the rows (ascending) whose code's band is flagged: count per slice, then write"""
+    n = codes.size
+    step = (n + T - 1) // T
+    cnt = np.zeros(T, np.int64)
+    for t in prange(T):
+        lo = t * step
+        hi = min(n, lo + step)
+        k = 0
+        for i in range(lo, hi):
+            if flag[np.int64(codes[i]) >> sh]:
+                k += 1
+        cnt[t] = k
+    off = np.zeros(T + 1, np.int64)
+    for t in range(T):
+        off[t + 1] = off[t] + cnt[t]
+    out = np.empty(off[T], np.int64)
+    for t in prange(T):
+        lo = t * step
+        hi = min(n, lo + step)
+        k = off[t]
+        for i in range(lo, hi):
+            if flag[np.int64(codes[i]) >> sh]:
+                out[k] = i
+                k += 1
+    return out
+
+
 def warm():
     """JIT-compile the kernels (call from prewarm; ~1 s once, cached on disk after)."""
     kway_topk(np.array([1, 2], np.int64), np.array([1, 1], np.int64),
@@ -2782,6 +2829,8 @@ def warm():
         pres_pair_count(np.array([255], np.uint8), np.array([0], np.int64),
                         np.zeros(8, np.int64), np.zeros(8, np.uint16),
                         np.zeros(8, np.uint8), 2, 2, _bl)
+        band_hist(np.zeros(8, np.uint32), 1, 12, 2)
+        band_rows(np.zeros(8, np.uint32), np.zeros(1, np.bool_), 12, 2)
         enc6_swar_pick(np.zeros(16, np.uint8), np.zeros(15, np.int64),
                        np.zeros(255, np.int64), np.zeros(1, np.uint8),
                        np.zeros(1, np.int64), np.zeros(2, np.int64),
