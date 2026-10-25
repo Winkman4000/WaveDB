@@ -2779,6 +2779,9 @@ def warm():
         pres_pair_count(np.array([255], np.uint8), np.array([0], np.int64),
                         np.zeros(8, np.int64), np.zeros(8, np.uint8),
                         np.zeros(8, np.uint8), 2, 2, _bl)
+        pres_pair_count(np.array([255], np.uint8), np.array([0], np.int64),
+                        np.zeros(8, np.int64), np.zeros(8, np.uint16),
+                        np.zeros(8, np.uint8), 2, 2, _bl)
         enc6_swar_pick(np.zeros(16, np.uint8), np.zeros(15, np.int64),
                        np.zeros(255, np.int64), np.zeros(1, np.uint8),
                        np.zeros(1, np.int64), np.zeros(2, np.int64),

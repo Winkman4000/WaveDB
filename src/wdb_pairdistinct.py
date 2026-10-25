@@ -103,8 +103,15 @@ def _tier_shelf(seg, a, b, u):
     differentiator's typed codes -- 'read only what you need' as an mmap
     slice. Born once; no zstd frame pops again for this query family."""
     import os
+    # THE CODE WIDTH LAW (2026-10-25): a key's codes are u8 only when its V <= 256, else u16 (detect admits V <=
+    # 4096). The u8 cast wrapped code 256+ onto 0+: ParamOrderID (V 397) counted '88563' (code 340) inside
+    # '84163' (code 84) -- 21 users where DuckDB has 9. The widths are in the file name: an old all-u8 shelf is
+    # never read back.
+    wa = np.uint8 if int(seg.cols[a]['V']) <= 256 else np.uint16
+    wb = np.uint8 if int(seg.cols[b]['V']) <= 256 else np.uint16
+    ia, ib = np.dtype(wa).itemsize, np.dtype(wb).itemsize
     p9 = os.path.join(os.path.dirname(seg.path),
-                      'tier2__%s__%s__%s.bin' % (a, b, u))
+                      'tier2__%s__%s__%s__w%d%d.bin' % (a, b, u, ia, ib))
     if not os.path.exists(p9):
         e0 = int(WS._code_of(seg, b, ''))
         cb = seg.cols.get(b) or {}
@@ -113,20 +120,20 @@ def _tier_shelf(seg, a, b, u):
             # THE PLANES ARE THE FILTER (Q11's line items): a tiered/sparse column's planes hold
             # exactly the non-default rows and their codes -- no full decode, no 100M compare
             typed0 = np.ascontiguousarray(np.asarray(pl[0]), dtype=np.uint32)
-            bt0 = np.asarray(pl[1]).astype(np.uint8)
+            bt0 = np.asarray(pl[1]).astype(wb)
         else:
             bc0 = np.asarray(seg._raw_codes(b))
             typed0 = np.flatnonzero(bc0 != e0).astype(np.uint32)
-            bt0 = bc0[typed0].astype(np.uint8)
+            bt0 = bc0[typed0].astype(wb)
         ac0 = np.asarray(seg._raw_codes(a))
         uc0 = np.asarray(seg._raw_codes(u))
         import wdb_sidecar
         if not wdb_sidecar.births_on(os.path.dirname(seg.path)):          # THE SWITCH: the same four, in RAM
-            return typed0, ac0[typed0].astype(np.uint8), bt0, uc0[typed0].astype(np.uint32)
+            return typed0, ac0[typed0].astype(wa), bt0, uc0[typed0].astype(np.uint32)
         with open(p9 + '.tmp', 'wb') as f:
             f.write(np.asarray([typed0.size], np.int64).tobytes())
             f.write(typed0.tobytes())
-            f.write(ac0[typed0].astype(np.uint8).tobytes())
+            f.write(ac0[typed0].astype(wa).tobytes())
             f.write(bt0.tobytes())
             f.write(uc0[typed0].astype(np.uint32).tobytes())
         os.replace(p9 + '.tmp', p9)
@@ -134,10 +141,11 @@ def _tier_shelf(seg, a, b, u):
         wdb_shelves.record(seg, 'tier2', a=a, b=b, u=u)
     mm = np.memmap(p9, dtype=np.uint8, mode='r')
     n9 = int(np.frombuffer(mm[:8], np.int64)[0])
-    typed = np.frombuffer(mm[8:8 + 4 * n9], np.uint32)
-    at = np.frombuffer(mm[8 + 4 * n9:8 + 5 * n9], np.uint8)
-    bt = np.frombuffer(mm[8 + 5 * n9:8 + 6 * n9], np.uint8)
-    ut = np.frombuffer(mm[8 + 6 * n9:8 + 10 * n9], np.uint32)
+    o9 = 8 + 4 * n9
+    typed = np.frombuffer(mm[8:o9], np.uint32)
+    at = np.frombuffer(mm[o9:o9 + ia * n9], wa); o9 += ia * n9
+    bt = np.frombuffer(mm[o9:o9 + ib * n9], wb); o9 += ib * n9
+    ut = np.frombuffer(mm[o9:o9 + 4 * n9], np.uint32)
     return typed, at, bt, ut
 
 

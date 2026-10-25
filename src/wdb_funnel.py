@@ -796,8 +796,9 @@ def execute(seg, spec):
             bufQ[spB['cstart']:spB['cstart'] + (e8n * b8 + 7) // 8 + 8])
         codes9 = np.ascontiguousarray(_WK.unpack_any(lb9, e8n, b8).astype(np.int64))
         tot9 = np.bincount(codes9, minlength=V8)
-        eng9 = np.ascontiguousarray(
-            seg.codes_band(_mbp[smi[0]]['col'], 0, seg.N).astype(np.uint8))
+        eng9 = np.ascontiguousarray(                 # THE CODE WIDTH LAW: u8 only when V <= 256 (V <= 4096 here)
+            seg.codes_band(_mbp[smi[0]]['col'], 0, seg.N).astype(
+                np.uint8 if int(spS['V']) <= 256 else np.uint16))
         pres9 = np.ascontiguousarray(
             bufQ[spB['e8pres']:spB['e8pres'] + (seg.N + 7) // 8])
         ck9 = np.frombuffer(seg.buf, np.uint64,
