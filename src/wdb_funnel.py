@@ -364,6 +364,22 @@ def detect(seg, tree, col_map):
                 if seg.cols.get(cn) is None or seg.cols[cn].get('mode') not in _DICT_MODES:
                     return None
                 strneq.append(cn); continue
+            if isinstance(v9, str):
+                # THE TYPED LITERAL (2026-10-24, the Q36 board): a text or date literal on a dictionary column is one
+                # more flag, compared in code space -- its code from wherescan's _code_of (the text bisect; a date in
+                # the column's stored unit). URL <> 'http://...' and EventDate <> '2013-07-21' declined here and
+                # went to wherescan (0.367 / 0.100 s against DuckDB 0.116 / 0.048). Resolved now, so an unparseable
+                # literal declines instead of failing in execute; a column with NULLs keeps declining (NULL <> v).
+                c9 = seg.cols.get(cn)
+                if c9 is None or c9.get('has_null') or c9.get('mode') not in _DICT_MODES or c9.get('dt') not in (1, 3):
+                    return None
+                try:
+                    import wdb_wherescan
+                    wdb_wherescan._code_of(seg, cn, v9)
+                except Exception:
+                    return None
+                flags.append((cn, v9, isinstance(p9, E.EQ)))
+                continue
             if not isinstance(v9, int):
                 return None
             c9 = seg.cols.get(cn)
@@ -420,11 +436,16 @@ def detect(seg, tree, col_map):
                     unitT = aT
                 if isinstance(aT, E.Column):
                     colT = aT
-            if unitT is not None and str(getattr(unitT, 'this', unitT)).lower() == 'minute' \
-                    and colT is not None:
+            # THE TRUNCATION UNITS (2026-10-24, the Q42 board): second, minute, hour and day are each a fixed number
+            # of seconds, so the bucket is the epoch second over it and the file order is still bucket order;
+            # 'hour' and 'day' went to fused_agg (0.10-0.18 s against DuckDB 0.05-0.06). Month / year / week are
+            # not fixed lengths: they decline as before.
+            uT = str(getattr(unitT, 'this', unitT)).lower() if unitT is not None else None
+            secsT = {'second': 1, 'minute': 60, 'hour': 3600, 'day': 86400}.get(uT)
+            if secsT is not None and colT is not None:
                 cnT = cm.get(colT.name, colT.name)
-                if seg.stairs(cnT) is not None:
-                    trunc = (cnT, 60)
+                if seg.stairs(cnT) is not None and seg.cols[cnT].get('dt') == 3 and _sec_scale(seg, cnT) is not None:
+                    trunc = (cnT, secsT)
     if trunc is not None:
         ox = tree.args.get('order'); lx = tree.args.get('limit')
         if ox is None or lx is None or len(ox.expressions) != 1 \
@@ -533,6 +554,9 @@ def detect(seg, tree, col_map):
 
 
 def _code_of(seg, col, value):
+    if isinstance(value, (str, bytes)):          # a typed literal (detect resolved it once): wherescan's lookup
+        import wdb_wherescan
+        return wdb_wherescan._code_of(seg, col, value)
     c = seg.cols[col]
     V = int(c['V'])
     lo, hi = 0, V - 1                            # sorted dict: binary search
@@ -1419,6 +1443,19 @@ def execute(seg, spec):
     return out, [wdb_sql._alias(p) for p in spec['proj']]
 
 
+def _sec_scale(seg, ecol):
+    """how a datetime column's stored unit becomes seconds: ('div', n) for finer units, ('mul', n) for coarser,
+    None for units of no fixed length (month, year, week)"""
+    import wdb_engine as _E
+    c9 = seg.cols[ecol]
+    un = _E._DT_UNITS[c9.get('aux')] if c9.get('dt') == 3 else 's'
+    if un in ('s', 'ms', 'us', 'ns'):
+        return 'div', {'s': 1, 'ms': 1000, 'us': 1000000, 'ns': 1000000000}[un]
+    if un in ('m', 'h', 'D'):
+        return 'mul', {'m': 60, 'h': 3600, 'D': 86400}[un]
+    return None
+
+
 def _sec_at(seg, ecol, rows):
     """Epoch seconds at ROWS for a staircase datetime column, all in code
     space: codes via one searchsorted on the steps (free), values via a
@@ -1431,11 +1468,10 @@ def _sec_at(seg, ecol, rows):
         dv = np.asarray(seg._typed_dict(ecol), dtype=np.int64)
         unit = {0: 1, 1: 1, 2: 1}.get(0)         # placeholder; refined below
         u9 = c9.get('aux')
-        # normalize to SECONDS whatever the stored unit
-        div = {'s': 1, 'ms': 1000, 'us': 1000000, 'ns': 1000000000}
-        import wdb_engine as _E
-        un = _E._DT_UNITS[u9] if c9.get('dt') == 3 else 's'
-        dv = dv // div.get(un, 1)
+        # normalize to SECONDS whatever the stored unit -- finer units divide, coarser multiply (a DATE column is
+        # stored in days: it read as seconds before 2026-10-24, so its minute buckets were wrong)
+        kind9, f9 = _sec_scale(seg, ecol)
+        dv = dv // f9 if kind9 == 'div' else dv * f9
         steps9 = np.asarray(seg.stairs(ecol), dtype=np.int64)
         memo[ecol] = (steps9, dv)
         hit9 = memo[ecol]
@@ -1506,7 +1542,7 @@ def _execute_trunc(seg, spec):
             else:
                 hit = hit[fc == c9] if kind else hit[fc != c9]
         if hit.size:
-            mins = _sec_at(seg, ecol, hit) // 60
+            mins = _sec_at(seg, ecol, hit) // spec['trunc'][1]      # the bucket: epoch seconds over the unit
             bnd = np.flatnonzero(np.diff(mins) != 0)
             st9 = np.concatenate([[0], bnd + 1])
             en9 = np.concatenate([bnd + 1, [mins.size]])
@@ -1528,7 +1564,7 @@ def _execute_trunc(seg, spec):
         runs_m.append(cur_m); runs_c.append(cur_c)
     out = []
     for i9 in range(spec['off'], min(spec['off'] + spec['k'], len(runs_m))):
-        mv = _dtm.datetime(1970, 1, 1) + _dtm.timedelta(seconds=runs_m[i9] * 60)
+        mv = _dtm.datetime(1970, 1, 1) + _dtm.timedelta(seconds=runs_m[i9] * spec['trunc'][1])
         row = []
         for kind in spec['projkinds']:
             row.append(mv if kind[0] == 'M' else runs_c[i9])

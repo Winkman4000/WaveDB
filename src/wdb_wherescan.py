@@ -1283,7 +1283,58 @@ def _eq_e18_frames(seg, col, c, code, lo, hi, negate):
     return _scan_flag18(seg, col, np.packbits(flag18, bitorder='little'), lo, hi)
 
 
+_E3_BATCH = [os.environ.get('WDB_E3_BATCH', '1') != '0']
+_E3_DZ = []
+
+
+def _eq_e3_batch(seg, col, c, code, lo, hi):
+    """THE ONE-CODE FRAME SCAN (2026-10-24, the dashboard's fixed cost): the span's frames decompressed in ONE call on
+    zstd's own C threads (multi_decompress_to_buffer over a BufferWithSegments view of the file -- no per-frame copy,
+    no Python thread per frame), each frame then compared with the one code. The dashboard's selector, CounterID = 62
+    (738K rows, the 193 frames the load statistics leave): the frame scan 45-50 ms, of which decompressing on 14
+    Python threads 8.5 ms (one thread 11.5; zstd's threads 2.6) and the flag-bit test 10.8 ms on one thread against
+    the equality's 1.1 -- the rest contention. Whole dashboard queries 58-93 -> 20-55 ms (DuckDB 30-40)."""
+    import zstandard as zstd
+    BR = int(c['BR']); bo = c['boffs']; base = int(c['cstart'])
+    wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
+    j0, j1 = lo // BR, (hi - 1) // BR + 1
+    if j1 <= j0:
+        return np.empty(0, np.int64)
+    o0 = int(bo[j0])
+    seg.warm_span(base + o0, base + int(bo[j1]))             # cold frames: parallel large reads first
+    offs = np.asarray(bo[j0:j1 + 1], np.int64) - o0
+    segs = np.empty((j1 - j0, 2), np.uint64)
+    segs[:, 0] = offs[:-1]
+    segs[:, 1] = np.diff(offs)
+    if not _E3_DZ:
+        _E3_DZ.append(zstd.ZstdDecompressor())
+    data = memoryview(seg.buf)[base + o0: base + int(bo[j1])]
+    out = _E3_DZ[0].multi_decompress_to_buffer(zstd.BufferWithSegments(data, segs.tobytes()),
+                                              threads=min(_SCAN_THREADS, j1 - j0))
+    parts = []
+    for i in range(len(out)):
+        raw = np.frombuffer(out[i], dtype=wdt)
+        j = j0 + i
+        a = max(lo, j * BR) - j * BR
+        b = min(hi, j * BR + raw.size) - j * BR
+        h = np.flatnonzero(raw[a:b] == code)
+        if h.size:
+            parts.append(h + (j * BR + a))
+    pos = np.concatenate(parts) if parts else np.empty(0, np.int64)
+    if pos.size <= 4_000_000:                    # THE SCANNED CODES, kept for codes_at (as the frame scan keeps them)
+        seg.__dict__.setdefault('_scan_codes', {})[col] = (pos, np.full(pos.size, code, np.int64))
+    return pos
+
+
 def _eq_e3(seg, col, c, code, lo, hi, negate):
+    # = : the batch decompress + the equality (_eq_e3_batch); <> keeps the frame scan below, whose kernel writes the
+    # tens of millions of positions a common code's complement makes better than a compare per frame (measured
+    # 0.087 vs 0.102 s, 0.080 vs 0.106 on Robotness / ResponseEndTiming's commonest)
+    if not negate and code >= 0 and _E3_BATCH[0] and col not in seg._codes:
+        try:
+            return _eq_e3_batch(seg, col, c, int(code), lo, hi)
+        except Exception:
+            pass                                 # a frame the batch call cannot take: the frame scan below
     # one code IS a flag: the nogil frame scan (THE SCAN WITHOUT THE GIL) instead of a numpy
     # compare per frame under the GIL -- UserID = k measured 155 -> ~60 ms on 1,526 frames
     V3 = int(c.get('V') or 0)
