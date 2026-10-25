@@ -52,6 +52,10 @@ _CENSUS = [__import__('os').environ.get('WDB_CENSUS_DRESS', '1') == '1'] # A/B: 
 _VALSUM = [__import__('os').environ.get('WDB_E19_VALSUM', '1') == '1']   # A/B: 0 restores SUM/AVG of enc 19 by the full census
 _SORTGATHER = [__import__('os').environ.get('WDB_SORTGATHER', '1') == '1']  # A/B: 0 restores the general frame gathers (enc 3/18)
 _MANY_AT_SHIFT = int(__import__('os').environ.get('WDB_MANY_AT_SHIFT', '5'))   # codes_at decodes whole from N >> this rows
+# THE BATCH GATHER, enc 3 (2026-10-25): from this many touched frames, one zstd call on its own threads (measured: 64
+# frames 2.2-5.0 ms vs the lanes' 4.9-6.4; 1,526 frames 11.8-63 vs 129-139; at 32 mixed, below the lanes win)
+_E3_BATCH_FRAMES = int(__import__('os').environ.get('WDB_E3_BATCH_FRAMES', '64'))   # 0 = off
+_E3_BATCH_THREADS = 16
 _I2FOLD = [__import__('os').environ.get('WDB_I2FOLD', '1') == '1']   # A/B: 0 restores the inflated spine + numpy fold for exact SUM/AVG
 _LZ = [0]                 # program: (ZSTD_decompressDCtx address, create, free, lib) or None; 0 = not yet tried
 _E19CENSUS = [__import__('os').environ.get('WDB_E19_CENSUS', '1') == '1']   # A/B: 0 restores decode + boards for shelved enc 19
@@ -3580,6 +3584,14 @@ class Segment:
                 np.searchsorted(self.stairs(nm), rows, side='right').astype(np.int64)
         if _SORTGATHER[0] and rows.size >= 2 and bool((rows[1:] >= rows[:-1]).all()):
             return self._e3_at_sorted(c, rows)
+        if _SORTGATHER[0] and _E3_BATCH_FRAMES and rows.size >= _E3_BATCH_FRAMES:
+            o3 = np.argsort(rows, kind='stable')          # unsorted rows over many frames: sort, the batch gather,
+            rs3 = rows[o3]                                 # and back to the caller's order
+            if np.unique(rs3 // int(c['BR'])).size >= _E3_BATCH_FRAMES:
+                g3 = self._e3_at_sorted(c, rs3)
+                out3 = np.empty_like(g3)
+                out3[o3] = g3
+                return out3
         wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
         BR = c['BR']; base = c['cstart']; bo = c['boffs']; dz = self._dz
         out = np.empty(rows.size, dtype=wdt)
@@ -3662,6 +3674,23 @@ class Segment:
         BR = int(c['BR']); base = int(c['cstart']); bo = c['boffs']; N = int(self.N)
         out = np.empty(rows.size, dtype=wdt)
         ub, st, en = self._frame_runs(rows, BR)
+        if _E3_BATCH_FRAMES and ub.size >= _E3_BATCH_FRAMES:
+            # THE BATCH GATHER: the touched frames' segments in one multi_decompress_to_buffer (zstd's C threads; the
+            # lanes' Python threads contend: 1,526 frames of UTMSource 129 ms -> 15.7, ResponseEndTiming 129 -> 39,
+            # URL 139 -> 63), then the compiled gather per frame. Whole frames: no partial read (the lanes keep it).
+            import zstandard as _zs
+            bo64 = np.asarray(bo, np.int64)
+            o0 = int(bo64[int(ub[0])]); o1 = int(bo64[int(ub[-1]) + 1])
+            segs = np.empty((ub.size, 2), np.uint64)
+            segs[:, 0] = bo64[ub] - o0
+            segs[:, 1] = bo64[ub + 1] - bo64[ub]
+            res = _zs.ZstdDecompressor().multi_decompress_to_buffer(   # one per call: a shared one is not thread-safe
+                _zs.BufferWithSegments(memoryview(self.buf)[base + o0:base + o1], segs.tobytes()),
+                threads=min(_E3_BATCH_THREADS, int(ub.size)))
+            for k in range(ub.size):
+                a = int(st[k]); e = int(en[k])
+                _WK.gather_frame(np.frombuffer(res[k], dtype=wdt), rows[a:e], np.int64(int(ub[k]) * BR), out[a:e])
+            return out
         mv = memoryview(self.buf)
 
         def run(k0, k1):
@@ -3689,6 +3718,25 @@ class Segment:
         bits18 = int(c['pbits']); BR = int(c['BR']); N = int(self.N)
         out18 = np.empty(rows.size, dtype=np.int64)
         ub, st, en = self._frame_runs(rows, BR)
+        if _E3_BATCH_FRAMES and ub.size >= _E3_BATCH_FRAMES:
+            # THE BATCH GATHER (enc 3's sibling): the touched frames in one zstd call on its own threads, then each
+            # frame's words gathered by bit arithmetic (the lanes' Python threads waited on locks: ClientEventTime
+            # at 2,263 rows over ~1,000 frames spent ~70 ms there)
+            import zstandard as _zs
+            from wdb_kernels import pk32_words as _words
+            po = np.asarray(c['poffs'], np.int64); base = int(c['cstart'])
+            o0 = int(po[int(ub[0])]); o1 = int(po[int(ub[-1]) + 1])
+            segs = np.empty((ub.size, 2), np.uint64)
+            segs[:, 0] = po[ub] - o0
+            segs[:, 1] = po[ub + 1] - po[ub]
+            dz18 = _zs.ZstdDecompressor()                # one per call: a shared one is not thread-safe
+            res = dz18.multi_decompress_to_buffer(
+                _zs.BufferWithSegments(memoryview(self.buf)[base + o0:base + o1], segs.tobytes()),
+                threads=min(_E3_BATCH_THREADS, int(ub.size)))
+            for k in range(ub.size):
+                a = int(st[k]); e = int(en[k])
+                _WK18.pk32_gather(_words(res[k].tobytes()), bits18, rows[a:e] - int(ub[k]) * BR, out18[a:e])
+            return out18
 
         def run(k0, k1):
             import zstandard as _zs

@@ -1284,7 +1284,6 @@ def _eq_e18_frames(seg, col, c, code, lo, hi, negate):
 
 
 _E3_BATCH = [os.environ.get('WDB_E3_BATCH', '1') != '0']
-_E3_DZ = []
 
 
 def _eq_e3_batch(seg, col, c, code, lo, hi):
@@ -1306,10 +1305,9 @@ def _eq_e3_batch(seg, col, c, code, lo, hi):
     segs = np.empty((j1 - j0, 2), np.uint64)
     segs[:, 0] = offs[:-1]
     segs[:, 1] = np.diff(offs)
-    if not _E3_DZ:
-        _E3_DZ.append(zstd.ZstdDecompressor())
     data = memoryview(seg.buf)[base + o0: base + int(bo[j1])]
-    out = _E3_DZ[0].multi_decompress_to_buffer(zstd.BufferWithSegments(data, segs.tobytes()),
+    dz9 = zstd.ZstdDecompressor()                # one per call: a shared one is not thread-safe
+    out = dz9.multi_decompress_to_buffer(zstd.BufferWithSegments(data, segs.tobytes()),
                                               threads=min(_SCAN_THREADS, j1 - j0))
     parts = []
     for i in range(len(out)):

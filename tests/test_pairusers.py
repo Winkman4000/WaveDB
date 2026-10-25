@@ -109,9 +109,16 @@ def test_pairusers_self_and_near_unique_legal():
 
 def test_pairusers_kept_case_legal():
     db, con, seg = _fixture()
-    served, hits = _run(db, con, KEPT)
-    assert served == ['pairusers'] * len(KEPT), served
-    assert hits == [0, 0, 3], hits               # w x r: the kept case comes before the near-unique one
+    import wdb_pairusers as PU
+    d0 = PU.DENSE_PAIRS
+    try:
+        for dense in (d0, 0):                    # the stop-early walk's two pair numberings: bincount, one unique
+            PU.DENSE_PAIRS = dense
+            served, hits = _run(db, con, KEPT)
+            assert served == ['pairusers'] * len(KEPT), (dense, served)
+            assert hits == [0, 0, 3], (dense, hits)   # w x r: the kept case comes before the near-unique one
+    finally:
+        PU.DENSE_PAIRS = d0
 
 
 def test_pairusers_declines_other_shapes():

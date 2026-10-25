@@ -275,12 +275,59 @@ def _kept(seg, spec, xcol, xcode):
     ka = np.asarray(seg.codes_at(a, pos)).astype(np.int64)
     kb = np.asarray(seg.codes_at(b, pos)).astype(np.int64)
     ku = np.asarray(seg.codes_at(u, pos)).astype(np.int64)
-    Vb, Vu = int(seg.cols[b]['V']), int(seg.cols[u]['V'])
-    pv, pid = np.unique(ka * Vb + kb, return_inverse=True)
-    pu = np.unique(pid.astype(np.int64) * Vu + ku)
-    users = np.bincount(pu // Vu, minlength=pv.size)
-    top = np.argsort(-users, kind='stable')[:k]
-    return [(int(users[i]), int(pv[i] // Vb), int(pv[i] % Vb)) for i in top]
+    Va, Vb, Vu = int(seg.cols[a]['V']), int(seg.cols[b]['V']), int(seg.cols[u]['V'])
+    return _stop_early(ka, kb, ku, Va, Vb, Vu, k)
+
+
+DENSE_PAIRS = 1 << 24      # rows per pair by bincount over a x Vb + b when Va x Vb is at most this; past it, one unique
+
+
+def _stop_early(ka, kb, ku, Va, Vb, Vu, k):
+    """JACKSON'S STOP-EARLY RULE over the kept rows. 1. rows(pair) for every pair (a bincount when the pair space
+    is small, else one unique). 2. users(pair) <= rows(pair). 3. walk the pairs by rows, biggest first, a batch at
+    a time: count each batch's distinct users over that batch's rows only. 4. stop at the first pair whose rows are
+    at most the k-th best users found: it and every pair after it hold at most that many users (a tie at the cut
+    is legal either way). Returns [(users, code a, code b)] best first."""
+    if Va * Vb <= DENSE_PAIRS:
+        pk = ka * Vb + kb
+        rows_per = np.bincount(pk, minlength=Va * Vb)
+        live = np.flatnonzero(rows_per)
+        order = live[np.argsort(-rows_per[live], kind='stable')]
+        keyof = None
+    else:
+        keyof, pk = np.unique(ka * Vb + kb, return_inverse=True)
+        pk = pk.astype(np.int64)
+        rows_per = np.bincount(pk)
+        order = np.argsort(-rows_per, kind='stable')
+    lut = np.full(rows_per.size, -1, np.int32)
+    board = []                                   # (users, pair)
+    kth = 0
+    i, batch = 0, max(4 * k, 64)
+    while i < order.size:
+        take = order[i:i + batch]
+        if len(board) >= k:
+            take = take[rows_per[take] > kth]    # a pair with rows <= kth cannot get in
+        if not take.size:
+            break
+        lut[take] = np.arange(take.size, dtype=np.int32)
+        li = lut[pk]
+        sel = li >= 0
+        uu = np.unique(li[sel].astype(np.int64) * Vu + ku[sel])
+        users = np.bincount(uu // Vu, minlength=take.size)
+        lut[take] = -1
+        board += list(zip(users.tolist(), take.tolist()))
+        board.sort(key=lambda t: -t[0])
+        board = board[:k]
+        kth = board[-1][0] if len(board) >= k else 0
+        i += batch
+        batch *= 4
+        if i < order.size and len(board) >= k and rows_per[order[i]] <= kth:
+            break                                # THE STOP: nothing after this can climb past the k-th
+    out = []
+    for n9, p9 in board:
+        key = int(p9) if keyof is None else int(keyof[p9])
+        out.append((int(n9), key // Vb, key % Vb))
+    return out
 
 
 def execute(seg, spec):
