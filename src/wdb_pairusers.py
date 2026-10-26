@@ -1,4 +1,4 @@
-"""wdb_pairusers -- THE PAIR USERS read (2026-10-25): Q11's shape on keys pairdistinct does not take.
+"""wdb_pairusers -- THE PAIR USERS read (2026-10-25): Q11's shape (before pairdistinct, which takes what it declines).
 
     SELECT a, b, COUNT(DISTINCT u) AS n FROM t [WHERE a|b <> literal] GROUP BY a, b ORDER BY n DESC LIMIT k
 
@@ -114,7 +114,8 @@ def detect(seg, tree, col_map):
                 best = (kc, extra)
         if best is not None:
             case = ('near', best[0])
-        elif excl is not None and int(seg.cols[excl[0]]['V']) <= CENSUS_V:
+        elif excl is not None and (int(seg.cols[excl[0]]['V']) <= CENSUS_V
+                                   or seg.cols[excl[0]].get('code_enc') in (8, 9)):
             case = ('kept', None)                # THE KEPT CASE alone: execute counts the kept rows (census)
         else:
             return None
@@ -252,12 +253,22 @@ def _one_row_groups(seg, ck, repc, K, O, a, need, xcol, xcode):
 
 
 def _kept_count(seg, xcol, xcode):
-    """rows the filter keeps, from the filter column's census (None when its V is past CENSUS_V)"""
-    V = int(seg.cols[xcol]['V'])
-    if V > CENSUS_V:
-        return None
+    """rows the filter keeps. THE CHEAP KEPT COUNT (2026-10-25): a sparse column (enc 8 / 9) excluding its
+    default value keeps exactly its stored non-default rows (e8n / e9n: MobilePhoneModel <> '' keeps 5,563,212 --
+    its census cost 21 ms a query, 209 the first); excluding any other of its values, None (not worth the census).
+    Otherwise the census (enc 2 / 10: under 1 ms; enc 3: 10-15), None past CENSUS_V."""
+    c = seg.cols[xcol]
     if xcode is None:
         return int(seg.N)
+    enc = c.get('code_enc')
+    if enc in (8, 9):
+        d9, n9 = c.get('e%dd' % enc), c.get('e%dn' % enc)
+        if d9 is not None and n9 is not None and int(d9) == int(xcode):
+            return int(n9)
+        return None
+    V = int(c['V'])
+    if V > CENSUS_V:
+        return None
     cen = np.asarray(seg.raw_census(xcol, V))
     return int(seg.N) - int(cen[xcode])
 

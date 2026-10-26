@@ -133,3 +133,20 @@ def test_pairusers_declines_other_shapes():
     q = "SELECT tx, s, COUNT(DISTINCT u) AS n FROM t WHERE s <> 99 GROUP BY tx, s ORDER BY n DESC LIMIT 10"
     spec = PU.detect(seg, sqlglot.parse_one(q), {})
     assert spec is not None and PU.execute(seg, spec) is None, spec
+
+
+def test_cheap_kept_count_reads_the_sparse_count():
+    """THE CHEAP KEPT COUNT: a sparse column (enc 8 / 9) excluding its default keeps exactly its stored non-default
+    rows (on the ClickBench data MobilePhoneModel's e9n, 5,563,212, is the census's count to the row); excluding
+    any other value: None (no census); no filter literal held by a row: every row"""
+    import wdb_pairusers as PU
+
+    class _Seg:
+        N = 1000
+        cols = {'x9': {'code_enc': 9, 'e9d': 0, 'e9n': 123, 'V': 5000000},
+                'x8': {'code_enc': 8, 'e8d': 4, 'e8n': 77, 'V': 9000000}}
+    assert PU._kept_count(_Seg, 'x9', 0) == 123
+    assert PU._kept_count(_Seg, 'x9', 3) is None
+    assert PU._kept_count(_Seg, 'x8', 4) == 77
+    assert PU._kept_count(_Seg, 'x8', 0) is None
+    assert PU._kept_count(_Seg, 'x9', None) == 1000

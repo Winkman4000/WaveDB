@@ -60,8 +60,8 @@ _READ_ORDER = (
     R.affinegroup,
     R.affinesum,
     R.mixtop,
+    R.pairusers,            # Q11's shape: few kept rows / u a key / a near-unique key (wdb_pairusers); declines to:
     R.pairdistinct,
-    R.pairusers,            # Q11's shape, any keys: u a key (every group 1) / a near-unique key (wdb_pairusers)
     R.septop,
     R.sampletop,
     R.tripletop,

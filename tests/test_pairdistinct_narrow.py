@@ -72,6 +72,8 @@ def test_through_sql_equal_old_path_and_duck():
                        env=dict(os.environ, **floor))
         calls = []
         real = PD._narrow
+        import wdb_pairusers as PU                   # this test aims at pairdistinct; the pair users read runs
+        pu0 = PU.ON[0]; PU.ON[0] = False             # ahead of it (c80) and would answer these small tables
         PD._narrow = lambda *a9: calls.append(a9[1]) or real(*a9)
         try:
             with _env(**floor):
@@ -102,6 +104,7 @@ def test_through_sql_equal_old_path_and_duck():
             assert seg.cols['plain'].get('code_enc') not in (8, 9)                                 # codes_at ran
         finally:
             PD._narrow = real
+            PU.ON[0] = pu0
     finally:
         shutil.rmtree(d, ignore_errors=True); shutil.rmtree(db_dir, ignore_errors=True)
         try: os.remove(pq)
