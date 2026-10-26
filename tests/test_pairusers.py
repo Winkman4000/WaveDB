@@ -102,7 +102,7 @@ def test_pairusers_self_and_near_unique_legal():
     finally:
         PU.KEPT_LINE = line0
     assert served == ['pairusers'] * len(SELF_NEAR), served
-    assert hits == [2, 3, 0, 0, 0, 0], hits                     # self x2, near-unique x3, nothing else
+    assert hits == [2, 3, 0, 0, 0, 0, 0], hits                     # self x2, near-unique x3, nothing else
     top = con.execute(SELF_NEAR[2]).fetchall()
     assert [x[-1] for x in top[:9]] == [2] * 9 and top[9][-1] == 1, top[:10]
 
@@ -116,7 +116,7 @@ def test_pairusers_kept_case_legal():
             PU.DENSE_PAIRS = dense
             served, hits = _run(db, con, KEPT)
             assert served == ['pairusers'] * len(KEPT), (dense, served)
-            assert hits == [0, 0, 3, 0, 0, 0], (dense, hits)  # w x r: the kept case before the near-unique one
+            assert hits == [0, 0, 3, 0, 0, 0, 0], (dense, hits)  # w x r: the kept case before the near-unique one
     finally:
         PU.DENSE_PAIRS = d0
 
@@ -183,7 +183,7 @@ def test_pairusers_dense_case_legal():
     finally:
         PU.KEPT_LINE = line0
     assert served == ['pairusers'] * len(DENSE), served
-    assert hits == [0, 0, 0, len(DENSE), 0, 0], hits
+    assert hits == [0, 0, 0, len(DENSE), 0, 0, 0], hits
 
 
 def test_pairusers_wide_case_legal():
@@ -198,10 +198,63 @@ def test_pairusers_wide_case_legal():
         PU.WIDE_BOX = (8, 32, 128, 512); PU.SPARSE_LINE = 1 << 40
         served, hits = _run(db, con, DENSE)
         assert served == ['pairusers'] * len(DENSE), served
-        assert hits == [0, 0, 0, 0, len(DENSE), 0], hits
+        assert hits == [0, 0, 0, 0, len(DENSE), 0, 0], hits
         PU.WIDE_BOX = (8,); PU.SPARSE_LINE = 0
         served, hits = _run(db, con, DENSE)
         assert served == ['pairusers'] * len(DENSE), served
-        assert hits == [0, 0, 0, 0, 0, len(DENSE)], hits
+        assert hits == [0, 0, 0, 0, 0, len(DENSE), 0], hits
     finally:
         PU.KEPT_LINE, PU.DENSE_CASE, PU.WIDE_BOX, PU.SPARSE_LINE = keep
+
+
+def test_pairusers_sparse_users_step_legal():
+    """THE SPARSE USERS step: a budget of 0 rounds read after the first, so every walk (dense; the wide box; the
+    sparse step) with pairs still above its k-th hands over -- exact users for every pair in one pass. Legal."""
+    db, con, seg = _fixture()
+    import wdb_pairusers as PU
+    keep = (PU.KEPT_LINE, PU.DENSE_CASE, PU.WIDE_BOX, PU.SPARSE_LINE, PU.USERS_AFTER, PU._rounds_budget)
+    try:
+        PU.KEPT_LINE = 0; PU.USERS_AFTER = 1             # a budget of 0 rounds, read after the first round
+        PU._rounds_budget = lambda kept, N: 0
+        served, hits = _run(db, con, DENSE)                    # the dense walk hands over
+        assert served == ['pairusers'] * len(DENSE), served
+        assert hits[6] >= 1, hits
+        PU.DENSE_CASE = 0; PU.WIDE_BOX = (8,); PU.SPARSE_LINE = 0
+        served, hits = _run(db, con, DENSE)                    # the box, then the sparse step, hand over
+        assert served == ['pairusers'] * len(DENSE), served
+        assert hits[6] >= 1, hits
+    finally:
+        PU.KEPT_LINE, PU.DENSE_CASE, PU.WIDE_BOX, PU.SPARSE_LINE, PU.USERS_AFTER, PU._rounds_budget = keep
+
+
+def test_pairusers_kept_rows_first_legal():
+    """THE KEPT ROWS FIRST: the line raised to every row (COMPACT_SHIFT = 0), so each filtered query reads its kept
+    rows' codes first and runs the dense steps, then the wide box and the sparse step, on them alone. Legal."""
+    db, con, seg = _fixture()
+    import wdb_pairusers as PU
+    keep = (PU.KEPT_LINE, PU.DENSE_CASE, PU.WIDE_BOX, PU.SPARSE_LINE, PU.COMPACT_SHIFT, PU.COMPACT_WIDE_SHIFT)
+    qs = [q for q in DENSE if ' WHERE ' in q] + [
+        "SELECT s, r, COUNT(DISTINCT u) AS n FROM t WHERE r <> 0 GROUP BY s, r ORDER BY n DESC LIMIT 10"]
+    try:
+        PU.KEPT_LINE = 0; PU.COMPACT_SHIFT = 0; PU.COMPACT_WIDE_SHIFT = 0
+        for dense, box, line in ((PU.DENSE_CASE, PU.WIDE_BOX, PU.SPARSE_LINE), (0, (8, 32, 128, 512), 1 << 40),
+                                 (0, (8,), 0)):
+            PU.DENSE_CASE, PU.WIDE_BOX, PU.SPARSE_LINE = dense, box, line
+            served, hits = _run(db, con, qs)
+            assert served == ['pairusers'] * len(qs), (dense, served)
+    finally:
+        PU.KEPT_LINE, PU.DENSE_CASE, PU.WIDE_BOX, PU.SPARSE_LINE, PU.COMPACT_SHIFT, PU.COMPACT_WIDE_SHIFT = keep
+
+
+def test_top_values_threshold_matches_the_full_sort():
+    """THE TOP VALUES BY A COUNT THRESHOLD: the listed values are the full stable sort's first ones, at most L of
+    them, and the bound for the rest is the biggest count left out"""
+    import numpy as np, wdb_pairusers as PU
+    rng = np.random.default_rng(83)
+    for L in (1, 5, 50, 1000, 10 ** 6):
+        cen = rng.integers(0, 40, 5000).astype(np.int64); cen[rng.integers(0, 5000, 30)] = 70000
+        o, c, rest = PU._top_values(cen, L)
+        full = np.argsort(-cen, kind='stable')
+        assert o.size <= max(L, 0) and np.array_equal(o, full[:o.size]), L
+        left = cen[full[o.size:]]
+        assert rest == (int(left.max()) if left.size else 0), (L, rest)

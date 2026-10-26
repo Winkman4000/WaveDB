@@ -3077,6 +3077,87 @@ def hunt64_sparse(ca, cb, which, xc, Vb, cu, fa, tk, tv, nslot, SH, NL, L):
     return out
 
 
+@njit(nogil=True, parallel=True, cache=True)
+def sparse_users(ca, cb, cu, which, xc, Vb, PB, T, k):
+    """THE SPARSE USERS step: distinct users for every occurring pair over the kept rows, in one partitioned pass.
+    Rows hashed by pair into 2^PB parts (every row of a pair in one part); each part keeps the different (pair,
+    user) in its own growing table, then counts them per pair (sorted keys, runs); its top k come out.
+    Returns topk_key (P, k) int64 (-1 none), topk_users (P, k) int64"""
+    n = ca.size; P = np.int64(1) << PB; S = np.uint64(64 - PB)
+    pc = np.zeros((T, P), np.int64)
+    for t in prange(T):
+        for i in range(n * t // T, n * (t + 1) // T):
+            a = np.int64(ca[i]); b = np.int64(cb[i])
+            if xc >= 0 and ((b if which == 1 else a) == xc):
+                continue
+            kk = a * Vb + b
+            pc[t, np.int64((np.uint64(kk) * _WIDE_C1) >> S)] += 1
+    offs = np.zeros(P + 1, np.int64)
+    s = np.int64(0)
+    for p in range(P):
+        for t in range(T):
+            v = pc[t, p]; pc[t, p] = s; s += v
+        offs[p + 1] = s
+    bk = np.empty(s, np.int64); bu = np.empty(s, np.uint32)
+    for t in prange(T):
+        cur = pc[t].copy()
+        for i in range(n * t // T, n * (t + 1) // T):
+            a = np.int64(ca[i]); b = np.int64(cb[i])
+            if xc >= 0 and ((b if which == 1 else a) == xc):
+                continue
+            kk = a * Vb + b
+            p = np.int64((np.uint64(kk) * _WIDE_C1) >> S)
+            q = cur[p]
+            bk[q] = kk; bu[q] = np.uint32(cu[i]); cur[p] = q + 1
+    tkey = np.full((P, k), -1, np.int64); tusr = np.zeros((P, k), np.int64)
+    for p in prange(P):
+        lo = offs[p]; m = offs[p + 1] - lo
+        if m == 0:
+            continue
+        lg = 12
+        sz = np.int64(1) << lg; msk = sz - 1
+        hk = np.full(sz, -1, np.int64); hu = np.zeros(sz, np.uint32); used = 0
+        for q in range(lo, lo + m):
+            if 2 * (used + 1) > sz:              # grow at half full (a part's distinct (pair, user), not its rows)
+                lg += 1; sz = np.int64(1) << lg; msk = sz - 1
+                nk = np.full(sz, -1, np.int64); nu = np.zeros(sz, np.uint32)
+                for y in range(hk.size):
+                    if hk[y] >= 0:
+                        h = np.int64(((np.uint64(hk[y]) * _WIDE_C2) ^ (np.uint64(hu[y]) * _WIDE_C1)) >> np.uint64(64 - lg))
+                        while nk[h] >= 0:
+                            h = (h + 1) & msk
+                        nk[h] = hk[y]; nu[h] = hu[y]
+                hk = nk; hu = nu
+            kk = bk[q]; uu = bu[q]
+            h = np.int64(((np.uint64(kk) * _WIDE_C2) ^ (np.uint64(uu) * _WIDE_C1)) >> np.uint64(64 - lg))
+            while hk[h] >= 0 and not (hk[h] == kk and hu[h] == uu):
+                h = (h + 1) & msk
+            if hk[h] < 0:
+                hk[h] = kk; hu[h] = uu; used += 1
+        ks = np.empty(used, np.int64); j = 0
+        for z in range(sz):
+            if hk[z] >= 0:
+                ks[j] = hk[z]; j += 1
+        ks.sort()
+        # runs: users per pair; keep the k biggest (a small insertion board)
+        nb = 0
+        z = 0
+        while z < used:
+            e = z + 1
+            while e < used and ks[e] == ks[z]:
+                e += 1
+            c = e - z
+            if nb < k or c > tusr[p, nb - 1]:
+                w = nb if nb < k else k - 1
+                while w > 0 and tusr[p, w - 1] < c:
+                    tusr[p, w] = tusr[p, w - 1]; tkey[p, w] = tkey[p, w - 1]; w -= 1
+                tusr[p, w] = c; tkey[p, w] = ks[z]
+                if nb < k:
+                    nb += 1
+            z = e
+    return tkey, tusr
+
+
 def warm():
     """JIT-compile the kernels (call from prewarm; ~1 s once, cached on disk after)."""
     kway_topk(np.array([1, 2], np.int64), np.array([1, 1], np.int64),
@@ -3162,6 +3243,7 @@ def warm():
                    1, -1, 2, np.zeros(8, np.uint32), np.full(4, -1, np.int8), 1, 2, 1, 2)
         _sb, _so, _sn = sparse_rows(np.zeros(8, np.uint8), np.zeros(8, np.uint8), 1, -1, 2, 1, 4, 2)
         sparse_gather(_sb, _so, _sn)
+        sparse_users(np.zeros(8, np.uint8), np.zeros(8, np.uint8), np.zeros(8, np.uint32), 1, -1, 2, 2, 2, 3)
         hunt64_sparse(np.zeros(8, np.uint8), np.zeros(8, np.uint8), 1, -1, 2, np.zeros(8, np.uint32),
                       np.zeros(2, np.int8), np.full(128, -1, np.int64), np.zeros(128, np.int8), 1, 2, 1, 2)
         enc6_swar_pick(np.zeros(16, np.uint8), np.zeros(15, np.int64),
