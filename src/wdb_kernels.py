@@ -2832,6 +2832,251 @@ def hunt64(ca, cb, which, xc, Vb, cu, lut, nslot, SH, NL, L):
     return out
 
 
+@njit(nogil=True, parallel=True, cache=True)
+def hist_kept(cw, co, xc, V, T):
+    """rows per value of cw over the rows where co != xc (xc < 0: every row); per-thread int32 boards"""
+    n = cw.size
+    part = np.zeros((T, V), np.int32)
+    for t in prange(T):
+        lo = n * t // T; hi = n * (t + 1) // T
+        for i in range(lo, hi):
+            if xc >= 0 and np.int64(co[i]) == xc:
+                continue
+            part[t, np.int64(cw[i])] += np.int32(1)
+    out = np.zeros(V, np.int64)
+    for v in prange(V):
+        s = np.int64(0)
+        for t in range(T):
+            s += part[t, v]
+        out[v] = s
+    return out
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def pair_rows_map(ca, cb, ma, mb, which, xc, Mb, K, T):
+    n = ca.size; step = (n + T - 1) // T
+    W = ((K + 15) // 16) * 16 + 16
+    h = np.zeros(T * W, np.int32)
+    for t in prange(T):
+        lo = t * step; hi = min(n, lo + step); base = t * W
+        for i in range(lo, hi):
+            a = np.int64(ca[i]); b = np.int64(cb[i])
+            if xc >= 0 and ((b if which == 1 else a) == xc):
+                continue
+            x = ma[a]; y = mb[b]
+            if x < 0 or y < 0:
+                continue
+            h[base + np.int64(x) * Mb + y] += 1
+    cnt = np.zeros(K, np.int64)
+    for t in range(T):
+        for s in range(K):
+            cnt[s] += h[t * W + s]
+    return cnt
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def hunt64_map(ca, cb, ma, mb, which, xc, Mb, cu, lut, nslot, SH, NL, L):
+    n = ca.size
+    pc = np.zeros((L, NL), np.int64)
+    for l in prange(L):
+        for i in range(l * n // L, (l + 1) * n // L):
+            a = np.int64(ca[i]); b = np.int64(cb[i])
+            if xc >= 0 and ((b if which == 1 else a) == xc):
+                continue
+            x = ma[a]; y = mb[b]
+            if x < 0 or y < 0:
+                continue
+            if lut[np.int64(x) * Mb + y] >= 0:
+                pc[l, np.int64(cu[i]) >> SH] += 1
+    offs = np.zeros(NL + 1, np.int64)
+    for g in range(NL):
+        s = 0
+        for l in range(L):
+            v = pc[l, g]; pc[l, g] = s; s += v
+        offs[g + 1] = offs[g] + s
+    bu = np.empty(offs[NL], np.uint32)
+    bs = np.empty(offs[NL], np.uint8)
+    for l in prange(L):
+        cur = np.empty(NL, np.int64)
+        for g in range(NL):
+            cur[g] = offs[g] + pc[l, g]
+        for i in range(l * n // L, (l + 1) * n // L):
+            a = np.int64(ca[i]); b = np.int64(cb[i])
+            if xc >= 0 and ((b if which == 1 else a) == xc):
+                continue
+            x = ma[a]; y = mb[b]
+            if x < 0 or y < 0:
+                continue
+            p = lut[np.int64(x) * Mb + y]
+            if p >= 0:
+                g = np.int64(cu[i]) >> SH
+                q = cur[g]
+                bu[q] = cu[i]; bs[q] = p; cur[g] = q + 1
+    Wj = np.int64(1) << SH
+    cnt = np.zeros((NL, nslot), np.int64)
+    for g in prange(NL):
+        jar = np.zeros(Wj, np.uint64)
+        base = np.int64(g) << SH
+        for q in range(offs[g], offs[g + 1]):
+            xq = np.int64(bu[q]) - base
+            bit = np.uint64(1) << np.uint64(bs[q])
+            w = jar[xq]
+            if w & bit == 0:
+                jar[xq] = w | bit
+                cnt[g, bs[q]] += 1
+    out = np.zeros(nslot, np.int64)
+    for g in range(NL):
+        for j in range(nslot):
+            out[j] += cnt[g, j]
+    return out
+
+
+_WIDE_C1 = np.uint64(0x9E3779B97F4A7C15)
+_WIDE_C2 = np.uint64(0xC2B2AE3D27D4EB4F)
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def sparse_rows(ca, cb, which, xc, Vb, F, PB, T):
+    """rows per occurring pair (key a*Vb+b) over kept rows: spread by hash into 2^PB parts, count each part in its
+    own growing table; keep pairs with rows > F (F >= 1, so a kept pair has >= 2 rows and fits in place).
+    returns buf, offs, nem: part p's kept pairs sit at buf[offs[p] + 2j] (key), buf[offs[p] + 2j + 1] (rows)"""
+    n = ca.size; P = np.int64(1) << PB; S = np.uint64(64 - PB)
+    pc = np.zeros((T, P), np.int64)
+    for t in prange(T):
+        for i in range(n * t // T, n * (t + 1) // T):
+            a = np.int64(ca[i]); b = np.int64(cb[i])
+            if xc >= 0 and ((b if which == 1 else a) == xc):
+                continue
+            k = a * Vb + b
+            pc[t, np.int64((np.uint64(k) * _WIDE_C1) >> S)] += 1
+    offs = np.zeros(P + 1, np.int64)
+    s = np.int64(0)
+    for p in range(P):
+        for t in range(T):
+            v = pc[t, p]; pc[t, p] = s; s += v
+        offs[p + 1] = s
+    buf = np.empty(s, np.int64)
+    for t in prange(T):
+        cur = pc[t].copy()
+        for i in range(n * t // T, n * (t + 1) // T):
+            a = np.int64(ca[i]); b = np.int64(cb[i])
+            if xc >= 0 and ((b if which == 1 else a) == xc):
+                continue
+            k = a * Vb + b
+            p = np.int64((np.uint64(k) * _WIDE_C1) >> S)
+            buf[cur[p]] = k; cur[p] += 1
+    nem = np.zeros(P, np.int64)
+    for p in prange(P):
+        lo = offs[p]; m = offs[p + 1] - lo
+        if m == 0:
+            continue
+        lg = 12
+        tk = np.full(np.int64(1) << lg, -1, np.int64); tc = np.zeros(np.int64(1) << lg, np.int64); used = 0
+        for q in range(lo, lo + m):
+            if 2 * (used + 1) > (np.int64(1) << lg):
+                lg += 1
+                nk = np.full(np.int64(1) << lg, -1, np.int64); nc = np.zeros(np.int64(1) << lg, np.int64)
+                msk = (np.int64(1) << lg) - 1
+                for z in range(tk.size):
+                    if tk[z] >= 0:
+                        h = np.int64((np.uint64(tk[z]) * _WIDE_C2) >> np.uint64(64 - lg))
+                        while nk[h] >= 0:
+                            h = (h + 1) & msk
+                        nk[h] = tk[z]; nc[h] = tc[z]
+                tk = nk; tc = nc
+            msk = (np.int64(1) << lg) - 1
+            k = buf[q]
+            h = np.int64((np.uint64(k) * _WIDE_C2) >> np.uint64(64 - lg))
+            while tk[h] >= 0 and tk[h] != k:
+                h = (h + 1) & msk
+            if tk[h] < 0:
+                tk[h] = k; used += 1
+            tc[h] += 1
+        j = 0
+        for z in range(tk.size):
+            if tk[z] >= 0 and tc[z] > F:
+                buf[lo + 2 * j] = tk[z]; buf[lo + 2 * j + 1] = tc[z]; j += 1
+        nem[p] = j
+    return buf, offs, nem
+
+
+@njit(cache=True)
+def sparse_gather(buf, offs, nem):
+    H = nem.sum()
+    hk = np.empty(H, np.int64); hc = np.empty(H, np.int64); o = 0
+    for p in range(nem.size):
+        lo = offs[p]
+        for j in range(nem[p]):
+            hk[o] = buf[lo + 2 * j]; hc[o] = buf[lo + 2 * j + 1]; o += 1
+    return hk, hc
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def hunt64_sparse(ca, cb, which, xc, Vb, cu, fa, tk, tv, nslot, SH, NL, L):
+    """hunt64 for up to 64 pairs given by key: fa[a] != 0 when some hunted pair has this a; tk / tv a 128-slot
+    table key -> slot (tk -1 empty)"""
+    n = ca.size
+    pc = np.zeros((L, NL), np.int64)
+    for l in prange(L):
+        for i in range(l * n // L, (l + 1) * n // L):
+            a = np.int64(ca[i])
+            if fa[a] == 0:
+                continue
+            b = np.int64(cb[i])
+            if xc >= 0 and ((b if which == 1 else a) == xc):
+                continue
+            k = a * Vb + b
+            h = np.int64((np.uint64(k) * _WIDE_C2) >> np.uint64(57))
+            while tk[h] >= 0 and tk[h] != k:
+                h = (h + 1) & 127
+            if tk[h] == k:
+                pc[l, np.int64(cu[i]) >> SH] += 1
+    offs = np.zeros(NL + 1, np.int64)
+    for g in range(NL):
+        s = 0
+        for l in range(L):
+            v = pc[l, g]; pc[l, g] = s; s += v
+        offs[g + 1] = offs[g] + s
+    bu = np.empty(offs[NL], np.uint32)
+    bs = np.empty(offs[NL], np.uint8)
+    for l in prange(L):
+        cur = np.empty(NL, np.int64)
+        for g in range(NL):
+            cur[g] = offs[g] + pc[l, g]
+        for i in range(l * n // L, (l + 1) * n // L):
+            a = np.int64(ca[i])
+            if fa[a] == 0:
+                continue
+            b = np.int64(cb[i])
+            if xc >= 0 and ((b if which == 1 else a) == xc):
+                continue
+            k = a * Vb + b
+            h = np.int64((np.uint64(k) * _WIDE_C2) >> np.uint64(57))
+            while tk[h] >= 0 and tk[h] != k:
+                h = (h + 1) & 127
+            if tk[h] == k:
+                g = np.int64(cu[i]) >> SH
+                q = cur[g]
+                bu[q] = cu[i]; bs[q] = tv[h]; cur[g] = q + 1
+    Wj = np.int64(1) << SH
+    cnt = np.zeros((NL, nslot), np.int64)
+    for g in prange(NL):
+        jar = np.zeros(Wj, np.uint64)
+        base = np.int64(g) << SH
+        for q in range(offs[g], offs[g + 1]):
+            xq = np.int64(bu[q]) - base
+            bit = np.uint64(1) << np.uint64(bs[q])
+            w = jar[xq]
+            if w & bit == 0:
+                jar[xq] = w | bit
+                cnt[g, bs[q]] += 1
+    out = np.zeros(nslot, np.int64)
+    for g in range(NL):
+        for j in range(nslot):
+            out[j] += cnt[g, j]
+    return out
+
+
 def warm():
     """JIT-compile the kernels (call from prewarm; ~1 s once, cached on disk after)."""
     kway_topk(np.array([1, 2], np.int64), np.array([1, 1], np.int64),
@@ -2910,6 +3155,15 @@ def warm():
         pair_rows(np.zeros(8, np.uint8), np.zeros(8, np.uint8), 1, -1, 2, 4, 2)
         hunt64(np.zeros(8, np.uint8), np.zeros(8, np.uint8), 1, -1, 2, np.zeros(8, np.uint32),
                np.full(4, -1, np.int8), 1, 2, 1, 2)
+        hist_kept(np.zeros(8, np.uint8), np.zeros(8, np.uint8), 0, 2, 2)
+        pair_rows_map(np.zeros(8, np.uint8), np.zeros(8, np.uint8), np.zeros(2, np.int32), np.zeros(2, np.int32),
+                      1, -1, 2, 4, 2)
+        hunt64_map(np.zeros(8, np.uint8), np.zeros(8, np.uint8), np.zeros(2, np.int32), np.zeros(2, np.int32),
+                   1, -1, 2, np.zeros(8, np.uint32), np.full(4, -1, np.int8), 1, 2, 1, 2)
+        _sb, _so, _sn = sparse_rows(np.zeros(8, np.uint8), np.zeros(8, np.uint8), 1, -1, 2, 1, 4, 2)
+        sparse_gather(_sb, _so, _sn)
+        hunt64_sparse(np.zeros(8, np.uint8), np.zeros(8, np.uint8), 1, -1, 2, np.zeros(8, np.uint32),
+                      np.zeros(2, np.int8), np.full(128, -1, np.int64), np.zeros(128, np.int8), 1, 2, 1, 2)
         enc6_swar_pick(np.zeros(16, np.uint8), np.zeros(15, np.int64),
                        np.zeros(255, np.int64), np.zeros(1, np.uint8),
                        np.zeros(1, np.int64), np.zeros(2, np.int64),

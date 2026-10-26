@@ -102,7 +102,7 @@ def test_pairusers_self_and_near_unique_legal():
     finally:
         PU.KEPT_LINE = line0
     assert served == ['pairusers'] * len(SELF_NEAR), served
-    assert hits == [2, 3, 0, 0], hits                           # self x2, near-unique x3, kept / dense none
+    assert hits == [2, 3, 0, 0, 0, 0], hits                     # self x2, near-unique x3, nothing else
     top = con.execute(SELF_NEAR[2]).fetchall()
     assert [x[-1] for x in top[:9]] == [2] * 9 and top[9][-1] == 1, top[:10]
 
@@ -116,7 +116,7 @@ def test_pairusers_kept_case_legal():
             PU.DENSE_PAIRS = dense
             served, hits = _run(db, con, KEPT)
             assert served == ['pairusers'] * len(KEPT), (dense, served)
-            assert hits == [0, 0, 3, 0], (dense, hits)   # w x r: the kept case comes before the near-unique one
+            assert hits == [0, 0, 3, 0, 0, 0], (dense, hits)  # w x r: the kept case before the near-unique one
     finally:
         PU.DENSE_PAIRS = d0
 
@@ -124,13 +124,13 @@ def test_pairusers_kept_case_legal():
 def test_pairusers_declines_other_shapes():
     db, con, seg = _fixture()
     import sqlglot, wdb_pairusers as PU
-    d0 = PU.DENSE_CASE
-    PU.DENSE_CASE = 0                                         # past the dense line: (s, tx) has no case
+    d0, w0 = PU.DENSE_CASE, PU.WIDE_ON[0]
+    PU.DENSE_CASE = 0; PU.WIDE_ON[0] = False                  # past the dense line, the wide case off: no case
     try:
         assert PU.detect(seg, sqlglot.parse_one(
             "SELECT s, tx, COUNT(DISTINCT u) AS n FROM t GROUP BY s, tx ORDER BY n DESC LIMIT 10"), {}) is None
     finally:
-        PU.DENSE_CASE = d0
+        PU.DENSE_CASE = d0; PU.WIDE_ON[0] = w0
     for q in ("SELECT w, s, COUNT(DISTINCT u) AS n FROM t GROUP BY w, s ORDER BY n DESC, s LIMIT 10",   # tie order
               "SELECT w, s, COUNT(DISTINCT u) AS n FROM t WHERE u > 5 GROUP BY w, s ORDER BY n DESC LIMIT 10",
               "SELECT w, s, COUNT(DISTINCT u) AS n FROM t GROUP BY w, s ORDER BY n DESC LIMIT 10 OFFSET 3"):
@@ -140,7 +140,11 @@ def test_pairusers_declines_other_shapes():
     q = "SELECT tx, s, COUNT(DISTINCT u) AS n FROM t WHERE s <> 99 GROUP BY tx, s ORDER BY n DESC LIMIT 10"
     spec = PU.detect(seg, sqlglot.parse_one(q), {})
     spec['case'] = ('ord', False)
-    assert spec is not None and PU.execute(seg, spec) is None, spec
+    PU.WIDE_ON[0] = False
+    try:
+        assert spec is not None and PU.execute(seg, spec) is None, spec
+    finally:
+        PU.WIDE_ON[0] = w0
 
 
 def test_cheap_kept_count_reads_the_sparse_count():
@@ -179,4 +183,25 @@ def test_pairusers_dense_case_legal():
     finally:
         PU.KEPT_LINE = line0
     assert served == ['pairusers'] * len(DENSE), served
-    assert hits == [0, 0, 0, len(DENSE)], hits
+    assert hits == [0, 0, 0, len(DENSE), 0, 0], hits
+
+
+def test_pairusers_wide_case_legal():
+    """THE WIDE CASE on the dense queries (the dense and kept lines lowered so they stand aside): 1. boxes of 8,
+    32, 128, 512 pairs, the sparse line out of reach -- the box grows until the outside bound is met (s x tx is
+    480 pairs); 2. a box of 8 then THE SPARSE STEP at once. Every answer legal against DuckDB."""
+    db, con, seg = _fixture()
+    import wdb_pairusers as PU
+    keep = (PU.KEPT_LINE, PU.DENSE_CASE, PU.WIDE_BOX, PU.SPARSE_LINE)
+    try:
+        PU.KEPT_LINE = 0; PU.DENSE_CASE = 0
+        PU.WIDE_BOX = (8, 32, 128, 512); PU.SPARSE_LINE = 1 << 40
+        served, hits = _run(db, con, DENSE)
+        assert served == ['pairusers'] * len(DENSE), served
+        assert hits == [0, 0, 0, 0, len(DENSE), 0], hits
+        PU.WIDE_BOX = (8,); PU.SPARSE_LINE = 0
+        served, hits = _run(db, con, DENSE)
+        assert served == ['pairusers'] * len(DENSE), served
+        assert hits == [0, 0, 0, 0, 0, len(DENSE)], hits
+    finally:
+        PU.KEPT_LINE, PU.DENSE_CASE, PU.WIDE_BOX, PU.SPARSE_LINE = keep

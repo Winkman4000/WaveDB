@@ -11,6 +11,16 @@ Jackson's instant cases (the counts stop it early; a near-unique column is solve
   then the pairs by rows, biggest first, 64 a round, distinct users counted, stopping at the first pair whose rows
   are at most the k-th best users (users <= rows). Defers to pairdistinct's narrow read where that is quicker.
 
+  THE WIDE CASE (2026-10-26) -- pairs past the dense line. users(x, y) <= rows_kept(x, y) <= rows_kept(x) and
+  <= rows_kept(y): 1. rows per value of each key over the kept rows (the kept census); 2. the top values of each
+  side renumbered into a box (pair space 2^20, then 2^22, 2^24; every other value passed over like the excluded
+  one) and the dense steps run inside it; 3. done when the k-th best users >= max(next_a, next_b), the most kept
+  rows of a value left outside. THE SPARSE STEP: when the box the k-th best would need (values of a with more
+  kept rows than it, times values of b with more) is past SPARSE_LINE, rows for every occurring pair instead --
+  hashed into 2^12 parts, each counted in its own table, the pairs with more rows than the box's k-th kept -- and
+  the dense walk over them (users <= rows). LocalEventTime x WindowClientHeight needed a box of 2.2 billion
+  pairs; 1,926 pairs have more rows than its 10th best.
+
   THE SELF CASE -- u is one of the keys. A group fixes its user: every group holds exactly 1 distinct user, so
   any k groups that pass the filter are a legal top k (all tie at 1). Read the first rows until k groups.
 
@@ -43,7 +53,12 @@ KEPT_LINE = 1 << 20        # THE KEPT CASE when the filter keeps at most this ma
                            # the kept rows vs DuckDB: 177,085 kept 0.32x (x Age) / 0.40x (x Title); 333,781 0.60 /
                            # 0.29; 460,217 0.91 / 1.07; 630,500 0.92 / 0.42; 1,561,991 5.1 / 1.29; 5,563,212 3.9 /
                            # 1.93 -- the line sits between 630,500 and 1,561,991 (nothing measured in between)
-_HITS = [0, 0, 0, 0]       # telemetry: self answers, near-unique answers, kept answers, dense answers
+_HITS = [0, 0, 0, 0, 0, 0] # telemetry: self, near-unique, kept, dense, wide box, wide sparse answers
+WIDE_ON = [os.environ.get('WDB_PAIRUSERS_WIDE', '1') != '0']
+WIDE_BOX = (1 << 20, 1 << 22, 1 << 24)   # the box's pair space, growing. Measured on 26 wide Q11 holes: 21 stopped
+                                         # in 2^20, 1 in 2^22 (Referer x ClientEventTime)
+SPARSE_LINE = 1 << 24     # THE SPARSE STEP when the box the k-th best needs is past this (or the last box fails)
+SPARSE_PARTS = 12         # 2^12 hash parts: a part's table stays small
 
 
 def detect(seg, tree, col_map):
@@ -122,7 +137,7 @@ def detect(seg, tree, col_map):
             keptable = excl is not None and (int(seg.cols[excl[0]]['V']) <= CENSUS_V
                                              or seg.cols[excl[0]].get('code_enc') in (8, 9))
             dense = int(seg.cols[a]['V']) * int(seg.cols[b]['V']) <= DENSE_CASE
-            if not (keptable or dense):
+            if not (keptable or dense or WIDE_ON[0]):
                 return None
             case = ('ord', dense)                # THE KEPT CASE when the filter keeps few rows, else THE DENSE CASE
     pcols = [None if i == ci else sc(wdb_sql._proj_colname(p)) for i, p in enumerate(proj)]
@@ -414,6 +429,146 @@ def _dense(seg, spec, xcol, xcode):
     return [(n9, p9 // Vb, p9 % Vb) for n9, p9 in board]
 
 
+def _walk(rows, order, k, hunt):
+    """the dense walk: pairs by rows, biggest first, 64 a round (hunt(take) -> users each); stop at the first pair
+    whose rows are at most the k-th best users. Returns board [(users, pair)], kth, idx (pairs walked)"""
+    board, kth, idx = [], 0, 0
+    while idx < order.size:
+        take = []
+        while idx < order.size and (len(board) < k or rows[order[idx]] > kth):
+            take.append(int(order[idx])); idx += 1
+            if len(take) >= _DENSE_PAIRS_ROUND:
+                break
+        if not take:
+            break
+        dc = hunt(take)
+        board += [(int(dc[j]), take[j]) for j in range(len(take))]
+        board.sort(key=lambda t: -t[0])
+        board = board[:k]
+        kth = board[-1][0] if len(board) >= k else 0
+        if idx < order.size and len(board) >= k and kth >= rows[order[idx]]:
+            break                                # THE STOP: nothing after this can climb past the k-th
+    return board, kth, idx
+
+
+def _kept_census(seg, c, codes, xcol, fcodes, xcode):
+    """rows per value of c over the rows the filter keeps: the census (the filter on c: its excluded value zeroed;
+    no filter: as is), else one masked pass (wdb_kernels.hist_kept)"""
+    V = int(seg.cols[c]['V'])
+    if xcol is None or xcode is None:
+        return np.asarray(seg.raw_census(c, V), np.int64)[:V]
+    if xcol == c:
+        cen = np.array(np.asarray(seg.raw_census(c, V))[:V], np.int64)
+        cen[int(xcode)] = 0
+        return cen
+    import wdb_kernels as WK
+    return WK.hist_kept(codes, fcodes, int(xcode), V, numba.get_num_threads())
+
+
+def _box(sa, sb, cap):
+    """Ma x Mb <= cap (Ma a power of 2) with the smallest outside bound max(next_a, next_b); sa / sb: each side's
+    kept rows, biggest first, values with none left out"""
+    best = None
+    Ma = 1
+    while True:
+        Ma = min(Ma, sa.size)
+        Mb = min(sb.size, cap // Ma)
+        if Mb >= 1:
+            na = int(sa[Ma]) if Ma < sa.size else 0
+            nb = int(sb[Mb]) if Mb < sb.size else 0
+            bnd = max(na, nb)
+            if best is None or bnd < best[0]:
+                best = (bnd, Ma, Mb)
+        if Ma >= sa.size or Ma >= cap:
+            break
+        Ma *= 2
+    return best
+
+
+_M64 = (1 << 64) - 1
+
+
+def _wide(seg, spec, xcol, xcode):
+    """THE WIDE CASE (Jackson's steps): the kept census of each key; the top values renumbered into a box and the
+    dense steps run inside it; done when the k-th best >= max(next_a, next_b) (a pair outside the box has a value
+    outside it: users <= that value's kept rows); a bigger box, or THE SPARSE STEP past SPARSE_LINE.
+    Returns [(users, code a, code b)], or None (declined)"""
+    import wdb_kernels as WK
+    a, b, u, k = spec['a'], spec['b'], spec['u'], spec['k']
+    Va, Vb, Vu = int(seg.cols[a]['V']), int(seg.cols[b]['V']), int(seg.cols[u]['V'])
+    which = 1 if xcol == b else 0
+    xc = -1 if xcode is None else int(xcode)
+    ca = np.asarray(seg._raw_codes(a))
+    cb = np.asarray(seg._raw_codes(b))
+    cu = np.asarray(seg._raw_codes(u))
+    T = numba.get_num_threads()
+    SH = max(1, int(Vu - 1).bit_length() - 7)
+    NL = ((Vu - 1) >> SH) + 1
+    fc = ca if xcol == a else cb
+    cena = _kept_census(seg, a, ca, xcol, fc, xcode)
+    cenb = _kept_census(seg, b, cb, xcol, fc, xcode)
+    oa = np.argsort(-cena, kind='stable'); sa = cena[oa]; sa = sa[:int(np.count_nonzero(sa))]
+    ob = np.argsort(-cenb, kind='stable'); sb = cenb[ob]; sb = sb[:int(np.count_nonzero(sb))]
+    if not sa.size or not sb.size:
+        return []                                # no row passes the filter
+    for cap in WIDE_BOX:
+        bnd, Ma, Mb = _box(sa, sb, cap)
+        ma = np.full(Va, -1, np.int32); ma[oa[:Ma]] = np.arange(Ma, dtype=np.int32)
+        mb = np.full(Vb, -1, np.int32); mb[ob[:Mb]] = np.arange(Mb, dtype=np.int32)
+        K = Ma * Mb
+        cnt = WK.pair_rows_map(ca, cb, ma, mb, which, xc, Mb, K, T)
+        live = np.flatnonzero(cnt)
+        order = live[np.argsort(-cnt[live], kind='stable')]
+        lut = np.full(K, -1, np.int8)
+
+        def hunt(take):
+            tk = np.asarray(take, np.int64)
+            lut[tk] = np.arange(tk.size, dtype=np.int8)
+            dc = WK.hunt64_map(ca, cb, ma, mb, which, xc, Mb, cu, lut, tk.size, SH, NL, T)
+            lut[tk] = -1
+            return dc
+        board, kth, _ = _walk(cnt, order, k, hunt)
+        if bnd == 0 or (len(board) >= k and bnd <= kth):
+            _HITS[4] += 1                        # every value with kept rows inside, or the outside bound met
+            return [(n9, int(oa[p9 // Mb]), int(ob[p9 % Mb])) for n9, p9 in board]
+        need = int(np.count_nonzero(sa > kth)) * int(np.count_nonzero(sb > kth))
+        if need > SPARSE_LINE or cap == WIDE_BOX[-1]:
+            return _sparse(ca, cb, cu, which, xc, Va, Vb, max(kth, 1), k, SH, NL, T)
+    return None
+
+
+def _sparse(ca, cb, cu, which, xc, Va, Vb, F, k, SH, NL, T):
+    """THE SPARSE STEP: rows for every occurring pair over the kept rows (hashed into 2^SPARSE_PARTS parts, each
+    counted in its own table), the pairs with more than F rows kept (F: the box's k-th best, which the final k-th
+    can only pass); the dense walk over them (users <= rows). Every pair not kept has rows <= F: declined (None)
+    unless the walk stops, or ends with the k-th best >= F"""
+    import wdb_kernels as WK
+    buf, offs, nem = WK.sparse_rows(ca, cb, which, xc, Vb, F, SPARSE_PARTS, T)
+    hk, hc = WK.sparse_gather(buf, offs, nem)
+    del buf
+    o = np.argsort(-hc, kind='stable'); hk = hk[o]; hc = hc[o]
+    fa = np.zeros(Va, np.int8)
+    C2 = 0xC2B2AE3D27D4EB4F                       # wdb_kernels._WIDE_C2: the same 128-slot hash
+
+    def hunt(take):
+        tk = np.full(128, -1, np.int64); tv = np.zeros(128, np.int8)
+        for j, q in enumerate(take):
+            key = int(hk[q]); h = ((key * C2) & _M64) >> 57
+            while tk[h] >= 0:
+                h = (h + 1) & 127
+            tk[h] = key; tv[h] = j
+            fa[key // Vb] = 1
+        dc = WK.hunt64_sparse(ca, cb, which, xc, Vb, cu, fa, tk, tv, len(take), SH, NL, T)
+        for q in take:
+            fa[int(hk[q]) // Vb] = 0
+        return dc
+    board, kth, idx = _walk(hc, np.arange(hk.size), k, hunt)
+    if len(board) < k or (idx >= hk.size and kth < F):
+        return None
+    _HITS[5] += 1
+    return [(n9, int(hk[p9]) // Vb, int(hk[p9]) % Vb) for n9, p9 in board]
+
+
 def execute(seg, spec):
     a, b, k = spec['a'], spec['b'], spec['k']
     xcol, xcode = _excl_code(seg, spec)
@@ -426,9 +581,14 @@ def execute(seg, spec):
     elif kc is not None and kc <= KEPT_LINE:
         board = _kept(seg, spec, xcol, xcode)
     elif spec['case'][0] == 'ord':
-        if not spec['case'][1] or _defer_narrow(seg, spec, xcol, xcode):
-            return None                          # pairs past the dense line, or pairdistinct's narrow read is quicker
-        board = _dense(seg, spec, xcol, xcode)
+        if _defer_narrow(seg, spec, xcol, xcode):
+            return None                          # pairdistinct's narrow read is quicker
+        if spec['case'][1]:
+            board = _dense(seg, spec, xcol, xcode)
+        else:
+            board = _wide(seg, spec, xcol, xcode) if WIDE_ON[0] else None
+            if board is None:
+                return None
     elif spec['case'][0] == 'self':
         board = [(1, x, y) for x, y in _first_groups(seg, a, b, k, xcol, xcode)]
         _HITS[0] += 1
