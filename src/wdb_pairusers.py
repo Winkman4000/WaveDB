@@ -7,6 +7,10 @@ Jackson's instant cases (the counts stop it early; a near-unique column is solve
   THE KEPT CASE -- the filter keeps few rows (the filter column's census: N minus the excluded value's rows, at most
   KEPT_LINE). The whole query is those rows: every pair's distinct users counted exactly over them.
 
+  THE DENSE CASE -- any other pairs whose space Va x Vb is at most 2^24: rows per pair in one pass over a and b,
+  then the pairs by rows, biggest first, 64 a round, distinct users counted, stopping at the first pair whose rows
+  are at most the k-th best users (users <= rows). Defers to pairdistinct's narrow read where that is quicker.
+
   THE SELF CASE -- u is one of the keys. A group fixes its user: every group holds exactly 1 distinct user, so
   any k groups that pass the filter are a legal top k (all tie at 1). Read the first rows until k groups.
 
@@ -39,7 +43,7 @@ KEPT_LINE = 1 << 20        # THE KEPT CASE when the filter keeps at most this ma
                            # the kept rows vs DuckDB: 177,085 kept 0.32x (x Age) / 0.40x (x Title); 333,781 0.60 /
                            # 0.29; 460,217 0.91 / 1.07; 630,500 0.92 / 0.42; 1,561,991 5.1 / 1.29; 5,563,212 3.9 /
                            # 1.93 -- the line sits between 630,500 and 1,561,991 (nothing measured in between)
-_HITS = [0, 0, 0]          # telemetry: self answers, near-unique answers, kept answers
+_HITS = [0, 0, 0, 0]       # telemetry: self answers, near-unique answers, kept answers, dense answers
 
 
 def detect(seg, tree, col_map):
@@ -114,13 +118,20 @@ def detect(seg, tree, col_map):
                 best = (kc, extra)
         if best is not None:
             case = ('near', best[0])
-        elif excl is not None and (int(seg.cols[excl[0]]['V']) <= CENSUS_V
-                                   or seg.cols[excl[0]].get('code_enc') in (8, 9)):
-            case = ('kept', None)                # THE KEPT CASE alone: execute counts the kept rows (census)
         else:
-            return None
+            keptable = excl is not None and (int(seg.cols[excl[0]]['V']) <= CENSUS_V
+                                             or seg.cols[excl[0]].get('code_enc') in (8, 9))
+            dense = int(seg.cols[a]['V']) * int(seg.cols[b]['V']) <= DENSE_CASE
+            if not (keptable or dense):
+                return None
+            case = ('ord', dense)                # THE KEPT CASE when the filter keeps few rows, else THE DENSE CASE
     pcols = [None if i == ci else sc(wdb_sql._proj_colname(p)) for i, p in enumerate(proj)]
-    return {'a': a, 'b': b, 'u': u, 'k': k, 'excl': excl, 'case': case, 'ci': ci, 'proj': proj, 'pcols': pcols}
+    defer = False
+    if case[0] == 'ord' and excl is not None and seg.cols[excl[0]].get('code_enc') in (8, 9):
+        import wdb_pairdistinct as _PD             # its narrow read takes this shape quicker (_defer_narrow)
+        defer = _PD.detect(seg, tree, col_map) is not None
+    return {'a': a, 'b': b, 'u': u, 'k': k, 'excl': excl, 'case': case, 'ci': ci, 'proj': proj, 'pcols': pcols,
+            'defer': defer}
 
 
 def _excl_code(seg, spec):
@@ -341,6 +352,68 @@ def _stop_early(ka, kb, ku, Va, Vb, Vu, k):
     return out
 
 
+DENSE_CASE = 1 << 24       # THE DENSE CASE: a pair space Va x Vb up to this. Measured on 14 Q11 holes, 2 to 16,104,704
+                           # pairs: every answer DuckDB's, 0.18-1.69x DuckDB (the largest: T count tables of K int32)
+_DENSE_PAIRS_ROUND = 64    # candidates a round: one bit each in a u64 per user
+
+
+def _defer_narrow(seg, spec, xcol, xcode):
+    """pairdistinct's narrow read -- a sparse filter column excluding its default, so only the kept rows are read --
+    beats the dense case's three whole decodes: Q11 itself 55 ms vs 136, JavaEnable x MobilePhoneModel 59 vs 121.
+    (A dense filter column goes the other way: UTMSource-filtered pairs 122-184 ms dense vs 184-274.)"""
+    if not spec.get('defer') or xcode is None:
+        return False
+    c = seg.cols[xcol]
+    enc = c.get('code_enc')
+    return enc in (8, 9) and int(c.get('e%dd' % enc, -1)) == int(xcode)
+
+
+def _dense(seg, spec, xcol, xcode):
+    """THE DENSE CASE -- Jackson's stop-early steps over every row, the filter's excluded rows passed over (the
+    exceptions road: the kept rows are never listed). 2. rows per pair: slot = a x Vb + b, one pass over a and b
+    (wdb_kernels.pair_rows: each thread's table on its own cache lines; no slot array -- writing one cost 83-91 ms
+    a query). 3. pairs by rows, biggest first, 64 a round: distinct users per pair, the slot computed again from
+    a and b (wdb_kernels.hunt64: rows bucketed by user lane, a u64 of pair bits per user). 4. stop at the first
+    pair whose rows are at most the k-th best users."""
+    import wdb_kernels as WK
+    a, b, u, k = spec['a'], spec['b'], spec['u'], spec['k']
+    Va, Vb, Vu = int(seg.cols[a]['V']), int(seg.cols[b]['V']), int(seg.cols[u]['V'])
+    K = Va * Vb
+    which = 1 if xcol == b else 0
+    xc = -1 if xcode is None else int(xcode)
+    ca = np.asarray(seg._raw_codes(a))
+    cb = np.asarray(seg._raw_codes(b))
+    cu = np.asarray(seg._raw_codes(u))
+    T = numba.get_num_threads()
+    SH = max(1, int(Vu - 1).bit_length() - 7)       # 128 user lanes: a lane's table 2^SH u64
+    NL = ((Vu - 1) >> SH) + 1
+    cnt = WK.pair_rows(ca, cb, which, xc, Vb, K, T)
+    live = np.flatnonzero(cnt)
+    order = live[np.argsort(-cnt[live], kind='stable')]
+    lut = np.full(K, -1, np.int8)
+    board, kth, idx = [], 0, 0
+    while idx < order.size:
+        take = []
+        while idx < order.size and (len(board) < k or cnt[order[idx]] > kth):
+            take.append(int(order[idx])); idx += 1
+            if len(take) >= _DENSE_PAIRS_ROUND:
+                break
+        if not take:
+            break
+        tk = np.asarray(take, np.int64)
+        lut[tk] = np.arange(tk.size, dtype=np.int8)
+        dc = WK.hunt64(ca, cb, which, xc, Vb, cu, lut, tk.size, SH, NL, T)
+        lut[tk] = -1
+        board += [(int(dc[j]), int(tk[j])) for j in range(tk.size)]
+        board.sort(key=lambda t: -t[0])
+        board = board[:k]
+        kth = board[-1][0] if len(board) >= k else 0
+        if idx < order.size and len(board) >= k and kth >= cnt[order[idx]]:
+            break                                # THE STOP: nothing after this can climb past the k-th
+    _HITS[3] += 1
+    return [(n9, p9 // Vb, p9 % Vb) for n9, p9 in board]
+
+
 def execute(seg, spec):
     a, b, k = spec['a'], spec['b'], spec['k']
     xcol, xcode = _excl_code(seg, spec)
@@ -352,8 +425,10 @@ def execute(seg, spec):
         board = []                               # the filter removes the column's only value: no rows pass
     elif kc is not None and kc <= KEPT_LINE:
         board = _kept(seg, spec, xcol, xcode)
-    elif spec['case'][0] == 'kept':
-        return None                              # the filter keeps too many rows and no other case applies
+    elif spec['case'][0] == 'ord':
+        if not spec['case'][1] or _defer_narrow(seg, spec, xcol, xcode):
+            return None                          # pairs past the dense line, or pairdistinct's narrow read is quicker
+        board = _dense(seg, spec, xcol, xcode)
     elif spec['case'][0] == 'self':
         board = [(1, x, y) for x, y in _first_groups(seg, a, b, k, xcol, xcode)]
         _HITS[0] += 1

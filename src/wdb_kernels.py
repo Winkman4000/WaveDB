@@ -2756,6 +2756,82 @@ def band_rows(codes, flag, sh, T):
     return out
 
 
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def pair_rows(ca, cb, which, xc, Vb, K, T):
+    """rows per pair (slot a x Vb + b) over the rows that pass `key <> literal` (xc < 0: no filter)"""
+    n = ca.size; step = (n + T - 1) // T
+    W = ((K + 15) // 16) * 16 + 16
+    h = np.zeros(T * W, np.int32)
+    for t in prange(T):
+        lo = t * step; hi = min(n, lo + step); base = t * W
+        for i in range(lo, hi):
+            a = np.int64(ca[i]); b = np.int64(cb[i])
+            if xc >= 0 and ((b if which == 1 else a) == xc):
+                continue
+            h[base + a * Vb + b] += 1
+    cnt = np.zeros(K, np.int64)
+    for t in range(T):
+        for s in range(K):
+            cnt[s] += h[t * W + s]
+    return cnt
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def hunt64(ca, cb, which, xc, Vb, cu, lut, nslot, SH, NL, L):
+    """distinct users per candidate pair (lut[slot] = 0..63, -1 not a candidate), the slot computed from a and b:
+    rows bucketed by the user code's top bits into NL lanes (two passes, private counts per row lane), then each
+    lane marks its users in a 2^SH table of u64 (one bit per candidate) -- lanes in parallel, nothing shared"""
+    n = ca.size
+    pc = np.zeros((L, NL), np.int64)
+    for l in prange(L):
+        for i in range(l * n // L, (l + 1) * n // L):
+            a = np.int64(ca[i]); b = np.int64(cb[i])
+            if xc >= 0 and ((b if which == 1 else a) == xc):
+                continue
+            if lut[a * Vb + b] >= 0:
+                pc[l, np.int64(cu[i]) >> SH] += 1
+    offs = np.zeros(NL + 1, np.int64)
+    for g in range(NL):
+        s = 0
+        for l in range(L):
+            v = pc[l, g]; pc[l, g] = s; s += v
+        offs[g + 1] = offs[g] + s
+    bu = np.empty(offs[NL], np.uint32)
+    bs = np.empty(offs[NL], np.uint8)
+    for l in prange(L):
+        cur = np.empty(NL, np.int64)
+        for g in range(NL):
+            cur[g] = offs[g] + pc[l, g]
+        for i in range(l * n // L, (l + 1) * n // L):
+            a = np.int64(ca[i]); b = np.int64(cb[i])
+            if xc >= 0 and ((b if which == 1 else a) == xc):
+                continue
+            p = lut[a * Vb + b]
+            if p >= 0:
+                g = np.int64(cu[i]) >> SH
+                q = cur[g]
+                bu[q] = cu[i]; bs[q] = p; cur[g] = q + 1
+    Wj = np.int64(1) << SH
+    cnt = np.zeros((NL, nslot), np.int64)
+    for g in prange(NL):
+        jar = np.zeros(Wj, np.uint64)
+        base = np.int64(g) << SH
+        for q in range(offs[g], offs[g + 1]):
+            x = np.int64(bu[q]) - base
+            bit = np.uint64(1) << np.uint64(bs[q])
+            w = jar[x]
+            if w & bit == 0:
+                jar[x] = w | bit
+                cnt[g, bs[q]] += 1
+    out = np.zeros(nslot, np.int64)
+    for g in range(NL):
+        for j in range(nslot):
+            out[j] += cnt[g, j]
+    return out
+
+
 def warm():
     """JIT-compile the kernels (call from prewarm; ~1 s once, cached on disk after)."""
     kway_topk(np.array([1, 2], np.int64), np.array([1, 1], np.int64),
@@ -2831,6 +2907,9 @@ def warm():
                         np.zeros(8, np.uint8), 2, 2, _bl)
         band_hist(np.zeros(8, np.uint32), 1, 12, 2)
         band_rows(np.zeros(8, np.uint32), np.zeros(1, np.bool_), 12, 2)
+        pair_rows(np.zeros(8, np.uint8), np.zeros(8, np.uint8), 1, -1, 2, 4, 2)
+        hunt64(np.zeros(8, np.uint8), np.zeros(8, np.uint8), 1, -1, 2, np.zeros(8, np.uint32),
+               np.full(4, -1, np.int8), 1, 2, 1, 2)
         enc6_swar_pick(np.zeros(16, np.uint8), np.zeros(15, np.int64),
                        np.zeros(255, np.int64), np.zeros(1, np.uint8),
                        np.zeros(1, np.int64), np.zeros(2, np.int64),
