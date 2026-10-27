@@ -31,6 +31,19 @@ BIG_KV = int(os.environ.get('WDB_LENAGG_BIG_KV', str(4 << 20)))
 # a small key's pour is cheap and its read at 1.5M rows is not (Robotness x UTMSource 98 -> 205 ms), while 2,263
 # live rows still win (ResolutionHeight x ParamOrderID 100 -> 35 ms)
 SPARSE_KV = 1 << 20
+# THE LIVE ROWS FIRST (2026-10-27): an enc-10 measured column with at most N >> LIVE_SHIFT non-empty rows is read at
+# those rows only. Measured on the Q27 board (this PC): SocialSourcePage (177,085 non-empty) 68 of 68 variants faster,
+# ~155 ms -> 4-67 ms (0.03-0.7x DuckDB, were 1.5-3.1x); OpenstatAdID / OpenstatServiceName (460K) 30 of 30 faster. Other
+# encodings lose (their non-empty rows cost more to find than the current read: ParamOrderID enc 3, 2,263 rows, 27 ->
+# 50 ms; UTMSource enc 3 30 -> 115; MobilePhoneModel enc 9 47 -> 270; SocialNetwork enc 2 20 -> 350; text 17-85%
+# non-empty 160 ms -> 0.7-5.5 s). Nothing past 460K non-empty was measured: the line sits at N / 128 (781K).
+# Only where the read would inflate the stored ROW LENGTHS (rowl: 134 ms for 100M rows whatever the column): the
+# OpenstatAdID / OpenstatServiceName columns carry none, their read already works off the codes (30-70 ms), and the
+# live rows lost there on the board -- CounterID x OpenstatAdID open 67 -> 87 ms, SocialNetwork x OpenstatServiceName
+# filtered 30 -> 39 (re-timed back to back, c83 vs c84).
+LIVE_SHIFT = int(os.environ.get('WDB_LENAGG_LIVE_SHIFT', '7'))      # -1: never
+LIVE_ENC = (10,)
+_LIVE_HITS = [0]
 SPARSE_DIV = int(os.environ.get('WDB_LENAGG_SPARSE_DIV', '50'))
 SPARSE_DIV_SMALL = int(os.environ.get('WDB_LENAGG_SPARSE_DIV_SMALL', '1024'))
 _HAVING = {E.GT: lambda c, n: c > n, E.GTE: lambda c, n: c >= n, E.LT: lambda c, n: c < n,
@@ -231,11 +244,56 @@ def _group(kk, w):
     return ks[brk], np.add.reduceat(ws, brk), np.diff(np.r_[brk, ks.size]).astype(np.int64)
 
 
+def _live_sums(seg, spec):
+    """THE LIVE ROWS FIRST (Jackson's steps): 1. S's census: non-empty rows = N - rows(''); past N >> LIVE_SHIFT:
+    None (the current read). 2. their positions (the encoding's own exceptions), their codes, F of each code (the
+    dictionary table), the key's codes at them. 3. WHERE S <> '': grouped (the codes present, ascending). 4. no WHERE:
+    the sum per key from them alone (an empty row adds F('') -- 0 for length), the count per key from the key's census
+    over every row."""
+    key, lcol = spec['key'], spec['lcol']
+    c = seg.cols[lcol]
+    if not spec['rowl'] or c.get('code_enc') not in LIVE_ENC or LIVE_SHIFT < 0:
+        return None                              # the win is the stored row lengths not inflated (see LIVE_SHIFT)
+    N = int(seg.N)
+    V = int(c['V'])
+    ec = _empty_code(seg, lcol)
+    if ec < 0 or V <= 0:
+        return None
+    cen = np.asarray(seg.raw_census(lcol, V))
+    live = N - int(cen[ec])
+    if live > (N >> LIVE_SHIFT):
+        return None
+    tab = _fn_table(seg, lcol, spec['lkind'])
+    if tab is None:
+        return None
+    tab = np.asarray(tab)
+    tab = tab.astype(np.float64) if tab.dtype.kind == 'f' else tab.astype(np.int64)
+    import wdb_wherescan as WS
+    pos = np.asarray(WS._scan_eq(seg, lcol, int(ec), 0, N, negate=True), np.int64)
+    w = tab[np.asarray(seg.codes_at(lcol, pos)).astype(np.int64)]
+    gk, s, n9 = _group(_key_at(seg, key, pos), w)
+    _LIVE_HITS[0] += 1
+    if spec['excl_empty']:
+        return gk, s, n9
+    KV = int(seg.cols[key]['V'])
+    cnt = np.asarray(seg.raw_census(key, KV)).astype(np.int64)[:KV]
+    sums = np.zeros(KV, s.dtype)
+    sums[gk] = s
+    if float(tab[ec]) != 0.0:                    # F('') is not 0: each empty row adds it
+        lv = np.zeros(KV, np.int64)
+        lv[gk] = n9
+        sums = sums + (cnt - lv) * tab[ec]
+    return None, sums, cnt
+
+
 def _sums(seg, spec):
     """(key codes, sums, counts): the stored row lengths, or the V-table of F over S's dictionary, poured on every
     core against the key's codes (key codes None: dense, indexed by code) -- or, under WHERE S <> '' with few live
     rows, grouped at those rows (the codes present, ascending)"""
     import wdb_kernels as WK
+    r9 = _live_sums(seg, spec)
+    if r9 is not None:
+        return r9
     key, lcol = spec['key'], spec['lcol']
     KV = int(seg.cols[key]['V'])
     N = int(seg.N)

@@ -120,3 +120,24 @@ def test_lenagg_without_row_lengths():
         _check(Database.open(os.path.dirname(w)), pq, _sqls())
     finally:
         os.replace(moved, p)
+
+
+def test_lenagg_live_rows_first():
+    """THE LIVE ROWS FIRST: the line opened to every encoding and every row count (LIVE_SHIFT 0), so the column with
+    stored row lengths (s: 20% empty) is read at its non-empty rows only -- filtered (grouped there) and open (sums
+    there, counts from the key's census) -- for every key, equal to DuckDB (or a legal tie); the columns without
+    stored row lengths (sp, emp) keep the current read."""
+    db, pq, w = _fixture()
+    old = wdb_lenagg.LIVE_ENC, wdb_lenagg.LIVE_SHIFT
+    try:
+        wdb_lenagg.LIVE_ENC = tuple(range(64)); wdb_lenagg.LIVE_SHIFT = 0
+        qs = [q for q in _sqls() if 'length(s)' in q]
+        h0 = wdb_lenagg._LIVE_HITS[0]
+        _check(db, pq, qs)
+        assert wdb_lenagg._LIVE_HITS[0] - h0 == len(qs), (wdb_lenagg._LIVE_HITS[0] - h0, len(qs))
+        qs = [q for q in _sqls() if 'length(sp)' in q or 'length(emp)' in q]
+        h0 = wdb_lenagg._LIVE_HITS[0]
+        _check(db, pq, qs)
+        assert wdb_lenagg._LIVE_HITS[0] - h0 == 0, 'no stored row lengths for sp / emp: the line keeps them out'
+    finally:
+        wdb_lenagg.LIVE_ENC, wdb_lenagg.LIVE_SHIFT = old
