@@ -44,6 +44,7 @@ SPARSE_KV = 1 << 20
 LIVE_SHIFT = int(os.environ.get('WDB_LENAGG_LIVE_SHIFT', '7'))      # -1: never
 LIVE_ENC = (10,)
 _LIVE_HITS = [0]
+_BOUND_HITS = [0]                  # the too-few-rows bound's answers (tests)
 SPARSE_DIV = int(os.environ.get('WDB_LENAGG_SPARSE_DIV', '50'))
 SPARSE_DIV_SMALL = int(os.environ.get('WDB_LENAGG_SPARSE_DIV_SMALL', '1024'))
 _HAVING = {E.GT: lambda c, n: c > n, E.GTE: lambda c, n: c >= n, E.LT: lambda c, n: c < n,
@@ -202,6 +203,26 @@ def _empty_code(seg, lcol):
     return -1
 
 
+def _too_few(spec, k):
+    """THE TOO-FEW-ROWS BOUND (Jackson, 2026-10-27): every group's count is between 1 and k (k = the kept rows), so
+    when no count from 1 to k passes HAVING COUNT(*) op n, no group passes. The HAVING ops are monotone (> >= < <=) or
+    single-valued (= <>), so testing 1, k and n clipped into 1..k is exact. Measured (this PC): LocalEventTime x
+    ParamOrderID HAVING COUNT(*) > 100000, k = 2,263: the key's whole decode (69 ms of 103 ms) was read for nothing"""
+    h = spec['having']
+    if h is None:
+        return False
+    op, n = h
+    if k <= 0:
+        return True
+    c = np.array([1, k, min(max(int(n), 1), k)], np.int64)
+    return not bool(np.asarray(op(c, int(n))).any())
+
+
+def _none_pass():
+    _BOUND_HITS[0] += 1
+    return np.empty(0, np.int64), np.empty(0, np.int64), np.empty(0, np.int64)
+
+
 def _key_at(seg, key, pos):
     """the key's codes at the live rows only, by the grab's rule (wdb_gridwalk): point reads while the rows touch
     few frames (frame-coded) or are few (the rest); a one-stream column, or many rows, decoded whole and gathered"""
@@ -261,6 +282,8 @@ def _live_sums(seg, spec):
         return None
     cen = np.asarray(seg.raw_census(lcol, V))
     live = N - int(cen[ec])
+    if spec['excl_empty'] and _too_few(spec, live):
+        return _none_pass()
     if live > (N >> LIVE_SHIFT):
         return None
     tab = _fn_table(seg, lcol, spec['lkind'])
@@ -341,6 +364,8 @@ def _sums(seg, spec):
             pos = (WK.live_rows(L, 1, ge=True, limit=N // div) if rowl
                    else WK.live_rows(sc, ec, limit=N // div))
         if pos is not None:
+            if _too_few(spec, int(pos.size)):
+                return _none_pass()
             return _group(_key_at(seg, key, pos), L[pos] if rowl else tab[sc[pos]])
     kc = np.asarray(seg._raw_codes(key))
     acc = np.float64 if (tab is not None and tab.dtype.kind == 'f') else np.int64

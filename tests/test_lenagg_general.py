@@ -141,3 +141,32 @@ def test_lenagg_live_rows_first():
         assert wdb_lenagg._LIVE_HITS[0] - h0 == 0, 'no stored row lengths for sp / emp: the line keeps them out'
     finally:
         wdb_lenagg.LIVE_ENC, wdb_lenagg.LIVE_SHIFT = old
+
+
+def test_lenagg_too_few_rows():
+    """THE TOO-FEW-ROWS BOUND: under WHERE S <> '' a group holds at most k rows (k = the kept rows: sp ~1,200 of
+    300,001, s ~240,000, emp none). A HAVING no count from 1 to k passes is answered empty without reading the key;
+    one some count passes is read as before. Both through the grab (every filtered query grouped at its rows) and the
+    live rows first (s read at its non-empty rows), for every key, equal to DuckDB."""
+    db, pq, w = _fixture()
+    q = ("SELECT %s, AVG(length(%s)) AS l, COUNT(*) AS c FROM tbl WHERE %s <> '' GROUP BY %s "
+         "HAVING COUNT(*) %s ORDER BY l DESC LIMIT 25")
+    keys = ('st', 'rk', 'sk', 'wide')
+    fire = [q % (k, sc, sc, k, h) for k in keys for sc, h in (
+        ('sp', '> 5000'), ('sp', '>= 5001'), ('sp', '= 4000'), ('s', '> 300001'), ('emp', '< 3'), ('emp', '> 0'))]
+    keep = [q % (k, sc, sc, k, h) for k in keys for sc, h in (
+        ('sp', '> 1'), ('sp', '< 3'), ('sp', '= 1'), ('sp', '<= 2'), ('s', '> 50'), ('s', '>= 1'))]
+    old = wdb_lenagg.SPARSE_DIV, wdb_lenagg.SPARSE_DIV_SMALL, wdb_lenagg.LIVE_ENC, wdb_lenagg.LIVE_SHIFT
+    try:
+        wdb_lenagg.SPARSE_DIV = wdb_lenagg.SPARSE_DIV_SMALL = 1
+        for live in (False, True):
+            if live:
+                wdb_lenagg.LIVE_ENC = tuple(range(64)); wdb_lenagg.LIVE_SHIFT = 0
+            h0 = wdb_lenagg._BOUND_HITS[0]
+            _check(db, pq, fire)
+            assert wdb_lenagg._BOUND_HITS[0] - h0 == len(fire), (live, wdb_lenagg._BOUND_HITS[0] - h0, len(fire))
+            h0 = wdb_lenagg._BOUND_HITS[0]
+            _check(db, pq, keep)
+            assert wdb_lenagg._BOUND_HITS[0] - h0 == 0, (live, 'a count from 1 to k passes: the key must be read')
+    finally:
+        (wdb_lenagg.SPARSE_DIV, wdb_lenagg.SPARSE_DIV_SMALL, wdb_lenagg.LIVE_ENC, wdb_lenagg.LIVE_SHIFT) = old
