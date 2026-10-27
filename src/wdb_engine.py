@@ -1777,8 +1777,10 @@ class Segment:
         if c.get('code_enc', 0) == 20:               # THE BACK-REFERENCE: one parallel pass over the blocks
             import wdb_kernels as _WK20
             cc = np.empty(self.N, dtype=self._e20_dtype(c))
-            _WK20.e20_decode(np.frombuffer(self.buf, np.uint8), np.int64(c['cstart']), np.int64(c['e20BR']),
-                             np.int64(self.N), np.int64(c['e20bits']), c['e20boff'], cc)
+            # on every vCPU (run_wide), as the window and the gather already ran: the walk is per-row work the
+            # hyperthreads overlap (RefererHash, one load: 59 ms on numba's 8 threads, 39 ms on 16)
+            _WK20.run_wide(_WK20.e20_decode, np.frombuffer(self.buf, np.uint8), np.int64(c['cstart']),
+                           np.int64(c['e20BR']), np.int64(self.N), np.int64(c['e20bits']), c['e20boff'], cc)
             self._codes[nm] = cc; return cc
         if c.get('code_enc', 0) == 19:               # BLOCK DICTIONARIES: one parallel pass, no inflate
             import wdb_kernels as _WK19

@@ -8311,12 +8311,38 @@ def probe_sorted_id(keys, q, ent, out):
 # reads another; any row is one jump to its block plus a walk to the row. One 8-byte load decodes
 # one row (the widest row is 1 + 32 bits after at most 7 bits of shift).
 # ---------------------------------------------------------------------------------------------
-@njit(cache=True, inline='always')
-def _e20_load(buf, byte):
-    w = np.uint64(0)
-    for k in range(8):
-        w |= np.uint64(buf[byte + k]) << np.uint64(8 * k)
-    return w
+# THE ONE LOAD (Jackson, 2026-10-27, the Q27 split): the row walk is the whole cost of a decode (RefererHash: the walk
+# alone 92 of 114 ms), and each row's read was 8 single-byte loads glued together. One unaligned 8-byte load at the
+# byte reads the same 8 bytes (little-endian, as the glue built them; 0 of 2M random loads differ). Measured on the
+# PC, whole decode, 8 / 16 threads: RefererHash 108 / 79 -> 59 / 39 ms, URLHash 101 / 72 -> 57 / 39 ms.
+if HAVE_NUMBA:
+    from numba.extending import intrinsic as _intrinsic
+    from numba import types as _nbt
+    from llvmlite import ir as _llir
+
+    @_intrinsic
+    def _ld8(typingctx, arr, idx):
+        """buf[idx .. idx+7] as one little-endian uint64 (an unaligned i64 load from the array's data)"""
+        if not (isinstance(arr, _nbt.Array) and arr.dtype == _nbt.uint8 and isinstance(idx, _nbt.Integer)):
+            return None
+        sig = _nbt.uint64(arr, idx)
+
+        def codegen(context, builder, signature, args):
+            a = context.make_array(signature.args[0])(context, builder, args[0])
+            i = context.cast(builder, args[1], signature.args[1], _nbt.intp)
+            p = builder.bitcast(builder.gep(a.data, [i]), _llir.IntType(64).as_pointer())
+            return builder.load(p, align=1)
+        return sig, codegen
+
+    @njit(cache=True, inline='always')
+    def _e20_load(buf, byte):
+        return _ld8(buf, byte)
+else:                                                 # pragma: no cover
+    def _e20_load(buf, byte):
+        w = np.uint64(0)
+        for k in range(8):
+            w |= np.uint64(buf[byte + k]) << np.uint64(8 * k)
+        return w
 
 
 @njit(cache=True, parallel=True, nogil=True)
