@@ -63,3 +63,40 @@ def test_absent_literal_hands_on():
     h0 = wdb_pairtop._HITS
     db.run('SELECT u, a, COUNT(*) AS c FROM t WHERE a <> 99 GROUP BY u, a ORDER BY c DESC LIMIT 10')
     assert wdb_pairtop._HITS == h0, 'an absent literal was guessed'
+
+
+def test_kept_rows_first():
+    """THE KEPT ROWS FIRST: the line opened to every kept-row count (KEPT_SHIFT 0), the '<>' queries on a key of the
+    pair are served from the kept rows (the near-unique half's census over them only) -- legal against DuckDB, with
+    the real count-2+ pairs among them; closed (-1), the census serves them, also legal"""
+    db, df, pq, d = _fixture()
+    old = wdb_pairtop.KEPT_SHIFT
+    qs = []
+    for where in ('a <> 2', 's <> 7', "w <> 'x'", "w <> ''"):
+        for k1, k2 in (('u', 'a'), ('s', 'u'), ('u', 'w')):
+            if where.split()[0] in (k1, k2):
+                qs.append((where, k1, k2))
+    import glob, wdb_blockstats
+    ans0 = wdb_blockstats._ANSWERS[0]
+    try:
+        # the repeat list from the load statistics (LOAD_ANSWERS) or a stored one (a .ptrep sidecar) is read before
+        # any census: the kept rows first stands in for the census only, so both are taken away here
+        wdb_blockstats._ANSWERS[0] = False
+        for shift in (0, -1):
+            wdb_pairtop.KEPT_SHIFT = shift
+            h0 = wdb_pairtop._KEPT_HITS[0]
+            for where, k1, k2 in qs:
+                for f9 in glob.glob(os.path.join(d, '*.ptrep')):
+                    os.remove(f9)
+                q = 'SELECT %s, %s, COUNT(*) AS c FROM t WHERE %s GROUP BY %s, %s ORDER BY c DESC LIMIT 10' % (
+                    k1, k2, where, k1, k2)
+                rows = [tuple(x.decode() if isinstance(x, (bytes, bytearray)) else x for x in r) for r in db.run(q)[0]]
+                _legal(rows, pq, where, k1, k2, 10)
+            hits = wdb_pairtop._KEPT_HITS[0] - h0
+            if shift == 0:
+                assert hits >= 1, 'the kept rows first never served'
+            else:
+                assert hits == 0
+    finally:
+        wdb_pairtop.KEPT_SHIFT = old
+        wdb_blockstats._ANSWERS[0] = ans0

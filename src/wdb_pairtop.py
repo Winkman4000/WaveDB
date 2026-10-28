@@ -16,6 +16,14 @@ from sqlglot import expressions as E
 import wdb_sql
 
 _HITS = 0
+# THE KEPT ROWS FIRST (Jackson, 2026-10-28, the Q14 board's WatchID pairs at 3-9x): under WHERE f <> x a pair repeats
+# among the kept rows only if its near-unique half repeats among them -- so the census of that half is taken over the
+# kept rows, not the column. Measured (this PC, 29 WatchID pairs, same counts on all): kept 177K-1.56M rows 28-38 ms
+# (today 396-423), 5.6-15M 104-196 ms (today 400-504), 25.4M 324 (445), 32.8M 408 (411: even), 56M+ loses. The line:
+# kept <= N >> KEPT_SHIFT (2: a quarter of the rows); -1 never. The near-unique half must be plain bitpack (enc 0).
+import os as _os
+KEPT_SHIFT = int(_os.environ.get('WDB_PAIRTOP_KEPT_SHIFT', '2'))
+_KEPT_HITS = [0]
 
 
 def detect(seg, tree, col_map):
@@ -160,6 +168,9 @@ def execute(seg, spec):
         if ridx.size > N // 8:
             return None
         return _finish(seg, spec, _prune(seg, spec, ridx), fpool=_fpool(seg, spec))
+    r9 = _kept_first(seg, spec)
+    if r9 is not None:
+        return r9
     import wdb_kernels as WK
     ac = np.ascontiguousarray(seg._raw_codes(a))
     V9 = int(seg.cols[a]['V'])
@@ -187,6 +198,45 @@ def execute(seg, spec):
     if ridx.size > N // 8:
         return None                              # not near-unique enough: yield
     return _finish(seg, spec, _prune(seg, spec, ridx), fpool=_fpool(seg, spec))
+
+
+def _kept_first(seg, spec):
+    """THE KEPT ROWS FIRST: 1. the filter column's codes, its kept rows (code != the literal's), k of them -- past
+    N >> KEPT_SHIFT: None (the census). 2. the near-unique half's codes at the kept rows only (bp0_gather). 3. its
+    repeats among them: one parallel sort of the k codes, the values seen twice, their rows. 4. the pairs on those
+    rows (_finish), the count-1 filler from the kept rows."""
+    fg = spec.get('fgen')
+    if fg is None or not fg[1] or KEPT_SHIFT < 0:
+        return None
+    a = spec['a']
+    ca = seg.cols[a]
+    if ca.get('code_enc') != 0 or ca.get('cstart') is None:
+        return None
+    import wdb_kernels as WK
+    N = int(seg.N)
+    sc = np.asarray(seg._raw_codes(fg[0]))
+    pos = WK.live_rows(sc, int(fg[2]), limit=N >> KEPT_SHIFT)
+    if pos is None:
+        return None
+    bits = int(ca['bits'])
+    wa = np.empty(pos.size, np.int64)
+    if pos.size:
+        WK.bp0_gather(np.frombuffer(seg.buf, np.uint8), np.int64(ca['cstart']), np.int64(bits), pos, wa)
+    s = WK.sort_keys_par(wa, np.int64(max(0, bits - 12))) if pos.size > 1 else wa
+    dv = np.unique(s[1:][s[1:] == s[:-1]])
+    if dv.size == 0:
+        rr = np.empty(0, np.int64)
+    elif dv.size <= 16:
+        m = wa == dv[0]
+        for v in dv[1:]:
+            m |= wa == v
+        rr = pos[m]
+    else:
+        rr = pos[np.isin(wa, dv)]
+    out = _finish(seg, spec, rr, fpool=pos[:262144])
+    if out is not None:
+        _KEPT_HITS[0] += 1
+    return out
 
 
 def _pt2_path(seg, a, b):
@@ -266,7 +316,9 @@ def _pt_codes(seg, cn, rows):
         if rows.size <= 4096:
             # the armory's own batch point-pop: touched frames inflate ONCE
             return np.asarray(seg.codes_at(cn, rows), np.int64)
-        return np.asarray(seg._raw_codes(cn), np.int64)[rows]
+        # take, then widen (2026-10-28): widening the whole decoded column first cost 57 ms per call (100M codes
+        # to int64) for the filler pool's 262,144 rows
+        return np.asarray(seg._raw_codes(cn))[rows].astype(np.int64)
     bits = int(c['bits'])
     bp = np.asarray(rows, np.int64) * bits
     by = (bp >> 3) + int(c['cstart'])
