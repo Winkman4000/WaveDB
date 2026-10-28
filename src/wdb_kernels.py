@@ -3544,6 +3544,46 @@ def _pr_fold2_nb(key, pay, offs, SH, AB, dv1, dv2, ucnt, us1, us2, ukey, nruns, 
 TALLY_MAX = 1 << 18          # a bucket's key range counted in a table: 16 threads x 3 x 8 B x 256K = 100 MB
 
 
+@njit(nogil=True, parallel=True, cache=True)
+def pf_heavy_fold(pos, allrows, ac, bc, xc, yc, hidx, VA, dv1, dv2, C, S1, S2, lc):
+    """THE HEAVY VALUES ON EVERY CORE (2026-10-28): each thread takes 1/T of the rows (every row when allrows, else
+    pos); a row whose b is heavy (hidx[b] >= 0) adds 1, dv1[x], dv2[y] at slot hidx[b] * VA + a of the THREAD'S OWN
+    table row; the other rows are only counted (lc[t], for pf_light_rows). The caller adds the tables."""
+    T = C.shape[0]
+    n = bc.size if allrows else pos.size
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        nl = 0
+        for i in range(lo, hi):
+            p = i if allrows else pos[i]
+            h = hidx[bc[p]]
+            if h >= 0:
+                s = h * VA + np.int64(ac[p])
+                C[t, s] += 1
+                S1[t, s] += dv1[xc[p]]
+                S2[t, s] += dv2[yc[p]]
+            else:
+                nl += 1
+        lc[t] = nl
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def pf_light_rows(pos, allrows, bc, hidx, offs, out):
+    """the rows whose b is not heavy, ascending: thread t writes its slice's at offs[t] (pf_heavy_fold's counts)"""
+    T = offs.size - 1
+    n = bc.size if allrows else pos.size
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        w = offs[t]
+        for i in range(lo, hi):
+            p = i if allrows else pos[i]
+            if hidx[bc[p]] < 0:
+                out[w] = p
+                w += 1
+
+
 def pr_fold2(key, pay, offs, SH, AB, dv1, dv2, ucnt, us1, us2, ukey, nruns):
     import numba
     T = max(1, numba.get_num_threads())

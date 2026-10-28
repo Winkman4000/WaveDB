@@ -276,3 +276,39 @@ def test_warm_plist_reads_cold_pages_once():
         print('warm_plist cold bytes', n1)
     finally:
         shutil.rmtree(d, ignore_errors=True); os.remove(pq)
+
+
+def test_heavy_values_on_every_core():
+    """THE HEAVY VALUES ON EVERY CORE: w's 0 (half the rows) and m's 0 (60%) are heavy b values -- their pairs are
+    counted on every core, the rest go the buckets' way; with and without the filter, legal against DuckDB (counts,
+    SUM, AVG), the same counts as with the step off (HEAVY_DIV 0); past HEAVY_SLOTS the step stands aside"""
+    d, pq, seg = _db30()
+    try:
+        db = Database.open(d)
+        con = duckdb.connect()
+        old = wdb_pairfold.HEAVY_DIV, wdb_pairfold.HEAVY_SLOTS
+        for where in (" WHERE p <> ''", ''):
+            for ka, part in (('a', 'w'), ('m', 'n'), ('w', 'a')):
+                truth = {(int(a), int(b)): (int(c), int(sx), float(ay)) for a, b, c, sx, ay in con.execute(
+                    f"SELECT {ka}, {part}, COUNT(*), SUM(x), AVG(y) FROM '{pq}'{where} GROUP BY {ka}, {part}").fetchall()}
+                for k in (1, 10, 100):
+                    sql = ("SELECT %s, %s, COUNT(*) AS c, SUM(x), AVG(y) FROM hits%s GROUP BY %s, %s "
+                           "ORDER BY c DESC LIMIT %d" % (ka, part, where, ka, part, k))
+                    try:
+                        h0 = wdb_pairfold._HEAVY_HITS[0]
+                        rows = db.run(sql)[0]
+                        assert wdb_pairfold._HEAVY_HITS[0] == h0 + 1, ('the heavy step did not serve', sql)
+                        _legal5(rows, truth, min(k, len(truth)))
+                        wdb_pairfold.HEAVY_DIV = 0
+                        rows0 = db.run(sql)[0]
+                        assert wdb_pairfold._HEAVY_HITS[0] == h0 + 1, 'HEAVY_DIV 0 did not turn the step off'
+                        _legal5(rows0, truth, min(k, len(truth)))
+                        assert [int(r[2]) for r in rows0] == [int(r[2]) for r in rows]
+                        wdb_pairfold.HEAVY_DIV, wdb_pairfold.HEAVY_SLOTS = old[0], 2
+                        rows2 = db.run(sql)[0]
+                        assert wdb_pairfold._HEAVY_HITS[0] == h0 + 1, 'past HEAVY_SLOTS the step must stand aside'
+                        _legal5(rows2, truth, min(k, len(truth)))
+                    finally:
+                        wdb_pairfold.HEAVY_DIV, wdb_pairfold.HEAVY_SLOTS = old
+    finally:
+        shutil.rmtree(d, ignore_errors=True); os.remove(pq)

@@ -20,6 +20,15 @@ _DENSE = [__import__('os').environ.get('WDB_PF_DENSE', '1') == '1']      # A/B: 
 _UNIQUE_HANDOFF = [__import__('os').environ.get('WDB_PF_UNIQUE', '1') == '1']  # A/B: 0 keeps near-unique partners
 SMALL_MAX = 4 << 20          # the smaller key's values for pairfold (both keys past it: pairtop's)
 DENSE_MAX = 1 << 18         # pair slots Va x Vb for the dense fold: 16 thread tables x 3 x 8 B x 256K = 100 MB
+# THE HEAVY VALUES ON EVERY CORE (Jackson, 2026-10-28, the Q32 board: 242 of its 254 pairfold variants over 2x had one
+# bucket holding > n/64 of the rows, sorted or counted by ONE thread while 15 idled -- ResponseEndTiming x OpenstatAdID
+# 24.2 s, 22.9 of them in pr_fold2, OpenstatAdID's '' on 99.5M rows). b values with more than n // HEAVY_DIV rows (n =
+# the rows read) are counted on every core into the threads' own tables of (heavy values x Va) slots, at most
+# HEAVY_SLOTS (past it: the buckets, as before); the other rows go the buckets' way. Prototype (this PC, same counts on
+# 13 pairs): 24.2 -> 0.22 s (DuckDB 0.21), SendTiming x UserAgentMajor 1.22 -> 0.29 (0.22). HEAVY_DIV 0: never.
+HEAVY_DIV = int(__import__('os').environ.get('WDB_PF_HEAVY_DIV', '64'))
+HEAVY_SLOTS = int(__import__('os').environ.get('WDB_PF_HEAVY_SLOTS', str(1 << 18)))
+_HEAVY_HITS = [0]
 _DENSED = 0
 
 
@@ -256,7 +265,8 @@ def execute(seg, spec):
     ckey = ('pf', spec['f'], spec['b'])
     cnt_b = memo.get(ckey)
     if cnt_b is None:                        # the bound: a pair can never
-        cnt_b = np.bincount(bc9 if pos is None else bc9[pos], minlength=BV)   # outscore its b's total
+        # (2026-10-28) on every core: numpy's bincount was one thread, 170-224 ms of the Q32 pairs (THE HEAVY VALUES)
+        cnt_b = _WK.bincount_par(bc9 if pos is None else bc9[pos], BV)    # outscore its b's total
         memo[ckey] = cnt_b
     ac9 = np.asarray(seg._raw_codes(spec['a']))
     xc9 = np.asarray(seg._raw_codes(x1))
@@ -267,6 +277,36 @@ def execute(seg, spec):
         T9 = max(1, numba.get_num_threads())
     except Exception:
         T9 = 1
+    hv = None                                    # the heavy values' pairs: (key, count, sum 1, sum 2)
+    if HEAVY_DIV > 0:
+        nrows9 = int(seg.N) if pos is None else int(pos.size)
+        H9 = np.flatnonzero(cnt_b > nrows9 // HEAVY_DIV)
+        if H9.size and H9.size * VA <= HEAVY_SLOTS:
+            # THE HEAVY VALUES ON EVERY CORE: 1. their pairs counted exactly, every thread its own table;
+            # 2. the other rows (the light ones) are the positions the buckets walk; 3. the heavy values leave the
+            # census the bound reads (counted exactly, they are never "excluded")
+            hidx9 = np.full(BV, -1, np.int64)
+            hidx9[H9] = np.arange(H9.size, dtype=np.int64)
+            W9 = int(H9.size) * VA
+            C9 = np.zeros((T9, W9 + 16), np.int64)           # rows padded apart (THE PADDED BOARDS)
+            A9 = np.zeros((T9, W9 + 16), np.float64)
+            B9 = np.zeros((T9, W9 + 16), np.float64)
+            lc9 = np.zeros(T9, np.int64)
+            allr9 = pos is None
+            pos9 = np.zeros(1, np.int64) if allr9 else pos
+            _WK.pf_heavy_fold(pos9, allr9, ac9, bc9, xc9, yc9, hidx9, np.int64(VA), dv1, dv2, C9, A9, B9, lc9)
+            c9 = C9.sum(0)[:W9]
+            nzs = np.flatnonzero(c9)
+            hv = ((H9[nzs // VA].astype(np.int64) << spec['abits']) | (nzs % VA).astype(np.int64),
+                  c9[nzs], A9.sum(0)[:W9][nzs], B9.sum(0)[:W9][nzs])
+            off9 = np.zeros(T9 + 1, np.int64)
+            off9[1:] = np.cumsum(lc9)
+            lpos9 = np.empty(int(off9[-1]), np.int64)
+            _WK.pf_light_rows(pos9, allr9, bc9, hidx9, off9, lpos9)
+            pos = lpos9
+            cnt_b = cnt_b.copy()
+            cnt_b[H9] = 0
+            _HEAVY_HITS[0] += 1
     M = 4096
     nz = int((cnt_b > 0).sum())
     while True:
@@ -275,7 +315,7 @@ def execute(seg, spec):
             spos = pos
             max_excl = 0
         else:
-            hkey = ('pfh', spec['f'], spec['b'], M9)
+            hkey = ('pfh', spec['f'], spec['b'], M9) if hv is None else ('pfhL', spec['f'], spec['b'], M9, HEAVY_DIV)
             hit = memo.get(hkey)                   # the heavy set is static
             if hit is None:                        # per (filter, column, M):
                 thr_idx = np.argpartition(-cnt_b, M9 - 1)[:M9]   # select once,
@@ -286,23 +326,29 @@ def execute(seg, spec):
                 memo[hkey] = (max_excl, spos9)
                 hit = memo[hkey]
             max_excl, spos = hit
-        if spos is None:                     # no filter, no prune: every row
-            key, pay, offs = _WK.pr_scatter_all(ac9, bc9, xc9, yc9, SH, spec['abits'], T9)
+        if spos is not None and spos.size == 0:      # every row was a heavy value's
+            ucnt = np.zeros(0, np.int64); us1 = np.zeros(0); us2 = np.zeros(0); ukey = np.zeros(0, np.int64)
         else:
-            key, pay, offs = _WK.pr_scatter2(spos, ac9, bc9, xc9, yc9, SH, spec['abits'], T9)
-        n = key.size
-        ucnt = np.zeros(n, np.int64)
-        us1 = np.zeros(n, np.float64)
-        us2 = np.zeros(n, np.float64)
-        ukey = np.zeros(n, np.int64)
-        nruns = np.zeros(1 << 12, np.int64)
-        _WK.pr_fold2(key, pay, offs, SH, spec['abits'], dv1, dv2,    # a heavy bucket is counted, not sorted
-                     ucnt, us1, us2, ukey, nruns)
-        live = np.zeros(n, bool)
-        for b in range(nruns.size):
-            if nruns[b]:
-                live[offs[b]:offs[b] + nruns[b]] = True
-        ucnt = ucnt[live]; us1 = us1[live]; us2 = us2[live]; ukey = ukey[live]
+            if spos is None:                     # no filter, no prune: every row
+                key, pay, offs = _WK.pr_scatter_all(ac9, bc9, xc9, yc9, SH, spec['abits'], T9)
+            else:
+                key, pay, offs = _WK.pr_scatter2(spos, ac9, bc9, xc9, yc9, SH, spec['abits'], T9)
+            n = key.size
+            ucnt = np.zeros(n, np.int64)
+            us1 = np.zeros(n, np.float64)
+            us2 = np.zeros(n, np.float64)
+            ukey = np.zeros(n, np.int64)
+            nruns = np.zeros(1 << 12, np.int64)
+            _WK.pr_fold2(key, pay, offs, SH, spec['abits'], dv1, dv2,    # a heavy bucket is counted, not sorted
+                         ucnt, us1, us2, ukey, nruns)
+            live = np.zeros(n, bool)
+            for b in range(nruns.size):
+                if nruns[b]:
+                    live[offs[b]:offs[b] + nruns[b]] = True
+            ucnt = ucnt[live]; us1 = us1[live]; us2 = us2[live]; ukey = ukey[live]
+        if hv is not None:                       # the heavy values' pairs join the light ones'
+            ukey = np.concatenate([hv[0], ukey]); ucnt = np.concatenate([hv[1], ucnt])
+            us1 = np.concatenate([hv[2], us1]); us2 = np.concatenate([hv[3], us2])
         k9 = min(k, ucnt.size)
         if k9 == 0 and max_excl > 0:
             M *= 4; continue
