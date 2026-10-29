@@ -16,6 +16,21 @@ from wdb_engine import Segment
 TMP = tempfile.gettempdir()
 
 
+def _buckets(fn):
+    """the buckets' machinery under test (the heavy step, the prune, the fold): the one pass stands aside"""
+    import functools
+
+    @functools.wraps(fn)
+    def w():
+        old = wdb_pairfold._HT[0]
+        wdb_pairfold._HT[0] = False
+        try:
+            return fn()
+        finally:
+            wdb_pairfold._HT[0] = old
+    return w
+
+
 @contextlib.contextmanager
 def _env(**kv):
     old = {k: os.environ.get(k) for k in kv}
@@ -156,6 +171,7 @@ def _legal5(rows, truth, k):
     assert len({(int(r[0]), int(r[1])) for r in rows}) == len(rows)
 
 
+@_buckets
 def test_q30_shape_dense_and_buckets_legal_against_duck():
     """the dense fold (small pair space) and the buckets (wide partner) both serve, both legal; the dense
     fold switched off, the buckets answer the small pair space too, with the same counts"""
@@ -278,6 +294,7 @@ def test_warm_plist_reads_cold_pages_once():
         shutil.rmtree(d, ignore_errors=True); os.remove(pq)
 
 
+@_buckets
 def test_heavy_values_on_every_core():
     """THE HEAVY VALUES ON EVERY CORE: w's 0 (half the rows) and m's 0 (60%) are heavy b values -- their pairs are
     counted on every core, the rest go the buckets' way; with and without the filter, legal against DuckDB (counts,

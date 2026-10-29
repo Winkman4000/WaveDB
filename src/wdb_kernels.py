@@ -9267,3 +9267,193 @@ def off_value_gather(ch, co, top):
     """the rows where ch is not `top`: their ch and co codes, in row order, in two parallel passes (count, then
     place) -- no mask, no positions (THE HEAVY SPLIT's light rows, 2026-10-23)"""
     return _off_value_gather_nb(np.ascontiguousarray(ch), np.ascontiguousarray(co), np.int64(top), _nt())
+
+
+# ---- THE ONE PASS (2026-10-29, Jackson's fix 3) -------------------------------------------------------------------
+# A pair (a, b) is the key (b << AB | a) + 1 (0 marks an empty slot). Every thread takes 1/T of the rows and adds
+# each row into ITS OWN open-addressed table (one multiply hash, linear probing); then the tables are merged on every
+# core, each core owning one slice of the hash range. No census, no prune, no buckets, no sort: one read of the rows.
+
+@njit(nogil=True, cache=True)
+def pf_ht_sample(pos, allrows, ac, bc, AB, S, CB):
+    """THE ESTIMATE: S rows spread evenly over the rows (pos, or every row), their pairs counted in one table of
+    2^CB slots and their b values in another. Returns (pairs seen, pairs seen once, pairs seen twice, sampled rows
+    whose b value holds more than 1/64 of the sample) -- the caller's occurring-pairs estimate (Chao1) that sizes the
+    tables, and the heavy share; both draw the line."""
+    n = bc.size if allrows else pos.size
+    cap = np.int64(1) << CB
+    mask = cap - 1
+    K = np.zeros(cap, np.int64)
+    C = np.zeros(cap, np.int32)            # 32-bit counts and b keys: half the pages to fault and zero
+    KB = np.zeros(cap, np.int32)
+    CB2 = np.zeros(cap, np.int32)
+    d = 0
+    for j in range(S):
+        i = (np.int64(j) * n) // S
+        p = i if allrows else pos[i]
+        key = ((np.int64(bc[p]) << AB) | np.int64(ac[p])) + 1
+        h = np.int64((np.uint64(key) * np.uint64(0x9E3779B97F4A7C15)) >> np.uint64(64 - CB))
+        while True:
+            kk = K[h]
+            if kk == key:
+                break
+            if kk == 0:
+                K[h] = key
+                d += 1
+                break
+            h = (h + 1) & mask
+        C[h] += 1
+        bk = np.int32(np.int64(bc[p]) + 1)
+        h = np.int64((np.uint64(bk) * np.uint64(0x9E3779B97F4A7C15)) >> np.uint64(64 - CB))
+        while True:
+            kk = KB[h]
+            if kk == bk:
+                break
+            if kk == 0:
+                KB[h] = bk
+                break
+            h = (h + 1) & mask
+        CB2[h] += 1
+    f1 = 0
+    f2 = 0
+    hb = 0
+    thr = S // 64
+    for h in range(cap):
+        if C[h] == 1:
+            f1 += 1
+        elif C[h] == 2:
+            f2 += 1
+        if CB2[h] > thr:
+            hb += CB2[h]
+    return d, f1, f2, hb
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def pf_ht_pass(pos, allrows, ac, bc, xc, yc, dv1, dv2, AB, CB, K, V, used, full):
+    """THE PASS: thread t adds its rows into table row t -- K[t] the keys, V[t, :, 0] the counts (exact in float64),
+    V[t, :, 1..2] the sums of dv1[x], dv2[y] when V has 3 columns. A table past 7/10 full stops and sets full[t]
+    (the caller redoes the pass with larger tables)."""
+    T = K.shape[0]
+    W = V.shape[2]
+    n = bc.size if allrows else pos.size
+    cap = np.int64(1) << CB
+    mask = cap - 1
+    lim = (cap * 7) // 10
+    for t in prange(T):
+        lo = t * n // T
+        hi = (t + 1) * n // T
+        u = 0
+        for i in range(lo, hi):
+            p = i if allrows else pos[i]
+            key = ((np.int64(bc[p]) << AB) | np.int64(ac[p])) + 1
+            h = np.int64((np.uint64(key) * np.uint64(0x9E3779B97F4A7C15)) >> np.uint64(64 - CB))
+            while True:
+                kk = K[t, h]
+                if kk == key:
+                    break
+                if kk == 0:
+                    K[t, h] = key
+                    u += 1
+                    break
+                h = (h + 1) & mask
+            V[t, h, 0] += 1.0
+            if W > 1:
+                V[t, h, 1] += dv1[xc[p]]
+                V[t, h, 2] += dv2[yc[p]]
+            if u > lim:
+                full[t] = 1
+                break
+        used[t] = u
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def pf_ht_bound(K, PB, ub):
+    """THE MERGE'S ROOM: slice p of the hash range is slots [p*R, (p+1)*R) of every table plus, in each table, the
+    occupied run just past it (a probe chain that crossed the slice's end -- it ends at the first empty slot);
+    ub[p] counts those slots, an upper bound on the pairs slice p owns"""
+    T = K.shape[0]
+    cap = K.shape[1]
+    mask = cap - 1
+    R = cap >> PB
+    for p in prange(ub.size):
+        lo = p * R
+        c = 0
+        for t in range(T):
+            for s in range(lo, lo + R):
+                if K[t, s] != 0:
+                    c += 1
+            s = lo + R
+            while s - lo < cap:
+                if K[t, s & mask] == 0:
+                    break
+                c += 1
+                s += 1
+        ub[p] = c
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def pf_ht_merge(K, V, CB, PB, offs, oK, oV, nout):
+    """THE MERGE ON EVERY CORE: core p owns the pairs whose home slot lies in slice p; it walks slice p of every
+    thread's table (plus the run past its end), adds the pairs it owns into its own small table and writes each
+    distinct pair once at offs[p] + j (oK the key, oV its count and sums); nout[p] the pairs written"""
+    T = K.shape[0]
+    cap = K.shape[1]
+    W = V.shape[2]
+    mask = cap - 1
+    R = cap >> PB
+    for p in prange(nout.size):
+        m = offs[p + 1] - offs[p]
+        lcb = 4
+        while (np.int64(1) << lcb) < 2 * m + 2:
+            lcb += 1
+        lmask = (np.int64(1) << lcb) - 1
+        LK = np.zeros(lmask + 1, np.int64)
+        LI = np.zeros(lmask + 1, np.int64)
+        base = offs[p]
+        u = 0
+        lo = p * R
+        for t in range(T):
+            s = lo
+            while s - lo < cap:
+                ss = s & mask
+                kk = K[t, ss]
+                if kk == 0:
+                    if s >= lo + R:
+                        break
+                    s += 1
+                    continue
+                hu = np.uint64(kk) * np.uint64(0x9E3779B97F4A7C15)
+                home = np.int64(hu >> np.uint64(64 - CB))
+                if (home >> (CB - PB)) == p:
+                    h2 = np.int64((hu << np.uint64(PB)) >> np.uint64(64 - lcb))
+                    while True:
+                        lk = LK[h2]
+                        if lk == 0:
+                            LK[h2] = kk
+                            LI[h2] = u
+                            oK[base + u] = kk - 1
+                            for w in range(W):
+                                oV[base + u, w] = V[t, ss, w]
+                            u += 1
+                            break
+                        if lk == kk:
+                            j = LI[h2]
+                            for w in range(W):
+                                oV[base + j, w] += V[t, ss, w]
+                            break
+                        h2 = (h2 + 1) & lmask
+                s += 1
+        nout[p] = u
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def pf_ht_compact(oK, oV, offs, nout, foffs, fK, fV):
+    """the merged pairs, gapless: slice p's nout[p] pairs move from offs[p] to foffs[p]"""
+    W = oV.shape[1]
+    for p in prange(nout.size):
+        a = offs[p]
+        b = foffs[p]
+        for j in range(nout[p]):
+            fK[b + j] = oK[a + j]
+            for w in range(W):
+                fV[b + j, w] = oV[a + j, w]

@@ -30,6 +30,20 @@ HEAVY_DIV = int(__import__('os').environ.get('WDB_PF_HEAVY_DIV', '64'))
 HEAVY_SLOTS = int(__import__('os').environ.get('WDB_PF_HEAVY_SLOTS', str(1 << 18)))
 _HEAVY_HITS = [0]
 _DENSED = 0
+# THE ONE PASS (2026-10-29, Jackson's fix 3): every thread adds its rows into its own hash table, the tables merge
+# on every core -- one read of the rows, no census, no prune, no buckets. It wins where FEW pairs occur (the tables
+# stay small) and loses where nearly every row is its own pair (the tables grow to the rows). The line is on the
+# occurring pairs, estimated from a sample of the rows before the pass.
+_HT = [__import__('os').environ.get('WDB_PF_HT', '1') == '1']
+HT_LINE = float(__import__('os').environ.get('WDB_PF_HT_LINE', '262144'))
+HT_HEAVY = float(__import__('os').environ.get('WDB_PF_HT_HEAVY', '0.95'))   # the heavy share past which the heavy fold wins
+HT_SAMPLE = 1 << 17          # rows in the estimate's sample (2^18: 3x the time, the same decisions)
+HT_SAMPLE1 = 1 << 15         # THE STAGED ESTIMATE: this many rows first ...
+HT_STAGE = 2.0               # ... and an estimate past HT_STAGE x HT_LINE there is past the line
+HT_CBMAX = 20                # largest per-thread table, 2^20 slots (past it: pairfold's buckets)
+_HT_HITS = [0]
+_HT_SPILL = [0]
+_HT_TRACE = __import__('os').environ.get('WDB_PF_HT_TRACE')
 
 
 def detect(seg, tree, col_map):
@@ -261,6 +275,28 @@ def execute(seg, spec):
         order = np.lexsort((ukey, -ucnt))[:min(k, ucnt.size)]      # count DESC, then (b, a) ASC
         _DENSED += 1
         return _pluck(seg, spec, order, ukey, ucnt, {x1: us1, x2: us2})
+    if _HT[0]:
+        # THE ONE PASS first: under the line (few pairs occur) it is the whole answer
+        try:
+            import numba
+            T8 = max(1, numba.get_num_threads())
+        except Exception:
+            T8 = 1
+        ac9 = np.asarray(seg._raw_codes(spec['a']))     # decoded once: the buckets reuse them when it stands aside
+        xc9 = np.asarray(seg._raw_codes(x1))
+        yc9 = xc9 if x2 == x1 else np.asarray(seg._raw_codes(x2))
+        r8 = _onepass(pos, ac9, bc9, xc9, yc9, dv1, dv2, spec['abits'], 3 if scols else 1, T8,
+                      tag='%s|%s|%s' % (spec['a'], spec['b'], spec['f']))
+        if r8 is not None:
+            ukey, ucnt, us1, us2 = r8
+            k9 = min(k, ucnt.size)
+            if k9:
+                order = np.argpartition(-ucnt, k9 - 1)[:k9]
+                order = order[np.argsort(-ucnt[order], kind='stable')]
+            else:
+                order = np.zeros(0, np.int64)
+            _HT_HITS[0] += 1
+            return _pluck(seg, spec, order, ukey, ucnt, {x1: us1, x2: us2})
     memo = seg.__dict__.setdefault('_censusmemo', {})
     ckey = ('pf', spec['f'], spec['b'])
     cnt_b = memo.get(ckey)
@@ -268,9 +304,10 @@ def execute(seg, spec):
         # (2026-10-28) on every core: numpy's bincount was one thread, 170-224 ms of the Q32 pairs (THE HEAVY VALUES)
         cnt_b = _WK.bincount_par(bc9 if pos is None else bc9[pos], BV)    # outscore its b's total
         memo[ckey] = cnt_b
-    ac9 = np.asarray(seg._raw_codes(spec['a']))
-    xc9 = np.asarray(seg._raw_codes(x1))
-    yc9 = np.asarray(seg._raw_codes(x2))
+    if not _HT[0]:
+        ac9 = np.asarray(seg._raw_codes(spec['a']))
+        xc9 = np.asarray(seg._raw_codes(x1))
+        yc9 = xc9 if x2 == x1 else np.asarray(seg._raw_codes(x2))
     SH = max(0, BV.bit_length() - 12)
     try:
         import numba
@@ -361,6 +398,92 @@ def execute(seg, spec):
     # (the loop's last fold IS the answer: the fold that was re-run here from the same buckets,
     # doubling every pair's bill, is gone -- 2026-10-17)
     return _pluck(seg, spec, order, ukey, ucnt, {x1: us1, x2: us2})
+
+
+def _ht_trace(rec):
+    if _HT_TRACE:
+        with open(_HT_TRACE, 'a') as f9:
+            f9.write(__import__('json').dumps(rec) + '\n')
+
+
+def _onepass(pos, ac9, bc9, xc9, yc9, dv1, dv2, AB, W, T9, tag=None):
+    """THE ONE PASS: (keys, counts, sums 1, sums 2) of every occurring pair -- or None when the estimate of the
+    occurring pairs is past HT_LINE, or the tables would pass 2^HT_CBMAX slots (the caller's buckets take it)"""
+    import wdb_kernels as _WK
+    import time as _tm
+    allr = pos is None
+    pos9 = np.zeros(1, np.int64) if allr else pos
+    n = int(bc9.size) if allr else int(pos.size)
+    if n == 0:
+        return None
+    t0 = _tm.perf_counter()
+    def _samp(S9):
+        ds9, f19, f29, hb9 = _WK.pf_ht_sample(pos9, allr, ac9, bc9, np.int64(AB), np.int64(S9),
+                                              np.int64(max(4, (2 * S9 - 1).bit_length())))   # load <= 1/2
+        ds9 = int(ds9); f19 = int(f19); f29 = int(f29)
+        # Chao1: the pairs seen plus the unseen ones the singletons imply (with every row sampled, the pairs seen)
+        return ds9, f19, f29, int(hb9) / S9, (float(ds9) if S9 >= n else ds9 + f19 * (f19 - 1) / (2.0 * (f29 + 1)))
+    # THE STAGED ESTIMATE (measured 2026-10-29 on the 563 pairs the Q30-Q32 boards traced): 2^15 rows first (0.7 ms
+    # median against 6.1 for 2^17 -- the sample's cost is its gathers); an estimate already past HT_STAGE x HT_LINE
+    # there is past the line at 2^17 too (not one of the 563 decisions flipped at a stage line of 2, 4 or 8)
+    S = min(n, HT_SAMPLE1)
+    ds, f1, f2, hsh, est = _samp(S)
+    if not (S < n and est > HT_STAGE * HT_LINE and not (allr and hsh > HT_HEAVY)):
+        S = min(n, HT_SAMPLE)
+        ds, f1, f2, hsh, est = _samp(S)
+    rec = {'tag': tag, 'n': n, 'S': S, 'ds': ds, 'f1': f1, 'f2': f2, 'est': est, 'heavy': hsh}
+    # THE HEAVY LINE (measured 2026-10-29, Q32 vs Q31 boards): over every row, a big key past HT_HEAVY is the heavy
+    # fold's (its dense table on contiguous rows beats the hash, 56 of 66 lost at share >= 0.99); under a filter both
+    # gather rows by position and the one pass won all 90 at share >= 0.95 -- the line holds only with no filter
+    if allr and hsh > HT_HEAVY:
+        rec['path'] = 'heavy'
+        _ht_trace(rec)
+        return None
+    if est > HT_LINE:
+        rec['path'] = 'line'
+        _ht_trace(rec)
+        return None
+    per = min(est, n / T9 + 1.0)                 # a thread can't see more pairs than its rows
+    CB = max(12, int(np.ceil(np.log2(max(per, 1.0) * 2.0))))
+    t1 = _tm.perf_counter()
+    while True:
+        if CB > HT_CBMAX:
+            rec['path'] = 'spill'
+            _ht_trace(rec)
+            return None
+        K = np.zeros((T9, 1 << CB), np.int64)
+        V = np.zeros((T9, 1 << CB, W), np.float64)
+        used = np.zeros(T9, np.int64)
+        full = np.zeros(T9, np.uint8)
+        _WK.pf_ht_pass(pos9, allr, ac9, bc9, xc9, yc9, dv1, dv2, np.int64(AB), np.int64(CB), K, V, used, full)
+        if not full.any():
+            break
+        _HT_SPILL[0] += 1                         # the estimate was short: larger tables, the pass again
+        CB += 2
+    t2 = _tm.perf_counter()
+    PB = min(8, CB - 6)
+    P = 1 << PB
+    ub = np.zeros(P, np.int64)
+    _WK.pf_ht_bound(K, np.int64(PB), ub)
+    offs = np.zeros(P + 1, np.int64)
+    offs[1:] = np.cumsum(ub)
+    oK = np.empty(int(offs[-1]), np.int64)
+    oV = np.empty((int(offs[-1]), W), np.float64)
+    nout = np.zeros(P, np.int64)
+    _WK.pf_ht_merge(K, V, np.int64(CB), np.int64(PB), offs, oK, oV, nout)
+    foffs = np.zeros(P + 1, np.int64)
+    foffs[1:] = np.cumsum(nout)
+    fK = np.empty(int(foffs[-1]), np.int64)
+    fV = np.empty((int(foffs[-1]), W), np.float64)
+    _WK.pf_ht_compact(oK, oV, offs, nout, foffs, fK, fV)
+    t3 = _tm.perf_counter()
+    ucnt = fV[:, 0].astype(np.int64)
+    us1 = fV[:, 1].copy() if W > 1 else np.zeros(ucnt.size)
+    us2 = fV[:, 2].copy() if W > 1 else us1
+    rec.update(path='ht', CB=CB, pairs=int(fK.size), used_max=int(used.max()),
+               ms_est=round((t1 - t0) * 1e3, 1), ms_pass=round((t2 - t1) * 1e3, 1), ms_merge=round((t3 - t2) * 1e3, 1))
+    _ht_trace(rec)
+    return fK, ucnt, us1, us2
 
 
 def _pluck(seg, spec, order, ukey, ucnt, sums):
