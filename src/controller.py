@@ -56,6 +56,7 @@ _READ_ORDER = (
     R.funnel,               # selective funnel: plist start, crumb hygiene, code-space group
     R.complement,           # COUNT(*) WHERE k <> v: N - rows(k = v) - NULLs (Q1; wdb_complement)
     R.wherescan,            # conjunctive WHERE: stair spans + blocked-frame predicate scan, disk-only
+    R.pairbound,            # two big keys, top-k by count: the rows whose two values both have >= T rows (wdb_pairbound)
     R.pairfold,
     R.affinegroup,
     R.affinesum,

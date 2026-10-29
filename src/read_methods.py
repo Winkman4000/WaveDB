@@ -173,6 +173,10 @@ funnel = Read('funnel',
               lambda c: wdb_funnel.detect(c.seg, c.tree, c.cmap),
               lambda c, spec: wdb_funnel.execute(c.seg, spec))
 
+import wdb_pairbound
+pairbound = Read('pairbound',                    # THE PAIR BOUND: count(a, b) <= min(rows of a, rows of b) (Q32's family 1)
+                 lambda c: wdb_pairbound.detect(c.seg, c.tree, c.cmap),
+                 lambda c, spec: wdb_pairbound.execute(c.seg, spec))
 import wdb_pairfold
 pairfold = Read('pairfold',
                 lambda c: wdb_pairfold.detect(c.seg, c.tree, c.cmap),

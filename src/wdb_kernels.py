@@ -3545,6 +3545,60 @@ TALLY_MAX = 1 << 18          # a bucket's key range counted in a table: 16 threa
 
 
 @njit(nogil=True, parallel=True, cache=True)
+def pb_survive_count(ac, bc, ca, cb, T, NT, cnt):
+    """THE PAIR BOUND (2026-10-28): per thread, how many of its rows have BOTH values with >= T rows"""
+    n = ac.size
+    for t in prange(NT):
+        lo = t * n // NT
+        hi = (t + 1) * n // NT
+        m = 0
+        for i in range(lo, hi):
+            if ca[ac[i]] >= T and cb[bc[i]] >= T:
+                m += 1
+        cnt[t] = m
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def pb_survive_write(ac, bc, ca, cb, T, NT, offs, VB, keys, pos):
+    """the surviving rows' pair keys (a * VB + b) and positions, thread t at offs[t] (ascending rows)"""
+    n = ac.size
+    for t in prange(NT):
+        lo = t * n // NT
+        hi = (t + 1) * n // NT
+        w = offs[t]
+        for i in range(lo, hi):
+            if ca[ac[i]] >= T and cb[bc[i]] >= T:
+                keys[w] = np.int64(ac[i]) * VB + np.int64(bc[i])
+                pos[w] = i
+                w += 1
+
+
+@njit(nogil=True, parallel=True, cache=True)
+def pb_winner_sums(keys, pos, wk, xc, yc, dvx, dvy, NT, S1, S2):
+    """the k winners' sums: a surviving row whose key is a winner (wk ascending, binary search) adds dvx[x], dvy[y]
+    to ITS thread's row of S1 / S2 at the winner's index"""
+    n = keys.size
+    k = wk.size
+    for t in prange(NT):
+        lo = t * n // NT
+        hi = (t + 1) * n // NT
+        for i in range(lo, hi):
+            v = keys[i]
+            l = 0
+            h = k
+            while l < h:
+                m = (l + h) >> 1
+                if wk[m] < v:
+                    l = m + 1
+                else:
+                    h = m
+            if l < k and wk[l] == v:
+                p = pos[i]
+                S1[t, l] += dvx[xc[p]]
+                S2[t, l] += dvy[yc[p]]
+
+
+@njit(nogil=True, parallel=True, cache=True)
 def pf_heavy_fold(pos, allrows, ac, bc, xc, yc, hidx, VA, dv1, dv2, C, S1, S2, lc):
     """THE HEAVY VALUES ON EVERY CORE (2026-10-28): each thread takes 1/T of the rows (every row when allrows, else
     pos); a row whose b is heavy (hidx[b] >= 0) adds 1, dv1[x], dv2[y] at slot hidx[b] * VA + a of the THREAD'S OWN
