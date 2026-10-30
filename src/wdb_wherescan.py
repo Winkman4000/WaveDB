@@ -32,6 +32,11 @@ import os
 _ENABLED = True
 _HITS = 0
 _SCAN_THREADS = 14
+_FLAG_LANES = [os.environ.get('WDB_FLAG_LANES', '1') == '1']   # A/B: 0 restores the thread-pool frame scan (enc 3)
+_SCAN_CODES_MAX = 4_000_000    # the scanned codes are kept for codes_at up to this many hits
+_SLOT_DIV = [4]                # the lane scan's pass 1 keeps up to BR // 4 hits per frame; a frame with more is
+                               # inflated again in pass 2 (measured, server: a quarter beat 1/16 and 1/64 on the
+                               # dense LIKEs and tied on URL; a whole frame's slot was slower everywhere)
 
 
 def enable():
@@ -1619,6 +1624,55 @@ def _scan_flag18(seg, col, fbits, lo, hi):
     return pos
 
 
+def _scan_flag3_lanes(seg, c, bitsB, lo, hi, j0, j1):
+    """THE FRAME SCAN IN COMPILED LANES (2026-10-30, E: Q21's small-text LIKEs on the PC). The thread pool below hands
+    each frame across threads three times (inflate, test, copy out); under a virtual machine every handoff wakes a
+    virtual CPU, so 14 threads ran slower than 4 (HitColor LIKE '%g', 1,526 frames: 390 ms in the query; inflating
+    alone 20 ms on 4 threads, 59 on 8). Here one compiled call holds the whole scan: pass 1 inflates each frame into
+    its lane's board, counts its hits and keeps up to a quarter frame of them in the frame's slot (offset, code); the
+    running total places every frame's hits; pass 2 copies each frame's hits from its slot -- inflating again only a
+    frame that held more -- and writes positions (and codes, when they will be kept) in place. Inflating everything
+    twice made URL LIKE '%google%' (16K hits in 1,432 of 1,526 frames) 51 -> 85 ms on the server; with the slots 47.
+    Returns (positions, codes or None), or None to fall back to the thread pool (no libzstd or numba, switched off,
+    a frame that fails)."""
+    if not _FLAG_LANES[0]:
+        return None
+    import wdb_engine as _WE
+    import wdb_kernels as _WK
+    kern = getattr(_WK, 'z3_flag_hits', None)
+    if kern is None or _WE._libzstd() is None or not _WE._ZLANES[0]:
+        return None
+    wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
+    BR = int(c['BR']); base = int(c['cstart'])
+    zabs = np.asarray(c['boffs'][j0:j1 + 1], np.int64) + base
+    nf = j1 - j0
+    P = int(_WK.wide_threads())
+    scr = np.empty((P, BR), wdt)
+    cnt = np.zeros(nf, np.int64)
+    e0 = np.empty(0, np.int64)
+    K = max(1, BR // int(_SLOT_DIV[0]))
+    soff = np.empty(nf * K, np.int32); scode = np.empty(nf * K, np.uint32)   # touched only where hits land
+    src = np.uint64(seg.buf.ctypes.data)
+    out = []
+    def run(zfn, dctx, err):
+        args = (np.uint64(zfn), src, zabs, dctx, scr, np.int64(BR), np.int64(j0), np.int64(lo), np.int64(hi), bitsB,
+                np.int64(K), soff, scode, cnt)
+        _WK.run_wide(kern, *args, e0, e0, e0, False, err)
+        if err.any():
+            return
+        offs = np.zeros(nf + 1, np.int64)
+        np.cumsum(cnt, out=offs[1:])
+        tot = int(offs[-1])
+        pos = np.empty(tot, np.int64)
+        codes = np.empty(tot, np.int64) if tot <= _SCAN_CODES_MAX else e0
+        if tot:
+            _WK.run_wide(kern, *args, offs, pos, codes, True, err)
+        out.append((pos, codes if tot <= _SCAN_CODES_MAX else None))
+    if not seg._zlanes(run, P) or not out:
+        return None
+    return out[0]
+
+
 def _scan_flag(seg, col, flag, lo, hi):
     """Positions in [lo, hi) where flag[code] is set -- the LIKE frame scan: parallel enc=3
     decompress, one fancy-index per frame; the substring test happened once, in the dict."""
@@ -1659,6 +1713,12 @@ def _scan_flag(seg, col, flag, lo, hi):
         j0, j1 = lo // BR, (hi - 1) // BR + 1
         seg.warm_span(base + int(bo[j0]), base + int(bo[j1]))   # cold frames: parallel large reads first
         bitsB = _flag_bits(seg, flag)
+        got = _scan_flag3_lanes(seg, c, bitsB, lo, hi, j0, j1)
+        if got is not None:
+            pos, codes = got
+            if codes is not None:
+                seg.__dict__.setdefault('_scan_codes', {})[col] = (pos, codes)
+            return pos
         mv = memoryview(buf)                     # slices without the copy: 89 -> 61 ms of decompression
         def scan(js):
             import zstandard as zstd
@@ -1678,7 +1738,7 @@ def _scan_flag(seg, col, flag, lo, hi):
         if not parts:
             return np.empty(0, np.int64)
         pos = np.concatenate([p[0] for p in parts]); codes = np.concatenate([p[1] for p in parts])
-        if pos.size <= 4_000_000:                                          # THE SCANNED CODES, kept for codes_at:
+        if pos.size <= _SCAN_CODES_MAX:                                    # THE SCANNED CODES, kept for codes_at:
             seg.__dict__.setdefault('_scan_codes', {})[col] = (pos, codes)  # a fact about the segment, never stale
         return pos
     if c.get('code_enc', 0) == 12 and (hi - lo) >= (1 << 16):

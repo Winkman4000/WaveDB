@@ -8926,6 +8926,70 @@ if HAVE_NUMBA:
                             cnt[t, v] += 1
 
     @njit(cache=True, parallel=True)
+    def z3_flag_hits(zfn, src, zabs, dctx, scr, BR, j0, lo, hi, bits, K, soff, scode, cnt, offs, pos, codes, fill, err):
+        """enc 3, THE LIKE FRAME SCAN IN COMPILED LANES (2026-10-30, E): the rows in [lo, hi) whose code's bit is set
+        in the packed flag `bits` (little-endian bit order). Frame k (file bytes zabs[k]..zabs[k+1], absolute) holds
+        rows (j0 + k) * BR onward; each lane inflates its frames into its own board (scr[t], one frame, typed by the
+        code width). fill False: cnt[k] = frame k's hits, the first K of them kept in frame k's slot (soff / scode at
+        k*K: the row's offset in the frame, its code). fill True: frame k's hits are written from offs[k] on --
+        positions into pos, codes into codes when codes is not empty -- copied from the slot when they all fit there;
+        only a frame that held more than K is inflated again.
+        err[t] = 1 when a frame inflates to more than BR codes or to a partial code."""
+        P = dctx.size
+        nf = zabs.size - 1
+        W = np.uint64(scr.strides[0])
+        isz = np.uint64(scr.itemsize)
+        cap = np.uint64(BR) * isz
+        base = np.uint64(scr.ctypes.data)
+        wc = codes.size > 0
+        for t in prange(P):
+            a = nf * t // P
+            b = nf * (t + 1) // P
+            dsts = base + np.uint64(t) * W
+            row = scr[t]
+            for k in range(a, b):
+                if fill and cnt[k] == 0:
+                    continue
+                if fill and cnt[k] <= K:
+                    r0 = (j0 + k) * BR
+                    o = offs[k]
+                    sb = k * K
+                    for q in range(cnt[k]):
+                        pos[o + q] = r0 + np.int64(soff[sb + q])
+                        if wc:
+                            codes[o + q] = np.int64(scode[sb + q])
+                    continue
+                r = _zcall5(zfn, np.uint64(dctx[t]), dsts, cap, src + np.uint64(zabs[k]),
+                            np.uint64(zabs[k + 1] - zabs[k]))
+                if r > cap or r % isz != np.uint64(0):
+                    err[t] = 1
+                    break
+                n = np.int64(r // isz)
+                r0 = (j0 + k) * BR
+                s0 = max(lo, r0) - r0
+                e0 = min(hi, r0 + n) - r0
+                if fill:
+                    o = offs[k]
+                    for i in range(s0, e0):
+                        v = np.int64(row[i])
+                        if (bits[v >> 3] >> (v & 7)) & 1:
+                            pos[o] = r0 + i
+                            if wc:
+                                codes[o] = v
+                            o += 1
+                else:
+                    m = 0
+                    sb = k * K
+                    for i in range(s0, e0):
+                        v = np.int64(row[i])
+                        if (bits[v >> 3] >> (v & 7)) & 1:
+                            if m < K:
+                                soff[sb + m] = i
+                                scode[sb + m] = v
+                            m += 1
+                    cnt[k] = m
+
+    @njit(cache=True, parallel=True)
     def z18_frames(zfn, src, zabs, dctx, scr, bits, BR, N, out, err):
         """enc 18: frame j inflates to its rows' codes bit-packed at `bits` (LE words) in the lane's board, then
         unpacks into out[j*BR ...]; the board keeps 16 spare bytes past the cap for the straddling word"""
