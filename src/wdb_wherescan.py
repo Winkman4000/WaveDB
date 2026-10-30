@@ -1921,6 +1921,23 @@ def _pot_keep(seg, col, test, sample, cc_memo):
     return float(np.count_nonzero(np.asarray(test(cc), bool))) / cc.size
 
 
+def _stored_start(seg, spec, key):
+    """True when the candidate's passing rows are already stored: '<>' the default value of an enc-8 column -- the
+    flag drops only the default, so _scan_flag answers from the literal rows (sliced, never scanned)"""
+    kind, i = key
+    if kind != 'eq':
+        return False
+    col, val, op = spec['eqs'][i]
+    c = seg.cols.get(col) or {}
+    if op != '<>' or c.get('code_enc', 0) != 8 or col in seg._codes or not hasattr(seg, 'e8_planes'):
+        return False
+    code = _code_of(seg, col, val)
+    if code is None:
+        return False
+    pl = seg.e8_planes(col)
+    return pl is not None and int(code) == int(pl[2])
+
+
 def _potency_pick(seg, spec, lo, hi):
     """THE POTENCY PICK (2026-10-19, Jackson: "a failure of the potency based system to detect that search phrase
     filter as an option"). The driver -- the one filter that scans the span and writes positions -- was chosen by
@@ -1980,8 +1997,22 @@ def _potency_pick(seg, spec, lo, hi):
     best = min(shares, key=lambda k: shares[k])
     cur_share = shares.get(cur, 1.0) if cur is not None else 1.0
     _POT_LAST[0] = (best, cur, {('%s%d' % k): round(v, 4) for k, v in shares.items()})
-    if best == cur or shares[best] >= _POT_SWITCH * cur_share:
+    if best == cur:
         return spec
+    if shares[best] >= _POT_SWITCH * cur_share:
+        # THE STORED START (2026-10-30, Jackson): a filter whose passing rows are already stored -- '<>' the default of
+        # an enc-8 column (SearchPhrase <> ''), whose answer is the literal rows _scan_flag slices -- costs nothing to
+        # start from, where the ladder's driver scans its whole column. It starts whenever it keeps no more rows than
+        # the driver. Measured on c96 (server, the Q21 / Q22 / Q22n boards, 687 variants): the 26 it moves (LIKEs
+        # keeping 14-19% against SearchPhrase's 13.2%) 0.90x / 0.96x geomean, none >10% slower (Title '%ль%' +8%),
+        # answers identical; HitColor LIKE '%g' 183 -> 141 ms, URL LIKE '%mes%' 617 -> 530.
+        if cur is None:
+            return spec
+        st = [k for k in shares if k != cur and shares[k] <= cur_share and _stored_start(seg, spec, k)]
+        if not st:
+            return spec
+        best = min(st, key=lambda k: shares[k])
+        _POT_LAST[0] = (best, cur, _POT_LAST[0][2])
     spec = dict(spec)
     for k in ('drive_eq', 'drive_like', 'drive_in', 'drive_neq'):
         spec[k] = None
