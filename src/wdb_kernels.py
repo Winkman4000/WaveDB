@@ -9457,3 +9457,78 @@ def pf_ht_compact(oK, oV, offs, nout, foffs, fK, fV):
             fK[b + j] = oK[a + j]
             for w in range(W):
                 fV[b + j, w] = oV[a + j, w]
+
+
+# THE CENSUS AND THE FOLD IN ONE PASS (2026-10-30, Jackson OK'd). SUM/AVG of a shelved enc-19 column built the whole
+# census (17.6M int64s for UserID: 141 MB written, 7 ms of it first-touch faults) only for i2_fold to read it back.
+# Each shelf already owns a range of W codes: it now adds its counts into a small board of its own (cache-sized),
+# inflates just the dictionary frames that hold its codes, and folds count x value on the spot.
+if HAVE_NUMBA:
+    @njit(cache=True, parallel=True)
+    def e19s_census_fold(dw, W, wb, gw, pre, soff, SW, eoff, cnt, zfn, src, zabs, CH, nd, dctx, scr, loc,
+                         outhi, outlo, outn, err):
+        """per lane t, the shelves t, t + P, ...: (1) the shelf's codes [r*W, min((r+1)*W, nd)) counted on the
+        lane's board loc[t] from every block's counts (pass A's cnt, as e19s_census_b reads them); (2) the
+        dictionary chunks covering that range inflated one at a time into scr[t] (deltas restart at 0 per
+        chunk: the running sum is the value), each code's count x value folded in two limbs (as i2_fold) and
+        its rows counted. Codes at or past nd (the NULL) are never counted. err[t] = 1 on a bad frame."""
+        P = dctx.size
+        R = SW.size - 1
+        nb = eoff.size - 1
+        nch = zabs.size - 1
+        M = np.int64(0xFFFFFFFF)
+        Wb = np.uint64(scr.shape[1] * 8)
+        cap = np.uint64(CH * 8)
+        sbase = np.uint64(scr.ctypes.data)
+        for t in prange(P):
+            hi = np.int64(0)
+            lo = np.int64(0)
+            nn = np.int64(0)
+            dst = sbase + np.uint64(t) * Wb
+            row = scr[t]
+            lt = loc[t]
+            for r in range(t, R, P):
+                base = np.int64(r) * W
+                end = min(base + W, nd)
+                if end <= base:
+                    continue
+                for i in range(end - base):
+                    lt[i] = 0
+                for b in range(nb):
+                    c0 = np.int64(pre[r, b]); c1 = np.int64(pre[r + 1, b])
+                    if c1 == c0:
+                        continue
+                    g = np.int64(gw[b])
+                    pos = SW[r] * 64 + np.int64(soff[r, b])
+                    v = base + _e19_get(dw, pos, wb); pos += wb
+                    e = eoff[b] + c0
+                    if v < end:
+                        lt[v - base] += cnt[e]
+                    for j in range(1, c1 - c0):
+                        v += _e19_get(dw, pos, g); pos += g
+                        if v < end:
+                            lt[v - base] += cnt[e + j]
+                j0 = base // CH
+                j1 = min((end - 1) // CH, nch - 1)
+                for j in range(j0, j1 + 1):
+                    rr = _zcall5(zfn, np.uint64(dctx[t]), dst, cap, np.uint64(src) + np.uint64(zabs[j]),
+                                 np.uint64(zabs[j + 1] - zabs[j]))
+                    if rr > cap or rr % np.uint64(8) != 0:
+                        err[t] = 1
+                        break
+                    m = np.int64(rr // np.uint64(8))
+                    k0 = np.int64(j) * CH
+                    val = np.int64(0)
+                    for i in range(m):
+                        val += row[i]
+                        k = k0 + i
+                        if k >= end:
+                            break
+                        if k >= base:
+                            c = lt[k - base]
+                            hi += c * (val >> 32)
+                            lo += c * (val & M)
+                            nn += c
+            outhi[t] = hi
+            outlo[t] = lo
+            outn[t] = nn

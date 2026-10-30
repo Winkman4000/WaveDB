@@ -59,6 +59,7 @@ _E3_BATCH_THREADS = 16
 _I2FOLD = [__import__('os').environ.get('WDB_I2FOLD', '1') == '1']   # A/B: 0 restores the inflated spine + numpy fold for exact SUM/AVG
 _LZ = [0]                 # program: (ZSTD_decompressDCtx address, create, free, lib) or None; 0 = not yet tried
 _E19CENSUS = [__import__('os').environ.get('WDB_E19_CENSUS', '1') == '1']   # A/B: 0 restores decode + boards for shelved enc 19
+_E19FOLD = [__import__('os').environ.get('WDB_E19_FOLD', '1') == '1']   # A/B: 0 restores the full census + i2_fold for SUM/AVG of a shelved enc 19
 
 
 def _e19s_blocks(c, pw, dw, N, b0, b1, cc):
@@ -2678,6 +2679,58 @@ class Segment:
         _RPF_HITS += 1
         return (sum(int(x) for x in oh) << 32) + sum(int(x) for x in ol), N
 
+    def e19_census_fold(self, nm):
+        """THE CENSUS AND THE FOLD IN ONE PASS (2026-10-30, Jackson OK'd): (exact SUM of the stored values as a
+        Python int, non-null rows) of a shelved enc-19 column over a chunked integer dictionary, or None.
+        Pass A as the census (per block, its pointers counted on a block-sized board); then per shelf its own
+        codes counted on a small board and folded against the dictionary frames that hold them -- the full
+        census (UserID: 17.6M int64s, 141 MB written then read back by i2_fold) is never built. Q3 measured
+        (server, hot): pass A 13.3 ms, pass B 20 + 7 faulting the total, the fold 13.8, ~59 ms in all.
+        Equal to i2_fold_sum(nm, raw_census(nm)[:n_dict]) and its row count. WDB_E19_FOLD=0 declines."""
+        c = self.cols[nm]
+        if (not _E19FOLD[0] or not _CENSUS[0] or not _E19CENSUS[0] or c.get('code_enc') != 19 or 'e19R' not in c
+                or c.get('mode') not in (0, 1, 2) or not self.i2_foldable(nm)):
+            return None
+        import wdb_kernels as _WK
+        if not hasattr(_WK, 'e19s_census_fold'):
+            return None
+        nb = int(c['e19lb'].size); poff = c['e19poff']
+        cs = int(c['cstart']); ds = int(c['e19dstart'])
+        self.warm_span(cs, cs + 8 * (int(poff[nb]) + 1))
+        self.warm_span(ds, min(len(self.buf), ds + 8 * int(c['e19dn'])))
+        nd = int(c.get('n_dict', c['V']))
+        zo = np.asarray(c['i2zoffs'], np.int64); zb = int(c['i2base']); CH = int(c['i2ch'])
+        self.warm_span(zb + int(zo[0]), zb + int(zo[-1]))
+        pw, dw = self._e19_words(c)
+        dcnt = np.asarray(c['e19dc'], np.int64)
+        eoff = np.zeros(dcnt.size + 1, np.int64)
+        np.cumsum(dcnt, out=eoff[1:])
+        cnt = np.empty(int(eoff[-1]), np.uint32)
+        _WK.e19s_census_a(pw, np.int64(c['e19BR']), np.int64(self.N), c['e19lb'], dcnt, poff, eoff, cnt)
+        zfn, mk, free = _libzstd()[:3]
+        P = int(_WK._nt())
+        W = int(c['e19W'])
+        dctx = np.zeros(P, np.uint64)
+        try:
+            for t in range(P):
+                d = mk()
+                if not d:
+                    return None
+                dctx[t] = d
+            scr = np.empty((P, 2 * CH), np.int64)
+            loc = np.empty((P, W + 8), np.int64)
+            oh = np.zeros(P, np.int64); ol = np.zeros(P, np.int64); on = np.zeros(P, np.int64)
+            err = np.zeros(P, np.int64)
+            _WK.e19s_census_fold(dw, np.int64(W), np.int64(c['e19wb']), c['e19gw'], c['e19pre'], c['e19soff'],
+                                 c['e19SW'], eoff, cnt, np.uint64(zfn), np.uint64(self.buf.ctypes.data), zo + zb,
+                                 np.int64(CH), np.int64(nd), dctx, scr, loc, oh, ol, on, err)
+        finally:
+            for d in dctx.tolist():
+                if d:
+                    free(d)
+        if err.any():
+            return None
+        return (sum(int(x) for x in oh) << 32) + sum(int(x) for x in ol), int(on.sum())
     def i2_fold_sum(self, nm, counts):
         """THE FOLD THROUGH THE DICTIONARY'S OWN FRAMES (2026-10-19): exact sum(counts[k] * value[k]) as a
         Python int over column nm's chunked integer dictionary, straight from its zstd frames

@@ -294,6 +294,10 @@ def _exact_scalar_one(seg, kind, col, counts_of, seqs, i2s, cnts):
             # folded chunk by chunk as libzstd inflates the dictionary -- no spine built (AVG(WatchID)
             # 855 -> ~250 ms; AVG(UserID), Q3: the spine's inflate 75 ms + block value sum 51 ms became
             # its census 46 ms + fold 18 ms)
+            if col not in i2s and col not in cnts:
+                f9 = seg.e19_census_fold(col)       # THE CENSUS AND THE FOLD IN ONE PASS (2026-10-30): no full census
+                if f9 is not None:
+                    i2s[col] = f9
             if col not in i2s:
                 cn = counts_of(col, int(c.get('n_dict', c['V'])))
                 s = seg.i2_fold_sum(col, cn)
