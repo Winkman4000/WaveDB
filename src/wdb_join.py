@@ -6788,6 +6788,8 @@ def _key_is_unique(db, table, col):
 
 _JPTR_ASKED = set()
 _JPTR_NOT = set()
+_JPTR_CODES = {}     # pointer side -> (birthmark, verdict): are the child's codes the pointer? a fact about the two files
+_CODES_PTR = [os.environ.get('WDB_CODES_PTR', '1') == '1']   # A/B: 0 builds every pointer from the keys
 _DIRECT_MAX = 1 << 28           # a direct-address table up to 268M slots (1 GB of int32)
 
 
@@ -6810,6 +6812,62 @@ def _key_values(seg, pc):
         try: wdb_shelf.SHELF.put(('keys', seg.path, pc), v, int(v.nbytes), kind='keys')
         except Exception: pass
     return v
+
+
+def _codes_pointer(cseg, cp, pseg, pp, side, mark):
+    """THE CODES ARE THE POINTER (2026-10-31, TPC-H 2b): when the child key column's dictionary IS the parent key
+    column in row order (same size, same values, position by position), a child row's code is its parent's row --
+    the pointer needs no table and no probe. TPC-H SF10: l_orderkey -> orders, l_suppkey -> supplier, l_partkey ->
+    part (codes == the built pointer, checked row by row); the builds cost 71 / 27 / 30 ms every query. The verdict
+    is a fact about the two files, kept under their birthmark (as a refusal is, _JPTR_NOT); the codes are decoded
+    source data, kept on the shelf as tier-1 'codes' and handed out read-only. None (the pointer is built) when
+    switched off, the sidecar switch is on (its persisted road serves), the child is not a plain null-free
+    dictionary column, or the dictionary is not the parent's keys (o_custkey: a subset of c_custkey)."""
+    if not _CODES_PTR[0]:
+        return None
+    c = cseg.cols.get(cp) or {}
+    if c.get('mode') not in (0, 1, 2) or c.get('has_null') or cseg._overrides(cp) is not None:
+        return None
+    import os as _osc, json as _jsc
+    try:
+        import wdb_sidecar as _wscc
+        if _wscc.births_on(_osc.path.dirname(getattr(cseg, 'path', '') or '')):
+            return None
+    except Exception:
+        pass
+    mk = _jsc.dumps(mark, sort_keys=True)
+    hit = _JPTR_CODES.get(side)
+    if hit is None or hit[0] != mk:
+        ok = False
+        try:
+            if int(c.get('V') or 0) == int(pseg.N):
+                td = np.asarray(cseg._typed_dict(cp))
+                if td.dtype.kind in 'iu' and td.size == int(pseg.N) and td.size > 0:
+                    pk = np.asarray(_key_values(pseg, pp))
+                    ok = pk.size == td.size and bool(np.array_equal(td.astype(np.int64, copy=False), pk.astype(np.int64, copy=False)))
+        except Exception:
+            ok = False
+        hit = _JPTR_CODES[side] = (mk, ok)
+    if not hit[1]:
+        return None
+    import wdb_shelf
+    key = ('codes', cseg.path, cp)
+    cc = wdb_shelf.SHELF.get(key)
+    if cc is None:
+        raw = np.asarray(cseg._raw_codes(cp))
+        if raw.dtype.kind not in 'iu' or raw.size != int(cseg.N):
+            return None
+        if int(pseg.N) < (1 << 31):
+            cc = raw.view(np.int32) if raw.dtype in (np.uint32, np.int32) else raw.astype(np.int32)
+        else:
+            cc = raw.view(np.int64) if raw.dtype in (np.uint64, np.int64) else raw.astype(np.int64)
+        cc = cc.view()
+        cc.flags.writeable = False            # one copy serves every query: no reader may write through it
+        try:
+            wdb_shelf.SHELF.put(key, cc, int(cc.nbytes), kind='codes')
+        except Exception:
+            pass
+    return cc
 
 
 def _keep_share(seg, col, keep):
@@ -6949,6 +7007,10 @@ def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
                     _js.dump(mark, open(side + '.no', 'w'))
             except Exception: pass
         raise _FastUnsupported
+    if side and mark:
+        cptr9 = _codes_pointer(cseg, cp, pseg, pp, side, mark)   # THE CODES ARE THE POINTER: no table, no probe
+        if cptr9 is not None:
+            return cptr9
     ck = _key_values(cseg, cp); pk = _key_values(pseg, pp)
     ptr = _direct_pointer(ck, pk)
     if ptr is None:

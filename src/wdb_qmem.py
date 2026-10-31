@@ -66,6 +66,8 @@ def flush(db=None):
 _MODULE_KEEP = frozenset({
     ('controller', '_BYNAME'), ('wdb_exprjit', '_CACHE'), ('wdb_db', '_PW_SEGS'),
     ('wdb_db', '_ROAD_DECLINED'), ('wdb_join', '_JPTR_ASKED'), ('wdb_join', '_JPTR_NOT'),
+    ('wdb_join', '_JPTR_CODES'),             # are a child's codes its pointer? a yes/no per file pair, under their
+                                             # birthmark -- a fact about the two files, like _JPTR_NOT's refusals
     ('wdb_ledger', '_STAGES'), ('wdb_ledger', '_OPEN'), ('wdb_semijoin', '_INV_LOCKS'),
     ('wdb_sidecar', '_SETTING_CACHE'), ('wdb_sidecar', '_SENTINEL'), ('wdb_blockstats', '_LOADED'),
     ('wdb_heavypair', '_DISABLED'), ('wdb_qmem', '_REGISTRY'), ('wdb_qmem', '_MODULE_KEEP'),
