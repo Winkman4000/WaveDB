@@ -1,5 +1,5 @@
-"""The fused engine's conjunct order is MEASURED (2026-10-21): a text conjunct's keep share comes from the census
-through its code LUT (it was a flat 0.5), and a conjunct over two columns, or one the census cannot judge, from the
+"""The fused engine's conjunct order is MEASURED (2026-10-21): a text conjunct's keep share comes from the potency
+sample through its code LUT (the census until 2026-10-31; it was a flat 0.5), and a conjunct over two columns, or one the census cannot judge, from the
 rows the pred will see (wdb_join._potency9; the witness is wdb_join._POT9_LAST). Answers never depend on it."""
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
@@ -28,11 +28,24 @@ def _share(where):
     return con.execute("SELECT COUNT(*) FROM lineitem, orders WHERE l_orderkey = o_orderkey AND " + where).fetchone()[0] / n
 
 
-def test_text_conjunct_scored_from_census():
-    w = _wit(Q_TEXT)
-    sm = w["l_shipmode = 'AIR'"]
-    assert sm[3] == 'census', sm
-    assert abs(sm[1] - (1.0 - _share("l_shipmode = 'AIR'"))) < 1e-4, sm       # exact (the witness rounds to 4 places), not 0.5
+def test_text_conjunct_scored_from_the_keep_sample():
+    """THE SAMPLED KEEP SHARE (2026-10-31): with the sidecar switch off the code LUT's share comes from the potency
+    sample -- every row of this small fixture, so exact; with the switch on (the suite's default) and with the
+    sample switched off, from the census"""
+    for env, oks, how in (('0', True, 'sample-keep'), ('1', True, 'census'), ('0', False, 'census')):
+        old = (os.environ.get('WDB_SIDECARS'), wdb_join._KEEP_SAMPLE[0])
+        try:
+            os.environ['WDB_SIDECARS'] = env; wdb_join._KEEP_SAMPLE[0] = oks
+            import controller; controller.plan_epoch_bump()            # a fresh plan under this setting
+            _db9 = J._fixture()[0]                                      # not yet counted (an earlier test may have)
+            _db9.open_segment(_db9.cat.segment_paths('lineitem')[0], 'lineitem').__dict__.pop('_ccounts', None)
+            sm = _wit(Q_TEXT)["l_shipmode = 'AIR'"]
+            assert sm[3] == how, (env, oks, sm)
+            assert abs(sm[1] - (1.0 - _share("l_shipmode = 'AIR'"))) < 1e-4, sm    # exact (the witness rounds to 4 places), not 0.5
+        finally:
+            if old[0] is None: os.environ.pop('WDB_SIDECARS', None)
+            else: os.environ['WDB_SIDECARS'] = old[0]
+            wdb_join._KEEP_SAMPLE[0] = old[1]
 
 
 def test_unjudged_conjuncts_sampled_on_the_rows_the_pred_sees():

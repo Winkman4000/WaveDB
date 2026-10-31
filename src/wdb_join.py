@@ -16,6 +16,7 @@ import wdb_sql
 import wdb_kernels, wdb_dml, wdb_agg, wdb_fkptr, wdb_exprjit, wdb_radix
 import wdb_groupexists
 import wdb_measure_runtime as RT
+_KEEP_SAMPLE = [os.environ.get('WDB_KEEP_SAMPLE', '1') == '1']   # A/B: 0 restores the census-scored keep shares
 _FUSE_POT = [os.environ.get('WDB_FUSE_POTENCY', '1') == '1']   # A/B: 0 restores census-or-0.5 conjunct scores
 _POT9_MIN_ROWS = 1 << 20  # measured only when the 64K-row sample is <= 1/16 of the rows the pred reads
 _POT9_LAST = [[]]        # (conjunct, prune, cost, how) of the last ordered WHERE: the witness
@@ -4738,12 +4739,16 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                         if code9 is not None: kx9[code9] = True
                 else:
                     _cres9.append(cn); continue
-                try:
-                    cnt9 = np.asarray(cs9.code_counts(cp9))[:V9]
-                except Exception:
-                    cnt9 = np.bincount(np.asarray(cs9.codes(cp9)), minlength=V9)[:V9]
-                t9s = cnt9.sum()
-                prune9 = 1.0 - float(cnt9[kx9[:cnt9.size]].sum()) / t9s if t9s else 0.5
+                sh9 = _keep_share(cs9, cp9, kx9)       # THE SAMPLED KEEP SHARE: a ranking, not a census
+                if sh9 is not None:
+                    prune9 = 1.0 - sh9
+                else:
+                    try:
+                        cnt9 = np.asarray(cs9.code_counts(cp9))[:V9]
+                    except Exception:
+                        cnt9 = np.bincount(np.asarray(cs9.codes(cp9)), minlength=V9)[:V9]
+                    t9s = cnt9.sum()
+                    prune9 = 1.0 - float(cnt9[kx9[:cnt9.size]].sum()) / t9s if t9s else 0.5
                 cost9 = 1.0 if cc9p is None else 6.0
                 plan9.append((prune9 / cost9, prune9, kx9, cs9, cp9, cc9p))
             if _cb9 is not None:
@@ -4758,9 +4763,13 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     _o9 = _fused9[_kk9]
                     _kx9 = _o9[2] & _pt9[2]
                     try:
-                        _cn9f = np.asarray(_pt9[3].code_counts(_pt9[4]))[:_kx9.size - 1]
-                        _t9f = _cn9f.sum()
-                        _pr9 = 1.0 - float(_cn9f[_kx9[:_cn9f.size]].sum()) / _t9f if _t9f else 0.5
+                        _sh9f = _keep_share(_pt9[3], _pt9[4], _kx9)
+                        if _sh9f is not None:
+                            _pr9 = 1.0 - _sh9f
+                        else:
+                            _cn9f = np.asarray(_pt9[3].code_counts(_pt9[4]))[:_kx9.size - 1]
+                            _t9f = _cn9f.sum()
+                            _pr9 = 1.0 - float(_cn9f[_kx9[:_cn9f.size]].sum()) / _t9f if _t9f else 0.5
                     except Exception:
                         _pr9 = 1.0 - (1.0 - _o9[1]) * (1.0 - _pt9[1])
                     _cost9 = 1.0 if _pt9[5] is None else 6.0
@@ -6185,11 +6194,15 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                             lut9 = (_leaf_lut9(n, cs9, cp9)
                                     if (cs9.cols.get(cp9) or {}).get('mode') in (0, 1, 2) else None)
                             if lut9 is not None:
-                                cc9 = np.asarray(cs9.code_counts(cp9))
-                                cc9 = cc9[:lut9.size]
-                                t9 = cc9.sum()
-                                if t9:
-                                    prune = 1.0 - float(cc9[lut9[:cc9.size]].sum()) / t9; how9 = 'census'
+                                sh9p = _keep_share(cs9, cp9, lut9)
+                                if sh9p is not None:
+                                    prune = 1.0 - sh9p; how9 = 'sample-keep'
+                                else:
+                                    cc9 = np.asarray(cs9.code_counts(cp9))
+                                    cc9 = cc9[:lut9.size]
+                                    t9 = cc9.sum()
+                                    if t9:
+                                        prune = 1.0 - float(cc9[lut9[:cc9.size]].sum()) / t9; how9 = 'census'
                         if how9 == 'default' and cols9 and n.find(E.Select) is None:
                             try:
                                 fr9 = _pot_rows9()
@@ -6797,6 +6810,36 @@ def _key_values(seg, pc):
         try: wdb_shelf.SHELF.put(('keys', seg.path, pc), v, int(v.nbytes), kind='keys')
         except Exception: pass
     return v
+
+
+def _keep_share(seg, col, keep):
+    """THE SAMPLED KEEP SHARE (2026-10-31, TPC-H): the share of a dictionary column's rows whose code a keep table
+    passes, read from wherescan's potency sample (32 evenly spaced blocks of 2,048 rows; every row of a smaller
+    segment) instead of a census of every row. The cascade's order and the arbiter need a ranking, not an answer:
+    on TPC-H SF10 the sample ordered Q3 / Q6 / Q7 / Q12 / Q14's filters exactly as the census did, shares within
+    0.3 points, read in 0.1 ms -- the census cost 66-100 ms on each enc-14 date column (rebuilt in full to be
+    counted), every query. None (the caller counts) when switched off, the column is not dictionary-coded, a code
+    falls outside the keep table, or the census is free: already counted, or the sidecar switch on (the census is
+    then persisted once and read back -- THE VANILLA LAW's other side: with births on, the exact fact is kept)."""
+    if not _KEEP_SAMPLE[0] or (seg.cols.get(col) or {}).get('mode') not in (0, 1, 2):
+        return None
+    if col in (getattr(seg, '_ccounts', None) or {}):
+        return None
+    try:
+        import wdb_sidecar as _wsck
+        if _wsck.births_on(os.path.dirname(seg.path)):
+            return None
+    except Exception:
+        pass
+    import wdb_wherescan as _WSk
+    n = int(seg.N)
+    if n <= 0:
+        return None
+    rows = _WSk._pot_sample(seg, 0, n)
+    cc = np.asarray(seg.codes_at(col, rows)).astype(np.int64)
+    if cc.size == 0 or int(cc.min()) < 0 or int(cc.max()) >= keep.size:
+        return None
+    return float(np.count_nonzero(np.asarray(keep, bool)[cc])) / cc.size
 
 
 def _direct_pointer(ck, pk, allow_miss=False):
