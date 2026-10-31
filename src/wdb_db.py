@@ -35,6 +35,7 @@ def _parse_sql_cached(sql):
 
 
 _PROGRAM = []
+_QUERY_GC = [os.environ.get('WDB_QUERY_GC', '1') == '1']   # A/B: 0 leaves the query's cycles to Python's own collector
 
 def _load_program():
     """Once per process, before any query: the SQL parser and every read module (program, not
@@ -702,6 +703,16 @@ class Database:
                 if _bill9:
                     _f0 = _t9.perf_counter()
                 wdb_qmem.flush(self)
+                if _QUERY_GC[0]:
+                    # THE QUERY'S CYCLES DIE WITH IT (2026-10-31, Jackson's law): the fused join's inner functions call
+                    # each other, so their closures -- and the per-query containers they hold (slot_list, slots,
+                    # _colmemo: whole columns) -- form reference cycles that only Python's cyclic collector frees, and
+                    # it counts objects, not bytes. Left alone: 2.3 GB of Q5's arrays alive after it returned (TPC-H
+                    # SF10), a board worker at 27 GB. A gen-1 pass frees them all (a full pass frees no more, at
+                    # 31-40 ms); measured inside the timing: ClickBench 5.414 -> 5.400 s, TPC-H +3.7% (the freeing
+                    # itself, which hot runs had been skipping)
+                    import gc as _gc9
+                    _gc9.collect(1)
                 if _bill9:
                     print('RUN BILL: qmem-flush=%.0fms' % ((_t9.perf_counter() - _f0) * 1000), flush=True)
                 wdb_sidecar.sentinel_after(self.cat.dbdir)   # a newborn under an off switch is a missed gate
