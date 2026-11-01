@@ -122,6 +122,23 @@ def dense_multigroup_fits(K):
     return K <= MULTI_GROUP_CEIL
 
 
+# THE DENSE SPACE PAYS BY THE ROWS (2026-11-01, sweep_dense2 on the server): the dense path costs ~0.4 ns per row
+# plus ~21 ns per slot of the composite space (8 per-thread tables, zeroed and summed); the parallel factorise costs
+# ~10 ns per row whatever the space. Dense pays while the space is under ~0.46 x the rows: K=1.58M at 1M rows dense
+# 33.7 ms vs factorise 9.9; at 3M rows 33.4 vs 29.0 (750k groups present: 45 vs 57); at 10M rows dense always.
+# Under the floor the dense tables cost < 1.4 ms and stay. WDB_DENSE_ROWS=0: the space alone decides (as before).
+DENSE_SPACE_PER_ROW = 0.5
+DENSE_SPACE_FLOOR = 1 << 16
+_DENSE_ROWS = [__import__('os').environ.get('WDB_DENSE_ROWS', '1') == '1']
+
+
+def dense_multigroup_pays(K, n):
+    """True iff the dense composite space K is worth its per-thread tables for n rows (see the measurement above)."""
+    if not _DENSE_ROWS[0] or K < DENSE_SPACE_FLOOR:
+        return True
+    return K <= DENSE_SPACE_PER_ROW * max(int(n), 1)
+
+
 GROUP_CD_CELL_CEIL = 1 << 22  # max (groups x value-cardinality) cells for the one-pass grouped
                               # COUNT(DISTINCT) keep-table; above this the dense 2-D table is too big
                               # and we fall back to the sort-based path.

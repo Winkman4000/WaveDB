@@ -35,6 +35,7 @@ _LEFT_FIRST_HITS = [0]
 # off. _FUSE_ROADS_HITS: diagnostic (tests read it).
 _FUSE_ROADS = [os.environ.get('WDB_FUSE_ROADS', '1') == '1']
 _FUSE_ROADS_HITS = [0]
+_DENSE_ROWS_HITS = [0]   # diagnostic: multi-key groups factorised because the dense space outgrew the rows
 
 
 class _LazyRoad:
@@ -5749,7 +5750,10 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     else:                                                 # multi-key: mixed-radix composite
         K = 1
         for k in gkeys: K *= k['K']
-        if RT.dense_multigroup_fits(K):                    # dense: codegen composes the code INLINE (no array)
+        _pays9 = RT.dense_multigroup_pays(K, n)            # THE DENSE SPACE PAYS BY THE ROWS
+        if RT.dense_multigroup_fits(K) and not _pays9:
+            _DENSE_ROWS_HITS[0] += 1
+        if RT.dense_multigroup_fits(K) and _pays9:         # dense: codegen composes the code INLINE (no array)
             group_op = None
             group_keys = [(k['full'], k['K'], k['cptr']) for k in gkeys]
         else:                                              # high-card: hash-factorise the composite to dense ids
