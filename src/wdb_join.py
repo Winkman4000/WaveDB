@@ -22,6 +22,13 @@ import wdb_measure_runtime as RT
 # survivors. WDB_LAZY_ROAD=0 composes at fact scale as before.
 _LAZY_ROAD = [os.environ.get('WDB_LAZY_ROAD', '1') == '1']
 
+# THE LEFTOVER IN FIRST (2026-11-01): after the plane handoff, a leftover 'fact text column IN (literals)' was judged
+# inside the per-row pred with everything else (TPC-H Q12: three dates rebuilt at the 9.1M year survivors when the
+# mode keeps 2.6M of them). Its keep table over the dictionary compresses the survivors first; the conjunct stays in
+# the pred (an exact re-check). WDB_LEFT_FIRST=0: off. _LEFT_FIRST_HITS: diagnostic (tests read it).
+_LEFT_FIRST = [os.environ.get('WDB_LEFT_FIRST', '1') == '1']
+_LEFT_FIRST_HITS = [0]
+
 
 class _LazyRoad:
     """A fact->ancestor road kept as its last hop read through the inner road (an array or another _LazyRoad).
@@ -5202,6 +5209,33 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     rows9 = _sv9
                     n = int(rows9.size)
                     _plane_mask9 = None
+                    if _LEFT_FIRST[0]:
+                        for _lc9 in list(_resid_c9):
+                            if not (isinstance(_lc9, E.In) and isinstance(_lc9.this, E.Column)) or _lc9.args.get('query') is not None:
+                                continue
+                            try:
+                                _ls9, _lp9, _lcp9 = resolve(_lc9.this)
+                            except Exception:
+                                continue
+                            _cl9 = _ls9.cols.get(_lp9) or {}
+                            if _lcp9 is not None or _cl9.get('dt') != 1 or _cl9.get('mode') == 4:
+                                continue                     # fact-direct dictionary text only
+                            if hasattr(_ls9, 'e8_planes') and _ls9.e8_planes(_lp9) is not None:
+                                continue                     # sparse-dressed: its own serve
+                            _ex9 = _lc9.args.get('expressions') or []
+                            if not _ex9 or not all(isinstance(e, E.Literal) and e.is_string for e in _ex9):
+                                continue
+                            _V9 = int(_cl9['V'])
+                            _kx9 = np.zeros(_V9 + 1, dtype=bool)
+                            for e in _ex9:
+                                _t9 = _code_of_literal(_ls9, _lp9, _lit_bytes(_ls9, _lp9, e))
+                                if 0 <= _t9 < _V9: _kx9[_t9] = True
+                            if _cl9.get('has_null'): _kx9[_V9 - 1] = False      # NULL IN (...) is never true
+                            rows9 = wdb_kernels.keep_rows_by_code(rows9, np.asarray(_ls9.codes_at(_lp9, rows9)), _kx9)
+                            n = int(rows9.size)
+                            _LEFT_FIRST_HITS[0] += 1
+                            if _bill9 is not None:
+                                print('JOIN BILL: LEFT-FIRST %s keeps %d' % (_lp9, n), flush=True)
             if _bill9 is not None:
                 print('JOIN BILL: PARTITION pre-pass=%.1fms' % ((_tk9() - _pp_t9) * 1000), flush=True)
             _resid_c9X = _resid_c9
