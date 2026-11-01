@@ -6218,7 +6218,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             conj9 = _flat9(where.this)
             if _resid_c9X is not None:
                 conj9 = _resid_c9X
-            if _plane_mask9 is not None and not conj9:
+            if not conj9 and (_plane_mask9 is not None or _resid_c9X is not None):
+                # every conjunct was a plane interval: the mask (or the survivor rows it
+                # handed off) IS the WHERE -- no per-row pred is left to build
                 pred_body = None
             elif len(conj9) > 1:
                 _POT9_LAST[0] = []; _POT9_ROWS[0] = None
