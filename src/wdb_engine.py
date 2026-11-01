@@ -3659,7 +3659,7 @@ class Segment:
             # huge row sets: ONE full decode + one vectorized gather beats touching every
             # frame through a positional walk (sq-nested passed ~90M positions here)
             return np.asarray(self._raw_codes(nm))[rows] if c.get('code_enc', 0) != 2 else \
-                np.searchsorted(self.stairs(nm), rows, side='right').astype(np.int64)
+                __import__('wdb_kernels').stairs_at(self.stairs(nm), rows)     # sorted rows: the walk
         if _SORTGATHER[0] and rows.size >= 2 and bool((rows[1:] >= rows[:-1]).all()):
             return self._e3_at_sorted(c, rows)
         if _SORTGATHER[0] and _E3_BATCH_FRAMES and rows.size >= _E3_BATCH_FRAMES:

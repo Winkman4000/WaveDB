@@ -6670,6 +6670,46 @@ def keep_rows_by_code(rows, codes, keep):
 
 
 @njit(cache=True, parallel=True, nogil=True)
+def _stairs_walk_nb(st, rows, out):
+    """out[i] = how many step rows are <= rows[i] (rows ascending): each chunk finds its first row's count by binary
+    search, then walks the steps forward -- sorted rows ride the stairs, every step read once per chunk."""
+    n = rows.shape[0]
+    S = st.shape[0]
+    C = 1 << 14
+    nch = (n + C - 1) // C
+    for k in prange(nch):
+        a = k * C
+        b = min(n, a + C)
+        j = np.searchsorted(st, rows[a], side='right')
+        for i in range(a, b):
+            r = rows[i]
+            while j < S and st[j] <= r:
+                j += 1
+            out[i] = j
+
+
+# THE STAIRS WALKED (2026-11-01): code_enc 2 codes at rows were np.searchsorted (one binary search per row, one
+# thread: TPC-H Q3's l_orderkey at the survivors 22.6 ms). Measured (15M steps, 60M rows): 300k rows 28.0 -> 2.6 ms,
+# 1M 28.7 -> 2.7, 3M 71.4 -> 3.7, 10M 205 -> 8.3; 30k rows equal (5.8) -- hence the line. WDB_STAIR_WALK=0: off.
+_STAIR_WALK = [__import__('os').environ.get('WDB_STAIR_WALK', '1') == '1']
+_STAIR_WALK_MIN = 1 << 16
+
+
+def stairs_at(st, rows):
+    """Staircase codes at rows: how many step rows are <= each row (searchsorted side='right'), int64. Rows
+    ascending and at least _STAIR_WALK_MIN of them: the parallel walk; otherwise numpy."""
+    rows = np.asarray(rows)
+    if (HAVE_NUMBA and _STAIR_WALK[0] and rows.ndim == 1 and rows.shape[0] >= _STAIR_WALK_MIN
+            and rows.dtype.kind in 'iu'):
+        r = np.ascontiguousarray(rows, dtype=np.int64)
+        if bool((r[1:] >= r[:-1]).all()):
+            out = np.empty(r.shape[0], dtype=np.int64)
+            _stairs_walk_nb(np.ascontiguousarray(st, dtype=np.int64), r, out)
+            return out
+    return np.searchsorted(st, rows, side='right').astype(np.int64)
+
+
+@njit(cache=True, parallel=True, nogil=True)
 def pgather_ptr(p, cc, out):
     """out[i] = p[cc[i]] -- composing a grandparent road through a parent road
     at fact scale, in parallel (serial numpy fancy-index cost ~100ms per 60M)."""
