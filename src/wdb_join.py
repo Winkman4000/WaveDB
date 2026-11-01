@@ -29,6 +29,13 @@ _LAZY_ROAD = [os.environ.get('WDB_LAZY_ROAD', '1') == '1']
 _LEFT_FIRST = [os.environ.get('WDB_LEFT_FIRST', '1') == '1']
 _LEFT_FIRST_HITS = [0]
 
+# THE ROADS IN ONE PASS (2026-11-01): the cascade built the fact keep's row list (mask_rows: 18 ms at 60M), then per
+# fact-adjacent parent a bool at those rows (pkeep_via_ptr) and a row list again. Now one two-pass compress judges
+# the fact keep and up to two parent keeps through their roads (TPC-H Q7 146 -> 130 ms, Q3 97 -> 82). WDB_FUSE_ROADS=0:
+# off. _FUSE_ROADS_HITS: diagnostic (tests read it).
+_FUSE_ROADS = [os.environ.get('WDB_FUSE_ROADS', '1') == '1']
+_FUSE_ROADS_HITS = [0]
+
 
 class _LazyRoad:
     """A fact->ancestor road kept as its last hop read through the inner road (an array or another _LazyRoad).
@@ -5005,11 +5012,28 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     homes9[ca9] = []                      # transit alias now carries a keep
             fm9 = keeps9.get(fact9)
             import wdb_engine as _WEc
-            rows9 = _WEc.Segment.mask_rows(fm9) if fm9 is not None else None
-            for a9, (ca9, p9) in eps9.items():
-                pass
+            _fused9 = set()
+            _rd9 = []
+            if fm9 is not None and _FUSE_ROADS[0]:
+                for pa9, (ca9, p9) in eps9.items():
+                    if (ca9 == fact9 and pa9 in keeps9 and keeps9[pa9] is not None
+                            and depth9.get(pa9) == 1 and len(_rd9) < 2):
+                        _pt9 = np.asarray(p9)
+                        if _pt9.shape[0] == fm9.shape[0]:
+                            _rd9.append((pa9, _pt9, np.ascontiguousarray(keeps9[pa9], dtype=np.bool_)))
+            if _rd9:
+                # THE ROADS IN ONE PASS: the fact keep and its parents' keeps, one compress
+                rows9 = wdb_kernels.fuse_roads_rows(np.ascontiguousarray(fm9, dtype=np.bool_),
+                                                    [(x[1], x[2]) for x in _rd9])
+                _fused9 = {x[0] for x in _rd9}
+                _FUSE_ROADS_HITS[0] += 1
+                if _bill9 is not None:
+                    print('JOIN BILL: FUSED ROADS %s keeps %d' % ([x[0] for x in _rd9], rows9.size), flush=True)
+            else:
+                rows9 = _WEc.Segment.mask_rows(fm9) if fm9 is not None else None
             # any keep left on a fact-adjacent alias applies through its road
             for pa9, (ca9, p9) in eps9.items():
+                if pa9 in _fused9: continue                  # judged in the one pass above
                 if ca9 == fact9 and pa9 in keeps9 and keeps9[pa9] is not None                         and depth9.get(pa9) == 1:
                     k9 = keeps9[pa9]
                     pt9 = np.asarray(p9)

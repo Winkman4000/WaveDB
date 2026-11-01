@@ -6710,6 +6710,54 @@ def stairs_at(st, rows):
 
 
 @njit(cache=True, parallel=True, nogil=True)
+def _fuse_roads_count(mask, p1, k1, p2, k2, use2, chunk, counts):
+    n = mask.shape[0]
+    nc = counts.shape[0]
+    for c in prange(nc):
+        lo = c * chunk
+        hi = min(n, lo + chunk)
+        t = 0
+        for i in range(lo, hi):
+            if mask[i] and k1[np.int64(p1[i])] and ((not use2) or k2[np.int64(p2[i])]):
+                t += 1
+        counts[c] = t
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def _fuse_roads_fill(mask, p1, k1, p2, k2, use2, chunk, offs, out):
+    n = mask.shape[0]
+    nc = offs.shape[0] - 1
+    for c in prange(nc):
+        lo = c * chunk
+        hi = min(n, lo + chunk)
+        o = offs[c]
+        for i in range(lo, hi):
+            if mask[i] and k1[np.int64(p1[i])] and ((not use2) or k2[np.int64(p2[i])]):
+                out[o] = i
+                o += 1
+
+
+def fuse_roads_rows(mask, roads):
+    """THE ROADS IN ONE PASS (2026-11-01): the rows i (ascending, int64) where mask[i] and keep[ptr[i]] for each
+    (ptr, keep) in roads (one or two fact-scale roads). Two parallel passes over chunks of 2^20: count, then write
+    -- the fact keep's row list, a bool per survivor per parent and a second row list are never built. A pointer
+    reads its keep as numpy indexing would (a negative entry from the table's end)."""
+    p1, k1 = roads[0]
+    p2, k2 = roads[1] if len(roads) > 1 else roads[0]
+    use2 = len(roads) > 1
+    n = mask.shape[0]
+    chunk = 1 << 20
+    nc = (n + chunk - 1) // chunk
+    counts = np.empty(nc, np.int64)
+    _fuse_roads_count(mask, p1, k1, p2, k2, use2, chunk, counts)
+    offs = np.zeros(nc + 1, np.int64)
+    np.cumsum(counts, out=offs[1:])
+    out = np.empty(int(offs[-1]), np.int64)
+    _fuse_roads_fill(mask, p1, k1, p2, k2, use2, chunk, offs, out)
+    return out
+
+
+@njit(cache=True, parallel=True, nogil=True)
 def pgather_ptr(p, cc, out):
     """out[i] = p[cc[i]] -- composing a grandparent road through a parent road
     at fact scale, in parallel (serial numpy fancy-index cost ~100ms per 60M)."""
