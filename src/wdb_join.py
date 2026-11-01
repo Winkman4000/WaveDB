@@ -16,6 +16,76 @@ import wdb_sql
 import wdb_kernels, wdb_dml, wdb_agg, wdb_fkptr, wdb_exprjit, wdb_radix
 import wdb_groupexists
 import wdb_measure_runtime as RT
+
+# THE ROAD AT THE SURVIVORS (2026-11-01): a fact->ancestor pointer two or more hops up was composed for every fact
+# row at plan time (one 60M gather per extra hop: TPC-H Q7 paid three, 66 ms) though its readers ask at the
+# survivors. WDB_LAZY_ROAD=0 composes at fact scale as before.
+_LAZY_ROAD = [os.environ.get('WDB_LAZY_ROAD', '1') == '1']
+
+
+class _LazyRoad:
+    """A fact->ancestor road kept as its last hop read through the inner road (an array or another _LazyRoad).
+    at(rows): the ancestor row of each asked fact row -- the first hop at those rows, then each next hop at the
+    answers (parallel gathers, survivor scale). Anything that asks for the whole array (np.asarray, slicing, an
+    attribute) gets the full compose once, kept for the rest of the query: exactly the old cost, never more."""
+    FULLS = [0]                                   # diagnostic: whole-road composes (tests read it)
+
+    def __init__(self, p, inner):
+        self.p = np.asarray(p)
+        self.inner = inner
+        self._full = None
+        self.shape = (int(inner.shape[0]),)
+        self.dtype = self.p.dtype
+        self.ndim = 1
+
+    @property
+    def size(self):
+        return self.shape[0]
+
+    def __len__(self):
+        return self.shape[0]
+
+    def at(self, rows):
+        rows = np.ascontiguousarray(rows)
+        if self._full is not None:
+            return self._full[rows]
+        if isinstance(self.inner, _LazyRoad):
+            idx = self.inner.at(rows)
+        else:
+            src = np.asarray(self.inner)
+            idx = np.empty(rows.shape[0], dtype=src.dtype)
+            wdb_kernels.pgather_ptr(src, rows, idx)
+        out = np.empty(rows.shape[0], dtype=self.p.dtype)
+        wdb_kernels.pgather_ptr(self.p, idx, out)
+        return out
+
+    def full(self):
+        if self._full is None:
+            cc = np.asarray(self.inner)
+            o = np.empty(cc.shape[0], dtype=self.p.dtype)
+            wdb_kernels.pgather_ptr(self.p, cc, o)              # parallel compose, as _build_chain did
+            self._full = o
+            _LazyRoad.FULLS[0] += 1
+        return self._full
+
+    def __array__(self, dtype=None, copy=None):
+        a = self.full()
+        return a if dtype is None else a.astype(dtype, copy=False)
+
+    def __getitem__(self, k):
+        if isinstance(k, np.ndarray) and k.ndim == 1 and k.dtype.kind in 'iu':
+            return self.at(k)
+        return self.full()[k]
+
+    def __getattr__(self, name):                  # any other array question: the whole road answers it
+        if name.startswith('__') or name in ('p', 'inner', '_full'):
+            raise AttributeError(name)
+        return getattr(self.full(), name)
+
+
+def _at_rows(a, rows):
+    """a[rows] for a road or an array; a lazy road is looked up at the rows only."""
+    return a.at(rows) if isinstance(a, _LazyRoad) else np.asarray(a)[rows]
 _KEEP_SAMPLE = [os.environ.get('WDB_KEEP_SAMPLE', '1') == '1']   # A/B: 0 restores the census-scored keep shares
 _FUSE_POT = [os.environ.get('WDB_FUSE_POTENCY', '1') == '1']   # A/B: 0 restores census-or-0.5 conjunct scores
 _POT9_MIN_ROWS = 1 << 20  # measured only when the 64K-row sample is <= 1/16 of the rows the pred reads
@@ -4953,7 +5023,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     rows9 = wdb_kernels.keep_rows_by_code(rows9, np.asarray(cs9.codes_at(cp9, rows9)), kx9)
                 else:
                     pc9r = np.asarray(cs9.codes(cp9))
-                    rows9 = wdb_kernels.keep_rows_by_code(rows9, pc9r[np.asarray(cc9p)[rows9]], kx9)
+                    rows9 = wdb_kernels.keep_rows_by_code(rows9, pc9r[_at_rows(cc9p, rows9)], kx9)
             _where_spent = not _cres9        # leftovers: the pred re-applies the full
                                              # WHERE at survivor scale (cheap, exact)
             _cres_left9 = list(_cres9)
@@ -5140,7 +5210,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 import traceback as _tb9; _tb9.print_exc()
             _plane_mask9 = None; _resid_c9X = None; rows9 = None
     def _rw9(a):
-        return a if (rows9 is None or a is None) else np.asarray(a)[rows9]
+        return a if (rows9 is None or a is None) else _at_rows(a, rows9)
     # ---- THE KEY-DEPENDENT TOP-K DOOR (Q10's shape, 2026-09-01) --------------
     # GROUP BY a parent's unique key plus that parent's attributes (and its
     # own parents' attributes), ORDER BY one aggregate, LIMIT k: group by the
@@ -5300,7 +5370,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             return None
         rows = _door_rows()
         if rows is None: return None
-        key = np.asarray(keyptr9)[rows]
+        key = _at_rows(keyptr9, rows)
         NK = int(kseg9.N)
         cnt = np.bincount(key, minlength=NK)
         vals9 = {}
@@ -6116,7 +6186,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             def _rows_of9(cptr9, fr9):
                 # the column's own rows under the sampled fact rows, and which fact rows have one
                 if cptr9 is None: return fr9, None
-                dr9 = np.asarray(cptr9)[fr9]
+                dr9 = _at_rows(cptr9, fr9)
                 ok9 = dr9 >= 0
                 return (dr9, None) if ok9.all() else (np.where(ok9, dr9, 0), ok9)
             def _vals_at9(col9, fr9):
@@ -7237,6 +7307,8 @@ def _build_chain(db, tree, allow_hash=True):
                 edge_ptrs[parent_a] = (child_a, p)       # child-scale road, kept for the downhill flow
                 if cc is None:
                     composed[parent_a] = p
+                elif _LAZY_ROAD[0]:
+                    composed[parent_a] = _LazyRoad(p, cc)      # composed where asked (the survivors)
                 else:
                     _pc9 = np.asarray(p); _cc9 = np.asarray(cc)
                     _o9 = np.empty(_cc9.shape[0], dtype=_pc9.dtype)
