@@ -38,6 +38,7 @@ _POOL = None
 
 
 _ZLANES = [__import__('os').environ.get('WDB_ZLANES', '1') == '1']
+_E14KEEP = [__import__('os').environ.get('WDB_E14_KEEP', '1') == '1']   # A/B: 0 rebuilds the date planes every query
 _RPF = [__import__('os').environ.get('WDB_RPF', '1') != '0']      # the repeats-per-frame fold
 _RPF_MAX = [float(__import__('os').environ.get('WDB_RPF_MAX', '1.0'))]   # its switch: repeats per frame below this
 _RPF_HITS = 0
@@ -2209,6 +2210,28 @@ class Segment:
         return out
 
     def _e14_planes(self, nm):
+        """THE DATE PLANES STAY (2026-10-31, TPC-H): an enc-14 column's three planes ARE its codes, laid out by field
+        -- the file's own values decompressed, which Jackson's ruling (2026-10-03) keeps for the hot runs as tier-1
+        'codes' and never lets touch a cold run (WDB_HOT_KEEP=0 clears tier 1). Every TPC-H query rebuilt each date
+        it touched: 33 ms per lineitem date (60M rows x 3 planes), the sampled keep share included. Kept on the
+        shelf read-only (one copy serves every query); WDB_E14_KEEP=0 rebuilds them per query as before."""
+        if not _E14KEEP[0]:
+            return self._e14_planes_build(nm)
+        import wdb_shelf
+        key = ('e14planes', getattr(self, 'path', None) or id(self), nm)
+        hit = wdb_shelf.SHELF.get(key)
+        if hit is not None and all(int(a.shape[0]) == int(self.N) for a in hit):
+            return list(hit)
+        outs = self._e14_planes_build(nm)
+        for a in outs:
+            a.flags.writeable = False
+        try:
+            wdb_shelf.SHELF.put(key, tuple(outs), int(sum(a.nbytes for a in outs)), kind='codes')
+        except Exception:
+            pass
+        return outs
+
+    def _e14_planes_build(self, nm):
         """Decompress the three field planes, ALL FRAMES IN PARALLEL (zstd
         releases the GIL). Returns (Y, M, D) u8 arrays of length N."""
         c = self.cols[nm]
