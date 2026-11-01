@@ -6603,6 +6603,73 @@ def pkeep_via_ptr(rows, ptr, keep, out):
 
 
 @njit(cache=True, parallel=True, nogil=True)
+def _keep_rows_nb(rows, codes, keep, P):
+    """rows[i] for every i whose codes[i] the keep table passes, in order -- pass 1 counts each lane's keeps (and
+    flags a code outside the table), a running total places each lane, pass 2 writes. A negative code reads from
+    the table's end, as numpy indexing does. Returns (rows kept, flag)."""
+    n = rows.shape[0]
+    K = keep.shape[0]
+    cnt = np.zeros(P, np.int64)
+    bad = np.zeros(P, np.int64)
+    for t in prange(P):
+        a = n * t // P
+        b = n * (t + 1) // P
+        m = 0
+        for i in range(a, b):
+            c = np.int64(codes[i])
+            if c < 0:
+                c += K
+            if c < 0 or c >= K:
+                bad[t] = 1
+                break
+            if keep[c]:
+                m += 1
+        cnt[t] = m
+    flag = 0
+    for t in range(P):
+        flag += bad[t]
+    if flag:
+        return rows[:0], 1
+    offs = np.zeros(P + 1, np.int64)
+    for t in range(P):
+        offs[t + 1] = offs[t] + cnt[t]
+    out = np.empty(offs[P], rows.dtype)
+    for t in prange(P):
+        a = n * t // P
+        b = n * (t + 1) // P
+        o = offs[t]
+        for i in range(a, b):
+            c = np.int64(codes[i])
+            if c < 0:
+                c += K
+            if keep[c]:
+                out[o] = rows[i]
+                o += 1
+    return out, 0
+
+
+_KEEP_ROWS = [__import__('os').environ.get('WDB_KEEP_ROWS', '1') == '1']   # A/B: 0 keeps numpy's rows[keep[codes]]
+_KEEP_ROWS_MIN = 1 << 16
+
+
+def keep_rows_by_code(rows, codes, keep):
+    """THE KEEP BY CODE (2026-10-31, TPC-H Q6): rows[keep[codes]] -- a join cascade's leftover filter at survivor
+    scale -- as one parallel two-pass compress instead of numpy's two single-thread passes (a gather into the
+    keep table, then a boolean compress). Prototype, server: 9M rows 32.6 -> 3.8 ms, 17M 62.4 -> 8.4, the same rows.
+    Exactly numpy's answer: below 65,536 rows, switched off, or a code outside the table (numpy then raises as it
+    did), numpy answers itself."""
+    rows = np.asarray(rows); codes = np.asarray(codes); keep = np.asarray(keep)
+    if (not HAVE_NUMBA or not _KEEP_ROWS[0] or rows.shape[0] < _KEEP_ROWS_MIN or rows.ndim != 1
+            or codes.shape != rows.shape or keep.dtype != np.bool_ or codes.dtype.kind not in 'iu'):
+        return rows[keep[codes]]
+    out, bad = run_wide(_keep_rows_nb, np.ascontiguousarray(rows), np.ascontiguousarray(codes),
+                        np.ascontiguousarray(keep), pass_t=True)
+    if bad:
+        return rows[keep[codes]]
+    return out
+
+
+@njit(cache=True, parallel=True, nogil=True)
 def pgather_ptr(p, cc, out):
     """out[i] = p[cc[i]] -- composing a grandparent road through a parent road
     at fact scale, in parallel (serial numpy fancy-index cost ~100ms per 60M)."""

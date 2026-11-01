@@ -527,7 +527,7 @@ def _descent_exec(db, tree, meta, s9, k, fseg):
                         dh14 = int(td14c[hi14c]) if hi14c < V14c else int(td14c[V14c - 1]) + 1
                         r = r[fseg.plane_test(nm, dl14, dh14)[r]]
                         continue
-            r = r[kx[np.asarray(fseg.codes_at(nm, r))]]
+            r = wdb_kernels.keep_rows_by_code(r, np.asarray(fseg.codes_at(nm, r)), kx)   # THE KEEP BY CODE
         if _bl is not None: _bl.append(('fact-confirm', _tt.perf_counter() - _t0)); _t0 = _tt.perf_counter()
         # flow parent verdicts DOWN the roads (parent scale), then one fact gather each
         depth = {fact_a: 0}; ch = True
@@ -4949,11 +4949,11 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 _cb9.append(('roads+fnz', _tk9() - _ct9)); _ct9 = _tk9()
             for kx9, cs9, cp9, cc9p in _resid9:      # leftovers at survivor scale
                 if rows9.size == 0: break
-                if cc9p is None:
-                    rows9 = rows9[kx9[np.asarray(cs9.codes_at(cp9, rows9))]]
+                if cc9p is None:                   # THE KEEP BY CODE: one parallel compress
+                    rows9 = wdb_kernels.keep_rows_by_code(rows9, np.asarray(cs9.codes_at(cp9, rows9)), kx9)
                 else:
                     pc9r = np.asarray(cs9.codes(cp9))
-                    rows9 = rows9[kx9[pc9r[np.asarray(cc9p)[rows9]]]]
+                    rows9 = wdb_kernels.keep_rows_by_code(rows9, pc9r[np.asarray(cc9p)[rows9]], kx9)
             _where_spent = not _cres9        # leftovers: the pred re-applies the full
                                              # WHERE at survivor scale (cheap, exact)
             _cres_left9 = list(_cres9)
