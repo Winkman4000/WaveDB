@@ -98,9 +98,27 @@ class _LazyRoad:
         return getattr(self.full(), name)
 
 
+# ONE GATHER PER ARRAY (2026-11-01): the survivor gather of a road or column ran numpy's a[rows] (one thread) once
+# per mention -- TPC-H Q12's CASE names o_orderpriority four times: four 11 ms gathers of the same road at 2.6M rows.
+# Now each (array, survivor rows) is gathered once per query (_fast_pointer_agg's own memo, dying with it) and in
+# parallel from _RW_PAR_MIN rows (Q12 ~119 -> ~82 ms). WDB_RW_MEMO=0: off. _RW_MEMO_HITS: diagnostic (tests read it).
+_RW_MEMO = [os.environ.get('WDB_RW_MEMO', '1') == '1']
+_RW_PAR_MIN = 1 << 16
+_RW_MEMO_HITS = [0]
+
+
 def _at_rows(a, rows):
-    """a[rows] for a road or an array; a lazy road is looked up at the rows only."""
-    return a.at(rows) if isinstance(a, _LazyRoad) else np.asarray(a)[rows]
+    """a[rows] for a road or an array; a lazy road is looked up at the rows only, a long gather runs in parallel."""
+    if isinstance(a, _LazyRoad):
+        return a.at(rows)
+    a = np.asarray(a)
+    if (_RW_MEMO[0] and a.ndim == 1 and a.dtype.kind in 'iufb' and getattr(rows, 'ndim', 0) == 1
+            and rows.shape[0] >= _RW_PAR_MIN and rows.dtype.kind in 'iu'):
+        r = np.ascontiguousarray(rows)
+        out = np.empty(r.shape[0], dtype=a.dtype)
+        wdb_kernels.pgather_ptr(a, r, out)
+        return out
+    return a[rows]
 _KEEP_SAMPLE = [os.environ.get('WDB_KEEP_SAMPLE', '1') == '1']   # A/B: 0 restores the census-scored keep shares
 _FUSE_POT = [os.environ.get('WDB_FUSE_POTENCY', '1') == '1']   # A/B: 0 restores census-or-0.5 conjunct scores
 _POT9_MIN_ROWS = 1 << 20  # measured only when the 64K-row sample is <= 1/16 of the rows the pred reads
@@ -5268,8 +5286,20 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             if os.environ.get('WDB_HOIST_DEBUG'):
                 import traceback as _tb9; _tb9.print_exc()
             _plane_mask9 = None; _resid_c9X = None; rows9 = None
+    _rwm9 = {}                                       # ONE GATHER PER ARRAY: this query's only
     def _rw9(a):
-        return a if (rows9 is None or a is None) else _at_rows(a, rows9)
+        if rows9 is None or a is None:
+            return a
+        if not _RW_MEMO[0]:
+            return _at_rows(a, rows9)
+        k9m = (id(a), id(rows9))
+        h9m = _rwm9.get(k9m)
+        if h9m is not None and h9m[0] is a and h9m[1] is rows9:   # the same array at the same survivors
+            _RW_MEMO_HITS[0] += 1
+            return h9m[2]
+        r9m = _at_rows(a, rows9)
+        _rwm9[k9m] = (a, rows9, r9m)                 # holds a and rows9: their ids cannot be reused meanwhile
+        return r9m
     # ---- THE KEY-DEPENDENT TOP-K DOOR (Q10's shape, 2026-09-01) --------------
     # GROUP BY a parent's unique key plus that parent's attributes (and its
     # own parents' attributes), ORDER BY one aggregate, LIMIT k: group by the
