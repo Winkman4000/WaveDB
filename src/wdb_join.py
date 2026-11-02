@@ -133,6 +133,7 @@ _PARENT_WAIT_HITS = [0]
 # anything else declines as before. WDB_CORR_SCALAR=0: off. _CORR_SCALAR_HITS: diagnostic (tests read it).
 _CORR_SCALAR = [os.environ.get('WDB_CORR_SCALAR', '1') == '1']
 _CORR_SCALAR_HITS = [0]
+_RUN_SUM_HITS = [0]      # diagnostic: HAVING censuses summed run by run (THE RUNS SUM THEMSELVES, wdb_kernels)
 _CORR_AGG = (E.Avg, E.Sum, E.Count, E.Min, E.Max)
 _CORR_OPS = (E.LT, E.LTE, E.GT, E.GTE, E.EQ)
 
@@ -1893,11 +1894,21 @@ def _grouped_in_rewrite(db, tree):
             qsum = cache.get(ck9)
             if qsum is None:
                 if wcol is None:
-                    qsum = np.bincount(road, minlength=pseg.N).astype(np.float64)
+                    qsum = wdb_kernels.road_run_sums(road, None, None, int(pseg.N))   # THE RUNS SUM THEMSELVES
+                    if qsum is None:
+                        qsum = np.bincount(road, minlength=pseg.N).astype(np.float64)
+                    else:
+                        _RUN_SUM_HITS[0] += 1
                 else:
                     rw = wdb_sql.raw_dict_col(cseg, db.cat.phys_map(childT).get(wcol, wcol))
                     if rw is None: continue
-                    qsum = np.bincount(road, weights=rw[0][np.asarray(rw[1])], minlength=pseg.N)
+                    qsum = None
+                    if np.asarray(rw[0]).dtype.kind in 'iuf':
+                        qsum = wdb_kernels.road_run_sums(road, np.asarray(rw[1]), np.asarray(rw[0]), int(pseg.N))
+                    if qsum is None:
+                        qsum = np.bincount(road, weights=rw[0][np.asarray(rw[1])], minlength=pseg.N)
+                    else:
+                        _RUN_SUM_HITS[0] += 1
                 cache[ck9] = qsum
             op9 = {E.GT: np.greater, E.GTE: np.greater_equal,
                    E.LT: np.less, E.LTE: np.less_equal}[type(hv)]

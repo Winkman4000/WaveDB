@@ -6758,6 +6758,87 @@ def fuse_roads_rows(mask, roads):
 
 
 @njit(cache=True, parallel=True, nogil=True)
+def _road_rises_nb(road, nch):
+    """True when road never decreases (each chunk checks its own rows and the step into it)."""
+    n = road.shape[0]
+    bad = np.zeros(nch, np.int64)
+    for k in prange(nch):
+        a = k * n // nch
+        b = (k + 1) * n // nch
+        for i in range(max(a, 1), b):
+            if road[i] < road[i - 1]:
+                bad[k] = 1
+                break
+    return bad.sum() == 0
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def _road_run_sums_nb(road, codes, vals, weighted, nch, out, bad):
+    """out[p] = the sum of vals[codes[i]] (or the count) over the run of rows whose road is p. Chunk edges move
+    forward to the next run start, so every run is summed whole by one thread, in row order -- the same additions,
+    in the same order, as np.bincount(road, weights). A code outside vals flags its chunk (the caller falls back)."""
+    n = road.shape[0]
+    V = vals.shape[0]
+    for k in prange(nch):
+        a = k * n // nch
+        b = (k + 1) * n // nch
+        if k > 0:
+            while a < n and road[a] == road[a - 1]:
+                a += 1
+        if k < nch - 1:
+            while b < n and road[b] == road[b - 1]:
+                b += 1
+        else:
+            b = n
+        i = a
+        while i < b:
+            p = road[i]
+            s = 0.0
+            while i < b and road[i] == p:
+                if weighted:
+                    c = np.int64(codes[i])
+                    if c < 0 or c >= V:
+                        bad[k] = 1
+                    else:
+                        s += vals[c]
+                else:
+                    s += 1.0
+                i += 1
+            out[p] = s
+
+
+# THE RUNS SUM THEMSELVES (2026-11-02): TPC-H Q18's HAVING census was np.bincount(road, weights=vals[codes]) over all
+# 59,986,052 lineitem rows -- the value gather plus one thread, 221 ms. lineitem lies in orderkey order, so its road
+# to orders never decreases: checked in parallel (4.6 ms), then each chunk sums its runs straight from the codes
+# (16.7 ms), equal to the bincount bit for bit. A road that ever steps down, or under _RUN_SUM_MIN rows, or
+# WDB_RUN_SUM=0: None (the caller's bincount answers).
+_RUN_SUM = [__import__('os').environ.get('WDB_RUN_SUM', '1') == '1']
+_RUN_SUM_MIN = 1 << 16
+
+
+def road_run_sums(road, codes, vals, N):
+    """Per parent row 0..N-1: the sum of vals[codes[i]] over the child rows i whose road is that parent (codes None:
+    the count), float64 -- or None when the road is not non-decreasing (or the switch / line says no)."""
+    road = np.asarray(road)
+    n = road.shape[0]
+    if not (HAVE_NUMBA and _RUN_SUM[0]) or n < _RUN_SUM_MIN or road.dtype.kind not in 'iu' or road.ndim != 1:
+        return None
+    road = np.ascontiguousarray(road)
+    if int(road[0]) < 0 or int(road[-1]) >= N:
+        return None
+    nch = 256
+    if not _road_rises_nb(road, nch):
+        return None
+    out = np.zeros(N, np.float64)
+    bad = np.zeros(nch, np.int64)
+    if codes is None:
+        _road_run_sums_nb(road, road, np.zeros(1, np.float64), False, nch, out, bad)
+    else:
+        _road_run_sums_nb(road, np.ascontiguousarray(codes), np.ascontiguousarray(vals, dtype=np.float64), True, nch, out, bad)
+    return None if bad.sum() else out
+
+
+@njit(cache=True, parallel=True, nogil=True)
 def pgather_ptr(p, cc, out):
     """out[i] = p[cc[i]] -- composing a grandparent road through a parent road
     at fact scale, in parallel (serial numpy fancy-index cost ~100ms per 60M)."""
