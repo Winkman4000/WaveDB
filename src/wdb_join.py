@@ -114,6 +114,14 @@ _RW_MEMO_HITS = [0]
 _CENSUS_CODE = [os.environ.get('WDB_CENSUS_CODE', '1') == '1']
 _CENSUS_CODE_HITS = [0]
 
+# THE PARENT KEEP WAITS FOR THE ROAD (2026-11-02): with no fact keep, a fact-adjacent (depth-1) parent keep was
+# flowed to every fact row by numpy (keeps[pa][road]: 60M gathered on one thread, ~85 ms in Q17's outer) before
+# the road step. Now it waits: the road step reads the road once in parallel (plut_u8 -> mask_rows, or the next
+# parent through pkeep_via_ptr), as it already did for parents beside a fact keep. Q17's outer 95 -> 27.5 ms, TPC-H
+# Q18 444 -> 389. WDB_PARENT_WAIT=0: flowed as before. _PARENT_WAIT_HITS: diagnostic (tests read it).
+_PARENT_WAIT = [os.environ.get('WDB_PARENT_WAIT', '1') == '1']
+_PARENT_WAIT_HITS = [0]
+
 
 def _at_rows(a, rows):
     """a[rows] for a road or an array; a lazy road is looked up at the rows only, a long gather runs in parallel."""
@@ -5041,6 +5049,10 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                     continue        # RUNNING RULE: a depth-1 parent keep applies AT THE
                                     # FACT KEEP'S SURVIVORS below (15M rows, 5ms), never
                                     # flowed to fact scale (60M gather + AND, 120ms)
+                if ca9 == fact9 and depth9.get(pa9) == 1 and _PARENT_WAIT[0]:
+                    _PARENT_WAIT_HITS[0] += 1
+                    continue        # THE PARENT KEEP WAITS: no fact keep -- the road step below
+                                    # reads the road once, in parallel
                 flow9 = keeps9[pa9][np.asarray(p9)]       # verdict rides the road down
                 keeps9[ca9] = flow9 if keeps9.get(ca9) is None else (keeps9.get(ca9) & flow9)                     if ca9 in keeps9 else flow9
                 if ca9 not in homes9 and ca9 != fact9:
