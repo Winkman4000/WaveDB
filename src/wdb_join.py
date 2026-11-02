@@ -106,6 +106,14 @@ _RW_MEMO = [os.environ.get('WDB_RW_MEMO', '1') == '1']
 _RW_PAR_MIN = 1 << 16
 _RW_MEMO_HITS = [0]
 
+# THE CENSUS BY CODE (2026-11-01): the EXISTS census (_rich_lonely_frame) is computed state, emptied at query end, so
+# every TPC-H Q22 rebuilt it: 15M o_custkey values gathered, widened to int64, one-thread np.bincount -- 67 ms. Count
+# each dictionary code instead (bincount_par over the codes), then put each code's count at its value's slot in the
+# key range: the dictionary's values are distinct, so one plain scatter is exact (10 ms; Q22 126 -> 75 ms).
+# WDB_CENSUS_CODE=0: the old census. _CENSUS_CODE_HITS: diagnostic (tests read it).
+_CENSUS_CODE = [os.environ.get('WDB_CENSUS_CODE', '1') == '1']
+_CENSUS_CODE_HITS = [0]
+
 
 def _at_rows(a, rows):
     """a[rows] for a road or an array; a lazy road is looked up at the rows only, a long gather runs in parallel."""
@@ -1010,8 +1018,16 @@ def _rich_lonely_frame(db, inner):
                     if int(kv1.max()) - kmin + 1 != kv1.size: return None
                     fk9 = wdb_sql.raw_dict_col(seg2, db.cat.phys_map(t2).get(x9.name, x9.name))
                     if fk9 is None: return None
-                    cen = np.bincount((fk9[0][np.asarray(fk9[1])]).astype(np.int64) - kmin,
-                                      minlength=kv1.size)
+                    _dv9 = np.asarray(fk9[0]).astype(np.int64) - kmin
+                    if _CENSUS_CODE[0] and not (_dv9.size and (_dv9.min() < 0 or _dv9.max() >= kv1.size)):
+                        # THE CENSUS BY CODE: count the codes, then each code's count to its value's slot
+                        _byc9 = wdb_kernels.bincount_par(np.ascontiguousarray(fk9[1]), int(_dv9.size))[:_dv9.size]
+                        cen = np.zeros(kv1.size, dtype=np.int64)
+                        cen[_dv9] += _byc9.astype(np.int64, copy=False)
+                        _CENSUS_CODE_HITS[0] += 1
+                    else:
+                        cen = np.bincount((fk9[0][np.asarray(fk9[1])]).astype(np.int64) - kmin,
+                                          minlength=kv1.size)
                     _cc9[_ck9] = cen
                 else:
                     cen = _ent9
