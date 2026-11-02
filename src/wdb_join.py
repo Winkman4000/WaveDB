@@ -122,6 +122,97 @@ _CENSUS_CODE_HITS = [0]
 _PARENT_WAIT = [os.environ.get('WDB_PARENT_WAIT', '1') == '1']
 _PARENT_WAIT_HITS = [0]
 
+# THE VALUE PER KEY (2026-11-02, TPC-H Q17): a WHERE comparison 'outer value OP (scalar subquery)' whose subquery
+# reads one table, returns one aggregate (AVG / SUM / COUNT / MIN / MAX of one column, inside +-*/ with numeric
+# literals) and is correlated by exactly one equality inner column = outer column. Steps: (1) the outer's other
+# conjuncts give the survivors; (2) the parent rows the survivors reach through the outer column's road are marked;
+# (3) the inner rows are the inner table's rows whose key lands on a marked parent (a hash road inner key -> parent
+# key, read once in parallel); (4) per marked parent: the aggregate over its inner rows, then the subquery's
+# arithmetic -- one value per parent row, NaN where it has no inner rows (COUNT: 0); (5) each survivor reads its
+# parent's value through the same road as an ordinary value slot; NaN never compares true (SQL: NULL). '<>' and
+# anything else declines as before. WDB_CORR_SCALAR=0: off. _CORR_SCALAR_HITS: diagnostic (tests read it).
+_CORR_SCALAR = [os.environ.get('WDB_CORR_SCALAR', '1') == '1']
+_CORR_SCALAR_HITS = [0]
+_CORR_AGG = (E.Avg, E.Sum, E.Count, E.Min, E.Max)
+_CORR_OPS = (E.LT, E.LTE, E.GT, E.GTE, E.EQ)
+
+
+def _corr_scalar_spec(db, node):
+    """The correlated scalar subquery shape (see THE VALUE PER KEY), or None. Returns dict(t2, a2, k2, oc, agg, col,
+    expr): inner table and alias, inner key column, the outer Column node, the aggregate node, its column (None for
+    COUNT(*)), and the select expression."""
+    if not _CORR_SCALAR[0]:
+        return None
+    sub = node.this if isinstance(node, E.Subquery) else node
+    if not isinstance(sub, E.Select):
+        return None
+    if any(sub.args.get(k) for k in ('joins', 'group', 'having', 'order', 'limit', 'distinct', 'with')):
+        return None
+    frm = sub.args.get('from') or sub.args.get('from_')
+    if frm is None or not isinstance(frm.this, E.Table) or frm.args.get('expressions'):
+        return None
+    t2 = frm.this.name; a2 = frm.this.alias_or_name
+    try:
+        cols2 = set(db.cat.column_names(t2))
+    except Exception:
+        return None
+    if len(sub.expressions) != 1:
+        return None
+    ex = sub.expressions[0]
+    ex = ex.this if isinstance(ex, E.Alias) else ex
+    aggs = list(ex.find_all(*_CORR_AGG))
+    if len(aggs) != 1 or aggs[0].args.get('distinct'):
+        return None
+    ag = aggs[0]
+    arg = ag.this
+    if isinstance(ag, E.Count) and (arg is None or isinstance(arg, E.Star)):
+        col = None
+    elif isinstance(arg, E.Column) and arg.name in cols2 and arg.table in ('', a2, t2):
+        col = arg.name
+    else:
+        return None
+    def _arith_ok(nd):
+        if nd is ag: return True
+        if isinstance(nd, E.Paren): return _arith_ok(nd.this)
+        if isinstance(nd, E.Neg): return _arith_ok(nd.this)
+        if isinstance(nd, E.Literal): return not nd.is_string
+        if type(nd) in (E.Add, E.Sub, E.Mul, E.Div): return _arith_ok(nd.this) and _arith_ok(nd.expression)
+        return False
+    if not _arith_ok(ex):
+        return None
+    w = sub.args.get('where')
+    if w is None:
+        return None
+    eq = w.this
+    while isinstance(eq, E.Paren):
+        eq = eq.this
+    if not isinstance(eq, E.EQ) or not isinstance(eq.this, E.Column) or not isinstance(eq.expression, E.Column):
+        return None
+    def _inner(c):
+        return c.name in cols2 and c.table in ('', a2, t2)
+    x, y = eq.this, eq.expression
+    if _inner(x) and not _inner(y):
+        k2, oc = x.name, y
+    elif _inner(y) and not _inner(x):
+        k2, oc = y.name, x
+    else:
+        return None                                # both or neither inner: not this shape
+    return dict(t2=t2, a2=a2, k2=k2, oc=oc, agg=ag, col=col, expr=ex)
+
+
+def _corr_arith(nd, ag, vals):
+    """the subquery's arithmetic over the per-parent aggregate array"""
+    if nd is ag: return vals
+    if isinstance(nd, (E.Paren,)): return _corr_arith(nd.this, ag, vals)
+    if isinstance(nd, E.Neg): return -_corr_arith(nd.this, ag, vals)
+    if isinstance(nd, E.Literal): return float(nd.this)
+    a = _corr_arith(nd.this, ag, vals); b = _corr_arith(nd.expression, ag, vals)
+    if isinstance(nd, E.Add): return a + b
+    if isinstance(nd, E.Sub): return a - b
+    if isinstance(nd, E.Mul): return a * b
+    with np.errstate(divide='ignore', invalid='ignore'):
+        return np.true_divide(a, b)
+
 
 def _at_rows(a, rows):
     """a[rows] for a road or an array; a lazy road is looked up at the rows only, a long gather runs in parallel."""
@@ -4181,6 +4272,94 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         if a not in alias2t or nm not in cols_of[a]: raise _FastUnsupported
         if a not in composed: raise _FastUnsupported   # alias outside THIS chain's tree
         return seg_of[a], phys_of[a].get(nm, nm), composed[a]   # composed[a] is None for the fact table
+    _corr_ok9 = [False]
+    _corr_memo9 = {}
+    def _corr_cmp9(cn):
+        """cn is 'value OP (correlated scalar subquery)' (either side) of THE VALUE PER KEY's shape"""
+        if type(cn) not in _CORR_OPS:
+            return False
+        a, b = cn.this, cn.expression
+        sa = isinstance(a, (E.Subquery, E.Select)); sb = isinstance(b, (E.Subquery, E.Select))
+        if sa == sb:
+            return False
+        sub, oth = (a, b) if sa else (b, a)
+        if oth.find(E.Select) is not None:
+            return False
+        sp = _corr_scalar_spec(db, sub)
+        if sp is None:
+            return False
+        try:
+            _ps9, _pp9, _pc9 = resolve(sp['oc'])
+        except Exception:
+            return False
+        return _pc9 is not None                     # the outer column is a parent's: a road reaches it
+    def _corr_slot9(sub):
+        k9c = id(sub)
+        if k9c in _corr_memo9:
+            return _corr_memo9[k9c]
+        sp = _corr_scalar_spec(db, sub)
+        if sp is None: raise _FastUnsupported
+        pseg9, ppcol9, pcptr9 = resolve(sp['oc'])
+        if pcptr9 is None: raise _FastUnsupported
+        PN9 = int(pseg9.N)
+        oa9 = sp['oc'].table                         # the outer column's alias, by resolve's own rule
+        if not oa9:
+            own9 = [al for al, cs in cols_of.items() if sp['oc'].name in cs]
+            if len(own9) != 1: raise _FastUnsupported
+            oa9 = own9[0]
+        ptbl9 = alias2t[oa9]
+        seg2, _s2 = _solo_segment(db, sp['t2'])
+        road2 = np.asarray(_hash_pointer(db, sp['t2'], sp['k2'], seg2, ptbl9, sp['oc'].name, pseg9))
+        # (2) the parents the survivors reach
+        mark9 = np.zeros(PN9 + 1, dtype=np.bool_)    # + 1: a negative road entry reads False
+        if rows9 is not None:
+            mark9[np.asarray(_at_rows(pcptr9, rows9), dtype=np.int64)] = True
+        else:
+            mark9[:PN9] = True
+        # (3) the inner rows: their key lands on a marked parent (the road read once, in parallel)
+        _k9 = np.empty(road2.shape[0], dtype=np.bool_)
+        wdb_kernels.plut_u8(road2, mark9, _k9)
+        import wdb_engine as _WEk
+        irows9 = _WEk.Segment.mask_rows(_k9)
+        keys9 = road2[irows9].astype(np.int64, copy=False)
+        # (4) the aggregate per marked parent, then the subquery's arithmetic
+        ag9 = sp['agg']
+        if sp['col'] is not None:
+            cp2 = db.cat.phys_map(sp['t2']).get(sp['col'], sp['col'])
+            raw2 = wdb_sql.raw_dict_col(seg2, cp2, want_codes=False)
+            if raw2 is None: raise _FastUnsupported
+            c2 = seg2.cols[cp2]
+            if c2.get('dt') == 1 or c2.get('has_null'): raise _FastUnsupported   # numeric, null-free only
+            v9 = np.asarray(raw2[0])[np.asarray(seg2.codes_at(cp2, irows9))].astype(np.float64)
+        else:
+            v9 = None
+        cnt9 = np.bincount(keys9, minlength=PN9)[:PN9]
+        if isinstance(ag9, E.Count):
+            per9 = cnt9.astype(np.float64)
+        elif isinstance(ag9, (E.Sum, E.Avg)):
+            s9 = np.bincount(keys9, weights=v9, minlength=PN9)[:PN9]
+            with np.errstate(divide='ignore', invalid='ignore'):
+                per9 = np.where(cnt9 > 0, s9 / np.maximum(cnt9, 1) if isinstance(ag9, E.Avg) else s9, np.nan)
+        else:                                        # MIN / MAX: per key over the sorted keys
+            per9 = np.full(PN9, np.nan)
+            if keys9.size:
+                o9 = np.argsort(keys9, kind='stable')
+                ks9 = keys9[o9]; vs9 = v9[o9]
+                st9 = np.concatenate([[0], np.flatnonzero(np.diff(ks9)) + 1])
+                red9 = (np.minimum if isinstance(ag9, E.Min) else np.maximum).reduceat(vs9, st9)
+                per9[ks9[st9]] = red9
+        val9 = np.asarray(_corr_arith(sp['expr'], ag9, per9), dtype=np.float64)
+        if val9.ndim == 0:
+            val9 = np.full(PN9, float(val9))
+        # (5) the value slot: one value per parent row, through the outer column's road
+        ident9 = np.arange(PN9, dtype=np.int64)
+        slot9 = len(slot_list)
+        slot_list.append((np.ascontiguousarray(val9), ident9, np.ascontiguousarray(_rw9(pcptr9))))
+        _CORR_SCALAR_HITS[0] += 1
+        if _bill9 is not None:
+            print('JOIN BILL: VALUE PER KEY %s.%s -> %d parents, %d inner rows' % (sp['t2'], sp['k2'], int(mark9[:PN9].sum()), irows9.size), flush=True)
+        _corr_memo9[k9c] = 'v%d' % slot9
+        return _corr_memo9[k9c]
     def col_operand(node):
         # parent columns become ('g', arr, composed_ptr) so the gather happens per-chunk inside the
         # threaded kernel instead of materialising the full gathered array here.
@@ -4743,6 +4922,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                                              # pred re-applies the WHERE at survivors
             for cn in _cflat(_w9c.this):
                 if cn.find(E.Select) is not None:
+                    if _corr_cmp9(cn):
+                        _cres9.append(cn); continue  # THE VALUE PER KEY: judged by the pred at survivors
                     raise _FastUnsupported          # subqueries: never the cascade's to judge
                 cols9 = list(cn.find_all(E.Column))
                 if len(cols9) != 1:
@@ -5959,6 +6140,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     def build_fused(node):
         if isinstance(node, E.Cast) and any(k in node.to.sql().upper() for k in ('DATE', 'TIME', 'CHAR', 'TEXT', 'STRING', 'BOOL')):
             raise _FastUnsupported                  # a TYPE-CHANGING cast is not transparent
+        if isinstance(node, (E.Subquery, E.Select)):
+            if not _corr_ok9[0]: raise _FastUnsupported     # only inside a recognised comparison
+            return _corr_slot9(node)
         if isinstance(node, (E.Paren, E.Cast)): return build_fused(node.this)
         if isinstance(node, E.Neg): return f"(-{build_fused(node.this)})"
         if isinstance(node, E.Column):
@@ -6138,6 +6322,12 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             return f"({vk} != 0)"
         if type(node) in _CMP_STR:
             op = _CMP_STR[type(node)]; a, b = node.this, node.expression
+            if _corr_cmp9(node):                            # THE VALUE PER KEY
+                _corr_ok9[0] = True
+                try:
+                    return f"({build_fused(a)} {op} {build_fused(b)})"
+                finally:
+                    _corr_ok9[0] = False
             if not _is_lit(a) and not _is_lit(b):          # value-expr vs value-expr (e.g. col < col)
                 return f"({build_fused(a)} {op} {build_fused(b)})"   # numeric/datetime; string -> raises
             if _is_lit(a) and _is_lit(b): raise _FastUnsupported
