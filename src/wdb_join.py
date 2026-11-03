@@ -4145,7 +4145,121 @@ def _having_mask9(node, proj, col_results, counts, present):
     return m(node)
 
 
-def _same_rows_mask9(db, tree, proj, col_results, present):
+_ORDER_ARR = [__import__('os').environ.get('WDB_ORDER_ARR', '1') == '1']
+_ORDER_ARR_HITS = [0]
+_EXACT_WALK = [__import__('os').environ.get('WDB_EXACT_WALK', '1') == '1']
+_EXACT_WALK_HITS = [0]
+_EXACT_SCALE_MAX = 6                     # a factor needing more than 10^6 to come out whole keeps the float road
+
+
+def _units_of9(seg, pc):
+    """a dictionary column in its own whole units: (code -> units table int64, power of ten, bits of the largest), or
+    None when no power up to 10^_EXACT_SCALE_MAX makes every value whole. The table is the stored dictionary in another
+    notation -- tier-1 decoded source data (Jackson's law lets it stay) -- so it is kept on the shelf, kind 'units'."""
+    import wdb_shelf
+    key = ('units', seg.path, pc)
+    hit = wdb_shelf.SHELF.get(key)
+    if hit is not None:
+        return hit[0]
+    dv = np.asarray(seg._typed_dict(pc))
+    out = None
+    if dv.dtype.kind == 'f':
+        for e in range(_EXACT_SCALE_MAX + 1):
+            u = np.rint(dv * (10 ** e))
+            if np.array_equal(u / (10 ** e), dv):
+                lut = np.ascontiguousarray(u.astype(np.int64))
+                out = (lut, e, int(np.abs(lut).max()).bit_length() if lut.size else 0)
+                break
+    elif dv.dtype.kind in 'iu':
+        lut = np.ascontiguousarray(dv.astype(np.int64))
+        out = (lut, 0, int(np.abs(lut).max()).bit_length() if lut.size else 0)
+    try:
+        wdb_shelf.SHELF.put(key, (out,), int(out[0].nbytes) if out is not None else 64, kind='units')
+    except Exception:
+        pass
+    return out
+
+
+def _exact_walk9(sp9, proj, ix9, col_results, present, resolve, rows9, gkeys):
+    """THE EXACT WALK (Zoom.lean): the outer's group sums and the subquery's total in whole units, and the cut in whole
+    numbers; returns the keep flags over present (and writes the exact sums back for the answer), or None."""
+    import wdb_subquery as _wsq9
+    from fractions import Fraction
+    if not _EXACT_WALK[0] or rows9 is None or len(gkeys) != 1 or gkeys[0]['cptr'] is not None:
+        return None
+    arg9 = proj[ix9].this if isinstance(proj[ix9], E.Alias) else proj[ix9]
+    arg9 = arg9.this                                         # the SUM's argument
+    facs9 = []
+    def flat9(nd):
+        if isinstance(nd, E.Paren): return flat9(nd.this)
+        if isinstance(nd, E.Mul): return flat9(nd.this) and flat9(nd.expression)
+        if isinstance(nd, E.Column): facs9.append(nd); return True
+        return False
+    if not flat9(arg9) or not facs9:
+        return None
+    # 1. units, 2. width
+    if len(facs9) > 2:
+        return None
+    scale9 = 0; bits9 = 0; luts9 = []; codes9 = []
+    for f9 in facs9:
+        try:
+            sg9, pc9, cp9 = resolve(f9)
+        except Exception:
+            return None
+        c9 = sg9.cols[pc9]
+        if cp9 is not None or c9.get('mode') != 0 or c9.get('has_null') or sg9._overrides(pc9) is not None:
+            return None
+        un9 = _units_of9(sg9, pc9)
+        if un9 is None:
+            return None
+        lut9, e9, b9 = un9
+        scale9 += e9
+        bits9 += b9
+        luts9.append(lut9)
+        codes9.append(np.ascontiguousarray(np.asarray(sg9.codes_at(pc9, rows9))))
+    if bits9 + int(len(rows9)).bit_length() > 63:
+        return None
+    # 3. the line-up: each survivor's amount in units (code -> units tables, read and multiplied in one parallel pass)
+    amount9 = np.empty(codes9[0].shape[0], np.int64)
+    if len(facs9) == 1:
+        wdb_kernels.units_amount1(codes9[0], luts9[0], amount9)
+    else:
+        if codes9[1].shape[0] != codes9[0].shape[0]:
+            return None
+        wdb_kernels.units_amount2(codes9[0], luts9[0], codes9[1], luts9[1], amount9)
+    K9 = np.ascontiguousarray(np.asarray(gkeys[0]['full']))
+    if K9.dtype.kind not in 'iu' or K9.shape[0] != amount9.shape[0] or not wdb_kernels._road_rises_nb(K9, 256):
+        return None
+    # 4. the zoom
+    m9 = K9.shape[0]
+    ok9 = np.empty(m9, K9.dtype); os9 = np.empty(m9, np.int64)
+    nr9, tot9 = wdb_kernels.zoom_runs_exact(K9, amount9, 256, ok9, os9)
+    nr9 = int(nr9); tot9 = int(tot9)
+    keys9 = ok9[:nr9]; sums9 = os9[:nr9]
+    if nr9 != len(present) or not np.array_equal(keys9, present):
+        return None
+    # 5. the cut in whole numbers: value / 10^scale OP arith(total / 10^scale)  <=>  value * q OP p
+    try:
+        r9 = _wsq9._sr_eval_frac9(sp9['arith'], Fraction(tot9, 10 ** scale9)) * (10 ** scale9)
+    except (ValueError, ZeroDivisionError):
+        return None
+    p9, q9 = r9.numerator, r9.denominator
+    import operator
+    opf9 = getattr(operator, sp9['op'])
+    big9 = (int(np.abs(sums9).max()) if sums9.size else 0) * q9
+    if big9 < (1 << 62) and abs(p9) < (1 << 62):
+        keep9 = opf9(sums9 * np.int64(q9), np.int64(p9))
+    else:
+        keep9 = np.array([opf9(int(x) * q9, p9) for x in sums9.tolist()], dtype=bool)
+    # 6. the answer reads the exact sums (decimals only here)
+    cr9 = col_results[ix9]
+    if cr9 is not None and cr9[0] == 'arr' and cr9[1].dtype.kind == 'f':
+        cr9[1][present] = sums9 / float(10 ** scale9)
+    _EXACT_WALK_HITS[0] += 1
+    return keep9
+
+
+def _same_rows_mask9(db, tree, proj, col_results, present, resolve=None, rows9=None, gkeys=None):
     """THE SAME ROWS, ONE WALK: the HAVING's same-rows subquery answered from the outer's own group sums -- the total
     of the present groups' SUM, the subquery's arithmetic, the comparison -- or None (the join's own scalars decide)."""
     import wdb_subquery as _wsq9
@@ -4158,10 +4272,15 @@ def _same_rows_mask9(db, tree, proj, col_results, present):
     psql9 = [(q.this if isinstance(q, E.Alias) else q).sql() for q in proj]
     if sp9['agg'] not in psql9:
         return None
-    r9 = col_results.get(psql9.index(sp9['agg']))
+    ix9 = psql9.index(sp9['agg'])
+    r9 = col_results.get(ix9)
     if r9 is None or r9[0] != 'arr' or r9[2]:
         return None
-    m9 = _wsq9.same_rows_cut(sp9, r9[1][present])
+    m9 = None
+    if resolve is not None:
+        m9 = _exact_walk9(sp9, proj, ix9, col_results, present, resolve, rows9, gkeys or [])   # THE EXACT WALK
+    if m9 is None:
+        m9 = _wsq9.same_rows_cut(sp9, r9[1][present])
     if m9 is not None:
         _wsq9._SAME_ROWS_HITS[0] += 1
     return m9
@@ -7012,7 +7131,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     _hav_done9 = False
     if gkeys and _HAVING_ARR[0] and tree.args.get('having') is not None:
         if tree.args['having'].find(E.Subquery) is not None:
-            _hm9 = _same_rows_mask9(db, tree, proj, col_results, present)    # THE SAME ROWS, ONE WALK (Q11)
+            _hm9 = _same_rows_mask9(db, tree, proj, col_results, present,    # THE SAME ROWS, ONE WALK (Q11)
+                                    resolve=resolve, rows9=rows9, gkeys=gkeys)
         else:
             _hm9 = _having_mask9(tree.args['having'].this, proj, col_results, counts, present)
         if _hm9 is not None:
@@ -7074,6 +7194,46 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
             present = _pres_e[_pick_e]
             _early9 = True
             global _TOPK_EMIT_HITS; _TOPK_EMIT_HITS += 1
+
+    # THE ORDER IN ARRAYS (2026-11-03): ORDER BY over aggregate / COUNT columns with no LIMIT is put in order on the
+    # group arrays -- the same stable order _apply_order gives the rows (each key from the last to the first, desc
+    # keeping equal values in place) -- so the rows come out ordered and the Python sort is skipped.
+    _ord_done9 = False
+    _ordt9 = tree.args.get('order')
+    if (_ORDER_ARR[0] and not columnar and gkeys and _ordt9 is not None and not _early9
+            and wdb_sql._limit(tree) is None and not wdb_sql._offset(tree)
+            and (tree.args.get('having') is None or _hav_done9)):
+        _pres_o = np.flatnonzero(present) if present.dtype == bool else present
+        _ord_keys9 = []
+        _al_o = [wdb_sql._alias(p) for p in proj]
+        _in_o = [(p.this if isinstance(p, E.Alias) else p).sql() for p in proj]
+        for _oe in _ordt9.expressions:
+            _t_o = _oe.this
+            if isinstance(_t_o, E.Literal) and not _t_o.is_string:
+                _i_o = int(str(_t_o.this)) - 1
+                if not 0 <= _i_o < len(proj): _ord_keys9 = None; break
+            else:
+                _s_o = _t_o.sql(); _n_o = _t_o.name if isinstance(_t_o, E.Column) else None
+                _i_o = next((j for j in range(len(proj)) if _in_o[j] == _s_o or _al_o[j] == _n_o), None)
+                if _i_o is None: _ord_keys9 = None; break
+            _r_o = col_results.get(_i_o)
+            if _r_o is None: _ord_keys9 = None; break
+            if _r_o[0] == 'count':
+                _a_o = np.asarray(counts)[_pres_o].astype(np.float64)
+            elif _r_o[0] == 'arr' and not _r_o[2] and _r_o[1].dtype.kind in 'iuf':
+                _v_o = _r_o[1][_pres_o]
+                if _v_o.dtype.kind in 'iu' and _v_o.size and max(int(_v_o.max()), -int(_v_o.min())) >= (1 << 53):
+                    _ord_keys9 = None; break
+                _a_o = _v_o.astype(np.float64)
+            else:
+                _ord_keys9 = None; break
+            if np.isnan(_a_o).any(): _ord_keys9 = None; break
+            _ord_keys9.append(-_a_o if _oe.args.get('desc') else _a_o)
+        if _ord_keys9:
+            _perm9 = np.lexsort(tuple(reversed(_ord_keys9)))
+            present = _pres_o[_perm9]
+            _ord_done9 = True
+            _ORDER_ARR_HITS[0] += 1
 
     # ---- assemble rows (vectorised) ----
     # Decode every present group's composite code into per-key code arrays in one shot, bulk-decode each key
@@ -7219,7 +7379,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     if having is not None and not _hav_done9:
         rows = wdb_sql._apply_having(rows, proj, having.this, None)   # fused path must filter too
     if _sel9 is None and not _early9:
-        rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))
+        if not _ord_done9:
+            rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))
         lim = wdb_sql._limit(tree)
         if lim is not None: rows = rows[:lim]
     if _bill9 is not None:

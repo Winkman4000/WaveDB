@@ -871,6 +871,25 @@ def _sr_eval9(n, total):
     raise ValueError('arith')
 
 
+def _sr_eval_frac9(n, total):
+    """the subquery's arithmetic in exact fractions (Fraction literals: 0.00001 is 1/100000 exactly)"""
+    from fractions import Fraction
+    if isinstance(n, E.Sum):
+        return total
+    if isinstance(n, E.Paren):
+        return _sr_eval_frac9(n.this, total)
+    if isinstance(n, E.Neg):
+        return -_sr_eval_frac9(n.this, total)
+    if isinstance(n, E.Literal) and not n.is_string:
+        return Fraction(str(n.this))
+    a = _sr_eval_frac9(n.this, total); b = _sr_eval_frac9(n.expression, total)
+    if isinstance(n, E.Mul): return a * b
+    if isinstance(n, E.Add): return a + b
+    if isinstance(n, E.Sub): return a - b
+    if isinstance(n, E.Div): return a / b
+    raise ValueError('arith')
+
+
 def _sr_arith_ok9(n):
     if isinstance(n, E.Sum):
         return True

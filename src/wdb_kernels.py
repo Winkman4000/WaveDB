@@ -9832,3 +9832,66 @@ if HAVE_NUMBA:
             outhi[t] = hi
             outlo[t] = lo
             outn[t] = nn
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def zoom_runs_exact(K, V, nch, out_k, out_s):
+    """THE ZOOM (Zoom.lean): K never decreasing, V exact whole amounts. Each of nch stretches moves both edges forward
+    to a key change (snap_boundary) and sums each of its runs whole in row order (runs_append); the stretch totals add
+    to the grand total (total_runs). Pass 1 counts each stretch's runs, pass 2 writes them packed in order.
+    Returns (number of runs, grand total). The caller sized the width (sum_bound): int64 never wraps."""
+    m = K.shape[0]
+    lo = np.zeros(nch, np.int64)
+    hi = np.zeros(nch, np.int64)
+    cnt = np.zeros(nch, np.int64)
+    for t in prange(nch):
+        a = t * m // nch
+        b = (t + 1) * m // nch
+        while 0 < a < m and K[a] == K[a - 1]:
+            a += 1
+        while 0 < b < m and K[b] == K[b - 1]:
+            b += 1
+        lo[t] = a
+        hi[t] = b
+        c = 0
+        for i in range(a, b):
+            if i == a or K[i] != K[i - 1]:
+                c += 1
+        cnt[t] = c
+    off = np.zeros(nch + 1, np.int64)
+    for t in range(nch):
+        off[t + 1] = off[t] + cnt[t]
+    tot = np.zeros(nch, np.int64)
+    for t in prange(nch):
+        a = lo[t]
+        b = hi[t]
+        o = off[t]
+        s = np.int64(0)
+        i = a
+        while i < b:
+            j = i
+            v = np.int64(0)
+            while j < b and K[j] == K[i]:
+                v += V[j]
+                j += 1
+            out_k[o] = K[i]
+            out_s[o] = v
+            o += 1
+            s += v
+            i = j
+        tot[t] = s
+    return off[nch], tot.sum()
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def units_amount1(c1, l1, out):
+    """the line-up's amount per survivor in whole units: one factor read through its code -> units table"""
+    for i in prange(c1.shape[0]):
+        out[i] = l1[np.int64(c1[i])]
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def units_amount2(c1, l1, c2, l2, out):
+    """the line-up's amount per survivor in whole units: two factors, each through its code -> units table, multiplied"""
+    for i in prange(c1.shape[0]):
+        out[i] = l1[np.int64(c1[i])] * l2[np.int64(c2[i])]
