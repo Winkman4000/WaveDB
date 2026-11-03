@@ -769,6 +769,18 @@ class Database:
             if tree.args.get('joins'):
                 import os as _os9
                 import wdb_subquery as _wsq9
+                _srs9 = _wsq9.same_rows_spec(self, tree)          # THE SAME ROWS, ONE WALK (Q11)
+                if _srs9 is not None:
+                    _h9 = _wsq9._SAME_ROWS_HITS[0]
+                    _wsq9._SR_PENDING[0] = _srs9
+                    try:
+                        _r9 = wdb_join.join_query(self, sql)
+                        if _wsq9._SAME_ROWS_HITS[0] > _h9:
+                            return _r9
+                    except Exception:
+                        pass                                       # not taken: the subquery runs on its own below
+                    finally:
+                        _wsq9._SR_PENDING[0] = None
                 _js9 = _wsq9.join_scalars(self, tree)             # THE JOIN'S OWN SCALARS (Q11)
                 if _js9 is not None:
                     return self._run_impl(_js9, escalate)

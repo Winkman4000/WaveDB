@@ -773,3 +773,184 @@ def rewrite(db, tree):
         else:
             sub.replace(_lit(v))
     return tree
+
+
+# ---- THE SAME ROWS, ONE WALK (Jackson's line-up and zoom, 2026-11-03, Q11) ----------------------------------------
+# A join GROUP BY whose HAVING compares its own SUM(e) against a scalar subquery summing the SAME e over the SAME
+# tables under the SAME conditions (times literal arithmetic) asks one question twice: the subquery's SUM is the
+# total of the outer's group sums. same_rows_spec recognises it; wdb_join cuts the groups on the group-sum array
+# (total of the present groups' sums -> the subquery's arithmetic -> compare) before a single key is decoded.
+_SAME_ROWS = [_os.environ.get('WDB_SAME_ROWS', '1') == '1']
+_SAME_ROWS_HITS = [0]
+_SR_CMP9 = {E.GT: 'gt', E.GTE: 'ge', E.LT: 'lt', E.LTE: 'le'}
+_SR_FLIP9 = {'gt': 'lt', 'ge': 'le', 'lt': 'gt', 'le': 'ge'}
+
+
+def _sr_conj9(n):
+    if isinstance(n, E.And):
+        return _sr_conj9(n.this) + _sr_conj9(n.expression)
+    if isinstance(n, E.Paren) and isinstance(n.this, E.And):
+        return _sr_conj9(n.this)
+    return [n]
+
+
+def _sr_bare9(n):
+    n = n.copy()
+    for c in n.find_all(E.Column):
+        c.set('table', None)
+    return n
+
+
+def _sr_norm9(n):
+    b = _sr_bare9(n)
+    if isinstance(b, E.EQ):
+        x, y = sorted([b.this.sql(), b.expression.sql()])
+        return 'EQ(%s,%s)' % (x, y)
+    return b.sql()
+
+
+def _sr_scope9(db, sel):
+    """(table names, normalised conjuncts) of a plain inner-join SELECT whose bare column names are unique across its
+    tables (so qualifiers can be dropped), or None. Checks the columns of FROM / JOIN ON / WHERE / SELECT / GROUP BY."""
+    f = sel.args.get('from_') or sel.args.get('from')
+    if f is None or not isinstance(f.this, E.Table):
+        return None
+    tabs = [f.this]; conj = []
+    for j in sel.args.get('joins') or []:
+        if not isinstance(j.this, E.Table) or j.args.get('using'):
+            return None
+        if (j.args.get('side') or '') or (j.args.get('kind') or '').upper() not in ('', 'INNER', 'CROSS'):
+            return None
+        if j.args.get('on') is not None:
+            conj += _sr_conj9(j.args['on'])
+        tabs.append(j.this)
+    names = [t.name for t in tabs]
+    if len(set(names)) != len(names):
+        return None
+    quals = {t.alias_or_name for t in tabs} | set(names)
+    owner = {}
+    for t in names:
+        try:
+            cs = db.cat.column_names(t)
+        except Exception:
+            return None
+        for c in cs:
+            if c in owner:
+                return None
+            owner[c] = t
+    w = sel.args.get('where')
+    if w is not None:
+        conj += _sr_conj9(w.this)
+    for c in conj:
+        if c.find(E.Subquery) is not None or c.find(E.Exists) is not None or c.find(E.Select) is not None:
+            return None
+    parts = list(conj) + list(sel.expressions) + list((sel.args.get('group') or E.Group()).expressions)
+    for p in parts:
+        for c in p.find_all(E.Column):
+            if c.name not in owner or (c.table and c.table not in quals):
+                return None
+    return frozenset(names), frozenset(_sr_norm9(c) for c in conj)
+
+
+def _sr_eval9(n, total):
+    """the subquery's arithmetic around its SUM, in Python numbers (SQL '/' is true division)"""
+    if isinstance(n, E.Sum):
+        return total
+    if isinstance(n, E.Paren):
+        return _sr_eval9(n.this, total)
+    if isinstance(n, E.Neg):
+        return -_sr_eval9(n.this, total)
+    if isinstance(n, E.Literal) and not n.is_string:
+        s = str(n.this)
+        return float(s) if any(ch in s for ch in '.eE') else int(s)
+    a = _sr_eval9(n.this, total); b = _sr_eval9(n.expression, total)
+    if isinstance(n, E.Mul): return a * b
+    if isinstance(n, E.Add): return a + b
+    if isinstance(n, E.Sub): return a - b
+    if isinstance(n, E.Div): return a / b
+    raise ValueError('arith')
+
+
+def _sr_arith_ok9(n):
+    if isinstance(n, E.Sum):
+        return True
+    if isinstance(n, E.Literal):
+        return not n.is_string
+    if isinstance(n, (E.Paren, E.Neg)):
+        return _sr_arith_ok9(n.this)
+    if isinstance(n, (E.Mul, E.Add, E.Sub, E.Div)):
+        return _sr_arith_ok9(n.this) and _sr_arith_ok9(n.expression)
+    return False
+
+
+def same_rows_spec(db, tree):
+    """THE SAME ROWS: {'agg': the outer's SUM node's SQL, 'arith': the subquery's expression, 'op': gt|ge|lt|le} when
+    the HAVING is SUM(e) OP (SELECT arith(SUM(e)) FROM the same tables WHERE the same conditions), else None."""
+    if not _SAME_ROWS[0] or not isinstance(tree, E.Select) or not tree.args.get('joins'):
+        return None
+    if tree.args.get('group') is None or tree.args.get('having') is None:
+        return None
+    for k in ('distinct', 'with', 'qualify'):
+        if tree.args.get(k):
+            return None
+    cmp9 = tree.args['having'].this
+    op9 = _SR_CMP9.get(type(cmp9))
+    if op9 is None:
+        return None
+    a9, b9 = cmp9.this, cmp9.expression
+    if isinstance(a9, E.Subquery):
+        a9, b9 = b9, a9; op9 = _SR_FLIP9[op9]
+    if not isinstance(a9, E.Sum) or not isinstance(b9, E.Subquery) or a9.find(E.Subquery) is not None:
+        return None
+    if a9.args.get('distinct') or isinstance(a9.this, E.Distinct):
+        return None
+    inner = b9.this
+    if not isinstance(inner, E.Select) or any(x is not inner for x in inner.find_all(E.Select)):
+        return None
+    for k in ('group', 'having', 'order', 'limit', 'offset', 'distinct', 'with', 'qualify'):
+        if inner.args.get(k):
+            return None
+    if len(inner.expressions) != 1:
+        return None
+    ie = inner.expressions[0]
+    ie = ie.this if isinstance(ie, E.Alias) else ie
+    sums = list(ie.find_all(E.Sum))
+    if len(sums) != 1 or len(list(ie.find_all(E.AggFunc))) != 1 or not _sr_arith_ok9(ie):
+        return None
+    if sums[0].args.get('distinct') or isinstance(sums[0].this, E.Distinct):
+        return None
+    if _sr_bare9(sums[0].this).sql() != _sr_bare9(a9.this).sql():
+        return None
+    so = _sr_scope9(db, tree); si = _sr_scope9(db, inner)
+    if so is None or si is None or so != si:
+        return None
+    psql = [(p.this if isinstance(p, E.Alias) else p).sql() for p in tree.expressions]
+    if a9.sql() not in psql:
+        return None
+    return {'agg': a9.sql(), 'arith': ie, 'op': op9, 'sub_sql': inner.sql()}
+
+
+# the spec recognised on the whole query, handed to the join's aggregate (whose tree has its join conditions taken
+# into the chain, so the same-rows test can only be made up front); set and cleared around one join_query
+_SR_PENDING = [None]
+
+
+def same_rows_cut(spec, v):
+    """the keep flags over the present groups' sums v (the outer's SUM column at the present groups), or None"""
+    import operator
+    v = np.asarray(v)
+    if v.dtype.kind not in 'iuf' or (v.dtype.kind == 'f' and bool(np.isnan(v).any())):
+        return None
+    if v.size == 0:
+        return np.zeros(0, dtype=bool)        # zero groups: the subquery's SUM is NULL, the comparison never holds
+    total = float(np.sum(v, dtype=np.float64)) if v.dtype.kind == 'f' else int(sum(v.tolist()))
+    try:
+        scalar = _sr_eval9(spec['arith'], total)
+    except (ValueError, ZeroDivisionError):
+        return None
+    opf = getattr(operator, spec['op'])
+    if isinstance(scalar, int) and v.dtype.kind in 'iu' and -(1 << 62) < scalar < (1 << 62):
+        return opf(v, scalar)
+    if v.dtype.kind in 'iu' and max(int(v.max()), -int(v.min())) >= (1 << 53):
+        return None
+    return opf(v.astype(np.float64), float(scalar))

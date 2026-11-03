@@ -4145,6 +4145,28 @@ def _having_mask9(node, proj, col_results, counts, present):
     return m(node)
 
 
+def _same_rows_mask9(db, tree, proj, col_results, present):
+    """THE SAME ROWS, ONE WALK: the HAVING's same-rows subquery answered from the outer's own group sums -- the total
+    of the present groups' SUM, the subquery's arithmetic, the comparison -- or None (the join's own scalars decide)."""
+    import wdb_subquery as _wsq9
+    sp9 = _wsq9._SR_PENDING[0]
+    if sp9 is None:
+        return None
+    subs9 = list(tree.args['having'].find_all(E.Subquery))
+    if len(subs9) != 1 or subs9[0].this.sql() != sp9['sub_sql']:
+        return None
+    psql9 = [(q.this if isinstance(q, E.Alias) else q).sql() for q in proj]
+    if sp9['agg'] not in psql9:
+        return None
+    r9 = col_results.get(psql9.index(sp9['agg']))
+    if r9 is None or r9[0] != 'arr' or r9[2]:
+        return None
+    m9 = _wsq9.same_rows_cut(sp9, r9[1][present])
+    if m9 is not None:
+        _wsq9._SAME_ROWS_HITS[0] += 1
+    return m9
+
+
 def _topk_prefilter(tree, proj, col_results, counts, present, gkeys):
     """ORDER BY <projected aggregate>[DESC] LIMIT k over a GROUP BY: shrink `present` to a provable
     superset of the top-k groups with ONE numpy partition on the primary order array, so the row
@@ -6989,7 +7011,10 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     present = np.array([0]) if not gkeys else np.nonzero(counts > 0)[0]
     _hav_done9 = False
     if gkeys and _HAVING_ARR[0] and tree.args.get('having') is not None:
-        _hm9 = _having_mask9(tree.args['having'].this, proj, col_results, counts, present)
+        if tree.args['having'].find(E.Subquery) is not None:
+            _hm9 = _same_rows_mask9(db, tree, proj, col_results, present)    # THE SAME ROWS, ONE WALK (Q11)
+        else:
+            _hm9 = _having_mask9(tree.args['having'].this, proj, col_results, counts, present)
         if _hm9 is not None:
             present = present[_hm9]
             _hav_done9 = True
