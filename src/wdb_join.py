@@ -4093,6 +4093,58 @@ def _mode4_group(seg, pcol):
     return res
 
 
+_HAVING_ARR = [__import__('os').environ.get('WDB_HAVING_ARR', '1') == '1']
+_HAVING_ARR_HITS = [0]
+_ONE_KEY_RUNS = [__import__('os').environ.get('WDB_ONE_KEY_RUNS', '1') == '1']
+_ONE_KEY_RUNS_MIN_K = 1 << 16          # dict-wide K under this: the per-thread copies are cheap
+_ONE_KEY_RUNS_HITS = [0]
+
+
+def _having_mask9(node, proj, col_results, counts, present):
+    """THE HAVING IN ARRAY SPACE: the boolean over `present` that wdb_sql._apply_having would compute on the emitted
+    rows, or None (the old road decides). Same first-match column rule; values compared as float64 exactly as the
+    row path's Python values compare (ints only below 2**53, where float64 holds them exactly)."""
+    import operator
+    OPS = {E.GT: operator.gt, E.LT: operator.lt, E.GTE: operator.ge, E.LTE: operator.le,
+           E.EQ: operator.eq, E.NEQ: operator.ne}
+    proj_sql = [(q.this if isinstance(q, E.Alias) else q).sql() for q in proj]
+
+    def arr(expr):
+        es = expr.sql()
+        for i, ps in enumerate(proj_sql):
+            if ps == es:
+                r = col_results.get(i)
+                if r is None:
+                    return None
+                if r[0] == 'count':
+                    a = np.asarray(counts)[present]
+                elif r[0] == 'arr' and not r[2] and r[1].dtype.kind in 'iuf':
+                    a = r[1][present]
+                else:
+                    return None
+                if a.dtype.kind in 'iu' and a.size and max(int(a.max()), -int(a.min())) >= (1 << 53):
+                    return None
+                return a.astype(np.float64)
+        return None
+
+    def m(nd):
+        if isinstance(nd, (E.And, E.Or)):
+            a = m(nd.this); b = m(nd.expression)
+            if a is None or b is None:
+                return None
+            return (a & b) if isinstance(nd, E.And) else (a | b)
+        if type(nd) in OPS:
+            rhs = nd.expression
+            if not (isinstance(rhs, E.Literal) and not rhs.is_string):
+                return None
+            a = arr(nd.this)
+            if a is None:
+                return None
+            return OPS[type(nd)](a, float(rhs.this))
+        return None
+    return m(node)
+
+
 def _topk_prefilter(tree, proj, col_results, counts, present, gkeys):
     """ORDER BY <projected aggregate>[DESC] LIMIT k over a GROUP BY: shrink `present` to a provable
     superset of the top-k groups with ONE numpy partition on the primary order array, so the row
@@ -5997,6 +6049,12 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         k0 = gkeys[0]; K = k0['K']
         group_op = ('g', k0['full'], k0['cptr']) if k0['cptr'] is not None else ('d', k0['full'])
         group_keys = [(k0['full'], K, k0['cptr'])]
+        if (_ONE_KEY_RUNS[0] and k0['cptr'] is None and K >= _ONE_KEY_RUNS_MIN_K
+                and K * wdb_exprjit._NT >= 2 * n and n > 1):
+            _f9 = np.asarray(k0['full'])
+            if _f9.ndim == 1 and _f9.dtype.kind in 'iu' and wdb_kernels._road_rises_nb(np.ascontiguousarray(_f9), 256):
+                _mono_gids = True
+                _ONE_KEY_RUNS_HITS[0] += 1
     else:                                                 # multi-key: mixed-radix composite
         K = 1
         for k in gkeys: K *= k['K']
@@ -6929,6 +6987,13 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
     # No GROUP BY -> exactly one output row (the grand total), even over zero rows (COUNT=0, SUM/MIN/MAX=NULL,
     # matching SQL). With a GROUP BY, empty groups are dropped.
     present = np.array([0]) if not gkeys else np.nonzero(counts > 0)[0]
+    _hav_done9 = False
+    if gkeys and _HAVING_ARR[0] and tree.args.get('having') is not None:
+        _hm9 = _having_mask9(tree.args['having'].this, proj, col_results, counts, present)
+        if _hm9 is not None:
+            present = present[_hm9]
+            _hav_done9 = True
+            _HAVING_ARR_HITS[0] += 1
     present = _topk_prefilter(tree, proj, col_results, counts, present, gkeys)   # bounded top-K: drop non-winners pre-assembly
 
     # THE EARLY PICK (2026-10-12): choose the k rows to emit BEFORE the keys are decoded and the
@@ -7126,7 +7191,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
 
     global _FAST_HITS; _FAST_HITS += 1
     having = tree.args.get('having')
-    if having is not None:
+    if having is not None and not _hav_done9:
         rows = wdb_sql._apply_having(rows, proj, having.this, None)   # fused path must filter too
     if _sel9 is None and not _early9:
         rows = wdb_sql._apply_order(rows, proj, tree.args.get('order'))
