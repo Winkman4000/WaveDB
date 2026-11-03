@@ -1267,6 +1267,24 @@ def _to_physical(node, col_map):
             col.this.set('this', col_map[nm])
     return t
 
+# THE ROWS ASKED FOR (2026-11-02): a row projection decoded every value of each projected column, then kept the
+# selected rows -- TPC-H Q15's keyed read of ONE supplier paid 54 ms for three 100k-row text columns. Measured (server,
+# values_at_rows vs values, equal after _pyval): inline text (mode 5) is cheaper at every share up to half the rows
+# (s_name: 1 row 0.00 ms, 1,000 0.21, 6,250 1.33, 50,000 11.2 vs whole 16.6; c_name 750k of 1.5M 207 vs 281);
+# dictionary columns win only while few (o_totalprice: 1,000 rows 0.33 ms vs whole 151, 937k rows 473) -- hence a
+# half for text and 1/256 for the rest. WDB_ROWS_AT=0: whole columns as before.
+_ROWS_AT = [__import__('os').environ.get('WDB_ROWS_AT', '1') == '1']
+_ROWS_AT_TEXT_DIV = 2
+_ROWS_AT_DICT_DIV = 256
+_ROWS_AT_HITS = [0]
+
+
+def _rows_at_ok(seg, c, k, N):
+    """read column c at k of N rows (values_at_rows) instead of whole (THE ROWS ASKED FOR)"""
+    mode = (seg.cols.get(c) or {}).get('mode')
+    return k * (_ROWS_AT_TEXT_DIV if mode == 5 else _ROWS_AT_DICT_DIV) <= N
+
+
 def execute(seg: Segment, sql: str, col_map=None, tree=None):
     """col_map: optional {sql_name -> segment_name}; default identity.
     tree: optional pre-parsed sqlglot AST -- lets the router reuse its parse (no second parse)."""
@@ -1345,7 +1363,20 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
             if early and (lim is not None or off):
                 idx = idx[off: off + lim] if lim is not None else idx[off:]
             out = []
-            colvals = {c: seg.values(c) for c in cols if c is not None}
+            # THE ROWS ASKED FOR: a column read at the selected rows, or whole (see _rows_at_ok)
+            _at9 = {}
+            colvals = {}
+            for c in dict.fromkeys(x for x in cols if x is not None):
+                if _ROWS_AT[0] and _rows_at_ok(seg, c, len(idx), N):
+                    try:
+                        _at9[c] = seg.values_at_rows(c, idx)          # emission-ready values, aligned to idx
+                        continue
+                    except Exception:
+                        pass
+                colvals[c] = seg.values(c)
+            _ROWS_AT_HITS[0] += 1 if _at9 else 0
+            def _cv9(c, k, i):
+                return _at9[c][k] if c in _at9 else _pyval(colvals[c][i])
             if _exprs9:
                 # EXPRESSION PROJECTIONS in a row select (v1 - 3.0 AS dev): the row evaluator at idx
                 _m9 = np.zeros(N, bool); _m9[idx] = True
@@ -1359,9 +1390,9 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
                         if _ev9[j].ndim == 0:      # a constant (no column under it): the same value
                             _ev9[j] = np.full(len(idx), _ev9[j].item(), dtype=object)   # for every row
                 for k, i in enumerate(idx):
-                    out.append(tuple((_pyval(_ev9[j][k]) if j in _ev9 else _pyval(colvals[cols[j]][i])) for j in range(len(_inner9))))
+                    out.append(tuple((_pyval(_ev9[j][k]) if j in _ev9 else _cv9(cols[j], k, i)) for j in range(len(_inner9))))
             else:
-                for i in idx: out.append(tuple(_pyval(colvals[c][i]) for c in cols))
+                for k, i in enumerate(idx): out.append(tuple(_cv9(c, k, i) for c in cols))
             if distinct:                                           # SELECT DISTINCT -> dedup (order-preserving)
                 seen = set(); ded = []
                 for r in out:
