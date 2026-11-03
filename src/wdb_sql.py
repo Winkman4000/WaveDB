@@ -1356,6 +1356,8 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
                             _ev9[j] = np.asarray(_eval_rows(seg, n, _m9, seg_col), dtype=object)
                         except TypeError as _te:
                             raise NotImplementedError('row projection: %s' % str(_te)[:60])
+                        if _ev9[j].ndim == 0:      # a constant (no column under it): the same value
+                            _ev9[j] = np.full(len(idx), _ev9[j].item(), dtype=object)   # for every row
                 for k, i in enumerate(idx):
                     out.append(tuple((_pyval(_ev9[j][k]) if j in _ev9 else _pyval(colvals[cols[j]][i])) for j in range(len(_inner9))))
             else:
