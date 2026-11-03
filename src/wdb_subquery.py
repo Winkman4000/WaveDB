@@ -513,6 +513,74 @@ def _corr_eq(sel, outer_names, inner_cols=None):
     return None if corr is None else (corr[0], corr[1], rest)
 
 
+# THE JOIN'S OWN SCALARS (2026-11-02, TPC-H Q11): rewrite() substitutes uncorrelated WHERE subqueries, but only the
+# single-table path reached it -- every join query went to the join engine first and a scalar subquery in its
+# comparison failed there ('float() ... not Select'). join_scalars: in a join query's WHERE and HAVING, each scalar
+# subquery under a comparison whose columns all belong to its own FROM tables (uncorrelated -- a correlated one, like
+# Q17's, is left for the join engine's value per key) runs alone through the full pipeline; one row, one column ->
+# its value as a literal; no row (or NULL) -> the comparison is FALSE (a NULL comparison is not true); more rows ->
+# left alone. WDB_JOIN_SCALARS=0: off. _JOIN_SCALARS_HITS: diagnostic (tests read it).
+import os as _os
+_JOIN_SCALARS = [_os.environ.get('WDB_JOIN_SCALARS', '1') == '1']
+_JOIN_SCALARS_HITS = [0]
+_CMP9 = (E.GT, E.GTE, E.LT, E.LTE, E.EQ, E.NEQ)
+
+
+def _uncorrelated(db, sel):
+    """every column of sel belongs to sel's own FROM / JOIN tables (no nested SELECT)"""
+    if not isinstance(sel, E.Select) or any(x is not sel for x in sel.find_all(E.Select)):
+        return False
+    f = sel.args.get('from_') or sel.args.get('from')
+    if f is None:
+        return False
+    tabs = [f.this] + [j.this for j in (sel.args.get('joins') or [])]
+    if not all(isinstance(t, E.Table) for t in tabs):
+        return False
+    quals, cols = set(), set()
+    for t in tabs:
+        quals.add(t.alias_or_name); quals.add(t.name)
+        try:
+            cols |= set(db.cat.column_names(t.name))
+        except Exception:
+            return False
+    for c in sel.find_all(E.Column):
+        if c.table:
+            if c.table not in quals: return False
+        elif c.name not in cols:
+            return False
+    return True
+
+
+def join_scalars(db, tree):
+    """THE JOIN'S OWN SCALARS: the rewritten SQL with each uncorrelated scalar in WHERE / HAVING as a literal, or None."""
+    if not _JOIN_SCALARS[0] or not tree.args.get('joins'):
+        return None
+    t = tree.copy()
+    changed = False
+    for key in ('where', 'having'):
+        node = t.args.get(key)
+        if node is None:
+            continue
+        for sub in list(node.find_all(E.Subquery)):
+            par = sub.parent
+            if par is None or type(par) not in _CMP9 or not _uncorrelated(db, sub.this):
+                continue
+            out = db.run(sub.this.sql())
+            rows = out[0] if isinstance(out, tuple) else out
+            if len(rows) > 1 or (rows and len(rows[0]) != 1):
+                continue
+            v = rows[0][0] if rows else None
+            if v is None:
+                par.replace(E.false())
+            else:
+                sub.replace(_lit(v))
+            changed = True
+    if not changed:
+        return None
+    _JOIN_SCALARS_HITS[0] += 1
+    return t.sql()
+
+
 def _try_window_decorrelate(db, tree):
     """x <cmp> (SELECT AGG(y) FROM <same table> t2 WHERE t2.g = outer.g) as the WHOLE WHERE
     -> the window read: QUALIFY x <cmp> AGG(y) OVER (PARTITION BY g). Self-joins become one

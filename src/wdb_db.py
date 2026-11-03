@@ -768,6 +768,10 @@ class Database:
                 sql = tree.sql()
             if tree.args.get('joins'):
                 import os as _os9
+                import wdb_subquery as _wsq9
+                _js9 = _wsq9.join_scalars(self, tree)             # THE JOIN'S OWN SCALARS (Q11)
+                if _js9 is not None:
+                    return self._run_impl(_js9, escalate)
                 import wdb_segparts
                 if wdb_segparts.multi_segment_tables(self, tree):
                     try:
