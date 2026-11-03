@@ -146,6 +146,153 @@ def _flatten_once(outer, cte_sel):
     return cte_sel
 
 
+# THE WITH READ TWICE, RUN ONCE (2026-11-02, TPC-H Q15): WITH c AS (body) SELECT ... FROM base, c WHERE base.k = c.ck
+# AND c.v = (SELECT MAX(v) FROM c) [AND conditions on base only] -- c is read twice (joined, and inside the
+# scalar), so it cannot flatten. Steps: (1) run the body once (its rows live for this query only); (2) the scalar
+# reads only those rows: the largest (or smallest) v; (3) keep the body rows whose v equals it -- our own values
+# compared with each other, so the equality is exact; (4) the outer becomes a read of base alone: WHERE base.k IN
+# (the kept keys) and base's own conditions, c.ck -> base.k, c.v -> the extreme as a literal (named as before);
+# ORDER / LIMIT unchanged. Any other use of c, another c column, or an outer join shape: None (as before).
+# WDB_CTE_ONCE=0: off. _CTE_ONCE_HITS: diagnostic (tests read it).
+import os as _os
+_CTE_ONCE = [_os.environ.get('WDB_CTE_ONCE', '1') == '1']
+_CTE_ONCE_HITS = [0]
+
+
+def _unalias(p):
+    return p.this if isinstance(p, E.Alias) else p
+
+
+def once_rewrite(db, tree):
+    """THE WITH READ TWICE, RUN ONCE: the rewritten outer SQL, or None (not this shape)."""
+    if not _CTE_ONCE[0]:
+        return None
+    w = _with_arg(tree)
+    if w is None or len(w.expressions) != 1 or w.args.get('recursive'):
+        return None
+    cte = w.expressions[0]
+    C = cte.alias
+    body = cte.this
+    if not isinstance(body, E.Select):
+        return None
+    amap, star = _alias_map(body)
+    if amap is None or star:
+        return None
+    cnames = [p.alias if isinstance(p, E.Alias) else p.name for p in body.expressions]
+    outer = tree.copy()
+    outer.set('with_', None)
+    outer.set('with', None)
+    f = _from_arg(outer)
+    joins = outer.args.get('joins') or []
+    if f is None or len(joins) != 1:
+        return None
+    j = joins[0]
+    if j.args.get('on') or j.args.get('using') or j.args.get('side') or j.args.get('kind'):
+        return None                                     # comma join only: the WHERE carries the key
+    tabs = [f.this, j.this]
+    if not all(isinstance(t, E.Table) for t in tabs):
+        return None
+    names = [t.name for t in tabs]
+    if names.count(C) != 1:
+        return None
+    ct = tabs[names.index(C)]
+    bt = tabs[1 - names.index(C)]
+    calias, balias = ct.alias_or_name, bt.alias_or_name
+    try:
+        base_cols = set(db.cat.column_names(bt.name))
+    except Exception:
+        return None
+    def is_c(col):
+        return col.table == calias or (not col.table and col.name in cnames and col.name not in base_cols)
+    def is_b(col):
+        return col.table == balias or (not col.table and col.name in base_cols and col.name not in cnames)
+    wh = outer.args.get('where')
+    if wh is None:
+        return None
+    key_eq = None; ext = None; rest = []
+    for c in _conjuncts(wh.this):
+        if isinstance(c, E.EQ) and isinstance(c.this, E.Column) and isinstance(c.expression, E.Column):
+            a, b = c.this, c.expression
+            if is_b(a) and is_c(b) and key_eq is None:
+                key_eq = (a, b.name); continue
+            if is_c(a) and is_b(b) and key_eq is None:
+                key_eq = (b, a.name); continue
+        if isinstance(c, E.EQ) and ext is None:
+            hit = None
+            for x, y in ((c.this, c.expression), (c.expression, c.this)):
+                if isinstance(x, E.Column) and is_c(x) and isinstance(y, E.Subquery):
+                    s = y.this
+                    if (isinstance(s, E.Select) and len(s.expressions) == 1 and _table_name(s) == C
+                            and not any(s.args.get(k) for k in ('where', 'joins', 'group', 'having', 'limit', 'order'))):
+                        ag = _unalias(s.expressions[0])
+                        if isinstance(ag, (E.Max, E.Min)) and isinstance(ag.this, E.Column) and ag.this.name == x.name:
+                            hit = (x.name, isinstance(ag, E.Max))
+                if hit: break
+            if hit:
+                ext = hit; continue
+        cols = list(c.find_all(E.Column))
+        if c.find(E.Select) is None and cols and all(is_b(x) for x in cols):
+            rest.append(c); continue
+        return None
+    if key_eq is None or ext is None:
+        return None
+    bkey, ckey = key_eq
+    vname, is_max = ext
+    order = outer.args.get('order')
+    for nd in list(outer.expressions) + ([order] if order is not None else []):
+        for col in nd.find_all(E.Column):
+            if is_c(col):
+                if col.name not in (ckey, vname): return None
+            elif not is_b(col):
+                return None
+    # (1) the body, once
+    out = db.run(body.sql())
+    rows = out[0] if isinstance(out, tuple) else out
+    if not rows or len(rows[0]) != len(cnames):
+        return None
+    iv, ik = cnames.index(vname), cnames.index(ckey)
+    vals = [r[iv] for r in rows if r[iv] is not None]
+    if not vals:
+        return None
+    # (2) the extreme, (3) the keys whose value equals it
+    target = max(vals) if is_max else min(vals)
+    keys = list(dict.fromkeys(r[ik] for r in rows if r[iv] == target))
+    if not keys or any(k is None for k in keys):
+        return None
+    # (4) the outer over base alone
+    def _lit(v):
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return E.Literal.number(repr(v) if isinstance(v, float) else v)
+        return E.Literal.string(str(v))
+    new = outer.copy()
+    new.set('joins', None)
+    new.set('from_', E.From(this=bt.copy()))
+    new.set('from', None)
+    exprs = []
+    for p in new.expressions:
+        nm = p.alias_or_name
+        inner = _unalias(p)
+        if isinstance(inner, E.Column) and is_c(inner):
+            rep = _lit(target) if inner.name == vname else bkey.copy()
+            exprs.append(E.Alias(this=rep, alias=E.Identifier(this=nm, quoted=False)))
+            continue
+        for col in list(inner.find_all(E.Column)):
+            if is_c(col):
+                col.replace(_lit(target) if col.name == vname else bkey.copy())
+        exprs.append(p)
+    new.set('expressions', exprs)
+    if new.args.get('order') is not None:
+        for col in list(new.args['order'].find_all(E.Column)):
+            if is_c(col):
+                col.replace(_lit(target) if col.name == vname else bkey.copy())
+    cond = E.In(this=bkey.copy(), expressions=[_lit(k) for k in keys])
+    for r in rest:
+        cond = E.And(this=cond, expression=r.copy())
+    new.set('where', E.Where(this=cond))
+    _CTE_ONCE_HITS[0] += 1
+    return new.sql()
+
+
 def _is_agg(p):
     import wdb_sql
     return wdb_sql._agg_kind(p) is not None

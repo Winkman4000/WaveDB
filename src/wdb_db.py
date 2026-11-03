@@ -761,6 +761,9 @@ class Database:
             if wdb_literal.references_only_literals(tree, _is_stored9):
                 return wdb_literal.run_literal(tree)       # LITERAL RELATIONS: no stored table touched
             if wdb_cte.has_cte(tree):
+                _once9 = wdb_cte.once_rewrite(self, tree)     # THE WITH READ TWICE, RUN ONCE (Q15)
+                if _once9 is not None:
+                    return self._run_impl(_once9, escalate)
                 tree = wdb_cte.rewrite(tree)      # flatten views before anything resolves
                 sql = tree.sql()
             if tree.args.get('joins'):
