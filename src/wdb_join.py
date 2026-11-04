@@ -4259,6 +4259,17 @@ def _exact_walk9(sp9, proj, ix9, col_results, present, resolve, rows9, gkeys):
     return keep9
 
 
+def join_rows(db, tree):
+    """THE PROJECTION DOOR's survivors: {'rows': the fact rows the WHERE keeps, in row order, 'resolve': column ->
+    (segment, physical column, road or None)} for a pointer-chain join whose WHERE the cascade spends whole; raises
+    _FastUnsupported otherwise. The tree is copied (the chain builder strips the join equalities it consumes)."""
+    t2 = tree.copy()
+    chain = _build_chain(db, t2)
+    if chain is None:
+        raise _FastUnsupported
+    return _fast_pointer_agg(db, t2, chain, rows_only=True)
+
+
 def _same_rows_mask9(db, tree, proj, col_results, present, resolve=None, rows9=None, gkeys=None):
     """THE SAME ROWS, ONE WALK: the HAVING's same-rows subquery answered from the outer's own group sums -- the total
     of the present groups' SUM, the subquery's arithmetic, the comparison -- or None (the join's own scalars decide)."""
@@ -4390,7 +4401,7 @@ def _slice_scalar_agg(group_keys, inputs, exprs, mask, n, pred, offsets):
     return counts, [(sums[e], None, None) for e in range(len(exprs))]
 
 
-def _fast_pointer_agg(db, tree, ctx, columnar=False):
+def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
     import operator
     import time as _t9
     _tk9 = _t9.perf_counter
@@ -4441,6 +4452,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
         cols = [(p.this if isinstance(p, E.Alias) else p) for p in proj]      # SELECT DISTINCT cols == GROUP BY cols
         if not all(isinstance(c, E.Column) for c in cols): raise _FastUnsupported  # DISTINCT * / over expr
         gnodes = cols
+    elif not has_agg and rows_only:
+        gnodes = []                                                           # THE PROJECTION DOOR: survivors only
     elif not has_agg:
         raise _FastUnsupported                                                # plain projection -> fallback
     else:
@@ -5505,6 +5518,12 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False):
                 import traceback as _tbc9
                 print('CASCADE-DECLINED:', repr(_cex9)[:100], flush=True); _tbc9.print_exc()
             rows9 = None; _where_spent = False
+    if rows_only:                            # THE PROJECTION DOOR: the survivors + what the cascade left unjudged
+        if rows9 is None:
+            raise _FastUnsupported
+        _bump_fast()
+        return {'rows': np.asarray(rows9), 'resolve': resolve, 'fact': fact,
+                'left': [] if _where_spent else list(locals().get('_cres_left9') or [])}
     _plane_mask9 = None
     _resid_c9X = None
     _cres_left9 = locals().get('_cres_left9', [])

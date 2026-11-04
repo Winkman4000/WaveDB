@@ -769,6 +769,10 @@ class Database:
             if tree.args.get('joins'):
                 import os as _os9
                 import wdb_subquery as _wsq9
+                import wdb_projdoor as _wpd9
+                _pd9 = _wpd9.try_door(self, tree)                 # THE PROJECTION DOOR (Q2)
+                if _pd9 is not None:
+                    return _pd9
                 _srs9 = _wsq9.same_rows_spec(self, tree)          # THE SAME ROWS, ONE WALK (Q11)
                 if _srs9 is not None:
                     _h9 = _wsq9._SAME_ROWS_HITS[0]
