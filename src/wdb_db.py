@@ -882,6 +882,8 @@ class Database:
                         rows = [r[:drop] + r[drop + 1:] for r in rows]   # legacy paths that
                         hdr = hdr[:drop] + hdr[drop + 1:]                # still emit the helper
                     return rows, hdr
+                import wdb_runwalk                        # THE RUN WALK (Q4): [NOT] EXISTS over a child
+                wdb_runwalk.rewrite(self, tree)           # stored by its key -> a per-row verdict
                 tree = wdb_subquery.rewrite(self, tree)   # in-tree: no sql-text roundtrip
                 sql = tree.sql()                          # for reads that consume raw sql
             cmap = {c: phys.get(c, c) for c in self.cat.column_names(name)}  # complete logical->physical
