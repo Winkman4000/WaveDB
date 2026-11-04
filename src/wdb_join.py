@@ -1396,6 +1396,12 @@ def has_expr_group(tree):
     return False
 
 
+_AGG_ORDER = [__import__('os').environ.get('WDB_AGG_ORDER', '1') == '1']      # step 1: ORDER BY after the arithmetic
+_AGG_KEYCOL = [__import__('os').environ.get('WDB_AGG_KEYCOL', '1') == '1']    # step 2: a computed key rides as a column
+_AGG_ORDER_HITS = [0]
+_AGG_KEYCOL_HITS = [0]
+
+
 def _agg_expr_rewrite(db, tree):
     """AGGREGATE ARITHMETIC (Q14's Div-of-Sums): a projection combining
     aggregates with +-*/ and literals runs as hidden aggregate aliases
@@ -1415,7 +1421,14 @@ def _agg_expr_rewrite(db, tree):
         elif not _plain(nd) and nd.find(*_AGG) is not None:
             need = True
     if not need: return None
-    if tree.args.get('order') is not None or tree.args.get('having') is not None: return None
+    if tree.args.get('having') is not None: return None
+    _ord9 = tree.args.get('order')
+    if _ord9 is not None:
+        if not _AGG_ORDER[0] or tree.args.get('offset') is not None: return None
+        try:
+            wdb_sql._apply_order([], proj, _ord9)       # every ORDER item names a projection (decline before work)
+        except NotImplementedError:
+            return None
     grp = tree.args.get('group')
     hidden = []          # (alias, node)
     def _hoist(nd):
@@ -1453,6 +1466,14 @@ def _agg_expr_rewrite(db, tree):
         elif isinstance(nd, _AGG):
             al = '__agg%d' % len(hidden); hidden.append((al, nd.copy()))
             outer.append(('hid', al))
+        elif (_AGG_KEYCOL[0] and nd.find(*_AGG) is None
+              and not any(c9.name.startswith('__med') for c9 in nd.find_all(E.Column))):
+            # A COMPUTED KEY (Q8's o_orderdate / 365 AS o_year): no aggregate inside, so it is one value per
+            # group -- the hidden query computes it as its own column under the same alias
+            _AGG_KEYCOL_HITS[0] += 1
+            al9k = p.alias if isinstance(p, E.Alias) else '__key%d' % len(new_exprs)
+            outer.append(('col', len(new_exprs)))
+            new_exprs.append(E.Alias(this=nd.copy(), alias=E.Identifier(this=al9k, quoted=False)))
         else:
             outer.append(('expr', _hoist(nd)))
     for al, nd in hidden:
@@ -1467,6 +1488,8 @@ def _agg_expr_rewrite(db, tree):
             if not any((e.alias_or_name == g9) for e in new_exprs):
                 new_exprs.append(E.Column(this=E.Identifier(this=g9, quoted=False)))
     st.set('expressions', new_exprs)
+    if _ord9 is not None:
+        st.set('order', None); st.set('limit', None)    # sorted and cut after the arithmetic
     rows = join_query(db, st.sql(dialect='duckdb'))
     rows = rows[0] if isinstance(rows, tuple) else rows
     names = [e.alias_or_name for e in new_exprs]
@@ -1500,6 +1523,11 @@ def _agg_expr_rewrite(db, tree):
             elif kind == 'hid': row.append(rec[names.index(x)])
             else: row.append(ev(x, rec))
         out.append(tuple(row))
+    if _ord9 is not None:
+        _AGG_ORDER_HITS[0] += 1
+        out = wdb_sql._apply_order(out, proj, _ord9)
+        lim9 = wdb_sql._limit(tree)
+        if lim9 is not None: out = out[:lim9]
     return out
 
 
@@ -3777,9 +3805,34 @@ def _mask(df, node, R):
     raise NotImplementedError(f"join WHERE: {type(node).__name__}")
 
 
+_PANDAS_KEYEXPR = [__import__('os').environ.get('WDB_PANDAS_KEYEXPR', '1') == '1']
+_PANDAS_KEYEXPR_HITS = [0]
+
+
 def _aggregate(merged, proj, group, R):
     _PF = {'SUM': 'sum', 'AVG': 'mean', 'MIN': 'min', 'MAX': 'max', 'COUNT': 'count'}
     specs = []  # per projection: ('key', col) | ('size',) | ('agg', fn, col)
+    # A COMPUTED KEY (o_orderdate / 365 AS o_year): evaluated ONCE into its own column; the projection and the
+    # GROUP BY (by the expression or by the alias) read that column. A table column of the same name wins (SQL).
+    _alias9k = {p.alias: p.this for p in proj if isinstance(p, E.Alias)}
+    _keysyn9 = {}
+    def _keycol9(nd):
+        if isinstance(nd, E.Column):
+            try:
+                return R(nd)
+            except _FastUnsupported:
+                if (not _PANDAS_KEYEXPR[0] or nd.table or nd.name not in _alias9k
+                        or isinstance(_alias9k[nd.name], E.Column)):
+                    raise
+                nd = _alias9k[nd.name]
+        if isinstance(nd, E.Column) or not _PANDAS_KEYEXPR[0]:
+            return R(nd)
+        k9 = nd.sql()
+        if k9 not in _keysyn9:
+            _keysyn9[k9] = '_key%d' % len(_keysyn9)
+            merged[_keysyn9[k9]] = _eval_expr(merged, nd, R)
+            _PANDAS_KEYEXPR_HITS[0] += 1
+        return _keysyn9[k9]
     for i, p in enumerate(proj):
         inner = p.this if isinstance(p, E.Alias) else p
         kind = wdb_sql._agg_kind(p)
@@ -3803,7 +3856,7 @@ def _aggregate(merged, proj, group, R):
                 amap9[id(an9)] = syn9
             specs.append(('compose', inner, amap9))
         elif kind is None:
-            specs.append(('key', R(inner)))
+            specs.append(('key', _keycol9(inner)))
         elif kind[0] == 'COUNT_STAR':
             specs.append(('size',))
         else:
@@ -3815,7 +3868,7 @@ def _aggregate(merged, proj, group, R):
                 merged[syn9] = _eval_expr(merged, arg9, R)
                 specs.append(('agg', kind[0], syn9))
     if group is not None:
-        key_cols = [R(g) for g in group.expressions]
+        key_cols = [_keycol9(g) for g in group.expressions]
         g = merged.groupby(key_cols, sort=False, dropna=False)
         named = {(s[3] if len(s) > 3 else f"_a{i}"): pd.NamedAgg(column=s[2], aggfunc=_PF[s[1]])
                  for i, s in enumerate(specs) if s[0] == 'agg'}
