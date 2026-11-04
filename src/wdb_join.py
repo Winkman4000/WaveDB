@@ -4454,6 +4454,10 @@ def _slice_scalar_agg(group_keys, inputs, exprs, mask, n, pred, offsets):
     return counts, [(sums[e], None, None) for e in range(len(exprs))]
 
 
+_PARENT_LIKE = [__import__('os').environ.get('WDB_PARENT_LIKE', '1') == '1']
+_PARENT_LIKE_HITS = [0]
+
+
 def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
     import operator
     import time as _t9
@@ -5217,6 +5221,22 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
                     kx9 = np.zeros(V9 + 1, bool)
                     _cd9x = np.asarray(cn.args['_codes'], dtype=np.int64)
                     kx9[_cd9x[(_cd9x >= 0) & (_cd9x < V9)]] = True
+                    td9 = None
+                elif (_PARENT_LIKE[0] and type(cn) is E.Like and c9.get('mode') == 5 and int(cs9.N) > 4096
+                      and isinstance(cn.expression, E.Literal) and cn.expression.is_string
+                      and next((q9 for q9, m9 in cs9.cols.items() if m9.get('mode') == 4), None) is not None):
+                    # THE PARENT'S LIKE PER ROW (c124): judged on the stored bytes, per row of the parent; the verdict stands on the
+                    # parent's identity column (code == row) so the keep + road below carry it unchanged
+                    _rk9 = wdb_sql._like_mode5(cs9, cp9, str(cn.expression.this), False)
+                    if _rk9 is None:
+                        _cres9.append(cn); continue
+                    if c9.get('has_null'):
+                        _rk9 = _rk9 & ~wdb_sql._mode5_null(cs9, cp9)
+                    cp9 = next(q9 for q9, m9 in cs9.cols.items() if m9.get('mode') == 4)
+                    c9 = cs9.cols[cp9]
+                    V9 = int(cs9.N)
+                    kx9 = np.zeros(V9 + 1, bool); kx9[:V9] = np.asarray(_rk9, bool)
+                    _PARENT_LIKE_HITS[0] += 1
                     td9 = None
                 elif c9.get('mode') == 5 and int(cs9.N) <= 4096 and c9.get('dt') == 1 and not c9.get('has_null'):
                     # TINY MODE-5 DIM (nation names): the sorted inline dict is
@@ -6592,6 +6612,18 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
             if cseg.cols[cpcol]['dt'] != 1: raise _FastUnsupported
             pat = node.expression
             if not isinstance(pat, E.Literal) or not pat.is_string: raise _FastUnsupported
+            _c9m = cseg.cols[cpcol]
+            if (_PARENT_LIKE[0] and cptr is not None and not isinstance(node, E.ILike) and _c9m.get('mode') == 5
+                    and not RT.code_lut_fits(int(_c9m.get('V') or 0))):
+                # THE PARENT'S LIKE PER ROW (c124), in the pred: verdict table over the parent's rows, codes = row numbers
+                _rk9 = wdb_sql._like_mode5(cseg, cpcol, str(pat.this), False)
+                if _rk9 is not None:
+                    if _c9m.get('has_null'): _rk9 = _rk9 & ~wdb_sql._mode5_null(cseg, cpcol)
+                    _PARENT_LIKE_HITS[0] += 1
+                    _ids9 = np.arange(int(cseg.N), dtype=np.int64)
+                    slot_list.append((np.asarray(_rk9, dtype=np.int8), _ids9, np.ascontiguousarray(_rw9(cptr))))
+                    vk = f"v{len(slot_list) - 1}"
+                    return f"({vk} == 0)" if node.args.get('negate') else f"({vk} != 0)"
             vk = _code_lut(cseg, cpcol, cptr, _like_fn(cseg, cpcol, pat, isinstance(node, E.ILike)))
             return f"({vk} == 0)" if node.args.get('negate') else f"({vk} != 0)"   # NOT LIKE -> negate=True
         if isinstance(node, E.Is):                        # IS NULL (IS NOT NULL handled via E.Not)
