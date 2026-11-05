@@ -28,6 +28,30 @@ except Exception:
 _NT = min(8, os.cpu_count() or 1)
 _ISOLATED = [True]                # A/B switch: False sends every shape to the generator
 _CACHE = {}                       # (body, slot_gathered, group_gathered, has_mask, need_minmax) -> kernel
+_LIFT = [os.environ.get('WDB_JIT_LIFT', '1') == '1']
+_LIFT_HITS = [0]
+_NUM9 = re.compile(r'(?<![\w.])(\d+\.\d*(?:[eE][-+]?\d+)?|\d+(?:[eE][-+]?\d+)?)(?![\w.])')
+
+
+def _lift9(bodies, pred):
+    """ONE COMPILE PER SHAPE (c125): every number in the bodies and the predicate becomes an argument L<j>; returns the lifted
+    bodies, the lifted pred and the constants (int or float, in order of appearance)."""
+    if not _LIFT[0]:
+        return bodies, pred, ()
+    consts = []
+    def sub(x):
+        def r(m):
+            t = m.group(1)
+            consts.append(float(t) if ('.' in t or 'e' in t or 'E' in t) else int(t))
+            return 'L%d' % (len(consts) - 1)
+        return _NUM9.sub(r, x)
+    nb = tuple(sub(b) for b in bodies)
+    if isinstance(pred, tuple):
+        npd = tuple(sub(p9) for p9 in pred)
+    else:
+        npd = sub(pred) if pred else pred
+    if consts: _LIFT_HITS[0] += 1
+    return nb, npd, tuple(consts)
 
 
 def _build(body, slot_gathered, gk_gathered, nkeys, has_mask, need_minmax):
@@ -128,13 +152,13 @@ def grouped_expr(group_keys, body, inputs, mask, n, need_minmax):
 
 
 def _build_multi(bodies, mm_flags, slot_gathered, slot_code, gk_gathered, nkeys, has_mask, pred,
-                 mono=False):
+                 mono=False, ckinds=()):
     """Compile a kernel that, in ONE pass, composes the group code inline, decodes the shared value slots
     once, and accumulates EVERY value expression (count + per-expr sum, and min/max where flagged).
     bodies: tuple of numba-source expressions over global slots v0..v{G-1}; mm_flags: per-expr need_minmax.
     pred: a boolean expression over the same slots (WHERE fused inline); '' for none. When present, the
     predicate's slots are decoded first and a failing row is skipped before any other slot is decoded."""
-    key = (bodies, mm_flags, slot_gathered, slot_code, gk_gathered, nkeys, has_mask, pred, mono)
+    key = (bodies, mm_flags, slot_gathered, slot_code, gk_gathered, nkeys, has_mask, pred, mono, ckinds)
     fn = _CACHE.get(key)
     if fn is not None:
         return fn
@@ -153,6 +177,7 @@ def _build_multi(bodies, mm_flags, slot_gathered, slot_code, gk_gathered, nkeys,
     params += ['K', 'NT', 'Kp']
     if has_mask:
         params.append('mask')
+    params += ['L%d' % j for j in range(len(ckinds))]
 
     def gkexpr(j): return f'gk{j}[gp{j}[i]]' if gk_gathered[j] else f'gk{j}[i]'
 
@@ -263,8 +288,9 @@ def grouped_multi(group_keys, inputs, exprs, mask, n, pred=None, mono=False):
         if n >= (1 << 22):
             return wdb_kernels.bincount_par(codes, K)[:K].astype(np.int64, copy=False), []
         return wdb_kernels.count_codes(np.ascontiguousarray(codes), np.int64(K)), []
-    fn = _build_multi(bodies, mm_flags, slot_gathered, slot_code, gk_gathered, nkeys, has_mask, pred or '',
-                      mono=mono)
+    bodies, _pl9, _cs9 = _lift9(bodies, pred or '')
+    fn = _build_multi(bodies, mm_flags, slot_gathered, slot_code, gk_gathered, nkeys, has_mask, _pl9,
+                      mono=mono, ckinds=tuple(type(c).__name__ for c in _cs9))
 
     args = [n]
     for (codes, _ki, ptr) in group_keys:
@@ -278,6 +304,7 @@ def grouped_multi(group_keys, inputs, exprs, mask, n, pred=None, mono=False):
         if ptr is not None: args.append(np.ascontiguousarray(ptr))
     args += [K, _NT, Kp]
     if has_mask: args.append(mask)
+    args += list(_cs9)
 
     res = fn(*args)
     if mono:
@@ -309,10 +336,10 @@ def grouped_multi(group_keys, inputs, exprs, mask, n, pred=None, mono=False):
 # SUM over 6M rows. A prange reduction with register/scalar accumulators is ~11x faster (0.5ms) and
 # beats DuckDB. This path handles COUNT + SUM (and AVG via sum/count); MIN/MAX stay on grouped_multi.
 
-def _build_scalar(bodies, slot_gathered, slot_code, has_mask, pred):
+def _build_scalar(bodies, slot_gathered, slot_code, has_mask, pred, ckinds=()):
     """Codegen a one-pass prange reduction: optional fused predicate, then COUNT + each SUM body,
     accumulated in scalar reduction variables (no per-group arrays). Returns (cnt, s0, s1, ...)."""
-    key = ('scalar', bodies, slot_gathered, slot_code, has_mask, pred)
+    key = ('scalar', bodies, slot_gathered, slot_code, has_mask, pred, ckinds)
     fn = _CACHE.get(key)
     if fn is not None:
         return fn
@@ -323,6 +350,7 @@ def _build_scalar(bodies, slot_gathered, slot_code, has_mask, pred):
         params.append(f'c{k}')
         if slot_gathered[k]: params.append(f'p{k}')
     if has_mask: params.append('mask')
+    params += ['L%d' % j for j in range(len(ckinds))]
 
     def _decode(k, ind):
         idx = f'c{k}[p{k}[i]]' if slot_gathered[k] else f'c{k}[i]'
@@ -370,13 +398,16 @@ def scalar_multi(inputs, exprs, mask, n, pred=None):
     slot_code     = tuple(inp[0] is None for inp in inputs)
     bodies        = tuple(e[0] for e in exprs)
     has_mask = mask is not None                      # mask ALWAYS gates; pred follows
-    fn = _build_scalar(bodies, slot_gathered, slot_code, has_mask, pred or '')
+    bodies, _pl9, _cs9 = _lift9(bodies, pred or '')
+    fn = _build_scalar(bodies, slot_gathered, slot_code, has_mask, _pl9,
+                       ckinds=tuple(type(c).__name__ for c in _cs9))
     args = [n]
     for (base, codes, ptr) in inputs:
         if base is not None: args.append(base)
         args.append(codes)
         if ptr is not None: args.append(np.ascontiguousarray(ptr))
     if has_mask: args.append(mask)
+    args += list(_cs9)
     res = fn(*args)
     counts = np.array([res[0]], dtype=np.int64)
     out = [(np.array([res[1 + e]], dtype=np.float64), None, None) for e in range(len(bodies))]
