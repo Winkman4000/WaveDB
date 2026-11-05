@@ -183,6 +183,49 @@ def _pair_parent(db, ptbl, pseg, pcols):
     return None
 
 
+# THE DISTINCT COUNT IN SLICES (c127, TPC-H Q16): grouped COUNT(DISTINCT col) when the group keys come from a parent
+# table, or the (groups x values) grid is too big: each survivor is placed in its group's slice in one pass (a counting
+# sort by group number), then each group's slice is sorted -- in parallel, slices are short (Q16: ~43 rows) -- and its
+# distinct values counted. WDB_GCD_SLICES=0: off (the old grid-only lane).
+_GCD_SLICES = [os.environ.get('WDB_GCD_SLICES', '1') == '1']
+_GCD_SLICES_HITS = [0]
+_GCD_K_MAX = 1 << 26
+
+
+@_njit_pair(parallel=True, cache=True, nogil=True)
+def _gcd_slices(gid, v, K, nullc):
+    """rows per group and distinct non-null values per group; gid in [0, K), v the value codes (nullc: the null code,
+    -1 when none)"""
+    m = gid.shape[0]
+    cnt = np.zeros(K, np.int64)
+    for i in range(m):
+        cnt[gid[i]] += 1
+    st = np.zeros(K + 1, np.int64)
+    for g in range(K):
+        st[g + 1] = st[g] + cnt[g]
+    pos = st[:K].copy()
+    buf = np.empty(m, np.int64)
+    for i in range(m):
+        g = gid[i]
+        buf[pos[g]] = v[i]
+        pos[g] += 1
+    dist = np.zeros(K, np.int64)
+    for g in _prange_pair(K):
+        a = st[g]; b = st[g + 1]
+        if b > a:
+            sl = np.sort(buf[a:b])
+            c = 0
+            have = False
+            prev = 0
+            for x in sl:
+                if x == nullc:
+                    continue
+                if (not have) or x != prev:
+                    c += 1; prev = x; have = True
+            dist[g] = c
+    return cnt, dist
+
+
 class _PairRoad(_LazyRoad):
     """fact row -> parent row through the pair: the child's two keys at the asked rows, probed in the parent's runs.
     inner: the child's own road from the fact (None when the child IS the fact)."""
@@ -3543,6 +3586,8 @@ def join_query(db, sql, columnar=False):
     # THE COUNT INSTEAD OF THE SEARCH (2026-10-04, Q21): [NOT] EXISTS(same group, other x, P) becomes a per-row
     # verdict over the outer alias's table -- a WDB_ROWMASK placeholder build_pred and mask_eval read as a slot
     wdb_groupexists.rewrite(db, tree)
+    import wdb_insub                       # [NOT] IN (uncorrelated subquery) -> a code-set filter (Q16)
+    wdb_insub.rewrite(db, tree)
 
     if tree.find(E.Window) is not None and not (tree.args.get('from') or tree.args.get('from_')).this.__class__.__name__ == 'Subquery':
         try:
@@ -7157,25 +7202,55 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
             else:
                 return None
         if cd_idx is None: return None
-        if any(k['cptr'] is not None for k in gkeys): return None          # v1: fact-only group keys
+        _sl9 = any(k['cptr'] is not None for k in gkeys)                   # parent group keys: the slices
+        if _sl9 and not _GCD_SLICES[0]: return None                        # (v1: fact-only group keys)
         vseg, vpcol, vcptr = resolve(vnode)
         vc = vseg.cols[vpcol]
-        if vc['mode'] == 4 or vcptr is not None: return None               # need value-identity fact codes
+        if vcptr is not None: return None                                  # need the value's fact codes
+        if vc['mode'] == 4: return None            # mode-4 codes are row positions, not values: never counted here
         nv = vc['V']
-        if not RT.grouped_cdist_fits(K, nv): return None                   # dense table too big -> fallback
-        op = _group_op()
-        if op is None or op[0] != 'd': return None
-        gid = np.asarray(op[1], dtype=np.int64)
-        vcodes = (np.asarray(vseg.codes_at(vpcol, rows9)) if rows9 is not None
-                  else vseg.codes(vpcol))   # fact-space by this lane's own gate
-        m = get_mask()
+        if not RT.grouped_cdist_fits(K, nv):                               # dense table too big
+            if not _GCD_SLICES[0]: return None
+            _sl9 = True
+        if _sl9 and int(K) > _GCD_K_MAX: return None
+        if _sl9 and rows9 is None and group_op is None:
+            # THE SURVIVORS FIRST: the mask's rows, then each one's group number and value code at those rows only
+            m = get_mask()
+            sr9 = np.flatnonzero(m).astype(np.int64) if m is not None else np.arange(n, dtype=np.int64)
+            gid = np.zeros(sr9.shape[0], dtype=np.int64)
+            for k in gkeys:
+                kc9 = np.asarray(k['full'])
+                if k['cptr'] is not None:
+                    at9 = _at_rows(k['cptr'], sr9)
+                    kc9 = kc9[np.asarray(at9, dtype=np.int64)]
+                else:
+                    kc9 = kc9[sr9]
+                gid = gid * k['K'] + kc9.astype(np.int64, copy=False)
+            vcodes = np.asarray(vseg.codes_at(vpcol, sr9))
+            m = None
+        else:
+            op = _group_op()
+            if op is None or op[0] != 'd': return None
+            gid = np.asarray(op[1], dtype=np.int64)
+            vcodes = (np.asarray(vseg.codes_at(vpcol, rows9)) if rows9 is not None
+                      else vseg.codes(vpcol))   # fact-space by this lane's own gate
+            m = get_mask()
         if m is not None: gid = gid[m]; vcodes = vcodes[m]
-        # ONE pass: a (groups x value) cell count. Row totals give presence; nonzero non-null
-        # columns per row give the distinct count. The null code is the last dict slot (V-1).
-        table = np.bincount(gid * nv + vcodes, minlength=K * nv).reshape(K, nv)
-        counts_l = table.sum(axis=1)                                       # rows per group (presence)
-        nn = nv - 1 if vc['has_null'] else nv                              # COUNT(DISTINCT) drops NULL
-        dist = (table[:, :nn] > 0).sum(axis=1).astype(object)
+        if _sl9:
+            # THE SLICES: one pass places each row in its group's slice; each slice sorted, distinct counted
+            if gid.shape[0] != np.asarray(vcodes).shape[0]: return None
+            counts_l, dist = _gcd_slices(np.ascontiguousarray(gid, dtype=np.int64),
+                                         np.ascontiguousarray(vcodes, dtype=np.int64), int(K),
+                                         int(nv - 1) if vc['has_null'] else -1)
+            dist = dist.astype(object)
+            _GCD_SLICES_HITS[0] += 1
+        else:
+            # ONE pass: a (groups x value) cell count. Row totals give presence; nonzero non-null
+            # columns per row give the distinct count. The null code is the last dict slot (V-1).
+            table = np.bincount(gid * nv + vcodes, minlength=K * nv).reshape(K, nv)
+            counts_l = table.sum(axis=1)                                       # rows per group (presence)
+            nn = nv - 1 if vc['has_null'] else nv                              # COUNT(DISTINCT) drops NULL
+            dist = (table[:, :nn] > 0).sum(axis=1).astype(object)
         cr = {}
         for idx, p in enumerate(proj):
             if idx == cd_idx:
