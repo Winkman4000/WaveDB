@@ -38,6 +38,9 @@ _FUSE_ROADS_HITS = [0]
 _DENSE_ROWS_HITS = [0]   # diagnostic: multi-key groups factorised because the dense space outgrew the rows
 
 
+from numba import njit as _njit_pair, prange as _prange_pair
+
+
 class _LazyRoad:
     """A fact->ancestor road kept as its last hop read through the inner road (an array or another _LazyRoad).
     at(rows): the ancestor row of each asked fact row -- the first hop at those rows, then each next hop at the
@@ -96,6 +99,130 @@ class _LazyRoad:
         if name.startswith('__') or name in ('p', 'inner', '_full'):
             raise AttributeError(name)
         return getattr(self.full(), name)
+
+
+# THE PAIR ROAD (c126, TPC-H Q9): lineitem -> partsupp has no one-column key -- (l_partkey, l_suppkey) is unique in
+# partsupp only together. partsupp is stored by its first key, so each part's rows are one run: a child row's parent
+# row is a binary search for the run of its first key, then a scan of the run for its second. Built at the rows asked
+# (the cascade's survivors); the whole road only if something asks for the whole array. A child row with no parent
+# row declines (INNER, row-preserving, as the hash road). WDB_PAIR_ROAD=0: off.
+_PAIR_ROAD = [os.environ.get('WDB_PAIR_ROAD', '1') == '1']
+_PAIR_ROAD_HITS = [0]
+
+
+@_njit_pair(parallel=True, cache=True, nogil=True)
+def _pair_ok(PK, SK):
+    """the parent's first key never decreases, and within each run of one first key the second keys are distinct"""
+    n = PK.shape[0]
+    NT = 64
+    bad = np.zeros(NT, np.int64)
+    for t in _prange_pair(NT):
+        lo = t * n // NT; hi = (t + 1) * n // NT
+        for i in range(max(lo, 1), hi):
+            if PK[i] < PK[i - 1]:
+                bad[t] = 1
+                break
+            j = i - 1
+            while j >= 0 and PK[j] == PK[i]:
+                if SK[j] == SK[i]:
+                    bad[t] = 1
+                    break
+                j -= 1
+            if bad[t]: break
+    return bad.sum() == 0
+
+
+@_njit_pair(parallel=True, cache=True, nogil=True)
+def _pair_probe(PK, SK, k1, k2):
+    """parent row of each (k1, k2): binary search for the first PK >= k1, scan the run for SK == k2; -1 when none"""
+    m = k1.shape[0]; n = PK.shape[0]
+    out = np.empty(m, np.int64)
+    for i in _prange_pair(m):
+        a = 0; b = n; v = k1[i]
+        while a < b:
+            h = (a + b) >> 1
+            if PK[h] < v: a = h + 1
+            else: b = h
+        r = -1
+        j = a
+        while j < n and PK[j] == v:
+            if SK[j] == k2[i]:
+                r = j
+                break
+            j += 1
+        out[i] = r
+    return out
+
+
+def _int_vals(seg, pc, rows=None):
+    """integer values of a dictionary column, at rows (or all); None when not a clean integer column"""
+    c = seg.cols.get(pc)
+    if c is None or c.get('has_null') or c.get('dt') not in (0, 3):
+        return None
+    try:
+        if seg._overrides(pc) is not None: return None
+    except Exception:
+        return None
+    td = np.asarray(seg._typed_dict(pc))
+    if td.dtype.kind not in 'iu':
+        return None
+    cd = np.asarray(seg.codes(pc) if rows is None else seg.codes_at(pc, rows))
+    return np.ascontiguousarray(td[cd], dtype=np.int64)
+
+
+def _pair_parent(db, ptbl, pseg, pcols):
+    """((first, second) column order, PK, SK) when one of the two columns never decreases and the pair is unique
+    under that order; else None. Each column is decoded once; both orders are tried on the same values."""
+    pm = db.cat.phys_map(ptbl)
+    A = _int_vals(pseg, pm.get(pcols[0], pcols[0]))
+    B = _int_vals(pseg, pm.get(pcols[1], pcols[1]))
+    if A is None or B is None or A.shape[0] != int(pseg.N):
+        return None
+    if _pair_ok(A, B): return (0, 1), A, B
+    if _pair_ok(B, A): return (1, 0), B, A
+    return None
+
+
+class _PairRoad(_LazyRoad):
+    """fact row -> parent row through the pair: the child's two keys at the asked rows, probed in the parent's runs.
+    inner: the child's own road from the fact (None when the child IS the fact)."""
+
+    def __init__(self, cseg, cpcs, PK, SK, inner, n_fact):
+        self.cseg, self.cpcs, self.PK, self.SK = cseg, cpcs, PK, SK
+        self.p = None
+        self.inner = inner
+        self._full = None
+        self.shape = (int(n_fact),)
+        self.dtype = np.dtype(np.int64)
+        self.ndim = 1
+
+    def at(self, rows):
+        rows = np.ascontiguousarray(rows, dtype=np.int64)
+        if self._full is not None:
+            return self._full[rows]
+        if self.inner is None:
+            crow = rows
+        elif isinstance(self.inner, _LazyRoad):
+            crow = np.asarray(self.inner.at(rows), dtype=np.int64)
+        else:
+            src = np.asarray(self.inner)
+            crow = np.empty(rows.shape[0], dtype=src.dtype)
+            wdb_kernels.pgather_ptr(src, rows, crow)
+        k1 = _int_vals(self.cseg, self.cpcs[0], crow)
+        k2 = _int_vals(self.cseg, self.cpcs[1], crow)
+        if k1 is None or k2 is None:
+            raise _FastUnsupported
+        out = _pair_probe(self.PK, self.SK, k1, k2)
+        if out.shape[0] and int(out.min()) < 0:
+            raise _FastUnsupported                  # a child row with no parent row: not row-preserving
+        _PAIR_ROAD_HITS[0] += 1
+        return out
+
+    def full(self):
+        if self._full is None:
+            self._full = self.at(np.arange(self.shape[0], dtype=np.int64))
+            _LazyRoad.FULLS[0] += 1
+        return self._full
 
 
 # ONE GATHER PER ARRAY (2026-11-01): the survivor gather of a road or column ran numpy's a[rows] (one thread) once
@@ -7877,6 +8004,7 @@ def _build_chain(db, tree, allow_hash=True):
     edges = {}            # child_alias -> (parent_alias, fk_col)
     parents = set()
     _edge_w = []
+    _pair9 = []           # equalities no single key serves: two between the same tables may be a pair road
     for on in eq_pool:
         le, re = on.this, on.expression
         aA, kA, aB, kB = _own(le), le.name, _own(re), re.name
@@ -7892,6 +8020,7 @@ def _build_chain(db, tree, allow_hash=True):
         elif allow_hash and _key_is_unique(db, tA, kA):
             child_a, parent_a, fk_col = aB, aA, ('hash', kB, kA)
         else:
+            _pair9.append((on, aA, kA, aB, kB))
             continue                                             # neither key unique: rides WHERE as a filter
         ee9 = edges.setdefault(child_a, [])
         if any(pa9 == parent_a for pa9, _f9 in ee9):
@@ -7899,6 +8028,34 @@ def _build_chain(db, tree, allow_hash=True):
         ee9.append((parent_a, fk_col)); parents.add(parent_a)
         if id(on) in {id(x) for x in w_eqs}:
             _edge_w.append(on)
+
+    if allow_hash and _PAIR_ROAD[0] and len(_pair9) >= 2:
+        # THE PAIR ROAD: exactly two leftover equalities between the same two tables, unique together on one side
+        # whose first column never decreases -> one edge from the other side (the child) to it (the parent)
+        _by9 = {}
+        for e9 in _pair9:
+            _by9.setdefault(frozenset((e9[1], e9[3])), []).append(e9)
+        for _k9, _es9 in _by9.items():
+            if len(_es9) != 2 or len(_k9) != 2: continue
+            for _par9 in _k9:
+                _chi9 = next(a9 for a9 in _k9 if a9 != _par9)
+                _pc9 = [(e9[2] if e9[1] == _par9 else e9[4]) for e9 in _es9]
+                _cc9 = [(e9[4] if e9[1] == _par9 else e9[2]) for e9 in _es9]
+                _pseg9, _ = _solo_segment(db, alias2t[_par9])
+                _r9 = _pair_parent(db, alias2t[_par9], _pseg9, (_pc9[0], _pc9[1]))   # which column is ordered
+                if _r9 is None: continue
+                _o9, _A9, _B9 = _r9
+                _ok9 = (_A9, _B9)
+                _pcs9 = (_pc9[_o9[0]], _pc9[_o9[1]]); _ccs9 = (_cc9[_o9[0]], _cc9[_o9[1]])
+                if any(pa9 == _par9 for pa9, _f9 in edges.get(_chi9, [])): break
+                _pmc9 = db.cat.phys_map(alias2t[_chi9])
+                edges.setdefault(_chi9, []).append(
+                    (_par9, ('pair', tuple(_pmc9.get(c9, c9) for c9 in _ccs9), _pcs9, _ok9[0], _ok9[1])))
+                parents.add(_par9)
+                for e9 in _es9:
+                    if id(e9[0]) in {id(x) for x in w_eqs}:
+                        _edge_w.append(e9[0])
+                break
 
     if not edges:                                                                # 0 joins: single-table query
         if len(tables) != 1: raise _FastUnsupported                              # multiple tables, no FK edge
@@ -7957,6 +8114,15 @@ def _build_chain(db, tree, allow_hash=True):
           for parent_a, fk_col in ee9:
             if parent_a not in keep: continue                                    # pruned hop: skip the gather
             if child_a in composed and parent_a not in composed:
+                if isinstance(fk_col, tuple) and fk_col and fk_col[0] == 'pair':
+                    _cc9p = composed[child_a]
+                    _cseg9p = seg_of[child_a]
+                    _nf9 = int(seg_of[fact].N)
+                    edge_ptrs[parent_a] = (child_a, _PairRoad(_cseg9p, fk_col[1], fk_col[3], fk_col[4], None,
+                                                              int(_cseg9p.N)))
+                    composed[parent_a] = _PairRoad(_cseg9p, fk_col[1], fk_col[3], fk_col[4], _cc9p, _nf9)
+                    progress = True
+                    continue
                 if isinstance(fk_col, tuple) and fk_col and fk_col[0] == 'hash':
                     if not allow_hash:
                         raise _FastUnsupported   # O(N) hash as ROUTING is forbidden: the
