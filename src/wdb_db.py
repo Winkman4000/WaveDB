@@ -882,6 +882,10 @@ class Database:
                         rows = [r[:drop] + r[drop + 1:] for r in rows]   # legacy paths that
                         hdr = hdr[:drop] + hdr[drop + 1:]                # still emit the helper
                     return rows, hdr
+                import wdb_projdoor as _wpd9s                 # THE VALUE PER ROW (Q20's middle query): a
+                _pd9s = _wpd9s.try_door(self, tree, single=True)   # comparison against a correlated scalar
+                if _pd9s is not None:                         # subquery, judged at the survivors
+                    return _pd9s
                 import wdb_runwalk                        # THE RUN WALK (Q4): [NOT] EXISTS over a child
                 wdb_runwalk.rewrite(self, tree)           # stored by its key -> a per-row verdict
                 tree = wdb_subquery.rewrite(self, tree)   # in-tree: no sql-text roundtrip

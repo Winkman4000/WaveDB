@@ -10,7 +10,8 @@ The inner query does not read the outer row, so:
      predicate and the mask layer already read), with no subquery left in it.
 An empty list: NOT IN keeps every row (the code set is all the column's codes); IN an empty list stands down (the
 mask layer cannot take an empty code set yet -- the old road declines it, as before).
-Only a plain inner query is taken (one table, a WHERE, one column; no GROUP BY / HAVING / aggregate):
+Only a plain inner query is taken (one table, a WHERE, one column; no GROUP BY / HAVING / aggregate; its WHERE may
+hold subqueries of its own -- the inner runs by itself, c128 Q20):
 the grouped shapes keep their own roads (Q18's IN ... GROUP BY ... HAVING -> the run sums).
 SQL's NULL rule: NOT IN against a list holding a NULL keeps no row -- that case, an outer column with NULLs, a text
 column and anything unexpected leave the conjunct untouched (the old road answers or declines).
@@ -56,10 +57,34 @@ def _plain_inner(q):
         if sub.args.get(k9): return False
     frm = sub.args.get('from') or sub.args.get('from_')
     if frm is None or not isinstance(frm.this, E.Table): return False
-    if sub.find(E.AggFunc) is not None or sub.find(E.Window) is not None: return False
-    w = sub.args.get('where')
-    if w is not None and w.find(E.Select) is not None: return False
-    return True
+    if any(p.find(E.AggFunc, E.Window, E.Select) is not None for p in sub.expressions): return False
+    return True                              # the WHERE may hold subqueries: answered when the inner runs alone
+
+
+def _door_values(db, q):
+    """the inner query's one column as an array, when the projection door answers it (c128), else None"""
+    import wdb_projdoor
+    sub = q.this if isinstance(q, E.Subquery) else q
+    if not isinstance(sub, E.Select):
+        return None
+    try:
+        return wdb_projdoor.try_door(db, sub, single=not sub.args.get('joins'), values=True)
+    except Exception:
+        if os.environ.get('WDB_IN_SUB_DEBUG'):
+            import traceback; traceback.print_exc()
+        return None
+
+
+def _codes_of(seg, pc, vals):
+    """the outer column's codes of these values (a sorted numeric dictionary), or None"""
+    td = np.asarray(seg._typed_dict(pc))
+    if td.dtype.kind not in 'iuf' or (td.size > 1 and not bool(np.all(td[1:] >= td[:-1]))):
+        return None
+    u = np.unique(np.asarray(vals))
+    ix = np.searchsorted(td, u)
+    ok = ix < td.size
+    ok[ok] = td[ix[ok]] == u[ok]
+    return np.unique(ix[ok]).astype(np.int64)
 
 
 def _serve(db, tree, node, neg):
@@ -71,6 +96,12 @@ def _serve(db, tree, node, neg):
     pc = db.cat.phys_map(own[0]).get(node.this.name, node.this.name)
     c = seg.cols.get(pc)
     if c is None or c.get('has_null') or c.get('dt') not in (0, 2, 3): return None
+    arr = _door_values(db, node.args['query'])
+    if arr is not None:                                              # steps 1-2 in arrays: the door's values,
+        codes = _codes_of(seg, pc, arr) if arr.size else np.zeros(0, dtype=np.int64)   # then the outer's codes
+        if codes is None: return None
+        if codes.size == 0 and not neg: return None                  # IN an empty set: stands down (see above)
+        return _finish(node, c, codes, neg)
     rows = S._run_inner(db, node.args['query'])                      # step 1
     if rows and len(rows[0]) != 1: return None
     vals = [r[0] for r in rows]
@@ -83,10 +114,16 @@ def _serve(db, tree, node, neg):
         codes = S._road_codes(db, tree, probe, rows)                 # step 2
         if codes is None: return None
         codes = np.unique(np.asarray(codes, dtype=np.int64))
+        if codes.size == 0 and not neg: return None                  # IN values the column never holds: as empty
     else:
         if not neg: return None                                      # IN an empty list: stands down (the mask
         codes = np.zeros(0, dtype=np.int64)                          # layer cannot take an empty code set yet);
                                                                      # NOT IN an empty list keeps every row
+    return _finish(node, c, codes, neg)
+
+
+def _finish(node, c, codes, neg):
+    """In(column) carrying the codes it keeps (NOT IN: the complement)"""
     if neg:
         V = int(c.get('V') or 0)
         if V <= 0: return None
@@ -96,6 +133,28 @@ def _serve(db, tree, node, neg):
     out = E.In(this=node.this.copy())                                # step 3
     out.set('_codes', codes)
     return out
+
+
+def in_conj(cj):
+    """cj is 'col [NOT] IN (subquery)' (the shape serve_conj takes)"""
+    node = cj.this if isinstance(cj, E.Not) else cj
+    return isinstance(node, E.In) and node.args.get('query') is not None and isinstance(node.this, E.Column)
+
+
+def serve_conj(db, tree, cj):
+    """one WHERE conjunct 'col [NOT] IN (uncorrelated subquery)' of tree as In(col) with codes, or None"""
+    if not _IN_SUB[0] or not in_conj(cj):
+        return None
+    neg = isinstance(cj, E.Not)
+    try:
+        rep = _serve(db, tree, cj.this if neg else cj, neg)
+    except Exception:
+        if os.environ.get('WDB_IN_SUB_DEBUG'):
+            import traceback; traceback.print_exc()
+        return None
+    if rep is not None:
+        _HITS[0] += 1
+    return rep
 
 
 def rewrite(db, tree):

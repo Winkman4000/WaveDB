@@ -11,6 +11,9 @@ table -- was handed to the pandas tail (Q2's outer: 1.64 s against DuckDB's 22 m
      survivors with that key; the zoom over the key's runs takes each run's extreme, the rows equal to it stay;
   4. ORDER BY on the kept rows (columns read at those rows only, parents through their pointers; a stable sort);
   5. LIMIT; 6. the selected columns decoded at the winners only.
+c128 (TPC-H Q20): a conjunct 'col [NOT] IN (uncorrelated subquery)' becomes the column's code set before the survivors
+(wdb_insub.serve_conj), and a comparison against a correlated scalar subquery is judged at the survivors (THE VALUE PER
+ROW, wdb_corrrow, step 2c); a single table comes to the door only with such a comparison (single=True, wdb_db).
 Anything else declines to the roads behind it."""
 import os
 import numpy as np
@@ -202,10 +205,12 @@ def _judge(n, vals):
     raise ValueError('kind')
 
 
-def try_door(db, tree):
-    """THE PROJECTION DOOR: (rows, names), or None."""
-    import wdb_join, wdb_sql
-    if not _PROJ_DOOR[0] or not isinstance(tree, E.Select) or not tree.args.get('joins'):
+def try_door(db, tree, single=False, values=False):
+    """THE PROJECTION DOOR: (rows, names), or None. single: a one-table query (taken only with a value-per-row
+    comparison). values: one selected numeric column, answered as an array of its values (an IN's inner query,
+    wdb_insub -- no Python rows)."""
+    import wdb_join, wdb_sql, wdb_corrrow, wdb_insub
+    if not _PROJ_DOOR[0] or not isinstance(tree, E.Select) or not (tree.args.get('joins') or single):
         return None
     for k in ('group', 'having', 'distinct', 'qualify', 'offset', 'with'):
         if tree.args.get(k):
@@ -226,10 +231,23 @@ def try_door(db, tree):
     where = tree.args.get('where')
     conjs = _conj(where.this if where is not None else None)
     spec = None
+    rowval, insub = {}, set()               # conjunct index -> THE VALUE PER ROW's spec; IN conjuncts served as codes
     if any(c.find(E.Subquery) is not None or c.find(E.Exists) is not None for c in conjs):
-        spec = _per_key_spec(db, tree, conjs, own, otabs)
-        if spec is None:
-            return None
+        spec = _per_key_spec(db, tree, conjs, own, otabs)      # THE PER-KEY EXTREME first (Q2)
+    if spec is None and any(c.find(E.Subquery) is not None or c.find(E.Exists) is not None for c in conjs):
+        for i, c in enumerate(conjs):
+            if c.find(E.Subquery) is None and c.find(E.Exists) is None:
+                continue
+            sv = wdb_corrrow.spec(db, c, own)
+            if sv is not None:
+                rowval[i] = sv
+            elif wdb_insub.in_conj(c):
+                insub.add(i)
+        if not (rowval or insub) or any((c.find(E.Subquery) is not None or c.find(E.Exists) is not None)
+                                        for i, c in enumerate(conjs) if i not in rowval and i not in insub):
+            return None                         # a subquery none of the three takes
+    if single and not rowval:
+        return None
     # the ORDER BY terms as columns
     oterms = []
     order = tree.args.get('order')
@@ -250,9 +268,21 @@ def try_door(db, tree):
         oterms.append((col, bool(oe.args.get('desc'))))
     # 2. the survivors
     t2 = tree.copy()
-    keep = [c.copy() for i, c in enumerate(_conj(t2.args['where'].this if t2.args.get('where') else None))
-            if spec is None or i != spec[0]]
-    t2.set('where', E.Where(this=E.and_(*keep)) if keep else None)
+    keep = []
+    for i, c in enumerate(_conj(t2.args['where'].this if t2.args.get('where') else None)):
+        if (spec is not None and i == spec[0]) or i in rowval:
+            continue
+        if i in insub:
+            c = wdb_insub.serve_conj(db, tree, conjs[i])
+            if c is None:
+                return None
+            keep.append(c)
+        else:
+            keep.append(c.copy())
+    w2 = None
+    for c in keep:                              # And by hand: the code sets ride their nodes uncopied
+        w2 = c if w2 is None else E.And(this=w2, expression=c)
+    t2.set('where', E.Where(this=w2) if keep else None)
     for k in ('order', 'limit'):
         t2.set(k, None)
     try:
@@ -288,6 +318,9 @@ def try_door(db, tree):
                     rows = rows[_judge(cj, list(sg.values_at_rows(pc, pr)))]
             except ValueError:
                 return None
+        # 2c. THE VALUE PER ROW: each comparison against a correlated scalar subquery, judged at the survivors
+        for i in sorted(rowval):
+            rows = wdb_corrrow.keep(db, rowval[i], lambda nm, rws: at(E.column(nm), rws), rows)
         # 3. the per-key extreme over the key's runs
         if spec is not None:
             _, vname, kname, kind = spec
@@ -338,6 +371,15 @@ def try_door(db, tree):
         if lim is not None:
             rows = rows[:int(lim)]
         # 6. the selected columns at the winners only
+        if values:
+            if len(pcols) != 1:
+                return None
+            sg, pc, pr = at(pcols[0], rows)
+            td = np.asarray(sg._typed_dict(pc))
+            if td.dtype.kind not in 'iuf':
+                return None
+            _PROJ_DOOR_HITS[0] += 1
+            return td[np.asarray(sg.codes_at(pc, pr))]
         cols = []
         for col in pcols:
             sg, pc, pr = at(col, rows)

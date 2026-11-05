@@ -1,7 +1,8 @@
 """THE PROJECTION DOOR + THE PER-KEY EXTREME (c121, 2026-11-03, TPC-H Q2): plain-projection pointer-chain joins answer
 like DuckDB, in DuckDB's order, through the door -- with LIMIT and without; Q2's per-key MIN / MAX over the same rows
 answers like DuckDB, the key in runs (lineitem by order) and not (orders by customer); a subquery over other rows is
-not the door's; switched off, the old roads give the same answers."""
+not the per-key extreme's (since c128 the value per row answers it, like DuckDB); switched off, the old roads give the
+same answers."""
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 sys.path.insert(0, os.path.dirname(__file__))
@@ -57,7 +58,14 @@ def test_plain_projection():
 def test_other_rows_and_switch():
     import sqlglot, wdb_projdoor as P, test_join_fast as J
     db, con = J._fixture()
-    assert P.try_door(db, sqlglot.parse_one(OTHER, read='duckdb')) is None     # the subquery's rows are not the outer's
+    import wdb_corrrow as CR
+    k0, c0 = P._PER_KEY_HITS[0], CR._HITS[0]
+    exp = sorted(J._norm([tuple(r) for r in con.execute(OTHER).fetchall()]))
+    r = db.run(OTHER)
+    got = sorted(J._norm(r[0] if isinstance(r, tuple) else r))
+    assert len(got) == len(exp) and all(J._eq(g, e) for g, e in zip(got, exp))
+                                                 # the subquery's rows are not the outer's: not the per-key extreme,
+    assert P._PER_KEY_HITS[0] == k0 and CR._HITS[0] == c0 + 1   # the value per row (c128)
     old = P._PROJ_DOOR[0]
     try:
         P._PROJ_DOOR[0] = False
