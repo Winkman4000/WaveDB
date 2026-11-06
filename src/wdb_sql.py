@@ -1498,6 +1498,8 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
             fv = _fval_by_code(seg, gk[2], gn, params)
             if fv.dtype == object:                             # string-valued fn
                 codes = seg.codes(gn); codes = codes[mask] if mask is not None else codes
+                if seg.cols[gn].get('has_null') and len(fv) < int(seg.cols[gn]['V']):
+                    fv = np.append(fv, np.array([None], dtype=object))   # NULL's code (the last): F(NULL) is NULL
                 u, code2g = _factorize_obj(fv)                 # per-code result -> group id (V values)
                 inv = code2g[codes]                            # per-row group id (gather)
             else:                                              # int-valued fn (length)

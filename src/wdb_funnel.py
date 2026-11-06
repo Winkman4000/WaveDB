@@ -451,10 +451,24 @@ def detect(seg, tree, col_map):
         if ox is None or lx is None or len(ox.expressions) != 1 \
                 or ox.expressions[0].args.get('desc'):
             return None                      # the file order IS minute order
+        # c129: the ORDER BY must BE the bucket (the expression, its alias, or its position) -- not a count
+        o9 = ox.expressions[0].this
+        b9 = tn.sql()
+        ok9 = o9.sql() == b9
+        for i9, p9 in enumerate(tree.expressions):
+            in9 = p9.this if isinstance(p9, E.Alias) else p9
+            if in9.sql() == b9 and ((isinstance(p9, E.Alias) and isinstance(o9, E.Column) and not o9.table
+                                     and o9.name == p9.alias)
+                                    or (isinstance(o9, E.Literal) and not o9.is_string and str(o9.this) == str(i9 + 1))):
+                ok9 = True
+        if not ok9:
+            return None
         proj9 = []
         for p9 in tree.expressions:
             inner = p9.this if isinstance(p9, E.Alias) else p9
             if isinstance(inner, (E.DateTrunc, E.TimestampTrunc, E.Anonymous)):
+                if inner.sql() != tn.sql():
+                    return None              # c129: only the bucket itself is the bucket column
                 proj9.append(('M',))
             else:
                 ak = wdb_sql._agg_kind(inner)
@@ -475,7 +489,8 @@ def detect(seg, tree, col_map):
         import wdb_policies as P
         if not P.no_deleted_rows(seg):
             return None
-        return {'sel': sel, 'rng': rng, 'flags': flags, 'strneq': strneq,
+        flags = flags + [(c9, '', False) for c9 in strneq]   # c129: `<> ''` applied by code (was dropped)
+        return {'sel': sel, 'rng': rng, 'flags': flags, 'strneq': [],
                 'g': [], 'trunc': trunc, 'k': lim, 'off': off,
                 'projkinds': proj9, 'proj': tree.expressions}
     aliasmap = {}
@@ -1214,6 +1229,13 @@ def execute(seg, spec):
             if z9 == '':
                 fc = np.asarray(seg.codes_at(pcol, crumb))
                 crumb = crumb[fc != 0]
+            continue
+        import wdb_policies as _P9
+        if not _P9.sparse_default_is(seg, pcol, ''):
+            # c129: the planes are `<> ''` only when the default is '' -- else by the code of '' (none: all pass)
+            z9 = _code_of(seg, pcol, '')
+            if z9 is not None:
+                crumb = crumb[np.asarray(seg.codes_at(pcol, crumb)) != int(z9)]
             continue
         pl = seg.e8_planes(pcol)
         pos8 = np.asarray(pl[0])

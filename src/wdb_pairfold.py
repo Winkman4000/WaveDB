@@ -62,9 +62,9 @@ def detect(seg, tree, col_map):
                 and wr.is_string and str(wr.this) == ''):
             return None
         fcol = cm.get(wl.name, wl.name)
-        fc = seg.cols.get(fcol)
-        if fc is None or fc.get('code_enc') not in (8, 9) or fc.get('has_null'):
-            return None
+        import wdb_policies as _P9
+        if not _P9.sparse_default_is(seg, fcol, ''):
+            return None                          # the planes ARE `<> ''` only when the default is 
     g = tree.args.get('group')
     if g is None or len(g.expressions) != 2 \
             or not all(isinstance(x, E.Column) for x in g.expressions):

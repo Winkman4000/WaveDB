@@ -298,7 +298,7 @@ def _stream_dump(db, tree, fact_tn, fkey, fact_conds, dmap, need, attr_idx,
             return None
         lv = c.expression.this if c.expression.is_string else str(c.expression.this)
         code = WS._code_of(fseg, nm, lv)
-        conds.append((nm, tn, code))
+        conds.append((nm, tn, code, int(cc['V']) - 1 if (tn == 'NEQ' and cc.get('has_null')) else None))   # NULL's code
     V = int(kc0['V'])
     flag = np.zeros(V + 1, bool)
     if not left:
@@ -313,8 +313,8 @@ def _stream_dump(db, tree, fact_tn, fkey, fact_conds, dmap, need, attr_idx,
     # column, its planes ARE the candidate list, already sorted in row order. No block
     # walking for that column at all: take candidates front-to-back in chunks, read the
     # join key ONLY at those positions (a prefix of frames), flag, collect LIMIT, leave.
-    e8i = next((i for i, (nm, tn, code) in enumerate(conds)
-                if tn == 'NEQ' and code is not None
+    e8i = next((i for i, (nm, tn, code, nulc) in enumerate(conds)
+                if tn == 'NEQ' and code is not None and nulc is None
                 and fseg.cols[nm].get('code_enc') == 8
                 and int(code) == int(fseg.cols[nm]['e8d'])
                 and hasattr(fseg, 'e8_planes')), None)
@@ -331,12 +331,14 @@ def _stream_dump(db, tree, fact_tn, fkey, fact_conds, dmap, need, attr_idx,
             rcspan = np.asarray(fseg._raw_codes_range(fkey, lo2, hi2))   # order: ONE span
             rc = rcspan[loc].astype(np.int64)    # (a frame or two), not a full decode
             keep = flag[rc]
-            for nm2, tn2, code2 in rest:
+            for nm2, tn2, code2, nulc2 in rest:
                 cb2 = np.asarray(fseg._raw_codes_range(nm2, lo2, hi2))[loc].astype(np.int64)
                 if code2 is None:
                     km2 = np.zeros(cb2.size, bool) if tn2 == 'EQ' else np.ones(cb2.size, bool)
                 else:
                     km2 = (cb2 == code2) if tn2 == 'EQ' else (cb2 != code2)
+                if nulc2 is not None:
+                    km2 &= cb2 != nulc2          # SQL: NULL <> x is not TRUE
                 keep &= km2
             hit = chunk[keep]
             if hit.size:
@@ -367,12 +369,14 @@ def _stream_dump(db, tree, fact_tn, fkey, fact_conds, dmap, need, attr_idx,
         if not left:
             kcb = np.asarray(fseg._raw_codes_range(fkey, lo, hi)).astype(np.int64)
             m = flag[kcb]
-        for nm, tn, code in conds:
+        for nm, tn, code, nulc in conds:
             cb = np.asarray(fseg._raw_codes_range(nm, lo, hi)).astype(np.int64)
             if code is None:
                 cm = np.zeros(cb.size, bool) if tn == 'EQ' else np.ones(cb.size, bool)
             else:
                 cm = (cb == code) if tn == 'EQ' else (cb != code)
+            if nulc is not None:
+                cm &= cb != nulc                 # SQL: NULL <> x is not TRUE
             m = cm if m is None else (m & cm)
         if m is None:
             m = np.ones(hi - lo, bool)

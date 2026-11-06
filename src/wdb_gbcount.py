@@ -588,12 +588,17 @@ def execute(seg, spec):
         return None
     hc, hn = loaded
     kc_ex = None
+    kc_nul = None
     if spec.get('excl_lit') is not None:
         import wdb_wherescan as WS
         kc = WS._code_of(seg, col, spec['excl_lit'])
         if kc is not None:
             kc_ex = int(kc)
             keep = hc != int(kc)                        # one cell out; count-desc order kept
+            hc, hn = hc[keep], hn[keep]
+        if seg.cols[col].get('has_null'):               # SQL: NULL <> x is not TRUE -- NULL's cell (a
+            kc_nul = int(seg.cols[col]['V']) - 1        # dictionary column's last code) goes out too
+            keep = hc != kc_nul
             hc, hn = hc[keep], hn[keep]
     if spec.get('unbounded'):
         V = int(seg.cols[col]['V'])
@@ -603,6 +608,8 @@ def execute(seg, spec):
         else:
             cnt = np.ones(V, np.int64)                  # dict codes appear >= 1;
             cnt[hc] = hn                                # absent from heavy == exactly 1
+        if kc_nul is not None:
+            cnt[kc_nul] = 0
         if kc_ex is not None:
             cnt[kc_ex] = 0                              # the excluded key is no group (it came back
         hm2 = spec.get('having_min')                    # as a count-1 "singleton" before this line)

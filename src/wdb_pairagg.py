@@ -236,6 +236,14 @@ def detect(seg, tree, col_map):
             'lim': wdb_sql._limit(tree), 'order': order, 'pred': pred, 'col_map': col_map}
 
 
+def _not_null(seg, pcol, codes, m):
+    """SQL: NULL <> x is not TRUE -- a dictionary column holds NULL as its last code"""
+    c = seg.cols[pcol]
+    if c.get('has_null') and c.get('mode') != 4:
+        m &= codes != int(c['V']) - 1
+    return m
+
+
 def _build_mask(seg, pcol, op, lit):
     """Row mask for `pcol = lit` / `pcol <> lit`. Find the literal's code CHEAPLY via _code_of
     (O(1) for empty string / int dicts -- no full-dict materialize); only a non-empty string
@@ -247,7 +255,7 @@ def _build_mask(seg, pcol, op, lit):
         code = -1 if code is None else int(code)
         codes = seg._raw_codes(pcol)
         if op == '=': return (codes == code) if code >= 0 else np.zeros(codes.size, dtype=bool)
-        return (codes != code) if code >= 0 else np.ones(codes.size, dtype=bool)
+        return _not_null(seg, pcol, codes, (codes != code) if code >= 0 else np.ones(codes.size, dtype=bool))
     key = lit.encode('utf-8', 'surrogatepass') if (dt == 1 and isinstance(lit, str)) else lit
     code = wdb_compound._code_of(seg, pcol, key)
     if code is None:                             # non-empty string literal: fall back to full dict
@@ -256,7 +264,7 @@ def _build_mask(seg, pcol, op, lit):
     codes = seg._raw_codes(pcol)
     if op == '=':
         return (codes == code) if code >= 0 else np.zeros(codes.size, dtype=bool)
-    return (codes != code) if code >= 0 else np.ones(codes.size, dtype=bool)
+    return _not_null(seg, pcol, codes, (codes != code) if code >= 0 else np.ones(codes.size, dtype=bool))
 
 
 def _survivor_payload(seg, pc, idx):

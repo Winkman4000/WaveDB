@@ -63,8 +63,9 @@ def detect(seg, tree, col_map):
         return None
     if uc.get('mode') == 4:
         return None                              # codes are row positions: distinct would count rows
-    if kc.get('code_enc') not in (8, 9):
-        return None                              # v1: the sparse dress only --
+    import wdb_policies as _P9
+    if not _P9.sparse_default_is(seg, key, ''):
+        return None                              # v1: the sparse dress whose default is '' only --
     d9 = int(kc.get('e8d' if kc.get('code_enc') == 8 else 'e9d', -1))
     if d9 < 0:
         return None

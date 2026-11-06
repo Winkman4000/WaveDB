@@ -88,6 +88,14 @@ def detect(seg, tree, col_map):
     if isinstance(io, E.Column):
         if calias is None or io.name != calias:
             return None
+    else:
+        # c129: an ORDER BY that is not the distinct count (COUNT(*), another column) was served in its order
+        ok9 = False
+        if isinstance(io, E.Count) and isinstance(io.this, E.Distinct) and len(io.this.expressions) == 1 \
+                and isinstance(io.this.expressions[0], E.Column):
+            ok9 = cm.get(io.this.expressions[0].name, io.this.expressions[0].name) == ucol
+        if not ok9:
+            return None
     try:
         lim = int(lx.expression.this)
     except Exception:

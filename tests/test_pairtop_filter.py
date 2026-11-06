@@ -58,11 +58,18 @@ def test_general_filter_on_each_column():
             _legal(rows, pq, where, k1, k2, 10)
 
 
-def test_absent_literal_hands_on():
+def test_absent_literal():
+    """a literal the column never holds (c129): `= v` is not guessed (declined); `<> v` keeps every row of a column
+    without NULLs -- DuckDB's answer, served (the swapped column of the board's Q31 holds no '')"""
     db, df, pq, d = _fixture()
     h0 = wdb_pairtop._HITS
-    db.run('SELECT u, a, COUNT(*) AS c FROM t WHERE a <> 99 GROUP BY u, a ORDER BY c DESC LIMIT 10')
+    db.run('SELECT u, a, COUNT(*) AS c FROM t WHERE a = 99 GROUP BY u, a ORDER BY c DESC LIMIT 10')
     assert wdb_pairtop._HITS == h0, 'an absent literal was guessed'
+    for where, k1, k2 in (('a <> 99', 'u', 'a'), ("w <> 'zz'", 'u', 'w'), ('a <> 99', 's', 'u')):
+        q = 'SELECT %s, %s, COUNT(*) AS c FROM t WHERE %s GROUP BY %s, %s ORDER BY c DESC LIMIT 10' % (
+            k1, k2, where, k1, k2)
+        rows = [tuple(x.decode() if isinstance(x, (bytes, bytearray)) else x for x in r) for r in db.run(q)[0]]
+        _legal(rows, pq, where, k1, k2, 10)
 
 
 def test_kept_rows_first():

@@ -118,7 +118,9 @@ def detect(seg, tree, col_map):
             return None
     if fcol is not None:
         fc9 = seg.cols.get(fcol)
-        if fc9 is None or fc9.get('code_enc') not in (8, 9) or fcol in (a, b):
+        import wdb_policies as _P9
+        if fc9 is None or not _P9.sparse_default_is(seg, fcol, '') or fcol in (a, b):
+            # (the planes are `<> ''` only when the default is ''; any other column: by code, below)
             # THE GENERAL FILTER takes '' on any other column too (2026-10-17)
             fgen = (fcol, True, w9.this.expression)
             fcol = None
@@ -139,8 +141,12 @@ def detect(seg, tree, col_map):
         except Exception:
             return None
         if code9 is None:
-            return None                          # never guess a literal absent
-        fgen = (fgen[0], fgen[1], int(code9))
+            same_kind = (gc9.get('dt') == 1) == bool(getattr(fgen[2], 'is_string', False)) and gc9.get('dt') in (0, 1)
+            if not fgen[1] or not same_kind:
+                return None                      # `= v` the column never holds, or v of another kind: never guess
+            fgen = None                          # `<> v` the column never holds (no NULLs): every row passes
+        else:
+            fgen = (fgen[0], fgen[1], int(code9))
     return {'a': a, 'b': b, 'aggs': aggs, 'lim': lim, 'fcol': fcol, 'fgen': fgen,
             'proj': tree.expressions}
 

@@ -83,6 +83,8 @@ def detect(seg, tree, col_map):
             uid = cn
     if sp is None or uid is None:
         return None
+    if any(seg.cols[c9].get('mode') == 4 or seg.cols[c9].get('has_null') for c9 in (sp, uid)):
+        return None                              # a sequence's codes are row positions; NULL is no group here
     if dtcol is not None:
         dc = seg.cols.get(dtcol)
         if dc is None or dc.get('dt') is None:
@@ -244,10 +246,8 @@ def execute(seg, spec):
     pos8 = np.ascontiguousarray(pl[0], np.int64)
     lits8 = np.ascontiguousarray(pl[1], np.int64)
     spc = np.ascontiguousarray(WK.bincount_par(lits8, int(seg.cols[sp]['V'])), np.int64)   # was one thread, 52 ms
-    e0 = WS._code_of(seg, sp, '')
-    if e0 is None:
-        return None
-    e0 = int(e0)
+    e0 = int(pl[2])                              # the rows outside the planes hold the stored default (c129: it was
+                                                 # taken to be '', which labelled them wrongly on any other column)
     emptyc = N - int(pos8.size)
     if dtc is not None:
         mt = np.ascontiguousarray(_minute_table(seg, dtc))

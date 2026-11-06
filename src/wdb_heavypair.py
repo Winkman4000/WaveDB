@@ -189,6 +189,13 @@ def _order_is_count_desc(tree, proj, ci):
     return ak is not None and ak[0] == 'COUNT_STAR'
 
 
+def _with_null(c, n, codes):
+    """for `<>` the NULL code (a dictionary column's last) joins the codes the walk drops: NULL <> x is not TRUE"""
+    if isinstance(n, E.NEQ) and c.get('has_null'):
+        codes = np.append(codes, int(c['V']) - 1).astype(np.int64)
+    return codes
+
+
 def _axis_filter(seg, where_node, cols, col_map):
     """Parse a WHERE that is a single equality/inequality on ONE of the two pair axes into a walk
     filter: (col, neg, codeset). The pre-sorted block already separates pairs by both axes, so such
@@ -222,14 +229,14 @@ def _axis_filter(seg, where_node, cols, col_map):
         except Exception:
             return None
         if v is None:                        # finer than the stored unit: no stored value equals it
-            return (phys, isinstance(n, E.NEQ), np.zeros(0, np.int64))
+            return (phys, isinstance(n, E.NEQ), _with_null(c, n, np.zeros(0, np.int64)))
     if c['dt'] not in (0, 2, 3) and isinstance(v, int):
         v = str(v).encode()
     try:
         codes = np.nonzero(np.asarray(vals) == v)[0].astype(np.int64)
     except Exception:
         return None
-    return (phys, isinstance(n, E.NEQ), codes)
+    return (phys, isinstance(n, E.NEQ), _with_null(c, n, codes))
 
 
 def detect_distinct(seg, tree, col_map):
@@ -375,6 +382,7 @@ def execute(seg, spec):
             return None                                  # ambiguous boundary -> defer to scan
     # unordered LIMIT: any N pairs is a legal answer, so a tie across the boundary is fine -- no decline.
 
+    nul = {col: int(seg.cols[col]['V']) - 1 for col in cols if seg.cols[col].get('has_null')}   # NULL's code
     rows = []
     for r in positions[:lim]:
         r = int(r)
@@ -386,7 +394,7 @@ def execute(seg, spec):
             knm = wdb_sql._proj_colname(p)
             col = cols[knames.index(knm)]
             code = int(by_col[col][r])
-            row[pi] = wdb_sql._pyval(V[col][code])
+            row[pi] = None if code == nul.get(col) else wdb_sql._pyval(V[col][code])
         rows.append(tuple(row))
     rows = workers.finalize(rows, proj, spec['order'], lim)
     _HITS += 1

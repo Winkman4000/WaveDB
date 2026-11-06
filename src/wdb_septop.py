@@ -47,8 +47,11 @@ def detect(seg, tree, col_map):
     cp = seg.cols.get(sp)
     if cs is None or cp is None:
         return None
-    if cp.get('code_enc') not in (8, 9):
-        return None                              # the filter must BE the plane
+    import wdb_policies as _P9
+    if not _P9.sparse_default_is(seg, sp, ''):
+        return None                              # the filter must BE the plane: the default must be ''
+    if int(cp.get('V') or 1 << 30) >= (1 << 23):
+        return None                              # the packed key holds the phrase code in 23 bits
     if int(cs.get('V') or 1 << 30) > 4096:
         return None                              # engine-first needs low V
     aggs = []

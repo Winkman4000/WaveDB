@@ -121,6 +121,8 @@ def detect(seg, tree, col_map):
         return None
     col = rk[1]
     if wcol is not None and col != wcol: return None
+    if wcol is None and (seg.cols.get(col) or {}).get('has_null'):
+        return None                      # the labels cover the dictionary's values: a NULL group has none
     if not P.columns_exist(seg, col):    return None
     if seg._effective(col) is not None:  return None
     if seg.cols[col].get('mode') not in (0, 1):

@@ -2337,8 +2337,14 @@ def execute(seg, spec):
         col, val, op = spec['eqs'][i]
         if i == de or i == spec.get('drive_neq') or pos.size == 0: continue
         code = _code_of(seg, col, val)
+        c_n9 = seg.cols.get(col) or {}
+        nul9 = int(c_n9['V']) - 1 if (op == '<>' and c_n9.get('has_null') and c_n9.get('mode') != 4) else None
         if code is None:
-            if op == '=': pos = np.empty(0, np.int64)
+            if op == '=':
+                pos = np.empty(0, np.int64)
+            elif nul9 is not None:               # SQL: NULL <> x is not TRUE, also when x is not in the column
+                pos = pos[np.asarray(seg.codes_at(col, pos)) != nul9]
+                pos_full = False
             continue
         c_e = seg.cols.get(col) or {}
         if pos_full and c_e.get('mode') in (0, 1, 2) and seg._effective(col) is None:
@@ -2357,6 +2363,8 @@ def execute(seg, spec):
             continue
         cc = np.asarray(seg.codes_at(col, pos))
         keep9 = (cc != code) if op == '<>' else (cc == code)
+        if nul9 is not None:
+            keep9 &= cc != nul9                  # SQL: NULL <> x is not TRUE
         pos = pos[keep9]
         _eqcc[col] = (pos, cc[keep9])
     for ii, (col, vals, ineg) in enumerate(spec.get('ins', ())):

@@ -98,16 +98,22 @@ def detect(seg, tree, col_map):
     for c in rcols:
         if seg.cols[c]['mode'] not in (0, 1, 2, 3):     return None   # fetch-able dict cols
     wcol = resolve(wname) if wname else None
+    wcode = None
     if wcol is not None:
         if not P.columns_exist(seg, wcol):              return None
         wc = seg.cols[wcol]
-        if wc['dt'] != 1 or wc['mode'] not in (0, 1):   return None   # `<>''` -> code 0
+        if wc['dt'] != 1 or wc['mode'] not in (0, 1):   return None
+        if wc.get('has_null'):                          return None   # NULL <> '' is not true
+        import wdb_wherescan as _WS9
+        wcode = _WS9._code_of(seg, wcol, '')            # c129: was assumed to be code 0
+        if wcode is None:
+            wcol = None                                 # the column holds no '': every row passes
     kcol = resolve(prim_name)
     if not P.columns_exist(seg, kcol):                  return None
 
     return {'pcols': rcols, 'proj': proj, 'kcol': kcol, 'kdesc': prim_desc,
             'sec': [(resolve(kn), kd) for (kn, kd) in keys[1:]],
-            'wcol': wcol, 'nn': int(cm['nn']), 'lim': wdb_sql._limit(tree)}
+            'wcol': wcol, 'wcode': wcode, 'nn': int(cm['nn']), 'lim': wdb_sql._limit(tree)}
 
 
 def _gather(seg, col, rows, maxrow):
@@ -119,7 +125,7 @@ def _gather(seg, col, rows, maxrow):
 def execute(seg, spec):
     global _HITS
     nn = spec['nn']; lim = spec['lim']; desc = spec['kdesc']
-    kcol = spec['kcol']; wcol = spec['wcol']; sec = spec['sec']
+    kcol = spec['kcol']; wcol = spec['wcol']; wcode = spec.get('wcode'); sec = spec['sec']
     aliases = [wdb_sql._alias(p) for p in spec['proj']]
     if nn <= 0 or lim <= 0:
         return [], aliases
@@ -133,7 +139,7 @@ def execute(seg, spec):
 
     def survivors(lo, hi):
         if wcol is not None:
-            m = seg._raw_codes_range(wcol, lo, hi) != 0    # '' == code 0
+            m = seg._raw_codes_range(wcol, lo, hi) != wcode
             return np.nonzero(m)[0] + lo
         return np.arange(lo, hi)
 

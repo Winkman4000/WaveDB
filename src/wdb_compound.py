@@ -138,6 +138,7 @@ def _resolve(seg, conjuncts):
     for cj in conjuncts:
         col = cj['col']; op = cj['op']
         if op == 'in' or cj.get('strempty'): residual.append(cj); continue
+        if seg.cols[col].get('has_null'): return None   # a range models no NULL: the general path
         ne = SP.n_exceptions(seg, col)
         if not RT.compound_range_worth_it(ne): residual.append(cj); continue
         r = SP.survivor_ranges(seg, col, _OP2SP[op], int(cj['const']))
@@ -153,6 +154,9 @@ def _resolve(seg, conjuncts):
     los, his = cur; n = int((his - los).sum()); keep = np.ones(n, bool)
     for cj in residual:
         col = cj['col']; op = cj['op']; c = seg.cols[col]; ne = SP.n_exceptions(seg, col)
+        if c.get('has_null') and not (cj.get('strempty') or (ne is None and c['mode'] == 2)):
+            return None                                   # NULL is no value on the value paths: the general path
+        nul = int(c['V']) - 1 if c.get('has_null') else None   # a dictionary column holds NULL as its last code
         if cj.get('strempty'):
             ec = _code_of(seg, col, b''); cc = _codes_in_ranges(seg, col, los, his)
             m = (cc != ec) if op in ('<>', '!=') else (cc == ec)
@@ -176,6 +180,8 @@ def _resolve(seg, conjuncts):
         else:
             vals = np.concatenate([np.asarray(seg.values_range(col, int(a), int(b))) for a, b in zip(los, his)])
             m = np.isin(vals, np.array(cj['const'])) if op == 'in' else _APPLY(vals, _OP2SP[op], cj['const'])
+        if nul is not None:
+            m = m & (cc != nul)                           # SQL: a comparison with NULL is not TRUE
         keep &= m
     return (los, his), keep
 

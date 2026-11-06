@@ -32,9 +32,16 @@ def _staircase_ok(seg, cn):
     c = seg.cols.get(cn)
     ok = False
     if c is not None and c.get('dt') in (2, 3) and int(c.get('V') or 0) > 1:
-        rows = np.linspace(0, int(seg.N) - 1, 4096).astype(np.int64)
-        ev = np.asarray(seg.codes_at(cn, rows), np.int64)
-        ok = bool((np.diff(ev) >= 0).all())
+        # c129: the staircase storage exists only for codes that never decrease -- exact (4,096 sampled rows
+        # could pass a column that is only mostly in order)
+        try:
+            if c.get('mode') == 4:                       # a sequence column: its values, every row
+                v4 = np.asarray(seg._seq_decode(c))
+                ok = bool(v4.size < 2 or (v4[1:] >= v4[:-1]).all())
+            else:
+                ok = seg.stairs(cn) is not None
+        except Exception:
+            ok = False
     memo[cn] = ok
     return ok
 

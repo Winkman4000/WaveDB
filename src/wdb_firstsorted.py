@@ -40,8 +40,9 @@ def detect(seg, tree, col_map):
     if cm.get(wl.name, wl.name) != pcol:
         return None                              # v1: filter col is the projection
     pc = seg.cols.get(pcol)
-    if pc is None or pc.get('code_enc') not in (8, 9) or pc.get('has_null'):
-        return None
+    import wdb_policies as _P9
+    if pc is None or not _P9.sparse_default_is(seg, pcol, ''):
+        return None                              # the planes ARE `<> ''` only when the default is 
     ox = tree.args.get('order'); lx = tree.args.get('limit')
     if ox is None or lx is None or len(ox.expressions) not in (1, 2):
         return None

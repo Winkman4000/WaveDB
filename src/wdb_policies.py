@@ -63,6 +63,26 @@ def columns_exist(seg, *cols):
     """Every named (physical) column is present in the segment."""
     return all(c in seg.cols for c in cols)
 
+def sparse_default_is(seg, col, value=''):
+    """The column is stored sparse (code_enc 8/9: its planes hold exactly the rows whose value differs from the
+    stored default), holds no NULLs, and that default IS `value`. Every read that answers `col <> value` from the
+    planes stands on this -- the planes are the filter only when the default is the excluded value (c129: a column
+    whose most common value is not '' -- BrowserLanguage's 'S0' -- had its 'S0' rows dropped by `<> ''`)."""
+    c = seg.cols.get(col)
+    if c is None or c.get('code_enc') not in (8, 9) or c.get('has_null'):
+        return False
+    d = int(c.get('e8d' if c.get('code_enc') == 8 else 'e9d', -1))
+    if d < 0:
+        return False
+    try:
+        v = seg.fetch(col, d)
+    except Exception:
+        return False
+    if isinstance(v, (bytes, bytearray)):
+        v = v.decode('utf-8', 'replace')
+    return v == value
+
+
 def no_deleted_rows(seg):
     """No pending DELETEs -- a presence mask would make a per-row scan unsound for these operators."""
     return seg.presence_mask() is None

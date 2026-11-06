@@ -69,6 +69,10 @@ ap.add_argument('--no-escalate', action='store_true', help="a hash mismatch is r
                 "running the total-order form on WaveDB (minutes when every count ties); legal_check.py decides it")
 ap.add_argument('--wait-answers', type=float, default=0.0, help="WaveDB-only: wait up to this many seconds per "
                 "query for the DuckDB pod to save its answer (a board trailing a running --engines duck)")
+ap.add_argument('--lit', default='top', choices=('top', 'empty'),
+                help="the '<> literal' filters: 'top' = the column's most common value (default); 'empty' = '' on a "
+                     "text column (c129: a column whose most common value is not '' -- the swap the boards never ran)")
+ap.add_argument('--fcol', default='SearchPhrase', help="q31's filter column (form 'filtered': WHERE FCOL <> '')")
 ap.add_argument('--needles', default='', help="like_needles.py output: the LIKE shapes' pattern per column and class")
 A = ap.parse_args()
 sys.path.insert(0, A.src)
@@ -183,6 +187,8 @@ PROF_OF = {c: p for p, c in REPS.items()}
 
 def literal(col):
     c = COLS[col]; v = c['top']
+    if A.lit == 'empty' and c['dt'] == 'str':
+        return "''"
     if c['dt'] in ('int', 'float') and not isinstance(v, str):
         return str(v)
     if c['dt'] in ('int', 'float'):
@@ -318,7 +324,7 @@ def sql_of(k, d, form):
         return ('SELECT %s, %s - 1, %s - 2, %s - 3, COUNT(*) AS c FROM hits GROUP BY %s, %s - 1, %s - 2, %s - 3 '
                 'ORDER BY c DESC LIMIT 10' % ((k,) * 8))
     if A.shape == 'q31':
-        where = " WHERE SearchPhrase <> ''" if form == 'filtered' else ''
+        where = " WHERE %s <> ''" % A.fcol if form == 'filtered' else ''
         return ('SELECT %s, %s, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits%s GROUP BY %s, %s '
                 'ORDER BY c DESC LIMIT 10' % (k, d, where, k, d))
     where = '' if form == 'open' else ' WHERE %s <> %s' % (k, literal(k))
