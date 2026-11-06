@@ -729,7 +729,8 @@ def _gdp_load(seg, pcol, ocol, dirn):
     disk. Lazy birth from _try_rn1's own kernel output; N-stamped; cold-truth clean."""
     import os, pickle
     p = _gdp_path(seg, pcol, ocol, dirn)
-    if not os.path.exists(p):
+    import wdb_sidecar as _SC
+    if not _SC.may_read(p) or not os.path.exists(p):
         return None
     try:
         blob = pickle.load(open(p, 'rb'))

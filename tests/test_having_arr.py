@@ -28,7 +28,6 @@ DOWNQ = ("SELECT l.l_partkey, SUM(l.l_extendedprice) AS v " + LO + "WHERE o.o_or
 
 def _check(db, con, q):
     import controller, test_join_fast as J
-    controller.plan_epoch_bump()
     exp = J._norm([tuple(r) for r in con.execute(q).fetchall()])
     r = db.run(q)
     got = J._norm(r[0] if isinstance(r, tuple) else r)

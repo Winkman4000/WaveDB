@@ -161,7 +161,6 @@ def test_every_road_legal_and_the_same():
             for exc in (True, False):
                 for board in (True, False):
                     WS._EXC_ROUTE[0], WS._COUNT_BOARD[0] = exc, board
-                    controller.plan_epoch_bump()
                     outs = [db.run(q)]
                     if spec is not None:
                         outs.append(WS.execute(seg, dict(spec)))
@@ -174,7 +173,6 @@ def test_every_road_legal_and_the_same():
             direct += spec is not None
     finally:
         WS._EXC_ROUTE[0], WS._COUNT_BOARD[0] = saved
-        controller.plan_epoch_bump()
     assert direct >= 8, direct                      # wherescan itself answered most shapes
 
 

@@ -35,9 +35,7 @@ def test_join_answers_both_ways():
         for qq in (q, q2):
             for on in (True, False):
                 WJ._RW_MEMO[0] = on
-                controller.plan_epoch_bump()
                 J._match(qq, ordered=(qq is q), expect_fast=False)
         assert WJ._RW_MEMO_HITS[0] > h0, 'a repeated parent column was gathered again'
     finally:
         WJ._RW_MEMO[0], WJ._RW_PAR_MIN = old
-        controller.plan_epoch_bump()

@@ -34,7 +34,6 @@ STAND_DOWN = [
 
 def _same(db, con, q):
     import controller, test_join_fast as J
-    controller.plan_epoch_bump()
     exp = sorted(J._norm([tuple(r) for r in con.execute(q).fetchall()]))
     r = db.run(q)
     got = sorted(J._norm(r[0] if isinstance(r, tuple) else r))

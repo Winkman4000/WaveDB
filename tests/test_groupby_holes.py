@@ -75,13 +75,11 @@ def test_keys_only_group_by_legal_with_and_without_the_counted_form():
             got = {}
             for on in ('1', '0'):
                 os.environ['WDB_COUNTED_DISTINCT'] = on
-                controller.plan_epoch_bump()
                 rows = sorted(tuple(x) for x in _rows(db.run(q)))
                 assert rows == [tuple(x) for x in want], (q, on, rows[:3], want[:3])
                 got[on] = rows
             assert got['1'] == got['0'], q
         os.environ['WDB_COUNTED_DISTINCT'] = '1'
-        controller.plan_epoch_bump()
         q = 'SELECT a + 1 AS x FROM t GROUP BY x ORDER BY x DESC LIMIT 7'
         assert [tuple(r) for r in _rows(db.run(q))] == con.execute(q).fetchall()
     finally:
@@ -89,13 +87,11 @@ def test_keys_only_group_by_legal_with_and_without_the_counted_form():
             os.environ.pop('WDB_COUNTED_DISTINCT', None)
         else:
             os.environ['WDB_COUNTED_DISTINCT'] = saved
-        controller.plan_epoch_bump()
 
 
 def test_keys_only_group_by_reaches_the_counted_form():
     db, _con = _fixture()
     import controller
-    controller.plan_epoch_bump()
     f0 = WC._FALLBACK[0]
     db.run('SELECT a + 1 AS x FROM t GROUP BY x')
     assert WC._FALLBACK[0] == f0 + 1 and str(controller._SERVED[0]).startswith('counted:'), controller._SERVED[0]
@@ -123,7 +119,6 @@ def test_wherescan_columnar_emission_is_the_loop_exactly():
             outs = {}
             for gate in (0, 1 << 40):
                 WS._COL_EMIT_MIN = gate
-                controller.plan_epoch_bump()
                 h0 = WS._HITS
                 r = db.run(q)
                 if WS._HITS > h0:
@@ -143,6 +138,5 @@ def test_wherescan_columnar_emission_is_the_loop_exactly():
                 assert type(a0[0][i]) is type(want[0][i]) or isinstance(want[0][i], int), (q, i, a0[0][i], want[0][i])
     finally:
         WS._COL_EMIT_MIN = saved
-        controller.plan_epoch_bump()
     assert served >= 12, served      # wherescan answered both gates of most queries (which keys the encoder frames,
                                      # and so which filters wherescan takes, varies with the run's settings)

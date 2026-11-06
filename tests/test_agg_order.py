@@ -18,7 +18,6 @@ FLAT = ("SELECT l_linenumber * 2 AS k, SUM(CASE WHEN n_name = 'FRANCE' THEN l_qu
 
 def _rows(db, q):
     import controller, test_join_fast as J
-    controller.plan_epoch_bump()
     r = db.run(q)
     return J._norm(r[0] if isinstance(r, tuple) else r)
 

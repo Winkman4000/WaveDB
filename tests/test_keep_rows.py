@@ -53,7 +53,6 @@ def test_join_answers_both_ways():
             exp = [tuple(r) for r in con.execute(q).fetchall()]
             for on in (True, False):
                 WK._KEEP_ROWS[0] = on
-                controller.plan_epoch_bump()
                 got = [tuple(r) for r in db.run(q)[0]]
                 assert len(got) == len(exp), (q, on)
                 for a, b in zip(got, exp):

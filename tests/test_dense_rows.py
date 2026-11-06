@@ -36,9 +36,7 @@ def test_join_answers_both_ways():
         for q in qs:
             for on in (True, False):
                 RT._DENSE_ROWS[0] = on
-                controller.plan_epoch_bump()
                 J._match(q, expect_fast=False)
         assert WJ._DENSE_ROWS_HITS[0] > h0, 'the factorise by the rows was never taken'
     finally:
         RT._DENSE_ROWS[0] = old
-        controller.plan_epoch_bump()

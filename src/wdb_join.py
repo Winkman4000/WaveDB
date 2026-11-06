@@ -795,7 +795,8 @@ def _sumslice_meta(db, tbl):
         import os as _os, json as _js
         p = _os.path.join(db.cat.dbdir, tbl + '.sumslice.json')
         m = None
-        if _os.path.exists(p):
+        import wdb_sidecar as _SC
+        if _SC.may_read(p) and _os.path.exists(p):
             try:
                 m = _js.load(open(p))
                 m.setdefault('stamp', 'l_sumslice')

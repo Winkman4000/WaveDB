@@ -23,7 +23,6 @@ def test_answers_both_ways():
             assert exp, q
             for on in (True, False):
                 WJ._CENSUS_CODE[0] = on
-                controller.plan_epoch_bump()
                 r = db.run(q)
                 got = J._norm(r[0] if isinstance(r, tuple) else r)    # this door returns the rows themselves
                 assert len(got) == len(exp), (q, on, got, exp)
@@ -32,4 +31,3 @@ def test_answers_both_ways():
         assert WJ._CENSUS_CODE_HITS[0] > h0, 'the census by code was never taken'
     finally:
         WJ._CENSUS_CODE[0] = old
-        controller.plan_epoch_bump()

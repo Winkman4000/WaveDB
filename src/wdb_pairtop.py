@@ -164,7 +164,8 @@ def execute(seg, spec):
     except Exception:
         ridx = None
     try:
-        if ridx is None and os.path.exists(shp):
+        import wdb_sidecar as _SC
+        if ridx is None and _SC.may_read(shp) and os.path.exists(shp):
             b9 = pickle.load(open(shp, 'rb'))
             if int(b9.get('n', -1)) == N:
                 ridx = np.asarray(b9['rows'], np.int64)
@@ -252,7 +253,8 @@ def _pt2_path(seg, a, b):
 def _pt2_load(seg, a, b):
     import os, pickle
     p = _pt2_path(seg, a, b)
-    if not os.path.exists(p):
+    import wdb_sidecar as _SC
+    if not _SC.may_read(p) or not os.path.exists(p):
         return None
     try:
         b9 = pickle.load(open(p, 'rb'))

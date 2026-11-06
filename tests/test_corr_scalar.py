@@ -35,16 +35,13 @@ def test_answers_both_ways():
         h0 = WJ._CORR_SCALAR_HITS[0]
         WJ._CORR_SCALAR[0] = True
         for q in QS:
-            controller.plan_epoch_bump()
             J._match(q, expect_fast=False)
         exp = con.execute(Q17).fetchall()[0][0]
-        controller.plan_epoch_bump()
         r = db.run(Q17)
         got = r[0][0][0] if isinstance(r, tuple) else (r[0][0] if isinstance(r, list) else r)
         assert abs(float(got) - float(exp)) <= 1e-6 * max(1.0, abs(float(exp))), (got, exp)
         assert WJ._CORR_SCALAR_HITS[0] >= h0 + len(QS) + 1, 'the value per key was not taken every time'
         WJ._CORR_SCALAR[0] = False                            # off: the old decline (no answer from the fast path)
-        controller.plan_epoch_bump()
         h1 = WJ._CORR_SCALAR_HITS[0]
         try:
             db.run(QS[0])
@@ -53,7 +50,6 @@ def test_answers_both_ways():
         assert WJ._CORR_SCALAR_HITS[0] == h1
     finally:
         WJ._CORR_SCALAR[0] = old
-        controller.plan_epoch_bump()
 
 
 def test_spec_declines():

@@ -344,7 +344,8 @@ def build(seg, col):
         return st
     try:
         import os as _os
-        if _os.path.exists(fn):
+        import wdb_sidecar as _SC
+        if _SC.may_read(fn) and _os.path.exists(fn):
             z = np.load(fn, allow_pickle=False)
             if int(z['N']) == N:
                 st = {'cnt': np.asarray(z['cnt']), 'nn': np.asarray(z['nn']),

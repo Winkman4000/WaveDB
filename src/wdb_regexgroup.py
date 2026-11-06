@@ -234,6 +234,8 @@ def _load_sidecar(seg, col, spec):
     to hostize on every fresh process (Q28 cold), for a result that never changes"""
     p = _sidecar_path(seg, col, spec)
     if not p or not os.path.exists(p): return None
+    import wdb_sidecar as _SC
+    if not _SC.may_read(p): return None
     try:
         import wdb_sidecar
         if not wdb_sidecar.is_fresh(os.path.dirname(p), os.path.basename(p)): return None

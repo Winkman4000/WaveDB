@@ -78,7 +78,6 @@ def test_answers_both_ways():
             exp = [tuple(int(v) for v in r) for r in con.execute(qy).fetchall()]
             for on in (True, False):
                 wdb_engine._E14KEEP[0] = on
-                controller.plan_epoch_bump()
                 for _ in range(2):                # the second run reads the kept planes
                     got = [tuple(int(v) for v in r) for r in db.run(qy)[0]]
                     assert got == exp, (qy, on, got[:3], exp[:3])

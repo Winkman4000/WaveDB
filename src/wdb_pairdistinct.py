@@ -120,7 +120,8 @@ def _tier_shelf(seg, a, b, u):
     ia, ib = np.dtype(wa).itemsize, np.dtype(wb).itemsize
     p9 = os.path.join(os.path.dirname(seg.path),
                       'tier2__%s__%s__%s__w%d%d.bin' % (a, b, u, ia, ib))
-    if not os.path.exists(p9):
+    import wdb_sidecar as _SC
+    if not (_SC.may_read(p9) and os.path.exists(p9)):
         e0 = int(WS._code_of(seg, b, ''))
         cb = seg.cols.get(b) or {}
         pl = seg.e8_planes(b) if cb.get('code_enc') in (8, 9) and hasattr(seg, 'e8_planes') else None

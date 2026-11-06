@@ -912,7 +912,8 @@ def detect(seg, tree, col_map):
                 return int(wdb_gbshelf.point(sh9, int(k)))
         except Exception:
             pass
-        if os.path.exists(seg.path + '.' + col + '.gbc'):
+        import wdb_sidecar
+        if wdb_sidecar.may_read(seg.path) and os.path.exists(seg.path + '.' + col + '.gbc'):
             try:
                 import wdb_gbcount
                 loaded = wdb_gbcount._load(seg, col)
@@ -1078,8 +1079,9 @@ def detect(seg, tree, col_map):
     # LIKE conjuncts disqualify the sidecar (it can only filter eq/in shapes), so no defer.
     if not likes and len(keys) == 1 and keys[0][1].get('kind') == 'col':
         for a in aggs:
-            if a[1] == 'COUNT_D' and os.path.exists(
-                    wdb_gdsidecar.sidecar_path(seg.path, keys[0][1]['src'], a[2])):
+            import wdb_sidecar
+            _gd9 = wdb_gdsidecar.sidecar_path(seg.path, keys[0][1]['src'], a[2])
+            if a[1] == 'COUNT_D' and wdb_sidecar.may_read(_gd9) and os.path.exists(_gd9):
                 return None
     order = tree.args.get('order')
     if order is not None:

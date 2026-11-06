@@ -163,7 +163,8 @@ def _gdc_load(seg, kcol, tcol):
     Same law as the gbc: lawful V-sized sidecar, no_deleted_rows-gated, cold-truth clean."""
     import os, pickle
     p = _gdc_path(seg, kcol, tcol)
-    if not os.path.exists(p):
+    import wdb_sidecar as _SC
+    if not _SC.may_read(p) or not os.path.exists(p):
         return None
     try:
         blob = pickle.load(open(p, 'rb'))

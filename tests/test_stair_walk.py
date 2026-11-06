@@ -54,10 +54,8 @@ def test_join_answers_both_ways():
         for q in qs:
             for on in (True, False):
                 WK._STAIR_WALK[0] = on
-                controller.plan_epoch_bump()
                 J._match(q, expect_fast=False)
         assert calls[0] > 0, 'the walk was never taken'
     finally:
         WK._stairs_walk_nb = orig
         WK._STAIR_WALK[0], WK._STAIR_WALK_MIN = old
-        controller.plan_epoch_bump()

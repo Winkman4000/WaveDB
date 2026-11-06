@@ -72,7 +72,6 @@ def test_stored_start():
     old = WS._POT_SWITCH
     for q, want in ((q1, 'p'), (q2, 'b')):
         WS._POT_LAST[0] = None
-        controller.plan_epoch_bump()
         w = _rows(db.run(q))
         assert controller._SERVED[0] == 'wherescan', (q, controller._SERVED[0])
         pk = WS._POT_LAST[0]
@@ -89,7 +88,6 @@ def test_stored_start():
         _legal(q, w, con)
         WS._POTENCY[0] = False
         try:
-            controller.plan_epoch_bump()
             assert _rows(db.run(q)) == w, q
         finally:
             WS._POTENCY[0] = True

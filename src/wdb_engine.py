@@ -2806,7 +2806,7 @@ class Segment:
             fn = self.path + '.' + nm + '.cnt.npy'
             try:
                 import wdb_sidecar as _wsc9
-                if _wsc9.exists(fn) and _wsc9.is_fresh(_os.path.dirname(self.path), _os.path.basename(fn)):
+                if _wsc9.may_read(fn) and _wsc9.exists(fn) and _wsc9.is_fresh(_os.path.dirname(self.path), _os.path.basename(fn)):
                     v9 = np.load(fn, mmap_mode='r')
                     if v9.shape[0] == int(self.cols[nm]['V']):
                         cc[nm] = v9
@@ -3106,7 +3106,8 @@ class Segment:
         if isinstance(self._cubes, int):              # 0 = not yet loaded
             import os, pickle
             p = self.path + '.cube'
-            self._cubes = pickle.load(open(p, 'rb')) if os.path.exists(p) else []
+            import wdb_sidecar as _SC
+            self._cubes = pickle.load(open(p, 'rb')) if (_SC.may_read(p) and os.path.exists(p)) else []
         return self._cubes
 
     def slice_for_predicate(self, nm, op, lit):

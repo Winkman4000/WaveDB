@@ -51,9 +51,7 @@ def test_q18_shape_both_ways():
         for qty in (250, 300):
             for on in (True, False):
                 WK._RUN_SUM[0] = on
-                controller.plan_epoch_bump()
                 J._match(q % qty, ordered=True, expect_fast=False)
         assert WJ._RUN_SUM_HITS[0] > h0, 'the run sums were never taken'
     finally:
         WK._RUN_SUM[0], WK._RUN_SUM_MIN = old
-        controller.plan_epoch_bump()

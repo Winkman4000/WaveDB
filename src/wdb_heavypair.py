@@ -127,7 +127,8 @@ def _load(seg, cols):
     if hit is not None:
         return hit
     p = _path(seg, cols)
-    if os.path.exists(p):
+    import wdb_sidecar as _SC
+    if _SC.may_read(p) and os.path.exists(p):
         try:
             blob = pickle.load(open(p, 'rb'))
             if blob.get('fmt') == _FMT and blob['n'] == int(seg.N) and (blob['a'], blob['b']) == (a, b):

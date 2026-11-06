@@ -22,7 +22,6 @@ NULL_IN = ("SELECT COUNT(*) FROM partsupp, part WHERE p_partkey = ps_partkey AND
 
 def _same(db, con, q, ordered=False):
     import controller, test_join_fast as J
-    controller.plan_epoch_bump()
     exp = J._norm([tuple(r) for r in con.execute(q).fetchall()])
     r = db.run(q)
     got = J._norm(r[0] if isinstance(r, tuple) else r)

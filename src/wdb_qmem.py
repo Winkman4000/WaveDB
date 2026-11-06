@@ -64,8 +64,8 @@ def flush(db=None):
 # locks, settings, the ledger, open files). Everything else that is still full after a query's end
 # is residue. Registered caches are cleared by flush and so never appear.
 _MODULE_KEEP = frozenset({
-    ('controller', '_BYNAME'), ('wdb_exprjit', '_CACHE'), ('wdb_db', '_PW_SEGS'),
-    ('wdb_db', '_ROAD_DECLINED'), ('wdb_join', '_JPTR_ASKED'), ('wdb_join', '_JPTR_NOT'),
+    ('wdb_exprjit', '_CACHE'), ('wdb_db', '_PW_SEGS'),
+    ('wdb_join', '_JPTR_ASKED'), ('wdb_join', '_JPTR_NOT'),
     ('wdb_join', '_JPTR_CODES'),             # are a child's codes its pointer? a yes/no per file pair, under their
                                              # birthmark -- a fact about the two files, like _JPTR_NOT's refusals
     ('wdb_ledger', '_STAGES'), ('wdb_ledger', '_OPEN'), ('wdb_semijoin', '_INV_LOCKS'),
@@ -74,7 +74,7 @@ _MODULE_KEEP = frozenset({
     ('wdb_qmem', '_BASE'), ('wdb_sidecar', '_stamp_cache'), ('wdb_db', '_PROGRAM'),
     ('wdb_sidecar', '_exists_cache'),        # which sidecar FILES exist: the directory, not data
     ('wdb_calib', '_CACHE'),                 # the machine card: this hardware's primitive speeds
-    ('controller', '_PLANS'), ('wdb_semijoin', '_PLANS'), ('wdb_semijoin', '_KMAX'),   # plans: program
+    ('wdb_semijoin', '_PLANS'), ('wdb_semijoin', '_KMAX'),   # plans: program
     ('wdb_qmem', '_TIER1'),
 })
 

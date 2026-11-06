@@ -71,7 +71,6 @@ def test_answers_legal_with_and_without_the_counted_form():
             got = {}
             for on in ('1', '0'):
                 os.environ['WDB_COUNTED_DISTINCT'] = on
-                controller.plan_epoch_bump()
                 rows, hdr = _rows(db.run(q))
                 assert [tuple(x) for x in rows] == [tuple(x) for x in want], (q, on, rows[:3], want[:3])
                 if hdr is not None:
@@ -83,13 +82,11 @@ def test_answers_legal_with_and_without_the_counted_form():
             os.environ.pop('WDB_COUNTED_DISTINCT', None)
         else:
             os.environ['WDB_COUNTED_DISTINCT'] = saved
-        controller.plan_epoch_bump()
 
 
 def test_ordered_and_limited_distinct_legal():
     db, con = _fixture()
     import controller
-    controller.plan_epoch_bump()
     q = 'SELECT DISTINCT a + 1 AS x FROM t ORDER BY x DESC LIMIT 7'
     rows = db.run(q)
     rows = rows[0] if isinstance(rows, tuple) else rows
@@ -105,11 +102,9 @@ def test_counted_form_serves():
     """a derived DISTINCT reaches the counted form -- ahead of diskpair or before the general scan"""
     db, _con = _fixture()
     import controller
-    controller.plan_epoch_bump()
     h0, f0 = WC._HITS[0], WC._FALLBACK[0]
     db.run('SELECT DISTINCT a + 1 AS x FROM t WHERE b = 3')     # nothing takes it: before the general scan
     assert WC._FALLBACK[0] == f0 + 1 and str(controller._SERVED[0]).startswith('counted:'), controller._SERVED[0]
-    controller.plan_epoch_bump()
     db.run('SELECT DISTINCT a + 1 AS x FROM t')                 # ahead of diskpair (or, unframed, before the scan)
     assert WC._HITS[0] + WC._FALLBACK[0] >= h0 + f0 + 2, controller._SERVED[0]
 

@@ -92,8 +92,7 @@ def test_flat_person_gate():
     df = _frame()
     d = os.path.join(TMP, 'ttg_' + uuid.uuid4().hex[:8]); pq = d + '.parquet'; db_dir = d + '_db'
     os.makedirs(d)
-    floor = dict(WDB_LOAD_ANSWERS='0', WDB_SIDECARS='0', WDB_SEQ_NARROW_OK='0', WDB_SEQ_REPEATS_OK='0',
-                 WDB_PLANCACHE_OFF='1')
+    floor = dict(WDB_LOAD_ANSWERS='0', WDB_SIDECARS='0', WDB_SEQ_NARROW_OK='0', WDB_SEQ_REPEATS_OK='0')
     old = TT.TALLY_MAX_BYTES
     try:
         df.to_parquet(pq, index=False)

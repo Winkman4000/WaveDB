@@ -19,8 +19,6 @@ def _ledger_path(seg):
 
 def record(seg, kind, **args):
     """Append a birth recipe (deduped, atomic, quiet on failure)."""
-    import controller
-    controller.plan_epoch_bump()
     try:
         import wdb_sidecar
         if not wdb_sidecar.births_on(os.path.dirname(seg.path)):

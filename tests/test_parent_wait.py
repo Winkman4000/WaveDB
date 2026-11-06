@@ -24,9 +24,7 @@ def test_join_answers_both_ways():
         for q in qs:
             for on in (True, False):
                 WJ._PARENT_WAIT[0] = on
-                controller.plan_epoch_bump()
                 J._match(q, expect_fast=False)
         assert WJ._PARENT_WAIT_HITS[0] > h0, 'the parent keep never waited'
     finally:
         WJ._PARENT_WAIT[0] = old
-        controller.plan_epoch_bump()

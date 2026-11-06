@@ -22,11 +22,9 @@ def test_row_projection_both_ways():
             exp = J._norm([tuple(r) for r in con.execute(q).fetchall()])
             for on in (True, False):
                 S._ROWS_AT[0] = on
-                controller.plan_epoch_bump()
                 r = db.run(q)
                 got = J._norm(r[0] if isinstance(r, tuple) else r)
                 assert len(got) == len(exp) and all(J._eq(g, e) for g, e in zip(got, exp)), (q, on, got[:3], exp[:3])
         assert S._ROWS_AT_HITS[0] > h0, 'the read at the rows was never taken'
     finally:
         S._ROWS_AT[0] = old
-        controller.plan_epoch_bump()

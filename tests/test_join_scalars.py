@@ -23,7 +23,6 @@ def test_answers():
     db, con = J._fixture()
     h0 = S._JOIN_SCALARS_HITS[0]
     for q in QS:
-        controller.plan_epoch_bump()
         exp = J._norm([tuple(r) for r in con.execute(q).fetchall()])
         r = db.run(q)
         got = J._norm(r[0] if isinstance(r, tuple) else r)

@@ -83,7 +83,6 @@ def test_routed_answers_legal_both_ways():
         for on in (True, False):
             WS._E3_BATCH[0] = on
             for q in qs:
-                controller.plan_epoch_bump()
                 r = db.run(q)
                 got = [tuple(x) for x in (r[0] if isinstance(r, tuple) else r)]
                 want = con.execute(q).fetchall()
@@ -92,4 +91,3 @@ def test_routed_answers_legal_both_ways():
                 assert got == want, (q, on, got[:3], want[:3])
     finally:
         WS._E3_BATCH[0] = saved
-        controller.plan_epoch_bump()

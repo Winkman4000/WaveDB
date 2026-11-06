@@ -123,16 +123,12 @@ def _drop_count(res):
 def walk(ctx2, scan):
     """the counted request through the read order (the general scan last when scan) -> (result, read name) or None"""
     import controller, read_methods as R
-    rp = controller._plan_replay(ctx2)
-    if rp is not None:
-        return rp, controller._SERVED[0]
     for read in controller._READ_ORDER:
         spec = read.detect(ctx2)
         if spec is None:
             continue
         rows = read.execute(ctx2, spec)
         if rows is not None:
-            controller._plan_store(ctx2, read.name, spec)
             return rows, read.name
     if scan:
         return R.general_scan(ctx2), 'general_scan'

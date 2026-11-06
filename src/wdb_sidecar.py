@@ -272,6 +272,12 @@ def births_on(dbdir):
     return setting(dbdir) == 'on'
 
 
+def may_read(path):
+    """THE SWITCH ON THE READ SIDE: with sidecars off, a derived file on disk is not read either -- off means
+    the engine answers from the loaded segments alone. `path` is the derived file's path."""
+    return births_on(os.path.dirname(path))
+
+
 def may_build(path):
     """THE VANILLA LAW (Jackson, 2026-09-20): with the switch off, a read may USE a structure that
     exists on disk but may never BUILD one to answer -- it declines and the streaming reads serve.

@@ -24,7 +24,6 @@ def test_answers():
           (Q % 'MAX').replace('ORDER BY c_custkey', "AND c_mktsegment <> 'NONE' ORDER BY c_custkey"),
           (Q % 'MAX').replace('c_phone, total', 'c_phone, total * 2 AS t2')]
     for q in qs:
-        controller.plan_epoch_bump()
         exp = J._norm([tuple(r) for r in con.execute(q).fetchall()])
         got = J._norm(_rows(db, q))
         assert exp and len(got) == len(exp), (q, got, exp)

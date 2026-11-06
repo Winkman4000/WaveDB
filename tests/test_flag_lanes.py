@@ -143,7 +143,6 @@ def test_like_answers_duckdb_both_ways():
             want = [tuple(r) for r in con.execute(q).fetchall()]
             for lanes in (True, False):
                 WS._FLAG_LANES[0] = lanes
-                controller.plan_epoch_bump()
                 got = [tuple(r) for r in db.run(q)[0]]
                 assert got == want, (q, lanes, got[:3], want[:3])
     finally:

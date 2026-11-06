@@ -129,7 +129,6 @@ def test_join_answers_both_ways():
             exp = [tuple(r) for r in con.execute(q).fetchall()]
             for on in (True, False):
                 wdb_join._KEEP_SAMPLE[0] = on
-                controller.plan_epoch_bump()
                 got = [tuple(r) for r in db.run(q)[0]]
                 assert len(got) == len(exp), (q, on, got[:3], exp[:3])
                 for a, b in zip(got, exp):

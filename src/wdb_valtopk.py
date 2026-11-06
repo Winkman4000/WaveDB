@@ -79,7 +79,8 @@ def _counts_lane(seg, kcol, kdesc, need):
     import wdb_gbcount
     import wdb_blockstats as BS
     import wdb_window as WN
-    if not os.path.exists(seg.path + '.' + kcol + '.gbc'):
+    import wdb_sidecar as _SC
+    if not _SC.may_read(seg.path) or not os.path.exists(seg.path + '.' + kcol + '.gbc'):
         return None                              # peek only: the lane must never lazy-build
     t = np.asarray(WN._int_table(seg, kcol), dtype=np.int64)
     if t.size < 2 or not bool(np.all(np.diff(t) >= 0)):

@@ -27,7 +27,6 @@ KEYORD = ("SELECT o_orderpriority, SUM(l_quantity) AS q FROM lineitem, orders WH
 
 def _check(db, con, q, vcol, ordered=False):
     import controller, test_join_fast as J
-    controller.plan_epoch_bump()
     exp = J._norm([tuple(r) for r in con.execute(q).fetchall()])
     r = db.run(q)
     got = J._norm(r[0] if isinstance(r, tuple) else r)

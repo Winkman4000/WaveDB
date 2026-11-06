@@ -86,7 +86,8 @@ def save(segment_path, sc):
 
 def load(segment_path, group_col, target_col):
     p = sidecar_path(segment_path, group_col, target_col)
-    if not os.path.exists(p):
+    import wdb_sidecar as _SC
+    if not _SC.may_read(p) or not os.path.exists(p):
         return None
     z = np.load(p)
     meta = json.loads(bytes(z['meta']).decode())

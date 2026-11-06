@@ -29,7 +29,6 @@ OTHER = ("SELECT l_orderkey, SUM(l_extendedprice) AS v " + W + " GROUP BY l_orde
 
 def _check(db, con, q, vcol):
     import controller, test_join_fast as J
-    controller.plan_epoch_bump()
     exp = J._norm([tuple(r) for r in con.execute(q).fetchall()])
     r = db.run(q)
     got = J._norm(r[0] if isinstance(r, tuple) else r)

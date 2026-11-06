@@ -82,11 +82,9 @@ def _run(db, con, qs):
     import controller, wdb_pairusers as PU
     served, hits0 = [], list(PU._HITS)
     for q in qs:
-        controller.plan_epoch_bump()
         r = db.run(q)
         _legal(con, q, [tuple(x) for x in (r[0] if isinstance(r, tuple) else r)])
         served.append(controller._SERVED[0])
-    controller.plan_epoch_bump()
     return served, [x - y for x, y in zip(PU._HITS, hits0)]
 
 

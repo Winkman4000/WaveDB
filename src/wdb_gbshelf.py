@@ -66,7 +66,8 @@ def open_shelf(seg, col):
     """mmap the shelf; returns views dict or None. No caching needed: opening
     is priced in microseconds by design."""
     p = _path(seg, col)
-    if not os.path.exists(p):
+    import wdb_sidecar as _SC
+    if not _SC.may_read(p) or not os.path.exists(p):
         return None
     try:
         f = open(p, 'rb')

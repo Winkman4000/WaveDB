@@ -214,7 +214,6 @@ def test_every_shape_is_duckdbs():
     db, con = _fixture()
     bad = []
     for q in SHAPES + TRUNC:
-        controller.plan_epoch_bump()
         got = _rows(db.run(q))
         if not _legal(q, got, con):
             bad.append((controller._SERVED[0], q, got[:3], _rows(con.execute(q).fetchall())[:3]))
@@ -226,7 +225,6 @@ def test_every_join_row_is_an_answer_row():
     db, con = _fixture()
     bad = []
     for q in JOINS:
-        controller.plan_epoch_bump()
         got = _rows(db.run(q))
         full = set(_rows(con.execute(q.replace(' LIMIT 20', '')).fetchall()))
         if len(got) != min(20, len(full)) or not all(x in full for x in got):
@@ -240,7 +238,6 @@ def test_pairdistinct_order_by_another_aggregate():
     import controller
     db, con = _fixture()
     q = "SELECT k, s, COUNT(DISTINCT u) AS du FROM t WHERE s <> '' GROUP BY k, s ORDER BY COUNT(*) DESC LIMIT 3"
-    controller.plan_epoch_bump()
     try:
         got = _rows(db.run(q))
     except NotImplementedError:

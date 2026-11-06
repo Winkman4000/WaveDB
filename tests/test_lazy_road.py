@@ -50,14 +50,11 @@ def test_join_answers_both_ways():
         for q in qs:
             for on in (True, False):
                 WJ._LAZY_ROAD[0] = on
-                controller.plan_epoch_bump()
                 J._match(q, expect_fast=False)
         WJ._LAZY_ROAD[0] = True
-        controller.plan_epoch_bump()
         db.run(qs[0])
         f0 = WJ._LazyRoad.FULLS[0]
         db.run(qs[0])
         assert WJ._LazyRoad.FULLS[0] == f0, 'a filtered chain query composes its roads at the survivors only'
     finally:
         WJ._LAZY_ROAD[0] = old
-        controller.plan_epoch_bump()

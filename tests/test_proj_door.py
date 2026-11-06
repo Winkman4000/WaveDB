@@ -28,7 +28,6 @@ OTHER = ("SELECT c_name, o_orderkey FROM customer, orders WHERE c_custkey = o_cu
 
 def _ordered(db, con, q):
     import controller, test_join_fast as J
-    controller.plan_epoch_bump()
     exp = J._norm([tuple(r) for r in con.execute(q).fetchall()])
     r = db.run(q)
     got = J._norm(r[0] if isinstance(r, tuple) else r)

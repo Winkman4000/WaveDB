@@ -36,7 +36,6 @@ def test_text_conjunct_scored_from_the_keep_sample():
         old = (os.environ.get('WDB_SIDECARS'), wdb_join._KEEP_SAMPLE[0])
         try:
             os.environ['WDB_SIDECARS'] = env; wdb_join._KEEP_SAMPLE[0] = oks
-            import controller; controller.plan_epoch_bump()            # a fresh plan under this setting
             _db9 = J._fixture()[0]                                      # not yet counted (an earlier test may have)
             _db9.open_segment(_db9.cat.segment_paths('lineitem')[0], 'lineitem').__dict__.pop('_ccounts', None)
             sm = _wit(Q_TEXT)["l_shipmode = 'AIR'"]

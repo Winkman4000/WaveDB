@@ -67,13 +67,11 @@ def test_complement_both_sides_legal():
                 rows, _hdr = WC.execute(seg, spec)
                 assert [tuple(x) for x in rows] == want, (q, cut, rows)
                 assert all(type(v) is int for v in rows[0]), rows
-                controller.plan_epoch_bump()
                 r = db.run(q)
                 assert [tuple(x) for x in (r[0] if isinstance(r, tuple) else r)] == want, (q, cut)
                 ran += 1
     finally:
         WC._CENSUS_V = saved
-        controller.plan_epoch_bump()
     assert ran >= 16, ran                               # most queries ran, on both sides
 
 

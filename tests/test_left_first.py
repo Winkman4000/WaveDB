@@ -20,9 +20,7 @@ def test_join_answers_both_ways():
         for q in qs:
             for on in (True, False):
                 WJ._LEFT_FIRST[0] = on
-                controller.plan_epoch_bump()
                 J._match(q, ordered=True, expect_fast=False)
         assert WJ._LEFT_FIRST_HITS[0] > h0, 'the leftover IN never kept the survivors first'
     finally:
         WJ._LEFT_FIRST[0] = old
-        controller.plan_epoch_bump()

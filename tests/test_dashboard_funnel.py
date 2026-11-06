@@ -70,7 +70,6 @@ def test_dashboard_shapes_legal_and_funnel_answers():
     import controller
     served = 0
     for q in QS:
-        controller.plan_epoch_bump()
         r = db.run(q)
         got = [tuple(x) for x in (r[0] if isinstance(r, tuple) else r)]
         assert _legal(q, got, con), (q, got[:3], con.execute(q).fetchall()[:3])
