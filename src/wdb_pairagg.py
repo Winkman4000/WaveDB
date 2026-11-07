@@ -30,10 +30,10 @@ _ENABLED = True
 _HITS = 0
 _NT = 16
 _NSHARD = 64
-_TSIZE = 1 << 18
+_TSIZE = 1 << 18          # a shard table's smallest size; each grows to twice its shard's rows (never full)
 # lore: Q32 is the case.
-_SORT_MIN = 30_000_000   # above this many survivors the sparse hash oversubscribes (near-unique keys);
-                         # switch to sort + adjacent-run scan, which never melts.
+_SORT_MIN = 30_000_000   # above this many survivors sort + adjacent-run scan beats the shard hash (near-unique
+                         # keys: one sort of the pair ids against tables that grow with the rows)
 
 
 def enable():
@@ -109,11 +109,15 @@ def _agg_shards(PG, PPY, base, S, tsize):
     out_g = np.empty(n, np.int64); out_c = np.empty(n, np.int64); out_p = np.empty((n, Pn), np.int64)
     ndist = np.zeros(S, np.int64)
     for s in prange(S):
-        lo = base[s]; hi = base[s + 1]; m = tsize - 1
-        keys = np.full(tsize, -1, np.int64); cnts = np.zeros(tsize, np.int64)
-        psum = np.zeros((tsize, Pn), np.int64)
+        lo = base[s]; hi = base[s + 1]
+        ts = tsize
+        while ts < 2 * (hi - lo):                  # at most half full: the probe always finds a free slot
+            ts *= 2
+        m = ts - 1
+        keys = np.full(ts, -1, np.int64); cnts = np.zeros(ts, np.int64)
+        psum = np.zeros((ts, Pn), np.int64)
         for j in range(lo, hi):
-            g = PG[j]; h = (g * 2654435761) & m
+            g = PG[j]; h = ((g // S) * 2654435761) & m   # g % S is s for the whole shard: hash the rest
             while True:
                 k = keys[h]
                 if k == -1: keys[h] = g; cnts[h] = 1; break
@@ -121,7 +125,7 @@ def _agg_shards(PG, PPY, base, S, tsize):
                 else: h = (h + 1) & m
             for p in range(Pn): psum[h, p] += PPY[j, p]
         w = lo
-        for h in range(tsize):
+        for h in range(ts):
             if keys[h] != -1:
                 out_g[w] = keys[h]; out_c[w] = cnts[h]
                 for p in range(Pn): out_p[w, p] = psum[h, p]

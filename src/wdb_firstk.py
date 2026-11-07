@@ -121,7 +121,8 @@ def detect(seg, tree, col_map):
 
 
 # lore: Q23's 10th hit sits at row 214,125
-_FIRST_WINDOW = 1 << 18   # the walk's first window of rows
+_FIRST_WINDOW = 1 << 18   # the walk's first window of rows: a speed knob only -- the walk reads on, window after
+                          # window, until it holds k hits (a small first window answers early hits cheaply)
 _SCAN_SWITCH_SHIFT = 5    # the walk turns into one scan of the rest when more than N >> this rows remain to read
 
 

@@ -66,11 +66,12 @@ _READ_ORDER = (
     # lore: pairusers is Q11's shape
     R.pairusers,            # few kept rows / u a key / a near-unique key (wdb_pairusers); declines to:
     R.pairdistinct,
-    R.septop,
     R.sampletop,
     R.tripletop,
     R.pairtop,
     R.gridwalk,
+    R.septop,               # a pair count-top whose filter is the planes, after gridwalk: gridwalk's census wins
+    # lore: 2026-11-07 on hits (100M), the planes forms (7.2%-7.6% kept): septop 0.17-0.23 s, gridwalk 0.08
     R.smallk,              # narrow-key pair/triple boards (the small-K weapon)             # two-key COUNT(*) top-K via grid filled-cell + count-ordered head (opt-in)
     R.sumtopk,             # single big-key SUM top-K: one kernel, k label decodes
     R.distinctlim,         # DISTINCT-LIMIT early exit: stops at n pairs, streams never fully read

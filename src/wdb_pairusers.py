@@ -75,9 +75,11 @@ USERS_AFTER = 2            # rounds walked before the line is read (the first ro
 # lore: wide (JavaEnable x UTMSource 146 -> 81 ms, IPNetworkID x UTMSource 345 -> 282); 5.6M-33M kept loses on dense
 # lore: pairs (OpenerName x MobilePhone 131 -> 222, EventTime x JavaEnable 319 -> 1035: gathering EventTime at 33M
 # lore: positions)
-COMPACT_SHIFT = 6          # THE KEPT ROWS FIRST, any pair: the filter keeps at most N >> this. Measured: a filter
-                           # keeping ~1.6% of the rows wins dense and wide; 5.6%-33% kept loses on dense pairs
-                           # (gathering a wide column at the kept positions)
+COMPACT_SHIFT = 5          # THE KEPT ROWS FIRST, any pair: the filter keeps at most N >> this (1/32). Measured on
+                           # dense pairs, compact vs whole columns: up to 2.1% kept compact wins (1.4% 46 vs 98 ms,
+                           # 2.1% 54 vs 93); from 4.8% it loses (174 vs 108) -- the line sits between 2.1% and 4.8%
+# lore: 11-07 sweep on hits (100M rows), 14 filter columns x RegionID / SearchEngineID / MobilePhoneModel, 0.35M-9.4M
+# lore: kept; the line was N >> 6 (1.56%) before, which left 1.6%-2.1% kept on the slower path
 # lore: RefererHash pairs 6.7M-33M kept 0.86 -> 0.34 s, 1.31 -> 0.83; but IPNetworkID x ResponseEndTiming
 # lore: (V 89,907, 25.4M kept) 365 -> 453 ms
 COMPACT_WIDE_SHIFT = 1     # a wide pair up to N >> this when its widest key's census boards (V x threads) outweigh a

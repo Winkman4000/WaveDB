@@ -1,9 +1,9 @@
-"""wdb_cdgroup -- Jackson's bounded hunt for COUNT(DISTINCT u) GROUP BY sparse col.
+"""wdb_cdgroup -- Jackson's bounded hunt for COUNT(DISTINCT u) GROUP BY key WHERE key <> lit.
 
 Visits (rows) bound uniques (distinct(u) per group <= group's row count),
 so walk groups biggest-first computing exact uniques and STOP when the next
-group's visit count falls strictly below the k-th exact answer. The sparse
-dress hands the non-default rows (WHERE col <> '' is free); one scatter pass
+group's visit count falls strictly below the k-th exact answer. The row list
+is `key <> lit` (free from the planes when lit is a sparse key's default); one scatter pass
 buckets rows by group; only the k winners' strings are ever decoded.
 
 Lore: ClickBench Q13's lane."""
@@ -48,16 +48,18 @@ def detect(seg, tree, col_map):
     if ucol is None:
         return None
     w = tree.args.get('where')
-    # THE DEFAULT'S GROUP (2026-09-29): the planes hand only the NON-default rows, so the lane is
-    # exact only when the query itself drops the default -- WHERE key <> '' with '' the default.
-    # Without the WHERE it dropped the biggest group (a = 0, 160,025 distinct) from the podium.
+    # THE ROW LIST IS `key <> lit`, any literal of the key's kind: wdb_wherescan.neq_rows hands it (the planes, free,
+    # when the key is stored sparse and its default IS lit; else one pass over the codes; NULL keys never).
+    # lore: v1 (2026-09-29) served only WHERE key <> '' with '' the sparse default -- without the WHERE it dropped
+    # the biggest group (a = 0, 160,025 distinct) from the podium. Widened 2026-11-07 ("make them work for any").
     if w is None:
         return None
     n2 = w.this
     if not (isinstance(n2, E.NEQ) and isinstance(n2.this, E.Column)
-            and (col_map or {}).get(n2.this.name, n2.this.name) == key
-            and isinstance(n2.expression, E.Literal)
-            and str(n2.expression.this) == ''):
+            and (col_map or {}).get(n2.this.name, n2.this.name) == key):
+        return None
+    import wdb_wherescan as _WS
+    if _WS._litval(n2.expression) is None:
         return None
     kc = seg.cols.get(key)
     uc = seg.cols.get(ucol)
@@ -65,18 +67,11 @@ def detect(seg, tree, col_map):
         return None
     if uc.get('mode') == 4:
         return None                              # codes are row positions: distinct would count rows
-    import wdb_policies as _P9
-    if not _P9.sparse_default_is(seg, key, ''):
-        return None                              # v1: the sparse dress whose default is '' only --
-    d9 = int(kc.get('e8d' if kc.get('code_enc') == 8 else 'e9d', -1))
-    if d9 < 0:
-        return None
-    dv9 = seg.fetch(key, d9)
-    if isinstance(dv9, (bytes, bytearray)):
-        dv9 = dv9.decode('utf-8', 'replace')
-    if dv9 != '':
-        return None                              # the default is a real value: its rows are a group
-    ox = tree.args.get('order')                  # its planes ARE the row list
+    if seg._overrides(ucol) is not None:
+        return None                              # the raw codes would miss the overriding values
+    if uc.get('has_null') and uc.get('mode') not in (0, 1, 2):
+        return None                              # NULL's code is known (V-1) only in the dictionary modes
+    ox = tree.args.get('order')
     lim = None
     lx = tree.args.get('limit')
     if lx is not None:
@@ -91,22 +86,29 @@ def detect(seg, tree, col_map):
         return None
     if alias_cd is None or o.this.name != alias_cd:
         return None
-    return {'key': key, 'ucol': ucol, 'aggs': aggs, 'lim': lim,
+    return {'key': key, 'ucol': ucol, 'aggs': aggs, 'lim': lim, 'lit': n2.expression,
             'proj': tree.expressions}
 
 
 def execute(seg, spec):
     global _HITS
     key, ucol, k = spec['key'], spec['ucol'], spec['lim']
-    pl = seg.e8_planes(key)
-    if pl is None:
-        return None
-    pos8, lits8 = pl[0], pl[1]
-    lits8 = np.asarray(lits8, np.int64)
+    import wdb_wherescan as _WS
+    rl = _WS.neq_rows(seg, key, spec['lit'])
+    if rl is None:
+        return None                              # not a code filter (a literal of the other kind, a time key, ...)
+    pos8, lits8 = rl
     KV = int(seg.cols[key]['V'])
     import wdb_kernels as WK
+    uc = np.asarray(seg._raw_codes(ucol))[pos8].astype(np.int64)
+    c9 = seg.cols[ucol]
+    all9 = None
+    if c9.get('has_null'):                       # COUNT(DISTINCT u) counts no NULL: its rows leave the list
+        nn9 = uc != int(c9['V']) - 1
+        if not nn9.all():
+            all9 = lits8                         # (a group of only NULL u still answers 0)
+            lits8, uc = lits8[nn9], uc[nn9]
     counts = np.bincount(lits8, minlength=KV)
-    uc = np.asarray(seg._raw_codes(ucol))[np.asarray(pos8)].astype(np.int64)
     offs = np.zeros(KV + 1, np.int64)
     np.cumsum(counts, out=offs[1:])
     bucketed = np.empty(lits8.size, np.int64)
@@ -114,6 +116,8 @@ def execute(seg, spec):
     big = np.argsort(counts, kind='stable')[::-1].astype(np.int64)
     bc, bd, filled = WK.cd_hunt(bucketed, offs, big, counts.astype(np.int64),
                                 np.int64(k))
+    if int(filled) < k and all9 is not None and np.unique(all9).size > int(filled):
+        return None                              # the podium reaches the 0-distinct groups the hunt never visits
     best = sorted(((int(bd[t]), int(bc[t])) for t in range(int(filled))),
                   key=lambda t: (-t[0], t[1]))
     rows = []

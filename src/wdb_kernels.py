@@ -5335,11 +5335,11 @@ def cd_alldistinct(bucketed, offs):
 
 
 @njit(nogil=True, parallel=True, cache=True)
-def tt_survivors(uc, ucnt, pos8, lits8, spc, ec, mt, e0, emptyc, theta, outs, lens, has_m):
+def tt_survivors(uc, ucnt, pos8, lits8, spc, ec, mt, e0, emptyc, theta, outs, lens, has_m, ksh, msh):
     """The triple-key top-k's fused pass: per-thread chunks walk the rows once -- user bound
     from the census, phrase bound via two-pointer merge with the sorted
-    sparse planes (no 100M scratch arrays), survivors emit packed 54-bit
-    keys (uid<<29 | minute<<23 | sp) straight into per-thread buffers.
+    sparse planes (no 100M scratch arrays), survivors emit packed int64
+    keys (uid<<ksh | part<<msh | sp) straight into per-thread buffers.
 
     Lore: built for ClickBench Q18."""
     T = outs.shape[0]
@@ -5374,21 +5374,21 @@ def tt_survivors(uc, ucnt, pos8, lits8, spc, ec, mt, e0, emptyc, theta, outs, le
                 if emptyc < theta:
                     continue
             if has_m:
-                outs[t, w] = (u << 29) | (np.int64(mt[ec[i]]) << 23) | s
+                outs[t, w] = (u << ksh) | (np.int64(mt[ec[i]]) << msh) | s
             else:
-                outs[t, w] = (u << 29) | s   # pair shape: minute bits stay clear
+                outs[t, w] = (u << ksh) | s   # pair shape: part bits stay clear
             w += 1
         lens[t] = w
 
 
 @njit(nogil=True, parallel=True, cache=True)
-def tt_walk(uc, ubit, uidx, pos8, lits8, pbit, steps, mt, e0, empty_ok, NM, board, kout, koff, klen):
+def tt_walk(uc, ubit, uidx, pos8, lits8, pbit, steps, mt, e0, empty_ok, NM, board, kout, koff, klen, ksh, msh):
     """The triple-key top-k's walk by CHECKLISTS (Jackson's line items): one pass over the rows in L lanes.
     ubit/pbit are 1-bit-per-code "has >= theta rows" checklists (one bit a code --
-    cache-resident, where the int64 census itself is 8 bytes a code of random reads). The minute comes from the
-    staircase's step rows (code = steps <= row) and the code -> minute table: no 100M time decode.
+    cache-resident, where the int64 census itself is 8 bytes a code of random reads). The part (minute, hour, ...)
+    comes from the staircase's step rows (code = steps <= row) and the code -> part table: no 100M time decode.
     Survivors with the empty phrase (most of them, for a sparse phrase) tick a per-lane TALLY board[l, uidx[u]*NM + m];
-    survivors with a real phrase emit uid<<29 | m<<23 | sp into kout[koff[l]:], klen[l] of them.
+    survivors with a real phrase emit uid<<ksh | m<<msh | sp into kout[koff[l]:], klen[l] of them.
 
     Lore: 2026-10-02, ClickBench Q18's walk. Checklists: UserID 2.2 MB, SearchPhrase 0.75 MB, where the census was
     141 MB. Survivors with the empty phrase: 99.6% on ClickBench."""
@@ -5416,7 +5416,7 @@ def tt_walk(uc, ubit, uidx, pos8, lits8, pbit, steps, mt, e0, empty_ok, NM, boar
                 sp = np.int64(lits8[p])
                 p += 1
                 if (pbit[sp >> 3] >> (sp & 7)) & 1:
-                    kout[w] = (u << 29) | (m << 23) | sp
+                    kout[w] = (u << ksh) | (m << msh) | sp
                     w += 1
             elif empty_ok:
                 board[l, np.int64(uidx[u]) * NM + m] += 1

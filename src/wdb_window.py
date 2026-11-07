@@ -204,6 +204,25 @@ def _nline(seg, col):
     return c['_nline']
 
 
+def _dt_list(seg, col, cc):
+    """a time column's values at codes cc as Python datetimes (dates for a day unit), read in THE COLUMN'S OWN
+    unit (its dictionary holds ticks of that unit, not seconds); the NULL code (V-1) -> None. Finer than us lands
+    on us (Python's datetime has no ns)."""
+    tab = _int_table(seg, col)
+    cc = np.asarray(cc, dtype=np.int64)
+    if tab.size == 0:
+        return [None] * int(cc.size)
+    nul = cc >= tab.size
+    a = tab[np.minimum(cc, tab.size - 1)].view('datetime64[%s]' % seg.unit(col))
+    if seg.unit(col) == 'ns':
+        a = a.astype('datetime64[us]')
+    out = a.tolist()
+    if nul.any():
+        for i in np.flatnonzero(nul).tolist():
+            out[i] = None
+    return out
+
+
 def _int_table(seg, col):
     """code -> int64 value, exact. A flat .nline sidecar memmaps directly when present --
     the fixed number line: file layout IS the compute layout, the OS page cache owns the
@@ -1082,8 +1101,7 @@ def execute(seg, spec):
             if sel_file.size <= 10000:
                 slots[pi] = [wdb_sql._pyval(seg.fetch(nm, int(x))) for x in cc]
             elif c.get('dt') == 3:
-                secs = np.asarray(seg._dict_ints(c), dtype=np.int64)[cc]
-                slots[pi] = secs.astype('datetime64[s]').tolist()    # C-speed datetime conversion
+                slots[pi] = _dt_list(seg, nm, cc)                # C-speed datetime conversion, in the column's unit
             elif c.get('dt') == 0:
                 slots[pi] = _int_table(seg, nm)[cc].tolist()   # int64 end-to-end: float64
                                                                # mangles ints past 2**53
@@ -1187,8 +1205,7 @@ def _try_partagg_sortless(seg, spec):
             if sel_file.size <= 10000:
                 slots[pi] = [wdb_sql._pyval(seg.fetch(nm, int(x))) for x in cc]
             elif c.get('dt') == 3:
-                secs = np.asarray(seg._dict_ints(c), dtype=np.int64)[cc]
-                slots[pi] = secs.astype('datetime64[s]').tolist()
+                slots[pi] = _dt_list(seg, nm, cc)
             elif c.get('dt') == 0:
                 slots[pi] = _int_table(seg, nm)[cc].tolist()
             elif int(c['V']) > 100_000 and sel_file.size < int(c['V']) // 4:

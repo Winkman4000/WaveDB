@@ -1,7 +1,7 @@
 """wdb_pairdistinct -- the guillotine hunt for a top-k COUNT(DISTINCT) over a pair (Jackson's order of operations).
 
-SELECT a, b, COUNT(DISTINCT u) FROM t WHERE b <> '' GROUP BY a, b
-ORDER BY cnt DESC LIMIT k   (a, b low-V; u the big differentiator)
+SELECT a, b, COUNT(DISTINCT u) FROM t WHERE b <> <literal> GROUP BY a, b
+ORDER BY cnt DESC LIMIT k   (a, b low-V; u the big differentiator; the literal of b's kind)
 
 Reduce rows by the pair row-census first (the tiny columns cost nothing);
 then correct counts rows -> distinct users, biggest pair first, reading
@@ -28,12 +28,24 @@ def detect(seg, tree, col_map):
     if w9 is None:
         return None
     n9 = w9.this
-    if not (isinstance(n9, E.NEQ) and isinstance(n9.this, E.Column)
-            and isinstance(n9.expression, E.Literal)
-            and str(n9.expression.this) == ''):
+    if not (isinstance(n9, E.NEQ) and isinstance(n9.this, E.Column)):
+        return None
+    lv = WS._litval(n9.expression)
+    if lv is None:
         return None
     cm = col_map or {}
     fcol = cm.get(n9.this.name, n9.this.name)
+    cf = seg.cols.get(fcol) or {}
+    # THE LITERAL OF b's KIND: text against a text column, a whole number against an int column (1.5 is no int code;
+    # a number against text, or text against numbers, is the general scan's to coerce)
+    if cf.get('dt') == 1:
+        if not isinstance(lv, str):
+            return None
+    elif cf.get('dt') == 0:
+        if isinstance(lv, bool) or not isinstance(lv, (int, np.integer)):
+            return None
+    else:
+        return None
     g = tree.args.get('group')
     if g is None or len(g.expressions) != 2:
         return None
@@ -78,8 +90,8 @@ def detect(seg, tree, col_map):
         c = seg.cols.get(cn)
         if c is None or int(c.get('V') or 1 << 30) > 4096:
             return None                          # the census must be near-free
-    if seg.cols.get(ucol) is None:
-        return None
+    if seg.cols.get(ucol) is None or seg.cols[ucol].get('has_null'):
+        return None                              # COUNT(DISTINCT u) skips a NULL u; the hunt would count its code
     ox = tree.args.get('order'); lx = tree.args.get('limit')
     if ox is None or lx is None or len(ox.expressions) != 1:
         return None
@@ -104,15 +116,29 @@ def detect(seg, tree, col_map):
         return None
     return {'a': gcols[0] if gcols[0] != fcol else gcols[1],
             'b': fcol, 'u': ucol, 'lim': lim, 'aggs': aggs,
-            'proj': tree.expressions}
+            'proj': tree.expressions, 'lit': n9.expression, 'litv': lv}
 
 
-def _tier_shelf(seg, a, b, u):
+def _lit_tag(seg, b, lit):
+    """The shelf file's mark for its literal: a shelf born for one `b <> lit` is never read for another. '' on a
+    NULL-free b keeps the old name (its rows are the ones that file has always held); None when the literal is too
+    long to name a file (the shelf is then kept in RAM only)."""
+    v = WS._litval(lit)
+    if v == '' and not seg.cols[b].get('has_null'):
+        return ''
+    t = ('__s' + v.encode('utf-8').hex()) if isinstance(v, str) else ('__i%d' % int(v))
+    return t if len(t) <= 67 else None
+
+
+def _tier_shelf(seg, a, b, u, lit=None):
     """The dress's serving layer (rule eleven), a birth-on-touch sidecar:
-    typed row positions, both tiny columns' compacted typed codes, AND the
+    typed row positions (the rows of b <> lit; lit None is ''), both tiny columns' compacted typed codes, AND the
     differentiator's typed codes -- 'read only what you need' as an mmap
-    slice. Born once; no zstd frame pops again for this query family."""
+    slice. Born once; no zstd frame pops again for this query family. None when no code filter answers b <> lit."""
     import os
+    if lit is None:
+        lit = E.Literal.string('')
+    tag = _lit_tag(seg, b, lit)
     # THE CODE WIDTH LAW (2026-10-25): a key's codes are u8 only when its V <= 256, else u16 (detect admits V <=
     # 4096). The u8 cast wrapped code 256+ onto 0+: a key of V 397 counted code 340 inside code 84 -- 21 users
     # where DuckDB has 9. The widths are in the file name: an old all-u8 shelf is never read back.
@@ -121,26 +147,21 @@ def _tier_shelf(seg, a, b, u):
     wb = np.uint8 if int(seg.cols[b]['V']) <= 256 else np.uint16
     ia, ib = np.dtype(wa).itemsize, np.dtype(wb).itemsize
     p9 = os.path.join(os.path.dirname(seg.path),
-                      'tier2__%s__%s__%s__w%d%d.bin' % (a, b, u, ia, ib))
+                      'tier2__%s__%s__%s__w%d%d%s.bin' % (a, b, u, ia, ib, tag or ''))
     import wdb_sidecar as _SC
-    if not (_SC.may_read(p9) and os.path.exists(p9)):
-        e0 = int(WS._code_of(seg, b, ''))
-        cb = seg.cols.get(b) or {}
-        pl = seg.e8_planes(b) if cb.get('code_enc') in (8, 9) and hasattr(seg, 'e8_planes') else None
-        if pl is not None and int(pl[2]) == e0:
-            # THE PLANES ARE THE FILTER: a tiered/sparse column's planes hold
-            # exactly the non-default rows and their codes -- no full decode, no 100M compare
-            # lore: from Q11's line items.
-            typed0 = np.ascontiguousarray(np.asarray(pl[0]), dtype=np.uint32)
-            bt0 = np.asarray(pl[1]).astype(wb)
-        else:
-            bc0 = np.asarray(seg._raw_codes(b))
-            typed0 = np.flatnonzero(bc0 != e0).astype(np.uint32)
-            bt0 = bc0[typed0].astype(wb)
+    if tag is None or not (_SC.may_read(p9) and os.path.exists(p9)):
+        # THE ROWS OF b <> lit: the planes when b's stored sparse default IS lit (its non-default rows and their
+        # codes -- no full decode, no 100M compare), else one pass over the codes; NULL rows never
+        # lore: the planes path is from Q11's line items.
+        r9 = WS.neq_rows(seg, b, lit)
+        if r9 is None:
+            return None
+        typed0 = np.ascontiguousarray(r9[0], dtype=np.uint32)
+        bt0 = r9[1].astype(wb)
         ac0 = np.asarray(seg._raw_codes(a))
         uc0 = np.asarray(seg._raw_codes(u))
         import wdb_sidecar
-        if not wdb_sidecar.births_on(os.path.dirname(seg.path)):          # THE SWITCH: the same four, in RAM
+        if tag is None or not wdb_sidecar.births_on(os.path.dirname(seg.path)):   # THE SWITCH: the same four, in RAM
             return typed0, ac0[typed0].astype(wa), bt0, uc0[typed0].astype(np.uint32)
         with open(p9 + '.tmp', 'wb') as f:
             f.write(np.asarray([typed0.size], np.int64).tobytes())
@@ -164,21 +185,20 @@ def _tier_shelf(seg, a, b, u):
 _NARROW = [__import__('os').environ.get('WDB_PD_NARROW', '1') != '0']
 
 
-def _narrow(seg, a, b, u):
-    """THE NARROW READ (2026-10-02): only the rows that pass b <> '' are ever
+def _narrow(seg, a, b, u, v=''):
+    """THE NARROW READ (2026-10-02): only the rows that pass b <> v are ever
     read. b's planes ARE the filter (its non-default rows, ascending, and their codes); a's codes at those
     rows by THE ZIPPER from a's own planes (5.6 ms -- the old way expanded a to all 100M rows, ~31 ms, and
     gathered); u's codes at those rows only (codes_at, 35 ms -- the old way decoded all 100M, 47 ms, and
-    gathered, ~24 ms). None when b is not a sparse/tiered column whose default is ''.
+    gathered, ~24 ms). None when b is not a sparse/tiered NULL-free column whose stored default is v.
 
     Lore: from ClickBench Q11's line items, measured on the c6a."""
     import wdb_kernels as _WK
-    cb = seg.cols.get(b) or {}
-    if cb.get('code_enc') not in (8, 9) or not hasattr(seg, 'e8_planes'):
-        return None
-    e0 = WS._code_of(seg, b, '')
+    import wdb_policies as _P
+    if not hasattr(seg, 'e8_planes') or not _P.sparse_default_is(seg, b, v):
+        return None                              # the planes are the filter only when the default is v (and no NULLs)
     plb = seg.e8_planes(b)
-    if plb is None or e0 is None or int(plb[2]) != int(e0):
+    if plb is None:
         return None
     typed = np.ascontiguousarray(np.asarray(plb[0]), dtype=np.int64)
     bt = np.ascontiguousarray(np.asarray(plb[1]), dtype=np.uint16)
@@ -234,12 +254,15 @@ def execute(seg, spec):
     global _HITS
     a, b, u, k = spec['a'], spec['b'], spec['u'], spec['lim']
     Vb = int(seg.cols[b]['V'])
-    nr = _narrow(seg, a, b, u) if _NARROW[0] else None
+    nr = _narrow(seg, a, b, u, spec['litv']) if _NARROW[0] else None
     if nr is not None:
         key, ukc, ut = nr
         board = _hunt_lanes(seg, u, key, ukc, ut, int(seg.cols[a]['V']) * Vb, k)
         return _emit(seg, spec, a, b, Vb, k, board)
-    typed, at9, bt9, ut9 = _tier_shelf(seg, a, b, u)
+    sh = _tier_shelf(seg, a, b, u, spec['lit'])
+    if sh is None:
+        return None                              # no code filter answers b <> lit: the general scan's
+    typed, at9, bt9, ut9 = sh
     key = at9.astype(np.int64) * Vb + bt9
     ukc = np.bincount(key, minlength=int(seg.cols[a]['V']) * Vb)
     # Jackson's guillotine, sort-free: candidates are pairs whose ROW count

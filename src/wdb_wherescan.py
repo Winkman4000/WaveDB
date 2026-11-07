@@ -93,6 +93,34 @@ def _time_units(seg, col, val):
     return iv if np.datetime64(iv, unit) == t else None
 
 
+def neq_rows(seg, col, lit):
+    """THE ROWS OF `col <> lit`, as (positions ascending, their codes), both int64 -- or None when this column/literal
+    pair is not one a code filter can answer (not a dictionary column, an override, a time column, a literal of the
+    other kind: a string against numbers or a number against strings). A column stored sparse whose stored default
+    IS lit hands its planes (its non-default rows) as they are; any other: one pass over the codes keeps every row
+    whose code is not lit's (a lit the column never holds keeps every row). NULL rows never: NULL <> x is not TRUE."""
+    c = seg.cols.get(col)
+    if c is None or c.get('mode') not in (0, 1, 2) or c.get('dt') not in (0, 1) or seg._overrides(col) is not None:
+        return None
+    if (c.get('dt') == 1) != bool(getattr(lit, 'is_string', False)):
+        return None
+    v = _litval(lit)
+    if v is None:
+        return None
+    import wdb_policies as _P
+    if c.get('code_enc') in (8, 9) and _P.sparse_default_is(seg, col, v):
+        pl = seg.e8_planes(col)
+        if pl is not None:
+            return np.asarray(pl[0], np.int64), np.asarray(pl[1], np.int64)
+    code = _code_of(seg, col, v)
+    cc = np.asarray(seg._raw_codes(col))
+    keep = np.ones(cc.size, bool) if code is None else (cc != int(code))
+    if c.get('has_null'):
+        keep &= cc != int(c['V']) - 1
+    pos = np.flatnonzero(keep).astype(np.int64)
+    return pos, cc[pos].astype(np.int64)
+
+
 def _code_of(seg, col, val):
     """Dict code of a literal, or None when absent. Dicts are value-sorted: mode 2 answers by
     searchsorted over the int dict; string dicts by fetch-bisect (O(log V) point fetches, each
@@ -267,9 +295,10 @@ def _count_distinct(p):
 _SCMP = {'GT': '>', 'GTE': '>=', 'LT': '<', 'LTE': '<=', 'EQ': '=', 'NEQ': '<>'}
 
 
-def _scalar_cmp(seg, node, col_map):
+def _scalar_cmp(seg, node, col_map, nulls=False):
     """(spec, op, lit) for <scalar(col)> <cmp> <literal> -- evaluated as a flag table over the
-    scalar's code->value table: the comparison happens once per DISTINCT value."""
+    scalar's code->value table: the comparison happens once per DISTINCT value. nulls: the caller makes
+    the NULL code's flag false (wdb_scalar.parse)."""
     import wdb_scalar
     tn = type(node).__name__
     if tn not in _SCMP:
@@ -283,7 +312,7 @@ def _scalar_cmp(seg, node, col_map):
         tn = {'GT': 'LT', 'GTE': 'LTE', 'LT': 'GT', 'LTE': 'GTE'}.get(tn, tn)
     else:
         return None
-    sp = wdb_scalar.parse(seg, expr, col_map)
+    sp = wdb_scalar.parse(seg, expr, col_map, nulls=nulls)
     if sp is None:
         return None
     v = lit.this

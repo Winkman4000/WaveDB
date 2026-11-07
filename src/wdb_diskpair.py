@@ -17,8 +17,10 @@ What stays: bare DISTINCT (no GROUP BY / ORDER BY, LIMIT optional) over 2-4 keys
 still beats the general path (DuckDB is faster on the measured two-key DISTINCT -- both behind, the dense grid's
 next).
 The blocked (enc=3) code frames are streamed -- never touching the codes cache -- keys may be blocked dict
-columns, a scalar over one, or ONE derived minute-of(datetime column) key off the stair column's step rows (the
-code->minute table: row position IS the timestamp). Parallel per-thread block scan -> mixed-radix
+columns, a scalar over one, or EXTRACT(part FROM datetime column) keys off the stair column's step rows (a
+code->part table over the dictionary, in the column's own time unit: row position IS the timestamp; second, minute,
+hour, day, month, quarter, year, dow, isodow, doy -- the parts a dictionary value alone decides; NULLs, overrides
+and the other parts decline). Parallel per-thread block scan -> mixed-radix
 i64 key fold (declines if the key space overflows i64) -> per-thread np.unique (a dense mark when the key
 space is small) -> one merge -> decode.
 
@@ -28,7 +30,8 @@ Robotness 0.641 -> 0.252, ResponseEndTiming x Robotness x PageCharset 1.155 -> 0
 0.352 -> 0.041 s, FetchTiming 0.341 -> 0.045, WindowName 0.445 -> 0.078, LocalEventTime 1.247 -> 0.338, Referer
 27.4 -> 11.0, URL 28.0 -> 10.0. The derived key: extract(minute FROM EventTime) 0.374 s here vs 60.6 s;
 ResponseEndTiming + 1 0.457 vs 61.1. What stays: DISTINCT ResponseEndTiming, Robotness 1.145 s vs 2.370; DuckDB
-0.314. The stair table for EventTime has 1.4M entries.
+0.314. The stair table for EventTime has 1.4M entries. The part key (2026-11-07) replaced the minute key, which read
+the dictionary as seconds: on a millisecond column it found 18 of DuckDB's 60 minutes.
 """
 import numpy as np
 import zstandard as zstd
@@ -54,21 +57,77 @@ def disable():
     global _ENABLED; _ENABLED = False
 
 
-def _minute_key(p, seg, col_map):
-    """extract(minute FROM col) over a stair datetime column -> derived key spec."""
+# the EXTRACT parts a part key computes (DuckDB's names; the function forms minute(ts), dayofweek(ts), ... alike)
+_PARTS = {'second': 'second', 'minute': 'minute', 'hour': 'hour', 'day': 'day', 'dayofmonth': 'day',
+          'month': 'month', 'quarter': 'quarter', 'year': 'year', 'dow': 'dow', 'dayofweek': 'dow',
+          'weekday': 'dow', 'isodow': 'isodow', 'doy': 'doy', 'dayofyear': 'doy'}
+_PART_FN = {'Second': 'second', 'Minute': 'minute', 'Hour': 'hour', 'Day': 'day', 'DayOfMonth': 'day',
+            'Month': 'month', 'Quarter': 'quarter', 'Year': 'year', 'DayOfWeek': 'dow', 'DayOfWeekIso': 'isodow',
+            'DayOfYear': 'doy'}
+
+
+def _part_key(p, seg, col_map):
+    """EXTRACT(part FROM col) over a stair datetime column -> derived key spec. The part is a table over the
+    dictionary (the stair's code -> value), so any part a dictionary value alone decides is exact; the rest
+    (epoch, week, sub-second parts, ...) decline."""
     inner = p.this if isinstance(p, E.Alias) else p
-    if not isinstance(inner, E.Extract):
+    if isinstance(inner, E.Extract):
+        unit = inner.this.name.lower() if hasattr(inner.this, 'name') else str(inner.this).lower()
+        part, arg = _PARTS.get(unit), inner.expression
+    else:
+        part, arg = _PART_FN.get(type(inner).__name__), inner.this
+    if part is None or not isinstance(arg, E.Column):
         return None
-    unit = inner.this.name.lower() if hasattr(inner.this, 'name') else str(inner.this).lower()
-    if unit != 'minute' or not isinstance(inner.expression, E.Column):
-        return None
-    col = inner.expression.name
+    col = arg.name
     col = col_map.get(col, col) if col_map else col
     if not P.columns_exist(seg, col):
         return None
-    if seg.stairs(col) is None or seg.cols[col].get('dt') != 3:
-        return None
-    return {'kind': 'minute', 'src': col, 'V': 60}
+    c = seg.cols[col]
+    if seg.stairs(col) is None or c.get('dt') != 3 or c.get('has_null') or seg._effective(col) is not None:
+        return None                      # NULL has no part value in the table; overrides falsify the steps
+    return {'kind': 'part', 'part': part, 'src': col, 'V': _part_table(seg, col, part)[2]}
+
+
+def _part_table(seg, col, part):
+    """(code -> part value - lo, lo, V): the part of every dictionary value, in the column's own time unit;
+    memoized on the segment, as wdb_scalar's tables"""
+    memo = seg.__dict__.setdefault('_dp_part_memo', {})
+    if (col, part) not in memo:
+        memo[(col, part)] = _part_values(seg, col, part)
+    return memo[(col, part)]
+
+
+def _part_values(seg, col, part):
+    import wdb_scalar
+    secs = wdb_scalar.time_table(seg, col).astype('datetime64[s]').astype(np.int64)  # floors, as DuckDB's parts
+    days = secs // 86400
+    if part == 'second':
+        out = secs % 60
+    elif part == 'minute':
+        out = (secs // 60) % 60
+    elif part == 'hour':
+        out = (secs // 3600) % 24
+    elif part == 'dow':
+        out = (days + 4) % 7                         # 1970-01-01 was a Thursday; Sunday is 0
+    elif part == 'isodow':
+        out = (days + 3) % 7 + 1                     # Monday 1 .. Sunday 7
+    else:
+        D = days.astype('datetime64[D]')
+        M = D.astype('datetime64[M]')
+        mo = M.astype(np.int64) % 12 + 1
+        if part == 'day':
+            out = (D - M.astype('datetime64[D]')).astype(np.int64) + 1
+        elif part == 'month':
+            out = mo
+        elif part == 'quarter':
+            out = (mo - 1) // 3 + 1
+        elif part == 'doy':
+            out = (D - D.astype('datetime64[Y]').astype('datetime64[D]')).astype(np.int64) + 1
+        else:
+            out = D.astype('datetime64[Y]').astype(np.int64) + 1970
+    lo = int(out.min()) if out.size else 0
+    hi = int(out.max()) if out.size else 0
+    return (out - lo).astype(np.int64), lo, hi - lo + 1
 
 
 def detect(seg, tree, col_map):
@@ -92,7 +151,7 @@ def detect(seg, tree, col_map):
     for pi, p in enumerate(proj):
         if wdb_sql._agg_kind(p) is not None:
             return None                  # keys only, no aggregates
-        mk = _minute_key(p, seg, col_map)
+        mk = _part_key(p, seg, col_map)
         if mk is not None:
             keys.append((pi, mk))
             continue
@@ -117,8 +176,6 @@ def detect(seg, tree, col_map):
         return None
     if len(keys) == 1 and keys[0][1]['kind'] == 'col':
         return None                      # one plain column: the general reads (docstring, 2026-10-24)
-    if sum(1 for _pi, k in keys if k['kind'] == 'minute') > 1:
-        return None
     span = 1
     for _pi, k in keys:
         span *= k['V']
@@ -173,13 +230,9 @@ def execute(seg, spec):
     N = int(seg.N)
     # per-key block readers
     readers = []
-    minute_tab = None
     for _pi, k in keys:
-        if k['kind'] == 'minute':
-            st = seg.stairs(k['src'])
-            secs = np.asarray(seg._dict_ints(seg.cols[k['src']]), dtype=np.int64)
-            minute_tab = ((secs // 60) % 60).astype(np.int64)
-            readers.append(('minute', st))
+        if k['kind'] == 'part':
+            readers.append(('part', (_part_table(seg, k['src'], k['part'])[0], seg.stairs(k['src']))))
         elif k['kind'] == 'scalar':
             surr, svals = wdb_scalar.surrogate(seg, k['spec'])
             k['V'] = len(svals)                      # true surrogate cardinality for the fold
@@ -206,9 +259,10 @@ def execute(seg, spec):
             a, b = j * BR, min(N, (j + 1) * BR)
             cols = []
             for kind, meta in readers:
-                if kind == 'minute':
-                    codes = np.searchsorted(meta, np.arange(a, b), side='right')
-                    cols.append(minute_tab[codes])
+                if kind == 'part':
+                    tab, st = meta
+                    codes = np.searchsorted(st, np.arange(a, b), side='right')
+                    cols.append(tab[codes])
                 elif kind == 'scalar':
                     surr, bo2, base2, wdt2 = meta
                     codes = np.frombuffer(
@@ -255,8 +309,8 @@ def execute(seg, spec):
     BULK = uniq.size > 10000
     colvals = []
     for (pi, k), codes in zip(keys, keycodes):
-        if k['kind'] == 'minute':
-            colvals.append(codes.astype(np.int64))
+        if k['kind'] == 'part':
+            colvals.append(codes.astype(np.int64) + _part_table(seg, k['src'], k['part'])[1])
         elif k['kind'] == 'scalar':
             svals = wdb_scalar.surrogate(seg, k['spec'])[1]
             colvals.append([svals[int(c)] for c in codes] if not BULK

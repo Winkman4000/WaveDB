@@ -1,16 +1,21 @@
-"""wdb_septop -- the engine-first hunt (Jackson's design): top-k pairs (low-V key, sparse key whose default is '').
+"""wdb_septop -- the engine-first hunt (Jackson's design): top-k pairs (low-V key, a dictionary key filtered by `<>`).
 
-SELECT kcol, tcol, COUNT(*) WHERE tcol <> '' GROUP BY kcol, tcol ORDER BY c DESC LIMIT k
+SELECT kcol, tcol, COUNT(*) WHERE tcol <> lit GROUP BY kcol, tcol ORDER BY c DESC LIMIT k
 
-The filter IS the plane; codes differentiate without decoding. A pair's
+The kept rows are the planes: tcol is stored sparse and lit is its stored
+default (any default, any literal of tcol's kind), so the filter IS the plane --
+wdb_wherescan.neq_rows hands them, no scan. Any other literal is another read's.
+Codes differentiate without decoding. A pair's
 count <= its phrase's total, so top pairs live among top phrases: take the
 top-M phrases by tcnt, read the ENGINE (low V) at only their instance rows,
 count (engine, phrase) exactly inside the subset, and accept when the k-th
 count >= the M-th phrase total (no outside pair can beat it). Decode only
 the k winners.
 
-Lore: built for ClickBench Q14.
+Lore: built for ClickBench Q14 (`<> ''` on a sparse column whose default is '').
 """
+# lore: 2026-11-07 widened from `<> ''` on a default-'' sparse column only, to any literal that is the stored
+# lore: default of tcol (stored sparse)
 import numpy as np
 from sqlglot import expressions as E
 
@@ -27,9 +32,9 @@ def detect(seg, tree, col_map):
     if w9 is None:
         return None
     n9 = w9.this
+    import wdb_wherescan as _WS
     if not (isinstance(n9, E.NEQ) and isinstance(n9.this, E.Column)
-            and isinstance(n9.expression, E.Literal)
-            and str(n9.expression.this) == ''):
+            and _WS._litval(n9.expression) is not None):
         return None
     cm = col_map or {}
     fcol = cm.get(n9.this.name, n9.this.name)
@@ -49,13 +54,19 @@ def detect(seg, tree, col_map):
     cp = seg.cols.get(tcol)
     if cs is None or cp is None:
         return None
+    if cp.get('mode') not in (0, 1, 2) or cp.get('dt') not in (0, 1) \
+            or (cp.get('dt') == 1) != bool(getattr(n9.expression, 'is_string', False)):
+        return None                              # neq_rows answers a dictionary column against a literal of its kind
     import wdb_policies as _P9
-    if not _P9.sparse_default_is(seg, tcol, ''):
-        return None                              # the filter must BE the plane: the default must be ''
-    if int(cp.get('V') or 1 << 30) >= (1 << 23):
-        return None                              # the packed key holds the phrase code in 23 bits
+    if cp.get('code_enc') not in (8, 9) or not _P9.sparse_default_is(seg, tcol, _WS._litval(n9.expression)):
+        return None                              # the kept rows must BE the planes: tcol stored sparse, lit its default
+    # lore: 2026-11-07 board on hits (100M): with a full pass over the codes for any other literal, septop took the
+    # lore: filtered pair count-tops from gridwalk at 15-45x their time (0.06 -> 2.9 s, DuckDB 0.14); the planes
+    # lore: forms stayed at DuckDB's 0.02-0.1 s
     if int(cs.get('V') or 1 << 30) > 4096:
         return None                              # engine-first needs low V
+    if int(cp.get('V') or 1 << 30) >= (1 << 50):
+        return None                              # the packed key holds the engine code above the phrase code
     aggs = []
     calias = None
     for p in tree.expressions:
@@ -83,20 +94,25 @@ def detect(seg, tree, col_map):
             return None
     elif not isinstance(io, E.Count):
         return None
+    if tree.args.get('offset') is not None or lx.args.get('offset') is not None:
+        return None
     try:
         lim = int(lx.expression.this)
     except Exception:
         return None
-    return {'kcol': kcol, 'tcol': tcol, 'lim': lim, 'proj': tree.expressions}
+    return {'kcol': kcol, 'tcol': tcol, 'lim': lim, 'proj': tree.expressions, 'lit': n9.expression}
 
 
 def execute(seg, spec):
     global _HITS
     kcol, tcol, k = spec['kcol'], spec['tcol'], spec['lim']
-    pl = seg.e8_planes(tcol)
-    pos8 = np.asarray(pl[0], np.int64)
-    lits8 = np.asarray(pl[1], np.int64)
+    import wdb_wherescan as _WS
+    r9 = _WS.neq_rows(seg, tcol, spec['lit'])
+    if r9 is None:
+        return None                              # not a code filter this column can answer: the next read
+    pos8, lits8 = r9
     Vp = int(seg.cols[tcol]['V'])
+    sh = max(1, (Vp - 1).bit_length())           # the phrase code's field in the packed key
     tcnt = np.bincount(lits8, minlength=Vp)
     # Jackson's descent, window-batched: hunt the biggest phrases first in
     # ONE batch per window; stop when the k-th pair beats the best phrase
@@ -116,7 +132,7 @@ def execute(seg, spec):
         rows9 = pos8[sel]
         pc9 = lits8[sel]
         ec9 = np.asarray(seg.codes_at(kcol, rows9), np.int64)
-        key = (ec9 << 23) | pc9
+        key = (ec9 << sh) | pc9
         key.sort(kind='stable')
         brk = np.empty(key.size, bool)
         if key.size:
@@ -133,8 +149,8 @@ def execute(seg, spec):
     proj = spec['proj']
     for gi in order.tolist():
         kk = int(key[st[gi]]); c9 = int(cnt[gi])
-        ev = seg.fetch(kcol, kk >> 23)
-        sv = seg.fetch(tcol, kk & ((1 << 23) - 1))
+        ev = seg.fetch(kcol, kk >> sh)
+        sv = seg.fetch(tcol, kk & ((1 << sh) - 1))
         if isinstance(ev, (bytes, bytearray)):
             ev = ev.decode('utf-8', 'replace')
         if isinstance(sv, (bytes, bytearray)):

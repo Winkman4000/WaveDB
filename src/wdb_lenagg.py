@@ -1,11 +1,13 @@
 """wdb_lenagg -- grouped string-measure aggregates from the strings' stored lengths.
 
-  SELECT K, AGG(F(S)) [, COUNT(*)] FROM t [WHERE S <> ''] GROUP BY K [HAVING COUNT(*) op n]
+  SELECT K, AGG(F(S)) [, COUNT(*)] FROM t [WHERE S <> v] GROUP BY K [HAVING COUNT(*) op n]
   [ORDER BY <a projection> [ASC|DESC]] [LIMIT n]          AGG = AVG | SUM, F any registered numeric scalar fn
 
 == per key, the sum of F over its rows and their count: one pour over two code streams. F's value per row
 comes from the V-table of F over S's dictionary (the dictionary's character lengths for LENGTH), or, for
 LENGTH, from the row lengths the load stored (wdb_lens) -- then S's numbers are never read. No string is born.
+WHERE S <> v leaves out v's rows (a v S never holds: none) and S's NULL rows (NULL <> v is not TRUE); v = '' on a
+column with no NULL keeps the row lengths' reading (a length is 0 only for '').
 
 2026-10-18 (a board of every key profile x every text profile, 680 queries): this was a hidden first try
 inside general_scan, so the route map could not see it, and its frame-range reader carried an encoding gate
@@ -84,12 +86,22 @@ def _fn_table(seg, col, lkind):
     return None
 
 
-def _plain_col(seg, col):
-    """a dictionary column the pour can read as stored: present, not positional, no NULL, no deleted rows,
-    no overrides (the pour reads the stored codes)"""
+def _plain_col(seg, col, nulls=False):
+    """a dictionary column the pour can read as stored: present, not positional, no NULL (nulls: NULL allowed -- the
+    caller leaves its rows out), no deleted rows, no overrides (the pour reads the stored codes)"""
     return (P.columns_exist(seg, col) and P.not_positional(seg, col) and P.no_deleted_rows(seg)
-            and seg.cols[col].get('mode') in (0, 1, 2) and not seg.cols[col].get('has_null')
+            and seg.cols[col].get('mode') in (0, 1, 2) and (nulls or not seg.cols[col].get('has_null'))
             and seg._effective(col) is None)
+
+
+def _neq_lit(node, col, col_map):
+    """the literal of `col <> lit` (or `lit <> col`), else None"""
+    if not isinstance(node, E.NEQ):
+        return None
+    for a, b in ((node.this, node.expression), (node.expression, node.this)):
+        if (isinstance(a, E.Column) and (col_map or {}).get(a.name, a.name) == col and isinstance(b, E.Literal)):
+            return b
+    return None
 
 
 def detect(seg, tree, col_map):
@@ -132,14 +144,10 @@ def detect(seg, tree, col_map):
     if lcol is None:
         return None
     w = tree.args.get('where')
-    excl_empty = False
+    xlit = None
     if w is not None:
-        n2 = w.this
-        if (isinstance(n2, E.NEQ) and isinstance(n2.this, E.Column)
-                and (col_map or {}).get(n2.this.name, n2.this.name) == lcol
-                and isinstance(n2.expression, E.Literal) and str(n2.expression.this) == ''):
-            excl_empty = True
-        else:
+        xlit = _neq_lit(w.this, lcol, col_map)
+        if xlit is None or not xlit.is_string:        # F is a string fn: S is text, so v is a string
             return None
     hv = tree.args.get('having')
     having = None
@@ -155,8 +163,13 @@ def detect(seg, tree, col_map):
             having = (op, int(str(h.expression.this)))
         except ValueError:
             return None
-    if key == lcol or not _plain_col(seg, key) or not _plain_col(seg, lcol):
+    if key == lcol or not _plain_col(seg, key) or not _plain_col(seg, lcol, nulls=xlit is not None):
         return None
+    # THE EXCLUDED VALUE: '' on a column with no NULL is the old form, read by every '' path below (code 0, a
+    # length of 0); any other v, or a column with NULLs, leaves out v's code and the NULL code (gen)
+    xv = None if xlit is None else str(xlit.this)
+    excl_empty = xv == '' and not seg.cols[lcol].get('has_null')
+    gen = xv is not None and not excl_empty
     lim = None
     lx = tree.args.get('limit')
     if lx is not None:
@@ -187,12 +200,13 @@ def detect(seg, tree, col_map):
     # THE ROW LENGTHS (the operator's --row-lengths): when the load stored lcol's character length
     # per row, a LENGTH aggregate reads that column and the key -- never lcol's dictionary numbers
     import wdb_lens as _L9
-    rowl = bool(isinstance(lkind, tuple) and lkind[0] == 'LENGTH' and hasattr(seg, 'path')
-                and _L9.has_row_lens(seg, lcol) and _L9.clean(seg))
+    rowl = bool(isinstance(lkind, tuple) and lkind[0] == 'LENGTH' and hasattr(seg, 'path') and not gen
+                and _L9.has_row_lens(seg, lcol) and _L9.clean(seg))   # gen: a length cannot tell v's rows
     if not rowl and _fn_table(seg, lcol, lkind) is None:
         return None
     return {'key': key, 'lcol': lcol, 'lkind': lkind, 'aggs': aggs, 'excl_empty': excl_empty,
-            'having': having, 'lim': lim, 'oi': oi, 'odesc': odesc, 'proj': tree.expressions, 'rowl': rowl}
+            'gen': gen, 'xv': xv, 'xlit': xlit, 'having': having, 'lim': lim, 'oi': oi, 'odesc': odesc,
+            'proj': tree.expressions, 'rowl': rowl}
 
 
 def _empty_code(seg, lcol):
@@ -212,6 +226,21 @@ def _empty_code(seg, lcol):
         ec0 = WS._code_of(seg, lcol, '')
         return int(ec0) if ec0 is not None else -1
     return -1
+
+
+def _excl_codes(seg, spec):
+    """WHERE S <> v (gen): (the code the pour leaves out, a second code left out after it, -1 for none): v's code
+    and the NULL code (V-1); v absent from the dictionary: the NULL code alone, or none"""
+    lcol = spec['lcol']
+    c = seg.cols[lcol]
+    nc = int(c['V']) - 1 if c.get('has_null') else -1
+    if spec['xv'] == '':
+        xc = _empty_code(seg, lcol)
+    else:
+        import wdb_wherescan as WS
+        x9 = WS._code_of(seg, lcol, spec['xv'])
+        xc = -1 if x9 is None else int(x9)
+    return (xc, nc) if xc >= 0 else (nc, -1)
 
 
 def _too_few(spec, k):
@@ -324,7 +353,7 @@ def _live_sums(seg, spec):
 
 def _sums(seg, spec):
     """(key codes, sums, counts): the stored row lengths, or the V-table of F over S's dictionary, poured on every
-    core against the key's codes (key codes None: dense, indexed by code) -- or, under WHERE S <> '' with few live
+    core against the key's codes (key codes None: dense, indexed by code) -- or, under WHERE S <> v with few live
     rows, grouped at those rows (the codes present, ascending)"""
     import wdb_kernels as WK
     r9 = _live_sums(seg, spec)
@@ -335,8 +364,23 @@ def _sums(seg, spec):
     N = int(seg.N)
     T = WK._nt()
     L = tab = sc = None
-    ec = -1
+    ec = ec2 = -1
     rowl = spec['rowl']
+    where = spec['excl_empty'] or spec['gen']
+    div = SPARSE_DIV if KV > SPARSE_KV else SPARSE_DIV_SMALL
+    # THE PLANES: a sparse S whose stored default IS v holds S <> v's rows as its planes -- with few of them,
+    # grouped there and S's codes never decoded
+    if where and not rowl and div > 0 and P.sparse_default_is(seg, lcol, spec['xv'] if spec['gen'] else ''):
+        import wdb_wherescan as WS
+        tab = _fn_table(seg, lcol, spec['lkind'])
+        nr = WS.neq_rows(seg, lcol, spec['xlit']) if tab is not None else None
+        if nr is not None and nr[0].size <= N // div:
+            if _too_few(spec, int(nr[0].size)):
+                return _none_pass()
+            tab = np.asarray(tab)
+            tab = tab.astype(np.float64) if tab.dtype.kind == 'f' else tab.astype(np.int64)
+            return _group(_key_at(seg, key, nr[0]), tab[nr[1]])
+        tab = None
     # THE OVERLAP: with row lengths the key's codes unpack on a thread while the lengths are read; without, S's
     # codes unpack while F's table is made (the key waits: few live rows read it at those rows only). Started
     # here, joined below, in one call (2026-10-18: started in detect, it was left running whenever execute did
@@ -356,19 +400,23 @@ def _sums(seg, spec):
                 tab = tab.astype(np.float64) if tab.dtype.kind == 'f' else tab.astype(np.int64)
                 if spec['excl_empty']:
                     ec = _empty_code(seg, lcol)
+                elif spec['gen']:
+                    ec, ec2 = _excl_codes(seg, spec)
+                    V9 = int(seg.cols[lcol]['V'])
+                    if tab.size < V9:            # F's table has no slot for the NULL code: 0, its rows left out
+                        tab = np.concatenate([tab, np.zeros(V9 - tab.size, tab.dtype)])
     finally:
         t9.join()
     if L is None and tab is None:
         return None
     if not rowl:
         sc = np.asarray(seg._raw_codes(lcol))
-    # THE GRAB (2026-10-18): under WHERE S <> '' a mostly-empty S leaves few live rows --
+    # THE GRAB (2026-10-18): under WHERE S <> v an S mostly v leaves few live rows --
     # a big key's whole decode and its KV-sized boards were most of the cost (2,263 live
     # rows: 211 ms). Count the live rows (one parallel pass); none: no group; few: read the key at them only and
     # group them by a sort. Past N / SPARSE_DIV the pour below is cheaper (measured: 13% live, a sort 285-450 ms)
     # lore: the Q27 board's corner; the 2,263-row case was WatchID x ParamOrderID
-    div = SPARSE_DIV if KV > SPARSE_KV else SPARSE_DIV_SMALL
-    if spec['excl_empty'] and div > 0 and (rowl or ec >= 0):
+    if where and div > 0 and (rowl or ec >= 0):
         # a strided sample (~100K rows, ~1 ms) says when the live rows are plainly too many, so the dense side skips
         # the count pass (12-30 ms on 100M; a pair with 13% live had paid it for nothing)
         # lore: the 13%-live pair was UserID x SearchPhrase
@@ -379,6 +427,8 @@ def _sums(seg, spec):
             pos = (WK.live_rows(L, 1, ge=True, limit=N // div) if rowl
                    else WK.live_rows(sc, ec, limit=N // div))
         if pos is not None:
+            if ec2 >= 0:
+                pos = pos[sc[pos] != ec2]
             if _too_few(spec, int(pos.size)):
                 return _none_pass()
             return _group(_key_at(seg, key, pos), L[pos] if rowl else tab[sc[pos]])
@@ -402,6 +452,8 @@ def _sums(seg, spec):
         C = np.zeros((T, KV + 16), np.int64)
         WK.lenpour_dict(kc, sc, tab, np.int64(ec), S, C)
         sums, cnt = S.sum(0)[:KV], C.sum(0)[:KV]
+    if ec2 >= 0:                                 # the second code left out (F 0 there): its rows off the counts
+        cnt = cnt - np.bincount(kc[sc == ec2].astype(np.int64), minlength=KV)[:KV]
     return None, sums, cnt                       # dense: the key code IS the index (no compaction of KV slots)
 
 

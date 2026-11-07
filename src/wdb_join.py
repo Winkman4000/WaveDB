@@ -4429,7 +4429,7 @@ def _same_rows_mask9(db, tree, proj, col_results, present, resolve=None, rows9=N
     if sp9 is None:
         return None
     subs9 = list(tree.args['having'].find_all(E.Subquery))
-    if len(subs9) != 1 or subs9[0].this.sql() != sp9['sub_sql']:
+    if len(subs9) != 1 or subs9[0].this != sp9['sub_tree']:   # the same subquery, compared as trees
         return None
     psql9 = [(q.this if isinstance(q, E.Alias) else q).sql() for q in proj]
     if sp9['agg'] not in psql9:

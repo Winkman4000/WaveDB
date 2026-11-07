@@ -15,6 +15,7 @@ import numpy as np
 import sqlglot.expressions as E
 import wdb_sql
 import wdb_pairagg
+import wdb_scalar
 import workers
 import wdb_policies as P
 E = wdb_sql.E
@@ -87,23 +88,23 @@ def detect(seg, tree, col_map):
     kp = proj[1 - ci]
     if wdb_sql._agg_kind(kp) is not None:
         return None
-    # DERIVED-UNIT GROUPS ON A STAIRCASE (the stair-walk): extract(hour|minute) of a
-    # stair column groups in V-space -- step k's value is the dict's k-th entry, so the
-    # whole query is a unit map over dict values + one weighted bincount of step counts.
-    # No row is ever read.
+    # DERIVED-UNIT GROUPS ON A STAIRCASE (the stair-walk): EXTRACT(part) of a stair time
+    # column groups in V-space -- step k's value is the dict's k-th entry, so the whole query
+    # is a part map over dict values (in the column's own unit) + one weighted bincount of step
+    # counts. No row is ever read.
     inner = kp.this if isinstance(kp, E.Alias) else kp
     g0 = tree.args.get('group').expressions[0]
     if isinstance(inner, E.Extract) and isinstance(inner.expression, E.Column):
         unit = (inner.this.name if hasattr(inner.this, 'name') else str(inner.this)).lower()
         alias_nm = kp.alias if isinstance(kp, E.Alias) else None
-        g_matches = (isinstance(g0, E.Extract)
+        g_matches = ((isinstance(g0, E.Extract) and g0.sql() == inner.sql())
                      or (isinstance(g0, E.Column) and alias_nm and g0.name == alias_nm))
-        if unit in ('hour', 'minute') and g_matches:
+        if unit in wdb_scalar._EXTRACT_OK and g_matches:
             dcol = col_map.get(inner.expression.name, inner.expression.name) if col_map \
                 else inner.expression.name
             if (P.columns_exist(seg, dcol) and P.not_positional(seg, dcol)
                     and P.no_deleted_rows(seg) and seg._effective(dcol) is None
-                    and seg.cols[dcol].get('dt') in (0, 3)
+                    and seg.cols[dcol].get('dt') == 3
                     and not seg.cols[dcol].get('has_null')):
                 order = tree.args.get('order')
                 ord_ok = order is None
@@ -150,6 +151,11 @@ def execute(seg, spec):
     if spec['kind'] == 'count_desc':
         if k < nc:
             part = np.argpartition(counts, nc - k)[nc - k:]
+            # the codes tied with the k-th count: argpartition keeps an arbitrary few of them, and the canonical
+            # tiebreak (code ASC) takes the lowest -- every code above the cut, then the first ties in code order
+            thr = counts[part].min()
+            above = np.flatnonzero(counts > thr)
+            part = np.concatenate((above, np.flatnonzero(counts == thr)[:k - above.size]))
         else:
             part = np.arange(nc)
         o = part[np.lexsort((part, -counts[part]))][:k]    # canonical: count DESC, code ASC
@@ -169,24 +175,20 @@ def execute(seg, spec):
 
 
 def _unit_execute(seg, spec):
-    """The stair-walk: per-code counts from step offsets, unit map over dict values,
-    weighted bincount. Emits unit buckets ordered by count."""
+    """The stair-walk: per-code counts from step offsets, part map over dict values (in the
+    column's stored unit), weighted bincount. Emits part buckets ordered by count."""
     global _HITS
-    import wdb_window as WN
     col = spec['col']
     steps = seg.stairs(col)
     if steps is None:
         return None
     counts = np.diff(np.concatenate(([0], steps, [seg.N]))).astype(np.int64)
-    tv = np.asarray(WN._int_table(seg, col), dtype=np.int64)
-    if tv.size != counts.size:
+    key = wdb_scalar.part_table(seg, col, spec['unit'])   # the part of each dict value, in the column's unit
+    if key.size != counts.size:
         return None
-    if spec['unit'] == 'hour':
-        key = (tv % 86400) // 3600
-        span = 24
-    else:
-        key = (tv % 3600) // 60
-        span = 60
+    k0 = int(key.min()) if key.size else 0
+    key = key - k0
+    span = int(key.max()) + 1 if key.size else 1
     agg = np.bincount(key, weights=counts, minlength=span).astype(np.int64)
     present = np.flatnonzero(agg)
     sel = present[np.argsort(-agg[present], kind='stable')] if spec.get('order') is not None \
@@ -201,7 +203,7 @@ def _unit_execute(seg, spec):
     rows = []
     for u in sel.tolist():
         row = [None, None]
-        row[ki] = int(u)
+        row[ki] = int(u) + k0
         row[ci] = int(agg[u])
         rows.append(tuple(row))
     _HITS += 1

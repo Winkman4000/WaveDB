@@ -7,20 +7,25 @@ table; a 100M-row GROUP BY lower(url) pays the string work 19.7M times, not 100M
 it once per process.
 
 v1 functions: LENGTH (UTF-8 char count via the continuation-byte trick), LOWER, UPPER, TRIM,
-SUBSTR, EXTRACT(year|month|day|hour|minute FROM <datetime dict col>), and +/-/* by an integer
-literal over integer dict columns. Keys only (GROUP BY / projection); scalar predicates later.
+SUBSTR, EXTRACT(year|quarter|month|day|hour|minute|second|dow|isodow|doy FROM <time dict col>), and +/-/* by an
+integer literal over integer dict columns. Keys only (GROUP BY / projection); scalar predicates later.
+
+A time column's dictionary holds integers in THE COLUMN'S OWN UNIT (seg.unit: s, ms, us, D ...): every date part is
+taken from them in that unit, through wdb_sql.extract_field -- the row evaluator's own definition.
 """
 import numpy as np
 import sqlglot.expressions as E
 
 _FN_STR = {'Lower': 'lower', 'Upper': 'upper', 'Trim': 'trim', 'Length': 'length'}
-_EXTRACT_OK = {'year', 'month', 'day', 'hour', 'minute'}
+_EXTRACT_OK = {'year', 'quarter', 'month', 'day', 'hour', 'minute', 'second', 'dow', 'isodow', 'doy'}   # integer parts
 _ARITH = {'Add': '+', 'Sub': '-', 'Mul': '*'}
 
 
-def parse(seg, node, col_map):
+def parse(seg, node, col_map, nulls=False):
     """spec dict for a supported scalar over one existing column, else None.
-    spec: {'col', 'fn', 'arg'} with fn in lower|upper|trim|length|substr|extract_<unit>|arith."""
+    spec: {'col', 'fn', 'arg'} with fn in lower|upper|trim|length|substr|extract_<unit>|arith.
+    nulls: the caller gives the NULL code (V-1, past the table) its own answer -- else a date part of a column with
+    NULLs declines."""
     n = node.this if isinstance(node, E.Alias) else node
 
     def rescol(cnode):
@@ -52,6 +57,8 @@ def parse(seg, node, col_map):
             return None
         if seg.cols[col].get('dt') != 3 or seg.cols[col].get('mode') not in (0, 1, 2):
             return None
+        if seg.cols[col].get('has_null') and not nulls:
+            return None                  # the table has no slot for the NULL code (NULL's part is NULL): decline
         return {'col': col, 'fn': 'extract_' + unit, 'arg': None}
     if tn in _ARITH:
         a, b = n.this, n.expression
@@ -73,6 +80,22 @@ def parse(seg, node, col_map):
             return None
         return {'col': col, 'fn': 'arith', 'arg': (_ARITH[tn], v)}
     return None
+
+
+def time_table(seg, col):
+    """code -> a time column's dictionary value as datetime64 in the column's stored unit (the NULL code has no
+    entry). The integers are ticks of THAT unit -- never seconds by assumption."""
+    import wdb_window as WN
+    return np.asarray(WN._int_table(seg, col), dtype=np.int64).view('datetime64[%s]' % seg.unit(col))
+
+
+def part_table(seg, col, field):
+    """code -> EXTRACT(field FROM col) over a time column's dictionary (int64, V-sized less the NULL code), in the
+    column's own unit -- wdb_sql.extract_field, the row evaluator's definition, so every road emits the same parts.
+
+    Lore: the seconds-only tables answered EXTRACT(minute) of a millisecond column with 18 minutes of 60."""
+    import wdb_sql
+    return np.asarray(wdb_sql.extract_field(field, time_table(seg, col)), dtype=np.int64)
 
 
 def _key(spec):
@@ -108,19 +131,7 @@ def table(seg, spec):
         op, v = arg
         out = base + v if op == '+' else (base - v if op == '-' else base * v)
     elif fn.startswith('extract_'):
-        secs = np.asarray(seg._dict_ints(c), dtype=np.int64)
-        dt = secs.astype('datetime64[s]')
-        unit = fn[8:]
-        if unit == 'year':
-            out = dt.astype('datetime64[Y]').astype(np.int64) + 1970
-        elif unit == 'month':
-            out = (dt.astype('datetime64[M]').astype(np.int64) % 12) + 1
-        elif unit == 'day':
-            out = (dt - dt.astype('datetime64[M]')).astype('timedelta64[D]').astype(np.int64) + 1
-        elif unit == 'hour':
-            out = (secs // 3600) % 24
-        else:
-            out = (secs // 60) % 60
+        out = part_table(seg, col, fn[8:])
     elif fn == 'length':
         st = _stream(seg, col)
         if st is not None:

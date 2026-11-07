@@ -1,17 +1,19 @@
 """wdb_tripletop -- Jackson's double-bound hunt for a top-k COUNT(*) over a triple key.
 
-SELECT kcol, extract(minute FROM dt) AS m, tcol, COUNT(*) ... GROUP BY the three
-ORDER BY COUNT(*) DESC LIMIT k -- no WHERE.
+SELECT kcol, extract(<part> FROM dt) AS m, tcol, COUNT(*) ... GROUP BY the three
+ORDER BY COUNT(*) DESC LIMIT k -- no WHERE. <part> is a clock or calendar field with a small fixed
+range (_PARTS); the two-key form drops it.
 
 The law: a triple's count can never exceed min(user's total rows, phrase's
 total rows), and BOTH censuses are one bincount away (the phrase side rides
 the sparse planes). Threshold theta keeps only rows whose two bounds clear
-it; survivors pack a 54-bit key (kcol 25b | minute 6b | tcol 23b) and one
-np.unique crowns the podium. Exactness proof: accept only when the k-th
+it; survivors pack one int64 key (kcol | part | tcol, each field as wide as its codes need: bits(V_kcol),
+bits(part's top value), bits(V_tcol), at most 63 in all) and one sort crowns the podium. Exactness proof: accept only when the k-th
 count >= theta, so every excluded row's triple is strictly below the board.
 Otherwise theta drops and the hunt re-runs -- each pass is seconds.
 
 Lore: built for ClickBench Q18's triple-key giant.
+# lore: 2026-11-07, the widening: the key had fixed fields (kcol 25b | minute 6b | tcol 23b) and only the minute.
 """
 import numpy as np
 from sqlglot import expressions as E
@@ -21,12 +23,28 @@ import wdb_sql
 _HITS = 0
 
 
-def _extract_minute(p):
+# the EXTRACT fields served: field -> its top value (every value lies in 0..top), and each of wdb_sql.extract_field's
+# spellings -> its field. The rest (YEAR, EPOCH, WEEK, ...) have no small fixed range: declined.
+_TOPS = {'SECOND': 59, 'MINUTE': 59, 'HOUR': 23, 'DAY': 31, 'MONTH': 12, 'QUARTER': 4, 'DOW': 6, 'ISODOW': 7,
+         'DOY': 366}
+_PARTS = {f: n for n, fs in (('SECOND', ()), ('MINUTE', ()), ('HOUR', ()),
+                                         ('DAY', ('DD', 'DAYOFMONTH')), ('MONTH', ('MON', 'MM')), ('QUARTER', ()),
+                                         ('DOW', ('DAYOFWEEK', 'WEEKDAY')), ('ISODOW', ()), ('DOY', ('DAYOFYEAR',)))
+          for f in (n,) + fs}
+
+
+def _extract_part(p):
+    """EXTRACT(field FROM col) (or its named form, MINUTE(col)) with a field in _PARTS -> (col, alias, field)"""
     inner = p.this if isinstance(p, E.Alias) else p
-    if isinstance(inner, E.Extract) and isinstance(inner.expression, E.Column):
-        if str(inner.this.name if hasattr(inner.this, 'name') else inner.this).lower() == 'minute':
-            return inner.expression.name, (p.alias if isinstance(p, E.Alias) else None)
+    fld = wdb_sql.extract_unit(inner)
+    if fld in _PARTS and isinstance(wdb_sql.extract_arg(inner), E.Column):
+        return wdb_sql.extract_arg(inner).name, (p.alias if isinstance(p, E.Alias) else None), _PARTS[fld]
     return None
+
+
+def _bits(n):
+    """the bits a value 0..n needs"""
+    return int(max(0, n)).bit_length()
 
 
 def detect(seg, tree, col_map):
@@ -38,13 +56,15 @@ def detect(seg, tree, col_map):
         return None
     cm = col_map or {}
     proj = tree.expressions
-    dtcol = malias = None
+    dtcol = malias = part = None
     plain = []
     aggs = []
     for pi, p in enumerate(proj):
-        em = _extract_minute(p)
+        em = _extract_part(p)
         if em is not None:
-            dtcol = cm.get(em[0], em[0]); malias = em[1]
+            if dtcol is not None:
+                return None                      # one part only
+            dtcol = cm.get(em[0], em[0]); malias = em[1]; part = em[2]
             aggs.append(('M',)); continue
         inner = p.this if isinstance(p, E.Alias) else p
         if isinstance(inner, E.Column):
@@ -57,14 +77,17 @@ def detect(seg, tree, col_map):
     if len(plain) != 2:
         return None
     if dtcol is None and len(g.expressions) != 2:
-        return None                          # 3 group keys need the minute
-    # group keys must be exactly the two plain columns + the minute (by alias or expr)
+        return None                          # 3 group keys need the part
+    # group keys must be exactly the two plain columns + the part (by alias or the same expr)
     gnames = set()
     for ge in g.expressions:
         if isinstance(ge, E.Column):
             gnames.add(cm.get(ge.name, ge.name) if cm.get(ge.name, ge.name) in seg.cols
                        else ge.name)
-        elif _extract_minute(ge) is not None:
+        elif _extract_part(ge) is not None:
+            eg = _extract_part(ge)
+            if dtcol is None or cm.get(eg[0], eg[0]) != dtcol or eg[2] != part:
+                return None                      # a group key that is another part, or of another column
             gnames.add('__m__')
         else:
             return None
@@ -87,12 +110,20 @@ def detect(seg, tree, col_map):
         return None
     if any(seg.cols[c9].get('mode') == 4 or seg.cols[c9].get('has_null') for c9 in (tcol, kcol)):
         return None                              # a sequence's codes are row positions; NULL is no group here
+    mtop = 0
     if dtcol is not None:
         dc = seg.cols.get(dtcol)
-        if dc is None or dc.get('dt') is None:
-            return None
-    if int(seg.cols[kcol]['V']) >= (1 << 25) or int(seg.cols[tcol]['V']) >= (1 << 23):
+        if dc is None or dc.get('dt') != 3 or dc.get('has_null'):
+            return None                          # a time column; a NULL time has no part to pack
+        mtop = _TOPS[part]
+    # THE KEY'S FIELDS: kcol | part | tcol, each as wide as its codes need
+    tbits = _bits(int(seg.cols[tcol]['V']) - 1)
+    mbits = _bits(mtop) if dtcol is not None else 0
+    kbits = _bits(int(seg.cols[kcol]['V']) - 1)
+    if kbits + mbits + tbits > 63:
         return None
+    lay = {'msh': tbits, 'ksh': tbits + mbits, 'mmask': (1 << mbits) - 1, 'tmask': (1 << tbits) - 1,
+           'nm': mtop + 1, 'part': part}
     ox = tree.args.get('order'); lx = tree.args.get('limit')
     if ox is None:
         # THE FREEDOM SHAPE: ORDER-less LIMIT -- any k groups, exact counts.
@@ -104,7 +135,7 @@ def detect(seg, tree, col_map):
         except Exception:
             return None
         return {'kcol': kcol, 'tcol': tcol, 'dt': None, 'aggs': aggs,
-                'lim': lim9, 'free': True, 'proj': tree.expressions}
+                'lim': lim9, 'free': True, 'proj': tree.expressions, **lay}
     if ox is None or lx is None or len(ox.expressions) != 1:
         return None
     o = ox.expressions[0]
@@ -118,18 +149,16 @@ def detect(seg, tree, col_map):
     except Exception:
         return None
     return {'kcol': kcol, 'tcol': tcol, 'dt': dtcol, 'aggs': aggs, 'lim': lim,
-            'proj': proj}
+            'proj': proj, **lay}
 
 
-def _minute_table(seg, dtcol):
+def _part_table(seg, dtcol, part):
+    """code -> the part of that code's time: wdb_sql.extract_field (the row evaluator's own definition) over the
+    V distinct times, never the N rows"""
     c = seg.cols[dtcol]
     V = int(c['V'])
     vals = np.asarray(seg._dict_ints_at(c, np.arange(V, dtype=np.int64)), np.int64)
-    mx = int(np.abs(vals).max()) if vals.size else 0
-    div = (60_000_000_000 if mx > int(1e17) else    # ns
-           60_000_000 if mx > int(1e14) else        # us
-           60_000 if mx > int(1e11) else 60)        # ms | s
-    return ((vals // div) % 60).astype(np.int64)
+    return np.asarray(wdb_sql.extract_field(part, vals.view('datetime64[%s]' % seg.unit(dtcol))), np.int64)
 
 
 _TTBITS = [__import__('os').environ.get('WDB_TT_CHECKLISTS', '1') != '0']
@@ -137,11 +166,12 @@ TALLY_MAX_BYTES = 512 << 20     # the checklists' (heavy person x minute) tally 
 
 
 def _emit_rows(seg, spec, kcol, tcol, picks):
-    """picks: (packed key kcol<<29 | minute<<23 | tcol, count), best first -> the result rows"""
+    """picks: (packed key kcol<<ksh | part<<msh | tcol, count), best first -> the result rows"""
     global _HITS
     rows = []
+    ksh, msh, mmask, tmask = spec['ksh'], spec['msh'], spec['mmask'], spec['tmask']
     for kk, c9 in picks:
-        ucode = kk >> 29; mv = (kk >> 23) & 63; scode = kk & ((1 << 23) - 1)
+        ucode = kk >> ksh; mv = (kk >> msh) & mmask; scode = kk & tmask
         uv = seg.fetch(kcol, ucode)
         sv = seg.fetch(tcol, scode)
         if isinstance(uv, (bytes, bytearray)):
@@ -162,8 +192,8 @@ def _emit_rows(seg, spec, kcol, tcol, picks):
 def _walk_checklists(seg, spec, kc, kcnt, pos8, lits8, tcnt, e0, emptyc, dtc, mt):
     """THE CHECKLIST WALK (WDB_TT_CHECKLISTS=0 restores tt_survivors).
     The same double bound (a triple's count <= its user's rows and <= its phrase's rows), asked of
-    1-bit checklists instead of the 141 MB census; the minute from the time column's staircase steps (no 100M
-    decode); empty-phrase survivors counted on a (heavy user x 60 minutes) tally, only real-phrase
+    1-bit checklists instead of the 141 MB census; the part from the time column's staircase steps (no 100M
+    decode); empty-phrase survivors counted on a (heavy user x the part's NM values) tally, only real-phrase
     survivors packed and sorted. Exact under the same law: accept when the k-th count >= theta. None
     when the time column is not a clean staircase (one step per code, no nulls) or the tally is too big.
 
@@ -181,27 +211,28 @@ def _walk_checklists(seg, spec, kc, kcnt, pos8, lits8, tcnt, e0, emptyc, dtc, mt
     bounds = (np.arange(L + 1, dtype=np.int64) * N) // L
     koff = np.ascontiguousarray(np.searchsorted(pos8, bounds)[:-1], np.int64)
     kout = np.empty(max(1, pos8.size), np.int64)          # lane l's real-phrase keys <= its plane rows
+    NM, ksh, msh = int(spec['nm']), int(spec['ksh']), int(spec['msh'])
     theta = 256
     while True:
         hv = kcnt >= theta
         heavy = np.flatnonzero(hv)
         H = int(heavy.size)
         empty_ok = bool(emptyc >= theta)
-        if empty_ok and L * max(1, H) * 60 * 4 > TALLY_MAX_BYTES:
+        if empty_ok and L * max(1, H) * NM * 4 > TALLY_MAX_BYTES:
             return 'TALLY_TOO_BIG'                        # the tally would not be small: the old walk (or a decline)
         ubit = np.packbits(hv, bitorder='little')
         pbit = np.packbits(tcnt >= theta, bitorder='little')
         uidx = np.full(kcnt.size, -1, np.int32)
         uidx[heavy] = np.arange(H, dtype=np.int32)
-        board = np.zeros((L, max(1, H) * 60 if empty_ok else 1), np.int32)
+        board = np.zeros((L, max(1, H) * NM if empty_ok else 1), np.int32)
         klen = np.zeros(L, np.int64)
         WK.tt_walk(kc, ubit, uidx, pos8, lits8, pbit, steps, mt, np.int64(e0), empty_ok,
-                   np.int64(60), board, kout, koff, klen)
+                   np.int64(NM), board, kout, koff, klen, np.int64(ksh), np.int64(msh))
         keys, cnts = [], []
         if empty_ok:
             tally = board.sum(axis=0, dtype=np.int64)
             nz = np.flatnonzero(tally)
-            keys.append((heavy[nz // 60].astype(np.int64) << 29) | ((nz % 60).astype(np.int64) << 23) | np.int64(e0))
+            keys.append((heavy[nz // NM].astype(np.int64) << ksh) | ((nz % NM).astype(np.int64) << msh) | np.int64(e0))
             cnts.append(tally[nz])
         kk = np.concatenate([kout[int(koff[l]):int(koff[l]) + int(klen[l])] for l in range(L)])
         if kk.size:
@@ -255,7 +286,7 @@ def execute(seg, spec):
                                                  # taken to be '', which labelled them wrongly on any other column)
     emptyc = N - int(pos8.size)
     if dtc is not None:
-        mt = np.ascontiguousarray(_minute_table(seg, dtc))
+        mt = np.ascontiguousarray(_part_table(seg, dtc, spec['part']))
         if _TTBITS[0] and not spec.get('free'):
             got = _walk_checklists(seg, spec, kc, kcnt, pos8, lits8, tcnt, e0, emptyc, dtc, mt)
             if got == 'TALLY_TOO_BIG':
@@ -341,7 +372,7 @@ def execute(seg, spec):
             sel = np.flatnonzero(cm[ucp] & spm9[lits8])   # kth on a rarer phrase
             # the person's codes widen BEFORE the shift (2026-10-15: a narrow person -- uint8 codes, a yes/no
             # column -- shifted 23 places inside its own dtype came back 0, and every person's phrase rows merged)
-            pk = (ucp[sel].astype(np.int64) << 23) | lits8[sel]
+            pk = (ucp[sel].astype(np.int64) << spec['ksh']) | lits8[sel]
             pk.sort(kind='stable')
             b9 = np.empty(pk.size, bool)
             if pk.size:
@@ -350,8 +381,8 @@ def execute(seg, spec):
                 s9 = np.flatnonzero(b9)
                 c9a = np.diff(np.append(s9, pk.size))
                 for j9 in range(s9.size):
-                    board.append((int(c9a[j9]), int(pk[s9[j9]] >> 23),
-                                  int(pk[s9[j9]] & ((1 << 23) - 1))))
+                    board.append((int(c9a[j9]), int(pk[s9[j9]] >> spec['ksh']),
+                                  int(pk[s9[j9]] & spec['tmask'])))
             board.sort(reverse=True)
         rows = []
         for c9, u9, s9c in board[:k]:
@@ -377,7 +408,7 @@ def execute(seg, spec):
         lens = np.zeros(T9, np.int64)
         WK.tt_survivors(kc, kcnt, pos8, lits8, tcnt, ec, mt,
                         np.int64(e0), np.int64(emptyc), np.int64(theta),
-                        outs, lens, dtc is not None)
+                        outs, lens, dtc is not None, np.int64(spec['ksh']), np.int64(spec['msh']))
         key = np.concatenate([outs[t, :int(lens[t])] for t in range(T9)])             if int(lens.sum()) else np.empty(0, np.int64)
         idx = key                                 # naming kept for flow below
         if key.size:
@@ -394,26 +425,7 @@ def execute(seg, spec):
                 order = topi[np.argsort(-cn[topi], kind='stable')]
                 kth = int(cn[order[-1]])
                 if kth >= theta or theta <= 1:
-                    rows = []
-                    for gi in order.tolist():
-                        kk = int(uq[gi]); c9 = int(cn[gi])
-                        ucode = kk >> 29; mv = (kk >> 23) & 63; scode = kk & ((1 << 23) - 1)
-                        # dtc None: mv is provably 0 and never emitted
-                        uv = seg.fetch(kcol, ucode)
-                        sv = seg.fetch(tcol, scode)
-                        if isinstance(uv, (bytes, bytearray)):
-                            uv = uv.decode('utf-8', 'replace')
-                        if isinstance(sv, (bytes, bytearray)):
-                            sv = sv.decode('utf-8', 'replace')
-                        uv = wdb_sql._pyval(uv); sv = wdb_sql._pyval(sv)   # a time key emits as a time, not numpy datetime64
-                        row = []
-                        for a in spec['aggs']:
-                            row.append(uv if a[0] == 'K' and a[1] == kcol else
-                                       sv if a[0] == 'K' else
-                                       int(mv) if a[0] == 'M' else c9)
-                        rows.append(tuple(row))
-                    _HITS += 1
-                    return rows, [wdb_sql._alias(p) for p in spec['proj']]
+                    return _emit_rows(seg, spec, kcol, tcol, [(int(uq[g]), int(cn[g])) for g in order.tolist()])
         if theta <= 1:
             return None                      # exhausted: yield to the general road
         theta //= 4

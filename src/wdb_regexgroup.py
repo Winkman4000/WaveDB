@@ -1,7 +1,8 @@
 """regexgroup: GROUP BY REGEXP_REPLACE(dict column) computed entirely at the dictionary level.
 
 The shape: SELECT REGEXP_REPLACE(col, pat, repl) AS k, AVG(LENGTH(col)), COUNT(*),
-MIN(col) ... WHERE col <> '' GROUP BY k HAVING COUNT(*) > N ORDER BY <alias> DESC LIMIT n.
+MIN(col) ... [WHERE col <> 'lit'] GROUP BY k [HAVING COUNT(*) <op> N] [ORDER BY <one projection> [DESC]] LIMIT n.
+The WHERE takes one dictionary code's weight away (lit's; none if the column never holds it) and NULL's.
 
 Row data is never touched as strings: one parallel frame scan produces per-code row counts
 (bincount lanes), and every string operation -- the regex, the lengths, the min -- happens once
@@ -86,15 +87,16 @@ def detect(seg, tree, col_map):
     if not P.no_select_distinct(tree):  return None
     if not P.no_deleted_rows(seg):      return None
     where = tree.args.get('where')
-    wcol = None                          # no WHERE (the open form): the empty string is a value like any other
+    wcol = None                          # no WHERE (the open form): every value is a value like any other
+    wl = None
     if where is not None:
-        w = where.this
-        if not isinstance(w, E.NEQ) or not isinstance(w.this, E.Column):
+        w = where.this                   # col <> 'lit' (either side): one dictionary code carries no weight
+        if not isinstance(w, E.NEQ):
             return None
-        wcol = col_map.get(w.this.name, w.this.name) if col_map else w.this.name
-        wl = w.expression
-        if not (isinstance(wl, E.Literal) and wl.this == ''):
-            return None
+        wc, wl = (w.this, w.expression) if isinstance(w.this, E.Column) else (w.expression, w.this)
+        if not isinstance(wc, E.Column) or not isinstance(wl, E.Literal) or not wl.is_string:
+            return None                  # a number against text: DuckDB's cast, not this read's
+        wcol = col_map.get(wc.name, wc.name) if col_map else wc.name
     proj = tree.expressions
     lenfn = 'LENGTH'
     rk = None; cols = {}
@@ -127,43 +129,76 @@ def detect(seg, tree, col_map):
         return None                      # the labels cover the dictionary's values: a NULL group has none
     if not P.columns_exist(seg, col):    return None
     if seg._effective(col) is not None:  return None
-    if seg.cols[col].get('mode') not in (0, 1):
-        return None
+    if seg.cols[col].get('mode') not in (0, 1) or seg.cols[col].get('dt') != 1:
+        return None                      # REGEXP_REPLACE takes text: DuckDB refuses a number column
     for pi, (kind, c2) in cols.items():
         if c2 is not None and c2 != col:
             return None                  # v1: every aggregate rides the regex column
+    excl = None                          # the WHERE's code (a literal the column never holds: none)
+    if wl is not None:
+        import wdb_wherescan as _WS
+        v = _WS._litval(wl)
+        if not isinstance(v, str):
+            return None
+        excl = _WS._code_of(seg, col, v)
     group = tree.args.get('group')
     if group is None or len(group.expressions) != 1:
         return None
+    if _proj_at(group.expressions[0], proj, seg, col_map, True) != rk[0]:
+        return None                      # the groups are the labels: GROUP BY col would keep its values apart
     having = tree.args.get('having')
-    hmin = None
+    hav = None
     if having is not None:
-        h = having.this
-        if not isinstance(h, E.GT):
+        h = having.this                  # COUNT(*) <op> N, either side
+        if type(h) not in _HAV_OPS:
             return None
-        hk = wdb_sql._agg_kind(h.this)
+        a, b, op = h.this, h.expression, _HAV_OPS[type(h)]
+        if wdb_sql._agg_kind(a) is None:
+            a, b, op = b, a, _HAV_FLIP[op]
+        hk = wdb_sql._agg_kind(a)
         if hk is None or hk[0] != 'COUNT_STAR':
             return None
-        try:
-            hmin = int(str(h.expression.this))
-        except Exception:
+        import wdb_wherescan as _WS
+        hv = _WS._litval(b) if isinstance(b, (E.Literal, E.Neg)) else None
+        if not isinstance(hv, int) or isinstance(hv, bool):
             return None
+        hav = (op, hv)
     order = tree.args.get('order')
-    osel = None
+    osel = None; desc = True
     if order is not None:
-        if len(order.expressions) != 1 or not order.expressions[0].args.get('desc'):
+        if len(order.expressions) != 1:
             return None
-        onm = order.expressions[0].this
-        tgt = onm.name if isinstance(onm, E.Column) else None
-        for pi2, p in enumerate(proj):
-            if tgt is not None and wdb_sql._alias(p) == tgt:
-                osel = pi2
+        desc = bool(order.expressions[0].args.get('desc'))
+        osel = _proj_at(order.expressions[0].this, proj, seg, col_map, False)
         if osel is None:
             return None
     lim = wdb_sql._limit(tree)
     return {'col': col, 'pat': rk[2], 'rep': rk[3], 'all': rk[4], 'rk_pi': rk[0], 'aggs': cols,
-            'hmin': hmin, 'osel': osel, 'lim': lim, 'off': int(wdb_sql._offset(tree) or 0),
-            'proj': proj, 'lenfn': lenfn, 'filtered': wcol is not None}
+            'hav': hav, 'osel': osel, 'desc': desc, 'lim': lim, 'off': int(wdb_sql._offset(tree) or 0),
+            'proj': proj, 'lenfn': lenfn, 'filtered': wcol is not None, 'excl': excl}
+
+
+_HAV_OPS = {E.GT: '>', E.GTE: '>=', E.LT: '<', E.LTE: '<=', E.EQ: '=', E.NEQ: '<>'}
+_HAV_FLIP = {'>': '<', '>=': '<=', '<': '>', '<=': '>=', '=': '=', '<>': '<>'}
+
+
+def _proj_at(node, proj, seg, col_map, grouping):
+    """The projection a GROUP BY / ORDER BY item names: its ordinal, its alias, or its own expression; None otherwise.
+    A bare name in GROUP BY that is also a table column is that column (DuckDB binds the column first)."""
+    if isinstance(node, E.Literal) and not node.is_string:
+        try:
+            k = int(str(node.this))
+        except ValueError:
+            return None
+        return k - 1 if 1 <= k <= len(proj) else None
+    if isinstance(node, E.Column) and not node.table:
+        if grouping and ((col_map or {}).get(node.name, node.name) in seg.cols):
+            return None
+        hit = [i for i, p in enumerate(proj) if isinstance(p, E.Alias) and wdb_sql._alias(p) == node.name]
+        if len(hit) == 1:
+            return hit[0]
+    hit = [i for i, p in enumerate(proj) if (p.this if isinstance(p, E.Alias) else p) == node]
+    return hit[0] if hit else None
 
 
 def _code_counts(seg, col):
@@ -749,27 +784,34 @@ def _emit(seg, spec, counts, lens, lab_ids, uniq, empty_code):
     col = spec['col']
     G = len(uniq)
     w = counts.astype(np.int64)                      # a copy (counts is memoised): safe to zero below
-    if empty_code is not None and spec.get('filtered', True):
-        w[empty_code] = 0                            # WHERE col <> ''
+    if spec.get('filtered'):                         # WHERE col <> lit: lit's code carries no row, nor NULL's
+        if spec.get('excl') is not None and int(spec['excl']) < w.size:
+            w[int(spec['excl'])] = 0
+        if seg.cols[col].get('has_null') and w.size >= int(seg.cols[col]['V']):
+            w[int(seg.cols[col]['V']) - 1] = 0
     acc = np.zeros((G, 4), np.int64); acc[:, 2] = -1  # count, length sum, the first code that carries a row
     import wdb_kernels as _WKe                       # (= the MIN value: order is differentiation; under the
-    n9 = min(len(lab_ids), len(w))                   # WHERE the empty value carries none, so it is never the MIN)
+    n9 = min(len(lab_ids), len(w))                   # WHERE the excluded value carries none, so it is never the MIN)
     _WKe.label_fold(np.ascontiguousarray(lab_ids[:n9], dtype=np.int64), np.ascontiguousarray(w[:n9]),
                     np.ascontiguousarray(lens[:n9], dtype=np.int64), acc)
     gcnt = acc[:, 0]; glen = acc[:, 1]; min_code = acc[:, 2]
-    keep = np.nonzero(gcnt > (spec['hmin'] or 0))[0] if spec['hmin'] is not None else np.nonzero(gcnt > 0)[0]
-    keep = keep[gcnt[keep] > 0]
+    keep = np.nonzero(gcnt > 0)[0]                   # a label no row carries is no group
+    if spec.get('hav') is not None:                  # HAVING COUNT(*) <op> N
+        op, hn = spec['hav']
+        gk = gcnt[keep]
+        keep = keep[{'>': gk > hn, '>=': gk >= hn, '<': gk < hn, '<=': gk <= hn, '=': gk == hn, '<>': gk != hn}[op]]
+    desc = spec.get('desc', True)
     osel = spec['osel']
     kind0 = None if osel is None else ('K' if osel == spec['rk_pi'] else spec['aggs'][osel][0])
     if spec['lim'] is not None and kind0 != 'K':
         # THE ORDER BEFORE THE LABELS: only the groups the LIMIT returns become strings (without a HAVING,
         # every one of a near-unique text column's 9.4M groups was a Python row before the sort). A stable
-        # descending order, as the row sort's reverse=True keeps equal keys in group order.
+        # order, as the row sort (reverse=True for DESC) keeps equal keys in group order.
         # lore: the 9.4M groups were ClickBench's Title.
         if kind0 is not None:
             kv = {'AVG_LEN': lambda: glen[keep] / gcnt[keep], 'COUNT_STAR': lambda: gcnt[keep],
                   'MIN_DICT': lambda: min_code[keep]}[kind0]()
-            keep = keep[np.argsort(-kv, kind='stable')]
+            keep = keep[np.argsort(-kv if desc else kv, kind='stable')]
         keep = keep[spec['off']: spec['off'] + spec['lim']]
         spec = dict(spec, off=0)
     rows = []
@@ -782,7 +824,7 @@ def _emit(seg, spec, counts, lens, lab_ids, uniq, empty_code):
         kind = 'K' if osel == spec['rk_pi'] else spec['aggs'][osel][0]
         keyf = {'K': lambda r: r[0], 'AVG_LEN': lambda r: r[1],
                 'COUNT_STAR': lambda r: r[2], 'MIN_DICT': lambda r: r[3]}[kind]
-        rows.sort(key=keyf, reverse=True)
+        rows.sort(key=keyf, reverse=desc)
     if spec['lim'] is not None:
         rows = rows[spec['off']: spec['off'] + spec['lim']]
     out = []

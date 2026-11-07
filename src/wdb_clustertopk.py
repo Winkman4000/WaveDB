@@ -1,7 +1,7 @@
 """
 wdb_clustertopk -- cluster-ordered projection top-K.
 
-Answers   SELECT cols FROM t [WHERE c <> ''] ORDER BY K [ASC|DESC][, sec...] LIMIT k
+Answers   SELECT cols FROM t [WHERE c <> lit] ORDER BY K [ASC|DESC][, sec...] LIMIT k
 when the segment is CLUSTERED by K (the primary ORDER BY key). Clustering physically
 sorts rows by K over [0, nn) (see wdb_encode._cluster_order), so the k smallest- (ASC)
 or largest- (DESC) by-K surviving rows are a short prefix/suffix of the row space. We
@@ -19,8 +19,11 @@ this path; no match -> None and the caller scans. Nothing is probed at query tim
 detect (fail-closed): clustered segment; no deleted rows; single table; no GROUP BY /
 HAVING / DISTINCT / JOIN; LIMIT present; projection is 1+ bare non-agg dict columns
 (modes 0-3); the PRIMARY ORDER BY key is a bare Column == the cluster key; any
-secondary ORDER BY keys are themselves projected columns; WHERE is absent or exactly
-`C <> ''` on a string-dict column (dt==1, mode 0/1). Anything else -> None.
+secondary ORDER BY keys are themselves projected columns; WHERE is absent or `C <> lit` (either
+side) with C a dictionary column (modes 0-2, text or int) and lit a literal of C's kind. The WHERE is a
+per-row code test: a row survives when its code is not lit's (lit absent from the dict: every row) and
+not the NULL code V-1 (NULL <> x is not TRUE). A literal of the other kind, a time column, a boolean
+text column -> None (those compare through casts, not codes). Anything else -> None.
 """
 import numpy as np
 import wdb_sql
@@ -46,19 +49,49 @@ def _order_keys(tree):
     return keys
 
 
-def _where_neq_empty_col(tree):
-    """col name for a `col <> ''` WHERE; '' when there is no WHERE; None for anything else."""
+def _where_neq(tree):
+    """(col name, literal node) for a `col <> lit` WHERE (either side); ('', None) when there is no WHERE;
+    None for anything else. lit may carry unary minus / parens; a CAST is not a bare literal."""
     w = tree.args.get('where')
     if w is None:
-        return ''
+        return '', None
     pred = w.this
     if not isinstance(pred, E.NEQ):
         return None
-    lhs, rhs = pred.this, pred.expression
-    if not (isinstance(lhs, E.Column) and isinstance(rhs, E.Literal)
-            and rhs.is_string and rhs.this == ''):
-        return None
-    return lhs.name
+    for a, b in ((pred.this, pred.expression), (pred.expression, pred.this)):
+        n = b
+        while isinstance(n, (E.Neg, E.Paren)):
+            n = n.this
+        if isinstance(a, E.Column) and isinstance(n, E.Literal):
+            return a.name, b
+    return None
+
+
+def _lit_code(seg, col, lit):
+    """(applies, code) for `col <> lit` as a per-row code test: applies False when it is not one (not a
+    dict column of lit's kind); code is lit's dict code, or None when the column never holds lit."""
+    import wdb_wherescan as _WS9
+    c = seg.cols[col]
+    if c['mode'] not in (0, 1, 2) or c['dt'] not in (0, 1):
+        return False, None
+    if c['dt'] == 1 and c.get('aux') == 9:
+        return False, None                         # boolean text: compared as bools, not as text
+    inner = lit
+    while isinstance(inner, (E.Neg, E.Paren)):
+        inner = inner.this
+    if (c['dt'] == 1) != bool(inner.is_string):
+        return False, None                         # the other kind compares through a cast
+    v = _WS9._litval(lit)
+    if v is None:
+        return False, None
+    if c['dt'] == 0:
+        if isinstance(v, float):
+            if not v.is_integer():
+                return True, None                  # no int equals it: every non-NULL row passes
+            v = int(v)
+        if not isinstance(v, int):
+            return False, None
+    return True, _WS9._code_of(seg, col, v)        # c129: '' was assumed to be code 0
 
 
 def detect(seg, tree, col_map):
@@ -90,30 +123,32 @@ def detect(seg, tree, col_map):
     for (kn, _kd) in keys[1:]:
         if kn not in pcols:            return None      # secondary must be projected
 
-    wname = _where_neq_empty_col(tree)
-    if wname is None:                  return None
+    wq = _where_neq(tree)
+    if wq is None:                     return None
+    wname, wlit = wq
 
     rcols = [resolve(c) for c in pcols]
     if not all(P.columns_exist(seg, c) for c in rcols): return None
     for c in rcols:
         if seg.cols[c]['mode'] not in (0, 1, 2, 3):     return None   # fetch-able dict cols
     wcol = resolve(wname) if wname else None
-    wcode = None
+    wcode = None; wnull = None
     if wcol is not None:
         if not P.columns_exist(seg, wcol):              return None
+        ok, wcode = _lit_code(seg, wcol, wlit)
+        if not ok:                                      return None
         wc = seg.cols[wcol]
-        if wc['dt'] != 1 or wc['mode'] not in (0, 1):   return None
-        if wc.get('has_null'):                          return None   # NULL <> '' is not true
-        import wdb_wherescan as _WS9
-        wcode = _WS9._code_of(seg, wcol, '')            # c129: was assumed to be code 0
-        if wcode is None:
-            wcol = None                                 # the column holds no '': every row passes
+        if wc.get('has_null'):
+            wnull = int(wc['V']) - 1                    # NULL <> x is not TRUE: the NULL code never passes
+        if wcode is None and wnull is None:
+            wcol = None                                 # the column never holds lit: every row passes
+        # lore: was exactly `C <> ''` on a NULL-free text column (Q24's SearchPhrase); widened 2026-11-07
     kcol = resolve(prim_name)
     if not P.columns_exist(seg, kcol):                  return None
 
     return {'pcols': rcols, 'proj': proj, 'kcol': kcol, 'kdesc': prim_desc,
             'sec': [(resolve(kn), kd) for (kn, kd) in keys[1:]],
-            'wcol': wcol, 'wcode': wcode, 'nn': int(cm['nn']), 'lim': wdb_sql._limit(tree)}
+            'wcol': wcol, 'wcode': wcode, 'wnull': wnull, 'nn': int(cm['nn']), 'lim': wdb_sql._limit(tree)}
 
 
 def _gather(seg, col, rows, maxrow):
@@ -125,7 +160,7 @@ def _gather(seg, col, rows, maxrow):
 def execute(seg, spec):
     global _HITS
     nn = spec['nn']; lim = spec['lim']; desc = spec['kdesc']
-    kcol = spec['kcol']; wcol = spec['wcol']; wcode = spec.get('wcode'); sec = spec['sec']
+    kcol = spec['kcol']; wcol = spec['wcol']; wcode = spec.get('wcode'); wnull = spec.get('wnull'); sec = spec['sec']
     aliases = [wdb_sql._alias(p) for p in spec['proj']]
     if nn <= 0 or lim <= 0:
         return [], aliases
@@ -139,7 +174,13 @@ def execute(seg, spec):
 
     def survivors(lo, hi):
         if wcol is not None:
-            m = seg._raw_codes_range(wcol, lo, hi) != wcode
+            rc = seg._raw_codes_range(wcol, lo, hi)
+            if wcode is None:
+                m = rc != wnull
+            else:
+                m = rc != wcode
+                if wnull is not None:
+                    m &= rc != wnull
             return np.nonzero(m)[0] + lo
         return np.arange(lo, hi)
 

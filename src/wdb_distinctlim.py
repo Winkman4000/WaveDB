@@ -43,7 +43,7 @@ def detect(seg, tree, col_map):
     ct, ck = seg.cols.get(tcol), seg.cols.get(kcol)
     if ct is None or ck is None:
         return None
-    if ct.get('dt') != 3 or ct.get('mode') != 2 or seg.stairs(tcol) is None:
+    if ct.get('dt') != 3 or ct.get('mode') != 2 or ct.get('has_null') or seg.stairs(tcol) is None:
         return None
     if ck.get('mode') not in (0, 1, 2) or ck.get('has_null'):
         return None
@@ -56,9 +56,8 @@ def detect(seg, tree, col_map):
 def execute(seg, spec):
     global _HITS
     tcol, kcol, lim, off = spec['tcol'], spec['kcol'], spec['lim'], spec['off']
-    import wdb_window as W
-    tvals = W._int_table(seg, tcol)                       # dict seconds, V-sized, once
-    hour_tab = ((tvals % 86400) // 3600).astype(np.int64)
+    import wdb_scalar
+    hour_tab = wdb_scalar.part_table(seg, tcol, 'hour')   # the hour of each dict value, in the column's own unit
     stairs = np.asarray(seg.stairs(tcol))
     Vc = int(seg.cols[kcol]['V'])
     BR = int(seg.cols[kcol].get('BR') or 524288)

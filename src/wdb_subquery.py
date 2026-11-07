@@ -943,7 +943,7 @@ def same_rows_spec(db, tree):
         return None
     if sums[0].args.get('distinct') or isinstance(sums[0].this, E.Distinct):
         return None
-    if _sr_bare9(sums[0].this).sql() != _sr_bare9(a9.this).sql():
+    if _sr_bare9(sums[0].this) != _sr_bare9(a9.this):          # the same expression tree (not its printed text)
         return None
     so = _sr_scope9(db, tree); si = _sr_scope9(db, inner)
     if so is None or si is None or so != si:
@@ -951,7 +951,7 @@ def same_rows_spec(db, tree):
     psql = [(p.this if isinstance(p, E.Alias) else p).sql() for p in tree.expressions]
     if a9.sql() not in psql:
         return None
-    return {'agg': a9.sql(), 'arith': ie, 'op': op9, 'sub_sql': inner.sql()}
+    return {'agg': a9.sql(), 'arith': ie, 'op': op9, 'sub_tree': inner}
 
 
 # the spec recognised on the whole query, handed to the join's aggregate (whose tree has its join conditions taken

@@ -278,6 +278,8 @@ def _sfn_array(seg, fname, cn, mask=None, params=None):
     nmask = None
     if c.get('has_null'):
         nmask = (codes == (c['V'] - 1))
+        if len(fv) < int(c['V']):                        # the dictionary holds no entry for NULL's code (the
+            fv = np.append(fv, np.array([None if fv.dtype == object else 0], dtype=fv.dtype))   # last): a slot, masked
     arr = fv[codes]
     if mask is not None:
         arr = arr[mask]; nmask = nmask[mask] if nmask is not None else None
@@ -352,11 +354,16 @@ def _date_count_rollup(seg, col, unit):
         m = (keys, inv); _DATEMAP_CACHE[mk] = m
     keys, inv = m
     cc = _code_counts(seg, col)                             # length-V counts (cached)
-    g = np.bincount(inv, weights=cc, minlength=len(keys)).astype(np.int64)
+    nnull = int(cc[inv.size:].sum())                        # the NULL code (V-1) has no dict value: its group is NULL
+    g = np.bincount(inv, weights=cc[:inv.size], minlength=len(keys)).astype(np.int64)
     if _is_trunc(unit):
         du = seg.unit(col)
-        return {_trunc_to_dt(k, du): int(v) for k, v in zip(keys.tolist(), g.tolist())}
-    return dict(zip(keys.tolist(), g.tolist()))
+        out = {_trunc_to_dt(k, du): int(v) for k, v in zip(keys.tolist(), g.tolist())}
+    else:
+        out = dict(zip(keys.tolist(), g.tolist()))
+    if nnull:
+        out[None] = nnull
+    return out
 
 def _literal_value(g):
     """Python value of a sqlglot Literal (string -> str, else int then float)."""
@@ -1113,6 +1120,11 @@ def _eval_rows_core(seg, node, mask, resolve=None, env=None):
     if type(n).__name__ == 'Replace':
         old_, new_ = str(n.expression.this), str(n.args['replacement'].this)
         return rebytes(np.array([None if v is None else v.replace(old_, new_) for v in strs(ev(n.this))], dtype=object))
+    if (isinstance(n, E.RegexpReplace) and isinstance(n.args.get('expression'), E.Literal)
+            and isinstance(n.args.get('replacement'), E.Literal)):
+        mods = n.args.get('modifiers')
+        prm = (n.args['expression'].this, n.args['replacement'].this, mods.this if isinstance(mods, E.Literal) else None)
+        return rebytes(_fn_regexp_replace(np.atleast_1d(np.asarray(ev(n.this), dtype=object)), prm))
     if isinstance(n, (E.DPipe, E.Concat)):
         parts = [n.this, n.expression] if isinstance(n, E.DPipe) else list(n.expressions)
         nrows = (len(next(iter(env.values()))) if env else ((int(np.count_nonzero(mask)) if mask.dtype == bool else int(mask.size)) if mask is not None else seg.N))
@@ -1399,6 +1411,12 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
                             raise NotImplementedError('row projection: %s' % str(_te)[:60])
                         if _ev9[j].ndim == 0:      # a constant (no column under it): the same value
                             _ev9[j] = np.full(len(idx), _ev9[j].item(), dtype=object)   # for every row
+                        elif extract_unit(n) not in (None, 'EPOCH'):
+                            # A DATE PART IS AN INTEGER OR NULL: the dictionary map carries a part of a column with
+                            # NULLs as float with NaN -- emitted as the integer, NaN as NULL
+                            _ev9[j] = np.array([None if (isinstance(v, (float, np.floating)) and v != v)
+                                                else (int(v) if isinstance(v, (float, np.floating)) else v)
+                                                for v in _ev9[j]], dtype=object)
                 for k, i in enumerate(idx):
                     out.append(tuple((_pyval(_ev9[j][k]) if j in _ev9 else _cv9(cols[j], k, i)) for j in range(len(_inner9))))
             else:
@@ -1460,8 +1478,14 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
             td = seg._typed_dict(gn)                            # sorted dict values (datetime64 day-numbers)
             gid_of_code = _date_unit(td, unit, seg.unit(gn))   # code -> integer group value, in the column's unit
             gc = seg.codes(gn); gc = gc[mask] if mask is not None else gc
+            nul = None
+            if gid_of_code.size < int(seg.cols[gn]['V']):       # the NULL code (V-1): its group is NULL, sorted last
+                nul = np.iinfo(np.int64).max
+                gid_of_code = np.append(np.asarray(gid_of_code, dtype=np.int64), nul)
             row_gv = gid_of_code[gc]                            # per-row group value
             u, inv = np.unique(row_gv, return_inverse=True)    # distinct group values + per-row slot
+            if nul is not None and u.size and int(u[-1]) == nul:
+                u = u.astype(object); u[-1] = None
             metas.append((gn, 'computed', u, unit))
         elif gk[0] == 'const':
             # constant key (GROUP BY <int> -> SELECT <literal>): one distinct value, contributes
@@ -1513,8 +1537,13 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
                 u, code2g = _factorize_obj(fv)                 # per-code result -> group id (V values)
                 inv = code2g[codes]                            # per-row group id (gather)
             else:                                              # int-valued fn (length)
-                row_gv, _ = _sfn_array(seg, gk[2], gn, mask, params)
-                u, inv = _factorize_nonneg(row_gv)
+                row_gv, _nm = _sfn_array(seg, gk[2], gn, mask, params)
+                if _nm is not None and _nm.any():              # F(NULL) is NULL: its own group, past every value
+                    row_gv = np.where(_nm, int(row_gv.max(initial=0)) + 1, row_gv)
+                    u, inv = _factorize_nonneg(row_gv)
+                    u = u.astype(object); u[-1] = None
+                else:
+                    u, inv = _factorize_nonneg(row_gv)
             metas.append((gn, 'computed', u, None))
         elif seg.cols[gn]['mode'] == 4:
             vals = seg.values(gn); vals = vals[mask] if mask is not None else vals
@@ -1544,7 +1573,7 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
         gn, kk, u, unit = metas[ki]
         if kk == 'computed':
             v = u[idx]
-            return _trunc_to_dt(v, seg.unit(gn)) if _is_trunc(unit) else v
+            return _trunc_to_dt(v, seg.unit(gn)) if (_is_trunc(unit) and v is not None) else v
         if kk == 'val': return u[idx]                          # typed value directly
         code = u[idx]; c = seg.cols[gn]
         if c['has_null'] and int(code) == c['V']-1: return None
@@ -1686,8 +1715,49 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
         try: kk = _group_key(pp, proj, _resolve_pos=False)
         except NotImplementedError: return None
         return _gpos.get(kk)
+    # A SCALAR OF THE KEYS (length(s) / upper(s) / EXTRACT(minute FROM tm) ... GROUP BY s, tm): a projection that is
+    # neither a key nor arithmetic of the key values is evaluated over the emitted groups' key values -- once,
+    # vectorised, the expression's columns bound to their keys -- never emitted as the raw key. A column that is
+    # not a GROUP BY key (or an expression the evaluator lacks) raises.
+    _kexpr = {}
+    def _key_table(mi):                                    # key mi's typed value per key index
+        gn, kk, u, _un = metas[mi]; c = seg.cols[gn]
+        if kk == 'val':
+            v = np.asarray(u)
+            if c.get('dt') == 3 and v.dtype.kind != 'M': v = v.astype(np.int64).view('datetime64[%s]' % seg.unit(gn))
+            return v
+        if c.get('mode') in (0, 1, 2) and len(u) and int(u.max()) < int(c['V']):
+            td = _typed_dict_dt(seg, gn)
+            if len(td) == int(c['V']): return td[u]
+        return np.array([keyval(mi, j) for j in range(len(u))], dtype=object)
+    def _key_expr(j, node, gx):
+        if j not in _kexpr:
+            env9 = {'\x00rows': np.zeros(len(gi_list))}   # the group count, for an expression with no key under it
+            kix = np.array([decombo(uc[g9]) for g9 in gi_list], dtype=np.int64).reshape(len(gi_list), len(metas))
+            for nm9 in {c9.name for c9 in node.find_all(E.Column)}:
+                mi = _gpos.get(('col', nm9))
+                if mi is None or metas[mi][1] not in ('code', 'val'):
+                    raise NotImplementedError('projection %s is not a function of the GROUP BY keys' % node.sql()[:60])
+                v = _key_table(mi)[kix[:, mi]]
+                if v.dtype == object and any(x is None for x in v) and all(
+                        x is None or isinstance(x, (int, float, np.integer, np.floating)) for x in v):
+                    v = np.array([np.nan if x is None else float(x) for x in v])   # a numeric key with NULL: NaN
+                env9[nm9] = v
+            try:
+                out = _eval_rows(seg, node, None, seg_col, env=env9)
+            except (TypeError, ValueError, KeyError) as _te:
+                raise NotImplementedError('projection over GROUP BY keys: %s' % str(_te)[:60])
+            out = _to_rows(out, len(gi_list)) if np.ndim(out) else np.full(len(gi_list), out, dtype=object)
+            isint = _expr_is_int(node, seg, seg_col)
+            vals = []
+            for x in out.tolist() if out.dtype.kind != 'M' else list(out):
+                if isinstance(x, float):
+                    x = None if x != x else (int(x) if isint and x == int(x) else x)   # NaN is NULL
+                vals.append(x)
+            _kexpr[j] = vals
+        return _kexpr[j][gx]
     rows=[]
-    for gi in gi_list:
+    for _gx, gi in enumerate(gi_list):
         cv = uc[gi]
         keyidx = decombo(cv); rowout=[]; ki=0
         # base-column values for this pile -> evaluate any arithmetic/bare-column projection directly
@@ -1695,7 +1765,7 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
         for _mi, (_gn, _kk, _u, _un) in enumerate(metas):
             if _gn is not None and _kk in ('code', 'val'):
                 env[_gn] = keyval(_mi, keyidx[_mi])
-        for p,kind in agg_specs:
+        for _pj, (p,kind) in enumerate(agg_specs):
             _inn = p.this if isinstance(p, E.Alias) else p
             if isinstance(_inn, E.Count) and isinstance(_inn.this, E.Distinct):   # COUNT(DISTINCT col) per group
                 _dx = _inn.this.expressions
@@ -1725,8 +1795,11 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
                 val, ok = _eval_scalar_safe(_inn2, env)         # bare col / arithmetic of base columns
                 if not ok:                                      # genuine derived key (sfn/date/const)
                     gk_i = _gki_of(p)
-                    if gk_i is None: gk_i = ki                  # defensive positional fallback
-                    val = keyval(gk_i, keyidx[gk_i])
+                    if gk_i is not None:
+                        val = keyval(gk_i, keyidx[gk_i])
+                    else:                                       # a scalar of the keys (never the raw key)
+                        val = _key_expr(_pj, _inn2, _gx)
+                    # lore: a positional fallback emitted the key here: length(s) ... GROUP BY s gave 'x', not 1
                 rowout.append(_pyval(val)); ki+=1
             elif kind[0]=='COUNT_STAR':
                 rowout.append(int(counts[gi]))
@@ -1848,6 +1921,7 @@ def _rowagg_eval(seg, inner, rows_mask, seg_col):
         if a.dtype == object:
             keep = np.array([v is not None and not (isinstance(v, float) and np.isnan(v)) for v in a])
             return a[keep]
+        if a.dtype.kind == 'M': return a[~np.isnat(a)]               # a NULL time (NaT) is NULL: aggregates skip it
         return a[~np.isnan(a)] if a.dtype.kind == 'f' else a
     t = type(inner).__name__
     if t == 'IgnoreNulls': return _rowagg_eval(seg, inner.this, rows_mask, seg_col)
@@ -2064,10 +2138,29 @@ def extract_field(field, a):
 
     Lore: the ClickBench Q18 board, JavaEnable x minute x Age 10.8 s."""
     field = str(field).upper()
+    a = np.asarray(a)
+    if a.dtype.kind == 'M' and a.size:
+        nat = np.isnat(a)
+        if nat.any():
+            # NULL'S PART IS NULL: a NaT read as an integer is the int64 floor, and its "minute" a real-looking
+            # value; the parts of the rest, the NULLs as None (the evaluator's NULL)
+            out = np.empty(a.shape, dtype=object)
+            if not nat.all():
+                out[~nat] = np.asarray(extract_field(field, a[~nat])).tolist()
+            return out
     if field in ('HOUR', 'MINUTE', 'SECOND', 'EPOCH'):
         # the clock fields need no calendar (2026-10-14: the three calendar casts were most of a minute extract
         # over a time column's distinct times)
         # lore: 50 ms of the minute's 72 over EventTime's 1.4M distinct times, on every Q18-shape query
+        un9, n9 = np.datetime_data(a.dtype) if a.dtype.kind == 'M' else (None, 0)
+        per9 = {'s': 1, 'ms': 1000, 'us': 1_000_000, 'ns': 1_000_000_000}.get(un9) if n9 == 1 else None
+        if per9 is not None:
+            # IN THE STORED UNIT: the ticks of a second-or-finer unit divide directly (no conversion pass)
+            t9 = a.view(np.int64)
+            if field == 'HOUR': return (t9 // (3600 * per9)) % 24
+            if field == 'MINUTE': return (t9 // (60 * per9)) % 60
+            if field == 'SECOND': return (t9 // per9) % 60
+            return t9 / per9
         us = a.astype('datetime64[us]').astype(np.int64)
         if field == 'HOUR': return (us // 3_600_000_000) % 24
         if field == 'MINUTE': return (us // 60_000_000) % 60
@@ -2258,7 +2351,8 @@ def _agg_scalar(seg, p, mask, seg_col):
             keep = np.array([v is not None and not (isinstance(v, float) and np.isnan(v)) for v in arr])
             arr = arr[keep]
         else:
-            keep = ~np.isnan(arr) if arr.dtype.kind == 'f' else np.ones(arr.shape[0], bool)
+            keep = ~np.isnan(arr) if arr.dtype.kind == 'f' else \
+                (~np.isnat(arr) if arr.dtype.kind == 'M' else np.ones(arr.shape[0], bool))   # NaT is a NULL time
             arr = arr[keep]
         if fn == 'COUNT': return int(arr.shape[0])
         if arr.shape[0] == 0: return None
@@ -2649,7 +2743,7 @@ def _scalar_served(seg, node):
         return False
     try:
         import wdb_wherescan as _WSs
-        return _WSs._scalar_cmp(seg, node, None) is not None
+        return _WSs._scalar_cmp(seg, node, None, nulls=True) is not None
     except Exception:
         return False
 
@@ -2698,7 +2792,7 @@ def _eval_pred_core(seg, node, seg_col):
         col=_colname(node.this)
         if col is None:                        # LHS isn't a bare column: try scalar-expression
             import wdb_wherescan as _WS
-            sc = _WS._scalar_cmp(seg, node, None)
+            sc = _WS._scalar_cmp(seg, node, None, nulls=True)   # the NULL code's flag is made false below
             if sc is not None:
                 sp, op, lit2 = sc
                 fl = np.asarray(_WS._scalar_flag(seg, sp, op, lit2), dtype=bool)
