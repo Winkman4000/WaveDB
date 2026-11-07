@@ -5,7 +5,7 @@
 # timed cold runs.
 set -e
 cd "$(dirname "$0")"
-WAVEDB_REF=${WAVEDB_REF:-0ed1d62a34f042eb4b59ec95466093b3329b4d7f}   # the engine this entry was measured with
+WAVEDB_REF=${WAVEDB_REF:-5a0df8b228be8f883f96b345ad6425c64a249f4d}   # the engine this entry was measured with
 WAVEDB_REPO=${WAVEDB_REPO:-https://github.com/Winkman4000/WaveDB.git}
 PY=${WAVEDB_PYTHON:-python3}
 if ! command -v "$PY" >/dev/null || ! "$PY" -c 'import venv, ensurepip' 2>/dev/null \
