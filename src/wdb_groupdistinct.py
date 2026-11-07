@@ -7,7 +7,7 @@ This is the non-foldable aggregate — you can't merge partial counts, you must 
 thing seen. WaveDB's edge: dictionary codes are distinctness-preserving, so distinct(target) ==
 distinct(target_codes) with NO value decode. We pack (group_code, target_code) into one int64 and count
 distinct pairs per group in a single pass using an open-addressing hash set: one probe per row, and a
-re-seen pair is a no-op. Flips the group-wise-distinct class (the ClickBench Q08/Q09/Q13 shape) from a
+re-seen pair is a no-op. Flips the group-wise-distinct class (top groups by distinct count) from a
 ~150s scalar fallback to sub-second, single-threaded and exact.
 
 Same contract as the other operators: try_groupdistinct(seg, tree, col_map) -> (rows, colnames) | None
@@ -15,10 +15,12 @@ Same contract as the other operators: try_groupdistinct(seg, tree, col_map) -> (
 
 Scope: single segment, no HAVING/JOIN, projection exactly {bare key, COUNT(DISTINCT target)}, both key
 and target value-identity (mode 0/1/2, never mode-4 positional codes), group key not nullable, ORDER BY the
-distinct-count DESC (or absent), optional LIMIT; WHERE only `key <> literal` (the Q13 board, 2026-10-13:
+distinct-count DESC (or absent), optional LIMIT; WHERE only `key <> literal` (2026-10-13:
 any literal). The walk is picked by the two columns' profiles (execute): the sparse planes, the dense
 boards, the target scatter, the key marker, the key sort -- and the survivor road when the filter removes
 nearly every row. Co-aggregates live in wdb_groupmix.
+
+Lore: the class is ClickBench's Q08/Q09/Q13 shape; `key <> any literal` came from the Q13 board (2026-10-13).
 """
 import numpy as np
 from sqlglot import expressions as E
@@ -32,9 +34,10 @@ _HITS = 0   # telemetry: queries answered by the group-distinct kernel
 LANES = {}  # telemetry: lane -> answers (dense / scatter / keymark / keysort / None = numpy)
 DENSE_CELLS = 1 << 22   # dense lane: (groups x targets) cells; per-thread boards cost T x cells bytes
 MARK_MAX = 1 << 22      # key-mark lane: target space; per-thread marker tables cost T x targets x 4 bytes
+# lore: the 10% case was ClickBench's MobilePhoneModel at IsMobile's 10%.
 SURVIVOR_ROAD = 64      # read the counted column at the survivors when the filter keeps <= 1/64 of the rows:
-                        # a gather costs ~30 ns a row on the sparse encodings (MobilePhoneModel at IsMobile's
-                        # 10%: 0.29 s gathered vs 0.08 s whole), so the road pays only when few rows survive
+                        # a gather costs ~30 ns a row on the sparse encodings (a sparse text column at a
+                        # 10% filter: 0.29 s gathered vs 0.08 s whole), so the road pays only when few rows survive
 SURVIVOR_HITS = 0       # telemetry: answers that took the survivor road
 
 try:
@@ -70,9 +73,11 @@ except Exception:                                    # numba absent: NumPy pack+
 def idspace_sig(seg, col):
     """THE ID-SPACE BIRTHMARK: which id space a group column lives in today
     (raw values vs dict codes) and the dict's edges. A sidecar built under a
-    different space must be rejected -- a July RegionID shelf built on raw
-    values decoded today as codes produced right counts with WRONG labels
-    (ClickBench Q08/Q09, 2026-09-04)."""
+    different space must be rejected -- a July shelf of a small integer
+    column built on raw values decoded today as codes produced right counts
+    with WRONG labels (2026-09-04).
+
+    Lore: the shelf was RegionID's, on ClickBench Q08/Q09."""
     r = _ids(seg, col)
     if r is None:
         return 'none'
@@ -99,7 +104,8 @@ def _ids(seg, col):
         ids = np.asarray(seg.codes(col)).astype(np.int64, copy=False)
         null_code = (c['V'] - 1) if c.get('has_null') else -1
         return ids, null_code, V
-    if c.get('dt') == 0 and c['mode'] in (0, 1):         # raw small-range int (e.g. RegionID): id == value
+    # lore: the raw small-range int example was ClickBench's RegionID.
+    if c.get('dt') == 0 and c['mode'] in (0, 1):         # raw small-range int: id == value
         ids = np.asarray(seg.values(col)).astype(np.int64, copy=False)
         null_code = -1                                   # raw ints carry no dict null sentinel here
         return ids, null_code, None
@@ -139,8 +145,10 @@ def _order_is_distinct_desc(tree, proj, ci):
 
 def _top_sel(counts, present, lim):
     """present groups ordered by count desc, code asc (stable), cut to lim -- via a PARTITION when
-    lim is small against millions of groups (Q13: 6M SearchPhrases, two full argsorts = 82 ms).
-    Exact to the full sort: the window is extended to the whole plateau of the lim-th count."""
+    lim is small against millions of groups (6M text keys: two full argsorts = 82 ms).
+    Exact to the full sort: the window is extended to the whole plateau of the lim-th count.
+
+    Lore: the 6M keys were ClickBench Q13's SearchPhrases."""
     counts = np.asarray(counts)
     if lim is None or lim <= 0 or lim * 8 >= present.size:
         return present[np.argsort(-counts[present], kind='stable')] if lim is None else \
@@ -350,9 +358,9 @@ def detect(seg, tree, col_map, _allow_group_filter=False):
         w9 = tree.args.get('where')
         n9 = w9.this if w9 is not None else None
         gx = tree.args.get('group')
-        # WHERE key <> <any literal> (THE Q13 BOARD, 2026-10-13: was key <> '' only -- ClickBench's own
-        # literal): the filter names only the group key, so the other groups' counts are untouched and
-        # the one group whose value it names leaves at emission
+        # WHERE key <> <any literal> (2026-10-13: was key <> '' only): the filter names only the group key,
+        # so the other groups' counts are untouched and the one group whose value it names leaves at emission
+        # lore: THE Q13 BOARD; '' was ClickBench's own literal.
         if (isinstance(n9, E.NEQ) and isinstance(n9.this, E.Column)
                 and gx is not None and len(gx.expressions) == 1
                 and isinstance(gx.expressions[0], E.Column)
@@ -425,16 +433,19 @@ def _heavy_groups(grp, VRk, N, ecode):
 
 
 def lane_runs(grp, tgt, tnull, VRk, VTt, ecode=None):
-    """THE Q13 BOARD'S LANES (2026-10-13), shared with group_mix (2026-10-19): per-group COUNT(DISTINCT)
+    """THE LANES (2026-10-13), shared with group_mix (2026-10-19): per-group COUNT(DISTINCT)
     by a walk the two columns' profiles pick --
       DENSE   (groups x targets) cells small: per-thread presence boards, one parallel pass;
-      SCATTER few groups, a big target space: MSD by target + a group marker table (Q8/Q9's lane);
+      SCATTER few groups, a big target space: MSD by target + a group marker table;
       KEYMARK the target space fits a per-thread marker table: MSD by group, one linear marker walk;
       KEYSORT anything else: MSD by group, each group's own run sorted (no table at all).
     On the key lanes the heavy groups (one value holding most rows: the open form's '' or 0) are counted
-    apart on every core (gd_heavy) -- left in, a heavy group is one bucket on one thread (SearchPhrase x
-    UserID with no WHERE: 7.5 s). Returns (lane, runs): runs[g] = the distinct count, -1 = group absent;
-    a group whose targets are all NULL is present with 0. The filtered group (ecode) may hold anything."""
+    apart on every core (gd_heavy) -- left in, a heavy group is one bucket on one thread (a sparse text key
+    x a near-unique target with no WHERE: 7.5 s). Returns (lane, runs): runs[g] = the distinct count,
+    -1 = group absent; a group whose targets are all NULL is present with 0. The filtered group (ecode) may
+    hold anything.
+
+    Lore: THE Q13 BOARD'S LANES (ClickBench); SCATTER is Q8/Q9's lane; the 7.5 s was SearchPhrase x UserID."""
     global HEAVY_HITS
     import wdb_kernels as _WK
     N = grp.shape[0]
@@ -457,8 +468,9 @@ def lane_runs(grp, tgt, tnull, VRk, VTt, ecode=None):
         dist, rowsper = _WK.gd_dense(grp, tgt, VRk, VTt, tnull)
         return lane, np.where(rowsper > 0, dist, -1)
     if lane == 'presence':
-        # A HANDFUL OF GROUPS over a wide target (GoodEvent's 1 value x SearchPhrase): every group is a heavy
+        # A HANDFUL OF GROUPS over a wide target (a one-value key x a text column): every group is a heavy
         # one -- one parallel pass marks presence rows, no scatter (the scatter lane: 0.67 s vs DuckDB 0.55)
+        # lore: the key was ClickBench's GoodEvent (1 value), the target SearchPhrase.
         dist = _WK.gd_heavy(grp, tgt, np.arange(VRk, dtype=np.int32), VRk, VTt, tnull)
         rowsper = _WK.bincount_par(grp, VRk) if tnull >= 0 else dist
         return lane, np.where(np.asarray(rowsper) > 0, dist, -1)
@@ -466,7 +478,8 @@ def lane_runs(grp, tgt, tnull, VRk, VTt, ecode=None):
         SH = max(1, VTt.bit_length() - 12)
         GB = max(1, int(VRk - 1).bit_length())
         if SH + GB <= 32 and PACKED:
-            # one u32 per row: the target's low bits over the group (Q8: RegionID's 14 bits + UserID's 13)
+            # one u32 per row: the target's low bits over the group (e.g. a key's 14 bits + a target's 13)
+            # lore: Q8, RegionID's 14 bits + UserID's 13.
             pk, offs = _WK.gd_pass1_packed(tgt, grp, np.int64(SH), np.int64(GB), np.int64(8))
             counts = _WK.gd_pass2_packed(pk, offs, np.int64(SH), np.int64(GB), np.int64(VRk))
             del pk
@@ -560,9 +573,10 @@ def execute(seg, det, tree):
             and _ecode == int(kc9.get('e8d' if kc9.get('code_enc') == 8 else 'e9d', -1))):
         # the planes hold only NON-default rows: this branch serves solely the
         # filtered shape (the default group is exactly what the filter removes)
-        # BIG-KEY BRANCH (Q13's shape): sparse planes hand non-default rows;
+        # BIG-KEY BRANCH: sparse planes hand non-default rows;
         # scatter buckets target codes by key; every group's uniques exact;
         # the sidecar births codes-only (noempty) on first touch.
+        # lore: Q13's shape.
         try:
             import wdb_kernels as _WK
             pl = seg.e8_planes(kcol)
@@ -571,8 +585,9 @@ def execute(seg, det, tree):
             uc9 = np.asarray(seg._raw_codes(tcol))[pos8]
             VT9 = int(seg.cols[tcol].get('V') or 0)
             if KV9 <= 262_144 and VT9 > 65_536 and lits8.size > 4_000_000:
-                # THE SCATTER LANE for a SMALL key space (Q10: 166 phone models): per-slice sorts
+                # THE SCATTER LANE for a SMALL key space (166 keys): per-slice sorts
                 # were one giant slice on one thread (336 ms); the MSD lane balances by TARGET
+                # lore: Q10's 166 phone models.
                 SH9 = max(1, VT9.bit_length() - 12)
                 ku9, kr9, offs9 = _WK.gd_pass1(np.ascontiguousarray(uc9), np.ascontiguousarray(lits8),
                                                np.int64(SH9), np.int64(8))
@@ -607,8 +622,9 @@ def execute(seg, det, tree):
         except Exception:
             pass
     def _codes_or_ids(col):
-        # THE KEY IS ITS CODE (Q09's line items, applied here for Q08): a dict column without nulls
+        # THE KEY IS ITS CODE: a dict column without nulls
         # groups on its codes as stored -- no value array, no astype; decoded only at emission
+        # lore: from Q09's line items, applied here for Q08.
         c9 = seg.cols.get(col)
         if c9 is not None and c9.get('mode') in (0, 1, 2) and not c9.get('has_null'):
             dec = wdb_gbcount._code_values(seg, col)
@@ -630,9 +646,10 @@ def execute(seg, det, tree):
     t_codes = False
     tc0 = seg.cols.get(tcol)
     if _ecode is not None and tc0 is not None and tc0.get('mode') in (0, 1, 2) and grp.size:
-        # THE SURVIVOR ROAD (2026-10-13): when the removed group is nearly every row (IsOldCounter's 0,
-        # OpenerName's -1, ParamOrderID's '': ~100%), read the counted column at the survivors only --
+        # THE SURVIVOR ROAD (2026-10-13): when the removed group is nearly every row (a column's default
+        # at ~100%), read the counted column at the survivors only --
         # the whole column decode was the bill (DuckDB 0.08 s, the full lanes 0.4-0.7 s; the road 0.05 s)
+        # lore: IsOldCounter's 0, OpenerName's -1, ParamOrderID's ''.
         keep = grp != _ecode
         m9 = int(np.count_nonzero(keep))
         if m9 * SURVIVOR_ROAD <= grp.size:
@@ -687,7 +704,9 @@ def execute(seg, det, tree):
     counts = runs                                        # per-group counts, -1 = absent (every lane)
     if lim is not None and lim > 0 and runs.size > (1 << 20):
         # the census pick, for many groups only: its histogram is as wide as the largest count, and a few
-        # groups can each count millions (RegionID x UserID: 0.48 -> 1.1 s); numpy picks among few groups
+        # groups can each count millions (a small key x a near-unique target: 0.48 -> 1.1 s); numpy picks
+        # among few groups
+        # lore: the 0.48 -> 1.1 s was RegionID x UserID.
         sel = _WK.gd_topk(runs, -1 if _ecode is None else _ecode, int(lim))
     if sel is None:
         present = np.flatnonzero(runs >= 0)

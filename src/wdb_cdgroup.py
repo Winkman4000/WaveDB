@@ -1,10 +1,12 @@
 """wdb_cdgroup -- Jackson's bounded hunt for COUNT(DISTINCT u) GROUP BY sparse col.
 
-Q13's lane: visits bound uniques (distinct(u) per group <= group's row count),
+Visits (rows) bound uniques (distinct(u) per group <= group's row count),
 so walk groups biggest-first computing exact uniques and STOP when the next
 group's visit count falls strictly below the k-th exact answer. The sparse
 dress hands the non-default rows (WHERE col <> '' is free); one scatter pass
-buckets rows by group; only the k winners' strings are ever decoded."""
+buckets rows by group; only the k winners' strings are ever decoded.
+
+Lore: ClickBench Q13's lane."""
 import numpy as np
 from sqlglot import expressions as E
 

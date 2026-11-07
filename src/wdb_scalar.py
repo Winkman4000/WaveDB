@@ -125,8 +125,9 @@ def table(seg, spec):
         st = _stream(seg, col)
         if st is not None:
             # THE LENGTH ON THE STREAM (2026-10-05): one parallel pass counts each value's characters on the
-            # dictionary's compiled byte stream -- the Python road unpacked 18-20M URLs/Referers into objects
-            # first (LENGTH(URL) > 100: 16 s hot; GROUP BY LENGTH(Referer): 20 s)
+            # dictionary's compiled byte stream -- the Python road unpacked every dictionary value into an
+            # object first
+            # lore: 18-20M URLs/Referers unpacked (LENGTH(URL) > 100: 16 s hot; GROUP BY LENGTH(Referer): 20 s)
             import wdb_kernels as _WKs
             blob, off = st
             out = np.empty(off.size - 1, np.int64)
@@ -176,8 +177,10 @@ def _surrogate_prefix(seg, spec):
     """SUBSTR(col, 1, n) -- a prefix -- over a value-sorted dictionary keeps the order, so equal prefixes sit
     side by side: the slices are byte bounds on the dictionary's stream (no copy), a neighbour compare marks
     each new value, and a running count is the sorted surrogate id. No Python string until the answer is
-    printed (the Python road sliced 18M URLs and sorted the slices: 28 s of GROUP BY SUBSTR(URL, 1, 20)).
-    None when it does not apply (another start, malformed UTF-8, a dictionary not in order)."""
+    printed (the Python road sliced every dictionary value and sorted the slices).
+    None when it does not apply (another start, malformed UTF-8, a dictionary not in order).
+
+    Lore: the Python road sliced 18M URLs and sorted the slices: 28 s of GROUP BY SUBSTR(URL, 1, 20)."""
     start, ln = spec['arg']
     if start > 1 or (ln is not None and ln < 0):
         return None

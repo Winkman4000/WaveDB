@@ -82,9 +82,11 @@ def detect(seg, tree, col_map):
     if not P.no_joins(tree):           return None
     if not P.no_select_distinct(tree): return None
     if not P.single_group_key(tree):   return None
-    # NO LIMIT IS A SHAPE TOO (2026-10-01): Q07 (AdvEngineID <> 0, every group, ORDER BY COUNT(*) DESC)
-    # fell to the fused cascade -- a 100M-row mask and a row walk, 78-88 ms hot -- for 18 bins.
+    # NO LIMIT IS A SHAPE TOO (2026-10-01): a filtered GROUP BY k ORDER BY COUNT(*) DESC with every group is
+    # served on the bins here instead of the fused cascade's full-table mask and row walk.
     # Without a LIMIT every live bin is emitted (execute declines past _NOLIM_MAX of them)
+    # lore: Q07 (AdvEngineID <> 0, every group, ORDER BY COUNT(*) DESC) fell to the fused cascade -- a 100M-row
+    # lore: mask and a row walk, 78-88 ms hot -- for 18 bins.
     proj = tree.expressions
     if len(proj) != 2:
         return None
@@ -180,8 +182,9 @@ def execute(seg, spec):
     rc = np.asarray(seg.raw_census(col, V))
     npos = None                      # the live squares (count > 0), when counted in the copy and kept exact since
     if HAVE_COPY_LIVE and V >= _COPY_LIVE_MIN[0] and rc.dtype == np.int64 and rc.ndim == 1 and rc.size >= V:
-        # THE COPY AND ITS COUNT IN ONE PASS (2026-10-22, WatchID): np's copy is one thread (88 ms over 100M squares),
-        # then cn > 0 and count_nonzero another 37 ms -- one parallel pass gives both
+        # THE COPY AND ITS COUNT IN ONE PASS (2026-10-22): np's copy is one thread, then cn > 0 and count_nonzero
+        # another pass -- one parallel pass gives both
+        # lore: on WatchID np's copy was 88 ms over 100M squares, then cn > 0 and count_nonzero another 37 ms
         import wdb_kernels
         cn = np.empty(V, np.int64)
         npos = int(wdb_kernels.copy_live(rc, cn))
@@ -244,8 +247,9 @@ def execute(seg, spec):
     k = nlive if spec['lim'] is None else min(spec['lim'], nlive)
     if nlive > k and len(spec['order'].expressions) == 1:
         # THE CANONICAL TOP (2026-10-18): ORDER BY the count alone -- a tie at the LIMIT is SQL's to leave
-        # unordered, and declining it sent WatchID-like keys (every count 1) to a 4.7 s scan. Count desc, then code
+        # unordered, and declining it sent near-unique keys (every count 1) to a scan. Count desc, then code
         # asc, by topk_bar over the live board without sorting it (dead squares zeroed sit below every live count)
+        # lore: the keys were WatchID-like; the scan took 4.7 s
         import wdb_kernels
         board = np.where(live, cn, 0)
         sel = np.asarray(wdb_kernels.topk_bar(board, k), np.int64)
@@ -309,13 +313,15 @@ def _bulk_values(seg, col, c, sel):
 
 
 def _bulk_rows(seg, col, c, board, nlive, spec, hdrs):
-    """THE COUNTING PATH WITHOUT A CAP (2026-10-22, Q7's board): GROUP BY K ORDER BY COUNT(*) with no LIMIT and more than
-    _NOLIM_MAX groups. It declined (one point-fetch per group), and the shape fell to wherescan's row-level grouping:
-    ResponseEndTiming's 28K groups 0.68 s (DuckDB 0.077), LocalEventTime / ClientEventTime / UserID / RefererHash past
-    10 s. Here the board is ordered by count in two linear passes (wdb_kernels.count_desc_order: count descending, code
+    """THE COUNTING PATH WITHOUT A CAP (2026-10-22): GROUP BY K ORDER BY COUNT(*) with no LIMIT and more than
+    _NOLIM_MAX groups. It declined (one point-fetch per group), and the shape fell to wherescan's row-level grouping.
+    Here the board is ordered by count in two linear passes (wdb_kernels.count_desc_order: count descending, code
     ascending -- the small path's argsort order) and the winners' values come from the dictionary in bulk. The rows are
     built in their final order, so finalize's re-sort is skipped. The working-set guard still names a result too big to
-    hold as Python rows (WatchID's 100M groups). WDB_GS_BULK=0 declines as before."""
+    hold as Python rows (a near-unique key's one group per row). WDB_GS_BULK=0 declines as before.
+
+    Lore: Q7's board. On wherescan's row-level grouping ResponseEndTiming's 28K groups took 0.68 s (DuckDB 0.077),
+    LocalEventTime / ClientEventTime / UserID / RefererHash past 10 s. The too-big result: WatchID's 100M groups."""
     global _HITS
     import wdb_govern, wdb_kernels, wdb_result
     cols_ok = wdb_result.WANT[0] and type(seg).__name__ == 'Segment'
@@ -365,8 +371,8 @@ def _columns(seg, col, c, sel, cnt_arr, spec, hdrs):
         a = np.asarray(seg._typed_dict(col), np.int64)[sel].astype('datetime64[%s]' % unit)
         kcol = WR.ArrayColumn(a, py=(lambda s: s.tolist()) if unit == 'D' else (lambda s: s.astype('datetime64[us]').tolist()))
     elif dt == 1 and int(c['V']) <= _LAZY_TEXT_V:
-        # a small dictionary decodes whole faster than a batch of point fetches (SocialSourcePage, 63K values: 0.15 s
-        # through point fetches, 0.04 s whole) -- in the query, as the rows path does
+        # a small dictionary decodes whole faster than a batch of point fetches -- in the query, as the rows path does
+        # lore: SocialSourcePage, 63K values: 0.15 s through point fetches, 0.04 s whole
         vals = _bulk_values(seg, col, c, sel)
         if vals is None:
             return None
@@ -390,7 +396,9 @@ def _columns(seg, col, c, sel, cnt_arr, spec, hdrs):
 def _bulk_order_ok(spec):
     """the bulk path's order is count descending, then code ascending -- the key's value ascending, the dictionary being
     value-sorted. It serves ORDER BY the count alone (ties are SQL's to leave) and ORDER BY the count, then the key
-    ascending (the board's tie-break form: Title's had fallen to the row path and timed out)."""
+    ascending (the board's tie-break form).
+
+    Lore: Title's tie-break form had fallen to the row path and timed out."""
     ex = spec['order'].expressions
     if len(ex) == 1:
         return True
@@ -409,14 +417,16 @@ def _bulk_order_ok(spec):
 
 
 def _run_columns(seg, col, c, board, nlive, spec, hdrs):
-    """THE RUN ORDER'S ANSWER (2026-10-22, WatchID): the answer ordered by count descending, then code ascending, is one
+    """THE RUN ORDER'S ANSWER (2026-10-22): the answer ordered by count descending, then code ascending, is one
     run per count value -- each run the squares with that count, left to right on the board (the dictionary is
     value-sorted, so code order is value order). The biggest run is never written: its rows are the board read left
     to right, walked per fetched batch (wdb_result.RunOrder); only the squares outside it are collected (one parallel
     pass) and sorted. Its count is the one number the switch reads: R, the squares in the biggest run among counts
     1.._RUN_CAP, from one parallel histogram pass. R below _RUN_MIN declines (count_desc_order over the board, as
-    before). WatchID: count_desc_order 0.65-0.91 s + value / count gathers 0.3-0.9 s over 100M squares -> this.
-    None: not a shape handled here."""
+    before). None: not a shape handled here.
+
+    Lore: built for WatchID: count_desc_order 0.65-0.91 s + value / count gathers 0.3-0.9 s over 100M squares -> this.
+    """
     import wdb_kernels, wdb_result as WR
     if c.get('mode') not in (0, 1, 2) or seg._effective(col) is not None or c.get('aux') == 9:
         return None

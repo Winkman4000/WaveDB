@@ -136,7 +136,9 @@ def _colname(node):
 # Same shape as the date-coarsening group key. Registry maps SQL func name -> (typed_dict -> int64[V]).
 
 def _fn_strlen(td, params=None):
-    """BYTE length of each dict value (official ClickBench STRLEN)."""
+    """BYTE length of each dict value (STRLEN counts bytes).
+
+    Lore: the official ClickBench STRLEN."""
     out = np.empty(len(td), dtype=np.int64)
     for i, v in enumerate(td):
         if v is None: out[i] = 0
@@ -527,7 +529,9 @@ def _dict_stream(seg, pc):
 def _fc_stream(seg, c):
     """the front-coded dictionary expanded straight into the stream, compiled, chunk by chunk in the leaf
     pool -- no Python bytes per value (_decode_fc's value-by-value walk was ~590 ms of a cold 716K-value
-    dictionary, cast_info.note)"""
+    dictionary)
+
+    Lore: the dictionary was JOB's cast_info.note."""
     import wdb_kernels as _WKf, wdb_engine as _WEf
     R = np.int64(int(c['R']))
     if c.get('chunked'):
@@ -802,8 +806,9 @@ def _eval_rows(seg, node, mask, resolve=None, env=None):
     # THE DICTIONARY MAP, universal: ANY expression (not a bare column or literal; no aggregate,
     # subquery or window inside) that depends on exactly ONE dictionary column is evaluated
     # once per distinct value and gathered by code. It used to fire for a fixed list of node
-    # types; AVG(length(URL)) took the row path and decoded 100M URLs into Python strings --
-    # 16 GB/s until the kernel killed the server (ClickBench, 2026-09-14).
+    # types; an aggregate of a text column's length took the row path and decoded every row into
+    # Python strings until the kernel killed the server (2026-09-14).
+    # lore: ClickBench AVG(length(URL)) decoded 100M URLs into Python strings -- 16 GB/s.
     if (env is None and not isinstance(n, (E.Column, E.Literal, E.Star, E.Null, E.Boolean, E.Paren))
             and n.find(E.AggFunc, E.Select, E.Window, E.Subquery) is None):
         ds = _dict_string_col(seg, n, resolve, any_dt=True)
@@ -821,8 +826,9 @@ def _eval_rows(seg, node, mask, resolve=None, env=None):
                 except Exception:
                     pass
             # ONCE PER QUERY: the mapped values over V are cached for the query's lifetime -- a
-            # per-group row aggregate (AVG(length(URL)) GROUP BY CounterID) re-mapped the 6M-value
-            # dictionary 6,506 times, decoding it into Python strings each time (16 GB/s, OOM)
+            # per-group row aggregate (AVG(length(col)) GROUP BY k) re-mapped the
+            # dictionary once per group, decoding it into Python strings each time (OOM)
+            # lore: AVG(length(URL)) GROUP BY CounterID re-mapped the 6M-value dictionary 6,506 times (16 GB/s)
             _ck9 = ('dmap', pc, n.sql())
             outv = seg._codes.get(_ck9) if hasattr(seg, '_codes') else None
             if outv is None:
@@ -1130,7 +1136,8 @@ def _eval_rows_core(seg, node, mask, resolve=None, env=None):
             cre = _re.compile(rx, flags)
             sv = strs(raw9)
             out = np.array([False if v is None else bool(cre.match(v)) for v in sv])
-        # THREE-VALUED LOGIC: NULL [NOT] LIKE is never true (JOB 1b: NULL notes leaked through NOT LIKE)
+        # THREE-VALUED LOGIC: NULL [NOT] LIKE is never true (NULLs leaked through NOT LIKE)
+        # lore: JOB 1b: NULL notes leaked through NOT LIKE
         return (~out & ~isn) if n.args.get('negate') else out
     if isinstance(n, E.RegexpLike):
         import re as _re
@@ -1268,11 +1275,13 @@ def _to_physical(node, col_map):
     return t
 
 # THE ROWS ASKED FOR (2026-11-02): a row projection decoded every value of each projected column, then kept the
-# selected rows -- TPC-H Q15's keyed read of ONE supplier paid 54 ms for three 100k-row text columns. Measured (server,
-# values_at_rows vs values, equal after _pyval): inline text (mode 5) is cheaper at every share up to half the rows
-# (s_name: 1 row 0.00 ms, 1,000 0.21, 6,250 1.33, 50,000 11.2 vs whole 16.6; c_name 750k of 1.5M 207 vs 281);
-# dictionary columns win only while few (o_totalprice: 1,000 rows 0.33 ms vs whole 151, 937k rows 473) -- hence a
+# selected rows -- a keyed read of ONE row paid for whole text columns. Measured (server,
+# values_at_rows vs values, equal after _pyval): inline text (mode 5) is cheaper at every share up to half the rows;
+# dictionary columns win only while few -- hence a
 # half for text and 1/256 for the rest. WDB_ROWS_AT=0: whole columns as before.
+# lore: TPC-H Q15's keyed read of ONE supplier paid 54 ms for three 100k-row text columns. s_name: 1 row 0.00 ms,
+# lore: 1,000 0.21, 6,250 1.33, 50,000 11.2 vs whole 16.6; c_name 750k of 1.5M 207 vs 281; o_totalprice: 1,000 rows
+# lore: 0.33 ms vs whole 151, 937k rows 473.
 _ROWS_AT = [__import__('os').environ.get('WDB_ROWS_AT', '1') == '1']
 _ROWS_AT_TEXT_DIV = 2
 _ROWS_AT_DICT_DIV = 256
@@ -1309,11 +1318,12 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
     group = tree.args.get('group')
     rowexpr_nodes = {}
     gkeys_raw = [ _group_key(g, proj, node_sink=rowexpr_nodes) for g in group.expressions ] if group else []
-    # Effective grouping dimensions: an affine single-column key (ClientIP-1) reduces to its base
-    # column (ClientIP) -- injective, so same piles -- and base columns are DEDUPED. This collapses
-    # GROUP BY ClientIP, ClientIP-1, ClientIP-2, ClientIP-3 to grouping by ClientIP ONCE (no radix
-    # explosion); the minus-variants are functions of the pile's ClientIP, computed at emit. Genuine
+    # Effective grouping dimensions: an affine single-column key (c-1) reduces to its base
+    # column (c) -- injective, so same piles -- and base columns are DEDUPED. This collapses
+    # GROUP BY c, c-1, c-2, c-3 to grouping by c ONCE (no radix
+    # explosion); the minus-variants are functions of the pile's c, computed at emit. Genuine
     # derived keys (sfn/date/const) stay their own dimension (deduped by identity).
+    # lore: GROUP BY ClientIP, ClientIP-1, ClientIP-2, ClientIP-3 (ClickBench).
     gkeys = []; _eff_seen = {}
     for _k in gkeys_raw:
         _e = ('col', _k[1]) if _k[0] == 'affine' else _k
@@ -1762,8 +1772,10 @@ def execute(seg: Segment, sql: str, col_map=None, tree=None):
 # ---------- helpers ----------
 def _alias(p):
     """the output name of a projection. An unaliased expression is printed by sqlglot, which DEEP-COPIES
-    the subtree before generating (31 us a name, 8.6 without the copy; Q29 has ninety); generation does
-    not mutate a projection, so the copy is not paid"""
+    the subtree before generating (31 us a name, 8.6 without the copy); generation does
+    not mutate a projection, so the copy is not paid
+
+    Lore: ClickBench Q29 has ninety unaliased projections."""
     if isinstance(p, E.Alias): return p.alias
     if isinstance(p, E.Column): return p.name
     try: return p.sql(copy=False)
@@ -1782,7 +1794,8 @@ def _is_rowagg(inner):
     if isinstance(inner, (E.Sum, E.Count, E.Avg, E.Min, E.Max)) and isinstance(inner.this, E.Distinct):
         _dx = inner.this.expressions
         if isinstance(inner, E.Count) and len(_dx) == 1 and isinstance(_dx[0], E.Column):
-            return False                          # COUNT(DISTINCT col): the group-distinct doors own it (ClickBench Q09: 1.1s -> 53s as a row aggregate)
+            # lore: ClickBench Q09: 1.1s -> 53s as a row aggregate
+            return False                          # COUNT(DISTINCT col): the group-distinct doors own it
         return True
     if isinstance(inner, E.Count) and inner.this is not None and not isinstance(inner.this, (E.Star, E.Column, E.Distinct)): return True
     return False
@@ -1984,9 +1997,11 @@ def _count_topk_plan(proj, agg_specs, tree):
     return None
 def _exact_int_sum(arr):
     """Exact Python-int sum of an integer numpy array -- no int64 overflow and no float64 mantissa
-    loss (DuckDB sums integers exactly; float64 loses precision past 2^53, e.g. AVG(UserID)).
+    loss (DuckDB sums integers exactly; float64 loses precision past 2^53, e.g. AVG of a 64-bit id).
     Non-negative arrays use a fast hi/lo 32-bit split summed in uint64; signed arrays fall back to
-    object accumulation."""
+    object accumulation.
+
+    Lore: AVG(UserID)."""
     if arr.size == 0: return 0
     if int(arr.min()) >= 0:
         u = arr.astype(np.uint64, copy=False)
@@ -2044,12 +2059,15 @@ def extract_arg(n):
 
 def extract_field(field, a):
     """EXTRACT over a datetime64 array -- the ONE definition, shared by the row evaluator and fused_agg's
-    dictionary-riding group key (2026-10-13, the Q18 board: a minute key paid the general scan's per-row
-    path, JavaEnable x minute x Age 10.8 s), so both roads emit the same integers."""
+    dictionary-riding group key (2026-10-13: a minute key paid the general scan's per-row
+    path), so both roads emit the same integers.
+
+    Lore: the ClickBench Q18 board, JavaEnable x minute x Age 10.8 s."""
     field = str(field).upper()
     if field in ('HOUR', 'MINUTE', 'SECOND', 'EPOCH'):
-        # the clock fields need no calendar (2026-10-14: the three calendar casts were 50 ms of the minute's
-        # 72 over EventTime's 1.4M distinct times, on every Q18-shape query)
+        # the clock fields need no calendar (2026-10-14: the three calendar casts were most of a minute extract
+        # over a time column's distinct times)
+        # lore: 50 ms of the minute's 72 over EventTime's 1.4M distinct times, on every Q18-shape query
         us = a.astype('datetime64[us]').astype(np.int64)
         if field == 'HOUR': return (us // 3_600_000_000) % 24
         if field == 'MINUTE': return (us // 60_000_000) % 60
@@ -2481,8 +2499,9 @@ def _dict_eq_mask(seg, name, neg, lit):
     nullcode = (V - 1) if c['has_null'] else None
     if c['mode'] == 1 and c['dt'] == 1 and name not in seg._tdict:
         # THE LITERAL BY BISECTION (2026-10-03): a front-coded text dictionary not yet decoded answers one
-        # literal's code by fetch-bisect, as IN already did -- the whole-dictionary decode was 3.8 s on
-        # movie_info.info (2.7M values) for mi.info = 'Horror' (JOB 25a/b), ~0.5 s on cast_info.note
+        # literal's code by fetch-bisect, as IN already did -- the whole-dictionary decode took seconds on
+        # a dictionary of millions of values for one literal
+        # lore: 3.8 s on movie_info.info (2.7M values) for mi.info = 'Horror' (JOB 25a/b), ~0.5 s on cast_info.note
         import wdb_wherescan as _WSq
         _lv9 = _WSq._litval(lit) if isinstance(lit, E.Expression) else lit
         if _lv9 is None:
@@ -2549,8 +2568,8 @@ def _eval_pred(seg, node, seg_col):
             if _lits9 and all(isinstance(L, E.Literal) and L.is_string for L in _lits9) and node.args.get('query') is None \
                     and seg._overrides(_pc9) is None:
                 # THE LITERALS ON THE STORED STREAM (2026-10-03): = / <> / IN against an inline column compare
-                # each row's bytes in place -- the S-array made a Python object per row first (t.title = 'Shrek 2'
-                # and chn.name = 'Queen' were most of JOB 29a's cold isolation)
+                # each row's bytes in place -- the S-array made a Python object per row first
+                # lore: t.title = 'Shrek 2' and chn.name = 'Queen' were most of JOB 29a's cold isolation
                 import wdb_kernels as _WKq
                 _ls9 = [L.this.encode() for L in _lits9]
                 _lo9 = np.zeros(len(_ls9) + 1, np.int64); np.cumsum([len(x) for x in _ls9], out=_lo9[1:])
@@ -2623,7 +2642,9 @@ def _strict_col(node):
 def _scalar_served(seg, node):
     """a comparison of a dictionary-level scalar (LENGTH(col) > 100) against a literal: the core judges it
     once per distinct value through wdb_scalar's table (compiled where the stream serves) -- the dictionary
-    map below it walks every value in Python (LENGTH(SearchPhrase) = 12: 6.7 s over 6M phrases)"""
+    map below it walks every value in Python (seconds over a dictionary of millions of values)
+
+    Lore: LENGTH(SearchPhrase) = 12: 6.7 s over 6M phrases."""
     if type(node) not in (E.EQ, E.NEQ, E.GT, E.LT, E.GTE, E.LTE) or isinstance(node.this, E.Column):
         return False
     try:

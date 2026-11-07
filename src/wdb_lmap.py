@@ -3,7 +3,7 @@
 LOWER(col) GROUP BY doesn't want the column's values; it wants to know which
 codes COLLIDE under lowering. That is a derived fact about the dictionary,
 computed once and memmapped forever (nline doctrine: the file is the memory).
-24MB for SearchPhrase's 6M codes instead of a 417MB value store.
+4 bytes a code instead of the whole value store.
 
 Format (.lmap.<col>, little-endian):
   magic 'WLM1' | uint32 V | uint32 G | int32 lmap[V] | int32 rep[G]
@@ -11,6 +11,8 @@ lmap[code] = gid of the code's lowered value; rep[gid] = one original code of
 the group (any member: its lowered bytes ARE the group's emitted key).
 Lowering matches the engine's scalar path exactly (wdb_sql: utf-8 'replace'
 decode -> str.lower()) so board answers stay bit-identical.
+
+Lore: 24MB for SearchPhrase's 6M codes instead of a 417MB value store.
 """
 import os
 import numpy as np

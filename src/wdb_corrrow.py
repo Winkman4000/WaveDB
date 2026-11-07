@@ -1,8 +1,8 @@
-"""wdb_corrrow: THE VALUE PER ROW (c128, TPC-H Q20) -- a WHERE comparison against a correlated scalar subquery, judged
+"""wdb_corrrow: THE VALUE PER ROW -- a WHERE comparison against a correlated scalar subquery, judged
 at the outer query's survivors.
 
-    ... WHERE ps_availqty > (SELECT 0.5 * SUM(l_quantity) FROM lineitem
-                             WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey AND l_shipdate >= .. AND < ..)
+    ... WHERE o.x > (SELECT 0.5 * SUM(i.y) FROM inner_t i
+                     WHERE i.k1 = o.k1 AND i.k2 = o.k2 AND i.d >= .. AND i.d < ..)
 
 The subquery reads one table and returns one aggregate (SUM / AVG / COUNT / MIN / MAX of one column, or COUNT(*),
 inside + - * / with numeric literals); its WHERE is equalities 'inner column = outer column' (one or more) and
@@ -17,7 +17,10 @@ columns (the KEY), so:
   5. each survivor reads its key's value; the comparison keeps the rows where it is true (no value: not true).
 Nothing reads a column name: the shape is the SQL's, the key test is the data's (integer columns, no NULLs).
 Anything else returns None / raises wdb_join._FastUnsupported and the roads behind decide.
-Switch WDB_CORR_ROW (default on)."""
+Switch WDB_CORR_ROW (default on).
+
+Lore: c128, TPC-H Q20 -- ... WHERE ps_availqty > (SELECT 0.5 * SUM(l_quantity) FROM lineitem
+WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey AND l_shipdate >= .. AND < ..)."""
 import os
 import numpy as np
 from sqlglot import expressions as E

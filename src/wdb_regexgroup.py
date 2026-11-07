@@ -1,13 +1,15 @@
 """regexgroup: GROUP BY REGEXP_REPLACE(dict column) computed entirely at the dictionary level.
 
-The Q28 shape: SELECT REGEXP_REPLACE(col, pat, repl) AS k, AVG(LENGTH(col)), COUNT(*),
+The shape: SELECT REGEXP_REPLACE(col, pat, repl) AS k, AVG(LENGTH(col)), COUNT(*),
 MIN(col) ... WHERE col <> '' GROUP BY k HAVING COUNT(*) > N ORDER BY <alias> DESC LIMIT n.
 
 Row data is never touched as strings: one parallel frame scan produces per-code row counts
 (bincount lanes), and every string operation -- the regex, the lengths, the min -- happens once
 per DISTINCT value against the dictionary, then aggregates by weight. MIN(col) is free: dicts
 are value-sorted, so the first code carrying each label is its minimum. The regex applies to V
-distinct values instead of N rows -- a ~10x reduction on ClickBench's Referer.
+distinct values instead of N rows -- a ~10x reduction on a text column that repeats its values.
+
+Lore: the shape is ClickBench Q28's; the ~10x reduction was measured on ClickBench's Referer.
 """
 import os
 import numpy as np
@@ -166,8 +168,10 @@ def detect(seg, tree, col_map):
 
 def _code_counts(seg, col):
     """Row count per dict code: THE CENSUS (Segment.code_counts -- the .cnt.npy sidecar, born once)
-    when the segment has it; otherwise one parallel pass over the blocked frames (5.6s on Referer
-    every process: the registry already knew the answer)."""
+    when the segment has it; otherwise one parallel pass over the blocked frames (5.6s on a large text
+    column every process: the registry already knew the answer).
+
+    Lore: the 5.6s was ClickBench's Referer."""
     c = seg.cols[col]
     V = int(c['V'])
     try:
@@ -230,8 +234,10 @@ def _sidecar_path(seg, col, spec):
 
 def _load_sidecar(seg, col, spec):
     """THE REGEX-GROUP SIDECAR: the road's V-scale result (label id per value, the distinct
-    labels, character lengths) born once and loaded in milliseconds -- 19.7M Referers took 15s
-    to hostize on every fresh process (Q28 cold), for a result that never changes"""
+    labels, character lengths) born once and loaded in milliseconds -- 19.7M distinct values took 15s
+    to hostize on every fresh process (cold), for a result that never changes
+
+    Lore: the 19.7M values were ClickBench's Referers, the cold run Q28's."""
     p = _sidecar_path(seg, col, spec)
     if not p or not os.path.exists(p): return None
     import wdb_sidecar as _SC
@@ -463,11 +469,13 @@ IDENTITY = True                                  # the identity road first (test
 def _derive_runs_identity(seg, col, spec, pcl):
     """THE IDENTITY LABELS (Jackson, 2026-10-19): a value the pattern does not match keeps itself as its
     label, and a dictionary's values are already distinct -- so those labels are never copied, hashed as a
-    blob or grouped (Title and SearchPhrase: nearly every value). Matched captures are grouped exactly as
-    before (label_groups_par); each unmatched value is its own group unless a capture equals it, which is
-    asked by hash (probe_sorted_id) and settled byte for byte against the dictionary for the few hits.
+    blob or grouped (on a column the pattern rarely matches: nearly every value). Matched captures are grouped
+    exactly as before (label_groups_par); each unmatched value is its own group unless a capture equals it, which
+    is asked by hash (probe_sorted_id) and settled byte for byte against the dictionary for the few hits.
     One read of the three streams per chunk (wdb_kernels.fc3_prefruns_id). None (the caller falls back)
-    on any other layout or surprise."""
+    on any other layout or surprise.
+
+    Lore: "nearly every value" was ClickBench's Title and SearchPhrase."""
     import wdb_kernels as WK, wdb_strings, wdb_engine
     c = seg.cols.get(col)
     if c is None or c.get('R') is None or not c.get('chunked') or not c.get('fc3'):
@@ -755,8 +763,9 @@ def _emit(seg, spec, counts, lens, lab_ids, uniq, empty_code):
     kind0 = None if osel is None else ('K' if osel == spec['rk_pi'] else spec['aggs'][osel][0])
     if spec['lim'] is not None and kind0 != 'K':
         # THE ORDER BEFORE THE LABELS: only the groups the LIMIT returns become strings (without a HAVING,
-        # every one of Title's 9.4M groups was a Python row before the sort). A stable descending order,
-        # as the row sort's reverse=True keeps equal keys in group order.
+        # every one of a near-unique text column's 9.4M groups was a Python row before the sort). A stable
+        # descending order, as the row sort's reverse=True keeps equal keys in group order.
+        # lore: the 9.4M groups were ClickBench's Title.
         if kind0 is not None:
             kv = {'AVG_LEN': lambda: glen[keep] / gcnt[keep], 'COUNT_STAR': lambda: gcnt[keep],
                   'MIN_DICT': lambda: min_code[keep]}[kind0]()

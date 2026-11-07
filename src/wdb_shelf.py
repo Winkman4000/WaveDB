@@ -111,7 +111,8 @@ VOCABULARY = frozenset({'dictionary', 'joined-text', 'dictionary-sarray', 'inlin
 # THE DECODED COLUMN IS SOURCE DATA (Jackson, 2026-10-03: "the whole premise of hot is to keep the data ready
 # in cache"): a join key column decoded to its values ('keys', vals[codes] -- no filter, no grouping) and a
 # column's decoded codes ('codes') are the file's own values, a buffer pool; they stay for the hot runs and
-# never touch a cold run. Measured on JOB (every 5th query): hot x0.54, cold unchanged. WDB_TIER1_KEYS=0: off.
+# never touch a cold run. WDB_TIER1_KEYS=0: off.
+# lore: measured on JOB (every 5th query): hot x0.54, cold unchanged.
 _KEYS_TIER1 = frozenset({'keys', 'codes'})
 
 

@@ -18,21 +18,24 @@ import wdb_groupexists
 import wdb_measure_runtime as RT
 
 # THE ROAD AT THE SURVIVORS (2026-11-01): a fact->ancestor pointer two or more hops up was composed for every fact
-# row at plan time (one 60M gather per extra hop: TPC-H Q7 paid three, 66 ms) though its readers ask at the
-# survivors. WDB_LAZY_ROAD=0 composes at fact scale as before.
+# row at plan time (one fact-scale gather per extra hop) though its readers ask at the survivors. WDB_LAZY_ROAD=0
+# composes at fact scale as before.
+# lore: TPC-H Q7 paid three 60M gathers, 66 ms.
 _LAZY_ROAD = [os.environ.get('WDB_LAZY_ROAD', '1') == '1']
 
 # THE LEFTOVER IN FIRST (2026-11-01): after the plane handoff, a leftover 'fact text column IN (literals)' was judged
-# inside the per-row pred with everything else (TPC-H Q12: three dates rebuilt at the 9.1M year survivors when the
-# mode keeps 2.6M of them). Its keep table over the dictionary compresses the survivors first; the conjunct stays in
+# inside the per-row pred with everything else (other columns rebuilt at all the survivors when the IN keeps far
+# fewer). Its keep table over the dictionary compresses the survivors first; the conjunct stays in
 # the pred (an exact re-check). WDB_LEFT_FIRST=0: off. _LEFT_FIRST_HITS: diagnostic (tests read it).
+# lore: TPC-H Q12 rebuilt three dates at the 9.1M year survivors when the mode keeps 2.6M of them.
 _LEFT_FIRST = [os.environ.get('WDB_LEFT_FIRST', '1') == '1']
 _LEFT_FIRST_HITS = [0]
 
 # THE ROADS IN ONE PASS (2026-11-01): the cascade built the fact keep's row list (mask_rows: 18 ms at 60M), then per
 # fact-adjacent parent a bool at those rows (pkeep_via_ptr) and a row list again. Now one two-pass compress judges
-# the fact keep and up to two parent keeps through their roads (TPC-H Q7 146 -> 130 ms, Q3 97 -> 82). WDB_FUSE_ROADS=0:
+# the fact keep and up to two parent keeps through their roads. WDB_FUSE_ROADS=0:
 # off. _FUSE_ROADS_HITS: diagnostic (tests read it).
+# lore: TPC-H Q7 146 -> 130 ms, Q3 97 -> 82.
 _FUSE_ROADS = [os.environ.get('WDB_FUSE_ROADS', '1') == '1']
 _FUSE_ROADS_HITS = [0]
 _DENSE_ROWS_HITS = [0]   # diagnostic: multi-key groups factorised because the dense space outgrew the rows
@@ -101,11 +104,12 @@ class _LazyRoad:
         return getattr(self.full(), name)
 
 
-# THE PAIR ROAD (c126, TPC-H Q9): lineitem -> partsupp has no one-column key -- (l_partkey, l_suppkey) is unique in
-# partsupp only together. partsupp is stored by its first key, so each part's rows are one run: a child row's parent
+# THE PAIR ROAD (c126): a child -> parent join with no one-column key -- the two-column key is unique in the parent
+# only together. The parent is stored by its first key, so each first key's rows are one run: a child row's parent
 # row is a binary search for the run of its first key, then a scan of the run for its second. Built at the rows asked
 # (the cascade's survivors); the whole road only if something asks for the whole array. A child row with no parent
 # row declines (INNER, row-preserving, as the hash road). WDB_PAIR_ROAD=0: off.
+# lore: built for TPC-H Q9, lineitem -> partsupp on (l_partkey, l_suppkey); partsupp is stored by ps_partkey.
 _PAIR_ROAD = [os.environ.get('WDB_PAIR_ROAD', '1') == '1']
 _PAIR_ROAD_HITS = [0]
 
@@ -183,10 +187,11 @@ def _pair_parent(db, ptbl, pseg, pcols):
     return None
 
 
-# THE DISTINCT COUNT IN SLICES (c127, TPC-H Q16): grouped COUNT(DISTINCT col) when the group keys come from a parent
+# THE DISTINCT COUNT IN SLICES (c127): grouped COUNT(DISTINCT col) when the group keys come from a parent
 # table, or the (groups x values) grid is too big: each survivor is placed in its group's slice in one pass (a counting
-# sort by group number), then each group's slice is sorted -- in parallel, slices are short (Q16: ~43 rows) -- and its
-# distinct values counted. WDB_GCD_SLICES=0: off (the old grid-only lane).
+# sort by group number), then each group's slice is sorted -- in parallel, slices are short when groups are many --
+# and its distinct values counted. WDB_GCD_SLICES=0: off (the old grid-only lane).
+# lore: built for TPC-H Q16 (slices of ~43 rows).
 _GCD_SLICES = [os.environ.get('WDB_GCD_SLICES', '1') == '1']
 _GCD_SLICES_HITS = [0]
 _GCD_K_MAX = 1 << 26
@@ -269,30 +274,33 @@ class _PairRoad(_LazyRoad):
 
 
 # ONE GATHER PER ARRAY (2026-11-01): the survivor gather of a road or column ran numpy's a[rows] (one thread) once
-# per mention -- TPC-H Q12's CASE names o_orderpriority four times: four 11 ms gathers of the same road at 2.6M rows.
+# per mention -- a CASE naming one parent column several times gathered the same road once per mention.
 # Now each (array, survivor rows) is gathered once per query (_fast_pointer_agg's own memo, dying with it) and in
-# parallel from _RW_PAR_MIN rows (Q12 ~119 -> ~82 ms). WDB_RW_MEMO=0: off. _RW_MEMO_HITS: diagnostic (tests read it).
+# parallel from _RW_PAR_MIN rows. WDB_RW_MEMO=0: off. _RW_MEMO_HITS: diagnostic (tests read it).
+# lore: TPC-H Q12's CASE names o_orderpriority four times: four 11 ms gathers at 2.6M rows; Q12 ~119 -> ~82 ms.
 _RW_MEMO = [os.environ.get('WDB_RW_MEMO', '1') == '1']
 _RW_PAR_MIN = 1 << 16
 _RW_MEMO_HITS = [0]
 
 # THE CENSUS BY CODE (2026-11-01): the EXISTS census (_rich_lonely_frame) is computed state, emptied at query end, so
-# every TPC-H Q22 rebuilt it: 15M o_custkey values gathered, widened to int64, one-thread np.bincount -- 67 ms. Count
+# every query that asked rebuilt it: the key values gathered, widened to int64, one-thread np.bincount. Count
 # each dictionary code instead (bincount_par over the codes), then put each code's count at its value's slot in the
-# key range: the dictionary's values are distinct, so one plain scatter is exact (10 ms; Q22 126 -> 75 ms).
+# key range: the dictionary's values are distinct, so one plain scatter is exact.
 # WDB_CENSUS_CODE=0: the old census. _CENSUS_CODE_HITS: diagnostic (tests read it).
+# lore: every TPC-H Q22 gathered 15M o_custkey values -- 67 ms; by code 10 ms (Q22 126 -> 75 ms).
 _CENSUS_CODE = [os.environ.get('WDB_CENSUS_CODE', '1') == '1']
 _CENSUS_CODE_HITS = [0]
 
 # THE PARENT KEEP WAITS FOR THE ROAD (2026-11-02): with no fact keep, a fact-adjacent (depth-1) parent keep was
-# flowed to every fact row by numpy (keeps[pa][road]: 60M gathered on one thread, ~85 ms in Q17's outer) before
+# flowed to every fact row by numpy (keeps[pa][road]: gathered at fact scale on one thread) before
 # the road step. Now it waits: the road step reads the road once in parallel (plut_u8 -> mask_rows, or the next
-# parent through pkeep_via_ptr), as it already did for parents beside a fact keep. Q17's outer 95 -> 27.5 ms, TPC-H
-# Q18 444 -> 389. WDB_PARENT_WAIT=0: flowed as before. _PARENT_WAIT_HITS: diagnostic (tests read it).
+# parent through pkeep_via_ptr), as it already did for parents beside a fact keep.
+# WDB_PARENT_WAIT=0: flowed as before. _PARENT_WAIT_HITS: diagnostic (tests read it).
+# lore: 60M gathered on one thread, ~85 ms in TPC-H Q17's outer; Q17's outer 95 -> 27.5 ms, Q18 444 -> 389.
 _PARENT_WAIT = [os.environ.get('WDB_PARENT_WAIT', '1') == '1']
 _PARENT_WAIT_HITS = [0]
 
-# THE VALUE PER KEY (2026-11-02, TPC-H Q17): a WHERE comparison 'outer value OP (scalar subquery)' whose subquery
+# THE VALUE PER KEY (2026-11-02): a WHERE comparison 'outer value OP (scalar subquery)' whose subquery
 # reads one table, returns one aggregate (AVG / SUM / COUNT / MIN / MAX of one column, inside +-*/ with numeric
 # literals) and is correlated by exactly one equality inner column = outer column. Steps: (1) the outer's other
 # conjuncts give the survivors; (2) the parent rows the survivors reach through the outer column's road are marked;
@@ -301,6 +309,7 @@ _PARENT_WAIT_HITS = [0]
 # arithmetic -- one value per parent row, NaN where it has no inner rows (COUNT: 0); (5) each survivor reads its
 # parent's value through the same road as an ordinary value slot; NaN never compares true (SQL: NULL). '<>' and
 # anything else declines as before. WDB_CORR_SCALAR=0: off. _CORR_SCALAR_HITS: diagnostic (tests read it).
+# lore: built for TPC-H Q17.
 _CORR_SCALAR = [os.environ.get('WDB_CORR_SCALAR', '1') == '1']
 _CORR_SCALAR_HITS = [0]
 _RUN_SUM_HITS = [0]      # diagnostic: HAVING censuses summed run by run (THE RUNS SUM THEMSELVES, wdb_kernels)
@@ -471,9 +480,10 @@ def _chain_pandas(db, tree, ctx):
         if nd is not None: scan.append(nd)
     alias9p = {p.alias for p in proj if isinstance(p, E.Alias)}
     where = tree.args.get('where')
-    # SURVIVOR DISCIPLINE for the pandas tail (Q10 paid 41s decoding fact-
-    # scale strings it then threw away): gather ONLY the WHERE's columns
+    # SURVIVOR DISCIPLINE for the pandas tail (decoding fact-scale strings
+    # that are then thrown away is the cost): gather ONLY the WHERE's columns
     # full-width, mask, then fetch every remaining column at survivors.
+    # lore: Q10 paid 41s decoding fact-scale strings it then threw away.
     wcols9 = set()
     if where is not None:
         for col in where.find_all(E.Column):
@@ -538,9 +548,11 @@ def _chain_pandas(db, tree, ctx):
 def _exact_scalar(db, tree):
     """No-WHERE, no-GROUP scalar aggregates over dict-int columns, by DICTIONARY
     ARITHMETIC: one bincount of raw codes per column, then SUM exact at any magnitude
-    (two-limb fold, wdb_exactint -- float64 drifts and int64 wraps at SUM(UserID) scale),
+    (two-limb fold, wdb_exactint -- float64 drifts and int64 wraps at the sum of a wide 64-bit id column),
     AVG correctly rounded from the exact SUM, MIN/MAX off the value-ordered dict's
-    present codes, COUNTs from the counts. Declines (None) on any other shape."""
+    present codes, COUNTs from the counts. Declines (None) on any other shape.
+
+    Lore: the drift and wrap were seen at SUM(UserID) scale on ClickBench."""
     import wdb_exactint as XI
     if (tree.args.get('where') is not None or tree.args.get('group') is not None
             or tree.args.get('joins') or tree.args.get('having') is not None
@@ -564,9 +576,10 @@ def _exact_scalar(db, tree):
     for p in tree.expressions:
         ak = wdb_sql._agg_kind(p)
         if ak is not None and ak[0] == 'SUM' and not isinstance(ak[1], str):
-            # THE AFFINE SUM (2026-10-21, Q29's board): SUM(col + k) is SUM(col) + k * COUNT(col), exact at any
+            # THE AFFINE SUM (2026-10-21): SUM(col + k) is SUM(col) + k * COUNT(col), exact at any
             # dictionary size -- wdb_affinesum serves dictionaries up to 1M values; past that the shape fell to
-            # the general path (WatchID, UserID, ClientEventTime, RefererHash, LocalEventTime: 10 s timeouts)
+            # the general path (10 s timeouts on columns past 1M distinct values)
+            # lore: Q29's board; the timeouts were WatchID, UserID, ClientEventTime, RefererHash, LocalEventTime
             import wdb_affinesum as _AF9
             inner9 = p.this if isinstance(p, E.Alias) else p
             af9 = _AF9._affine(inner9)
@@ -589,9 +602,10 @@ def _exact_scalar(db, tree):
         if seg._effective(col) is not None:
             return None                              # UPDATE overrides falsify raw codes
         if ak[0] in ('MIN', 'MAX') and c.get('dt') == 1 and c.get('mode') in (0, 1):
-            # TEXT MIN / MAX FROM THE DICTIONARY'S ENDS (2026-10-21, Q6's board): every dictionary is in value
+            # TEXT MIN / MAX FROM THE DICTIONARY'S ENDS (2026-10-21): every dictionary is in value
             # order and every code holds a row (no deletes: checked above), so MIN is code 0's value and MAX the
-            # last non-NULL code's -- two point reads. Text fell to the general path (OriginalURL 8.3 s, DuckDB 0.5)
+            # last non-NULL code's -- two point reads. Text fell to the general path before
+            # lore: Q6's board; OriginalURL took 8.3 s on the general path, DuckDB 0.5
             specs.append(('T' + ak[0], col)); continue
         if (ak[0] in ('SUM', 'AVG', 'MIN', 'MAX') or ak[0].startswith('SUMSHIFT')) and c.get('dt') != 0:
             return None                              # datetimes keep their typed emission
@@ -673,9 +687,9 @@ def _exact_scalar_one(seg, kind, col, counts_of, seqs, i2s, cnts):
                     i2s[col] = rs9
         if kind in ('SUM', 'AVG') and (col in i2s or (WN._nline(seg, col) is None and seg.i2_foldable(col))):
             # THE FOLD THROUGH THE DICTIONARY'S OWN FRAMES (2026-10-19): the census, then counts x values
-            # folded chunk by chunk as libzstd inflates the dictionary -- no spine built (AVG(WatchID)
-            # 855 -> ~250 ms; AVG(UserID), Q3: the spine's inflate 75 ms + block value sum 51 ms became
-            # its census 46 ms + fold 18 ms)
+            # folded chunk by chunk as libzstd inflates the dictionary -- no spine built
+            # lore: AVG(WatchID) 855 -> ~250 ms; AVG(UserID), Q3: the spine's inflate 75 ms + block value
+            # lore: sum 51 ms became its census 46 ms + fold 18 ms
             if col not in i2s and col not in cnts:
                 f9 = seg.e19_census_fold(col)       # THE CENSUS AND THE FOLD IN ONE PASS (2026-10-30): no full census
                 if f9 is not None:
@@ -690,7 +704,9 @@ def _exact_scalar_one(seg, kind, col, counts_of, seqs, i2s, cnts):
         tab = WN._int_table(seg, col)
         if kind in ('SUM', 'AVG') and col not in cnts:
             # THE SUM FROM THE BLOCK DICTIONARIES (2026-10-01): enc 19 sums block by block, exact,
-            # with no full census (AVG(UserID): 17.6M bins); the same integer fold_counts gives
+            # with no full census (a near-unique column's census is as big as its dictionary); the same integer
+            # fold_counts gives
+            # lore: AVG(UserID): 17.6M bins
             vs = seg.e19_value_sum(col, tab)
             if vs is not None:
                 s, n = vs
@@ -710,10 +726,13 @@ def _exact_scalar_one(seg, kind, col, counts_of, seqs, i2s, cnts):
 def _sum_overflow_gate(db, tree):
     """Raise _FastUnsupported when the fused engine's float64 accumulators would round an
     integer answer: a SUM/AVG over a dict-int column whose extremes times N could exceed 2^53
-    (SUM(UserID) at 100M: ~1e13 absolute error), or a MIN/MAX over one whose extremes
-    themselves pass 2^53 (MIN(URLHash) WHERE ... came back with its last three digits rounded;
-    the shifting board, 2026-10-12). Falling through reaches the exact paths (wherescan's
-    two-limb fold). Extremes cost two point-fetches on the value-ordered dict."""
+    (the sum of a wide 64-bit id column over many rows), or a MIN/MAX over one whose extremes
+    themselves pass 2^53 (a 64-bit hash column's minimum comes back with its low digits rounded).
+    Falling through reaches the exact paths (wherescan's
+    two-limb fold). Extremes cost two point-fetches on the value-ordered dict.
+
+    Lore: SUM(UserID) at 100M had ~1e13 absolute error; MIN(URLHash) WHERE ... came back with its last
+    three digits rounded (the shifting board, 2026-10-12)."""
     risky = []                                        # (column, scaled by N?)
     for p in tree.expressions:
         ak = wdb_sql._agg_kind(p)
@@ -799,7 +818,7 @@ def _sumslice_meta(db, tbl):
         if _SC.may_read(p) and _os.path.exists(p):
             try:
                 m = _js.load(open(p))
-                m.setdefault('stamp', 'l_sumslice')
+                m.setdefault('stamp', 'sumslice')        # the stamp column's name, when the file names none
             except Exception:
                 m = None
         memo[tbl] = m
@@ -1204,11 +1223,13 @@ def denorm_rewrite(db, tree):
 
 
 def _rich_lonely_frame(db, inner):
-    """Q22's inner dissolved: single-table SELECT over customer where every
+    """A lonely-rows inner dissolved: single-table SELECT over one table where every
     conjunct is one of {2-char-prefix IN literals (byte kernel), col > (scalar
     AVG subquery of the same shape), NOT EXISTS (child fk = key) (the CENSUS:
     a bincount of the child fk over the key's identity domain -- 'has no
-    orders' is 'the slot is empty')}. Returns the inner's frame or None."""
+    child rows' is 'the slot is empty')}. Returns the inner's frame or None.
+
+    Lore: built for TPC-H Q22's inner (customer; 'has no orders')."""
     import pandas as pd
     if inner.args.get('joins') or inner.args.get('group'): return None
     frm = inner.args.get('from') or inner.args.get('from_')
@@ -1344,12 +1365,14 @@ def _rich_lonely_frame(db, inner):
 
 
 def _left_count_frame(db, inner):
-    """Q13's LEFT JOIN dissolved (Jackson's reading: the join fetches NO
-    foreign data -- its whole meaning is 'the domain is ALL customers, absent
+    """A counting LEFT JOIN dissolved (Jackson's reading: the join fetches NO
+    foreign data -- its whole meaning is 'the domain is ALL parent rows, absent
     matches count zero'): filter the child by the ON's extra conjunct (a
     front-coded LIKE runs as a byte kernel over the dict), bincount child fk
     values over the parent's FULL key domain, zeros by construction. Returns
-    the inner's output frame or None."""
+    the inner's output frame or None.
+
+    Lore: built for TPC-H Q13 ('the domain is ALL customers')."""
     import pandas as pd
     joins = inner.args.get('joins') or []
     if len(joins) != 1: return None
@@ -1433,10 +1456,12 @@ _MOMENT9 = tuple(getattr(E, n) for n in ('Stddev', 'StddevSamp', 'StddevPop', 'V
 
 
 def has_agg_arith(tree):
-    """True when a projection combines aggregates with arithmetic (Q14's
-    Div-of-Sums, H2O q7's MAX-MIN) or uses a MOMENT aggregate (STDDEV,
+    """True when a projection combines aggregates with arithmetic (a
+    Div-of-Sums, a MAX-MIN) or uses a MOMENT aggregate (STDDEV,
     VARIANCE, CORR -- algebra over hidden sums): the single-table executor
-    cannot plan these."""
+    cannot plan these.
+
+    Lore: TPC-H Q14's Div-of-Sums, H2O q7's MAX-MIN."""
     if not isinstance(tree, E.Select): return False
     _AGG = (E.Sum, E.Count, E.Avg, E.Min, E.Max)
     _ROW9 = tuple(getattr(E, n) for n in ('Filter', 'GroupConcat', 'AnyValue', 'IgnoreNulls', 'Mode', 'LogicalAnd', 'LogicalOr',
@@ -1574,10 +1599,12 @@ _AGG_KEYCOL_HITS = [0]
 
 
 def _agg_expr_rewrite(db, tree):
-    """AGGREGATE ARITHMETIC (Q14's Div-of-Sums): a projection combining
+    """AGGREGATE ARITHMETIC (e.g. a Div-of-Sums): a projection combining
     aggregates with +-*/ and literals runs as hidden aggregate aliases
     through the fused engine; the arithmetic evaluates on the results.
-    Returns rows or None (not this shape)."""
+    Returns rows or None (not this shape).
+
+    Lore: TPC-H Q14's Div-of-Sums."""
     if not isinstance(tree, E.Select): return None
     _AGG = (E.Sum, E.Count, E.Avg, E.Min, E.Max)
     proj = list(tree.expressions)
@@ -1639,8 +1666,9 @@ def _agg_expr_rewrite(db, tree):
             outer.append(('hid', al))
         elif (_AGG_KEYCOL[0] and nd.find(*_AGG) is None
               and not any(c9.name.startswith('__med') for c9 in nd.find_all(E.Column))):
-            # A COMPUTED KEY (Q8's o_orderdate / 365 AS o_year): no aggregate inside, so it is one value per
+            # A COMPUTED KEY (col / 365 AS year): no aggregate inside, so it is one value per
             # group -- the hidden query computes it as its own column under the same alias
+            # lore: TPC-H Q8's o_orderdate / 365 AS o_year
             _AGG_KEYCOL_HITS[0] += 1
             al9k = p.alias if isinstance(p, E.Alias) else '__key%d' % len(new_exprs)
             outer.append(('col', len(new_exprs)))
@@ -1703,139 +1731,15 @@ def _agg_expr_rewrite(db, tree):
 
 
 
-def _lonely_rewrite(db, tree):
-    """Q21's EXISTS pair dissolved (Jackson): EXISTS(l2: same key, other supp)
-    and NOT EXISTS(l3: same key, other supp, ALSO LATE) are two PARENT KEEPS
-    -- distinct-supplier censuses over the child's sorted road: keep orders
-    with nsupp >= 2 and late-distinct == 1 (the outer's own lateness conjunct
-    covers l1's side). The pair is replaced by one In carrying _codes on the
-    parent key; the mask layer serves it."""
-    w = tree.args.get('where')
-    if w is None: return
-    def _flat9(x):
-        if isinstance(x, E.Paren): return _flat9(x.this)
-        if isinstance(x, E.And): return _flat9(x.this) + _flat9(x.expression)
-        return [x]
-    conj = _flat9(w.this)
-    ex_pos = ex_neg = None
-    for cj in conj:
-        if isinstance(cj, E.Exists): ex_pos = cj
-        elif isinstance(cj, E.Not) and isinstance(cj.this, E.Exists): ex_neg = cj
-    if ex_pos is None or ex_neg is None: return
-    def _parts(ex):
-        sub = ex.this
-        if not isinstance(sub, E.Select): return None
-        f9 = sub.args.get('from') or sub.args.get('from_')
-        if f9 is None or not isinstance(f9.this, E.Table): return None
-        al = f9.this.alias or f9.this.name
-        ww = sub.args.get('where')
-        if ww is None: return None
-        return f9.this.name, al, _flat9(ww.this)
-    P1 = _parts(ex_pos); P2 = _parts(ex_neg.this)
-    if P1 is None or P2 is None or P1[0] != P2[0]: return
-    childT = P1[0]
-    def _corr_neq(cjs, al):
-        key_eq = neq = None; extra = []
-        for c in cjs:
-            if isinstance(c, E.EQ) and isinstance(c.this, E.Column) and isinstance(c.expression, E.Column):
-                key_eq = c
-            elif isinstance(c, E.NEQ) and isinstance(c.this, E.Column) and isinstance(c.expression, E.Column):
-                neq = c
-            else:
-                extra.append(c)
-        return key_eq, neq, extra
-    k1, n1, e1 = _corr_neq(P1[2], P1[1])
-    k2, n2, e2 = _corr_neq(P2[2], P2[1])
-    if k1 is None or n1 is None or e1: return
-    if k2 is None or n2 is None or len(e2) != 1: return
-    # the NOT-EXISTS extra conjunct, re-aliased to the OUTER, must appear in the outer WHERE
-    x2 = e2[0].copy()
-    outer_al = None
-    for c9 in x2.find_all(E.Column):
-        if c9.table == P2[1]:
-            pass
-    inner_al = P2[1]
-    outer_al = (k2.this.table if k2.this.table != inner_al else k2.expression.table) or ''
-    for c9 in x2.find_all(E.Column):
-        if c9.table == inner_al:
-            c9.set('table', E.Identifier(this=outer_al, quoted=False) if outer_al else None)
-    want = x2.sql()
-    if not any(c.sql() == want for c in conj): return
-    # key/supp/flag columns on the child
-    key_c = k1.this if (k1.this.table or '') == P1[1] else k1.expression
-    sup_c = n1.this if (n1.this.table or '') == P1[1] else n1.expression
-    try:
-        cseg, _s = _solo_segment(db, childT)
-        # the parent of the child's key via the outer key column (other side of k1)
-        okc = k1.expression if key_c is k1.this else k1.this
-        # find the parent table owning the outer key through the OUTER's edges:
-        pT = None
-        for t9 in tree.find_all(E.Table):
-            if t9.find_ancestor(E.Select) is not tree: continue
-            if t9.name == childT and (t9.alias or t9.name) != (okc.table or ''):
-                continue
-        # outer key column l1.l_orderkey belongs to the fact alias; the road's
-        # PARENT key is found through the catalog FK or unique-key equality in
-        # the outer WHERE: o_orderkey = l1.l_orderkey
-        peq = None
-        for c9 in conj:
-            if (isinstance(c9, E.EQ) and isinstance(c9.this, E.Column) and isinstance(c9.expression, E.Column)
-                    and {c9.this.name, c9.expression.name} >= {okc.name} and c9 is not k1):
-                a9, b9 = c9.this, c9.expression
-                other = b9 if a9.name == okc.name and (a9.table or '') == (okc.table or '') else (
-                        a9 if b9.name == okc.name and (b9.table or '') == (okc.table or '') else None)
-                if other is not None:
-                    peq = other; break
-        if peq is None: return
-        pT9 = None
-        for t9 in tree.find_all(E.Table):
-            if t9.find_ancestor(E.Select) is tree and peq.name in set(db.cat.column_names(t9.name)):
-                pT9 = t9.name; break
-        if pT9 is None or not _key_is_unique(db, pT9, peq.name): return
-        pseg, _s2 = _solo_segment(db, pT9)
-        road = np.asarray(_hash_pointer(db, childT, db.cat.phys_map(childT).get(key_c.name, key_c.name),
-                                        cseg, pT9, db.cat.phys_map(pT9).get(peq.name, peq.name), pseg))
-        if not bool((np.diff(road) >= 0).all()): return       # runs law: sorted roads only
-        # the flag: the NOT-EXISTS extra conjunct evaluated on the CHILD --
-        # only the declared-clock strict compare is served (Q21's late)
-        f9n = e2[0]
-        if not (type(f9n) in (E.GT, E.LT) and isinstance(f9n.this, E.Column)
-                and isinstance(f9n.expression, E.Column)): return
-        a9c, b9c = f9n.this.name, f9n.expression.name
-        big, small = (a9c, b9c) if isinstance(f9n, E.GT) else (b9c, a9c)
-        cc9 = cseg.cols.get(db.cat.phys_map(childT).get(big, big), {})
-        if cc9.get('code_enc') != 16 or cc9.get('e16_partner') != db.cat.phys_map(childT).get(small, small):
-            return
-        bit9, dl9 = cseg.pair_bits(db.cat.phys_map(childT).get(big, big))
-        flag = np.ascontiguousarray(np.asarray(bit9) & (np.asarray(dl9) > 0), dtype=np.bool_)
-        sup9 = wdb_sql.raw_dict_col(cseg, db.cat.phys_map(childT).get(sup_c.name, sup_c.name), want_codes=True)
-        if sup9 is None: return
-        supv = np.ascontiguousarray(np.asarray(sup9[1]), dtype=np.int64)
-        ch9 = np.flatnonzero(np.diff(road) != 0) + 1
-        starts = np.concatenate((np.array([0]), ch9, np.array([road.shape[0]]))).astype(np.int64)
-        nsupp = np.zeros(pseg.N, np.int32); nflag = np.zeros(pseg.N, np.int32)
-        wdb_kernels.pruns_distinct(starts, np.ascontiguousarray(road, dtype=np.int64), supv, flag, nsupp, nflag)
-        qual = np.flatnonzero((nsupp >= 2) & (nflag == 1)).astype(np.int64)
-    except Exception:
-        return
-    # replace the pair with one In carrying _codes on the parent key
-    innode = E.In(this=peq.copy())
-    innode.set('_codes', qual)
-    kept = [c for c in conj if c is not ex_pos and c is not ex_neg] + [innode]
-    new = kept[0]
-    for c in kept[1:]:
-        new = E.And(this=new.copy() if new is kept[0] else new, expression=c.copy() if not isinstance(c, E.In) else c)
-    w.set('this', new)
-
-
-
 def _factor_or_rewrite(tree):
-    """SCHOOLBOOK ALGEBRA (Jackson's Q19): (E and A) or (E and B) = E and
+    """SCHOOLBOOK ALGEBRA (Jackson's): (E and A) or (E and B) = E and
     (A or B). For EVERY OR conjunct of the WHERE (top-level or inside the
-    AND chain -- Q7), conjuncts common to all branches hoist out, and THE
+    AND chain), conjuncts common to all branches hoist out, and THE
     IMPLIED KEEP adds col IN (union of pins) for columns pinned in every
     branch -- a single-column keep the cascade serves at dict scale, the
-    exact OR re-checked at survivors."""
+    exact OR re-checked at survivors.
+
+    Lore: Jackson's Q19 (TPC-H); the OR inside the AND chain is Q7's."""
     w = tree.args.get('where')
     if w is None: return
     def _ors(x):
@@ -1912,12 +1816,14 @@ def _factor_or_rewrite(tree):
 
 
 def _lonely_rewrite(db, tree):
-    """Q21's EXISTS pair dissolved (Jackson): EXISTS(l2: same key, other supp)
-    and NOT EXISTS(l3: same key, other supp, ALSO LATE) are two PARENT KEEPS
-    -- distinct-supplier censuses over the child's sorted road: keep orders
-    with nsupp >= 2 and late-distinct == 1 (the outer's own lateness conjunct
-    covers l1's side). The pair is replaced by one In carrying _codes on the
-    parent key; the mask layer serves it."""
+    """An EXISTS pair dissolved (Jackson): EXISTS(c2: same key, other x)
+    and NOT EXISTS(c3: same key, other x, ALSO LATE) are two PARENT KEEPS
+    -- distinct-x censuses over the child's sorted road: keep parent rows
+    with nx >= 2 and late-distinct == 1 (the outer's own lateness conjunct
+    covers c1's side). The pair is replaced by one In carrying _codes on the
+    parent key; the mask layer serves it.
+
+    Lore: built for TPC-H Q21 (l1/l2/l3 over lineitem, x = supplier, parent = orders)."""
     w = tree.args.get('where')
     if w is None: return
     def _flat9(x):
@@ -1969,9 +1875,9 @@ def _lonely_rewrite(db, tree):
             c9.set('table', E.Identifier(this=outer_al, quoted=False) if outer_al else None)
     want = x2.sql()
     if not any(c.sql() == want for c in conj): return
-    # key/supp/flag columns on the child
+    # key/x/flag columns on the child
     key_c = k1.this if (k1.this.table or '') == P1[1] else k1.expression
-    sup_c = n1.this if (n1.this.table or '') == P1[1] else n1.expression
+    x_c = n1.this if (n1.this.table or '') == P1[1] else n1.expression
     try:
         cseg, _s = _solo_segment(db, childT)
         # the parent of the child's key via the outer key column (other side of k1)
@@ -1982,9 +1888,10 @@ def _lonely_rewrite(db, tree):
             if t9.find_ancestor(E.Select) is not tree: continue
             if t9.name == childT and (t9.alias or t9.name) != (okc.table or ''):
                 continue
-        # outer key column l1.l_orderkey belongs to the fact alias; the road's
+        # the outer key column belongs to the fact alias; the road's
         # PARENT key is found through the catalog FK or unique-key equality in
-        # the outer WHERE: o_orderkey = l1.l_orderkey
+        # the outer WHERE: parent.key = c1.key
+        # lore: TPC-H Q21's l1.l_orderkey, o_orderkey = l1.l_orderkey
         peq = None
         for c9 in conj:
             if (isinstance(c9, E.EQ) and isinstance(c9.this, E.Column) and isinstance(c9.expression, E.Column)
@@ -2005,7 +1912,8 @@ def _lonely_rewrite(db, tree):
                                         cseg, pT9, db.cat.phys_map(pT9).get(peq.name, peq.name), pseg))
         if not bool((np.diff(road) >= 0).all()): return       # runs law: sorted roads only
         # the flag: the NOT-EXISTS extra conjunct evaluated on the CHILD --
-        # only the declared-clock strict compare is served (Q21's late)
+        # only the declared-clock strict compare is served (column > or < column)
+        # lore: TPC-H Q21's late
         f9n = e2[0]
         if not (type(f9n) in (E.GT, E.LT) and isinstance(f9n.this, E.Column)
                 and isinstance(f9n.expression, E.Column)): return
@@ -2016,14 +1924,14 @@ def _lonely_rewrite(db, tree):
             return
         bit9, dl9 = cseg.pair_bits(db.cat.phys_map(childT).get(big, big))
         flag = np.ascontiguousarray(np.asarray(bit9) & (np.asarray(dl9) > 0), dtype=np.bool_)
-        sup9 = wdb_sql.raw_dict_col(cseg, db.cat.phys_map(childT).get(sup_c.name, sup_c.name), want_codes=True)
-        if sup9 is None: return
-        supv = np.ascontiguousarray(np.asarray(sup9[1]), dtype=np.int64)
+        x9 = wdb_sql.raw_dict_col(cseg, db.cat.phys_map(childT).get(x_c.name, x_c.name), want_codes=True)
+        if x9 is None: return
+        xv = np.ascontiguousarray(np.asarray(x9[1]), dtype=np.int64)
         ch9 = np.flatnonzero(np.diff(road) != 0) + 1
         starts = np.concatenate((np.array([0]), ch9, np.array([road.shape[0]]))).astype(np.int64)
-        nsupp = np.zeros(pseg.N, np.int32); nflag = np.zeros(pseg.N, np.int32)
-        wdb_kernels.pruns_distinct(starts, np.ascontiguousarray(road, dtype=np.int64), supv, flag, nsupp, nflag)
-        qual = np.flatnonzero((nsupp >= 2) & (nflag == 1)).astype(np.int64)
+        nx = np.zeros(pseg.N, np.int32); nflag = np.zeros(pseg.N, np.int32)
+        wdb_kernels.pruns_distinct(starts, np.ascontiguousarray(road, dtype=np.int64), xv, flag, nx, nflag)
+        qual = np.flatnonzero((nx >= 2) & (nflag == 1)).astype(np.int64)
     except Exception:
         return
     # replace the pair with one In carrying _codes on the parent key
@@ -2038,11 +1946,13 @@ def _lonely_rewrite(db, tree):
 
 
 def _grouped_in_rewrite(db, tree):
-    """THE WEIGHTED CENSUS SERVE (Jackson's Q18): `pkey IN (SELECT ckey FROM
+    """THE WEIGHTED CENSUS SERVE (Jackson's): `pkey IN (SELECT ckey FROM
     child GROUP BY ckey HAVING AGG(col) cmp lit)` fetches no foreign data --
     it keeps parents whose slot in a weighted bincount over the child's road
     clears the bar. Resolve to the literal key list (monsters are rare) and
-    the query becomes a plain tree query. Declines loudly past 100k keys."""
+    the query becomes a plain tree query. Declines loudly past 100k keys.
+
+    Lore: Jackson's Q18 (TPC-H)."""
     w = tree.args.get('where')
     if w is None: return
     for node in list(w.find_all(E.In)):
@@ -2122,11 +2032,13 @@ def _grouped_in_rewrite(db, tree):
 
 
 def _window_topk_door(db, tree):
-    """THE TOP-K-PER-GROUP DOOR (H2O q8): FROM (SELECT cols..., ROW_NUMBER()
+    """THE TOP-K-PER-GROUP DOOR: FROM (SELECT cols..., ROW_NUMBER()
     OVER (PARTITION BY p ORDER BY o [DESC]) AS rn FROM T [WHERE inner]) t
     WHERE rn <= k. Dissolved: composite group ids over p, a COUNTING SCATTER
     of row indices by group, each group's slice sorted by o in parallel,
-    the first k rows gathered. ROW_NUMBER only (RANK ties would need more)."""
+    the first k rows gathered. ROW_NUMBER only (RANK ties would need more).
+
+    Lore: built for H2O q8."""
     frm = tree.args.get('from') or tree.args.get('from_')
     if frm is None or not isinstance(frm.this, E.Subquery) or tree.args.get('joins'): return None
     inner = frm.this.this
@@ -2238,11 +2150,13 @@ _PIECES_SERVED = [0]        # how many road joins the piecewise road answered (t
 
 
 def _road_join_emit(db, tree):
-    """THE ROAD JOIN (H2O joins): a row-emitting two-table equi-join whose
+    """THE ROAD JOIN: a row-emitting two-table equi-join whose
     right key is unique is a POINTER, not a merge -- the child's columns
     gather at its rows, the parent's at the pointer. INNER drops -1 rows;
     LEFT keeps them and emits NULLs for the parent side. Returns
-    (rows, names) or None (not this shape)."""
+    (rows, names) or None (not this shape).
+
+    Lore: built for the H2O joins."""
     if not isinstance(tree, E.Select): return None
     joins = tree.args.get('joins') or []
     if len(joins) != 1 or tree.args.get('group') is not None: return None
@@ -2406,11 +2320,13 @@ def _road_join_emit(db, tree):
                 on_l.append((_lt9, None if _lt9 is not None else
                              np.asarray(wdb_sql._eval_pred(lseg, _strip9(_cj9), lambda nm: lpm.get(nm, nm)), dtype=bool)))
         n9 = int(lseg.N); lo = 0; step = max(1 << 16, min(1 << 20, (_want9 if _want9 is not None else 1 << 20) * 64))
+        # lore: CounterID = 62 keeps 0.7%
         kraw = wdb_sql.raw_dict_col(lseg, ckn, want_codes=False)    # the key read only where the child's own
-        import wdb_kernels as _WKp                                    # filters left rows (CounterID = 62: 0.7%)
+        import wdb_kernels as _WKp                                    # filters left rows (a selective filter)
         # THE LOAD STEERS (Jackson's thesis: measured at load, known at query): when every child filter is a
         # code table, the load's per-block code ranges name the blocks that can hold a kept row -- the road
-        # walks only those (CounterID = 62 first appears 47.6M rows in; the plain walk read half the table)
+        # walks only those (a rare value whose first row is deep in the table: the plain walk reads up to it)
+        # lore: CounterID = 62 first appears 47.6M rows in; the plain walk read half the table
         cand9 = None; B9 = 32768
         if lconj and all(lt is not None for lt in luts):
             try:
@@ -2635,7 +2551,8 @@ def hidden_rewrite(tree):
     if not isinstance(tree, E.Select): return None
     _g0 = tree.args.get('group')
     if tree.args.get('having') is None and tree.args.get('order') is None and not (_g0 is not None and _g0.args.get('all')):
-        return None                       # nothing to rewrite: the copy below was 5 ms of Q29's 9 (ninety projections)
+        # lore: the copy was 5 ms of Q29's 9 (ninety projections)
+        return None                       # nothing to rewrite: the copy below is pure cost on wide projections
     t = tree.copy(); changed = False
     _AGG = (E.AggFunc,)
     g = t.args.get('group')
@@ -3171,10 +3088,12 @@ def _topk_rows_door(db, tree):
 
 
 def _from_door(db, tree):
-    """THE FROM DOOR (Q7/Q13/Q22): FROM (SELECT ...) alias -- run the INNER
+    """THE FROM DOOR: FROM (SELECT ...) alias -- run the INNER
     through the engine (it rides every fast path: trees, cascades, courts),
     then evaluate the outer over the inner's small output frame. Returns rows
-    or None (not this shape)."""
+    or None (not this shape).
+
+    Lore: built for TPC-H Q7/Q13/Q22."""
     frm = tree.args.get('from') or tree.args.get('from_')   # sqlglot renamed the key
     if frm is None or not isinstance(frm.this, E.Subquery): return None
     if tree.args.get('joins'): return None
@@ -3584,10 +3503,11 @@ def join_query(db, sql, columnar=False):
                                 expression=E.Column(this=E.Identifier(this=_nm9, quoted=False), table=E.Identifier(this=_ra9, quoted=False)))
                     _cond9 = _eq9 if _cond9 is None else E.And(this=_cond9, expression=_eq9)
                 _jn9.set('on', _cond9); _jn9.set('using', None)
-    # THE COUNT INSTEAD OF THE SEARCH (2026-10-04, Q21): [NOT] EXISTS(same group, other x, P) becomes a per-row
+    # THE COUNT INSTEAD OF THE SEARCH (2026-10-04): [NOT] EXISTS(same group, other x, P) becomes a per-row
     # verdict over the outer alias's table -- a WDB_ROWMASK placeholder build_pred and mask_eval read as a slot
+    # lore: built for Q21; the IN rewrite below for Q16
     wdb_groupexists.rewrite(db, tree)
-    import wdb_insub                       # [NOT] IN (uncorrelated subquery) -> a code-set filter (Q16)
+    import wdb_insub                       # [NOT] IN (uncorrelated subquery) -> a code-set filter
     wdb_insub.rewrite(db, tree)
 
     if tree.find(E.Window) is not None and not (tree.args.get('from') or tree.args.get('from_')).this.__class__.__name__ == 'Subquery':
@@ -3649,7 +3569,8 @@ def join_query(db, sql, columnar=False):
                 _route9('fpa-stored')
                 return _fast_pointer_agg(db, tree1, chain, columnar)  # fully fused
             except _FastUnsupported:
-                chain = None   # stored-only chain's plan declined (e.g. Q5's tree
+                # lore: e.g. Q5's tree
+                chain = None   # stored-only chain's plan declined (e.g. a tree that
                                # needs hash edges): release it so the retry rebuilds
     if joins and len(joins) == 1 and not has_aggs:
         # THE ROAD JOIN goes BEFORE the lazy chain: a row-emitting equi-join
@@ -3985,8 +3906,9 @@ _PANDAS_KEYEXPR_HITS = [0]
 def _aggregate(merged, proj, group, R):
     _PF = {'SUM': 'sum', 'AVG': 'mean', 'MIN': 'min', 'MAX': 'max', 'COUNT': 'count'}
     specs = []  # per projection: ('key', col) | ('size',) | ('agg', fn, col)
-    # A COMPUTED KEY (o_orderdate / 365 AS o_year): evaluated ONCE into its own column; the projection and the
+    # A COMPUTED KEY (col / 365 AS year): evaluated ONCE into its own column; the projection and the
     # GROUP BY (by the expression or by the alias) read that column. A table column of the same name wins (SQL).
+    # lore: o_orderdate / 365 AS o_year (TPC-H)
     _alias9k = {p.alias: p.this for p in proj if isinstance(p, E.Alias)}
     _keysyn9 = {}
     def _keycol9(nd):
@@ -4011,8 +3933,9 @@ def _aggregate(merged, proj, group, R):
         kind = wdb_sql._agg_kind(p)
         if kind is None and not isinstance(inner, E.Column) \
                 and any(True for _ in inner.find_all(E.Sum, E.Avg, E.Min, E.Max, E.Count)):
-            # arithmetic OVER aggregates (Q14's 100*SUM/SUM): each inner agg
+            # arithmetic OVER aggregates (100*SUM/SUM): each inner agg
             # becomes its own synth spec; the tree composes on the RESULT row.
+            # lore: TPC-H Q14's 100*SUM/SUM
             amap9 = {}
             for an9 in inner.find_all(E.Sum, E.Avg, E.Min, E.Max, E.Count):
                 k9 = wdb_sql._agg_kind(an9)
@@ -4183,8 +4106,10 @@ _SOLO_MEMO = __import__('wdb_qmem').register({})
 
 def _solo_segment(db, name):
     """THE CLEAN VERDICT, MEMOISED: 'this table is one clean segment (or a clean union)' asked the
-    filesystem ~53 times per JOB query (hot buffer, overrides, tombstones, per table). The verdict
-    can only change when DML or compaction writes, and both move the catalog stamp now."""
+    filesystem dozens of times per many-table query (hot buffer, overrides, tombstones, per table). The verdict
+    can only change when DML or compaction writes, and both move the catalog stamp now.
+
+    Lore: ~53 times per JOB query."""
     stamp = db._catalog_stamp() if hasattr(db, '_catalog_stamp') else None
     # THE PIN IS PART OF THE VERDICT: segment partials pin a table to ONE member (_seg_override) while
     # they iterate a union; a verdict memoised under the pin and served after it answered the whole
@@ -4650,10 +4575,11 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
                     if isinstance(nd9, (E.Min, E.Max)) and isinstance(nd9.this, E.Column):
                         if seg9.cols.get(pm9.get(nd9.this.name, nd9.this.name), {}).get('dt') == 1:
                             raise _FastUnsupported
-                    # A FUNCTION OF A STRING COLUMN under an aggregate (AVG(length(URL))): the fused
+                    # A FUNCTION OF A STRING COLUMN under an aggregate (AVG(length(col))): the fused
                     # operands take plain numeric columns only, so it would decline -- but only after
-                    # the WHERE literal and the group census were paid (Q27: ~320 ms thrown away).
+                    # the WHERE literal and the group census were paid.
                     # Decline FIRST; the dictionary's V-table reads (wdb_lenagg) serve it.
+                    # lore: AVG(length(URL)), Q27: ~320 ms thrown away
                     if isinstance(nd9, (E.Avg, E.Sum, E.Min, E.Max)) and not isinstance(nd9.this, E.Column) \
                             and any(seg9.cols.get(pm9.get(c9.name, c9.name), {}).get('dt') == 1
                                     for c9 in nd9.this.find_all(E.Column)):
@@ -4691,8 +4617,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
 
     fact = ctx['fact']; alias2t = ctx['alias2t']; seg_of = ctx['seg_of']; composed = ctx['composed']
     cols_of = {a: set(db.cat.column_names(t)) for a, t in alias2t.items()}
-    # GROUP BY a SELECT alias of a computed key (Q18: extract(minute FROM EventTime) AS m ... GROUP BY m) groups
+    # GROUP BY a SELECT alias of a computed key (extract(minute FROM t) AS m ... GROUP BY m) groups
     # by that expression -- unless a table column carries the name, which SQL resolves first
+    # lore: Q18's extract(minute FROM EventTime) AS m
     _al9g = {p.alias: p.this for p in proj if isinstance(p, E.Alias) and not isinstance(p.this, E.Column)}
     if _al9g:
         gnodes = [(_al9g[g.name] if isinstance(g, E.Column) and not g.table and g.name in _al9g
@@ -4929,9 +4856,11 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
         return seg.codes(pcol), code_of, (c['V'] - 1 if c['has_null'] else None)
     def _code_of_literal(seg, pcol, lit_bytes):
         """Resolve ONE literal to its dictionary code without building the full {value:code} dict.
-        DuckDB-style: a filter like URL = 'x' only needs x's code, not a dict of all 18M values.
+        DuckDB-style: a filter like col = 'x' only needs x's code, not a dict of all the values.
         Vectorized search over the dict values (object-array ==), result cached per (col, literal).
-        Returns the code (int) or -1 if the literal is absent from the dictionary."""
+        Returns the code (int) or -1 if the literal is absent from the dictionary.
+
+        Lore: URL = 'x' against a dictionary of 18M values."""
         c = seg.cols[pcol]
         litcache = getattr(seg, '_litcode_cache', None)
         if litcache is None: litcache = seg._litcode_cache = {}
@@ -4944,7 +4873,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
             litcache[key] = code; return code
         if c.get('dt') == 1 and c.get('mode') in (0, 1) and int(c.get('V', 0)) >= 50_000:
             # A SORTED DICTIONARY IS A BINARY SEARCH: ~22 probes through fetch (one chunk each),
-            # never the full decode (dict_vals of 6M URLs: 12s, to answer `URL <> ''`)
+            # never the full decode (a big text dictionary's full decode costs seconds, to answer `col <> ''`)
+            # lore: dict_vals of 6M URLs: 12s, to answer `URL <> ''`
             try:
                 import wdb_wherescan
                 _cd = wdb_wherescan._code_of(seg, pcol, bytes(lit_bytes))
@@ -4986,8 +4916,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
         if (type(node) in (E.GT, E.LT) and isinstance(node.this, E.Column)
                 and isinstance(node.expression, E.Column)):
             # THE DECLARED CLOCK in the mask layer: strict pair compares on an
-            # enc-16 dressed pair serve from the bit+delta streams (Q21's
-            # lateness reached get_mask through the lonely rewrite).
+            # enc-16 dressed pair serve from the bit+delta streams (an EXISTS
+            # pair's lateness reaches get_mask through the lonely rewrite).
+            # lore: Q21's lateness
             sgA9, pcA9, cpA9 = resolve(node.this)
             sgB9, pcB9, cpB9 = resolve(node.expression)
             if sgA9 is sgB9 and cpA9 is None and cpB9 is None:
@@ -5118,10 +5049,12 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
             return leaf(col9g, lambda seg, pcol: m9g)
         raise _FastUnsupported
     where = tree.args.get('where')
-    # THE DICTIONARY-RANGE PROOF (2026-10-12): a conjunct no stored value can satisfy -- IsLink < 0 on a 0/1
+    # THE DICTIONARY-RANGE PROOF (2026-10-12): a conjunct no stored value can satisfy -- col < 0 on a 0/1
     # column -- makes the WHERE empty, so a grouped query has no rows. Proven from each column's sorted
-    # dictionary ends (two point fetches) BEFORE any row is touched: the board's Q36 variant grouped 100M
-    # rows on FlashMinor2 for 9.4 s and then filtered every one out (DuckDB: 0.045 s from its min/max).
+    # dictionary ends (two point fetches) BEFORE any row is touched, instead of grouping every row and then
+    # filtering every one out.
+    # lore: IsLink < 0; the board's Q36 variant grouped 100M rows on FlashMinor2 for 9.4 s and then
+    # lore: filtered every one out (DuckDB: 0.045 s from its min/max).
     if where is not None and group is not None and not columnar:
         def _veto_lit(nd, sg, pc):
             k9 = 'f' if sg.cols[pc]['dt'] == 2 else 'i'
@@ -5355,7 +5288,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
                 _w9c = None            # cluster slice-scalar lane is faster: cascade stands down
         except Exception:
             pass
-    if _w9c is not None and cd_col is None:           # grouped OR scalar (Q19)
+    # lore: Q19
+    if _w9c is not None and cd_col is None:           # grouped OR scalar
         try:
             def _cflat(x):
                 if isinstance(x, E.Paren): return _cflat(x.this)
@@ -5374,7 +5308,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
                     raise _FastUnsupported          # subqueries: never the cascade's to judge
                 cols9 = list(cn.find_all(E.Column))
                 if len(cols9) != 1:
-                    _cres9.append(cn); continue     # multi-column (Q7's OR): residual
+                    # lore: Q7's OR
+                    _cres9.append(cn); continue     # multi-column (an OR over two columns): residual
                 # THE BARE-COLUMN LAW: a keep is judged over ONE column's dictionary,
                 # so every comparison in the conjunct must stand on that bare column.
                 # SUBSTRING(id3,3,2) = '10' has one column and was judged as id3 = '10'
@@ -5431,9 +5366,10 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
                         kx9[r9k] = sv9k in lits9
                     td9 = None
                 elif c9.get('mode') == 4 and c9.get('dt') in (0, 3) and not c9.get('has_null'):
-                    # MODE-4 SEQUENCE KEY (o_orderkey): V == N, codes are the
-                    # identity; a literal keep marks positions (Q18's 100 monster
-                    # orders) -- searchsorted when the sequence is sorted.
+                    # MODE-4 SEQUENCE KEY (a unique key): V == N, codes are the
+                    # identity; a literal keep marks positions (a list of key
+                    # literals) -- searchsorted when the sequence is sorted.
+                    # lore: o_orderkey; Q18's 100 monster orders
                     _rm4 = wdb_sql.raw_dict_col(cs9, cp9, want_codes=False)
                     if _rm4 is None:
                         _cres9.append(cn); continue
@@ -5459,7 +5395,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
                         kx9[_pos4[_ok4]] = True
                     else:
                         # UNSORTED SEQUENCE: a direct compare per literal beats np.isin's sort
-                        # (fjdb encodes AdvEngineID as a 100M-value sequence: 130ms -> 40ms)
+                        # (a column stored as a sequence keeps one value per row)
+                        # lore: fjdb encodes AdvEngineID as a 100M-value sequence: 130ms -> 40ms
                         if len(_la4) <= 8:
                             _m4 = _bv4 == _la4[0]
                             for _lv4 in _la4[1:]: _m4 |= (_bv4 == _lv4)
@@ -5475,8 +5412,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
                     if (c9.get('dt') == 1 and V9 >= 200_000 and type(cn) in (E.EQ, E.NEQ)
                             and isinstance(cn.expression, E.Literal) and isinstance(cn.this, E.Column)):
                         # THE BIG-DICTIONARY LITERAL: one binary search, never the whole dictionary --
-                        # the fused door spent 18s decoding 6M URLs for `URL <> ''` and then DECLINED
-                        # the query (Q27 cold), leaving the general scan to answer in 1.5s
+                        # the fused door decoded a whole big text dictionary for `col <> ''` and then DECLINED
+                        # the query, leaving the general scan to answer
+                        # lore: 18s decoding 6M URLs for `URL <> ''` (Q27 cold); the general scan answered in 1.5s
                         _c9l = _code_of_literal(cs9, cp9, _lit_bytes(cs9, cp9, cn.expression))
                         if isinstance(cn, E.EQ):
                             if _c9l is not None and _c9l >= 0: kx9[_c9l] = True
@@ -5526,7 +5464,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
                 _cb9.append(('plan-build(metadata+censuses)', _tk9() - _ct9)); _ct9 = _tk9()
             if not plan9: raise _FastUnsupported        # nothing servable: no cascade
             # CONJUNCT FUSION: same-column keeps AND at dict scale into ONE
-            # serve (Q7's l_shipdate >= a / <= b paid two full plane_tests).
+            # serve (a range col >= a AND col <= b paid two full plane_tests).
+            # lore: Q7's l_shipdate >= a / <= b
             _fused9 = {}
             for _pt9 in plan9:
                 _kk9 = (id(_pt9[3]), _pt9[4], id(_pt9[5]) if _pt9[5] is not None else None)  # per ALIAS (n1/n2)
@@ -5549,10 +5488,10 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
                     _fused9[_kk9] = _pt9
             plan9 = list(_fused9.values())
             # THE ARBITER: leftovers are tolerated only when the plan holds a
-            # POTENT PARENT KEEP through a road (Q7's nation INs: expected keep
+            # POTENT PARENT KEEP through a road (expected keep
             # < 5%). Fact-only plans with leftovers decline to the partition,
-            # whose shadow scheduling serves clock-shaped queries better
-            # (Q12 regressed 265 -> 358 under the cascade, 2026-09-03).
+            # whose shadow scheduling serves clock-shaped queries better.
+            # lore: Q7's nation INs; Q12 regressed 265 -> 358 under the cascade, 2026-09-03
             if _cres9:
                 _pk9 = [p for p in plan9 if p[5] is not None]
                 _keep9 = 1.0
@@ -5560,22 +5499,24 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
                     _keep9 *= max(0.0, 1.0 - float(p[1]))
                 # ...and only when the per-survivor work is HEAVY enough that
                 # shrinking survivors pays for the cascade's own passes: two or
-                # more group keys, or a computed/dressed key (Q7). A single
-                # cheap key (Q5) aggregates faster in one fused kernel pass.
+                # more group keys, or a computed/dressed key. A single
+                # cheap key aggregates faster in one fused kernel pass.
+                # lore: the heavy keys were Q7's, the single cheap key Q5's
                 _keys_heavy9 = (group is not None and (len(group.expressions) >= 2
                                 or any(not isinstance(g9, E.Column) for g9 in group.expressions)))
                 if _bill9 is not None:
                     print('JOIN BILL: cascade ARBITER leftovers=%d parent_keep=%.4f keys_heavy=%s'
                           % (len(_cres9), _keep9, _keys_heavy9), flush=True)
                 # ...or when the parent keep alone is tiny (< 1%): at that
-                # scale even a light key aggregates for nothing (Q21: Saudi x
-                # status-F x the lonely qualification).
+                # scale even a light key aggregates for nothing.
+                # lore: Q21: Saudi x status-F x the lonely qualification
                 _keep_all9 = 1.0
                 for p in plan9:
                     _keep_all9 *= max(0.0, 1.0 - float(p[1]))
                 if not gnodes:
                     # SCALAR: aggregation at survivors is trivial -- any potent
-                    # total keep (fact + parent, < 5%) pays for the cascade (Q19).
+                    # total keep (fact + parent, < 5%) pays for the cascade.
+                    # lore: Q19
                     if _keep_all9 > 0.05:
                         raise _FastUnsupported
                 elif not _pk9 or _keep9 > 0.05 or (not _keys_heavy9 and _keep9 > 0.01):
@@ -5590,8 +5531,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
             # THE MARGINAL-BOUND GATE: expected survivors, EXACT from the
             # censuses (product of keep fractions), known BEFORE any pass
             # runs. A high-survivor cascade turns cheap sequential reads
-            # into N-scale gathers (Q1: 98.6% survive -> +430ms regression),
-            # so the cascade fires only when the prune pays.
+            # into N-scale gathers, so the cascade fires only when the prune pays.
+            # lore: Q1: 98.6% survive -> +430ms regression
             _exp9 = 1.0
             for _, pr9, *_r9 in plan9:
                 _exp9 *= (1.0 - pr9)
@@ -5681,8 +5622,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
             _done9 = set()
             while True:
                 # FIXPOINT: a keep flowing down creates a keep on the next alias
-                # (Q7: nation -> supplier -> fact; nation -> customer -> orders ->
-                # fact); a snapshot loop dropped every keep past the first hop.
+                # (a grandparent -> parent -> fact, or a longer chain); a snapshot loop dropped every keep past
+                # the first hop.
+                # lore: Q7: nation -> supplier -> fact; nation -> customer -> orders -> fact
                 _cand9 = [a for a in keeps9 if a != fact9 and a not in _done9 and keeps9[a] is not None]
                 if not _cand9: break
                 pa9 = max(_cand9, key=lambda a: depth9.get(a, 0))
@@ -5912,8 +5854,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
                 import wdb_engine as _WE9
                 _sv9 = _WE9.Segment.mask_rows(_plane_mask9)
                 # RUNNING RULE on the handoff: a DRESSED group key (enc 14/15/16)
-                # costs a full 60M reconstruct at fact scale (Q7 paid 1.9s) but a
+                # costs a full reconstruct at fact scale but a
                 # cheap codes_at at survivors -- so any keep under ~60% hands off.
+                # lore: a 60M reconstruct, Q7 paid 1.9s
                 _dressed_key9 = False
                 for _g9 in (group.expressions if group is not None else []):
                     for _gc9 in ([_g9] if isinstance(_g9, E.Column) else list(_g9.find_all(E.Column))):
@@ -5978,17 +5921,19 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
         r9m = _at_rows(a, rows9)
         _rwm9[k9m] = (a, rows9, r9m)                 # holds a and rows9: their ids cannot be reused meanwhile
         return r9m
-    # ---- THE KEY-DEPENDENT TOP-K DOOR (Q10's shape, 2026-09-01) --------------
+    # ---- THE KEY-DEPENDENT TOP-K DOOR (2026-09-01) ---------------------------
     # GROUP BY a parent's unique key plus that parent's attributes (and its
     # own parents' attributes), ORDER BY one aggregate, LIMIT k: group by the
     # PARENT ROW alone (one int key), select the top k, and decode every
     # attribute for k rows only. Duck decodes them for every group.
+    # lore: Q10's shape
     def _door_rows():
         # THE DOORS' SURVIVORS (shared by the top-K attribute door and the singleton peel): the base
         # rows that pass WHERE, with the cascade's leftovers re-applied AT ROWS; None = can't judge.
         if _plane_mask9 is not None or (_resid_c9X and rows9 is None): return None
         # survivors -- WITH the cascade's leftovers re-applied AT ROWS (the door
-        # once consumed rows9 raw and shipped Q21 wrong, 2026-09-03)
+        # once consumed rows9 raw and shipped a wrong answer)
+        # lore: Q21 shipped wrong, 2026-09-03
         if rows9 is not None:
             rows = rows9
             for _lc9 in (_cres_left9 or []):
@@ -6047,14 +5992,16 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
             gcols9.append((g, sg, pc, cp))
         def _alias_of(g):
             return g.table or next((al for al in alias2t9 if g.name in cols_of[al]), None)
-        # THE KEY IS THE ALIAS EVERY OTHER GROUP COLUMN ROUTES TO (Q18: both
-        # c_name and o_orderkey are unique keys; only orders can host customer's
-        # attributes -- customer is orders' PARENT, not the reverse).
+        # THE KEY IS THE ALIAS EVERY OTHER GROUP COLUMN ROUTES TO (with two
+        # unique group keys from a child and its parent, only the child can host the
+        # parent's attributes -- the parent is the child's PARENT, not the reverse).
+        # lore: Q18: both c_name and o_orderkey are unique keys; customer is orders' parent
         # ONE UNIQUE COLUMN PER TABLE IS ENOUGH, THE CHEAP ONES ASKED FIRST (2026-10-04): a table's candidacy
         # needs one unique group column; uniqueness is free for a sequence column or a null-free dictionary
-        # (distinct count = rows) and a whole-column sort otherwise -- TPC-H Q10 sorted c_name, c_phone,
-        # c_address and c_comment (6.2 s hot) after c_custkey had already answered. Tables keep the order of
-        # their first group column.
+        # (distinct count = rows) and a whole-column sort otherwise -- sorting wide text columns after a cheap
+        # key column had already answered was the cost. Tables keep the order of their first group column.
+        # lore: TPC-H Q10 sorted c_name, c_phone, c_address and c_comment (6.2 s hot) after c_custkey
+        # lore: had already answered
         def _ucost9(sg, pc):
             c9 = sg.cols.get(pc, {})
             if c9.get('mode') in (4, 6): return 0
@@ -6133,7 +6080,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
                 return None
         _pcols9 = {n9.name for kind, n9, _a in plan9 if kind == 'col'}
         if not (any(kind == 'agg' and al9 == okey9 for kind, _n, al9 in plan9)
-                or all(o9.this.name in _pcols9 for o9 in ords9)):    # ORDER BY attributes (Q18)
+                or all(o9.this.name in _pcols9 for o9 in ords9)):    # ORDER BY attributes
+            # lore: ORDER BY attributes was Q18's
             return None
         rows = _door_rows()
         if rows is None: return None
@@ -6161,9 +6109,10 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
             sel = np.argpartition(-score if desc9 else score, kk - 1)[:kk]
             sel = sel[np.argsort(-score[sel] if desc9 else score[sel], kind='stable')]
         else:
-            # ORDER BY ATTRIBUTES (Jackson's Q18: totalprice DESC, date):
+            # ORDER BY ATTRIBUTES (a parent's columns, e.g. price DESC, date):
             # decode the order columns for the PRESENT groups (already tiny
             # after the mask) and lexsort; the aggregate needed no ordering.
+            # lore: Jackson's Q18: totalprice DESC, date
             if present.size > 200000: return None
             karr9 = []
             for o9 in ords9:
@@ -6213,8 +6162,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
         into u); shared by the singleton peel door and the fused key build"""
         # EXPRESSION GROUP KEY RIDES THE DICT: transform the V dictionary
         # values through the expression, collapse equal results, remap the
-        # codes -- O(V), never O(N) (Q7's l_shipdate/365 folds ~2500 days
-        # into 7 years at dict scale).
+        # codes -- O(V), never O(N) (a date column / 365 folds its distinct days
+        # into a few years at dict scale).
+        # lore: Q7's l_shipdate/365 folds ~2500 days into 7 years
         cols9g = list(g.find_all(E.Column))
         if len(cols9g) != 1: raise _FastUnsupported            # declines RAISE (a None from fpa is 'no answer')
         gseg, gpcol, gcptr = resolve(cols9g[0])
@@ -6236,8 +6186,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
             raise _FastUnsupported
         fld9x = wdb_sql.extract_unit(g)
         if fld9x is not None:
-            # EXTRACT RIDES THE DICT (2026-10-13, the Q18 board): the field of the V distinct times, not the N
+            # EXTRACT RIDES THE DICT (2026-10-13): the field of the V distinct times, not the N
             # rows -- wdb_sql.extract_field, the row evaluator's own definition
+            # lore: the Q18 board
             if not isinstance(wdb_sql.extract_arg(g), E.Column) or gseg.cols[gpcol].get('dt') != 3:
                 raise _FastUnsupported
             try:
@@ -6261,7 +6212,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
         dv9 = np.asarray(dv9)
         if dv9.dtype.kind in 'iu' and dv9.size and int(dv9.max()) - int(dv9.min()) < (1 << 20):
             # a small integer range (the minute's 60, an hour's 24): the distinct results by presence, not a
-            # sort -- np.unique over EventTime's 1.4M distinct times was 50 ms a query
+            # sort -- np.unique over a timestamp column's distinct times cost tens of ms a query
+            # lore: np.unique over EventTime's 1.4M distinct times was 50 ms a query
             lo9 = int(dv9.min()); off9 = (dv9 - lo9).astype(np.int64)
             seen9 = np.bincount(off9) > 0
             u9x = (np.flatnonzero(seen9) + lo9).astype(dv9.dtype)
@@ -6283,8 +6235,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
         keys9 = []
         for g in gnodes:
             if not isinstance(g, E.Column):
-                # an expression key over one column (minute of EventTime): its codes through the dictionary
+                # an expression key over one column (minute of a timestamp): its codes through the dictionary
                 # map, its labels the distinct results -- the peel key itself is always a bare column
+                # lore: minute of EventTime
                 sg, pc, cp, u9, inv9 = _expr_key(g)          # (codes_at indexes the map whatever the mode:
                 if cp is not None: return None               #  raw_dict_col vouched for it, as for fused's keys)
                 keys9.append({'seg': sg, 'pcol': pc, 'name': g.sql(), 'map': inv9,
@@ -6478,8 +6431,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
                 # THE HASHED COMPOSITE: pack the key codes by bit width into two
                 # 64-bit words and factorise with an open-addressing kernel --
                 # group ids at survivor scale, each group's key words kept for
-                # emission (H2O q10: 50M rows, 50M groups; the pandas tail was a
-                # 37GB hang, the mixed-radix code overflows int64).
+                # emission (as many groups as rows: the pandas tail hangs, the
+                # mixed-radix code overflows int64).
+                # lore: H2O q10: 50M rows, 50M groups; the pandas tail was a 37GB hang
                 widths9 = [max(1, int(k['K'] - 1).bit_length()) for k in gkeys]
                 if sum(widths9) > 126: raise _FastUnsupported
                 shifts9 = np.zeros(len(gkeys), np.int64); words9 = np.zeros(len(gkeys), np.int64)
@@ -6557,8 +6511,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
                     gids = np.cumsum(gids)
                     gid_to_comp = comp[starts]
                 else:
-                    # THE PARALLEL FACTORISE (was pandas' single-threaded factorize: 6.5 s of a
-                    # 7.9 s UserID x SearchPhrase group, 14 s of WatchID x ClientIP) -> only groups present
+                    # THE PARALLEL FACTORISE (was pandas' single-threaded factorize, most of a big
+                    # two-key group's time) -> only groups present
+                    # lore: 6.5 s of a 7.9 s UserID x SearchPhrase group, 14 s of WatchID x ClientIP
                     gids, gid_to_comp, _ = wdb_kernels.parallel_factorize(comp)
             if not _hashed_done9:
                 gids = np.ascontiguousarray(gids.astype(np.int64))
@@ -6586,8 +6541,10 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
     def _int_expr9(nd):
         """True iff the aggregate ARGUMENT is integer-typed end to end --
         duck emits BIGINT for such SUM/MIN/MAX and the board's referee
-        string-compares non-floats, so wave owes true ints (Q12's
-        62071.0 vs 62071 was flagged WRONG on values that matched)."""
+        string-compares non-floats, so wave owes true ints (62071.0 vs
+        62071 is flagged WRONG on values that match).
+
+        Lore: Q12's 62071.0 vs 62071 was flagged WRONG."""
         if isinstance(nd, E.Paren): return _int_expr9(nd.this)
         if isinstance(nd, E.Literal):
             return (not nd.is_string) and ('.' not in str(nd.this))
@@ -6641,10 +6598,11 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
         if type(node) in _ARITH_STR:
             return f"({build_fused(node.this)} {_ARITH_STR[type(node)]} {build_fused(node.expression)})"
         if isinstance(node, E.Case):
-            # CASE in the FUSED KERNEL (Q12's home): the condition compiles to
+            # CASE in the FUSED KERNEL: the condition compiles to
             # a truthy sub-expression (string trees ride _code_lut as a 0/1
             # value slot; numeric compares inline), branches are ordinary
             # fused exprs, and the whole thing is a numba conditional.
+            # lore: Q12's home
             ifs9 = node.args.get('ifs', [])
             if node.this is not None or not ifs9:
                 raise _FastUnsupported             # simple CASE x WHEN: not yet
@@ -6716,8 +6674,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
         # the (small) dictionary, add it as a value slot whose base IS that bool table, predicate -> 'vk!=0'.
         # Reuses the value-slot kernel verbatim (base[codes[i]]); gated on dict cardinality (precompute cost).
         # DECIDE BEFORE PAYING (2026-10-12): the LUT's size is the dictionary's, known from metadata -- a
-        # LIKE on SearchPhrase built a 6M-entry code map and only then found the table too big (5.4 s spent
-        # to decline a query the general scan answers in 0.9 s)
+        # LIKE on a big text column built a code map as big as its dictionary and only then found the table
+        # too big (seconds spent to decline a query the general scan answers faster)
+        # lore: LIKE on SearchPhrase built a 6M-entry code map (5.4 s spent; the general scan answers in 0.9 s)
         if not RT.code_lut_fits(int(cseg.cols[cpcol].get('V') or 0)): raise _FastUnsupported
         sc = _str_codes(cseg, cpcol)
         if sc is None: raise _FastUnsupported
@@ -6876,8 +6835,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
             lo = float(lo) if kind == 'f' else int(lo); hi = float(hi) if kind == 'f' else int(hi)
             return f"(({lo} <= {v}) and ({v} <= {hi}))"
         if wdb_groupexists.is_mark(node):
-            # THE PER-ROW VERDICT (Q21's counted EXISTS pair): a true/false byte per row of the outer alias's
+            # THE PER-ROW VERDICT (a counted EXISTS pair): a true/false byte per row of the outer alias's
             # table, read through that alias's pointer exactly like a string code slot
+            # lore: Q21's counted EXISTS pair
             try:
                 col9g, m9g, _f9g = wdb_groupexists.lookup(node)
             except KeyError:
@@ -6907,8 +6867,7 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
                 return [n]
             # THE SHARED MEASUREMENT (2026-10-21; the potency pick's sample, wdb_wherescan._potency_pick, carried
             # to the fused engine). Text conjuncts were a flat guess of 0.5 here even where the cascade, one step
-            # earlier, had judged them exactly (TPC-H Q5's r_name = 'ASIA' keeps 20%, Q7's nation IN 8%, Q21's
-            # SAUDI ARABIA 4%), and a conjunct over two columns (l_shipdate < l_commitdate, Q7's OR) was measured
+            # earlier, had judged them exactly, and a conjunct over two columns (col_a < col_b) was measured
             # by no one. Now every conjunct's keep share is measured:
             #   - ONE column, the whole fact table (the cascade did not run): EXACT from the census -- the rows of
             #     the values the conjunct keeps over all rows; a text column through its code LUT;
@@ -6917,6 +6876,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
             #     read on those rows (a parent's through its pointer), the conjunct evaluated there. At survivor
             #     scale a conjunct the cascade already served keeps 100% and so fires last.
             # WDB_FUSE_POTENCY=0 restores the census-or-0.5 score; _POT9_LAST is the witness.
+            # lore: TPC-H Q5's r_name = 'ASIA' keeps 20%, Q7's nation IN 8%, Q21's SAUDI ARABIA 4%;
+            # lore: the two-column conjunct was l_shipdate < l_commitdate, Q7's OR
             _potc9 = {}
             def _pot_rows9():
                 if 'rows' not in _potc9:
@@ -6925,8 +6886,9 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
                     _POT9_ROWS[0] = nf9
                     if nf9 < _POT9_MIN_ROWS:
                         # JACKSON'S RUNNING RULE on the measurement itself: the sample must be a small share of
-                        # what the pred reads, or measuring costs what any order could save (TPC-H SF10 Q19:
-                        # 77K survivors, a 65K-row sample over 30 leaves, +20 ms to order a pred of ~2 ms)
+                        # what the pred reads, or measuring costs what any order could save
+                        # lore: TPC-H SF10 Q19: 77K survivors, a 65K-row sample over 30 leaves,
+                        # lore: +20 ms to order a pred of ~2 ms
                         _potc9['rows'] = np.empty(0, np.int64)
                     else:
                         pos9 = _WS9._pot_sample(None, 0, nf9)
@@ -7099,11 +7061,12 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
         except _FastUnsupported:
             # FAIL LOUD: an unservable residual conjunct means THIS PLAN cannot
             # answer -- proceeding predicate-less silently dropped WHERE clauses
-            # (Q21's EXISTS pair vanished and a confident wrong top-100 shipped
-            # to the board, 2026-08-30). ONE explicit exception: an IN whose
+            # (an EXISTS pair vanished and a confident wrong answer shipped).
+            # ONE explicit exception: an IN whose
             # subquery was resolved to codes (query arg kept for codes-unaware
             # consumers) is the MASK layer's by design -- the pred skips exactly
-            # those and nothing else (Q4's EXISTS road). Anything else declines.
+            # those and nothing else (an EXISTS road). Anything else declines.
+            # lore: Q21's EXISTS pair vanished and a wrong top-100 shipped to the board, 2026-08-30; Q4's EXISTS road
             slots.clear(); slot_list.clear()
             _fu9, _ok9 = [], []
             for _cn9 in (conj9 if isinstance(conj9, list) else []):
@@ -7171,9 +7134,10 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
             if ki is None:
                 ki = next((j for j, k in enumerate(gkeys)
                            if k['seg'] is pseg and k['pcol'] == ppcol and not k.get('expr')), None)
-                # two aliases of one table (Q7's n1/n2): (seg,pcol) is ambiguous,
+                # two aliases of one table: (seg,pcol) is ambiguous,
                 # the composed pointer is the alias's identity -- no match means
                 # the pointers got rewritten (_rw9); match by group-node text then
+                # lore: Q7's n1/n2
                 gsql9c = inner.sql()
                 ki2 = next((j for j, gg in enumerate(gnodes) if gg.sql() == gsql9c), None)
                 if ki2 is not None: ki = ki2
@@ -7438,7 +7402,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
     _hav_done9 = False
     if gkeys and _HAVING_ARR[0] and tree.args.get('having') is not None:
         if tree.args['having'].find(E.Subquery) is not None:
-            _hm9 = _same_rows_mask9(db, tree, proj, col_results, present,    # THE SAME ROWS, ONE WALK (Q11)
+            # lore: THE SAME ROWS, ONE WALK was built for Q11
+            _hm9 = _same_rows_mask9(db, tree, proj, col_results, present,    # THE SAME ROWS, ONE WALK
                                     resolve=resolve, rows9=rows9, gkeys=gkeys)
         else:
             _hm9 = _having_mask9(tree.args['having'].this, proj, col_results, counts, present)
@@ -7451,9 +7416,10 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
     # THE EARLY PICK (2026-10-12): choose the k rows to emit BEFORE the keys are decoded and the
     # governor is asked. The prefilter keeps every group tied at the cut -- ORDER BY count ASC on a
     # near-unique key ties millions at 1 -- and decoding them all, then asking the governor about
-    # every one of them as a Python row, cost ~4 s and refused WatchID x ClientIP outright (99,997,489
+    # every one of them as a Python row, cost seconds and refused a near-unique key pair outright (~N
     # "rows" for a LIMIT 10). When the order uses no key column (or there is no ORDER BY), the pick
     # needs only the count/aggregate arrays; with ties at the cut SQL owes any of them.
+    # lore: ~4 s, and WatchID x ClientIP refused outright (99,997,489 "rows" for a LIMIT 10)
     _early9 = False
     if (not columnar and gkeys and tree.args.get('having') is None and not wdb_sql._offset(tree)
             and wdb_sql._limit(tree) is not None):
@@ -7599,7 +7565,8 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
     if (_ord9 is None and _lim9 is not None and tree.args.get('having') is None
             and not wdb_sql._offset(tree) and gkeys and not _early9):
         # LIMIT WITHOUT ORDER BY: SQL owes any k groups -- emit k, not every group (a
-        # GROUP BY UserID, SearchPhrase LIMIT 10 paid 17 s of emit for 10 rows)
+        # two-key GROUP BY with LIMIT 10 paid seconds of emit for 10 rows)
+        # lore: GROUP BY UserID, SearchPhrase LIMIT 10 paid 17 s of emit for 10 rows
         _np9 = int(present.sum()) if present.dtype == bool else int(present.size)
         _sel9 = np.arange(min(int(_lim9), _np9))
     if _ord9 is not None and _lim9 is not None and tree.args.get('having') is None and not _early9:
@@ -7697,12 +7664,13 @@ def _fast_pointer_agg(db, tree, ctx, columnar=False, rows_only=False):
 
 
 # ── Multi-table FK-pointer chain (rung: breadth) ─────────────────────────────
-# Generalises the single FK pointer to a walk: lineitem -> orders -> customer -> nation -> region.
+# Generalises the single FK pointer to a walk: fact -> parent -> grandparent -> ... (any depth).
 # Each join's ON must match a stored FK pointer (child -> parent). The "fact" table is the one that is
 # a child but never a parent; from it every other table is reached by composing the per-edge pointers
 # (compose by gathering the next pointer through the current one). composed[alias] maps each fact row to
 # that table's row (None for the fact itself). Raises _FastUnsupported if the join graph is not an
 # FK-pointer-rooted tree, so the caller can fall back.
+# lore: the walk was lineitem -> orders -> customer -> nation -> region.
 def _key_is_unique(db, table, col):
     """True if `col` in `table` is a single clean segment with all-distinct
     values (a candidate join parent). The dictionary already knows: V == N is
@@ -7747,8 +7715,11 @@ _DIRECT_MAX = 1 << 28           # a direct-address table up to 268M slots (1 GB 
 def _key_values(seg, pc):
     """A JOIN KEY COLUMN, DECODED, ON THE SHELF (2026-10-04): the same tier-1 entry the semi-join organ keeps
     ('keys', segment, column: int32 values, kept across queries under the shelf's ceiling -- Jackson's ruling
-    on decoded keys); a null-free integer column of 1M+ rows whose values fit is shelved here too. lineitem's
-    l_orderkey decoded at 290 ms per query (codes 180, a one-thread gather 115) for every pointer build."""
+    on decoded keys); a null-free integer column of 1M+ rows whose values fit is shelved here too, so a big
+    fact's key column is not decoded again for every pointer build.
+
+    Lore: lineitem's l_orderkey decoded at 290 ms per query (codes 180, a one-thread gather 115) for every
+    pointer build."""
     import wdb_shelf
     c9 = seg.cols.get(pc, {})
     clean9 = not c9.get('has_null') and seg._overrides(pc) is None   # the semi-join's entries write NULL as -1:
@@ -7766,14 +7737,18 @@ def _key_values(seg, pc):
 
 
 def _codes_pointer(cseg, cp, pseg, pp, side, mark):
-    """THE CODES ARE THE POINTER (2026-10-31, TPC-H 2b): when the child key column's dictionary IS the parent key
+    """THE CODES ARE THE POINTER (2026-10-31): when the child key column's dictionary IS the parent key
     column in row order (same size, same values, position by position), a child row's code is its parent's row --
-    the pointer needs no table and no probe. TPC-H SF10: l_orderkey -> orders, l_suppkey -> supplier, l_partkey ->
-    part (codes == the built pointer, checked row by row); the builds cost 71 / 27 / 30 ms every query. The verdict
+    the pointer needs no table and no probe (codes == the built pointer, checked row by row), so the per-query
+    pointer build is skipped. The verdict
     is a fact about the two files, kept under their birthmark (as a refusal is, _JPTR_NOT); the codes are decoded
     source data, kept on the shelf as tier-1 'codes' and handed out read-only. None (the pointer is built) when
     switched off, the sidecar switch is on (its persisted road serves), the child is not a plain null-free
-    dictionary column, or the dictionary is not the parent's keys (o_custkey: a subset of c_custkey)."""
+    dictionary column, or the dictionary is not the parent's keys (a child key whose values are a subset of the
+    parent's).
+
+    Lore: TPC-H 2b. On TPC-H SF10: l_orderkey -> orders, l_suppkey -> supplier, l_partkey -> part; the builds
+    cost 71 / 27 / 30 ms every query. The subset case is o_custkey (a subset of c_custkey)."""
     if not _CODES_PTR[0]:
         return None
     c = cseg.cols.get(cp) or {}
@@ -7822,14 +7797,17 @@ def _codes_pointer(cseg, cp, pseg, pp, side, mark):
 
 
 def _keep_share(seg, col, keep):
-    """THE SAMPLED KEEP SHARE (2026-10-31, TPC-H): the share of a dictionary column's rows whose code a keep table
+    """THE SAMPLED KEEP SHARE (2026-10-31): the share of a dictionary column's rows whose code a keep table
     passes, read from wherescan's potency sample (32 evenly spaced blocks of 2,048 rows; every row of a smaller
     segment) instead of a census of every row. The cascade's order and the arbiter need a ranking, not an answer:
-    on TPC-H SF10 the sample ordered Q3 / Q6 / Q7 / Q12 / Q14's filters exactly as the census did, shares within
-    0.3 points, read in 0.1 ms -- the census cost 66-100 ms on each enc-14 date column (rebuilt in full to be
-    counted), every query. None (the caller counts) when switched off, the column is not dictionary-coded, a code
-    falls outside the keep table, or the census is free: already counted, or the sidecar switch on (the census is
-    then persisted once and read back -- THE VANILLA LAW's other side: with births on, the exact fact is kept)."""
+    measured, the sample ranks filters as the census does, read in a fraction of a ms -- the census rebuilds an
+    enc-14 date column in full to count it, every query. None (the caller counts) when switched off, the column is
+    not dictionary-coded, a code falls outside the keep table, or the census is free: already counted, or the
+    sidecar switch on (the census is then persisted once and read back -- THE VANILLA LAW's other side: with
+    births on, the exact fact is kept).
+
+    Lore: TPC-H. On TPC-H SF10 the sample ordered Q3 / Q6 / Q7 / Q12 / Q14's filters exactly as the census did,
+    shares within 0.3 points, read in 0.1 ms -- the census cost 66-100 ms on each enc-14 date column, every query."""
     if not _KEEP_SAMPLE[0] or (seg.cols.get(col) or {}).get('mode') not in (0, 1, 2):
         return None
     if col in (getattr(seg, '_ccounts', None) or {}):
@@ -7853,11 +7831,14 @@ def _keep_share(seg, col, keep):
 
 def _direct_pointer(ck, pk, allow_miss=False):
     """THE KEY AS AN ADDRESS (2026-10-04): integer parent keys spanning a range not much wider than their count
-    (TPC-H's o_orderkey: 15M keys over 60M values) are a table indexed by key -- one pass writes each parent row
+    (e.g. a quarter of the range filled) are a table indexed by key -- one pass writes each parent row
     at its key, one parallel pass reads every child row's parent at its key. pandas' hash (Index.get_indexer,
-    one thread) was ~4.9 s of every lineitem-orders query at SF10. Returns the pointer (int64), False when it
+    one thread) cost seconds per big join. Returns the pointer (int64), False when it
     is not one (a repeated parent key, or -- unless allow_miss, where it stays -1 -- a child key no parent holds),
-    None when the keys don't suit."""
+    None when the keys don't suit.
+
+    Lore: TPC-H's o_orderkey: 15M keys over 60M values; pandas' hash was ~4.9 s of every lineitem-orders query
+    at SF10."""
     if ck.dtype.kind not in 'iu' or pk.dtype.kind not in 'iu' or pk.size == 0 or pk.size >= (1 << 31):
         return None
     lo = int(pk.min()); hi = int(pk.max()); size = hi - lo + 1
@@ -7938,9 +7919,10 @@ def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
             except Exception:
                 pass
     # A REFUSAL IS A FACT ABOUT THE TWO SEGMENTS: 'not a pointer' (many-to-many, or orphan child
-    # rows -- cast_info.person_id has people missing from name) is remembered under the same
-    # birthmark as a road, so it is decided once -- every JOB-COUNT query had rebuilt a 36M-row
-    # pointer (0.55s) to re-discover the same refusal
+    # rows -- a child key with values its parent lacks) is remembered under the same
+    # birthmark as a road, so it is decided once -- each query had rebuilt the pointer
+    # to re-discover the same refusal
+    # lore: cast_info.person_id has people missing from name; every JOB-COUNT query rebuilt a 36M-row pointer (0.55s)
     if side and mark:
         if side in _JPTR_NOT: raise _FastUnsupported
         try:
@@ -7985,16 +7967,18 @@ def _hash_pointer(db, ctbl, ckey, cseg, ptbl, pkey, pseg):
     # WDB_JPTR_EAGER=1 or forbid them with WDB_JPTR_OFF=1.
     if side and mark and not _os.environ.get('WDB_JPTR_OFF') and _wsc.births_on(_os.path.dirname(side)):   # THE SWITCH
         # THE SECOND ASK must be remembered across queries: this set lived in db.__dict__, which the
-        # per-query flush wiped, so every ask was the first -- cast_info's roads were never born
-        # and every JOB-COUNT query rebuilt a 36M-row pointer (0.55s) and threw it away
+        # per-query flush wiped, so every ask was the first -- the roads were never born
+        # and every query rebuilt the pointer and threw it away
+        # lore: cast_info's roads; every JOB-COUNT query rebuilt a 36M-row pointer (0.55s)
         asked = _JPTR_ASKED
         key9 = (side,)
         if key9 in asked or _os.environ.get('WDB_JPTR_EAGER'):
             try:
                 # Width stays intp/int64 BY MEASUREMENT: numpy indexes with
                 # intp, so narrow pointer arrays pay a cast-copy at every
-                # gather (u32 cost Q3 +50ms/query for 240MB disk saved --
+                # gather (u32 cost more per query than the disk it saved --
                 # the verdict law ruled disk loses).
+                # lore: u32 cost Q3 +50ms/query for 240MB disk saved
                 np.save(side + '.tmp.npy', ptr)
                 _os.replace(side + '.tmp.npy', side)
                 _js.dump(mark, open(side + '.mark', 'w'))
@@ -8039,7 +8023,8 @@ def _build_chain(db, tree, allow_hash=True):
         except Exception:
             pass
     def _own(c9):
-        return c9.table or col_owner.get(c9.name)   # TPC-H speaks bare names
+        # lore: TPC-H speaks bare names
+        return c9.table or col_owner.get(c9.name)   # unqualified column names resolve through their owner
     eq_pool = []
     residuals = []
     for jn in (tree.args.get('joins') or []):
@@ -8141,9 +8126,10 @@ def _build_chain(db, tree, allow_hash=True):
         if len(fact_candidates) != 1: raise _FastUnsupported                     # need a single rooted fact
         fact = fact_candidates[0]
 
-    # THE TREE (Jackson's Q5): a child may have MANY parents. BFS from the
+    # THE TREE (Jackson's): a child may have MANY parents. BFS from the
     # fact records each alias's route; pruning keeps exactly the aliases on
     # paths from the fact to anything the query actually reads.
+    # lore: Jackson's Q5
     prev9 = {}
     bfs9 = [fact]
     seen9 = {fact}
@@ -8236,21 +8222,24 @@ def _build_chain(db, tree, allow_hash=True):
     if any(a not in composed for a in keep): raise _FastUnsupported              # kept tables must connect
     # EARLY DECLINE: an alias the query reads that this chain never composed
     # (the stored-only attempt on a tree needing hash edges) fails HERE, not
-    # after running a 125ms cascade and dying in resolve (Q10's pre-work=256).
+    # after running a cascade and dying in resolve.
+    # lore: a 125ms cascade; Q10's pre-work=256
     if any((a in alias2t) and (a not in composed) for a in ref):
         raise _FastUnsupported
     # THE STRIP RUNS ONLY ON SUCCESS: the allow_hash=False attempt used to
     # consume edge equalities from WHERE and then raise, leaving the retry a
-    # gutted tree (Q5's nation vanished this way).
+    # gutted tree (a parent table vanished this way).
+    # lore: Q5's nation
     if w9 is not None and _edge_w:
         consumed = {id(x) for x in _edge_w}
         kept = [cj for cj in _conjuncts(w9.this) if id(cj) not in consumed]
-        # col=col survivors (Q5's c_nationkey = s_nationkey): neither side is
+        # col=col survivors (two parents' foreign keys equated): neither side is
         # unique, so it is not an edge -- it RIDES WHERE as a pred conjunct.
         # build_pred compares the two parent VALUE streams through their
         # pointer slots (dict-independent); if a side cannot resolve, the
         # pred raises and the pandas tail catches it. The old blanket
         # decline predates parent-vs-parent compare in the fused pred.
+        # lore: Q5's c_nationkey = s_nationkey
         if kept:
             merged = kept[0]
             for cj in kept[1:]:

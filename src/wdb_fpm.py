@@ -1,9 +1,9 @@
 """
 wdb_fpm — frame-presence map: which dictionary codes appear in which zstd frame.
 
-Jackson's granularity find: CounterID = 62 lives in 25 of 191 frames, yet the
-equality filter decompressed all 191 (7.6x read amplification). One bit per
-(code, frame) — V x F bits, 155KB for CounterID — and an eq-hunt pops ONLY the
+Jackson's granularity find: a clustered value can live in a few frames, yet the
+equality filter decompressed all of them (read amplification). One bit per
+(code, frame) — V x F bits — and an eq-hunt pops ONLY the
 frames that contain its code. The survivors then span those same few frames, so
 every downstream codes_at collapses by the same factor.
 
@@ -11,6 +11,9 @@ Species law: disk sidecar at V-scale (V x F bits; F is file-structural, ~191),
 born lazily on first eligible eq-touch, persisted as <seg>.<col>.fpm, staleness-
 guarded by (N, V, BR). Fail-closed: absent/ineligible -> caller keeps the full
 read. Exact by construction: the map only SKIPS frames proven empty of the code.
+
+Lore: CounterID = 62 lives in 25 of 191 frames, yet the filter decompressed all 191 (7.6x read
+amplification); the map is 155KB for CounterID.
 """
 import os, pickle, numpy as np
 import wdb_qmem

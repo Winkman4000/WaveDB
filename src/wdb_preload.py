@@ -1,12 +1,13 @@
 """THE PROGRAM LOADS ITSELF (Jackson, 2026-10-01): at server startup, every numba kernel we ship is loaded
 from numba's on-disk cache -- every compiled signature in each kernel's cache index that matches today's
 code -- so no query pays for loading machine code. A C++ engine has no such step: its code is in its
-binary and starting the process makes it runnable. Measured before this (kpre.py, cb_van0929): ~3.3 s
-of the 43 cold queries was numba loading kernels (50-260 ms a query; ~250 ms of it the first kernel in
-a process). ClickBench's driver restarts the database and waits for ./check before the timed query, so
-startup is outside the timer. Nothing here touches data: kernels only, all of them, not a list picked
-from any queries. A stale cache entry (the code changed since it was compiled) is skipped, never
-compiled here. WDB_PRELOAD=0 turns it off."""
+binary and starting the process makes it runnable. Startup is outside any query's timer. Nothing here
+touches data: kernels only, all of them, not a list picked from any queries. A stale cache entry (the
+code changed since it was compiled) is skipped, never compiled here. WDB_PRELOAD=0 turns it off.
+
+Lore: measured before this (kpre.py, cb_van0929): ~3.3 s of the 43 cold ClickBench queries was numba
+loading kernels (50-260 ms a query; ~250 ms of it the first kernel in a process). ClickBench's driver
+restarts the database and waits for ./check before the timed query, so startup is outside the timer."""
 import os, glob, importlib, time
 
 

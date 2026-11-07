@@ -1,11 +1,13 @@
 """wdb_exactint: exact integer aggregation at any magnitude.
 
-SUM over an int64 column can exceed int64 (SUM(UserID) at 100M reaches ~2.5e26):
-float64 accumulation drifts (~1e13 absolute at that scale) and int64 accumulation
+SUM over an int64 column can exceed int64 (a column of large 64-bit ids summed over
+many rows): float64 accumulation drifts and int64 accumulation
 silently wraps. Duck promotes to HUGEINT; we get exactness from dictionary
 arithmetic instead: SUM = sum_c counts[c] * vals[c], computed in two 32-bit limbs
 so every int64 partial stays within bounds (safe to N ~ 4e9 rows), recombined in
 python ints -- arbitrary precision, exact to the last digit.
+
+Lore: SUM(UserID) at 100M rows reaches ~2.5e26; float64 drifts ~1e13 absolute at that scale.
 """
 import numpy as np
 

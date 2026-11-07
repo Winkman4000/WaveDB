@@ -23,11 +23,12 @@ E = wdb_sql.E
 
 _ENABLED = True
 _HITS = 0
-# LOAD_ANSWERS (2026-09-29, the ClickBench rule: no "pre-aggregated tables or indices"): off, the load
+# LOAD_ANSWERS (2026-09-29, the no-pre-aggregation rule): off, the load
 # statistics may steer (block min/max skipping, THE PICK's estimates, COUNT from per-block counts,
 # MIN/MAX from zone maps) but never ARE an answer -- no SUM/AVG from block sums, no per-value counts
 # as a GROUP BY's result, no repeat list as a pair board. OFF BY DEFAULT (Jackson, 2026-09-29: "work
 # from the floor"); WDB_LOAD_ANSWERS=1 turns the answers back on (the suite does, to exercise them).
+# lore: the rule is ClickBench's: no "pre-aggregated tables or indices"
 import os as _os_la
 _ANSWERS = [_os_la.environ.get('WDB_LOAD_ANSWERS', '0') == '1']
 _BR = 32768
@@ -122,7 +123,9 @@ def differentiator_rows(seg, col):
     """THE EXCEPTION LIST of a near-unique column (Jackson, 2026-09-20: a column statistic, the same
     species as a distinct count or a discovered unique constraint -- not a query's answer). For a
     dictionary column with V >= N/2 and V >= 1024: the rows whose code occurs more than once, when
-    they are under 0.75% of V (WatchID: 4 rows in 100M). None when the column does not qualify."""
+    they are under 0.75% of V. None when the column does not qualify.
+
+    Lore: on WatchID that is 4 rows in 100M."""
     import wdb_kernels as _WK
     c = seg.cols.get(col)
     if c is None or c.get('mode') not in (0, 1, 2):
@@ -145,8 +148,10 @@ def value_counts(seg, col):
     """THE CENSUS OF THE LOAD (Jackson, 2026-09-24): rows per dictionary code, for dictionary
     columns of at most VCNT_MAX codes -- a column statistic of the same species as a distinct
     count, born with the load, a few hundred bytes. COUNT(*) WHERE k <op> v and GROUP BY k
-    COUNT(*) become arithmetic over V numbers instead of a pass over N rows: Q01 (AdvEngineID <> 0)
-    is N minus the count of code 0. None when the column does not qualify."""
+    COUNT(*) become arithmetic over V numbers instead of a pass over N rows: k <> v is N minus the
+    count of v's code. None when the column does not qualify.
+
+    Lore: Q01 (AdvEngineID <> 0) is N minus the count of code 0."""
     c = seg.cols.get(col)
     if c is None or c.get('mode') not in (0, 1, 2):
         return None
@@ -185,10 +190,12 @@ SIGNPOST_EVERY = 128
 def e19_signposts(seg, col):
     """THE SIGNPOSTS (Jackson, 2026-09-27): for a block-dictionary (tag 19) column, every 128th entry
     of each block's sorted dictionary kept whole -- born with the load beside the census, ~1/32 the
-    size of the dictionaries themselves (UserID: 1.08 MB beside 58.1 MB). 'Is code k in this block?'
-    becomes a halving among ~150 signposts and at most 127 gaps, instead of walking ~20,000 entries:
-    Q19 (UserID = k) touches one block of 1,526 by its label, never the other 1,525. Returns
-    (sp, spo): the signposts of block b are sp[spo[b]:spo[b + 1]]. None for any other column."""
+    size of the dictionaries themselves. 'Is code k in this block?'
+    becomes a halving among ~150 signposts and at most 127 gaps, instead of walking ~20,000 entries.
+    Returns (sp, spo): the signposts of block b are sp[spo[b]:spo[b + 1]]. None for any other column.
+
+    Lore: UserID's signposts are 1.08 MB beside 58.1 MB of dictionaries; Q19 (UserID = k) touches one
+    block of 1,526 by its label, never the other 1,525."""
     c = seg.cols.get(col)
     if c is None or c.get('code_enc') != 19 or c.get('e19dc') is None or 'e19R' in c:
         return None                                  # (shelved labels: a lookup already reads one shelf)
@@ -289,8 +296,9 @@ def write_for_segment(seg_path, verbose=False):
             out[col + '.rep'] = rep
             if verbose: print('  stats: %s is a differentiator, %d exception rows' % (col, rep.size), flush=True)
         # THE CENSUS OF THE LOAD (small dictionaries): a GROUP BY COUNT(*) table -- only with answers on too.
-        # The planner's estimate falls back to N / V; measured on ClickBench, cold 1.035 -> 1.033 and hot
-        # 1.265 -> 1.267 without it (2026-10-06): it was never earning its place
+        # The planner's estimate falls back to N / V; measured, the board barely moved without it (2026-10-06):
+        # it was never earning its place
+        # lore: measured on ClickBench, cold 1.035 -> 1.033 and hot 1.265 -> 1.267 without it
         vc = value_counts(seg, col) if _ANSWERS[0] else None
         if vc is not None:
             out[col + '.vcnt'] = vc
@@ -332,8 +340,9 @@ def build(seg, col):
     N = int(seg.N)
     fn = seg.path + '.' + col + '.bst.npz'
     # THE STATS ON THE SHELF: the per-query flush (qmem) forgets _SCACHE by law, and re-reading the
-    # .npz each query cost 4 ms of Q06's 6 (a zip of nine arrays on the network volume). The shelf is
+    # .npz each query cost milliseconds (a zip of nine arrays on the network volume). The shelf is
     # the lawful resident form -- bounded, evictable -- and 3,052 blocks x 6 arrays is 150 KB
+    # lore: the re-read cost 4 ms of Q06's 6
     import wdb_shelf
     try: _mt = __import__('os').stat(seg.path).st_mtime_ns
     except Exception: _mt = 0

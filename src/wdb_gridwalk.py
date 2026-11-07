@@ -8,7 +8,7 @@ as a grid-id, the count stored once per cell -- and keeps a count-ordered HEAD (
 count) as the entry point. Top-K is a direct O(K) slice of that pre-sorted head: enter at the
 high-count end, read K, decode coordinates back to values. No per-row materialization, no scan.
 
-Measured (100M cb25db, SearchPhrase x UserID): head read top-10 = ~2 us, exact; the full filled-cell
+Measured on a text x id pair: head read top-10 = ~2 us, exact; the full filled-cell
 structure is ~27 MB (walked identity 6.9 + counts 20 + head 0.4) vs heavypair's 161 MB and the per-row
 countpos column's 200 MB -- 6x lighter, microsecond reads.
 
@@ -18,11 +18,14 @@ rows; only those decode); NO WHERE/HAVING/DISTINCT/JOIN/OFFSET. The head is a CA
 DESC, gid ASC), so a count plateau at the LIMIT boundary resolves deterministically -- never a decline
 (the plateau is a set of equally-correct answers; we emit the canonical one and the total-order
 validator agrees). A LIMIT deeper than the heavy set fills from `ones` (the _ONES_N smallest singleton
-gids, count 1) -- exception-defined pairs like WatchID x ClientIP (4 heavy cells in 100M) are served
-as: 4 cells + deterministic singleton fill. For LIMIT beyond the head it decodes the gap-encoded bulk
+gids, count 1) -- exception-defined pairs (a near-unique pair with a handful of heavy cells) are served
+as: those cells + deterministic singleton fill. For LIMIT beyond the head it decodes the gap-encoded bulk
 (all heavy cells, byte-block frame-of-reference over dict-order gaps).
 Append-tail maintenance is the documented next layer. RAM-resident, never persisted. Live by default
 (_ENABLED True); disable() restores the prior routing (heavypair/scan) for the shapes it handles.
+
+Lore: the measurement was 100M cb25db, SearchPhrase x UserID. The exception-defined pair was WatchID x ClientIP
+(4 heavy cells in 100M).
 """
 import numpy as np
 import wdb_qmem
@@ -168,9 +171,11 @@ def _build(seg, cols):
     DETERMINISTIC total order (count DESC, gid ASC) -- so the head is a canonical prefix even when a
     count plateau crosses its boundary. Also keeps `ones`: the _ONES_N smallest count-1 gids, so a
     LIMIT deeper than the heavy set fills deterministically from singletons (exception-defined pairs
-    like WatchID x ClientIP have nheavy ~ a handful and the answer is mostly fill).
+    have nheavy ~ a handful and the answer is mostly fill).
     Returns (head_gid, head_cnt, Vb, nheavy, bulk|None, ones, pos|None, nd) or None; nd is the pair's
-    FULL distinct-cell count (heavy + singletons), recorded for the survey's FD post-pass."""
+    FULL distinct-cell count (heavy + singletons), recorded for the survey's FD post-pass.
+
+    Lore: the exception-defined pair was WatchID x ClientIP."""
     a, b = sorted(cols)
     ca0 = np.ascontiguousarray(seg._raw_codes(a)); cb0 = np.ascontiguousarray(seg._raw_codes(b))
     if ca0.size == 0:
@@ -178,16 +183,18 @@ def _build(seg, cols):
     Vb = int(cb0.max()) + 1                          # the stored-width codes' own max (the cell ids' radix)
     Va = int(ca0.max()) + 1
     if Va * Vb <= _BINC_MAX and ca0.dtype.kind in 'iu' and cb0.dtype.kind in 'iu' and _DENSE_PAR[0]:
-        # THE GRID ON EVERY CORE (2026-10-23, Q17's tiny x tiny pairs: JavaEnable x Income 0.39 s vs DuckDB 0.09).
+        # THE GRID ON EVERY CORE (2026-10-23, pairs of two tiny keys).
         # The build was numpy glue on one thread: two int64 copies of 100M codes (0.12 s), the key a x Vb + b as a
         # new array, a one-thread bincount (0.21 s with the glue) -- 17 ms of it was the decode. The composed count's
         # own atoms instead: radix_acc glues the stored-width codes into the key in place, bincount_par tallies the
         # cells on per-thread boards. The same key and the same cells (a x Vb + b).
+        # lore: Q17's tiny x tiny pairs: JavaEnable x Income 0.39 s vs DuckDB 0.09
         import wdb_kernels
         if Va * Vb <= _FUSED_MAX[0]:
             # THE COUNT FUSED (2026-10-23): a small grid is counted straight from the two code arrays on per-thread
-            # boards (grid2's kernel) -- the key is never written: radix_acc's two passes over an 800 MB key were
-            # 68 ms of JavaEnable x Income's 125. The key is built below only if the member positions need it.
+            # boards (grid2's kernel) -- the key is never written: radix_acc's two passes over the key were
+            # over half the count. The key is built below only if the member positions need it.
+            # lore: the two passes over an 800 MB key were 68 ms of JavaEnable x Income's 125
             key = None
             full = np.asarray(wdb_kernels.grid2_count(ca0, cb0, ca0, np.int64(-1), np.int64(Vb), np.int64(Va * Vb)))
         else:
@@ -224,7 +231,8 @@ def _build(seg, cols):
         head_gid = np.empty(0, np.int64); head_cnt = np.empty(0, np.int64); bulk = None
     # Exception-defined pairs (few cells stored in total): also record the MEMBER ROW POSITIONS of
     # every stored cell, so SUM/AVG payload at read is a direct row gather + decode of ~K rows --
-    # no per-query pass over the 100M codes. ~1 KB for WatchID x ClientIP (4 heavy + ones).
+    # no per-query pass over the 100M codes. ~1 KB for a pair of 4 heavy cells + ones.
+    # lore: the pair was WatchID x ClientIP
     pos = None
     stored = np.concatenate((gid, ones)) if ones.size else gid
     nmember = int(cnt.sum()) + int(ones.size)    # positions scale with MEMBER ROWS, not cells --
@@ -251,7 +259,8 @@ _GRAB_MAX = [int(__import__('os').environ.get('WDB_GW_GRAB_MAX', '-1'))]   # row
 # THE LINE (2026-10-18, measured: cross5.jsonl / cross6.jsonl, 26 pairs): the grab saves the other key's decode and
 # a count of N, and pays a gather and a count of S -- so the line is the share where count(S) + gather(S) meets
 # count(N), and the count is what differs by lane: the dense census is cheap per row (ties at 17-27% of the rows),
-# the flat lane's pack + scatter + bucket count is not (ties at 27-45%; ClientTimeZone x Title still won at 56%)
+# the flat lane's pack + scatter + bucket count is not (ties at 27-45%; one pair still won at 56%)
+# lore: the pair that still won at 56% was ClientTimeZone x Title
 _GRAB_SHARE = [float(__import__('os').environ.get('WDB_GW_GRAB_DENSE', '0.15')),
                float(__import__('os').environ.get('WDB_GW_GRAB_FLAT', '0.30'))]
 GRAB_AT_DIV = 256        # survivors up to N / this are read AT their rows; more: the column decoded whole, gathered
@@ -273,7 +282,8 @@ def _grab_reads_at(seg, a, b, afilter):
     fcol, fneg, fcode = afilter
     N = int(seg.N)
     # the survivors estimated from a strided sample of the filter key's codes -- decoded whole by either road anyway
-    # (a census of RefererHash's 21.6M values to learn this cost ~0.2 s)
+    # (a census of a key with millions of values to learn this costs far more)
+    # lore: a census of RefererHash's 21.6M values cost ~0.2 s
     cf = np.asarray(seg._raw_codes(fcol))
     smp = cf[::max(1, N // 65536)]
     share = float(np.count_nonzero((smp != fcode) if fneg else (smp == fcode))) / max(1, smp.size)
@@ -296,7 +306,7 @@ def _grab_at(seg, other, S, N):
 
 
 def _grab_top(seg, a, b, Va, Vb, lim, afilter, tick):
-    """THE GRAB (2026-10-18, the Q14 board; Jackson: "is just grabbing the 1M faster than removing the 99M"):
+    """THE GRAB (2026-10-18; Jackson: "is just grabbing the 1M faster than removing the 99M"):
     the axis filter's survivors are found from the filter key's codes alone, the other key is read only for them,
     and only they are counted. The remove lane decodes both keys whole, counts all N rows, then drops the
     filtered cells. Both decode the filter key, so the grab saves (decode of the other key + a count of N) and
@@ -308,7 +318,9 @@ def _grab_top(seg, a, b, Va, Vb, lim, afilter, tick):
         DENSE_MAX, the flat lane (wdb_bound._flat_candidates) otherwise -- every core, no sort (np.unique was
         51 ms per 1M survivors on one core).
     A filter key holding one value answers from its dictionary: '<>' that value keeps no row. Grabs while
-    S <= _grab_limit(N); returns the canonical top (sel_gid, sel_cnt, Vb), or None (the remove lane answers)."""
+    S <= _grab_limit(N); returns the canonical top (sel_gid, sel_cnt, Vb), or None (the remove lane answers).
+
+    Lore: the ClickBench Q14 board."""
     global _GRABBED
     import wdb_kernels, wdb_bound
     fcol, fneg, fcode = afilter
@@ -321,7 +333,8 @@ def _grab_top(seg, a, b, Va, Vb, lim, afilter, tick):
     if Va * Vb <= _FUSED_MAX[0] and _DENSE_PAR[0] and type(seg).__name__ == 'Segment':
         # THE CALL BEFORE THE WORK: the survivors' count from the filter key's census (no mask, no positions), and the
         # grab declines at once when it would decode the other key whole -- the remove lane's fused count wins there
-        # (below). The mask and positions it skips were 114 ms of IsRefresh x MobilePhone's 165.
+        # (below). The mask and positions it skips can be most of the grab's time.
+        # lore: the mask and positions were 114 ms of IsRefresh x MobilePhone's 165
         Vf = int(c['V'])
         cnf = np.asarray(seg.raw_census(fcol, Vf))[:Vf]
         hit = int(cnf[int(fcode)]) if 0 <= int(fcode) < Vf else 0
@@ -354,8 +367,9 @@ def _grab_top(seg, a, b, Va, Vb, lim, afilter, tick):
         if fused:
             # THE FRAMES PRICED (2026-10-23): at rows only while the frames the survivors touch cost less than the
             # whole decode (the census road's model: frames x frame cost + rows x row cost, vs the encoding's decode
-            # per row) -- Robotness x ParamOrderID's 2,263 survivors touched ~1,180 of 1,526 frames, 59 ms of reads
-            # against a 19 ms decode
+            # per row) -- a few thousand spread survivors can touch most frames and cost more than the decode
+            # lore: Robotness x ParamOrderID's 2,263 survivors touched ~1,180 of 1,526 frames, 59 ms of reads
+            # lore: against a 19 ms decode
             import wdb_sampletop as _ST
             at = _ST._read_cost(seg, other, S) <= _ST._decode_cost(seg, other)
         else:
@@ -363,12 +377,13 @@ def _grab_top(seg, a, b, Va, Vb, lim, afilter, tick):
     else:
         at = S * GRAB_AT_DIV <= N
     if fused and not at:
-        # THE GRAB'S LINE MOVED (2026-10-23, grabsweep.py, the Q14 sample's dense pairs): with the fused count the
+        # THE GRAB'S LINE MOVED (2026-10-23, grabsweep.py, dense pairs): with the fused count the
         # remove lane (both keys decoded, every row counted on per-thread boards, the filtered cells zeroed) beat the
         # grab wherever the grab had to decode the other key whole anyway -- the decode is the same, and two gathers
-        # of S rows cost more than counting N: IsRefresh x MobilePhone (7.2% kept) 0.147 -> 0.080 s, UserAgentMajor x
-        # MobilePhone 0.203 -> 0.128, EventDate x IsMobile (10.2%) 0.106 -> 0.072; at rows the grab still wins
-        # (UserAgentMajor x IsOldCounter 0.033 vs 0.097)
+        # of S rows cost more than counting N; at rows the grab still wins
+        # lore: the ClickBench Q14 sample: IsRefresh x MobilePhone (7.2% kept) 0.147 -> 0.080 s, UserAgentMajor x
+        # lore: MobilePhone 0.203 -> 0.128, EventDate x IsMobile (10.2%) 0.106 -> 0.072; at rows
+        # lore: UserAgentMajor x IsOldCounter 0.033 vs 0.097
         tick('grab: the other key decodes whole -- the remove lane counts')
         _GRABBED -= 1
         return None
@@ -410,8 +425,9 @@ def _grab_top(seg, a, b, Va, Vb, lim, afilter, tick):
 def _dense_cells(ca, cb, Va, Vb):
     """the dense grid's cell counts, cell a x Vb + b, on every core: the fused count (grid2's kernel, no key written)
     up to _FUSED_MAX cells, radix_acc + bincount_par past it (THE COUNT FUSED, 2026-10-23: _build's line, measured by
-    fusesweep.py; the count-ordered and the grab's counts are its siblings -- AdvEngineID x JavaEnable's top 10 was
-    0.16-0.20 s on the two radix passes vs DuckDB 0.08)"""
+    fusesweep.py; the count-ordered and the grab's counts are its siblings)
+
+    Lore: AdvEngineID x JavaEnable's top 10 was 0.16-0.20 s on the two radix passes vs DuckDB 0.08."""
     import wdb_kernels
     prod = int(Va) * int(Vb)
     if prod <= _FUSED_MAX[0] and _DENSE_PAR[0]:
@@ -424,21 +440,24 @@ def _dense_cells(ca, cb, Va, Vb):
 
 
 def _compose_top(seg, cols, lim, afilter=None):
-    """THE PAIR COUNT FROM THE ATOMS (2026-10-15, the Q16 board): the canonical top `lim` cells (count DESC,
+    """THE PAIR COUNT FROM THE ATOMS (2026-10-15): the canonical top `lim` cells (count DESC,
     gid ASC, gid = codeA * Vb + codeB over the name-sorted columns) WITHOUT building the structure -- the
     structure lives one query (qmem) and its build was the whole bill: codes copied to 8 bytes and glued
     (~280 ms), then ONE core tallied (~190 ms) or sorted all 100M keys (5-8 s) whenever the POSSIBLE pairs
-    passed 16.7M (WindowClientHeight x WindowClientWidth: 24.7M possible, 776K occurring), then every heavy
+    passed 16.7M (two mid-width keys: tens of millions possible, under a million occurring), then every heavy
     cell sorted and bulk-encoded for LIMITs nobody asked. Composed instead, on every core:
       possible pairs <= DENSE_MAX: radix_acc glues the stored-width codes, bincount_par tallies the cells;
       otherwise the flat lane (pack_u64 / flat_scatter / flat_count) counts only the pairs that occur;
     then only the cells reaching the lim-th count (ties kept) are sorted canonically.
-    THE AXIS FILTER (2026-10-17, the Q14 board): a WHERE that is one '=' / '<>' on ONE of the two keys
+    THE AXIS FILTER (2026-10-17): a WHERE that is one '=' / '<>' on ONE of the two keys
     (afilter = (column, neg, code)) is applied to the cells, not the rows -- the dense table's row or column of
     that code is kept alone ('=') or zeroed ('<>'); the flat lane counts only the rows it keeps. Exact: a pair's
     count is all its rows, and the filter takes a pair whole or not at all. (heavypair answered these by
     sorting every pair of all 100M rows each query -- 2-10 s -- because its stored sidecar is off.)
-    Returns (sel_gid, sel_cnt, Vb) or None (the structure build answers, as before)."""
+    Returns (sel_gid, sel_cnt, Vb) or None (the structure build answers, as before).
+
+    Lore: the composition came from the ClickBench Q16 board (WindowClientHeight x WindowClientWidth: 24.7M possible,
+    776K occurring); the axis filter from the Q14 board."""
     import os, time
     import wdb_kernels, wdb_bound
     bill = os.environ.get('WDB_JOIN_BILL')
@@ -456,8 +475,10 @@ def _compose_top(seg, cols, lim, afilter=None):
     if afilter is not None and Va * Vb > wdb_bound.DENSE_MAX and _HEAVY_TOP[0] and type(seg).__name__ == 'Segment' \
             and not _grab_reads_at(seg, a, b, afilter):
         # past the dense board a heavy value splits the pair before the grab (the split applies the filter on both
-        # sides, and its light rows are the heavier key's few others -- SocialSourcePage x SendTiming <> 0: 6.1M
-        # survivors gathered by the grab, against SocialSourcePage's non-empty rows)
+        # sides, and its light rows are the heavier key's few others -- the grab would gather millions of
+        # survivors, against the heavier key's few non-default rows)
+        # lore: SocialSourcePage x SendTiming <> 0: 6.1M survivors gathered by the grab, against SocialSourcePage's
+        # lore: non-empty rows
         ca0 = np.ascontiguousarray(seg._raw_codes(a)); cb0 = np.ascontiguousarray(seg._raw_codes(b))
         if ca0.dtype.kind in 'iu' and cb0.dtype.kind in 'iu':
             hg = _heavy_top(seg, a, b, ca0, cb0, Va, Vb, int(lim), afilter, tick)
@@ -660,8 +681,9 @@ def detect(seg, tree, col_map):
                 return None
     else:
         return None
+    # lore: SearchPhrase's dict is ~12 GB / 12.8 s to materialize
     Vs = None                              # winners decode via seg.fetch (O(1) per cell) -- NEVER the
-    for col in cols:                       # full value dict (SearchPhrase's dict is ~12 GB / 12.8 s to
+    for col in cols:                       # full value dict (a large text dict is GBs and seconds to
         if seg.cols[col].get('mode') == 4:  # materialize, for 10 winners). Metadata-only gate here.
             return None
     afilter = None
@@ -831,14 +853,16 @@ _HEAVY_HITS = 0
 
 
 def _heavy_top(seg, a, b, ca, cb, Va, Vb, lim, afilter, tick):
-    """THE HEAVY SPLIT IN THE COMPOSITION (2026-10-23, the Q16 board: SendTiming x OpenstatAdID / OpenstatAdID x
-    SocialSourcePage / SocialSourcePage x SendTiming at 0.54-0.58 s vs DuckDB 0.15 -- '' holds 99.5% of OpenstatAdID's
-    rows, so the flat lane's buckets had one huge bucket on one core; the 10-15 note: "put the heavy-value split into
+    """THE HEAVY SPLIT IN THE COMPOSITION (2026-10-23: when one value holds nearly all of a key's rows, the flat
+    lane's buckets had one huge bucket on one core; the 10-15 note: "put the heavy-value split into
     the composition"). A pair past the dense board whose key h has one value holding most rows: the rows on that value
     differ only in the other key o, so their groups are (top, o) and their counts are o's census less o's count over
     the remaining (light) rows; the light rows -- few -- are gathered and grouped exactly. The two sets of groups are
     disjoint (a light row is off the heavy value). The filter (one = / <> on a key) applies to both sides.
-    Returns (gid, cnt) of candidate cells (gid = a x Vb + b), or None (the flat lane answers)."""
+    Returns (gid, cnt) of candidate cells (gid = a x Vb + b), or None (the flat lane answers).
+
+    Lore: the ClickBench Q16 board: SendTiming x OpenstatAdID / OpenstatAdID x SocialSourcePage / SocialSourcePage x
+    SendTiming at 0.54-0.58 s vs DuckDB 0.15 -- '' holds 99.5% of OpenstatAdID's rows."""
     global _HEAVY_HITS
     import wdb_kernels
     n = int(ca.size)
@@ -892,8 +916,9 @@ def _heavy_top(seg, a, b, ca, cb, Va, Vb, lim, afilter, tick):
         hz = np.flatnonzero(hv)
         hc = hv[hz]
         if hz.size > lim:
-            # only heavy cells reaching their own lim-th count can reach the answer's (ties kept): Title's 9.4M
-            # values were all sorted as candidates
+            # only heavy cells reaching their own lim-th count can reach the answer's (ties kept): a wide key's
+            # millions of values were all sorted as candidates
+            # lore: Title's 9.4M values
             import wdb_bound
             ck = wdb_bound._kth_largest(hc, lim)
             keep = hc >= ck

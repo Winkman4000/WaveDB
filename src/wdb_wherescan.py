@@ -1,8 +1,7 @@
 """wherescan: the disk-first WHERE read -- predicate scan over blocked (enc=3) code frames.
 
-The shape this serves is the ClickBench trench: a conjunction of selective predicates feeding a
-GROUP BY or aggregate, e.g. WHERE CounterID = 62 AND EventDate BETWEEN .. AND IsRefresh = 0.
-Today those queries full-decode every involved column (0.6-1.9 s each; Q39 times out). Here:
+The shape this serves: a conjunction of selective predicates feeding a GROUP BY or aggregate,
+e.g. WHERE k = 62 AND d BETWEEN .. AND flag = 0, which otherwise full-decodes every involved column. Here:
 
   1. STAIR predicates (range/eq on a staircase column) become exact row spans via searchsorted
      over the step rows -- no bytes touched.
@@ -13,10 +12,13 @@ Today those queries full-decode every involved column (0.6-1.9 s each; Q39 times
      predicates check in place (bitpacked values, cached seq decode).
   4. Survivors group/aggregate: keys gathered by codes_at, composite built factorize-then-combine
      (overflow-safe), counts by bincount, canonical count-desc order, OFFSET/LIMIT, winners
-     decoded one value each. Supports the CASE WHEN <eq-conj> THEN col ELSE '' derived key (Q39).
+     decoded one value each. Supports the CASE WHEN <eq-conj> THEN col ELSE '' derived key.
 
 Zero columns enter the codes cache; the pipeline's residency is its survivors. Declines: joins,
 distinct, having, deleted rows, overrides on involved columns, non-conjunctive WHERE, LIKE/regex.
+
+Lore: built for the ClickBench trench, e.g. WHERE CounterID = 62 AND EventDate BETWEEN .. AND IsRefresh = 0;
+those queries full-decoded every involved column (0.6-1.9 s each; Q39 timed out). The CASE derived key is Q39's.
 Prototype of this exact pipeline ran Q39 (a 45 s timeout) in ~1 s steady-state, exact vs DuckDB.
 """
 import os
@@ -34,9 +36,10 @@ _HITS = 0
 _SCAN_THREADS = 14
 _FLAG_LANES = [os.environ.get('WDB_FLAG_LANES', '1') == '1']   # A/B: 0 restores the thread-pool frame scan (enc 3)
 _SCAN_CODES_MAX = 4_000_000    # the scanned codes are kept for codes_at up to this many hits
+# lore: measured on the server; a quarter also tied the others on URL
 _SLOT_DIV = [4]                # the lane scan's pass 1 keeps up to BR // 4 hits per frame; a frame with more is
-                               # inflated again in pass 2 (measured, server: a quarter beat 1/16 and 1/64 on the
-                               # dense LIKEs and tied on URL; a whole frame's slot was slower everywhere)
+                               # inflated again in pass 2 (measured: a quarter beat 1/16 and 1/64 on the
+                               # dense LIKEs; a whole frame's slot was slower everywhere)
 
 
 def enable():
@@ -99,10 +102,11 @@ def _code_of(seg, col, val):
     if V <= 0:
         return None
     if c['dt'] == 3:
-        # A TIME/DATE LITERAL IN THE COLUMN'S STORED UNITS (2026-10-17, the Q14 board): EventTime <> '2013-07-21
-        # 19:37:51' reached the int lookup as text, int() failed, and None read as "absent" -- '<>' then kept
-        # every row (a wrong answer) and the composed reads declined. The text is parsed to the column's unit;
+        # A TIME/DATE LITERAL IN THE COLUMN'S STORED UNITS: a text literal used to reach the int lookup, int()
+        # failed, and None read as "absent" -- '<>' then kept every row (a wrong answer) and the composed reads
+        # declined. The text is parsed to the column's unit;
         # an unparseable literal raises (never guessed absent); a value finer than the unit is absent.
+        # lore: 2026-10-17, the Q14 board: EventTime <> '2013-07-21 19:37:51'.
         val = _time_units(seg, col, val)
         if val is None:
             return None
@@ -219,7 +223,9 @@ def _in_list(node):
     return node.this.name, vals, neg
 
 def _case_key(p, seg, col_map):
-    """The Q39 pattern: CASE WHEN <conj of col = int-literal> THEN <column> ELSE <literal>."""
+    """The derived-key pattern: CASE WHEN <conj of col = int-literal> THEN <column> ELSE <literal>.
+
+    Lore: ClickBench Q39's pattern."""
     inner = p.this if isinstance(p, E.Alias) else p
     if not isinstance(inner, E.Case) or len(inner.args.get('ifs', [])) != 1:
         return None
@@ -316,8 +322,8 @@ def _like(node):
     neg = neg or bool(n.args.get('negate'))      # sqlglot: NOT LIKE == Like(negate=True)
     pat = _litval(n.expression)
     if isinstance(pat, str) and pat and pat.strip('%') == '':
-        # '%' (or '%%...'): every non-NULL value matches -- kind 'all' (2026-10-19, the LIKE board: it was refused
-        # here as too short, and Q21/Q23 with K LIKE '%' fell to the general path, past 30 s)
+        # '%' (or '%%...'): every non-NULL value matches -- kind 'all' (it was refused here as too short)
+        # lore: 2026-10-19, the LIKE board: Q21/Q23 with K LIKE '%' fell to the general path, past 30 s
         return n.this.name, '%', 'all', neg
     if not isinstance(pat, str) or len(pat) < 2:
         return None
@@ -474,8 +480,9 @@ def _char_count_kernel(buf, starts, out, base):
 def char_lengths(seg, col):
     """THE LENGTH SIDECAR: length(col) over a string dictionary as a V-scale int32 array -- born
     from the framed text with one parallel pass (UTF-8 characters, not bytes), never a Python
-    string. AVG(length(URL)) had front-decoded 6M URLs into objects: 12s cold for a number that
-    is a difference of offsets."""
+    string -- an average length is a difference of offsets, not a decode of every value into objects.
+
+    Lore: AVG(length(URL)) had front-decoded 6M URLs into objects: 12s cold."""
     base = getattr(seg, 'path', None)
     if not base: return None
     lp = base + '.' + col + '.clen.npy'
@@ -563,10 +570,12 @@ _LIKE_AT_LAST = [None]
 
 def _like_at(seg, col, needle, kind, cc):
     """Boolean[len(cc)]: the string at each code in cc matches the LIKE. THE FILTER BEFORE THE READ
-    (Jackson): a LIKE that runs after other filters decides only the distinct codes still alive --
-    18.3M URLs become the 2,450 behind Q22's survivors. Falls back to the whole dictionary when
+    (Jackson): a LIKE that runs after other filters decides only the distinct codes still alive.
+    Falls back to the whole dictionary when
     deciding the survivors would cost most of a whole pass (wdb_strings.take_subset_road), or when
-    the LIKE is not a plain contains."""
+    the LIKE is not a plain contains.
+
+    Lore: 18.3M URLs become the 2,450 behind Q22's survivors."""
     memo = seg.__dict__.setdefault('_ws_like_memo', {})
     if (col, needle, kind) in memo:              # already decided whole (the NULL bin padded)
         return _like_flags(seg, col, needle, kind)[cc]
@@ -617,16 +626,18 @@ def _like_flags_dict(seg, col, needle, kind='contains'):
         memo[mk] = flag
         return flag
     if kind == 'contains' and 'restarts' in c0 and len(nd) >= 1:
-        # THE FRONT-CODED HAYSTACK (vanilla law's find): the old path decoded 18M URLs into Python
-        # objects to join a haystack -- 19 s, every process. The kernel walks the dictionary's own
+        # THE FRONT-CODED HAYSTACK (vanilla law's find): the old path decoded the whole dictionary into Python
+        # objects to join a haystack, every process. The kernel walks the dictionary's own
         # front-coded bytes: no objects, blocks in parallel, nothing born.
+        # lore: the old path decoded 18M URLs -- 19 s.
         # THE THREE READS: identification over the dictionary AS STORED -- chunk by chunk as they
-        # decompress, prefix carry inside each chain, no whole-dictionary blob (the join of 2 GB of
-        # URL text was 1.4-2.3 s of every first LIKE).
+        # decompress, prefix carry inside each chain, no whole-dictionary blob.
+        # lore: the join of 2 GB of URL text was 1.4-2.3 s of every first LIKE.
         # ALWAYS, sidecars on or off (2026-09-26): this road was gated on the switch being off and
         # no text-buffer file existing, so the kit's warm step (switch on, text buffer born) sent
-        # Q20-22 back to the Sept 13 text buffer. Same kit database, text buffer removed: Q20 cold
-        # 2906 -> 854 ms, Q21 3349 -> 1223, Q22 3053 -> 2305.
+        # the contains-LIKEs back to the Sept 13 text buffer.
+        # lore: those were Q20-22. Same kit database, text buffer removed: Q20 cold 2906 -> 854 ms, Q21 3349 -> 1223,
+        # Q22 3053 -> 2305.
         import wdb_strings
         keep = wdb_strings.identify_contains(seg, col, nd)
         if keep is not None:
@@ -634,8 +645,8 @@ def _like_flags_dict(seg, col, needle, kind='contains'):
             return keep
     if kind == 'prefix' and c0.get('dt') == 1 and c0.get('mode') in (0, 1):
         # THE PREFIX NEEDS NO HAYSTACK (2026-10-05): a value-sorted dictionary holds a prefix as one code range,
-        # two bisections by point fetch -- the road below built the whole text buffer first (18M URLs unpacked
-        # into Python: 7.7 s of URL LIKE 'http://holodilnik%') and then never read it
+        # two bisections by point fetch -- the road below built the whole text buffer first and then never read it
+        # lore: 18M URLs unpacked into Python: 7.7 s of URL LIKE 'http://holodilnik%'
         V0 = int(c0['V']) - (1 if c0.get('has_null') else 0)
         lo = _bound_code(seg, col, nd, 'left')
         up = nd.rstrip(b'\xff')
@@ -704,7 +715,8 @@ def _like_flags_dict(seg, col, needle, kind='contains'):
     elif isinstance(hay, FramedText) and len(nd) >= 2:
         # THE PARALLEL NEEDLE: frames decompress in threads (zstd releases the GIL) and a numba
         # kernel finds every occurrence across cores; a hit maps to its value by offsets. Python's
-        # single-threaded find took 1.9s over 3.4 GB of URL text; this is memory-bound across 16 cores.
+        # single-threaded find is one core; this is memory-bound across 16 cores.
+        # lore: Python's find took 1.9s over 3.4 GB of URL text.
         hits = hay.find_all_parallel(nd)
         if hits.size:
             codes = np.searchsorted(offs, hits, side='right') - 1
@@ -897,10 +909,11 @@ def detect(seg, tree, col_map):
     if not eqs and not spans and not likes and not ors and not sflags and not ins:
         return None                      # unselective flag-only shapes stay with the scan family
     def _eq_cost(col, val):
-        # the driver decides the whole query's scale: RegionID=229 drove cte-chain at
-        # 18.3M survivors when CounterID=62 (738K) sat right next to it. Exact per-code
+        # the driver decides the whole query's scale: a common value must not drive when a rare one
+        # sits right next to it. Exact per-code
         # counts when a .gbc sidecar ALREADY EXISTS (peek only -- driver selection must
         # never trigger a lazy build); N/V average otherwise.
+        # lore: RegionID=229 drove cte-chain at 18.3M survivors when CounterID=62 (738K) sat right next to it.
         import os
         try:
             import wdb_gbshelf
@@ -929,8 +942,9 @@ def detect(seg, tree, col_map):
         V = int(seg.cols[col].get('V') or 1)
         return max(1, int(seg.N) // max(1, V))
     _cand = [i for i, e in enumerate(eqs) if e[2] == '=']
-    # one candidate is its own driver: pricing it read the whole .gbc count file for nothing (Q19 cold:
-    # 274 ms of a 577 ms query, 2026-09-27) -- min() calls the key even for a single item
+    # one candidate is its own driver: pricing it read the whole .gbc count file for nothing
+    # -- min() calls the key even for a single item
+    # lore: Q19 cold: 274 ms of a 577 ms query, 2026-09-27
     drive_eq = (_cand[0] if len(_cand) == 1 else
                 min(_cand, key=lambda i: _eq_cost(eqs[i][0], eqs[i][1]))) if _cand else None
     # a like is only THE driver when no eq drives -- execute skips lflags[drive_like],
@@ -994,9 +1008,10 @@ def detect(seg, tree, col_map):
         if order is None or not order.expressions:
             # THE UNORDERED ROWS (vanilla law's first find): no ORDER BY means any order is a
             # lawful answer, and the driver's positions in row order are one. Without this,
-            # `SELECT UserID FROM hits WHERE UserID = k` went to the general path, which decoded
-            # all 100M values before applying the predicate: 1,115 ms for 78 rows. No LIMIT is
+            # `SELECT col FROM t WHERE col = k` went to the general path, which decoded
+            # every value before applying the predicate. No LIMIT is
             # lim -1 (execute declines past 250K hits -- there the O(N) path is the cheaper one).
+            # lore: SELECT UserID FROM hits WHERE UserID = k decoded all 100M values: 1,115 ms for 78 rows.
             if lim is not None and (lim <= 0 or lim > 100000):
                 return None
             ocol = None; tiebreak = []
@@ -1100,9 +1115,11 @@ def detect(seg, tree, col_map):
             return None
         # trailing ASC key columns are this read's canonical emission order (count desc, then the
         # composite asc = each key's value asc, IN KEY ORDER) only when they are the keys in that
-        # order, from the first: ORDER BY c DESC, WatchID over keys (ClientIP, WatchID) broke the
-        # count ties on ClientIP and cut the wrong rows at the LIMIT (the shifting board's G,
-        # 2026-10-12). A prefix is enough -- ties past it are SQL's to leave in any order.
+        # order, from the first: ORDER BY c DESC, k2 over keys (k1, k2) would break the
+        # count ties on k1 and cut the wrong rows at the LIMIT. A prefix is enough -- ties past it are SQL's to
+        # leave in any order.
+        # lore: ORDER BY c DESC, WatchID over keys (ClientIP, WatchID) did exactly that (the shifting board's G,
+        # 2026-10-12).
         tail = order.expressions[1:]
         if len(tail) > len(keys):
             return None
@@ -1115,10 +1132,11 @@ def detect(seg, tree, col_map):
                 return None
     lim = wdb_sql._limit(tree)
     off = wdb_sql._offset(tree) or 0
-    # THE COMPOSED COUNT OUTRANKS THE SCAN (2026-10-17, the Q14 board): two keys, COUNT only, ordered by the
+    # THE COMPOSED COUNT OUTRANKS THE SCAN: two keys, COUNT only, ordered by the
     # count, the WHERE one '=' / '<>' on one of the keys -- gridwalk's composed count applies that filter to
-    # the counted cells (exact, every core); this scan walked the survivors on one key's frames and passed the
-    # board's 20 s cap on 30 of the Q14 samples (IsOldCounter x ClientEventTime 30 s, DuckDB 0.3 s)
+    # the counted cells (exact, every core); this scan walked the survivors on one key's frames
+    # lore: 2026-10-17, the Q14 board: the scan passed the board's 20 s cap on 30 of the Q14 samples
+    # (IsOldCounter x ClientEventTime 30 s, DuckDB 0.3 s)
     if len(keys) == 2 and order is not None:
         try:
             import wdb_gridwalk
@@ -1202,17 +1220,21 @@ _BP0EQ = [os.environ.get('WDB_BP0_EQ', '1') != '0']
 
 def _keep_eq_codes(seg, col, pos, code, negate):
     """the codes at an equality scan's hits are the code itself: kept for codes_at (as the frame scans keep theirs),
-    so the projection that follows reads no frame -- ClientEventTime = k's scan took 27 ms of the query's 85 without"""
+    so the projection that follows reads no frame.
+
+    Lore: without it ClientEventTime = k's scan took 27 ms of the query's 85."""
     if not negate and pos.size <= 4_000_000:
         seg.__dict__.setdefault('_scan_codes', {})[col] = (pos, np.full(pos.size, code, np.int64))
     return pos
 
 
 def _scan_eq18_lanes(seg, c, code, lo, hi, negate):
-    """THE ONE-CODE SCAN IN COMPILED LANES (2026-10-21, Q19's board): enc 18's frames inflate through libzstd inside
+    """THE ONE-CODE SCAN IN COMPILED LANES: enc 18's frames inflate through libzstd inside
     the kernel and their codes are tested against the one code as they unpack (wdb_kernels.z18_eq_count / _fill);
     the frame scan below inflated through Python's zstandard on a thread pool and tested a flag table. None (the
-    caller scans as before) without libzstd, with frames not yet in memory, or on a frame error."""
+    caller scans as before) without libzstd, with frames not yet in memory, or on a frame error.
+
+    Lore: 2026-10-21, Q19's board."""
     import wdb_engine as _EN
     import wdb_kernels as _WK
     if _EN._libzstd() is None or not _EN._ZLANES[0]:
@@ -1294,9 +1316,12 @@ _E3_BATCH = [os.environ.get('WDB_E3_BATCH', '1') != '0']
 
 
 def _eq_e3_batch(seg, col, c, code, lo, hi):
-    """THE ONE-CODE FRAME SCAN (2026-10-24, the dashboard's fixed cost): the span's frames decompressed in ONE call on
+    """THE ONE-CODE FRAME SCAN: the span's frames decompressed in ONE call on
     zstd's own C threads (multi_decompress_to_buffer over a BufferWithSegments view of the file -- no per-frame copy,
-    no Python thread per frame), each frame then compared with the one code. The dashboard's selector, CounterID = 62
+    no Python thread per frame), each frame then compared with the one code -- the fixed cost of a selective
+    equality on a column whose few frames the load statistics leave.
+
+    Lore: 2026-10-24, the dashboard's fixed cost. The dashboard's selector, CounterID = 62
     (738K rows, the 193 frames the load statistics leave): the frame scan 45-50 ms, of which decompressing on 14
     Python threads 8.5 ms (one thread 11.5; zstd's threads 2.6) and the flag-bit test 10.8 ms on one thread against
     the equality's 1.1 -- the rest contention. Whole dashboard queries 58-93 -> 20-55 ms (DuckDB 30-40)."""
@@ -1333,15 +1358,16 @@ def _eq_e3_batch(seg, col, c, code, lo, hi):
 
 def _eq_e3(seg, col, c, code, lo, hi, negate):
     # = : the batch decompress + the equality (_eq_e3_batch); <> keeps the frame scan below, whose kernel writes the
-    # tens of millions of positions a common code's complement makes better than a compare per frame (measured
-    # 0.087 vs 0.102 s, 0.080 vs 0.106 on Robotness / ResponseEndTiming's commonest)
+    # tens of millions of positions a common code's complement makes better than a compare per frame
+    # lore: measured 0.087 vs 0.102 s, 0.080 vs 0.106 on Robotness / ResponseEndTiming's commonest
     if not negate and code >= 0 and _E3_BATCH[0] and col not in seg._codes:
         try:
             return _eq_e3_batch(seg, col, c, int(code), lo, hi)
         except Exception:
             pass                                 # a frame the batch call cannot take: the frame scan below
     # one code IS a flag: the nogil frame scan (THE SCAN WITHOUT THE GIL) instead of a numpy
-    # compare per frame under the GIL -- UserID = k measured 155 -> ~60 ms on 1,526 frames
+    # compare per frame under the GIL
+    # lore: UserID = k measured 155 -> ~60 ms on 1,526 frames
     V3 = int(c.get('V') or 0)
     flag3 = np.full(max(V3, code + 1), bool(negate), np.bool_)
     if code >= 0:
@@ -1363,8 +1389,10 @@ def _eq_e20_pattern(seg, col, c, code, lo, hi, negate):
     A stray match (the pattern straddling rows) costs one block's walk, never a wrong row.
     THE SWITCH: code width >= 23 (the two-byte key needs width + 1 >= 24; the width sweep put strays at <= ~10% of
     blocks there: 25 -> 1.9%, 24 -> 5.6%, 23 -> 9.9%; below, 22% at 21, 46% at 20); sixteen evenly spaced blocks probed
-    first, then (after the search) fewer than a quarter of the blocks flagged -- a common value: the full walk. RefererHash = k: search 28 ms + 12 of 1,526 blocks
-    walked, where the full walk is 50-65 ms (DuckDB 36). WDB_E20_PATTERN=0 declines; WDB_E20_PATTERN_MIN is the width."""
+    first, then (after the search) fewer than a quarter of the blocks flagged -- a common value: the full walk.
+    WDB_E20_PATTERN=0 declines; WDB_E20_PATTERN_MIN is the width.
+
+    Lore: RefererHash = k: search 28 ms + 12 of 1,526 blocks walked, where the full walk is 50-65 ms (DuckDB 36)."""
     import wdb_kernels as _WK
     bits = int(c['e20bits'])
     if (negate or not _E20PAT[0] or bits < max(23, _E20PAT_MIN[0]) or code < 0 or code >= (1 << bits)
@@ -1376,9 +1404,9 @@ def _eq_e20_pattern(seg, col, c, code, lo, hi, negate):
     table = np.zeros(65536, np.uint8)
     for o in range(8):
         table[(P >> (8 - o)) & 0xFFFF] |= (1 << o)
-    # THE PROBE (2026-10-21, Q41): a common value flags most blocks and the search is wasted (Q41's URLHash over one
-    # counter's 12.6M rows: 4.1-4.9 ms thrown away before the walk). Sixteen evenly spaced blocks are searched first;
-    # a rare value flags almost none (strays: ~2% at width 25), a common one most -- a quarter flagged: the walk.
+    # THE PROBE: a common value flags most blocks and the search is wasted. Sixteen evenly spaced blocks are searched
+    # first; a rare value flags almost none (strays: ~2% at width 25), a common one most -- a quarter flagged: the walk.
+    # lore: 2026-10-21, Q41: Q41's URLHash over one counter's 12.6M rows threw 4.1-4.9 ms away before the walk.
     nsp = b1 - b0
     probe = np.unique(np.linspace(b0, b1 - 1, min(16, nsp)).astype(np.int64))
     pc = np.zeros(probe.size, np.uint8)
@@ -1404,9 +1432,10 @@ def _eq_e20_pattern(seg, col, c, code, lo, hi, negate):
 
 
 def _eq_e20_walk(seg, col, c, code, lo, hi, negate):
-    # THE ONE-CODE SCAN THROUGH THE BACK-REFERENCE (2026-10-21, Q19's board): the full decode wrote 100M codes to
-    # compare them with one (RefererHash = k: 0.12 s for one row, DuckDB 0.036 s); the walk keeps the hits of
+    # THE ONE-CODE SCAN THROUGH THE BACK-REFERENCE: the full decode wrote every code to
+    # compare them with one; the walk keeps the hits of
     # one block on its lane's board, and a second walk writes positions for the blocks that hold any
+    # lore: 2026-10-21, Q19's board: RefererHash = k, 100M codes, 0.12 s for one row, DuckDB 0.036 s
     if (hi - lo) < (1 << 16) or not _BP0EQ[0]:
         return None
     import wdb_kernels as _WK
@@ -1426,10 +1455,11 @@ def _eq_e20_walk(seg, col, c, code, lo, hi, negate):
 
 
 def _eq_e0_packed(seg, col, c, code, lo, hi, negate):
-    # THE ONE-CODE SCAN ON THE PACKED BITS (2026-10-21, Q19's board): plain bitpack had no equality scanner, so
-    # one code decoded every row of the span into an array and compared it (WatchID = k: 100M codes, 400 MB,
-    # 0.18 s for one row, DuckDB 0.034 s). The tile reader tests each packed code against the one target in a
+    # THE ONE-CODE SCAN ON THE PACKED BITS: plain bitpack had no equality scanner, so
+    # one code decoded every row of the span into an array and compared it. The tile reader tests each packed code
+    # against the one target in a
     # register; a second pass writes positions for the chunks that hold any. WDB_BP0_EQ=0 restores the decode.
+    # lore: 2026-10-21, Q19's board: WatchID = k: 100M codes, 400 MB, 0.18 s for one row, DuckDB 0.034 s
     if ('boffs' in c or not c.get('bits') or not (0 < int(c['bits']) <= 32) or (hi - lo) < (1 << 16)
             or not _BP0EQ[0]):
         return None
@@ -1480,9 +1510,11 @@ _E20PAT_HITS = 0
 def _scan_eq19(seg, col, code, lo, hi):
     """THE BOX LABELS (Jackson, 2026-09-27): a block-dictionary (tag 19) column carries, per block of
     rows, the sorted list of the codes in it. 'Which rows hold code k' reads the labels -- through the
-    load's signposts when present (Q19: 0.15 ms for 1,526 blocks), else walking each label to k --
+    load's signposts when present, else walking each label to k --
     then the pointers of only the blocks whose label holds k. The full decode it replaces unpacked
-    all 100M codes (48 ms hot, 247 MB cold) to keep 4 rows. None: the caller scans as before."""
+    all 100M codes (48 ms hot, 247 MB cold) to keep 4 rows. None: the caller scans as before.
+
+    Lore: Q19: the signposts read 0.15 ms for 1,526 blocks."""
     import wdb_kernels as _WK
     import wdb_blockstats
     c = seg.cols[col]
@@ -1496,7 +1528,8 @@ def _scan_eq19(seg, col, code, lo, hi):
     gb = np.int64(c['e19bits'])
     if 'e19R' in c:
         # THE SHELVES (Jackson, 2026-09-27): the labels by code range -- code k's pieces of every label sit
-        # together on shelf k // W (~256 KB for UserID), so the lookup reads that one shelf, not 58 MB
+        # together on shelf k // W, so the lookup reads that one shelf, not every label
+        # lore: ~256 KB for UserID, against 58 MB
         W = int(c['e19W']); r = code // W
         if r < int(c['e19R']) and os.environ.get('WDB_E19_WARM', '1') != '0':
             ds = int(c['e19dstart']); SW = c['e19SW']
@@ -1548,10 +1581,12 @@ def _num_table(seg, col):
 def _in_codes(seg, col, vals):
     """Dict codes for an IN list. Pre-resolved code sets (same-column subqueries) pass
     straight through. The dict-pass path decodes the ENTIRE dictionary
-    (V-proportional: ~6s for SearchPhrase's 6M) while bisects cost only the probes
+    (V-proportional) while bisects cost only the probes
     (each _code_of is O(log V) point-fetches, never materializing). The old fixed
     500-value threshold was calibrated in the leak era when the decoded dict was
-    retained and free; honestly priced, the crossover scales with the dictionary."""
+    retained and free; honestly priced, the crossover scales with the dictionary.
+
+    Lore: the dict pass was ~6s for SearchPhrase's 6M."""
     if isinstance(vals, dict):
         return np.asarray(vals['_codes'], dtype=np.int64)
     c = seg.cols[col]
@@ -1627,16 +1662,19 @@ def _scan_flag18(seg, col, fbits, lo, hi):
 
 
 def _scan_flag3_lanes(seg, c, bitsB, lo, hi, j0, j1):
-    """THE FRAME SCAN IN COMPILED LANES (2026-10-30, E: Q21's small-text LIKEs on the PC). The thread pool below hands
+    """THE FRAME SCAN IN COMPILED LANES. The thread pool below hands
     each frame across threads three times (inflate, test, copy out); under a virtual machine every handoff wakes a
-    virtual CPU, so 14 threads ran slower than 4 (HitColor LIKE '%g', 1,526 frames: 390 ms in the query; inflating
-    alone 20 ms on 4 threads, 59 on 8). Here one compiled call holds the whole scan: pass 1 inflates each frame into
-    its lane's board, counts its hits and keeps up to a quarter frame of them in the frame's slot (offset, code); the
-    running total places every frame's hits; pass 2 copies each frame's hits from its slot -- inflating again only a
-    frame that held more -- and writes positions (and codes, when they will be kept) in place. Inflating everything
-    twice made URL LIKE '%google%' (16K hits in 1,432 of 1,526 frames) 51 -> 85 ms on the server; with the slots 47.
+    virtual CPU, so 14 threads ran slower than 4. Here one compiled call holds the whole scan: pass 1 inflates each
+    frame into its lane's board, counts its hits and keeps up to a quarter frame of them in the frame's slot (offset,
+    code); the running total places every frame's hits; pass 2 copies each frame's hits from its slot -- inflating
+    again only a frame that held more -- and writes positions (and codes, when they will be kept) in place. Inflating
+    everything twice instead was slower than the slots when the hits are spread over most frames.
     Returns (positions, codes or None), or None to fall back to the thread pool (no libzstd or numba, switched off,
-    a frame that fails)."""
+    a frame that fails).
+
+    Lore: 2026-10-30, E: Q21's small-text LIKEs on the PC. HitColor LIKE '%g', 1,526 frames: 390 ms in the query;
+    inflating alone 20 ms on 4 threads, 59 on 8. Inflating everything twice made URL LIKE '%google%' (16K hits in
+    1,432 of 1,526 frames) 51 -> 85 ms on the server; with the slots 47."""
     if not _FLAG_LANES[0]:
         return None
     import wdb_engine as _WE
@@ -1709,7 +1747,8 @@ def _scan_flag(seg, col, flag, lo, hi):
         # fourteen threads ran one at a time (221 ms for 1,526 frames; 63 ms per 200 frames on one
         # thread was the whole cost). The membership test is a nogil kernel now, and it keeps the
         # scanned column's codes at the hits -- the caller's codes_at over the same positions would
-        # have decompressed every frame again (93 ms for 16K rows of URL)
+        # have decompressed every frame again
+        # lore: 93 ms for 16K rows of URL
         wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
         BR = c['BR']; base = c['cstart']; bo = c['boffs']; buf = seg.buf
         j0, j1 = lo // BR, (hi - 1) // BR + 1
@@ -1770,10 +1809,10 @@ def _scan_flag(seg, col, flag, lo, hi):
         outS = np.zeros(max(1, int(offs[-1])), np.int64)
         _WK.bp0_scan_fill(bufS, int(c['cstart']), int(c['bits']), lo, hi, flagS, offs, outS, CH)
         return outS[:int(offs[-1])]
-    # THE GENERAL FLAG SCAN (2026-10-19, the LIKE board): encodings with no fused scanner above (enc 10 / 9 / 2 ...)
-    # built arange for the range read and indexed the flag on one thread -- UTMContent 250 ms flat for codes that
-    # decode in 7-12 ms. The whole column decodes once (kept for the codes_at that follow), the scan runs on
-    # every core.
+    # THE GENERAL FLAG SCAN: encodings with no fused scanner above (enc 10 / 9 / 2 ...)
+    # built arange for the range read and indexed the flag on one thread, far slower than the decode. The whole
+    # column decodes once (kept for the codes_at that follow), the scan runs on every core.
+    # lore: 2026-10-19, the LIKE board: UTMContent 250 ms flat for codes that decode in 7-12 ms.
     if lo == 0 and hi >= int(seg.N):
         cc = np.asarray(seg._raw_codes(col))
     else:
@@ -1941,13 +1980,16 @@ def _stored_start(seg, spec, key):
 
 
 def _potency_pick(seg, spec, lo, hi):
-    """THE POTENCY PICK (2026-10-19, Jackson: "a failure of the potency based system to detect that search phrase
-    filter as an option"). The driver -- the one filter that scans the span and writes positions -- was chosen by
+    """THE POTENCY PICK. The driver -- the one filter that scans the span and writes positions -- was chosen by
     a fixed ladder (an '=', else the first LIKE, then OR / scalar / IN, and a '<>' only on enc 3/18 with nothing
-    else): Q21 with a one-letter needle drove on the LIKE that keeps 80% of the rows, wrote 80M positions, then
-    the residual SearchPhrase <> '' dropped 85% of them. Every positive LIKE, '=', '<>' and IN on a dictionary
+    else), so a weak LIKE could drive and write most of the rows' positions for a residual to drop. Every positive
+    LIKE, '=', '<>' and IN on a dictionary
     column is a candidate here; each one's keep share is measured (_pot_keep), and the one keeping fewest rows
-    drives when it keeps under _POT_SWITCH of the ladder's driver. The ladder's driver then runs as a residual."""
+    drives when it keeps under _POT_SWITCH of the ladder's driver. The ladder's driver then runs as a residual.
+
+    Lore: 2026-10-19, Jackson: "a failure of the potency based system to detect that search phrase filter as an
+    option". Q21 with a one-letter needle drove on the LIKE that keeps 80% of the rows, wrote 80M positions, then
+    the residual SearchPhrase <> '' dropped 85% of them."""
     if not _POTENCY[0] or hi - lo < (1 << 16):
         return spec
     if spec.get('drive_or') is not None or spec.get('drive_sf') is not None:
@@ -1956,8 +1998,9 @@ def _potency_pick(seg, spec, lo, hi):
     for i, (col, needle, kind, neg) in enumerate(spec.get('likes', [])):
         if not neg:
             # the whole dictionary's flags (memoized for the query): the driver reuses them, and a LIKE moved to the
-            # residuals answers from them at once. Deciding only the sampled values cost more: 4,096 random URL
-            # codes open ~4,096 front-coded chunks (192 ms), where the whole decision is the driver's own cost anyway
+            # residuals answers from them at once. Deciding only the sampled values cost more: random codes of a
+            # wide dictionary open as many front-coded chunks, where the whole decision is the driver's own cost anyway
+            # lore: 4,096 random URL codes opened ~4,096 front-coded chunks (192 ms)
             cands.append(('like', i, col,
                           lambda cc, col=col, needle=needle, kind=kind:
                           np.asarray(_like_flags(seg, col, needle, kind), bool)[cc]))
@@ -2003,11 +2046,13 @@ def _potency_pick(seg, spec, lo, hi):
         return spec
     if shares[best] >= _POT_SWITCH * cur_share:
         # THE STORED START (2026-10-30, Jackson): a filter whose passing rows are already stored -- '<>' the default of
-        # an enc-8 column (SearchPhrase <> ''), whose answer is the literal rows _scan_flag slices -- costs nothing to
+        # an enc-8 column (col <> ''), whose answer is the literal rows _scan_flag slices -- costs nothing to
         # start from, where the ladder's driver scans its whole column. It starts whenever it keeps no more rows than
-        # the driver. Measured on c96 (server, the Q21 / Q22 / Q22n boards, 687 variants): the 26 it moves (LIKEs
-        # keeping 14-19% against SearchPhrase's 13.2%) 0.90x / 0.96x geomean, none >10% slower (Title '%ль%' +8%),
-        # answers identical; HitColor LIKE '%g' 183 -> 141 ms, URL LIKE '%mes%' 617 -> 530.
+        # the driver.
+        # lore: the stored filter was SearchPhrase <> ''. Measured on c96 (server, the Q21 / Q22 / Q22n boards, 687
+        # variants): the 26 it moves (LIKEs keeping 14-19% against SearchPhrase's 13.2%) 0.90x / 0.96x geomean, none
+        # >10% slower (Title '%ль%' +8%), answers identical; HitColor LIKE '%g' 183 -> 141 ms, URL LIKE '%mes%'
+        # 617 -> 530.
         if cur is None:
             return spec
         st = [k for k in shares if k != cur and shares[k] <= cur_share and _stored_start(seg, spec, k)]
@@ -2036,8 +2081,9 @@ _COL_EMIT_MIN = 10000      # past this many groups the answer is emitted by colu
 def _key_values(seg, kk, a):
     """one key's values for the returned groups, exactly as the per-group loop emits them: a sequence column's own
     values, a scalar's surrogate values, a CASE key's default for -1, else seg.values_at -- [_pyval(fetch(code))]
-    by contract, each front-coded block walked once (the point fetches were 223 s of 232 for SearchPhrase's 5.9M
-    groups: ~65 Python steps per value, 17 us against values_at's 1 us)"""
+    by contract, each front-coded block walked once (point fetches cost ~65 Python steps per value)
+
+    Lore: the point fetches were 223 s of 232 for SearchPhrase's 5.9M groups: 17 us against values_at's 1 us."""
     if kk['kind'] == 'scalar':
         # each surrogate value as the per-group loop emits it (v.item() for a numpy scalar): the value list holds
         # numpy ints for the arithmetic and length scalars, and an object array's tolist hands them back as numpy
@@ -2064,10 +2110,13 @@ def _key_values(seg, kk, a):
 
 def _emit_columns(seg, spec, keyarr, sel, sel_w, rep, cnt, cells):
     """THE COLUMNAR EMISSION (2026-10-24, the GROUP BY holes): the per-group loop below sorted a list and point-fetched
-    every key value of every group -- SearchPhrase, COUNT(*) WHERE IsRefresh = 0 GROUP BY SearchPhrase was 102.6 s for
-    5.9M groups, 223 s of a profiled 232 in the point fetches. Here every projected column is one array over the
+    every key value of every group -- millions of groups spent nearly all their time in the point fetches. Here every
+    projected column is one array over the
     returned groups, each front-coded dictionary block walked once, the same values the loop emits (seg.values_at: the loop's _pyval(fetch) by contract); a ColRows past COL_GATE
-    (wdb_colresult), tuples below."""
+    (wdb_colresult), tuples below.
+
+    Lore: SearchPhrase, COUNT(*) WHERE IsRefresh = 0 GROUP BY SearchPhrase was 102.6 s for 5.9M groups, 223 s of a
+    profiled 232 in the point fetches."""
     import wdb_colresult as CR
     n = int(sel.size)
     byp = {}
@@ -2130,10 +2179,12 @@ def _exceptions_counts(seg, spec, lo, hi, ck):
         k's census over every row  -  k's census over the rows some filter fails,
     and the filters' own censuses say, before any scan, how many rows each keeps: the exceptions (at most the sum of
     the failing counts) are listed instead of the survivors (at least the smallest keeping count) whenever they are
-    fewer. Measured (excproto.py, same counts): RegionID WHERE IsRefresh = 0 (93.3% kept) 0.550 -> 0.228 s,
+    fewer.
+    = / <> filters only, the whole table (no span), COUNT only -- subtraction undoes a count; MIN / MAX it cannot.
+
+    Lore: measured (excproto.py, same counts): RegionID WHERE IsRefresh = 0 (93.3% kept) 0.550 -> 0.228 s,
     DontCountHits = 0 0.486 -> 0.278, AdvEngineID = 0 0.528 -> 0.149, SearchPhrase / UserID by IsRefresh 0.64 /
-    0.78 -> 0.34 / 0.35; SearchPhrase WHERE TraficSourceID = 0 (18.3% kept) keeps the survivors (0.49 vs 1.17).
-    = / <> filters only, the whole table (no span), COUNT only -- subtraction undoes a count; MIN / MAX it cannot."""
+    0.78 -> 0.34 / 0.35; SearchPhrase WHERE TraficSourceID = 0 (18.3% kept) keeps the survivors (0.49 vs 1.17)."""
     if not _EXC_ROUTE[0] or lo != 0 or hi < int(seg.N) or not spec['eqs']:
         return None
     if spec['flags'] or spec['ins'] or spec['likes'] or spec['nulls'] or spec['ors'] or spec['sflags']:
@@ -2252,8 +2303,9 @@ def execute(seg, spec):
         # THE COUNT FROM THE CENSUS (2026-10-19, the LIKE board): COUNT(*) WHERE col LIKE p over a dictionary
         # of at most ~1M values is the rows of the matching values -- the census of the codes, counted from the
         # encoding itself where it can be (raw_census), with no row positions written. The scan wrote every hit's
-        # position to count them (HitColor LIKE '%5%': 80M positions, 366 ms; UTMContent 250 ms flat). Big
-        # dictionaries keep the scan: their census costs more than it (Q20 on URL: 480 ms against 150).
+        # position to count them. Big dictionaries keep the scan: their census costs more than it.
+        # lore: HitColor LIKE '%5%': 80M positions, 366 ms; UTMContent 250 ms flat; Q20 on URL: census 480 ms
+        # against the scan's 150.
         col9, fl9, _n9 = lflags[dl]
         c9 = seg.cols[col9]
         V9 = int(c9['V'])
@@ -2351,8 +2403,9 @@ def execute(seg, spec):
         c_e = seg.cols.get(col) or {}
         if pos_full and c_e.get('mode') in (0, 1, 2) and seg._effective(col) is None:
             # THE RESIDUAL THAT SCANS (2026-10-19): nothing has filtered yet (a LIKE every value passes), so this
-            # filter reads the column through its own scanners -- SearchPhrase <> '' from the e8 planes' literals
+            # filter reads the column through its own scanners -- col <> '' from the e8 planes' literals
             # -- instead of gathering codes at every row and comparing them on one thread
+            # lore: SearchPhrase <> '' was the case
             if op == '=':
                 pos = _scan_eq(seg, col, int(code), lo, hi)
             else:
@@ -2597,7 +2650,8 @@ def execute(seg, spec):
             kth = cmax9 + 1
         elif cmax9 <= (1 << 24):
             # the k-th largest count from a count of the counts: one pass, no selection worst case
-            # (np.partition over 6M mostly-tied counts: 0.97 s under Q21 with K LIKE '%')
+            # (np.partition over millions of mostly-tied counts is slow)
+            # lore: np.partition over 6M mostly-tied counts: 0.97 s under Q21 with K LIKE '%'
             hist9 = np.bincount(cnt, minlength=cmax9 + 1)
             above9 = np.cumsum(hist9[::-1])           # groups with count >= cmax9 - j
             kth = cmax9 - int(np.searchsorted(above9, K9))
@@ -2627,9 +2681,10 @@ def execute(seg, spec):
         order = order[hmask[order]]
     sel = order[spec['off']: spec['off'] + spec['lim']] if spec['lim'] is not None else order[spec['off']:]
     # THE LATE AGGREGATES (2026-10-19, the LIKE board): the groups the answer returns are known once the counts
-    # are; every other aggregate is computed over THEIR rows only. Q21 with a one-letter needle gathered MIN(K)'s
-    # codes for 60M survivors and folded them with ufunc.at, to keep ten groups. From here pos / ginv / G are
-    # the returned groups' rows (sel_w: each returned group's local index); rep maps back to every survivor's row.
+    # are; every other aggregate is computed over THEIR rows only, not over every survivor. From here pos / ginv / G
+    # are the returned groups' rows (sel_w: each returned group's local index); rep maps back to every survivor's row.
+    # lore: Q21 with a one-letter needle gathered MIN(K)'s codes for 60M survivors and folded them with ufunc.at, to
+    # keep ten groups.
     G_all = cnt.size
     rix9 = None
     if sel.size < G_all and pos.size >= _LATE_MIN_ROWS:

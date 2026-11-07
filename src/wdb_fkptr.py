@@ -6,7 +6,9 @@ instead of a hash match. Kept as a sidecar next to the child segment (like the p
 sidecars) so the immutable .wdb bytes are never touched. A MISSING sidecar just means "no pointer".
 
 Stored delta-encoded + zstd: on a clustered arm (child sorted so the pointer is monotonic) this
-compresses ~95% (measured on TPC-H lineitem->orders); reconstructed with one cumsum on load.
+compresses well; reconstructed with one cumsum on load.
+
+Lore: the ~95% compression was measured on TPC-H lineitem->orders.
 """
 import os, struct, numpy as np, zstandard as zstd
 

@@ -10,7 +10,7 @@ above it, read their pairs from the segment, dedupe in count order, and stop at 
 irrelevant -- it is a masked scan, not a sorted read -- which is exactly why maintenance needs no
 resort: a new occurrence is a value-overwrite of that pair's rows (+1) in place.
 
-Tradeoff vs heavypair (measured, 100M cb25db, UserID x SearchPhrase): footprint scales per-ROW
+Tradeoff vs heavypair (measured, 100M rows, an int key x a text key): footprint scales per-ROW
 (~2 B/row uint16) instead of per-PAIR; read top-10 ~47 ms presence-scan vs heavypair's ~microsecond
 pre-sorted front; maintenance a ~37 ms find+rewrite (no resort) vs a full rebuild. ~17x faster than
 DuckDB on the read, with a per-row footprint that scales with the data, not the pair cardinality.
@@ -20,6 +20,8 @@ keys, projections {bare k1, bare k2, COUNT(*)}, LIMIT N, NO WHERE/HAVING/DISTINC
 COUNT(*) DESC or no ORDER BY. Filtered shapes are declined (heavypair's kept-axis walk serves those).
 Gated behind _ENABLED (default False) so the shipped heavypair path is untouched until countpos is
 promoted; when disabled detect returns None and the query routes to heavypair exactly as before.
+
+Lore: the measurements were on the 100M-row cb25db, keys UserID x SearchPhrase.
 """
 import numpy as np
 import wdb_qmem

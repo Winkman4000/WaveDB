@@ -1,4 +1,4 @@
-"""wdb_lenagg -- grouped string-measure aggregates (Q27's shape) from the strings' stored lengths.
+"""wdb_lenagg -- grouped string-measure aggregates from the strings' stored lengths.
 
   SELECT K, AGG(F(S)) [, COUNT(*)] FROM t [WHERE S <> ''] GROUP BY K [HAVING COUNT(*) op n]
   [ORDER BY <a projection> [ASC|DESC]] [LIMIT n]          AGG = AVG | SUM, F any registered numeric scalar fn
@@ -7,12 +7,14 @@
 comes from the V-table of F over S's dictionary (the dictionary's character lengths for LENGTH), or, for
 LENGTH, from the row lengths the load stored (wdb_lens) -- then S's numbers are never read. No string is born.
 
-2026-10-18 (the Q27 board, every key profile x every text profile, 680 queries): this was a hidden first try
+2026-10-18 (a board of every key profile x every text profile, 680 queries): this was a hidden first try
 inside general_scan, so the route map could not see it, and its frame-range reader carried an encoding gate
 (code_enc 0/3/5/8/10/12/19 for both columns) that sent 386 of the 680 queries to the scan at 2.2x DuckDB.
 Now a registered read; the pour runs over the decoded codes (_raw_codes reads every encoding) on every core:
 per-thread padded boards for a key up to BIG_KV values, the range partition (bincount_big's method) past it.
-Fail-closed: any unrecognized limb -> None, the next read serves."""
+Fail-closed: any unrecognized limb -> None, the next read serves.
+
+Lore: built for ClickBench Q27's shape; the 2026-10-18 board was the Q27 board."""
 import os
 import numpy as np
 from sqlglot import expressions as E
@@ -22,25 +24,32 @@ import wdb_policies as P
 _HITS = 0
 _PF = {}                      # kept for older callers (tests cleared it after a detect); detect starts no thread
 # past this many keys: the range partition. Measured (pod 2, 100M rows, stored row lengths; boards / partition ms):
-# KV 9K 13 / 406 (URL dense) 16 / 91 (SearchPhrase sparse); 1.4M 117 / 293, 91 / 78; 6M 353 / 350; 9.8M 631 / 362,
+# KV 9K 13 / 406 (a dense text column) 16 / 91 (a sparse one); 1.4M 117 / 293, 91 / 78; 6M 353 / 350; 9.8M 631 / 362,
 # 572 / 84; 17.6M 1058 / 358, 989 / 90. The boards grow with the keys, the partition with the live rows.
+# lore: the dense text column was URL, the sparse one SearchPhrase
 BIG_KV = int(os.environ.get('WDB_LENAGG_BIG_KV', str(4 << 20)))
 # under WHERE S <> '': live rows up to N / SPARSE_DIV are grouped at their rows (0: never) for a key past SPARSE_KV
-# values, up to N / SPARSE_DIV_SMALL for a smaller key. Measured (pod 2, the Q27 board): a big key's pour costs its
+# values, up to N / SPARSE_DIV_SMALL for a smaller key. Measured (pod 2): a big key's pour costs its
 # boards / partition -- 1.56% live sorted and grouped in 31-44 ms, 13% live 285-450 ms where the pour is cheaper;
-# a small key's pour is cheap and its read at 1.5M rows is not (Robotness x UTMSource 98 -> 205 ms), while 2,263
-# live rows still win (ResolutionHeight x ParamOrderID 100 -> 35 ms)
+# a small key's pour is cheap and its read at 1.5M rows is not (98 -> 205 ms), while 2,263
+# live rows still win (100 -> 35 ms)
+# lore: measured on the Q27 board; the 1.5M-row pair was Robotness x UTMSource, the 2,263-row one
+# lore: ResolutionHeight x ParamOrderID
 SPARSE_KV = 1 << 20
 # THE LIVE ROWS FIRST (2026-10-27): an enc-10 measured column with at most N >> LIVE_SHIFT non-empty rows is read at
-# those rows only. Measured on the Q27 board (this PC): SocialSourcePage (177,085 non-empty) 68 of 68 variants faster,
-# ~155 ms -> 4-67 ms (0.03-0.7x DuckDB, were 1.5-3.1x); OpenstatAdID / OpenstatServiceName (460K) 30 of 30 faster. Other
-# encodings lose (their non-empty rows cost more to find than the current read: ParamOrderID enc 3, 2,263 rows, 27 ->
-# 50 ms; UTMSource enc 3 30 -> 115; MobilePhoneModel enc 9 47 -> 270; SocialNetwork enc 2 20 -> 350; text 17-85%
+# those rows only. Measured (this PC): a column with 177,085 non-empty rows 68 of 68 variants faster,
+# ~155 ms -> 4-67 ms (0.03-0.7x DuckDB, were 1.5-3.1x); two with 460K 30 of 30 faster. Other
+# encodings lose (their non-empty rows cost more to find than the current read: enc 3, 2,263 rows, 27 ->
+# 50 ms; enc 3 30 -> 115; enc 9 47 -> 270; enc 2 20 -> 350; text 17-85%
 # non-empty 160 ms -> 0.7-5.5 s). Nothing past 460K non-empty was measured: the line sits at N / 128 (781K).
 # Only where the read would inflate the stored ROW LENGTHS (rowl: 134 ms for 100M rows whatever the column): the
-# OpenstatAdID / OpenstatServiceName columns carry none, their read already works off the codes (30-70 ms), and the
-# live rows lost there on the board -- CounterID x OpenstatAdID open 67 -> 87 ms, SocialNetwork x OpenstatServiceName
+# columns that carry none already read off the codes (30-70 ms), and the
+# live rows lost there on the board -- open 67 -> 87 ms,
 # filtered 30 -> 39 (re-timed back to back, c83 vs c84).
+# lore: measured on the Q27 board. The 177,085-row column was SocialSourcePage, the 460K ones OpenstatAdID /
+# lore: OpenstatServiceName (they carry no row lengths); the losers were ParamOrderID (enc 3, 2,263 rows), UTMSource
+# lore: (enc 3), MobilePhoneModel (enc 9), SocialNetwork (enc 2); the re-timed pairs were CounterID x OpenstatAdID
+# lore: (open) and SocialNetwork x OpenstatServiceName (filtered).
 LIVE_SHIFT = int(os.environ.get('WDB_LENAGG_LIVE_SHIFT', '7'))      # -1: never
 LIVE_ENC = (10,)
 _LIVE_HITS = [0]
@@ -188,7 +197,9 @@ def detect(seg, tree, col_map):
 
 def _empty_code(seg, lcol):
     """the code of '' in lcol's dictionary, or -1: '' sorts first in a sorted dictionary, so when present it IS
-    code 0 -- one fetch, not a binary search through the front-coded chunks (measured 71 ms on URL)"""
+    code 0 -- one fetch, not a binary search through the front-coded chunks (measured 71 ms on a big text dictionary)
+
+    Lore: the 71 ms was measured on URL."""
     if not int(seg.cols[lcol]['V']):
         return -1
     z0 = seg.fetch(lcol, 0)
@@ -206,8 +217,10 @@ def _empty_code(seg, lcol):
 def _too_few(spec, k):
     """THE TOO-FEW-ROWS BOUND (Jackson, 2026-10-27): every group's count is between 1 and k (k = the kept rows), so
     when no count from 1 to k passes HAVING COUNT(*) op n, no group passes. The HAVING ops are monotone (> >= < <=) or
-    single-valued (= <>), so testing 1, k and n clipped into 1..k is exact. Measured (this PC): LocalEventTime x
-    ParamOrderID HAVING COUNT(*) > 100000, k = 2,263: the key's whole decode (69 ms of 103 ms) was read for nothing"""
+    single-valued (= <>), so testing 1, k and n clipped into 1..k is exact. Measured (this PC): a time key x a sparse
+    column HAVING COUNT(*) > 100000, k = 2,263: the key's whole decode (69 ms of 103 ms) was read for nothing
+
+    Lore: the pair was LocalEventTime x ParamOrderID."""
     h = spec['having']
     if h is None:
         return False
@@ -349,14 +362,16 @@ def _sums(seg, spec):
         return None
     if not rowl:
         sc = np.asarray(seg._raw_codes(lcol))
-    # THE GRAB (2026-10-18, the Q27 board's corner): under WHERE S <> '' a mostly-empty S leaves few live rows --
-    # a big key's whole decode and its KV-sized boards were most of the cost (WatchID x ParamOrderID 2,263 live
+    # THE GRAB (2026-10-18): under WHERE S <> '' a mostly-empty S leaves few live rows --
+    # a big key's whole decode and its KV-sized boards were most of the cost (2,263 live
     # rows: 211 ms). Count the live rows (one parallel pass); none: no group; few: read the key at them only and
     # group them by a sort. Past N / SPARSE_DIV the pour below is cheaper (measured: 13% live, a sort 285-450 ms)
+    # lore: the Q27 board's corner; the 2,263-row case was WatchID x ParamOrderID
     div = SPARSE_DIV if KV > SPARSE_KV else SPARSE_DIV_SMALL
     if spec['excl_empty'] and div > 0 and (rowl or ec >= 0):
         # a strided sample (~100K rows, ~1 ms) says when the live rows are plainly too many, so the dense side skips
-        # the count pass (12-30 ms on 100M; UserID x SearchPhrase, 13% live, had paid it for nothing)
+        # the count pass (12-30 ms on 100M; a pair with 13% live had paid it for nothing)
+        # lore: the 13%-live pair was UserID x SearchPhrase
         smp = (L if rowl else sc)[::1021]
         live_est = float(np.count_nonzero(smp) if rowl else np.count_nonzero(smp != ec)) / max(1, smp.size)
         pos = None

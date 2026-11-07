@@ -1,6 +1,6 @@
 """stair: single-key GROUP BY reads served from a STAIRCASE column's step positions -- no code
 decode, no dict materialization, no scan. A staircase column (codes non-decreasing in row order,
-i.e. data ingested sorted by it: EventTime, EventDate) is fully described by the rows where its
+i.e. data ingested sorted by it, such as a timestamp or date column) is fully described by the rows where its
 code ticks +1: per-value COUNT(*) is literally np.diff over the step array, so the whole group-by
 is O(V) arithmetic on a structure that is ~KB (code_enc=2) instead of a 100M-row scan. Values
 decode winner-only via seg.fetch (never the full dict). The exception law as a read: the norm is
@@ -8,7 +8,9 @@ decode winner-only via seg.fetch (never the full dict). The exception law as a r
 
 v1 scope: GROUP BY col with projections {bare col, COUNT(*)}, no WHERE/JOIN/HAVING/DISTINCT/
 OFFSET, no overrides/deleted rows; ORDER BY COUNT(*) DESC (canonical count-desc, code-asc
-tiebreak), ORDER BY col ASC, or unordered; LIMIT optional when the value space is small."""
+tiebreak), ORDER BY col ASC, or unordered; LIMIT optional when the value space is small.
+
+Lore: the staircase columns in mind were EventTime and EventDate."""
 import numpy as np
 import sqlglot.expressions as E
 import wdb_sql

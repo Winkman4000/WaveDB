@@ -210,7 +210,9 @@ class Database:
         nothing else"). What a database does when it starts -- never what a query computes:
         open every segment (the file's column layout: metadata, not data), load the SQL parser,
         import the engine's reads (program). Nothing decoded from the data is built or kept here --
-        ClickBench clears database caches before every first run, and this fills none."""
+        a cold first run clears database caches before it starts, and this fills none.
+
+        Lore: the cold-run rule is ClickBench's (caches cleared before every first run)."""
         _load_program()
         for t in self.cat.list_tables():
             for p in self.cat.segment_paths(t):
@@ -224,8 +226,9 @@ class Database:
         override (UPDATE) sidecars are forced to reload, and ADD COLUMN synth columns re-registered."""
         # UNDER AN UNMOVED STAMP, NOTHING MOVED: DML and compaction move the catalog stamp, so while it
         # holds, the segment file cannot have changed and its DELETE/UPDATE sidecars cannot have
-        # appeared -- the stat and the forced sidecar reload (7 stats per JOB query, 0.57s per 113)
+        # appeared -- the stat and the forced sidecar reload (7 stats per query, 0.57s per 113 queries)
         # are skipped. The stamp itself is the registry's ttl-cached one.
+        # lore: measured on the JOB board (113 queries).
         stamp = self._catalog_stamp()
         hit = self._seg_cache.get(path)
         if hit is not None and stamp is not None and getattr(self, '_seg_stamp', {}).get(path) == stamp:
@@ -261,10 +264,12 @@ class Database:
         distinct count (nd) was computed by its build and every column's nd came back from the pool.
         FD knowledge (parent->child where nd(pair) == nd(parent)) is recorded for every proven pair;
         TWIN deferral additionally requires near-bijection (child/parent nd ratio >= 0.90) AND a fat
-        structure -- an FD with heavy collapse (a near-key like WatchID, a hierarchy like
-        EventTime->EventDate) does NOT make the parent-side slice substitutable, and deferring tiny
+        structure -- an FD with heavy collapse (a near-unique key, a hierarchy like
+        timestamp->date) does NOT make the parent-side slice substitutable, and deferring tiny
         exception-defined slices saves nothing while costing a first-touch rebuild. Deferred twins
-        rebuild-on-touch exactly, so nothing becomes unanswerable. Returns bytes freed."""
+        rebuild-on-touch exactly, so nothing becomes unanswerable. Returns bytes freed.
+
+        Lore: the examples were ClickBench's WatchID and EventTime->EventDate."""
         fd = {}; parents = set(); twins = {}
         for ent in manifest:
             ndp = ent.get('nd')
@@ -285,10 +290,11 @@ class Database:
             if verbose:
                 print("prewarm FD PROVEN: %s -> %s (nd(pair)=%d == nd(%s), child/parent nd ratio %.3f)"
                       % (par, ch, ndp, par, ratio), flush=True)
-            # TWINS require near-bijection: an FD with heavy collapse (near-key parents like WatchID,
-            # hierarchies like EventTime->EventDate) does NOT make (X,parent) substitutable by
+            # TWINS require near-bijection: an FD with heavy collapse (near-unique parents,
+            # hierarchies like timestamp->date) does NOT make (X,parent) substitutable by
             # (X,child) -- those are different matrices and different query shapes. Only a ~1:1
             # relabeling makes the parent-side copy redundant.
+            # lore: the examples were ClickBench's WatchID and EventTime->EventDate.
             if ratio >= 0.90:
                 twins[ch] = par
         freed = 0
@@ -706,10 +712,11 @@ class Database:
                     # THE QUERY'S CYCLES DIE WITH IT (2026-10-31, Jackson's law): the fused join's inner functions call
                     # each other, so their closures -- and the per-query containers they hold (slot_list, slots,
                     # _colmemo: whole columns) -- form reference cycles that only Python's cyclic collector frees, and
-                    # it counts objects, not bytes. Left alone: 2.3 GB of Q5's arrays alive after it returned (TPC-H
-                    # SF10), a board worker at 27 GB. A gen-1 pass frees them all (a full pass frees no more, at
-                    # 31-40 ms); measured inside the timing: ClickBench 5.414 -> 5.400 s, TPC-H +3.7% (the freeing
-                    # itself, which hot runs had been skipping)
+                    # it counts objects, not bytes. Left alone: 2.3 GB of a multi-table join's arrays alive after it
+                    # returned, a board worker at 27 GB. A gen-1 pass frees them all (a full pass frees no more, at
+                    # 31-40 ms); measured inside the timing: the single-table board 5.414 -> 5.400 s, the join board
+                    # +3.7% (the freeing itself, which hot runs had been skipping)
+                    # lore: the 2.3 GB was TPC-H Q5 at SF10; the boards were ClickBench and TPC-H.
                     import gc as _gc9
                     _gc9.collect(1)
                 if _bill9:
@@ -719,10 +726,12 @@ class Database:
     def _star_in_declared_order(self, sql, res):
         """SELECT * ANSWERS IN THE TABLE'S OWN COLUMN ORDER (2026-09-28): a segment's columns sit in
         the order the load finished them (seg.order is the file's order, and FD columns index into
-        it), and every read that serves a bare * listed them that way -- Q23's ten rows were right
-        value for value, in the wrong column order. The table's declared order is the catalog's
+        it), and every read that serves a bare * listed them that way -- a SELECT * ... LIMIT 10's ten rows
+        were right value for value, in the wrong column order. The table's declared order is the catalog's
         schema (written in the input's order at load); a bare * over one table is laid out in it
-        here, once, for whichever read served the query."""
+        here, once, for whichever read served the query.
+
+        Lore: the ten rows were ClickBench Q23's."""
         try:
             if not (isinstance(res, tuple) and len(res) == 2 and isinstance(res[1], (list, tuple))):
                 return res
@@ -760,7 +769,8 @@ class Database:
             if wdb_literal.references_only_literals(tree, _is_stored9):
                 return wdb_literal.run_literal(tree)       # LITERAL RELATIONS: no stored table touched
             if wdb_cte.has_cte(tree):
-                _once9 = wdb_cte.once_rewrite(self, tree)     # THE WITH READ TWICE, RUN ONCE (Q15)
+                # lore: THE WITH READ TWICE, RUN ONCE came from TPC-H Q15.
+                _once9 = wdb_cte.once_rewrite(self, tree)     # THE WITH READ TWICE, RUN ONCE
                 if _once9 is not None:
                     return self._run_impl(_once9, escalate)
                 tree = wdb_cte.rewrite(tree)      # flatten views before anything resolves
@@ -769,10 +779,12 @@ class Database:
                 import os as _os9
                 import wdb_subquery as _wsq9
                 import wdb_projdoor as _wpd9
-                _pd9 = _wpd9.try_door(self, tree)                 # THE PROJECTION DOOR (Q2)
+                # lore: THE PROJECTION DOOR came from TPC-H Q2.
+                _pd9 = _wpd9.try_door(self, tree)                 # THE PROJECTION DOOR
                 if _pd9 is not None:
                     return _pd9
-                _srs9 = _wsq9.same_rows_spec(self, tree)          # THE SAME ROWS, ONE WALK (Q11)
+                # lore: THE SAME ROWS, ONE WALK came from TPC-H Q11.
+                _srs9 = _wsq9.same_rows_spec(self, tree)          # THE SAME ROWS, ONE WALK
                 if _srs9 is not None:
                     _h9 = _wsq9._SAME_ROWS_HITS[0]
                     _wsq9._SR_PENDING[0] = _srs9
@@ -784,7 +796,8 @@ class Database:
                         pass                                       # not taken: the subquery runs on its own below
                     finally:
                         _wsq9._SR_PENDING[0] = None
-                _js9 = _wsq9.join_scalars(self, tree)             # THE JOIN'S OWN SCALARS (Q11)
+                # lore: THE JOIN'S OWN SCALARS came from TPC-H Q11.
+                _js9 = _wsq9.join_scalars(self, tree)             # THE JOIN'S OWN SCALARS
                 if _js9 is not None:
                     return self._run_impl(_js9, escalate)
                 import wdb_segparts
@@ -869,11 +882,13 @@ class Database:
                         rows = [r[:drop] + r[drop + 1:] for r in rows]   # legacy paths that
                         hdr = hdr[:drop] + hdr[drop + 1:]                # still emit the helper
                     return rows, hdr
-                import wdb_projdoor as _wpd9s                 # THE VALUE PER ROW (Q20's middle query): a
+                # lore: THE VALUE PER ROW came from TPC-H Q20's middle query.
+                import wdb_projdoor as _wpd9s                 # THE VALUE PER ROW: a
                 _pd9s = _wpd9s.try_door(self, tree, single=True)   # comparison against a correlated scalar
                 if _pd9s is not None:                         # subquery, judged at the survivors
                     return _pd9s
-                import wdb_runwalk                        # THE RUN WALK (Q4): [NOT] EXISTS over a child
+                # lore: THE RUN WALK came from TPC-H Q4.
+                import wdb_runwalk                        # THE RUN WALK: [NOT] EXISTS over a child
                 wdb_runwalk.rewrite(self, tree)           # stored by its key -> a per-row verdict
                 tree = wdb_subquery.rewrite(self, tree)   # in-tree: no sql-text roundtrip
                 sql = tree.sql()                          # for reads that consume raw sql

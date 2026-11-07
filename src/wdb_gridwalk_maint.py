@@ -20,9 +20,11 @@ fresh sorted base + ones (preserving untouched launch singletons) and clears the
 recompact-on-restart step; the tail degrades slowly between recompactions (most inserts hit existing
 heavy cells, which bump in place rather than growing the tail).
 
-This is the in-memory maintenance machinery, validated exactly against a full rebuild on 100M-row
-cb25db. Compact at-rest persistence of ones (gid-only gap codec) and the tail, and anchor-based
+This is the in-memory maintenance machinery, validated exactly against a full rebuild on 100M rows.
+Compact at-rest persistence of ones (gid-only gap codec) and the tail, and anchor-based
 point-lookup that avoids materializing the base flat, are the next increments.
+
+Lore: the rebuild check ran on cb25db (a 100M-row ClickBench load).
 """
 import numpy as np
 

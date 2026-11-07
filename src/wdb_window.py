@@ -2,7 +2,7 @@
 
 The architecture is the child-language design: walking the file once, each row is placed into
 its partition's lane; which lane = the group, position down the lane = the rank. Because the
-file is cluster-ordered (EventTime), order within every lane is INHERITED from the walk -- no
+file is cluster-ordered (by its stair column), order within every lane is INHERITED from the walk -- no
 comparison sort ever happens. The placement is one stable integer argsort of partition codes
 (counting-sort machinery); everything else is vectorized lane arithmetic on the permutation:
 ROW_NUMBER is position-minus-lane-start, LAG/LEAD are lane neighbors, running SUM/COUNT are
@@ -15,6 +15,8 @@ materialization). Full-output shapes require LIMIT. Everything else declines to 
 
 Functions: ROW_NUMBER, RANK/DENSE_RANK (over the order column's values), LAG, LEAD,
 running SUM, running COUNT(*).
+
+Lore: the cluster order in mind was EventTime.
 """
 import numpy as np
 import sqlglot.expressions as E
@@ -207,7 +209,9 @@ def _int_table(seg, col):
     the fixed number line: file layout IS the compute layout, the OS page cache owns the
     bytes, zero per-query rebuild. The map survives drop_derived lawfully (it IS a file,
     same class as seg.buf). Else _dict_ints when the layout has it, typed-dict otherwise.
-    Never float64 -- values past 2**53 lose low bits there (caught live: UserID)."""
+    Never float64 -- values past 2**53 lose low bits there.
+
+    Lore: caught live on UserID."""
     nl = _nline(seg, col)
     if nl is not None:
         return nl

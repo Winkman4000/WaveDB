@@ -7,9 +7,10 @@ import threading, numpy as np, zstandard as zstd
 from concurrent.futures import ThreadPoolExecutor
 _DT_UNITS = ['us','ns','ms','s','D','h','m','M','Y','W']
 # THE TWO TIERS (Jackson, 2026-09-23: "keep what is legal for the hot board, but it must not
-# interfere with the cold aspect -- cold reads are the heart of the engine"). ClickBench: "Caching
+# interfere with the cold aspect -- cold reads are the heart of the engine"). The rules kept: "Caching
 # source data (e.g. buffer pools) is fine"; caches "near the end of the query execution pipeline ...
 # similar to query result caching ... should be disabled"; indices are not recommended.
+# lore: the rules quoted are ClickBench's.
 #   TIER 1 -- the SOURCE-DATA cache, may outlive a query: the file's own values decoded (dictionaries,
 #   sparse planes, staircase steps, inline streams). A cache only KEEPS what a query already produced;
 #   it never makes a query do extra work to fill it. The official cold run restarts the process, so
@@ -66,8 +67,10 @@ _E19FOLD = [__import__('os').environ.get('WDB_E19_FOLD', '1') == '1']   # A/B: 0
 def _e19s_blocks(c, pw, dw, N, b0, b1, cc):
     """THE FIXED-WIDTH READERS, enc 19 shelved (Jackson, 2026-09-30): blocks [b0, b1) grouped by pointer
     width, each group through its own generated kernel (wdb_fw.e19s_L: 64 rows = L whole words, every
-    shift a constant, a u32 label). UserID hot, measured: 26.2 ms -> 17.5, exact. A width with no
-    kernel (0: a one-value block) takes the general reader, block by block."""
+    shift a constant, a u32 label). Hot, measured: 26.2 ms -> 17.5, exact. A width with no
+    kernel (0: a one-value block) takes the general reader, block by block.
+
+    Lore: measured on UserID."""
     import wdb_kernels as _WK
     BR = np.int64(c['e19BR']); W = np.int64(c['e19W']); wb = np.int64(c['e19wb'])
     lbs = c['e19lb'][b0:b1]
@@ -105,7 +108,9 @@ _LEAF_POOL = None
 def _leaf_pool():
     """ONE shared executor for all frame-decompress leaf jobs -- three
     loaders each spawning cpu_count() threads oversubscribed the box 3x
-    (measured on Q12's shadow). Leaf jobs never submit, so no deadlock."""
+    (measured). Leaf jobs never submit, so no deadlock.
+
+    Lore: measured on Q12's shadow."""
     global _LEAF_POOL
     if _LEAF_POOL is None:
         import os as _osl
@@ -650,11 +655,12 @@ class Segment:
         self._presence = 0; self._ov = 0; self._cluster = 0; self._cubes = 0
         # THE LAW, ENFORCED (2026-09-23): the named list above had drifted -- position lists, LIKE
         # flags, regex groups, sparse planes, scanned codes, censuses, date maps and more lived on
-        # the Segment across queries (Q22's run 2 skipped a 1.3 s LIKE; Q28's a 3.9 s regex
+        # the Segment across queries (a second run skipped a 1.3 s LIKE; another a 3.9 s regex
         # derivation). Every underscore container on the Segment dies now, save the three that
         # are not data: _synth (ADD COLUMN, catalog state), _tdict (the shelf's vocabulary, kept
         # above), _civil_lut_cache (the calendar). Every lazily-set '_' key on a column's
         # metadata dies too (_dictbytes, _steps, _idict, ...): cols keep only the file's shape.
+        # lore: the second runs were Q22's (the LIKE) and Q28's (the regex)
         sk = seg_keep(); ck = col_keep()                   # THE TWO TIERS (see _SEG_TIER1)
         for k, v in list(self.__dict__.items()):
             if k.startswith('_') and k not in sk and hasattr(v, 'clear') \
@@ -750,10 +756,12 @@ class Segment:
 
     def read_span(self, fb, fe):
         """bytes [fb, fe) of the segment file in ONE read. THE COLD READ (2026-09-23): through the
-        memory map a cold frame arrives page fault by page fault, in small pieces (Q28 pulled 839 MB
+        memory map a cold frame arrives page fault by page fault, in small pieces (one query pulled 839 MB
         at ~0.25 GB/s); one pread per frame, issued by the parallel workers, is many large streams
         (the pod's storage: 0.7 GB/s one stream, 1.7-1.8 at 16-32). Warm, it is the same one copy
-        the memory-map slice made."""
+        the memory-map slice made.
+
+        Lore: the 839 MB query was Q28."""
         import os as _osr
         fd = self.__dict__.get('_fd_read')
         if fd is None:
@@ -992,8 +1000,10 @@ class Segment:
         RUN: one pread, its frames inflated in the run's own thread, one reshaped cumsum (each chunk's
         deltas start from 0, so every row of the reshape sums on its own). Runs go in parallel,
         sized so a wide read keeps 16 streams busy. A toll per chunk -- a pool task, a call, a
-        small sum -- measured 1.45 s against 0.68 s for WatchID's 12,207 chunks. Returns the
-        number of values brought in."""
+        small sum -- measured 1.45 s against 0.68 s for a near-unique column's 12,207 chunks. Returns the
+        number of values brought in.
+
+        Lore: the 12,207 chunks were WatchID's."""
         cache = c['i2chunks']
         need = sorted(set(int(j) for j in chs if out is not None or int(j) not in cache))
         if not need:
@@ -1014,8 +1024,9 @@ class Segment:
             a = int(zo[r[0]])
             raw = memoryview(self.read_span(base + a, base + int(zo[r[-1] + 1])))
             dz = _z.ZstdDecompressor()                   # frame by frame: this call releases the GIL
-            d = np.empty(len(r) * CH, np.int64); n = 0   # (one call across frames held it: HID's
-            for j in r:                                  # 652 MB took 1130 ms on 16 threads, 150 so)
+            d = np.empty(len(r) * CH, np.int64); n = 0   # (one call across frames held it: a 652 MB
+            # lore: the column was ClickBench's HID
+            for j in r:                                  # column took 1130 ms on 16 threads, 150 so)
                 x = np.frombuffer(dz.decompress(raw[int(zo[j]) - a:int(zo[j + 1]) - a]), dtype=np.int64)
                 d[n:n + x.size] = x; n += x.size
             d = d[:n]; nf = n // CH
@@ -1102,9 +1113,11 @@ class Segment:
         """Mode-5 POINT READ: bytes at ROW positions. Decompresses lengths+bytes
         once per column (cached on the column), then slices -- no full object
         array, no np.unique. (values_at's mode-5 path built the whole sorted
-        dict to answer 20 lookups: 7s per query on Q10, 2026-09-01.)
+        dict to answer 20 lookups: 7s per query.)
         A BLOCKED column (2026-10-03): rows in a quarter of the blocks or fewer inflate those blocks alone
-        (kept on the column per block, tier 1); more, the whole stream."""
+        (kept on the column per block, tier 1); more, the whole stream.
+
+        Lore: the 7 s per query was Q10's, 2026-09-01."""
         c = self.cols[nm]
         st = c.get('_istream')
         if st is None and c.get('iblk') is not None:
@@ -1345,10 +1358,12 @@ class Segment:
     def _e3_pipelined(self, c):
         """THE READ AND THE DECODE AT ONCE (2026-09-24): an enc-3 full decode used to pull the whole
         code section first (warm_span: parallel preads) and only then decompress it in 8 lanes --
-        the CPU waited for the storage, then the storage sat idle while the CPU worked (URL: ~196 ms
-        of reading, then 170 ms of decoding). Here 16 lanes each own a stretch of frames and walk it
+        the CPU waited for the storage, then the storage sat idle while the CPU worked (a big text column:
+        ~196 ms of reading, then 170 ms of decoding). Here 16 lanes each own a stretch of frames and walk it
         in RUNS of neighbouring frames (one pread of up to 8 MB, then its frames inflated), so one
-        lane's inflate overlaps another's read. zstd releases the GIL frame by frame."""
+        lane's inflate overlaps another's read. zstd releases the GIL frame by frame.
+
+        Lore: the big text column was URL."""
         wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
         isz = np.dtype(wdt).itemsize
         cc = np.empty(self.N, dtype=wdt)
@@ -1514,12 +1529,13 @@ class Segment:
                                  c['e19lb'], c['e19gw'], c['e19dc'], poff, doff, cc)
             return cc
         if shelved:
-            # THE SHELVED SCHEDULE (2026-09-30, measured cold on UserID, 16 cores, 250 MB): a shelved decode
+            # THE SHELVED SCHEDULE (2026-09-30, measured cold on a shelved column, 16 cores, 250 MB): a shelved decode
             # needs EVERY label before any slice, so the slices only follow the pointers; 16 thin slices
             # ran one after another after the labels landed (118-159 ms of decode vs 47 in one hot call)
             # and the shelf table (e19tab, 2.7 MB) faulted in page by page inside the first (~50 ms).
             # Now the shelf table is read with the labels and the pointers decode in 4 slices:
             # 197-217 ms cold against 242-293, ~10-15 ms after the last byte lands.
+            # lore: the shelved column was UserID
             K = 4
         K = max(1, min(K, nb))
         cuts = [nb * k // K for k in range(K + 1)]
@@ -1624,10 +1640,11 @@ class Segment:
         if c.get('code_enc', 0) in (8, 9) and _PLANES[0]:
             # THE SPARSE DRESS FROM ITS PLANES (2026-09-24): the present rows' positions and codes
             # (e8_planes: the few percent of rows off the default), then one default fill and one
-            # scatter. Measured warm: SearchPhrase 245 -> ~90 ms (the 3-pass kernel's in-kernel
-            # uint32 fill was the bill), MobilePhone 232 -> ~159 (the old path unpacked a 100M-bit
-            # presence plane and index-filtered it per tier), MobilePhoneModel 141 -> ~82.
+            # scatter. Measured warm: a sparse text column 245 -> ~90 ms (the 3-pass kernel's in-kernel
+            # uint32 fill was the bill), a sparse int column 232 -> ~159 (the old path unpacked a 100M-bit
+            # presence plane and index-filtered it per tier), another sparse text column 141 -> ~82.
             # Output widths unchanged: enc 8 uint32, enc 9 by its bits.
+            # lore: the three were SearchPhrase, MobilePhone and MobilePhoneModel
             pos_p, lits_p, d_p = self.e8_planes(nm)
             wdt_p = np.uint32 if c['code_enc'] == 8 else (np.uint8 if c['e9bits'] <= 8 else np.uint16)
             cc = np.full(self.N, d_p, dtype=wdt_p)
@@ -1677,8 +1694,9 @@ class Segment:
         if c.get('code_enc', 0) == 1:                # zstd of byte-aligned codes (clustered/skewed)
             wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
             # THE STREAM INTO ITS PLACE (2026-10-21): the one-shot decompress of a copy of the frame took 66 ms for
-            # IsOldCounter's 100M bytes; the stream read straight into the column's reserved array takes 8-11 (the
+            # a 100M-byte column; the stream read straight into the column's reserved array takes 8-11 (the
             # same bytes, checked equal). A walk from the top that already read a prefix is read on from there.
+            # lore: the 100M-byte column was IsOldCounter
             isz1 = np.dtype(wdt).itemsize
             self._e1_prefix(nm, c, int(self.N) * isz1, wdt)
             st1 = self.__dict__.get('_e1pre', {}).pop(nm, None)
@@ -1780,7 +1798,8 @@ class Segment:
             import wdb_kernels as _WK20
             cc = np.empty(self.N, dtype=self._e20_dtype(c))
             # on every vCPU (run_wide), as the window and the gather already ran: the walk is per-row work the
-            # hyperthreads overlap (RefererHash, one load: 59 ms on numba's 8 threads, 39 ms on 16)
+            # hyperthreads overlap (one back-reference column, one load: 59 ms on numba's 8 threads, 39 ms on 16)
+            # lore: measured on RefererHash
             _WK20.run_wide(_WK20.e20_decode, np.frombuffer(self.buf, np.uint8), np.int64(c['cstart']),
                            np.int64(c['e20BR']), np.int64(self.N), np.int64(c['e20bits']), c['e20boff'], cc)
             self._codes[nm] = cc; return cc
@@ -1855,7 +1874,8 @@ class Segment:
             wdt0 = np.uint8 if bits <= 8 else (np.uint16 if bits <= 16 else np.uint32)
             cc = np.zeros(self.N, wdt0)              # native width, kernel at scale
             if _FWR[0]:                              # THE FIXED-WIDTH READERS: 8 values = bits bytes
-                import wdb_fw as _FW                 # (WatchID / HID hot, measured: ~31-41 ms -> ~22, exact)
+                # lore: measured on WatchID / HID
+                import wdb_fw as _FW                 # (two big int columns hot, measured: ~31-41 ms -> ~22, exact)
                 _FW.BP0[int(bits)](np.frombuffer(self.buf, np.uint8), np.int64(base), np.int64(self.N), cc)
             else:
                 _WK.bp0_decode(np.frombuffer(self.buf, np.uint8), int(base),
@@ -1878,7 +1898,8 @@ class Segment:
         BR = int(c['e20BR'])
         b0 = lo // BR; b1 = (hi - 1) // BR + 1
         out = np.empty(min(self.N, b1 * BR) - b0 * BR, dtype=self._e20_dtype(c))
-        # back-reference walks: latency-bound, on every vCPU (run_wide; Q40/Q41 on the c6a ~5 ms each)
+        # back-reference walks: latency-bound, on every vCPU (run_wide; ~5 ms a query on the c6a)
+        # lore: the ~5 ms each were Q40/Q41
         _WK20.run_wide(_WK20.e20_decode_blocks, np.frombuffer(self.buf, np.uint8), np.int64(c['cstart']),
                        np.int64(BR), np.int64(self.N), np.int64(c['e20bits']), c['e20boff'],
                        np.int64(b0), np.int64(b1), out)
@@ -2210,11 +2231,13 @@ class Segment:
         return out
 
     def _e14_planes(self, nm):
-        """THE DATE PLANES STAY (2026-10-31, TPC-H): an enc-14 column's three planes ARE its codes, laid out by field
+        """THE DATE PLANES STAY (2026-10-31): an enc-14 column's three planes ARE its codes, laid out by field
         -- the file's own values decompressed, which Jackson's ruling (2026-10-03) keeps for the hot runs as tier-1
-        'codes' and never lets touch a cold run (WDB_HOT_KEEP=0 clears tier 1). Every TPC-H query rebuilt each date
-        it touched: 33 ms per lineitem date (60M rows x 3 planes), the sampled keep share included. Kept on the
-        shelf read-only (one copy serves every query); WDB_E14_KEEP=0 rebuilds them per query as before."""
+        'codes' and never lets touch a cold run (WDB_HOT_KEEP=0 clears tier 1). Every query rebuilt each date
+        it touched: 33 ms per date column (60M rows x 3 planes), the sampled keep share included. Kept on the
+        shelf read-only (one copy serves every query); WDB_E14_KEEP=0 rebuilds them per query as before.
+
+        Lore: found on TPC-H: every TPC-H query rebuilt each date it touched, 33 ms per lineitem date."""
         if not _E14KEEP[0]:
             return self._e14_planes_build(nm)
         import wdb_shelf
@@ -2379,8 +2402,9 @@ class Segment:
         if c.get('mode') in (0, 2):
             # THE COLD NO: the load statistics' per-block min/max codes (non-null) refute a
             # staircase without a byte of the column -- a block whose max exceeds the next block's
-            # min, or a first block not starting at code 0. UserID paid a 100M decode + int64 copy
+            # min, or a first block not starting at code 0. An int key paid a 100M decode + int64 copy
             # + diff (~180 ms, the first query only) to learn "no".
+            # lore: the int key was UserID
             try:
                 import wdb_blockstats as _BS
                 st = _BS._from_load(self, nm)
@@ -2391,10 +2415,11 @@ class Segment:
                 c['_steps'] = None
                 return None
         # THE FIRST-BLOCK NO (2026-09-24): string columns carry no load statistics, so the probe
-        # below decoded, copied and diffed 100M codes to learn "no" (SearchPhrase, MobilePhoneModel:
+        # below decoded, copied and diffed 100M codes to learn "no" (two text columns:
         # 360-480 ms inside wherescan's DETECT, for queries another read then served). A staircase
         # starts at code 0 and never rises by more than 1: one counterexample in the first block
         # refutes it exactly.
+        # lore: the text columns were SearchPhrase and MobilePhoneModel
         if nm not in self._codes and self.N > 0:
             try:
                 h = np.asarray(self._raw_codes_range(nm, 0, min(int(self.N), 65535)), np.int64)   # < 64K: enc 8's rank read, not its full decode
@@ -2465,8 +2490,10 @@ class Segment:
         """THE PERSON COUNT FROM THE SHELVES (2026-10-02, Jackson: "if we have to read all the frames, read
         them at memory bandwidth"): per-code row counts of a shelved enc-19 column without the 100M decode
         or the per-thread boards. Pass A per block (pointer counts on a block-sized board, flat list);
-        pass B per shelf (each shelf adds into its own slice of the total). UserID on the pod: today's
-        decode + boards 118 ms, this 63.5 ms at 8 threads (36.5 at 16); the bytes alone 28-31 ms."""
+        pass B per shelf (each shelf adds into its own slice of the total). On the pod: today's
+        decode + boards 118 ms, this 63.5 ms at 8 threads (36.5 at 16); the bytes alone 28-31 ms.
+
+        Lore: measured on UserID."""
         import wdb_kernels as _WK
         nb = int(c['e19lb'].size); poff = c['e19poff']
         cs = int(c['cstart']); ds = int(c['e19dstart'])
@@ -2488,9 +2515,11 @@ class Segment:
         overrides), length max(V, minlength) -- np.bincount(self._raw_codes(nm)) exactly -- counted
         from the encoding itself where it can be, with no 100M-row decode: enc 5 (patched buckets)
         by a nibble census + its escapes, enc 10 (bitpack-plus) by its run lengths and its packed
-        blocks. Measured hot (pod): Q1's AdvEngineID decode + count 26 ms, Q2/Q29's ResolutionWidth
+        blocks. Measured hot (pod): one small int column's decode + count 26 ms, another's
         49 + 12-17 ms, plus the flush of the decoded arrays (14-16 ms). Otherwise the decode +
-        bincount_par, as every caller did. WDB_CENSUS_DRESS=0 restores the decode everywhere."""
+        bincount_par, as every caller did. WDB_CENSUS_DRESS=0 restores the decode everywhere.
+
+        Lore: the columns were Q1's AdvEngineID (26 ms) and Q2/Q29's ResolutionWidth (49 + 12-17 ms)."""
         import wdb_kernels as _WK
         c = self.cols[nm]
         L = max(int(c['V']), int(minlength))
@@ -2500,7 +2529,8 @@ class Segment:
         if _CENSUS[0] and c.get('mode') in (0, 1, 2) and (enc == 2 or c.get('_steps') is not None):
             # THE STAIRCASE CENSUS (2026-10-18): a staircase's count of code k is the gap between its k-th and
             # (k+1)-th step -- the stair read's own arithmetic, O(V). Under a WHERE (groupself) the census had
-            # repeated 100M codes out of the steps and counted them: GoodEvent / HTTPError 42 ms against 2 ms.
+            # repeated 100M codes out of the steps and counted them: 42 ms against 2 ms.
+            # lore: measured on GoodEvent / HTTPError
             st = self.stairs(nm)
             if st is not None:
                 cnt = np.diff(np.concatenate(([0], st, [self.N]))).astype(np.int64)
@@ -2524,10 +2554,12 @@ class Segment:
         """THE SUM FROM THE BLOCK DICTIONARIES (2026-10-01): (exact SUM of the stored values as a Python
         int, non-null rows) for an enc-19 column, or None. tab: the value of each non-null code (the
         integer dictionary). Per block, its row pointers are counted on a board the size of its own
-        dictionary, and each entry is weighed once -- where AVG(UserID) decoded 100M codes (62 ms hot)
+        dictionary, and each entry is weighed once -- where an AVG decoded 100M codes (62 ms hot)
         and counted them on per-thread boards of 17.6M bins (1.1 GB, 119 ms). Equal to
         fold_counts(np.bincount(codes), tab). Cold: the pointers and the block dictionaries are brought
-        in by the parallel reader first (page faults run ~0.25 GB/s). WDB_E19_VALSUM=0 declines."""
+        in by the parallel reader first (page faults run ~0.25 GB/s). WDB_E19_VALSUM=0 declines.
+
+        Lore: the AVG was AVG(UserID)."""
         c = self.cols[nm]
         if (not _VALSUM[0] or c.get('code_enc') != 19 or nm in self._codes
                 or c.get('mode') not in (0, 1, 2)):
@@ -2562,16 +2594,18 @@ class Segment:
         return _WK.HAVE_NUMBA and _libzstd() is not None
 
     def e20_read_sum(self, nm):
-        """THE READ-VALUES SUM (Jackson's order of operations, 2026-10-22, Q29's RefererHash): (exact SUM, rows) of a
+        """THE READ-VALUES SUM (Jackson's order of operations, 2026-10-22): (exact SUM, rows) of a
         back-reference (enc 20) integer column, or None. SUM needs the values added, not counts: the census wrote a mark
-        per row on a board of V counters hit at random (RefererHash: 194 ms for 21.6M counters) and then multiplied.
+        per row on a board of V counters hit at random (194 ms for 21.6M counters) and then multiplied.
         Here (1) the dictionary unzips into an array in compiled lanes (i2_inflate, 22 ms) and (2) each block is walked
         once to weigh its literals by the rows that lead back to them, then reads value x weight per literal in a loop
-        of its own (e20_read_sum) -- reads overlap where writes collide. RefererHash: census + fold 208 ms -> 113.
+        of its own (e20_read_sum) -- reads overlap where writes collide. Measured: census + fold 208 ms -> 113.
         THE SWITCH: SUM / AVG over enc 20 with a chunked integer dictionary, no NULLs, codes not decoded already (then
         the census over them is the cheaper road). The size sweep (20M-row columns, census + fold vs this, all exact):
         64K values 22.2 vs 19.0 ms, 256K 21.5 vs 16.1, 1M 26.2 vs 15.2, 4M 66.1 vs 19.8, 9.5M 124.3 vs 45.6 -- never
-        slower, so no size line (WDB_E20_READSUM_MIN can set one). WDB_E20_READSUM=0 declines."""
+        slower, so no size line (WDB_E20_READSUM_MIN can set one). WDB_E20_READSUM=0 declines.
+
+        Lore: built for Q29's RefererHash; the 194 ms and the 208 -> 113 ms were measured on it."""
         c = self.cols[nm]
         if (not _E20RS[0] or c.get('code_enc') != 20 or c.get('mode') != 2 or c.get('has_null')
                 or c.get('dt', 0) != 0 or nm in self._codes or not self.i2_foldable(nm)):
@@ -2601,14 +2635,14 @@ class Segment:
         return (sum(int(x) for x in oh) << 32) + sum(int(x) for x in ol), int(self.N)
 
     def rpf_sum(self, nm):
-        """THE REPEATS-PER-FRAME FOLD (Jackson, 2026-10-21, Q29's WatchID): (exact SUM, rows) of a big integer
+        """THE REPEATS-PER-FRAME FOLD (Jackson, 2026-10-21): (exact SUM, rows) of a big integer
         dictionary column with almost no repeated values, with no census; None when the switch is off.
 
         THE SWITCH -- repeats per frame, RPF = (N - V) / F: rows that repeat a value someone already holds, over the
         dictionary's frames (F of CH values each). Every column carries it in its own numbers. Below the line most
-        frames hold no repeat and the rest hold one; the census (one counter per value, 100M of them for WatchID,
-        hit at random: ~200 ms) is not needed. WatchID: 4 repeats / 12,207 frames = 0.0003; the next column, HID,
-        1,863.
+        frames hold no repeat and the rest hold one; the census (one counter per value, 100M of them for a 100M-row
+        near-unique column, hit at random: ~200 ms) is not needed. Such a column: 4 repeats / 12,207 frames = 0.0003;
+        the next column, 1,863.
 
         THE ORDERING:
           1. one walk of the codes keeps, per frame, its rows and the sum of their codes (bp0_frame_tally);
@@ -2619,7 +2653,9 @@ class Segment:
              times as it repeats (i2_fold_sparse).
         Exact: no NULLs, no deletes / overrides (the caller's checks), and every frame's arithmetic must agree
         (a frame with fewer rows than codes, or repeats that do not add up to N - V, declines).
-        WDB_RPF=0 declines; WDB_RPF_MAX is the line (default 1.0: the sweep's fold won at every point to 0.82 repeats per frame, the paths crossed near 1.8)."""
+        WDB_RPF=0 declines; WDB_RPF_MAX is the line (default 1.0: the sweep's fold won at every point to 0.82 repeats per frame, the paths crossed near 1.8).
+
+        Lore: built for Q29's WatchID (4 repeats / 12,207 frames); the next column was HID (1,863)."""
         c = self.cols[nm]
         if (not _RPF[0] or c.get('mode') != 2 or c.get('has_null') or c.get('dt', 0) != 0
                 or c.get('code_enc', 0) != 0 or 'boffs' in c or not c.get('bits') or nm in self._codes
@@ -2707,9 +2743,11 @@ class Segment:
         Python int, non-null rows) of a shelved enc-19 column over a chunked integer dictionary, or None.
         Pass A as the census (per block, its pointers counted on a block-sized board); then per shelf its own
         codes counted on a small board and folded against the dictionary frames that hold them -- the full
-        census (UserID: 17.6M int64s, 141 MB written then read back by i2_fold) is never built. Q3 measured
+        census (17.6M int64s at 17.6M values, 141 MB written then read back by i2_fold) is never built. Measured
         (server, hot): pass A 13.3 ms, pass B 20 + 7 faulting the total, the fold 13.8, ~59 ms in all.
-        Equal to i2_fold_sum(nm, raw_census(nm)[:n_dict]) and its row count. WDB_E19_FOLD=0 declines."""
+        Equal to i2_fold_sum(nm, raw_census(nm)[:n_dict]) and its row count. WDB_E19_FOLD=0 declines.
+
+        Lore: the 17.6M-value column was UserID; the measurement was Q3."""
         c = self.cols[nm]
         if (not _E19FOLD[0] or not _CENSUS[0] or not _E19CENSUS[0] or c.get('code_enc') != 19 or 'e19R' not in c
                 or c.get('mode') not in (0, 1, 2) or not self.i2_foldable(nm)):
@@ -2757,9 +2795,11 @@ class Segment:
     def i2_fold_sum(self, nm, counts):
         """THE FOLD THROUGH THE DICTIONARY'S OWN FRAMES (2026-10-19): exact sum(counts[k] * value[k]) as a
         Python int over column nm's chunked integer dictionary, straight from its zstd frames
-        (wdb_kernels.i2_fold) -- the 100M-value spine is never built (AVG(WatchID): inflate 0.5 s + numpy
-        fold 0.26 s became 0.1 s). counts: rows per code; only the first n_dict (the non-null codes) are
-        folded. None when not i2_foldable, or a frame fails to inflate."""
+        (wdb_kernels.i2_fold) -- the 100M-value spine is never built (AVG of a near-unique column: inflate 0.5 s
+        + numpy fold 0.26 s became 0.1 s). counts: rows per code; only the first n_dict (the non-null codes) are
+        folded. None when not i2_foldable, or a frame fails to inflate.
+
+        Lore: measured on AVG(WatchID)."""
         if not self.i2_foldable(nm):
             return None
         import wdb_kernels as _WK
@@ -2837,9 +2877,10 @@ class Segment:
         if self.cols[nm]['mode'] != 6:   # mode-6 synth value can change via register_synth; don't memo
             self._tdict[nm] = r
         # THE WIDTH LAW at the source: a STRING dictionary is an object array, never a Python
-        # list -- np.asarray(list_of_bytes) builds a fixed-width S<maxlen> array (6M URLs x a
+        # list -- np.asarray(list_of_bytes) builds a fixed-width S<maxlen> array (6M strings x a
         # thousands-byte longest value = tens of GB in one C call, GIL held: the fused cascade
-        # OOM-killed the server on AVG(length(URL)) before any watchdog could see it)
+        # OOM-killed the server on an AVG(length(s)) before any watchdog could see it)
+        # lore: the 6M strings were URLs; the query AVG(length(URL))
         _c9 = self.cols[nm]
         if _c9.get('dt') == 1 and isinstance(r, list) and _c9.get('mode') in (0, 1, 2):
             r = np.array(r, dtype=object)
@@ -2857,7 +2898,8 @@ class Segment:
             # values) every query. An int64 array, the same form mode 2 already returns
             if c.get('m0span') is not None and c['mode'] == 0:
                 # THE DIGITS COMPILED (2026-10-03): the plain dictionary's own bytes parsed in place --
-                # np.asarray(list).astype was still ~0.5 s cold on person_role_id's 3.1M values (JOB 10c)
+                # np.asarray(list).astype was still ~0.5 s cold on a 3.1M-value column
+                # lore: person_role_id's 3.1M values (JOB 10c)
                 import wdb_kernels as _WKi
                 out = np.empty(int(c['n_dict']), np.int64)
                 if _WKi.parse_m0_ints(np.asarray(self.buf), np.int64(c['m0span']), out):
@@ -3177,9 +3219,11 @@ class Segment:
         sparse-default (tag 8) column and their codes, from the head chunks only -- (pos, lits, n_all).
         A chunk's checkpoint is the rank at its start, so chunks [0, e) hold ck[e] present rows and
         their literals are the first ck[e] of the lane: e is the first checkpoint >= k. Plain numpy
-        (no kernel to load cold). ORDER BY a staircase LIMIT k (Q24/Q26) wanted the first ~64 of
+        (no kernel to load cold). ORDER BY a staircase LIMIT k wanted the first ~64 of
         13.2M; e8_planes decoded all of them (~90-110 ms cold). The full planes when already decoded,
-        or when the head would be the whole column. None for any other column."""
+        or when the head would be the whole column. None for any other column.
+
+        Lore: the ORDER BY a staircase LIMIT k queries were Q24/Q26."""
         c = self.cols.get(nm)
         if c is None or c.get('code_enc', 0) != 8:
             return None
@@ -3207,11 +3251,13 @@ class Segment:
         return pos, lits, n_all
 
     def low_counts(self, nm, T):
-        """THE LOW COUNT (2026-10-02, Q25): rows per code for codes 0..T-1 only -- what ORDER BY a
+        """THE LOW COUNT (2026-10-02): rows per code for codes 0..T-1 only -- what ORDER BY a
         value-sorted dictionary LIMIT k needs (the first k codes), not a census of all V. The sparse
         dress (tag 8): the default value's count is N minus the literals; the literal lane is read
         once by a counting kernel (no row positions, nothing densified). Any other dress: its codes,
-        counted below T. Exact. Nothing is kept."""
+        counted below T. Exact. Nothing is kept.
+
+        Lore: built for Q25."""
         import wdb_kernels as _WK
         c = self.cols[nm]; T = int(T)
         bits = int(c.get('e8bits', 0) or 0)
@@ -3242,7 +3288,8 @@ class Segment:
         if c.get('code_enc', 0) == 20 and nm not in self._codes and T <= (1 << 16):
             # the back-reference decodes block by block in each lane's board and counts there: no 100M-code array;
             # a back-reference walk waits on memory latency, so it runs on every vCPU (run_wide), not the engine's
-            # 8-thread cap for bandwidth-bound boards (RefererHash: 101 -> ~60 ms)
+            # 8-thread cap for bandwidth-bound boards (a back-reference column: 101 -> ~60 ms)
+            # lore: measured on RefererHash
             P = int(_WK.wide_threads())
             scr = np.empty((P, int(c['e20BR'])), np.int64)
             cnt = np.zeros((P, T), np.int64)
@@ -3288,11 +3335,12 @@ class Segment:
             return out8
         if enc_r == 9 and nm not in self._codes and 0 <= lo < hi and hi - lo < 65536:
             # THE TIERED DRESS, BY RANK (2026-09-30): a small range of a tag-9 column fell to the full
-            # decode -- stairs()' first-block "no" on MobilePhoneModel paid 170 ms inside wherescan's
-            # detect (Q10, Q11) to read 64K rows. The presence bitmap + checkpoints give the window's
+            # decode -- stairs()' first-block "no" on a tag-9 text column paid 170 ms inside wherescan's
+            # detect to read 64K rows. The presence bitmap + checkpoints give the window's
             # literal ranks [a, b); each tier's bitmap runs over the literals the earlier tiers left,
             # in order, so the window's leftovers stay one contiguous stretch of every tier's list:
             # the bits before it shift it (a -= set bits before a), the bits inside it assign.
+            # lore: the column was MobilePhoneModel, the queries Q10, Q11
             c = self.cols[nm]
             pb9 = np.asarray(self.buf[c['e9pres']:c['e9pres'] + (self.N + 7) // 8], dtype=np.uint8)
             ck9 = np.frombuffer(self.buf[c['e9ck']:c['e9ck'] + ((self.N + 65535) // 65536) * 8],
@@ -3326,10 +3374,11 @@ class Segment:
                                                  # the cached full decode is exact and 54ms-class
         if enc_r == 17:
             # RAW PACKED CODES had no branch here and fell to the bit-packed reader below, which
-            # reads another layout: every window of Age and WindowClientWidth came back scrambled
-            # (WHERE WindowClientWidth = 1863 counted 123,662 rows of 1,985,884; the shifting
+            # reads another layout: every window of two raw-packed columns came back scrambled
+            # (an equality filter counted 123,662 rows of 1,985,884; the shifting
             # board, 2026-10-12). The cached decode if present; a small window gathers its rows;
             # a wide one unpacks the column once.
+            # lore: the columns were Age and WindowClientWidth; the filter WHERE WindowClientWidth = 1863
             if nm in self._codes or hi - lo >= (1 << 16):
                 return self._raw_codes(nm)[lo:hi]
             if lo >= hi:
@@ -3415,12 +3464,15 @@ class Segment:
 
     def _e89_at(self, c, rows):
         """THE POINT READ BY RANK (2026-10-01), tags 8 and 9 (codes in the caller's row order, int64).
-        Measured cold before it (the gather census, cb_van0929): codes_at built the column's whole planes
-        for any row count -- Q23 asked 10 rows of BrowserLanguage (175 ms), MobilePhone (159),
-        SearchPhrase (115), OriginalURL (101); Q21/Q22 ~17K/44K rows of SearchPhrase (135/150).
+        Measured cold before it (the gather census): codes_at built the column's whole planes
+        for any row count -- 10 rows cost 101-175 ms a column, ~17K/44K rows 135/150 ms.
         Now: rows sorted; each row's rank from its 64K checkpoint plus the presence bits up to it
         (wdb_kernels.e8_rank_at); tag 8 reads each present row's literal at rank * bits; tag 9 walks the
-        tiers (e9_tier_at: hit, or the index among what the tier leaves) and the tail."""
+        tiers (e9_tier_at: hit, or the index among what the tier leaves) and the tail.
+
+        Lore: measured on cb_van0929 (a ClickBench load).
+        Q23 asked 10 rows of BrowserLanguage (175 ms), MobilePhone (159), SearchPhrase (115),
+        OriginalURL (101); Q21/Q22 ~17K/44K rows of SearchPhrase (135/150)."""
         import wdb_kernels as _WK
         rows = np.asarray(rows, np.int64)
         n = rows.size
@@ -3432,7 +3484,8 @@ class Segment:
         pres = np.frombuffer(self.buf, np.uint8, (self.N + 7) // 8, po)
         ck = np.frombuffer(self.buf, np.uint64, nck, c['e9ck' if t9 else 'e8ck'])
         # (tried and dropped: warming the presence/literal spans ahead when many rows land on them --
-        # Q21's 17K-row SearchPhrase read went 115 -> 187 ms cold; the page faults were not the cost)
+        # a 17K-row read went 115 -> 187 ms cold; the page faults were not the cost)
+        # lore: the 17K-row read was Q21's SearchPhrase
         rank = np.empty(n, np.int64); present = np.empty(n, np.int64)
         _WK.e8_rank_at(pres, ck, rs, rank, present)
         outs = np.full(n, int(c['e9d' if t9 else 'e8d']), np.int64)
@@ -3509,9 +3562,11 @@ class Segment:
             band13 = self._e13_band(nm, lo13, hi13)
             return band13[rows - lo13]
         if c.get('code_enc', 0) in (8, 9, 10) and nm not in self._codes and rows.size >= (self.N >> _MANY_AT_SHIFT):
-            # THE MANY-ROW READ (2026-10-19, the LIKE board): the point reads are for a few rows. SearchPhrase's
-            # codes at 100M rows by rank: 2,858 ms; at 13M: 438 -- the whole column decodes in ~75-150 ms and the
-            # gather is one pass (kept in _codes for the reads that follow, dropped at query end like any decode)
+            # THE MANY-ROW READ (2026-10-19, the LIKE board): the point reads are for a few rows. A sparse text
+            # column's codes at 100M rows by rank: 2,858 ms; at 13M: 438 -- the whole column decodes in ~75-150 ms
+            # and the gather is one pass (kept in _codes for the reads that follow, dropped at query end like any
+            # decode)
+            # lore: the column was SearchPhrase
             return self._raw_codes(nm)[np.asarray(rows, np.int64)]
         if c.get('code_enc', 0) == 10:
             if nm in self._codes:                    # already decoded: gather free
@@ -3595,12 +3650,13 @@ class Segment:
             return out0
         if c.get('code_enc', 0) == 1 and nm not in self._codes:
             # ONE FRAME, READ TO THE LAST ROW ASKED: enc-1 is a single zstd frame, and a point read
-            # inflated all 100M codes (ParamPrice: 87 ms for ten rows). zstd streams, so the prefix
+            # inflated all 100M codes (87 ms for ten rows). zstd streams, so the prefix
             # up to the highest row is what is inflated -- the first ten hits of a scan are early rows.
             # THE PREFIX KEPT (2026-10-21): a walk from the top asks window after window (firstk: 262K rows, then
             # 512K at a time) -- each used to re-inflate from row 0, and any window past 64K rows inflated all
-            # 100M (IsOldCounter's walk to its 10th kept row at 7.4M: 60 ms -> ~6). The stream stays open for the
+            # 100M (a walk to its 10th kept row at 7.4M: 60 ms -> ~6). The stream stays open for the
             # query and is read on; past half the column the whole decode is as cheap, and is taken.
+            # lore: the ten rows were ParamPrice's; the walk IsOldCounter's
             wdt1 = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]
             isz1 = np.dtype(wdt1).itemsize
             need1 = (int(rows.max()) + 1) * isz1
@@ -3618,8 +3674,9 @@ class Segment:
                     return _scc[_ix]
         if c.get('code_enc', 0) == 3 and 'boffs' in c and nm not in self._codes and rows.size >= (self.N >> 3):
             # THE MANY-ROW READ, enc 3 (2026-10-19): rows this many touch every frame anyway -- the whole decode is
-            # the same inflate without the per-frame gathers (HitColor at 13M rows 72 -> 44 ms, UserAgentMinor
-            # 89 -> 49, URL 169 -> 143), and it stays for the reads that follow
+            # the same inflate without the per-frame gathers (three columns at 13M rows: 72 -> 44 ms,
+            # 89 -> 49, 169 -> 143), and it stays for the reads that follow
+            # lore: the three were HitColor, UserAgentMinor and URL
             return self._raw_codes(nm)[rows]
         if c.get('code_enc', 0) == 18 and nm not in self._codes and rows.size < (self.N >> 2):
             # PACKED FRAMES, AT ROWS: inflate each touched frame to the byte its highest row needs,
@@ -3744,10 +3801,12 @@ class Segment:
         the frame runs come from one pass (_frame_runs), every lane takes a contiguous run of frames on
         the persistent gather pool, and inflates and gathers straight into its own slice of the output with
         a compiled loop (the main thread had gathered every frame, after two sorts and a fresh pool).
-        Measured on the dashboards' rows (CounterID = 62: 738K rows, 193 frames) against pure inflation of
-        the same frames on 8 threads (the floor): URL 27.6 -> 18.1 ms (floor 17.5), Referer 35.5 -> 24.8
-        (23.9), TraficSourceID 24.3 -> 8.8 (6.1), SearchEngineID 22.9 -> 6.9 (4.1). Same codes, same dtype.
-        WDB_SORTGATHER=0 restores the general path."""
+        Measured on one filter's rows (738K rows, 193 frames) against pure inflation of the same frames on
+        8 threads (the floor): two text columns 27.6 -> 18.1 ms (floor 17.5) and 35.5 -> 24.8 (23.9), two
+        small int columns 24.3 -> 8.8 (6.1) and 22.9 -> 6.9 (4.1). Same codes, same dtype.
+        WDB_SORTGATHER=0 restores the general path.
+
+        Lore: the dashboards' rows (CounterID = 62); the columns URL, Referer, TraficSourceID, SearchEngineID."""
         import io as _io, wdb_kernels as _WK
         wdt = {1: np.uint8, 2: np.uint16, 4: np.uint32}[c['cwidth']]; isz = np.dtype(wdt).itemsize
         BR = int(c['BR']); base = int(c['cstart']); bo = c['boffs']; N = int(self.N)
@@ -3755,8 +3814,9 @@ class Segment:
         ub, st, en = self._frame_runs(rows, BR)
         if _E3_BATCH_FRAMES and ub.size >= _E3_BATCH_FRAMES:
             # THE BATCH GATHER: the touched frames' segments in one multi_decompress_to_buffer (zstd's C threads; the
-            # lanes' Python threads contend: 1,526 frames of UTMSource 129 ms -> 15.7, ResponseEndTiming 129 -> 39,
-            # URL 139 -> 63), then the compiled gather per frame. Whole frames: no partial read (the lanes keep it).
+            # lanes' Python threads contend: 1,526 frames of three columns 129 ms -> 15.7, 129 -> 39,
+            # 139 -> 63), then the compiled gather per frame. Whole frames: no partial read (the lanes keep it).
+            # lore: the three were UTMSource, ResponseEndTiming and URL
             import zstandard as _zs
             bo64 = np.asarray(bo, np.int64)
             o0 = int(bo64[int(ub[0])]); o1 = int(bo64[int(ub[-1]) + 1])
@@ -3799,8 +3859,9 @@ class Segment:
         ub, st, en = self._frame_runs(rows, BR)
         if _E3_BATCH_FRAMES and ub.size >= _E3_BATCH_FRAMES:
             # THE BATCH GATHER (enc 3's sibling): the touched frames in one zstd call on its own threads, then each
-            # frame's words gathered by bit arithmetic (the lanes' Python threads waited on locks: ClientEventTime
+            # frame's words gathered by bit arithmetic (the lanes' Python threads waited on locks: a time column
             # at 2,263 rows over ~1,000 frames spent ~70 ms there)
+            # lore: the column was ClientEventTime
             import zstandard as _zs
             from wdb_kernels import pk32_words as _words
             po = np.asarray(c['poffs'], np.int64); base = int(c['cstart'])

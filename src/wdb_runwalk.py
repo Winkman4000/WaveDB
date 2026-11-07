@@ -1,10 +1,10 @@
-"""wdb_runwalk: THE RUN WALK (Jackson, 2026-11-04, TPC-H Q4).
+"""wdb_runwalk: THE RUN WALK -- a correlated [NOT] EXISTS answered by walking the child's run per parent.
 
     SELECT ... FROM parent WHERE <parent's own filters> AND [NOT] EXISTS
         (SELECT * FROM child WHERE child.fk = parent.key AND <child's own filters>)
 
-When the child is stored in order of its key to the parent (the road child -> parent never decreases:
-lineitem by l_orderkey), each parent's children are ONE contiguous run. Then:
+When the child is stored in order of its key to the parent (the road child -> parent never decreases),
+each parent's children are ONE contiguous run. Then:
   1. the shape (_spec): one outer table, the correlation is one equality child.fk = parent.key, every other
      inner conjunct is the child's own (column vs column, column vs literal), numeric dictionary columns;
   2. the parent survivors (_parent_keep): the outer's own one-column literal filters judged over each
@@ -16,7 +16,9 @@ lineitem by l_orderkey), each parent's children are ONE contiguous run. Then:
      (wdb_groupexists' query-scoped registry), so the existing aggregation reads it as any other filter;
      the outer filters the walk spent leave the WHERE.
 Nothing is kept between queries: no run starts, no masks (the registry dies with the query).
-A shape outside this leaves the tree untouched. Switch WDB_RUN_WALK (default on)."""
+A shape outside this leaves the tree untouched. Switch WDB_RUN_WALK (default on).
+
+Lore: Jackson, 2026-11-04, for TPC-H Q4 (lineitem stored by l_orderkey)."""
 import os
 import numpy as np
 from numba import njit, prange

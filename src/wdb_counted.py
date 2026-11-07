@@ -5,23 +5,27 @@ SELECT k1..kn, COUNT(*) FROM t [WHERE ...] GROUP BY k1..kn [ORDER BY ...] [LIMIT
 (NULL is one value either way). The counted form reaches the reads built for GROUP BY -- dict_count, stair,
 smallk, fused_agg -- where the bare DISTINCT reached diskpair or the general scan's DISTINCT path. Measured, hot,
 the same answers every shape (distgb.py, 2026-10-24):
-  DISTINCT ResponseEndTiming + 1             diskpair 0.459 s (general scan 65.1)  -> dict_count 0.087-0.093
-  DISTINCT minute(EventTime)                 diskpair 0.327 s (general scan 57.9)  -> stair      0.010-0.018
-  DISTINCT minute(EventTime) WHERE IsRefresh = 0   general scan 61.0 s             -> wherescan  2.24-2.35
-  DISTINCT ResponseEndTiming, Robotness      diskpair 1.262 s (fused_agg 2.44)     -> smallk     0.37-0.41
-  DISTINCT ResponseEndTiming, minute         diskpair 1.156 s                      -> fused_agg  0.408
-  DISTINCT length(URL)                       diskpair 0.852 s (general scan 63.9)  -> general scan 1.07-1.15
-and where fused_agg already took the DISTINCT itself, it stays faster (RegionID, TraficSourceID, IsMobile 0.094 vs
-0.219; FetchTiming 0.046 vs 0.081; SearchPhrase WHERE IsRefresh = 0 3.30 vs 102.6), so the counted form goes in
-only at two places:
+  DISTINCT x + 1                             diskpair 0.459 s (general scan 65.1)  -> dict_count 0.087-0.093
+  DISTINCT minute(ts)                        diskpair 0.327 s (general scan 57.9)  -> stair      0.010-0.018
+  DISTINCT minute(ts) WHERE flag = 0         general scan 61.0 s                   -> wherescan  2.24-2.35
+  DISTINCT x, y                              diskpair 1.262 s (fused_agg 2.44)     -> smallk     0.37-0.41
+  DISTINCT x, minute                         diskpair 1.156 s                      -> fused_agg  0.408
+  DISTINCT length(s)                         diskpair 0.852 s (general scan 63.9)  -> general scan 1.07-1.15
+(x, y small integer columns, ts a time column, flag a two-valued column, s a long text column), and where fused_agg
+already took the DISTINCT itself, it stays faster (small integer keys 0.094 vs 0.219 and 0.046 vs 0.081; a text key
+WHERE flag = 0 3.30 vs 102.6), so the counted form goes in only at two places:
   1. AHEAD OF DISKPAIR, on the shapes diskpair would take: the counted form through the read order (no general
-     scan); when no read takes it, diskpair answers as before (length(URL)'s case).
+     scan); when no read takes it, diskpair answers as before (length(s)'s case).
   2. BEFORE THE GENERAL SCAN, for any bare DISTINCT nothing took: the counted form through the read order, the
      general scan included -- its GROUP BY path, not its DISTINCT path (1.1 s against 64).
 WDB_COUNTED_DISTINCT=0 turns both off.
 
 THE KEYS-ONLY GROUP BY (2026-10-24, the GROUP BY holes): SELECT k FROM t GROUP BY k with no aggregate is the same
-question again -- before the general scan it is asked with a hidden COUNT(*) (fallback), the count dropped."""
+question again -- before the general scan it is asked with a hidden COUNT(*) (fallback), the count dropped.
+
+Lore: measured on ClickBench's hits -- x = ResponseEndTiming, y = Robotness, ts = EventTime, flag = IsRefresh,
+s = URL; the fused_agg cases were RegionID, TraficSourceID, IsMobile (0.094 vs 0.219), FetchTiming (0.046 vs 0.081)
+and SearchPhrase WHERE IsRefresh = 0 (3.30 vs 102.6)."""
 import os
 import sqlglot.expressions as E
 
@@ -157,8 +161,10 @@ def execute(ctx, spec):
 
 def fallback(ctx):
     """before the general scan: a bare DISTINCT, or a keys-only GROUP BY (2026-10-24: the general scan's GROUP BY with no
-    aggregate -- the minute 8.8 s, ResponseEndTiming x minute 14.3, SearchPhrase 116.8 -- against COUNT(*)'s stair
-    0.016), nothing took -> (result, read name) or None"""
+    aggregate -- the minute 8.8 s, an integer column x minute 14.3, a text column 116.8 -- against COUNT(*)'s stair
+    0.016), nothing took -> (result, read name) or None
+
+    Lore: the integer column was ClickBench's ResponseEndTiming, the text column SearchPhrase."""
     if not enabled():
         return None
     if bare_distinct(ctx.tree):

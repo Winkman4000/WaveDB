@@ -1,13 +1,15 @@
-"""wdb_pairdistinct -- Q11's guillotine hunt (Jackson's order of operations).
+"""wdb_pairdistinct -- the guillotine hunt for a top-k COUNT(DISTINCT) over a pair (Jackson's order of operations).
 
 SELECT a, b, COUNT(DISTINCT u) FROM t WHERE b <> '' GROUP BY a, b
 ORDER BY cnt DESC LIMIT k   (a, b low-V; u the big differentiator)
 
 Reduce rows by the pair row-census first (the tiny columns cost nothing);
 then correct counts rows -> distinct users, biggest pair first, reading
-UserID only at each candidate pair's rows; STOP when the k-th distinct
+u only at each candidate pair's rows; STOP when the k-th distinct
 beats every remaining pair's ROW count -- distinct <= rows, so nothing
 below the guillotine can climb.
+
+Lore: built for ClickBench Q11 ("Q11's guillotine hunt"); u there is UserID.
 """
 import numpy as np
 from sqlglot import expressions as E
@@ -112,9 +114,9 @@ def _tier_shelf(seg, a, b, u):
     slice. Born once; no zstd frame pops again for this query family."""
     import os
     # THE CODE WIDTH LAW (2026-10-25): a key's codes are u8 only when its V <= 256, else u16 (detect admits V <=
-    # 4096). The u8 cast wrapped code 256+ onto 0+: ParamOrderID (V 397) counted '88563' (code 340) inside
-    # '84163' (code 84) -- 21 users where DuckDB has 9. The widths are in the file name: an old all-u8 shelf is
-    # never read back.
+    # 4096). The u8 cast wrapped code 256+ onto 0+: a key of V 397 counted code 340 inside code 84 -- 21 users
+    # where DuckDB has 9. The widths are in the file name: an old all-u8 shelf is never read back.
+    # lore: the key was ClickBench's ParamOrderID; '88563' (code 340) counted inside '84163' (code 84).
     wa = np.uint8 if int(seg.cols[a]['V']) <= 256 else np.uint16
     wb = np.uint8 if int(seg.cols[b]['V']) <= 256 else np.uint16
     ia, ib = np.dtype(wa).itemsize, np.dtype(wb).itemsize
@@ -126,8 +128,9 @@ def _tier_shelf(seg, a, b, u):
         cb = seg.cols.get(b) or {}
         pl = seg.e8_planes(b) if cb.get('code_enc') in (8, 9) and hasattr(seg, 'e8_planes') else None
         if pl is not None and int(pl[2]) == e0:
-            # THE PLANES ARE THE FILTER (Q11's line items): a tiered/sparse column's planes hold
+            # THE PLANES ARE THE FILTER: a tiered/sparse column's planes hold
             # exactly the non-default rows and their codes -- no full decode, no 100M compare
+            # lore: from Q11's line items.
             typed0 = np.ascontiguousarray(np.asarray(pl[0]), dtype=np.uint32)
             bt0 = np.asarray(pl[1]).astype(wb)
         else:
@@ -162,11 +165,13 @@ _NARROW = [__import__('os').environ.get('WDB_PD_NARROW', '1') != '0']
 
 
 def _narrow(seg, a, b, u):
-    """THE NARROW READ (2026-10-02, Q11's line items on the c6a): only the rows that pass b <> '' are ever
+    """THE NARROW READ (2026-10-02): only the rows that pass b <> '' are ever
     read. b's planes ARE the filter (its non-default rows, ascending, and their codes); a's codes at those
     rows by THE ZIPPER from a's own planes (5.6 ms -- the old way expanded a to all 100M rows, ~31 ms, and
     gathered); u's codes at those rows only (codes_at, 35 ms -- the old way decoded all 100M, 47 ms, and
-    gathered, ~24 ms). None when b is not a sparse/tiered column whose default is ''."""
+    gathered, ~24 ms). None when b is not a sparse/tiered column whose default is ''.
+
+    Lore: from ClickBench Q11's line items, measured on the c6a."""
     import wdb_kernels as _WK
     cb = seg.cols.get(b) or {}
     if cb.get('code_enc') not in (8, 9) or not hasattr(seg, 'e8_planes'):
@@ -193,7 +198,9 @@ def _narrow(seg, a, b, u):
 
 
 def _hunt_lanes(seg, u, key, ukc, ut, K, k):
-    """Jackson's guillotine with the lane hunt: 32 pairs a round (one round on ClickBench's Q11)."""
+    """Jackson's guillotine with the lane hunt: 32 pairs a round.
+
+    Lore: one round on ClickBench's Q11."""
     import wdb_kernels as _WK
     Vu = max(2, int(seg.cols[u]['V']))
     SH = max(1, int(Vu - 1).bit_length() - 6)    # <= 64 user lanes, each table 2^SH u32
@@ -237,7 +244,7 @@ def execute(seg, spec):
     ukc = np.bincount(key, minlength=int(seg.cols[a]['V']) * Vb)
     # Jackson's guillotine, sort-free: candidates are pairs whose ROW count
     # could still beat the k-th DISTINCT count; distinct <= rows prunes the
-    # rest before UserID is ever touched. One packed sort dedups them all.
+    # rest before u is ever touched. One packed sort dedups them all.
     live = np.flatnonzero(ukc)
     live = live[np.argsort(-ukc[live], kind='stable')]
     board = []                               # (distinct, pairkey)

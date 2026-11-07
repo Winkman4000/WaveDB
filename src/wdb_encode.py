@@ -27,9 +27,10 @@ R = 128
 ZSTD_LEVEL = 9
 BLOCK_ROWS = int(os.environ.get('WDB_BLOCK_ROWS', 524288))   # rows per enc=3 frame
 COARSE_ROWS = int(os.environ.get('WDB_COARSE_ROWS', 1 << 22))  # enc=3's coarse tier: big columns only (see _codes_section)
-# code-stream compression level. Measured on 10.7M-row ClickBench columns: level 19 -> 9 is
-# 7-13x faster (URL 14.5s -> 1.9s, SearchPhrase 18.1s -> 1.4s) for 6-8% more bytes (EventTime
+# code-stream compression level. Measured on 10.7M-row columns: level 19 -> 9 is
+# 7-13x faster (text columns 14.5s -> 1.9s and 18.1s -> 1.4s) for 6-8% more bytes (a time column
 # 22%). Ingest speed wins by default; WDB_CODE_ZSTD=19 for archival encodes.
+# lore: ClickBench columns -- URL 14.5s -> 1.9s, SearchPhrase 18.1s -> 1.4s, EventTime 22%.
 CODE_ZSTD_LEVEL = int(os.environ.get('WDB_CODE_ZSTD', '9'))
 INLINE_ZSTD_LEVEL = 19  # mode-5 inline value blobs: the mode decision is a size race at the archival level
 CHUNK_DICT = bool(int(os.environ.get('WDB_CHUNK_DICT', '1')))   # block-segment front-coded dicts (default on; WDB_CHUNK_DICT=0 to opt out)
@@ -37,22 +38,27 @@ CHUNK_DICT_VALS = 16384                                          # values per in
 # THE THREE STREAMS (Jackson, 2026-09-23): a chunked front-coded dictionary is written as headers,
 # a start-of-character mask, and text -- each chunk's three frames, each kind contiguous. Length is
 # read from headers + mask without a text byte; the interleaved form is rejoined byte-for-byte.
-# Measured on cbdb (all six chunked dictionaries): 1820 -> 1857 MB, +0.42% of the file.
+# Measured: the interleaved chunks cost under half a percent of the file.
+# lore: on cbdb (the ClickBench load; all six chunked dictionaries) 1820 -> 1857 MB, +0.42%.
 FC3_DICT = bool(int(os.environ.get('WDB_FC3', '1')))
 _INLINE_ENABLED = True  # mode-5 inline strings (toggleable for ablation/debug)
 
 def _int_dictionary(data):
     """THE DICTIONARY WITHOUT THE SORT (Jackson, 2026-09-18): np.unique(return_inverse=True) on an
     integer column is a full O(N log N) sort of 100M values to discover a distinct set -- 20-40s
-    per column, the largest single cost of an integer column's encode (RegionID 24.6s for 9,040
+    per column, the largest single cost of an integer column's encode (24.6s for 9,040
     values). The route is ASSIGNED from what is known before any pass:
-      bounded range (<= 4N) -> bincount: one linear pass, sorted by construction   (RegionID 24.6s -> 0.4s)
+      bounded range (<= 4N) -> bincount: one linear pass, sorted by construction   (24.6s -> 0.4s)
       otherwise -> hash factorize UNSORTED, then sort the DICTIONARY and remap: V log V, not N log N
-                   (ClientIP 15.7s -> 4.2s; WatchID, V = N, breaks even -- there is no worse case)
+                   (a 10%-distinct column 15.7s -> 4.2s; a near-unique one, V = N, breaks even --
+                   there is no worse case)
       near-unique (>= 95% distinct in a 1M sample) -> np.unique: the hash table of N keys loses to
-                   the sort (WatchID 68s -> 80s without this gate; a 50% gate mis-sent ClientIP,
-                   whose 10%-distinct column reads 63% distinct in a sample -- samples lie about V/N
-                   except at the top). Same contract everywhere: a SORTED dictionary, identical codes."""
+                   the sort (68s -> 80s without this gate; a 50% gate mis-sent a 10%-distinct
+                   column that reads 63% distinct in a sample -- samples lie about V/N
+                   except at the top). Same contract everywhere: a SORTED dictionary, identical codes.
+
+    Lore: the 9,040-value column was ClickBench's RegionID, the 10%-distinct one ClientIP, the
+    near-unique one WatchID."""
     data = np.asarray(data)
     N = data.size
     if N == 0:
@@ -78,7 +84,8 @@ def _int_dictionary(data):
         # THE NEAR-UNIQUE GATE, by the number the sample CAN tell: a 1M sample of a 10%-distinct
         # column reads 63% distinct (it lies about V/N), but a near-unique column reads ~100% --
         # and only that case matters, because there the hash table of N keys loses to the sort
-        # (WatchID: 68s -> 80s without the gate). >= 95% distinct in the sample -> np.unique.
+        # (68s -> 80s without the gate). >= 95% distinct in the sample -> np.unique.
+        # lore: the 68s -> 80s near-unique column was ClickBench's WatchID.
         smp = data[np.random.default_rng(0).integers(0, N, 1_000_000)]
         if pd.Series(smp).nunique() >= 950_000:
             return np.unique(data, return_inverse=True)
@@ -148,10 +155,12 @@ def _vb_q(v): return struct.pack('<q', int(v))
 class _LazyVals:
     """THE NUMBERS' VALUE BYTES ON DEMAND (2026-10-01): a numeric dictionary's per-value bytes (an
     int's decimal text, a float's or a clock's 8 bytes) were built for every distinct value --
-    WatchID: 100M Python bytes objects, 31.6 s of its 94 s job (cProfile); URLHash 6.2 s, FUniqID
-    4.6 s -- and a delta-coded dictionary (mode 2: every large one) only ever asks their COUNT.
-    They are built the first time something reads them, by the same expression as before, in the
-    same order; len() costs nothing. Module-level parts only: a prep stays picklable."""
+    a near-unique column: 100M Python bytes objects, 31.6 s of its 94 s job (cProfile); other wide
+    integer columns 6.2 s and 4.6 s -- and a delta-coded dictionary (mode 2: every large one) only ever
+    asks their COUNT. They are built the first time something reads them, by the same expression as
+    before, in the same order; len() costs nothing. Module-level parts only: a prep stays picklable.
+
+    Lore: the near-unique column was ClickBench's WatchID; the 6.2 s was URLHash, the 4.6 s FUniqID."""
     def __init__(self, uniq, fn):
         self.uniq = uniq; self.fn = fn; self._l = None
 
@@ -186,7 +195,9 @@ def _zframes(level, n, make):
     its own one-shot compression -- nothing passes from one frame to the next -- so these are the
     bytes one compressor going frame by frame writes. zstd lets go of the GIL while it compresses:
     on the c6a's budget a narrow column spent 15-16 s of its 27 s serialize in 1,500-4,000 of these
-    calls on one core (IPNetworkID, ClientIP, cProfile). WDB_FRAME_THREADS (default 4; 1 = the loop)."""
+    calls on one core (cProfile). WDB_FRAME_THREADS (default 4; 1 = the loop).
+
+    Lore: the narrow columns were ClickBench's IPNetworkID and ClientIP."""
     if _FRAME_THREADS <= 1 or n < 16:
         cz = zstd.ZstdCompressor(level=level)
         return [cz.compress(make(k)) for k in range(n)]
@@ -274,10 +285,11 @@ def _try_seq(nm, col, allow_seq=True):
         dtype = 0; aux = 0
         iv = data if data.dtype.itemsize <= 4 else data.astype(np.int64, copy=False)
     elif k == 'M':
-        # THE CLOCK LAW: a clock that REPEATS (EventTime: ~70 rows per second) is a key -- a
+        # THE CLOCK LAW: a clock that REPEATS (e.g. ~70 rows per second) is a key -- a
         # DICTIONARY whose staircase is the sequence, which the window and range doors read
         # (enc=2); as a mode-4 sequence it lost them (w-runmin 1.9s -> 23s). A clock that
         # never repeats (a reading per row, an affine series) is a genuine sequence.
+        # lore: the ~70 rows per second clock is ClickBench's EventTime.
         _iv9 = data.view('int64'); _sm9 = _iv9[:: max(1, _iv9.size // 2_000_000)]
         if _sm9.size >= 1024 and np.unique(_sm9).size < 0.9 * _sm9.size:
             return None
@@ -296,8 +308,9 @@ def _try_seq(nm, col, allow_seq=True):
             # declined at <= 65536 -- a span under 65536 cannot hold more, so the span decides.)
             return None
         else:
-            # THE CARDINALITY LAW: judge by DISTINCT COUNT, not span -- CounterID (6,506 values
-            # spanning millions) became a 100M-value sequence under the span-only guard (2026-09-14)
+            # THE CARDINALITY LAW: judge by DISTINCT COUNT, not span -- a column of 6,506 values
+            # spanning millions became a 100M-value sequence under the span-only guard (2026-09-14)
+            # lore: the column was ClickBench's CounterID.
             samp = iv[:: max(1, iv.size // 4_000_000)]
             if np.unique(samp).size <= 65536 and samp.size >= 65536:
                 return None
@@ -369,9 +382,11 @@ def _front_code_py(valb):
 class _ByteVals:
     """THE DICTIONARY STAYS ONE BUFFER (2026-09-27): the sorted text dictionary in Arrow's own layout --
     one byte buffer + offsets -- standing in for the list of Python bytes objects the text prep used
-    to build (URL: 18.3M objects, 4+ GB and ~15 s) only for the front-coder to join them back into
-    one buffer. It reads like a sequence of bytes (len, index, iterate, compare) for the small
-    consumers; _front_code takes .buf and .offs directly -- the very arrays it built before."""
+    to build (a large text column: 18.3M objects, 4+ GB and ~15 s) only for the front-coder to join them
+    back into one buffer. It reads like a sequence of bytes (len, index, iterate, compare) for the small
+    consumers; _front_code takes .buf and .offs directly -- the very arrays it built before.
+
+    Lore: the 18.3M objects were ClickBench's URL."""
     def __init__(self, arr):
         import pyarrow as pa
         self.arr = arr                                      # keeps Arrow's buffers alive
@@ -506,7 +521,8 @@ def _dict_bytes(p, zc):
                 b1 = int(rst[(j+1)*BPC]) if (j+1)*BPC < nb else len(fc)
                 bounds.append((b0, b1)); ustart.append(b0)
             # THE PARALLEL FRAMES: the dictionary chunks are independent zstd frames and zstd
-            # releases the GIL -- 575 frames of Title took 23s on one core (the string tail)
+            # releases the GIL -- 575 frames of a long text column took 23s on one core (the string tail)
+            # lore: the 575 frames were ClickBench's Title.
             from concurrent.futures import ThreadPoolExecutor
             _lvl9 = getattr(zc, '_wdb_level', ZSTD_LEVEL)
             def _cz9(b):
@@ -691,9 +707,11 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
     """Per-row code array (mode 0/1/2): 1 tag byte + payload. tag 0 = raw bit-packed; tag 1 = zstd
     of byte-aligned codes; tag 2 = STAIRCASE (codes non-decreasing in row order, e.g. time-ordered
     ingest): store only the gap-packed rows where the code ticks +1 -- the norm is 'same as the row
-    above', the steps are the exceptions. EventTime measured: 3.13 MB zstd -> 1.37 MB steps, and
-    the steps serve point reads/GROUP BY with NO decode. Smallest candidate wins; incompressible
-    arrays stay raw, paying only the tag byte."""
+    above', the steps are the exceptions. Measured on a time-ordered column: 3.13 MB zstd -> 1.37 MB
+    steps, and the steps serve point reads/GROUP BY with NO decode. Smallest candidate wins;
+    incompressible arrays stay raw, paying only the tag byte.
+
+    Lore: the time-ordered column was ClickBench's EventTime."""
     # ONE SIGNED view of the stream, shared by every candidate (six copies of 800 MB were alive at once),
     # at the narrowest signed width that holds the largest code (2026-09-26): int64 was 800 MB of a
     # 100M-row flag column whose codes are 0 and 1. Signed, so a neighbour difference is exact. Wide
@@ -705,7 +723,8 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
     # stored as tag 20 whatever the size contest picks -- the only exception is a staircase, which
     # can only win when the codes climb from 0 by steps of 0 or 1. When they do not, every other
     # dress (zstd, sparse, tiered, bitpack-plus, frames, packed frames, block dictionaries...) was
-    # built only to be thrown away: URLHash spent 96 s and RefererHash 98 s serializing.
+    # built only to be thrown away: two declared hash columns spent 96 s and 98 s serializing.
+    # lore: they were ClickBench's URLHash (96 s) and RefererHash (98 s).
     if nm is not None and codes.size and 1 <= bits <= 32 and nm in _hash_cols():
         d20 = np.diff(arr)
         climbs = int(arr[0]) == 0 and (d20.size == 0 or (int(d20.min()) >= 0 and int(d20.max()) <= 1))
@@ -729,7 +748,8 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
     # THE LAYOUT LAW (Jackson): a low-V column is a bit-pack laid down as fast as possible --
     # zstd only earns its time on wide codes. Narrow codes (<= 4 bits) skip the zstd candidate
     # when the pack is already small; wider ones compress the BYTE-ALIGNED codes as before.
-    # (IsRefresh, V=2: 1.2s of zstd per 2M rows to lose to a 250KB pack.)
+    # (a flag, V=2: 1.2s of zstd per 2M rows to lose to a 250KB pack.)
+    # lore: the flag was ClickBench's IsRefresh.
     if bits <= 4 and len(packed) <= (64 << 20):
         # narrow codes: a CHEAP zstd (level 3, 0.3s per 100M rows) still wins the runs a
         # time-clustered table produces (skipping it cost 1.8 GB on the clustered encode)
@@ -740,8 +760,9 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
         zsec = bytes([1, width]) + struct.pack('<I', len(z)) + z
     # tag 8 = SPARSE-DEFAULT (Jackson's dress): store nothing for the dominant value.
     # presence bitmap + rank checkpoints + bitpacked literals. Beat zstd outright on
-    # SearchPhrase (50.4 vs 52.6 MB) with zero decoders; adopted on strict size
+    # a sparse text column whose default is '' (50.4 vs 52.6 MB) with zero decoders; adopted on strict size
     # dominance only -- no knobs, smaller or nothing.
+    # lore: the column was ClickBench's SearchPhrase.
     sparse = None
     cn8 = np.bincount(arr) if codes.size else np.zeros(0)
     dflt = int(cn8.argmax()) if cn8.size else 0
@@ -960,11 +981,12 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
             best = blocked
     # tag 18 = PACKED FRAMES (Jackson's question: "bitpack, then zstd the 1s and 0s").
     # Per 65536-row frame: LE bit-pack the codes (no byte padding per row), then one
-    # zstd frame. Measured on cbdb: Title 224 MB vs 226 (u32 frames) -- the packing
+    # zstd frame. Measured: a long text column's codes 224 MB vs 226 (u32 frames) -- the packing
     # removes the zero bytes zstd was paying tokens to skip. Wide codes only (>= 17
     # bits: below that the u16 rows are already tight). Elected on size alone against
     # the plain dresses (zstd / blocked / bitpack); a point read inflates a frame
     # PREFIX (the stream stops at its highest row).
+    # lore: the 224 MB column was ClickBench's Title.
     if 17 <= bits <= 32 and codes.size and (best is zsec or best is packed
                                             or best is blocked):
         from wdb_kernels import pk32_pack as _pk32
@@ -983,7 +1005,8 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
                   + o18.tobytes() + b''.join(fr18))
         # THE BITPACK GUARD (Jackson): over the plain bitpack -- whose point reads are bit
         # arithmetic on the mmap, no inflate ever -- the packed frames must win by 10%, not by
-        # a hair (HID: 337.5 -> 337.0 MB, 0.15%, was not worth a frame inflate per point read).
+        # a hair (0.15% smaller was not worth a frame inflate per point read).
+        # lore: ClickBench's HID, 337.5 -> 337.0 MB.
         # Over zstd / blocked frames, which already pay the inflate, strictly smaller elects.
         seal18 = 0.90 * len(best) if best is packed else len(best)
         if len(cand18) < seal18 or os.environ.get('WDB_E18_FORCE'):
@@ -992,8 +1015,9 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
     # per block, the distinct codes present, once, sorted and gap-coded; per row, a pointer into
     # its block's list at the block's own width). Decode is one jump per row, no inflate.
     # THE ELECTION (Jackson's general rule): it replaces an INFLATING dress (zstd 1 / blocked 3 /
-    # packed frames 18) when its bytes are within E19_SLACK (5%) of that dress's. Measured on
-    # cbdb: UserID 246.8 vs 246.0 MB at 32 vs 122 ms per full decode; RegionID 1.19x -> stays.
+    # packed frames 18) when its bytes are within E19_SLACK (5%) of that dress's. Measured: a wide id
+    # column 246.8 vs 246.0 MB at 32 vs 122 ms per full decode; a small-V one 1.19x -> stays.
+    # lore: on cbdb (the ClickBench load); the wide column was UserID, the 1.19x one RegionID.
     _f19 = bool(os.environ.get('WDB_E19_FORCE'))
     if 1 <= bits <= 32 and codes.size and (_f19 or (bits >= 9 and codes.size >= (1 << 20)
                                                     and best[0] in (1, 3, 18))):
@@ -1002,10 +1026,11 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
             best = cand19
     # tag 14 = FIELD PLANES (Jackson's dress): dates decompose to y/m/d u8
     # planes, each its own zstd stream -- the calendar's internal correlation
-    # compresses BELOW naive entropy (82.7 vs 94.1MB measured on l_shipdate),
+    # compresses BELOW naive entropy (82.7 vs 94.1MB measured on a date column),
     # and band predicates later read only the fields they constrain. Types
     # NOMINATE (the caller passes date_vals only for dt==3), measurements
     # SIZE (year width from the real range), the size election alone ELECTS.
+    # lore: the date column was TPC-H's l_shipdate.
     if date_vals is not None and codes.size:
         try:
             dv = np.asarray(date_vals, dtype=np.int64)[arr]
@@ -1037,7 +1062,8 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
     # table + escape patches (u16) + per-32K escape offsets. Skewed low-V numeric
     # streams only; adopted when within 25% of the zstd seal. Buys O(1) point reads
     # (no frame ever inflates), an escape-array hunt, and a stream decode that beats
-    # parallel zstd -- measured 0.1ms/84ms point, 54ms/70ms stream on ResolutionWidth.
+    # parallel zstd -- measured 0.1ms/84ms point, 54ms/70ms stream on a skewed small-int column.
+    # lore: the column was ClickBench's ResolutionWidth.
     if enc5_ok and best is not stair:
         arr16 = arr
         V5 = int(arr16.max()) + 1 if arr16.size else 0
@@ -1065,7 +1091,8 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
             elif V5 > 270:
                 # tag 6 = WARM BUCKETS: hot nibble -> warm byte (255 seats) -> u16 cold.
                 # The two-tier sibling for columns whose top-15 is thin but top-270 is
-                # fat (RegionID 49%->94%). Same 1.25 bar, same block independence.
+                # fat (e.g. 49%->94%). Same 1.25 bar, same block independence.
+                # lore: the 49%->94% was ClickBench's RegionID.
                 hot255 = np.argsort(cn5)[::-1][:270].astype(np.uint16)
                 warm = hot255[15:270]
                 lutw = np.full(V5, 255, dtype=np.uint8)
@@ -1111,8 +1138,9 @@ def _code_section(codes, bits, enc5_ok=False, nm=None, date_vals=None):
     if best and best[0] == 3 and bits >= 2 and bits <= 16 and codes.size >= (1 << 22):
         arr17 = arr
         # IN CHUNKS OF 1M ROWS (2026-09-26): the one-byte-per-bit array was rows x bits bytes (1.3 GB
-        # for CounterID) plus an 800 MB int64 temporary per bit -- the job's peak. A chunk of a
+        # for one 100M-row column) plus an 800 MB int64 temporary per bit -- the job's peak. A chunk of a
         # multiple of 8 rows packs to whole bytes, so the joined chunks are the same bytes.
+        # lore: the 1.3 GB column was ClickBench's CounterID.
         pk17p = []
         for lo17 in range(0, arr17.size, 1 << 20):
             ch17 = arr17[lo17:lo17 + (1 << 20)]
@@ -1315,11 +1343,12 @@ def _serialize_inline(p, blocked=True):
     return bytes(out), (len(out), p['V'], p['bits'], 1, 5, 0, p['aux'])
 
 
-# THE BLOCKED INLINE COLUMN (Jackson, 2026-10-03; the row lengths of the ClickBench flag brought over): the rows
+# THE BLOCKED INLINE COLUMN (Jackson, 2026-10-03): the rows
 # cut into blocks of INLINE_BLOCK_ROWS, each block its rows' byte lengths then their text, each zstd alone, and one
 # start table -- a point read inflates the blocks its rows live in, a whole read inflates every block at once.
-# Measured on JOB (zstd 19, cold, evicted): title 10 rows 132 -> 5 ms, whole column 119 -> 28 ms, for +17.5%
+# Measured (zstd 19, cold, evicted): a text column's 10 rows 132 -> 5 ms, whole column 119 -> 28 ms, for +17.5%
 # on the eight text columns (+3.4% of the realm). WDB_INLINE_BLOCK=0 writes the one-block layout.
+# lore: the row lengths of the ClickBench flag brought over; measured on JOB, the 10 rows were title's.
 INLINE_BLOCK_ROWS = int(os.environ.get('WDB_INLINE_BLOCK', '16384'))
 
 
@@ -1418,11 +1447,12 @@ def _arrow_string_prep(nm, chunked, perm=None):
             # (Per-chunk dictionary_encode + unify_dictionaries was measured: 5+ minutes on one core.)
             chunked = pc.cast(chunked, pa.large_string())
     # THE TEXT FLOWS THROUGH IN ITS ROW GROUPS (Jackson, 2026-09-27: hold less in RAM at once). The row
-    # groups were glued into one array first -- a second full copy of the text beside the first (URL:
-    # 8.8 GB) only to be hashed once. Arrow's dictionary_encode on the chunked column keeps ONE memo
+    # groups were glued into one array first -- a second full copy of the text beside the first (a large
+    # text column: 8.8 GB) only to be hashed once. Arrow's dictionary_encode on the chunked column keeps ONE memo
     # across the chunks: every chunk carries the same final dictionary, in the same first-seen order
-    # the glued array gave (measured on SearchPhrase and URL: identical indices and dictionary). If a
+    # the glued array gave (measured on two text columns: identical indices and dictionary). If a
     # build ever hands back per-chunk dictionaries, the glued road runs as before.
+    # lore: the 8.8 GB was ClickBench's URL; the two columns measured were SearchPhrase and URL.
     idx = dct = None
     if isinstance(chunked, pa.ChunkedArray) and chunked.num_chunks > 1:
         de = pc.dictionary_encode(chunked)
@@ -1475,9 +1505,10 @@ def _string_prep_tail(nm, dbox, order, codes, has_null, perm):
         codes = codes[np.asarray(perm)]                     # the cluster order, on 4-byte codes
     sorted_dict = pc.take(dct, pa.array(order))
     # THE DICTIONARY COMES OUT AS BYTES (2026-09-27): read as text it became 18M Python str objects
-    # (URL: +6 GB, 11 s) and then 18M bytes objects beside them (+4 GB, 4 s) -- the job's peak. Viewed
+    # (+6 GB, 11 s) and then 18M bytes objects beside them (+4 GB, 4 s) -- the job's peak. Viewed
     # as binary (the same buffers, no copy) it comes out as the bytes directly: the very bytes the
     # utf-8 encode gave back for valid text, and the raw bytes for any that is not.
+    # lore: the 18M values were ClickBench's URL.
     if pa.types.is_large_string(sorted_dict.type):
         sorted_dict = sorted_dict.cast(pa.large_binary())
     elif pa.types.is_string(sorted_dict.type):
@@ -1499,9 +1530,11 @@ def _string_prep_tail(nm, dbox, order, codes, has_null, perm):
     uniq = None
     aux = 0
     if mode == 1 and CHUNK_DICT:
+        # lore: the 6M-value probe was ClickBench's SearchPhrase <> '' on gov7.
         aux |= 0x40      # THE CHUNK LAW: a big front-coded dictionary is written as independent zstd frames
                          # (CHUNK_DICT_VALS values each) so a lookup decompresses one frame, not 6M values
-                         # (SearchPhrase <> '' on gov7: 0.34s = one 6M-value frame per probe; the reference 0.05s)
+                         # (col <> '' on a 6M-value dictionary: 0.34s = one 6M-value frame per probe;
+                         # the reference 0.05s)
         if FC3_DICT:
             aux |= 0x80  # as THE THREE STREAMS
     return dict(nm=nm, dtype=1, has_null=has_null, V=V, valb=valb, codes=codes, aux=aux, uniq=uniq, bits=bits, mode=mode)
@@ -1519,9 +1552,12 @@ def _arrow_string_prep_sliced(nm, input_path, perm=None, slices=None, threads=No
     hashing another. The local dictionaries are then merged by one more dictionary_encode, the merged
     dictionary is sorted, and every row's code is its value's rank in that sorted dictionary. The
     codes and the sorted dictionary depend only on WHICH values exist and WHICH row holds which, so
-    they are the whole-column road's exactly (checked: URL, Title). Prototype on URL: 35.5 s / 13.4 GB
-    against 37.6 s / 24.1 GB. Returns None (the caller takes the whole-column road) for a non-text
-    column, fewer than 2 row groups, an all-null column, or dictionaries that are not one per chunk."""
+    they are the whole-column road's exactly (checked on two large text columns). Prototype on the
+    larger: 35.5 s / 13.4 GB against 37.6 s / 24.1 GB. Returns None (the caller takes the whole-column
+    road) for a non-text column, fewer than 2 row groups, an all-null column, or dictionaries that are
+    not one per chunk.
+
+    Lore: checked on ClickBench's URL and Title; the prototype ran on URL."""
     import pyarrow as pa, pyarrow.parquet as pq, pyarrow.compute as pc
     from concurrent.futures import ThreadPoolExecutor
     pf = pq.ParquetFile(input_path)
@@ -1692,7 +1728,8 @@ def _column_job(input_path, nm, reader, cast=None, perm_path=None, N=None):
                     or pa.types.is_binary(ft) or pa.types.is_large_binary(ft)):
                 col = pq.read_table(input_path, columns=[nm]).column(0)
                 try:
-                    pa.default_memory_pool().release_unused()   # the read's freed page buffers: 2.9 GB kept on URL
+                    # lore: the 2.9 GB was kept on ClickBench's URL.
+                    pa.default_memory_pool().release_unused()   # the read's freed page buffers: 2.9 GB kept
                 except Exception:
                     pass
                 _mark('read')
@@ -1701,14 +1738,16 @@ def _column_job(input_path, nm, reader, cast=None, perm_path=None, N=None):
                 box = [col]; del col                          # the prep owns the text: freed once it is encoded
                 # THE CODES ARE GATHERED, NOT THE TEXT: the dictionary is sorted by value, so a code
                 # is the same number in any row order -- gathering 400 MB of codes through the cluster
-                # order replaces gathering 8 GB of URL text (same bytes out: the codes, the sorted
+                # order replaces gathering 8 GB of text (same bytes out: the codes, the sorted
                 # dictionary and the null bin do not depend on the order the rows arrive in)
+                # lore: the 8 GB of text was ClickBench's URL.
                 prep = _arrow_string_prep(nm, box, perm=perm)
                 _mark('prep')
                 import resource as _rs0
                 _tm['peak_after_prep_gb'] = (_own_hwm() or _rs0.getrusage(_rs0.RUSAGE_SELF).ru_maxrss * 1024) / 2**30   # where the peak falls
-                # measured on URL: the job's whole-life peak (22.0 GB) is reached by the end of the
-                # prep; the serialize that follows works on the dictionary and the codes only
+                # measured on a large text column: the job's whole-life peak (22.0 GB) is reached by the end
+                # of the prep; the serialize that follows works on the dictionary and the codes only
+                # lore: the column was ClickBench's URL.
                 _note('prepped')
         except Exception as _e9:
             # A FALLBACK THAT IS SILENT IS A FAST PATH THAT ISN'T THERE: the arrow path had failed
@@ -1897,7 +1936,8 @@ def _column_cost(input_path, cols, reader, N):
             frac = nuniq / n0
             if 'string' in t or 'binary' in t or 'large' in t:
                 try:                                      # the column's text: parquet's own uncompressed size, every row group
-                    # (row group 0 alone guessed Title at 21 GB of text; the file's metadata says 7.6)
+                    # (row group 0 alone guessed a text column at 21 GB of text; the file's metadata says 7.6)
+                    # lore: the column was ClickBench's Title.
                     md9 = pf.metadata; j9 = [md9.schema.column(k).name for k in range(md9.num_columns)].index(nm)
                     _TEXT_BYTES[nm] = int(sum(md9.row_group(i).column(j9).total_uncompressed_size for i in range(md9.num_row_groups)))
                 except Exception:
@@ -1973,16 +2013,19 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
     # not start under the truth
     # 2026-09-27: tiny and narrow restarted at their TRUE p80 peaks (3.1 / 4.5 GB, VmHWM) -- the 50 / 75
     # were set from ru_maxrss, which carried the parent's size into every spawned job
-    measured = {'string': 310, 'wide': 130, 'mid': 100, 'narrow': 55, 'tiny': 36}   # strings: the MEASURED peak on the arrow path (Title 29 GB at 100M rows; it was 57 GB on the object path)     # bytes per row: conservative starts (URL/Referer/Title peak ~25 GB at 100M rows), raised as workers report
+    # lore: the 29 GB text column was ClickBench's Title; the ~25 GB ones URL/Referer/Title.
+    measured = {'string': 310, 'wide': 130, 'mid': 100, 'narrow': 55, 'tiny': 36}   # strings: the MEASURED peak on the arrow path (the largest text column 29 GB at 100M rows; it was 57 GB on the object path)     # bytes per row: conservative starts (the long text columns peak ~25 GB at 100M rows), raised as workers report
     # A TEXT COLUMN IS PRICED BY ITS TEXT (2026-09-26): one class rate for every string charged
-    # SearchPhrase (8 GB measured) like URL (38 GB), so SearchPhrase and OriginalURL could not fit
+    # a short text column (8 GB measured) like a long one (38 GB), so two of them could not fit
     # while small columns ran, waited to the end and ran alone for 84 s. The charge is a floor (a
     # worker's own weight, 4.6 GB measured on a flag column) plus a learned multiple of the text.
-    # measured with the codes gathered, against parquet's uncompressed text: URL 21.5 GB on 7.9 (2.08x
-    # over the floor), Title 22.5 on 7.6 (2.30x), SearchPhrase 6.6 on 0.77 (2.1x)
-    # REPRICED 2026-09-27 for the text in slices: measured peaks URL 16.1 GB on 7.9 of text, OriginalURL
-    # 10.9 on 5.0, Referer 10.9 on 6.1, Title 6.6 on 7.6, SearchPhrase 3.9 on 0.77, a small text column
+    # measured with the codes gathered, against parquet's uncompressed text: 2.08x-2.30x over the floor
+    # REPRICED 2026-09-27 for the text in slices: measured peaks on the text columns, a small text column
     # 1.8-1.9 -- (peak - 2.5 GB) / text is at most ~1.8. The rate still only learns upward.
+    # lore: ClickBench's columns -- SearchPhrase 8 GB vs URL 38 GB (SearchPhrase and OriginalURL could not fit);
+    # lore: gathered: URL 21.5 GB on 7.9 (2.08x), Title 22.5 on 7.6 (2.30x), SearchPhrase 6.6 on 0.77 (2.1x);
+    # lore: in slices: URL 16.1 GB on 7.9, OriginalURL 10.9 on 5.0, Referer 10.9 on 6.1, Title 6.6 on 7.6,
+    # lore: SearchPhrase 3.9 on 0.77.
     sbase = int(2.5 * (1 << 30)); sratio = [1.9]
     def working_set(nm):
         tb = _TEXT_BYTES.get(nm)
@@ -1999,14 +2042,16 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
         # THE ENCODER MEASURES ITSELF: a worker's peak RSS updates its class's bytes-per-row
         # (max seen, plus 25% headroom) so the budget stops guessing after the first column.
         # One observation can never teach more than "two of this class fit the budget": an
-        # outlier (73 GB on URL) had starved the string class to one column at a time.
+        # outlier (73 GB on one text column) had starved the string class to one column at a time.
+        # lore: the 73 GB outlier was ClickBench's URL.
         c = cls(nm); seen = (peak - (400 << 20)) / max(1, N) * 1.25
         cap = (budget / 2 - (400 << 20)) / max(1, N)
         seen = min(seen, cap)
         # A CLASS IS PRICED BY ITS TYPICAL MEMBER (2026-09-26): the max rule let one member set the price
-        # of all -- CounterID (8.6 GB) charged every flag column ~10 GB against a real 4. From three
+        # of all -- one integer column (8.6 GB) charged every flag column ~10 GB against a real 4. From three
         # observations on, the rate is the 80th-percentile peak plus 20%; the limit's margin carries
         # the rare column above it.
+        # lore: the 8.6 GB column was ClickBench's CounterID.
         pk = _pk9.setdefault(c, []); pk.append(peak)
         if len(pk) >= 3:
             q = sorted(pk)[int(0.8 * (len(pk) - 1))]
@@ -2029,8 +2074,9 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
         arrs9 = [np.asarray(wdb_read.read_one_column(input_path, k, reader=reader)) for k in keys9]
         _c1 = time.time()
         # ONE INTEGER KEY IS ORDERED BY COUNTING (2026-09-26): the same stable permutation lexsort
-        # gives (equal keys keep file order), 0.75 s against 8.4 s for EventTime -- time every other
+        # gives (equal keys keep file order), 0.75 s against 8.4 s for a time column -- time every other
         # core spent waiting, since no column can start before the order exists
+        # lore: the time column was ClickBench's EventTime.
         perm = None
         if len(arrs9) == 1:
             try:
@@ -2116,9 +2162,10 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
             if cg is None:
                 return False
             # each running job keeps the room to grow to its charge: charge minus its own resident
-            # bytes; a text job past its prep (the raw text freed, its peak behind it -- measured: URL
-            # 21.8 GB, Title 22.4, Referer 16.5 at the end of the prep and never above) keeps a
+            # bytes; a text job past its prep (the raw text freed, its peak behind it -- measured on three
+            # long text columns: 16.5-22.4 GB at the end of the prep and never above) keeps a
             # quarter of its charge for the serialize
+            # lore: ClickBench's URL 21.8 GB, Title 22.4, Referer 16.5.
             grow = 0
             for c9 in running.values():
                 ch9 = _chg9.get(c9, working_set(c9))
@@ -2205,8 +2252,9 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
             live_on = False                        # after a kill, only the paper budget admits
             print('  pool killed (memory): retreating to %d workers, re-queueing %d columns (%s)' % (nworkers, len(lost), ', '.join(lost[:5])), flush=True)
         # THE COMPLETENESS LAW: the header promised len(cols) blobs; whatever the retreats lost
-        # is encoded again, in this process, before the file closes (measured: URL and Referer
+        # is encoded again, in this process, before the file closes (measured: two text columns
         # vanished across two retreats and the encode reported success)
+        # lore: the two columns were ClickBench's URL and Referer.
         missing = [c for c in cols if c not in sizes]
         if missing and not pending:
             print('  completeness: %d columns missing after the pool (%s): encoding in-process' % (len(missing), ', '.join(missing[:5])), flush=True)
@@ -2271,7 +2319,8 @@ def _encode_streaming(input_path, out_path, columns, reader, cubes, workers, t0,
             import wdb_sidecar as _SC9
             # THE SWITCH governs the load's shelves too (2026-09-29): the pair tables are derived
             # group facts, and with sidecars off they were born anyway -- measured, they only slowed
-            # the pair boards they serve (Q31 cold 265 -> 192 ms without them, Q32 194-216 -> 110)
+            # the pair queries they serve (cold 265 -> 192 ms without them, and 194-216 -> 110)
+            # lore: the pair boards were ClickBench Q31 (265 -> 192 ms) and Q32 (194-216 -> 110).
             if _os.environ.get('WDB_LOAD_SHELVES', '1') != '0' and _SC9.births_on(_os.path.dirname(out_path)):
                 _birth_differentiator_shelves(out_path, known={c: (_xt9[c].get('stats') or {}).get(c + '.rep') for c in cols})
         except Exception:
@@ -2507,13 +2556,15 @@ if __name__ == '__main__':
 
 
 def _birth_differentiator_shelves(out_path, known=None):
-    """THE SHELVES WITHOUT A FULL DECODE (2026-09-26, measured: 12.7 s of the load's tail was HID and
-    WatchID decoded and counted, then 42 companion columns decoded whole to read 8 rows each).
+    """THE SHELVES WITHOUT A FULL DECODE (2026-09-26, measured: 12.7 s of the load's tail was two
+    differentiator columns decoded and counted, then 42 companion columns decoded whole to read 8 rows each).
     - known: {column: exception rows} its own load job already found by the same law
       (wdb_blockstats.differentiator_rows); used as given instead of counting again.
     - A column of V distinct codes over N rows has at least N - V rows in repeated groups: when that
       floor alone breaks 0.75% of V the column cannot qualify, and nothing is decoded to learn it.
-    - The pairs read the companions only at the exception rows (Segment.codes_at). Same files."""
+    - The pairs read the companions only at the exception rows (Segment.codes_at). Same files.
+
+    Lore: the two columns were HID and ClickBench's WatchID."""
     import importlib, pickle
     import numpy as _np
     eng = importlib.import_module('wdb_engine')

@@ -1,13 +1,15 @@
-"""wdb_septop -- Q14's engine-first hunt (Jackson's design).
+"""wdb_septop -- the engine-first hunt (Jackson's design): top-k pairs (low-V key, sparse key whose default is '').
 
-SELECT se, sp, COUNT(*) WHERE sp <> '' GROUP BY se, sp ORDER BY c DESC LIMIT k
+SELECT kcol, tcol, COUNT(*) WHERE tcol <> '' GROUP BY kcol, tcol ORDER BY c DESC LIMIT k
 
 The filter IS the plane; codes differentiate without decoding. A pair's
 count <= its phrase's total, so top pairs live among top phrases: take the
-top-M phrases by spc, read the ENGINE (low V) at only their instance rows,
+top-M phrases by tcnt, read the ENGINE (low V) at only their instance rows,
 count (engine, phrase) exactly inside the subset, and accept when the k-th
 count >= the M-th phrase total (no outside pair can beat it). Decode only
 the k winners.
+
+Lore: built for ClickBench Q14.
 """
 import numpy as np
 from sqlglot import expressions as E
@@ -41,14 +43,14 @@ def detect(seg, tree, col_map):
         gcols.append(cm.get(ge.name, ge.name))
     if fcol not in gcols:
         return None
-    sp = fcol
-    se = [c for c in gcols if c != sp][0]
-    cs = seg.cols.get(se)
-    cp = seg.cols.get(sp)
+    tcol = fcol
+    kcol = [c for c in gcols if c != tcol][0]
+    cs = seg.cols.get(kcol)
+    cp = seg.cols.get(tcol)
     if cs is None or cp is None:
         return None
     import wdb_policies as _P9
-    if not _P9.sparse_default_is(seg, sp, ''):
+    if not _P9.sparse_default_is(seg, tcol, ''):
         return None                              # the filter must BE the plane: the default must be ''
     if int(cp.get('V') or 1 << 30) >= (1 << 23):
         return None                              # the packed key holds the phrase code in 23 bits
@@ -85,17 +87,17 @@ def detect(seg, tree, col_map):
         lim = int(lx.expression.this)
     except Exception:
         return None
-    return {'se': se, 'sp': sp, 'lim': lim, 'proj': tree.expressions}
+    return {'kcol': kcol, 'tcol': tcol, 'lim': lim, 'proj': tree.expressions}
 
 
 def execute(seg, spec):
     global _HITS
-    se, sp, k = spec['se'], spec['sp'], spec['lim']
-    pl = seg.e8_planes(sp)
+    kcol, tcol, k = spec['kcol'], spec['tcol'], spec['lim']
+    pl = seg.e8_planes(tcol)
     pos8 = np.asarray(pl[0], np.int64)
     lits8 = np.asarray(pl[1], np.int64)
-    Vp = int(seg.cols[sp]['V'])
-    spc = np.bincount(lits8, minlength=Vp)
+    Vp = int(seg.cols[tcol]['V'])
+    tcnt = np.bincount(lits8, minlength=Vp)
     # Jackson's descent, window-batched: hunt the biggest phrases first in
     # ONE batch per window; stop when the k-th pair beats the best phrase
     # still outside. kth lands high fast, so the first window usually ends it.
@@ -103,17 +105,17 @@ def execute(seg, spec):
     while True:
         W = min(W, Vp)
         if W < Vp:
-            part = np.argpartition(-spc, W)[:W + 1]     # top-W+1, unordered
-            part = part[np.argsort(-spc[part], kind='stable')]
+            part = np.argpartition(-tcnt, W)[:W + 1]     # top-W+1, unordered
+            part = part[np.argsort(-tcnt[part], kind='stable')]
             topp = part[:W]
-            outside = int(spc[part[W]])      # the best phrase left outside
+            outside = int(tcnt[part[W]])      # the best phrase left outside
         else:
             topp = np.arange(Vp)
             outside = 0
         sel = np.flatnonzero(np.isin(lits8, topp))
         rows9 = pos8[sel]
         pc9 = lits8[sel]
-        ec9 = np.asarray(seg.codes_at(se, rows9), np.int64)
+        ec9 = np.asarray(seg.codes_at(kcol, rows9), np.int64)
         key = (ec9 << 23) | pc9
         key.sort(kind='stable')
         brk = np.empty(key.size, bool)
@@ -131,8 +133,8 @@ def execute(seg, spec):
     proj = spec['proj']
     for gi in order.tolist():
         kk = int(key[st[gi]]); c9 = int(cnt[gi])
-        ev = seg.fetch(se, kk >> 23)
-        sv = seg.fetch(sp, kk & ((1 << 23) - 1))
+        ev = seg.fetch(kcol, kk >> 23)
+        sv = seg.fetch(tcol, kk & ((1 << 23) - 1))
         if isinstance(ev, (bytes, bytearray)):
             ev = ev.decode('utf-8', 'replace')
         if isinstance(sv, (bytes, bytearray)):
@@ -142,7 +144,7 @@ def execute(seg, spec):
             inner = p.this if isinstance(p, E.Alias) else p
             if isinstance(inner, E.Column):
                 cn = inner.name
-                row.append(sv if cn == spec['sp'] or cn.lower() == spec['sp'].lower() else ev)
+                row.append(sv if cn == spec['tcol'] or cn.lower() == spec['tcol'].lower() else ev)
             else:
                 row.append(c9)
         out.append(tuple(row))

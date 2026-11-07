@@ -10,11 +10,13 @@ The gate is COMPUTED at runtime, not guessed. The predicate has to be evaluated 
 columns have no value-identity codes, so there is no cheaper way to know which rows pass), so we
 popcount the resulting mask for the exact selectivity and take this path only when sel < gate(N, K).
 Otherwise we return None and the dense path (which is cheaper once the survivor set approaches N)
-handles it. Measured crossover (URL, K=18.3M): survivor-set wins up to ~30% selectivity, and the
+handles it. Measured crossover (a text key, K=18.3M): survivor-set wins up to ~30% selectivity, and the
 crossover rises with K because a wider accumulator costs more to scatter and scan.
 
 Sibling of wdb_gbcount (the filter-free count projection); reuses its by-code decoder and
 clean-boundary top-N. Fail-closed on any shape it does not own.
+
+Lore: the crossover was measured on URL (K=18.3M).
 """
 import numpy as np
 import wdb_sql

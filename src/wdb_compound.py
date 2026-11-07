@@ -63,7 +63,9 @@ def _APPLY(v, op, c):
 
 def _coerce(seg, col, lit):
     """Literal node -> value in column `col`'s domain. Adds date-string -> day-number coercion for
-    integer columns that store days-since-epoch (e.g. ClickBench EventDate)."""
+    integer columns that store days-since-epoch.
+
+    Lore: e.g. ClickBench EventDate."""
     if isinstance(lit, E.Neg):
         return -_coerce(seg, col, lit.this)
     c = seg.cols[col]

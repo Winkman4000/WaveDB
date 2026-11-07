@@ -300,10 +300,10 @@ def _exists_road(db, tree, inner, icol, ocol, rest, outer_where=None, ex_node=No
                 okeep9 = mo9 if okeep9 is None else (okeep9 & mo9)
                 _b9(_t9, 'okeep-conjunct'); _t9 = _tt9.perf_counter()
         if okeep9 is not None and rest:
-            # THE FILTER FIRST (Jackson, 2026-10-05, Q4): the window already knows which parents count, so only
-            # their lines are judged -- every other line's dates are never decoded. Q4 judged lateness for all
-            # 60M lines (510 ms: two full code rebuilds, two full code->date gathers) and the window threw ~96%
-            # of the verdicts away in the scatter.
+            # THE FILTER FIRST (Jackson, 2026-10-05): the window already knows which parents count, so only
+            # their child rows are judged -- every other child row's columns are never decoded.
+            # lore: TPC-H Q4 judged lateness for all 60M lines (510 ms: two full code rebuilds, two full
+            # lore: code->date gathers) and the window threw ~96% of the verdicts away in the scatter.
             import wdb_kernels as _wk9s, wdb_engine as _we9s
             lk9s = np.empty(int(segc.N), dtype=np.bool_)
             _wk9s.plut_u8(np.ascontiguousarray(ptr), np.ascontiguousarray(okeep9, dtype=np.bool_), lk9s)
@@ -489,8 +489,9 @@ def _corr_eq(sel, outer_names, inner_cols=None):
     inner_quals = {alias} if alias != _tn else {_tn}
     def is_outer(x):
         # Qualified: outer iff the qualifier isn't the inner table/alias.
-        # Unqualified (the TPC-H idiom): SQL binds innermost-first, so a bare
+        # Unqualified: SQL binds innermost-first, so a bare
         # name is outer exactly when the INNER table doesn't own it.
+        # lore: the unqualified form is the TPC-H idiom.
         if x.table:
             return x.table not in inner_quals
         return inner_cols is not None and x.name not in inner_cols
@@ -513,13 +514,14 @@ def _corr_eq(sel, outer_names, inner_cols=None):
     return None if corr is None else (corr[0], corr[1], rest)
 
 
-# THE JOIN'S OWN SCALARS (2026-11-02, TPC-H Q11): rewrite() substitutes uncorrelated WHERE subqueries, but only the
+# THE JOIN'S OWN SCALARS (2026-11-02): rewrite() substitutes uncorrelated WHERE subqueries, but only the
 # single-table path reached it -- every join query went to the join engine first and a scalar subquery in its
 # comparison failed there ('float() ... not Select'). join_scalars: in a join query's WHERE and HAVING, each scalar
-# subquery under a comparison whose columns all belong to its own FROM tables (uncorrelated -- a correlated one, like
-# Q17's, is left for the join engine's value per key) runs alone through the full pipeline; one row, one column ->
+# subquery under a comparison whose columns all belong to its own FROM tables (uncorrelated -- a correlated one
+# is left for the join engine's value per key) runs alone through the full pipeline; one row, one column ->
 # its value as a literal; no row (or NULL) -> the comparison is FALSE (a NULL comparison is not true); more rows ->
 # left alone. WDB_JOIN_SCALARS=0: off. _JOIN_SCALARS_HITS: diagnostic (tests read it).
+# lore: built for TPC-H Q11; the correlated one left to the join engine was TPC-H Q17's.
 import os as _os
 _JOIN_SCALARS = [_os.environ.get('WDB_JOIN_SCALARS', '1') == '1']
 _JOIN_SCALARS_HITS = [0]
@@ -678,10 +680,11 @@ def rewrite(db, tree):
         if rd9 is None:
             rd9 = _self_exists_codes(db, tree, inner, icol, ocol, rest)
         if rd9 is not None:
-            # THE SCATTER FORM (Jackson's Q4 walk): child residual mask in
+            # THE SCATTER FORM: child residual mask in
             # arrays -> road sidecar -> unique PARENT ROWS -> the _codes
             # sentinel directly. No SQL execution of the inner, no values,
             # no rows -- and a mode-4 outer key means parent rows ARE codes.
+            # lore: Jackson's TPC-H Q4 walk.
             in_node.set('_codes', rd9)
             in_node.set('expressions', [E.Subquery(this=sub)])
         in_node.set('_exists_rewrite', True)   # NOT EXISTS drops inner NULLs; it does NOT
@@ -725,11 +728,12 @@ def rewrite(db, tree):
         rows = _run_inner(db, sub)
         if rows and len(rows[0]) != 1:
             raise ValueError("IN subquery must return one column")
-        # THE ROAD FORM (Jackson's Q4 walk, array space end to end): a
+        # THE ROAD FORM (array space end to end): a
         # different-column IN resolves to the OUTER column's dict CODES --
         # searchsorted into the outer dict, unique, then the same _codes
         # sentinel the same-column path uses. No value lists, no cap: the
         # downstream LUT is V+1 bools however many million values matched.
+        # lore: Jackson's TPC-H Q4 walk.
         rc9 = _road_codes(db, tree, node, rows)
         if rc9 is not None:
             codes9 = rc9
@@ -775,7 +779,8 @@ def rewrite(db, tree):
     return tree
 
 
-# ---- THE SAME ROWS, ONE WALK (Jackson's line-up and zoom, 2026-11-03, Q11) ----------------------------------------
+# ---- THE SAME ROWS, ONE WALK (Jackson's line-up and zoom, 2026-11-03) ---------------------------------------------
+# lore: built for TPC-H Q11.
 # A join GROUP BY whose HAVING compares its own SUM(e) against a scalar subquery summing the SAME e over the SAME
 # tables under the SAME conditions (times literal arithmetic) asks one question twice: the subquery's SUM is the
 # total of the outer's group sums. same_rows_spec recognises it; wdb_join cuts the groups on the group-sum array

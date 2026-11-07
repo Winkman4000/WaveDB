@@ -1,4 +1,4 @@
-"""wdb_keepflag -- one column's WHERE as a keep flag over its dictionary codes (2026-10-21, the Q24-Q26 board).
+"""wdb_keepflag -- one column's WHERE as a keep flag over its dictionary codes.
 
 keep[code] is True when the value with that code passes the predicate; the NULL code (V-1 when the column has
 nulls) is False for every comparison, as in SQL. Every dictionary is stored in VALUE ORDER (encode: np.unique /
@@ -8,6 +8,8 @@ range is a run of codes and the bound of a run is one bisect over the dictionary
 Shapes: col =, <>, <, <=, >, >= literal (either side), BETWEEN, [NOT] IN (literals), [NOT] LIKE, IS [NOT] NULL,
 and AND / OR / NOT of these over ONE column. Anything else -> None (the caller declines). The flag is the
 filter for the reads that walk rows (wdb_firstk) and for the reads that walk the dictionary (wdb_valsort).
+
+Lore: 2026-10-21, the ClickBench Q24-Q26 board.
 """
 import numpy as np
 from sqlglot import expressions as E
@@ -40,7 +42,9 @@ _NOLIT = object()
 
 def _code(seg, col, v):
     """the code of a literal (None when absent); the empty string on a text dictionary is code 0 when present --
-    the smallest value of a sorted dictionary -- one point read instead of a bisect (Q25's SearchPhrase <> '')"""
+    the smallest value of a sorted dictionary -- one point read instead of a bisect (a text column <> '')
+
+    Lore: Q25's SearchPhrase <> ''."""
     c = seg.cols[col]
     if c['dt'] == 1 and v == '' and int(c['V']) - (1 if c['has_null'] else 0) > 0:
         return 0 if bytes(seg.fetch(col, 0) or b'') == b'' else None
@@ -193,8 +197,10 @@ def flag(seg, node, col):
 def runs(seg, node, col):
     """the kept codes as sorted, disjoint [lo, hi) runs -- the same judgement as flag() for the shapes that are
     unions of value ranges (=, <>, <, <=, >, >=, BETWEEN, IN and their AND / OR), WITHOUT a V-sized table: a
-    WatchID <> x flag is 100M booleans (~80 ms to build and scan) where the runs are two pairs. None for the
-    rest (LIKE, IS NULL, NOT ...): the caller builds the flag."""
+    near-unique column's col <> x flag is V booleans where the runs are two pairs. None for the
+    rest (LIKE, IS NULL, NOT ...): the caller builds the flag.
+
+    Lore: a WatchID <> x flag is 100M booleans (~80 ms to build and scan)."""
     c = seg.cols.get(col)
     if c is None or c.get('mode') not in (0, 1, 2) or seg._overrides(col) is not None:
         return None

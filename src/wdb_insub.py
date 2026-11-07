@@ -1,9 +1,9 @@
-"""wdb_insub: [NOT] IN (an uncorrelated subquery) in a JOIN query, as a filter (c127, TPC-H Q16).
+"""wdb_insub: [NOT] IN (an uncorrelated subquery) in a JOIN query, as a filter (c127).
 
-    ... WHERE ps_suppkey NOT IN (SELECT s_suppkey FROM supplier WHERE s_comment LIKE '%Customer%Complaints%')
+    ... WHERE a.k NOT IN (SELECT b.k FROM b WHERE b.txt LIKE '%x%y%')
 
 The inner query does not read the outer row, so:
-  1. run it by itself first (wdb_subquery._run_inner; Q16: 56 suppliers, ~2 ms);
+  1. run it by itself first (wdb_subquery._run_inner);
   2. turn its values into the outer column's dictionary codes (wdb_subquery._road_codes);
      NOT IN keeps the complement -- every code of the column NOT in the list -- so the filter is positive;
   3. replace the conjunct by In(column) carrying those codes (the pre-resolved code set the cascade, the fused
@@ -11,11 +11,15 @@ The inner query does not read the outer row, so:
 An empty list: NOT IN keeps every row (the code set is all the column's codes); IN an empty list stands down (the
 mask layer cannot take an empty code set yet -- the old road declines it, as before).
 Only a plain inner query is taken (one table, a WHERE, one column; no GROUP BY / HAVING / aggregate; its WHERE may
-hold subqueries of its own -- the inner runs by itself, c128 Q20):
-the grouped shapes keep their own roads (Q18's IN ... GROUP BY ... HAVING -> the run sums).
+hold subqueries of its own -- the inner runs by itself, c128):
+the grouped shapes keep their own roads (IN ... GROUP BY ... HAVING -> the run sums).
 SQL's NULL rule: NOT IN against a list holding a NULL keeps no row -- that case, an outer column with NULLs, a text
 column and anything unexpected leave the conjunct untouched (the old road answers or declines).
-Switch WDB_IN_SUB (default on)."""
+Switch WDB_IN_SUB (default on).
+
+Lore: built for TPC-H Q16, WHERE ps_suppkey NOT IN (SELECT s_suppkey FROM supplier WHERE s_comment LIKE
+'%Customer%Complaints%') -- the inner query gives 56 suppliers in ~2 ms; c128's nested inner WHERE is TPC-H Q20; the
+grouped IN ... GROUP BY ... HAVING shape is Q18's."""
 import os
 import numpy as np
 from sqlglot import expressions as E
@@ -50,7 +54,9 @@ def _outer_owner(db, tree, col):
 
 def _plain_inner(q):
     """a plain inner query: one table, an optional WHERE, one column out -- no GROUP BY, HAVING, aggregate, window,
-    LIMIT, OFFSET, ORDER, join or nested subquery (those shapes have roads of their own, e.g. Q18's run sums)"""
+    LIMIT, OFFSET, ORDER, join or nested subquery (those shapes have roads of their own, e.g. the run sums)
+
+    Lore: the run sums are TPC-H Q18's road."""
     sub = q.this if isinstance(q, E.Subquery) else q
     if not isinstance(sub, E.Select) or len(sub.expressions) != 1: return False
     for k9 in ('group', 'having', 'limit', 'offset', 'order', 'joins', 'with', 'laterals', 'qualify'):

@@ -46,7 +46,8 @@ _READ_ORDER = (
     R.gbcount,              # full-table group census from the gbc shelf
     R.stair,                # staircase column: single-key GROUP BY from step positions (no decode)
     R.regexgroup,           # GROUP BY regex over the dict: per-code counts, V-level strings
-    R.lenagg,               # AVG/SUM(F(S)) GROUP BY K: stored lengths poured against the key (Q27)
+    # lore: lenagg was built for Q27
+    R.lenagg,               # AVG/SUM(F(S)) GROUP BY K: stored lengths poured against the key
     R.window,               # window fns: stable scatter by partition, lanes inherit cluster order
     R.dict_count,           # dictionary per-code counts (sidecar: answers before any scan)
     R.groupself,            # counting board: GROUP BY K + WHERE on K, bins not rows
@@ -54,14 +55,16 @@ _READ_ORDER = (
     R.grid2,               # plain 2-key COUNT grid: one fused pass, narrow detect
     R.firstk,               # staircase early-exit: LIKE + ORDER BY stair LIMIT k, pops only the answer window
     R.funnel,               # selective funnel: plist start, crumb hygiene, code-space group
-    R.complement,           # COUNT(*) WHERE k <> v: N - rows(k = v) - NULLs (Q1; wdb_complement)
+    # lore: complement serves Q1
+    R.complement,           # COUNT(*) WHERE k <> v: N - rows(k = v) - NULLs (wdb_complement)
     R.wherescan,            # conjunctive WHERE: stair spans + blocked-frame predicate scan, disk-only
     R.pairbound,            # two big keys, top-k by count: the rows whose two values both have >= T rows (wdb_pairbound)
     R.pairfold,
     R.affinegroup,
     R.affinesum,
     R.mixtop,
-    R.pairusers,            # Q11's shape: few kept rows / u a key / a near-unique key (wdb_pairusers); declines to:
+    # lore: pairusers is Q11's shape
+    R.pairusers,            # few kept rows / u a key / a near-unique key (wdb_pairusers); declines to:
     R.pairdistinct,
     R.septop,
     R.sampletop,
@@ -123,7 +126,8 @@ def route_single_segment(ctx):
         # full ordered group set and slices [off:off+lim]) -- let it try before the scan.
         # fused_agg last: it answers LIMIT + OFFSET rows in order and slices (wdb_join.table_agg's OFFSET window)
         # sorted_proj and firstk slice [off:off+lim] themselves too (2026-10-21): the dictionary walk and the staircase
-        # walk read lim + off and drop the first off (SELECT UserID ... ORDER BY UserID LIMIT 10 OFFSET 3 was a 41 s scan)
+        # walk read lim + off and drop the first off (SELECT k ... ORDER BY k LIMIT 10 OFFSET 3 was a 41 s scan)
+        # lore: the 41 s scan was SELECT UserID ... ORDER BY UserID LIMIT 10 OFFSET 3
         for rd in (R.gbcount, R.funnel, R.dict_count, R.sorted_proj, R.firstk, R.echo, R.wherescan, R.diskpair, R.fused_agg):   # the reads that apply OFFSET themselves
             spec = rd.detect(ctx)
             if spec is not None:
@@ -183,7 +187,8 @@ def route_single_segment(ctx):
             if rows is not None:
                 _SERVED[0] = R.firstk.name;  _PATH_SINK(ctx, R.firstk.name) if _PATH_SINK is not None else None
                 return rows
-        spec = R.echo.detect(ctx)            # SELECT c WHERE c = lit: the literal x its code's count (Q19's lane)
+        # lore: echo is Q19's lane
+        spec = R.echo.detect(ctx)            # SELECT c WHERE c = lit: the literal x its code's count
         if spec is not None:
             rows = R.echo.execute(ctx, spec)
             if rows is not None:

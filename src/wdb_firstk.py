@@ -1,4 +1,4 @@
-"""wdb_firstk -- Q23's staircase early-exit (Jackson's design), general since 2026-10-21 (Q24-Q26 board).
+"""wdb_firstk -- the staircase early-exit (Jackson's design): ORDER BY a non-decreasing column LIMIT k.
 
 SELECT <*, or columns> FROM hits [WHERE <one column's predicate>] ORDER BY staircol [, more keys]
        LIMIT k [OFFSET o]
@@ -9,10 +9,13 @@ matches are the FIRST k matches in row order. The filter is a keep flag over its
 cheaper survivors road); the row data is walked window by window from the top of the file and stops at the
 k-th hit -- only the blocks holding the answer's time window ever inflate.
 
-More ORDER keys after the staircase (Q26's ORDER BY EventTime, SearchPhrase): the rows sharing the k-th hit's
+More ORDER keys after the staircase (ORDER BY staircol, col2): the rows sharing the k-th hit's
 staircase value form one unbroken run, so the walk reads on to the end of that run, and only those candidates
 are sorted by (staircase code, key codes) -- every dictionary is in value order, so codes compare as values.
 Emission decodes the projected columns for exactly k rows.
+
+Lore: built for ClickBench Q23; general since 2026-10-21 (the Q24-Q26 board). The extra-keys case came from
+Q26's ORDER BY EventTime, SearchPhrase.
 """
 import numpy as np
 from sqlglot import expressions as E
@@ -98,7 +101,8 @@ def detect(seg, tree, col_map):
     if w9 is not None:
         lk = WS._like(w9.this)
         if lk is not None and not lk[3] and lk[2] == 'contains':
-            spec.update(col=cm.get(lk[0], lk[0]), needle=lk[1], kind='contains')   # Q23's survivors road
+            # lore: Q23's survivors road
+            spec.update(col=cm.get(lk[0], lk[0]), needle=lk[1], kind='contains')   # the LIKE '%x%' survivors road
             if seg.cols.get(spec['col']) is None:
                 return None
         else:
@@ -116,7 +120,8 @@ def detect(seg, tree, col_map):
     return spec
 
 
-_FIRST_WINDOW = 1 << 18   # the walk's first window of rows (Q23's 10th hit sits at row 214,125)
+# lore: Q23's 10th hit sits at row 214,125
+_FIRST_WINDOW = 1 << 18   # the walk's first window of rows
 _SCAN_SWITCH_SHIFT = 5    # the walk turns into one scan of the rest when more than N >> this rows remain to read
 
 
@@ -172,7 +177,8 @@ def _walk(seg, spec, need):
             # _SCAN_SWITCH_SHIFT's share of the table still to read, one scan of the rest through the column's own
             # scanner is cheaper than window after window of point reads. NOT on a single stream (enc 1, 2026-10-21):
             # there the scan inflates the whole stream from row 0 while the walk reads on and stops at the k-th hit
-            # (IsOldCounter's 10th kept row is at 7.4M of 100M: 94 -> ~10 ms)
+            # (a filter whose k-th kept row sits far into the table)
+            # lore: IsOldCounter's 10th kept row is at 7.4M of 100M: 94 -> ~10 ms
             rate = len(hits) / float(lo)
             left = (need - len(hits)) / rate if rate > 0 else float('inf')
             if left > (N >> _SCAN_SWITCH_SHIFT):
@@ -198,8 +204,10 @@ def _matches_in(seg, spec, lo, hi):
 
 
 def _settle_ties(seg, spec, hits, read_to, need):
-    """THE RUN CERTIFICATE (Q26): the need-th hit's staircase value t is shared only by the rows of one unbroken
-    run; read on to the end of that run, then order the candidates by (staircase code, the other keys' codes)"""
+    """THE RUN CERTIFICATE: the need-th hit's staircase value t is shared only by the rows of one unbroken
+    run; read on to the end of that run, then order the candidates by (staircase code, the other keys' codes)
+
+    Lore: from ClickBench Q26."""
     N = int(seg.N); ocol = spec['ocol']
     hits = np.asarray(hits, np.int64)
     if hits.size >= need:
@@ -251,7 +259,8 @@ def execute(seg, spec):
         if c.get('dt') == 0 and not (c.get('has_null') and (np.asarray(cc) == int(c['V']) - 1).any()):
             try:
                 # plain ints: point dict reads -- values_at would unpack the
-                # WHOLE packed dict (WatchID: 100M x 27 bits) for k values
+                # WHOLE packed dict (a near-unique column: 100M x 27 bits) for k values
+                # lore: the column was WatchID
                 vv = np.asarray(seg._dict_ints_at(c, cc), np.int64)
                 return [int(x) for x in vv]
             except Exception:

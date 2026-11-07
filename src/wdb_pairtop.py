@@ -1,4 +1,4 @@
-"""wdb_pairtop -- Jackson's singleton-discard for Q32's near-unique pair giant.
+"""wdb_pairtop -- Jackson's singleton-discard for a top-k COUNT(*) over a pair with a near-unique half.
 
 SELECT a, b, COUNT(*) c, <aggs...> GROUP BY a, b ORDER BY c DESC LIMIT k.
 
@@ -9,6 +9,8 @@ few thousand, and the podium is computed exactly on them. Ranks past the
 repeated pairs are count-1 ties -- any singletons are valid, LIMIT-tie law.
 Aggregates: COUNT(*), SUM(col), AVG(col) ride survivor rows; singleton
 filler rows emit their own row's values.
+
+Lore: built for ClickBench Q32's near-unique pair giant.
 """
 import numpy as np
 from sqlglot import expressions as E
@@ -16,11 +18,13 @@ from sqlglot import expressions as E
 import wdb_sql
 
 _HITS = 0
-# THE KEPT ROWS FIRST (Jackson, 2026-10-28, the Q14 board's WatchID pairs at 3-9x): under WHERE f <> x a pair repeats
+# THE KEPT ROWS FIRST (Jackson): under WHERE f <> x a pair repeats
 # among the kept rows only if its near-unique half repeats among them -- so the census of that half is taken over the
-# kept rows, not the column. Measured (this PC, 29 WatchID pairs, same counts on all): kept 177K-1.56M rows 28-38 ms
-# (today 396-423), 5.6-15M 104-196 ms (today 400-504), 25.4M 324 (445), 32.8M 408 (411: even), 56M+ loses. The line:
+# kept rows, not the column. The line:
 # kept <= N >> KEPT_SHIFT (2: a quarter of the rows); -1 never. The near-unique half must be plain bitpack (enc 0).
+# lore: 2026-10-28, the Q14 board's WatchID pairs at 3-9x. Measured (this PC, 29 WatchID pairs, same counts on all):
+# lore: kept 177K-1.56M rows 28-38 ms (today 396-423), 5.6-15M 104-196 ms (today 400-504), 25.4M 324 (445),
+# lore: 32.8M 408 (411: even), 56M+ loses.
 import os as _os
 KEPT_SHIFT = int(_os.environ.get('WDB_PAIRTOP_KEPT_SHIFT', '2'))
 _KEPT_HITS = [0]
@@ -125,10 +129,11 @@ def detect(seg, tree, col_map):
             fgen = (fcol, True, w9.this.expression)
             fcol = None
     if fgen is not None:
-        # THE GENERAL FILTER (2026-10-17, the Q14 board): one '=' / '<>' between any column and a literal is
+        # THE GENERAL FILTER: one '=' / '<>' between any column and a literal is
         # applied by the column's CODE at the survivor rows (and at the filler pool) -- the singleton law is
-        # untouched: a pair that repeats among the admitted rows repeats among all rows. GoodEvent x WatchID
-        # WHERE WatchID <> ... had fallen to gridwalk's flat lane, 100M near-unique pairs counted (5-17 s)
+        # untouched: a pair that repeats among the admitted rows repeats among all rows.
+        # lore: 2026-10-17, the Q14 board: GoodEvent x WatchID WHERE WatchID <> ... had fallen to gridwalk's flat
+        # lore: lane, 100M near-unique pairs counted (5-17 s)
         import wdb_wherescan as WS
         gc9 = seg.cols.get(fgen[0])
         if gc9 is None or gc9.get('has_null') or gc9.get('mode') == 4:

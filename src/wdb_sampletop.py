@@ -134,8 +134,8 @@ def execute(seg, spec):
                 pairs[(c, aa)] = int(nn)
         return _emit(seg, spec, pairs)
     offsB, plB = _F._plist(seg, spec['b'])
-    # a draw's count is two neighbouring offsets -- the census diff over all 6M codes (48 MB of
-    # offsets, ~115 ms cold) was read to look up a few dozen of them (Q17)
+    # a draw's count is two neighbouring offsets -- no census diff over all the codes to look up a few dozen of them
+    # lore: Q17: the census diff over all 6M codes (48 MB of offsets, ~115 ms cold) was read to look up a few dozen
     V = int(offsB.size) - 1
     rng = np.random.default_rng()
     k = spec['k']
@@ -165,8 +165,9 @@ def _emit(seg, spec, pairs):
     k = spec['k']
     out = []
     items = list(pairs.items())[:k]
-    # THE PLUCK IN ONE BATCH (as Q14's, Q24's): values_at decodes each touched dictionary chunk
-    # once, in parallel -- 2k point fetches were serial chunk inflates (~61 ms cold, Q17)
+    # THE PLUCK IN ONE BATCH: values_at decodes each touched dictionary chunk
+    # once, in parallel -- 2k point fetches were serial chunk inflates
+    # lore: as Q14's, Q24's; the serial point fetches cost ~61 ms cold on Q17
     vbs = seg.values_at(spec['b'], np.array([bc for (bc, ac), nn in items], np.int64)) if items else []
     vas = seg.values_at(spec['a'], np.array([ac for (bc, ac), nn in items], np.int64)) if items else []
     for ((bc, ac), nn), vb, va in zip(items, vbs, vas):
@@ -188,7 +189,8 @@ def _emit(seg, spec, pairs):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# THE CENSUS ROAD (2026-10-23, Q17's board: 57 of 70 pairs over 2x DuckDB, geomean 3.26x, worst 24.5 s on gridwalk).
+# THE CENSUS ROAD (2026-10-23).
+# lore: Q17's board: 57 of 70 pairs over 2x DuckDB, geomean 3.26x, worst 24.5 s on gridwalk
 # GROUP BY a, b LIMIT k with no ORDER BY asks for any k real groups with exact counts. The lanes above need a plist or
 # an enc-8 key's stored planes; every other pair fell to a read that counts EVERY pair. Here, for any encoding:
 #   1. the picker is the key with more values (its rarest values have the fewest rows);
@@ -341,18 +343,19 @@ def _road_cost(seg, b, a, R, t_census, m):
     return _ROAD_FIXED + scan + _read_cost(seg, b, R) + _read_cost(seg, a, R) + R * (_COUNT_NS + find) * 1e-9
 
 
+# lore: measured on Title / Referer / UserID / WatchID / RefererHash x IsMobile, 4.9-8.6 s
 _FULL_WIDE_NS = [float(os.environ.get('WDB_SAMPLE_FULL_WIDE_NS', '45'))]   # past the dense board: the full count
-                                                    # measured 49-86 ns per table row (Title / Referer / UserID / WatchID /
-                                                    # RefererHash x IsMobile, 4.9-8.6 s)
+                                                    # measured 49-86 ns per table row (wide keys x a flag)
 _DENSE_CELLS = 1 << 24            # gridwalk's dense board: (values of a) x (values of b) up to 16.7M cells
 _FULL_SCALE = [1.0]               # a test's lever on the full count's price
 # THE DENSE FULL COUNT, PRICED (2026-10-23, after gridwalk's build went to every core -- ba4bb89): it is the two
 # keys' whole decodes plus the grid's count (gsweep.py, the 70-pair sample timed both ways, plans re-keyed):
-#   decode, ns per row by encoding and width (<= 16 bits, wider), measured with caches flushed: enc 0 0.07 / 0.38
-#   (WatchID), 1 0.08, 2 0.06-0.08 / 0.43 (EventTime), 3 0.08-0.27 / 0.63-0.73, 5 0.35-0.39, 8 0.60, 9 0.20-0.24,
+#   decode, ns per row by encoding and width (<= 16 bits, wider), measured with caches flushed: enc 0 0.07 / 0.38,
+#   1 0.08, 2 0.06-0.08 / 0.43, 3 0.08-0.27 / 0.63-0.73, 5 0.35-0.39, 8 0.60, 9 0.20-0.24,
 #   10 0.08-0.24, 17 0.23-0.26, 18 0.48-0.54, 19 0.16 / 0.29-0.39, 20 1.05 -- the dearest of each bucket taken;
 #   the count: full - both decodes = 0.024-0.035 s to ~100K cells, 0.074-0.092 at 0.5-1.6M, 0.17-0.26 at 4.3-7.3M --
 #   the fused count's curve (fusesweep.py: ~28 ns a cell past its fixed part) to 4M cells, the radix path past it.
+# lore: the wide enc 0 figure (0.38) is WatchID's, the wide enc 2 figure (0.43) EventTime's
 _DEC_NS = {0: (0.07, 0.38), 1: (0.08, 0.08), 2: (0.08, 0.43), 3: (0.27, 0.73), 5: (0.39, 0.39), 8: (0.60, 0.60),
            9: (0.24, 0.24), 10: (0.24, 0.24), 17: (0.26, 0.26), 18: (0.54, 0.54), 19: (0.16, 0.39), 20: (1.05, 1.05)}
 _DEC_DEFAULT = (0.60, 1.10)

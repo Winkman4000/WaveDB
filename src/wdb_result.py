@@ -1,4 +1,4 @@
-"""wdb_result -- THE CURSOR (2026-10-22, Q7's huge answers).
+"""wdb_result -- THE CURSOR: a result that stays in columns and builds rows only as they are fetched.
 
 The result interface the users of DuckDB's and ClickHouse's Python clients expect:
   - PEP 249's cursor: description, rowcount, arraysize, fetchone / fetchmany / fetchall, iteration;
@@ -11,7 +11,9 @@ Arrow batches. db.execute(sql) returns a Cursor; db.run(sql) is unchanged (it is
 Reads that can answer in columns hand back a Columns object -- only when the outermost db.execute asked (WANT), never
 to a nested run (a subquery's caller expects rows). Every other read's rows are wrapped as they are.
 A lazily decoded column (text from the dictionary) decodes outside the query that made it: the cursor ends each such
-batch the way a query ends (wdb_qmem.flush) when no query is running, so no decoded state outlives it (Jackson's law)."""
+batch the way a query ends (wdb_qmem.flush) when no query is running, so no decoded state outlives it (Jackson's law).
+
+Lore: written 2026-10-22, for Q7's huge answers."""
 import numpy as np
 
 WANT = [False]                    # Database.execute sets it for its outermost run: a read may answer with Columns

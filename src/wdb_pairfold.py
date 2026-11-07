@@ -1,4 +1,4 @@
-"""wdb_pairfold -- Q30's one-walk pair board (the eight taxes become one).
+"""wdb_pairfold -- a one-walk pair board: GROUP BY two keys, count and sums, top n by count.
 
 SELECT a, b, COUNT(*) c, SUM(x), AVG(y) FROM hits
 WHERE f <> '' GROUP BY a, b ORDER BY c DESC LIMIT n
@@ -6,7 +6,9 @@ WHERE f <> '' GROUP BY a, b ORDER BY c DESC LIMIT n
 The filter is free (the planes hand the typed positions, memoized). One
 fused kernel walks those positions, reads all four columns at the row,
 radix-buckets by b, then per-bucket sorts and folds count + both
-dictionary-valued sums. Ten pairs decode at the pluck.
+dictionary-valued sums. Only the n winning pairs decode at the pluck.
+
+Lore: built for ClickBench Q30 ("the eight taxes become one"); LIMIT 10 there, so ten pairs decode.
 """
 import numpy as np
 from sqlglot import expressions as E
@@ -20,12 +22,14 @@ _DENSE = [__import__('os').environ.get('WDB_PF_DENSE', '1') == '1']      # A/B: 
 _UNIQUE_HANDOFF = [__import__('os').environ.get('WDB_PF_UNIQUE', '1') == '1']  # A/B: 0 keeps near-unique partners
 SMALL_MAX = 4 << 20          # the smaller key's values for pairfold (both keys past it: pairtop's)
 DENSE_MAX = 1 << 18         # pair slots Va x Vb for the dense fold: 16 thread tables x 3 x 8 B x 256K = 100 MB
-# THE HEAVY VALUES ON EVERY CORE (Jackson, 2026-10-28, the Q32 board: 242 of its 254 pairfold variants over 2x had one
-# bucket holding > n/64 of the rows, sorted or counted by ONE thread while 15 idled -- ResponseEndTiming x OpenstatAdID
-# 24.2 s, 22.9 of them in pr_fold2, OpenstatAdID's '' on 99.5M rows). b values with more than n // HEAVY_DIV rows (n =
-# the rows read) are counted on every core into the threads' own tables of (heavy values x Va) slots, at most
-# HEAVY_SLOTS (past it: the buckets, as before); the other rows go the buckets' way. Prototype (this PC, same counts on
-# 13 pairs): 24.2 -> 0.22 s (DuckDB 0.21), SendTiming x UserAgentMajor 1.22 -> 0.29 (0.22). HEAVY_DIV 0: never.
+# THE HEAVY VALUES ON EVERY CORE: one bucket holding a large share of the rows was sorted or counted by ONE thread
+# while the rest idled. b values with more than n // HEAVY_DIV rows (n = the rows read) are counted on every core
+# into the threads' own tables of (heavy values x Va) slots, at most HEAVY_SLOTS (past it: the buckets, as before);
+# the other rows go the buckets' way. HEAVY_DIV 0: never.
+# lore: Jackson, 2026-10-28, the Q32 board: 242 of its 254 pairfold variants over 2x had one bucket holding > n/64 of
+# the rows, 15 threads idle -- ResponseEndTiming x OpenstatAdID 24.2 s, 22.9 of them in pr_fold2, OpenstatAdID's '' on
+# 99.5M rows. Prototype (this PC, same counts on 13 pairs): 24.2 -> 0.22 s (DuckDB 0.21), SendTiming x UserAgentMajor
+# 1.22 -> 0.29 (0.22).
 HEAVY_DIV = int(__import__('os').environ.get('WDB_PF_HEAVY_DIV', '64'))
 HEAVY_SLOTS = int(__import__('os').environ.get('WDB_PF_HEAVY_SLOTS', str(1 << 18)))
 _HEAVY_HITS = [0]
@@ -53,7 +57,8 @@ def detect(seg, tree, col_map):
     w = tree.args.get('where')
     cm = col_map or {}
     if w is None:
-        fcol = None                              # NO FILTER (2026-10-17, Q32's form): every row is a position
+        # lore: the unfiltered form is ClickBench Q32's (2026-10-17)
+        fcol = None                              # NO FILTER: every row is a position
     else:
         if not isinstance(w.this, E.NEQ):
             return None
@@ -80,16 +85,18 @@ def detect(seg, tree, col_map):
         ac, bc = bc, ac
         Va0, Vb0 = Vb0, Va0
     # THE SMALL KEY'S OWN BITS (2026-10-17): the low field was one byte (a <= 256 values); it is now as
-    # wide as the smaller key needs, so a mid key pairs too. Both keys past SMALL_MAX values (WatchID x
-    # ClientIP) stay pairtop's; the packed pair must fit 62 bits
+    # wide as the smaller key needs, so a mid key pairs too. Both keys past SMALL_MAX values stay pairtop's;
+    # the packed pair must fit 62 bits
+    # lore: the both-keys-wide pair was WatchID x ClientIP
     if Va0 > SMALL_MAX:
         return None
     abits = max(1, (Va0 - 1).bit_length())
     if max(1, (Vb0 - 1).bit_length()) + abits > 62:
         return None
-    # A NEAR-UNIQUE PARTNER IS PAIRTOP'S (2026-10-17, the c3 Q31 board): with the larger key holding a value
-    # per ~row (WatchID: 100M values in 100M rows) every pair counts ~1 and pairtop's walk wins -- SendTiming x
-    # WatchID 0.30 s there vs 1.19 s here; the Q31 board's WatchID family 12.5 s vs 25.2 s
+    # A NEAR-UNIQUE PARTNER IS PAIRTOP'S: with the larger key holding a value per ~row every pair counts ~1
+    # and pairtop's walk wins
+    # lore: 2026-10-17, the c3 Q31 board (WatchID: 100M values in 100M rows): SendTiming x WatchID 0.30 s
+    # there vs 1.19 s here; the Q31 board's WatchID family 12.5 s vs 25.2 s
     if _UNIQUE_HANDOFF[0] and Vb0 >= max(1, int(getattr(seg, 'N', 0) or 0)) // 2:
         return None
     proj = []                                    # ('A',)('B',)('C',)('S',col)('V',col)
@@ -175,9 +182,10 @@ def execute(seg, spec):
             and __import__('wdb_funnel').plist_ready(seg, spec['b']):    # THE VANILLA LAW: lists that may serve
         import wdb_funnel as _F
         from concurrent.futures import ThreadPoolExecutor as _TPa
-        # THE OVERLAP (Q14 cold): the small key's full decode is CPU (~70 ms warm or cold through
-        # codes_band; the pipelined 16-lane decode ~45) and the census is storage (48 MB of offsets,
-        # ~50 ms) -- the decode runs beside the census read instead of after it
+        # THE OVERLAP: the small key's full decode is CPU and the census is storage
+        # -- the decode runs beside the census read instead of after it
+        # lore: Q14 cold: the decode ~70 ms warm or cold through codes_band (the pipelined 16-lane decode ~45),
+        # the census 48 MB of offsets, ~50 ms
         _exa = _TPa(max_workers=1)
         futa = _exa.submit(seg._raw_codes, spec['a']) if _OVERLAP[0] else None
         try:
@@ -198,8 +206,9 @@ def execute(seg, spec):
             _exa.shutdown(wait=True)
         nz = int((cnt_b > 0).sum())
         # THE BAR, not the sort: the loop reads only the top M candidates and the count just below
-        # them -- topk_bar selects those M + 1 (a lowered bar, parallel compares) where a full argsort
-        # of all 6M SearchPhrase counts cost ~123 ms hot and cold (Q14)
+        # them -- topk_bar selects those M + 1 (a lowered bar, parallel compares) instead of a full argsort
+        # of every value's count
+        # lore: the full argsort of all 6M SearchPhrase counts cost ~123 ms hot and cold (Q14)
         M = max(64, 4 * k)
         while True:
             M9 = min(M, nz)
@@ -226,8 +235,9 @@ def execute(seg, spec):
             M *= 4
         out = []
         tl9 = topi.tolist()
-        # THE PLUCK IN ONE BATCH (as Q24's): values_at decodes each touched dictionary chunk once,
-        # in parallel -- k point fetches were k serial chunk inflates (~23 ms cold for 10 rows)
+        # THE PLUCK IN ONE BATCH: values_at decodes each touched dictionary chunk once,
+        # in parallel -- k point fetches were k serial chunk inflates
+        # lore: as Q24's pluck; the point fetches cost ~23 ms cold for 10 rows
         vbs = seg.values_at(spec['b'], np.array([int(cands[j >> 8]) for j in tl9], np.int64)) if tl9 else []
         vas = seg.values_at(spec['a'], np.array([j & 0xFF for j in tl9], np.int64)) if tl9 else []
         for j, va, vb in zip(tl9, vas, vbs):
@@ -260,7 +270,7 @@ def execute(seg, spec):
     VA = int(seg.cols[spec['a']]['V'])
     # THE SUMS' VALUE TABLES, once (2026-10-17): with no SUM/AVG the payload is never read, so no table is
     # decoded -- the first version decoded the small key's values as numbers anyway and a TEXT key crashed
-    # (MobilePhoneModel x SearchPhrase, COUNT only, WHERE SearchPhrase <> '')
+    # lore: the crash was MobilePhoneModel x SearchPhrase, COUNT only, WHERE SearchPhrase <> ''
     dv1 = _dv(seg, x1) if scols else np.zeros(max(1, VA), np.float64)
     dv2 = _dv(seg, x2) if len(scols) > 1 else dv1
     if _DENSE[0] and VA * BV <= DENSE_MAX:
@@ -301,7 +311,8 @@ def execute(seg, spec):
     ckey = ('pf', spec['f'], spec['b'])
     cnt_b = memo.get(ckey)
     if cnt_b is None:                        # the bound: a pair can never
-        # (2026-10-28) on every core: numpy's bincount was one thread, 170-224 ms of the Q32 pairs (THE HEAVY VALUES)
+        # on every core: numpy's bincount is one thread (THE HEAVY VALUES)
+        # lore: (2026-10-28) numpy's single-thread bincount was 170-224 ms of the Q32 pairs
         cnt_b = _WK.bincount_par(bc9 if pos is None else bc9[pos], BV)    # outscore its b's total
         memo[ckey] = cnt_b
     if not _HT[0]:
@@ -423,18 +434,21 @@ def _onepass(pos, ac9, bc9, xc9, yc9, dv1, dv2, AB, W, T9, tag=None):
         ds9 = int(ds9); f19 = int(f19); f29 = int(f29)
         # Chao1: the pairs seen plus the unseen ones the singletons imply (with every row sampled, the pairs seen)
         return ds9, f19, f29, int(hb9) / S9, (float(ds9) if S9 >= n else ds9 + f19 * (f19 - 1) / (2.0 * (f29 + 1)))
-    # THE STAGED ESTIMATE (measured 2026-10-29 on the 563 pairs the Q30-Q32 boards traced): 2^15 rows first (0.7 ms
-    # median against 6.1 for 2^17 -- the sample's cost is its gathers); an estimate already past HT_STAGE x HT_LINE
-    # there is past the line at 2^17 too (not one of the 563 decisions flipped at a stage line of 2, 4 or 8)
+    # THE STAGED ESTIMATE: 2^15 rows first (the sample's cost is its gathers); an estimate already past
+    # HT_STAGE x HT_LINE there is past the line at 2^17 too
+    # lore: measured 2026-10-29 on the 563 pairs the Q30-Q32 boards traced: 0.7 ms median against 6.1 for 2^17;
+    # not one of the 563 decisions flipped at a stage line of 2, 4 or 8
     S = min(n, HT_SAMPLE1)
     ds, f1, f2, hsh, est = _samp(S)
     if not (S < n and est > HT_STAGE * HT_LINE and not (allr and hsh > HT_HEAVY)):
         S = min(n, HT_SAMPLE)
         ds, f1, f2, hsh, est = _samp(S)
     rec = {'tag': tag, 'n': n, 'S': S, 'ds': ds, 'f1': f1, 'f2': f2, 'est': est, 'heavy': hsh}
-    # THE HEAVY LINE (measured 2026-10-29, Q32 vs Q31 boards): over every row, a big key past HT_HEAVY is the heavy
-    # fold's (its dense table on contiguous rows beats the hash, 56 of 66 lost at share >= 0.99); under a filter both
-    # gather rows by position and the one pass won all 90 at share >= 0.95 -- the line holds only with no filter
+    # THE HEAVY LINE: over every row, a big key past HT_HEAVY is the heavy fold's (its dense table on contiguous
+    # rows beats the hash); under a filter both gather rows by position and the one pass wins -- the line holds
+    # only with no filter
+    # lore: measured 2026-10-29, Q32 vs Q31 boards: unfiltered, the hash lost 56 of 66 at share >= 0.99; filtered,
+    # the one pass won all 90 at share >= 0.95
     if allr and hsh > HT_HEAVY:
         rec['path'] = 'heavy'
         _ht_trace(rec)

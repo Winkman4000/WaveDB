@@ -1,6 +1,6 @@
-"""wdb_pairbound -- THE PAIR BOUND (Jackson, 2026-10-28, Q32's family 1).
+"""wdb_pairbound -- THE PAIR BOUND: top-k pairs by count of two big keys, keeping only rows both bounds admit.
 
-SELECT a, b, COUNT(*) AS c [, SUM(x), AVG(y)] FROM hits GROUP BY a, b ORDER BY c DESC LIMIT k
+SELECT a, b, COUNT(*) AS c [, SUM(x), AVG(y)] FROM t GROUP BY a, b ORDER BY c DESC LIMIT k
 
 Every value lives at its rows on one row circle (N rows); a pair's count is the cancellation sum of its two values'
 signatures, and its frequency-0 term bounds it: count(a, b) <= min(rows of a, rows of b). So with T a bar:
@@ -11,11 +11,13 @@ signatures, and its frequency-0 term bounds it: count(a, b) <= min(rows of a, ro
   5. THE CERTIFICATE: the k-th exact count >= T -> every dropped pair (count < T) is below it: exact. Else
      T = max(that k-th count, T // 2) and again from 3 (T = 1 keeps every row: the whole exact count)
   6. the winners' SUM / AVG: one pass over the kept rows (pb_winner_sums)
-Measured on the PC (prototype, hot, the sample guess; DuckDB in brackets): ClientIP x RefererHash 11.7 s -> 0.90
-(1.22), IPNetworkID x RefererHash 8.3 -> 0.85 (0.98), OriginalURL x ClientIP 10.5 -> 1.02 (1.98), Referer x RefererHash
-8.9 -> 1.53 (2.07), LocalEventTime x RefererHash 21.3 -> 2.61 (2.06), three 30 s timeouts -> 1.1-2.5 s; all exact.
-The switch: THE LINE below (measured on the Q32 board), neither key near-unique (V >= N/2: pairtop's walk), no WHERE
+The switch: THE LINE below (measured), neither key near-unique (V >= N/2: pairtop's walk), no WHERE
 (this first form).
+
+Lore: Jackson, 2026-10-28, Q32's family 1; THE LINE was measured on the Q32 board. Measured on the PC (prototype,
+hot, the sample guess; DuckDB in brackets): ClientIP x RefererHash 11.7 s -> 0.90 (1.22), IPNetworkID x RefererHash
+8.3 -> 0.85 (0.98), OriginalURL x ClientIP 10.5 -> 1.02 (1.98), Referer x RefererHash 8.9 -> 1.53 (2.07),
+LocalEventTime x RefererHash 21.3 -> 2.61 (2.06), three 30 s timeouts -> 1.1-2.5 s; all exact.
 """
 import os
 import numpy as np
@@ -25,13 +27,15 @@ import wdb_sql
 
 _HITS = 0
 _ROUNDS = [0]
-# THE LINE (measured, Jackson OK'd 2026-10-28): the Q32 board run with the bound on every size (1,118 variants), against
+# THE LINE (measured, Jackson OK'd 2026-10-28): a pair board run with the bound on every size (1,118 variants), against
 # c88 pair by pair, by the larger key's V x the smaller key's V. The bound wins where
 #   1. the larger key has >= 2^24 values (any smaller key):           0.13-0.88x, over 2x 40 -> 1
 #   2. both keys >= 2^16 values and the larger >= 2^22:               0.14-0.80x, over 2x 13 -> 0
-#   3. the larger key 2^16 .. 2^20 values and the smaller >= 2^10:    0.50x,      over 2x 14 -> 9 (IPNetworkID x a mid key)
+#   3. the larger key 2^16 .. 2^20 values and the smaller >= 2^10:    0.50x,      over 2x 14 -> 9
 # and loses everywhere else (both keys small: every row kept and sorted, 3.5-15x slower than the dense / bucket folds).
-# Q32 estimate: over 2x 148 -> 96, timeouts 5 -> 0, 0.82x -> 0.74x. WDB_PAIRBOUND_LINE: line (default), all, off.
+# WDB_PAIRBOUND_LINE: line (default), all, off.
+# lore: the board was Q32's; case 3 was IPNetworkID x a mid key. Q32 estimate: over 2x 148 -> 96, timeouts 5 -> 0,
+# lore: 0.82x -> 0.74x.
 LINE = os.environ.get('WDB_PAIRBOUND_LINE', 'line')
 
 
@@ -98,9 +102,11 @@ def detect(seg, tree, col_map):
     if len(scols) > 2 or not any(k[0] == 'C' for k in proj):
         return None
     if not scols:
-        # THE MEASURED SHAPE (2026-10-28): the line was measured on Q32's form (COUNT + SUM / AVG), where pairfold and
-        # gridwalk were the competitors. On COUNT-only pairs (the Q16 board, 217 variants on the line) tripletop and
-        # gridwalk's composed tally were faster: over 2x 6 -> 24, Q16 itself 0.33 -> 0.81 s. They keep those.
+        # THE MEASURED SHAPE (2026-10-28): the line was measured on the COUNT + SUM / AVG form, where pairfold and
+        # gridwalk were the competitors. On COUNT-only pairs tripletop and gridwalk's composed tally were faster.
+        # They keep those.
+        # lore: the measured form was Q32's; the COUNT-only pairs were the Q16 board (217 variants on the line):
+        # lore: over 2x 6 -> 24, Q16 itself 0.33 -> 0.81 s.
         return None
     ox = tree.args.get('order'); lx = tree.args.get('limit')
     if ox is None or lx is None or len(ox.expressions) != 1:
@@ -178,8 +184,10 @@ def execute(seg, spec):
     ca = WK.bincount_par(ac, VA)
     cb = WK.bincount_par(bc, VB)
     # THE KEY'S HIGH PART (2026-10-28): the sort buckets by the key's top bits, so the high part is the column whose most
-    # common value holds the smaller share of the rows -- RefererHash's '' (19% of rows) high piled a fifth of the keys
-    # into one bucket on one thread (RefererHash x EventTime: 18.5 s of 33 s in the sort). key = hi * V(lo) + lo
+    # common value holds the smaller share of the rows -- a heavy value high piles its share of the keys into one
+    # bucket on one thread. key = hi * V(lo) + lo
+    # lore: RefererHash's '' (19% of rows) high piled a fifth of the keys into one bucket on one thread
+    # lore: (RefererHash x EventTime: 18.5 s of 33 s in the sort)
     swap = int(cb.max()) < int(ca.max())
     hc, lc, hcnt, lcnt, VL = (bc, ac, cb, ca, VA) if swap else (ac, bc, ca, cb, VB)
     T = _guess(hc, lc, VL, k)

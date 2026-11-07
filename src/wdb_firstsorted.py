@@ -1,13 +1,17 @@
-"""wdb_firstsorted -- Q24/Q26: the staircase answers ORDER BY unprojected time.
+"""wdb_firstsorted -- the staircase answers ORDER BY an unprojected file-ordered column.
 
-SELECT p FROM hits WHERE p <> '' ORDER BY et [, p] LIMIT k
-  where et is a STAIRCASE column (file order IS et order).
+SELECT p FROM t WHERE p <> '' ORDER BY et [, p] LIMIT k
+  where p is a sparse text column whose default is '' and et is a STAIRCASE column
+  (file order IS et order).
 
 The planes hand the typed positions ascending; the first k ARE the answer
-(Q24). With a tiebreak on p (Q26), et codes come free from the steps
+(no tiebreak). With a tiebreak on p, et codes come free from the steps
 (searchsorted, no decode) and p compares by sorted-dict CODE; a boundary
 certificate widens until the k-th row's et strictly clears the candidate
-window. Ten values decode at the pluck.
+window. Only k values decode at the pluck.
+
+Lore: built for ClickBench Q24 (no tiebreak) and Q26 (tiebreak on p), where et is EventTime
+("ten values decode at the pluck": LIMIT 10).
 """
 import numpy as np
 from sqlglot import expressions as E
@@ -88,7 +92,8 @@ def execute(seg, spec):
     if not spec['tie']:
         pos, lits, n_all = _planes_head(seg, spec['p'], spec['k'])
         k = min(spec['k'], pos.size)
-        pick = lits[:k]                          # file order IS et order (Q24)
+        # lore: the no-tiebreak case is ClickBench Q24
+        pick = lits[:k]                          # file order IS et order
     else:
         steps = np.asarray(seg.stairs(spec['o']), dtype=np.int64)
         K = max(64, 4 * spec['k'])

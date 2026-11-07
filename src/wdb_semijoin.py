@@ -1,10 +1,12 @@
-"""THE SEMI-JOIN FIXPOINT (the JOB shape): a multi-way equi-join projecting ONLY
+"""THE SEMI-JOIN FIXPOINT: a multi-way equi-join projecting ONLY
 MIN/MAX. Under MIN/MAX row multiplication is irrelevant -- a table's
 contribution is the extreme over its rows that PARTICIPATE in the join.
 Participation is a fixpoint: local filters seed each table's keep; every
 equality edge prunes both sides to the other's surviving keys (dense-id
 lookup tables, O(N)); iterate to stability; MIN/MAX per column over its
-table's survivors (strings by the extreme present dictionary code)."""
+table's survivors (strings by the extreme present dictionary code).
+
+Lore: the JOB shape."""
 import os
 import numpy as np
 import wdb_shelf
@@ -112,8 +114,9 @@ def _keyset_kernel(col, idx, mx):
 
 
 _NOIDX = np.zeros(0, np.int64)
+# lore: the settling rounds cut tables of 5 rows (JOB 7a: 10 x ~23 ms)
 _CUT_PAR_MIN = 262_144          # rows a cut must walk before the cores are woken: a parallel launch costs ~10-20 ms
-                                # on a shared host, and the settling rounds cut tables of 5 rows (JOB 7a: 10 x ~23 ms)
+                                # on a shared host, and the settling rounds can cut tables of a few rows
 
 
 @njit(nogil=True, parallel=True, cache=True)
@@ -194,9 +197,10 @@ def _inline_prefix8(blob, off, rows):
     return out
 
 
-# OFF BY DEFAULT, BY MEASUREMENT (JOB 7c, true cold/hot): 328 -> 511 ms hot, 1480 -> 1981 ms cold. Each try's
-# settle still re-derives the big tables' key sets (~90 ms), and waiting for every filter loses the stream's
-# overlap; 7c's time is its range filters (hot) and the whole pi.info stream read for the emit (cold)
+# OFF BY DEFAULT, BY MEASUREMENT: each try's settle still re-derives the big tables' key sets, and waiting for
+# every filter loses the stream's overlap
+# lore: JOB 7c, true cold/hot: 328 -> 511 ms hot, 1480 -> 1981 ms cold; the re-derivation ~90 ms; 7c's time is its
+# range filters (hot) and the whole pi.info stream read for the emit (cold)
 _WALK = os.environ.get('WDB_MIN_WALK', '0') == '1'
 _WALK_MIN = 4_096               # fewer candidates than this: the whole fixpoint is already cheap
 _WALK_FIRST = 64                # the first batch of the walk
@@ -205,12 +209,13 @@ _WALK_BUDGET = 4_096            # the walk gives up past this many candidates (t
 
 def _min_walk(tree, owner, segs, pms, alias2t, edges, base_keeps, base_counts, keys, keys_at, inverted, rows_for_keys,
               pack, _bill, _tk, keycache):
-    """JACKSON'S WALK (JOB 7c, 2026-10-03: "start with a bunch of samples from the A letter ... work our way
-    backwards down the list until we find one that satisfies all the requirements since they only need one"):
-    a MIN/MAX needs one row. Its table's candidates (after its own filters) in value order; the first batch is
-    the only live part of that table and the join settles around it; a survivor's extreme is the answer
+    """JACKSON'S WALK: a MIN/MAX needs one row. Its table's candidates (after its own filters) in value order; the
+    first batch is the only live part of that table and the join settles around it; a survivor's extreme is the answer
     (every candidate before it was in the batch and fell). None of the batch: four times as many. Past the budget,
-    None -- the caller's whole fixpoint answers. Every MIN/MAX of the select is walked, or none."""
+    None -- the caller's whole fixpoint answers. Every MIN/MAX of the select is walked, or none.
+
+    Lore: JOB 7c, 2026-10-03: "start with a bunch of samples from the A letter ... work our way
+    backwards down the list until we find one that satisfies all the requirements since they only need one"."""
     import wdb_sql
     out = []
     for p in tree.expressions:
@@ -325,10 +330,11 @@ def execute(db, tree, sql=None):
         except _FastUnsupported:
             raise _Decline('multi-segment table %s' % t)
         segs[a] = seg
-    # THE COSTLY CONDITION WAITS (Jackson's PEMDAS, 2026-10-03: "production year takes out a ton for 138 ms ...
-    # both prune before we have to do the expensive name LIKE"): a condition that reads a wide text column row by
+    # THE COSTLY CONDITION WAITS (Jackson's PEMDAS): a condition that reads a wide text column row by
     # row is kept out of isolation; the cheap ones and the join narrow first, then it is asked of the survivors
-    # only (JOB 7a: n.name LIKE 'B%' over 4.1M names, 507 ms hot / 2.5 s cold, for 12 people left standing)
+    # only
+    # lore: 2026-10-03: "production year takes out a ton for 138 ms ... both prune before we have to do the expensive
+    # name LIKE" (JOB 7a: n.name LIKE 'B%' over 4.1M names, 507 ms hot / 2.5 s cold, for 12 people left standing)
     dear = {a: [] for a in alias2t}
     if os.environ.get('WDB_DEFER', '1') != '0':
         cheap = {}
@@ -342,9 +348,10 @@ def execute(db, tree, sql=None):
         seg = segs[a]; m = None
         for c2 in local[a]:                            # already table-stripped, in the plan
             # THE PREDICATE SHELF: a local predicate's result on an immutable segment is a fact --
-            # kept as an index list on the shelf across queries (JOB's 113 queries reuse the same
-            # few filters on the same big tables: mi.info LIKE ... on 14.8M rows was 392ms, every
-            # time). A segment with tombstones or overrides never gets here (_solo_segment).
+            # kept as an index list on the shelf across queries (a workload that reuses the same
+            # few filters on the same big tables pays for each once). A segment with tombstones or
+            # overrides never gets here (_solo_segment).
+            # lore: JOB's 113 queries reuse such filters: mi.info LIKE ... on 14.8M rows was 392ms, every time
             _pk9 = ('pred', seg.path, c2.sql())
             _hit9 = wdb_shelf.SHELF.get(_pk9)
             if _hit9 is not None:
@@ -743,8 +750,9 @@ def execute(db, tree, sql=None):
             if (cd.get('mode') == 5 and rows.size and ib9 is not None and cd.get('_istream') is None
                     and np.unique(rows // ib9[0]).size * 4 <= ib9[1]):
                 # THE SURVIVORS' BLOCKS ONLY (2026-10-03): a blocked inline column whose surviving rows sit in a
-                # quarter of its blocks or fewer reads and inflates those blocks alone -- MIN(t.title) in 111 of
-                # JOB's 113 queries opened the whole 2.5M-title stream cold (~230 ms) for a handful of rows
+                # quarter of its blocks or fewer reads and inflates those blocks alone, not the whole stream
+                # lore: MIN(t.title) in 111 of JOB's 113 queries opened the whole 2.5M-title stream cold (~230 ms)
+                # for a handful of rows
                 vals9 = seg.inline_at(pc, rows)
                 out.append(wdb_sql._pyval(max(vals9) if isinstance(nd, E.Max) else min(vals9)))
                 continue
@@ -784,15 +792,17 @@ def _is_dear(seg, node, pm):
         if cd.get('mode') == 5:
             # THE COST IS WHAT IT COSTS HERE: a pattern the token kernel says over the stored stream is a few
             # ms for millions of rows -- cheap, it stays in isolation (deferring it lost its early cut and its
-            # overlap: JOB 17a-f, 6d, 13b/c ~90 -> ~240 ms hot); only what falls back to Python objects waits
+            # overlap); only what falls back to Python objects waits
+            # lore: deferred, JOB 17a-f, 6d, 13b/c went ~90 -> ~240 ms hot
             pat = lk.expression
             if (isinstance(lk, E.Like) and isinstance(pat, E.Literal) and pat.is_string and lk.args.get('escape') is None
                     and wdb_sql._like_tok_parts(pat.this) is not None and seg._overrides(pc) is None):
                 continue
             return True
         if int(cd.get('V', 0)) >= _DEAR_DICT_V:
-            # JACKSON'S "LIKE FIRST" (JOB 10c): a pattern the token kernel says over the dictionary's own byte
+            # JACKSON'S "LIKE FIRST": a pattern the token kernel says over the dictionary's own byte
             # stream is one pass over the distinct values plus a code lookup -- cheap, so it prunes first
+            # lore: JOB 10c
             pat = lk.expression
             if (isinstance(lk, E.Like) and isinstance(pat, E.Literal) and pat.is_string and lk.args.get('escape') is None
                     and cd.get('mode') in (0, 1) and wdb_sql._like_tok_parts(pat.this) is not None
@@ -889,8 +899,9 @@ def _string_rank(seg, pc):
         import wdb_sidecar
         if not wdb_sidecar.may_build(seg.path):
             # THE VANILLA LAW, HERE TOO (2026-10-03): with the switch off the rank could never be kept,
-            # so building it answers one MIN with a sort of the whole column -- 2.2 s of argsort and
-            # 0.7 s of decode in JOB 1b's 3.7 s. Decline: the callers read only the rows they need
+            # so building it answers one MIN with a sort of the whole column. Decline: the callers read
+            # only the rows they need
+            # lore: 2.2 s of argsort and 0.7 s of decode in JOB 1b's 3.7 s
             return None
     except Exception:
         pass
@@ -995,9 +1006,10 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
         ck = (a, c, counts[a])                     # cached per (table, column, live count): a key set
         if ck in kcache: return kcache[ck]         # only changes when its table shrinks
         # THE SETTLED-SPACE CACHE (Jackson's relationship chain): a junction's key set after a cut is a
-        # fact about (segment, column, provenance of the keep); JOB's families repeat the same first
-        # hops -- rt.role = 'actor' reaches cast_info in 13 queries -- and recomputed each one (12.7M
-        # live rows -> the movie key set, ~50ms). Shelved across queries; DML moves the stamp.
+        # fact about (segment, column, provenance of the keep); query families repeat the same first
+        # hops and recomputed each one. Shelved across queries; DML moves the stamp.
+        # lore: in JOB's families rt.role = 'actor' reaches cast_info in 13 queries (12.7M live rows -> the
+        # movie key set, ~50ms)
         _sk9 = ('kset', segs[a].path, c, prov[a]) if (prov[a] is not None and prov[a]) else None
         if _sk9 is not None:
             _h9 = wdb_shelf.SHELF.get(_sk9)
@@ -1086,8 +1098,9 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
         if m_idx is not None:
             cnt = int(m_idx.size)                 # the shelf's index list: no pass over the mask
         else:
+            # lore: that bug made JOB 3b answer '#1' for '11,830,420'
             cnt = int(np.count_nonzero(m))        # (an overwrite here discarded them; the applied-space skip then
-        if cnt != counts[a]:                      #  removed the accidental repair -- JOB 3b answered '#1' for '11,830,420')
+        if cnt != counts[a]:                      #  removed the accidental repair)
             keeps[a] = m; counts[a] = cnt; full[a] = False
             idx_of[a] = np.asarray(m_idx, dtype=np.int64) if m_idx is not None else np.flatnonzero(m)
             return True
@@ -1166,7 +1179,7 @@ def _keyspace_fixpoint(alias2t, segs, edges, keeps, counts, keys, keys_at, inver
                         # THE CUT IN ONE PASS (2026-10-03): the live set as a bitmap, then every core walks its
                         # stretch of the decoded keys (or of the live rows) and writes the rows that hit --
                         # the numpy road was an int64 copy, a where, a gather and a flatnonzero, one thread each
-                        # (a quarter of JOB 6a's hot main thread)
+                        # lore: that road was a quarter of JOB 6a's hot main thread
                         lut = np.zeros(mx + 2, bool); lut[S] = True
                         rows = _cut_rows(np.asarray(_kc9), _NOIDX if isfull else np.ascontiguousarray(idx, dtype=np.int64),
                                          lut, isfull)

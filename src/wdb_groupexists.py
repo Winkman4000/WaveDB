@@ -1,4 +1,4 @@
-"""wdb_groupexists: THE COUNT INSTEAD OF THE SEARCH (Jackson, 2026-10-04, TPC-H Q21).
+"""wdb_groupexists: THE COUNT INSTEAD OF THE SEARCH (Jackson, 2026-10-04): a correlated [NOT] EXISTS as a count.
 
     EXISTS     (SELECT * FROM t i WHERE i.k = o.k AND i.x <> o.x AND P(i))
     NOT EXISTS (SELECT * FROM t i WHERE i.k = o.k AND i.x <> o.x AND P(i))
@@ -14,12 +14,14 @@ mask layer reads it the same way (mask_eval). The verdicts live in a query-scope
 nothing outlives the query.
 
 Two roads:
-  - THE RUNS: inner table is the outer table, same k and x columns, k non-decreasing on disk (lineitem by
-    l_orderkey). Groups are contiguous runs; one parallel pass per run (wdb_kernels.pruns_others).
+  - THE RUNS: inner table is the outer table, same k and x columns, k non-decreasing on disk (a child table
+    stored in its parent key's order). Groups are contiguous runs; one parallel pass per run (wdb_kernels.pruns_others).
   - THE CENSUS: anything else of integer keys -- counts per group and per (group, x) over the inner rows
     meeting P, looked up for each outer row by bisection.
 A shape outside these (nulls, overrides, strings across tables, a correlation other than one = and one <>)
-leaves the node untouched: the query declines as before, never answers wrong."""
+leaves the node untouched: the query declines as before, never answers wrong.
+
+Lore: built for TPC-H Q21; THE RUNS road is lineitem stored by l_orderkey."""
 import itertools
 import numpy as np
 from sqlglot import expressions as E

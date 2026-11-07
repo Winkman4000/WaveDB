@@ -1,5 +1,5 @@
 """
-wdb_valsort -- value-sorted projection top-K, read from the dictionary (general since 2026-10-21, Q24-Q26 board).
+wdb_valsort -- value-sorted projection top-K, read from the dictionary (general since 2026-10-21).
 
 Answers   SELECT C FROM t [WHERE <a predicate on C>] ORDER BY C [ASC|DESC] LIMIT k [OFFSET o]
 for any dictionary column C (numbers, times, text). Every dictionary is stored in VALUE ORDER (encode:
@@ -12,12 +12,14 @@ parallel counting pass, nothing kept); high (DESC, or a filter like > x), one pa
 emitted ever decode. NULLs sort last both ways (DuckDB's NULLS LAST); with no WHERE they fill after the values.
 
 Before 2026-10-21 this read took only text columns filtered by `C <> ''`; every number and time column, and
-any other filter, fell to the general top-k door, which sorts the survivors (Age: 7.0 s, of it 6.1 s one
-argpartition over 95M values, against DuckDB's 0.036 s).
+any other filter, fell to the general top-k door, which sorts the survivors.
 
 detect (fail-closed): single table; projection is exactly one bare column C (mode 0/1/2, no overrides);
 ORDER BY C alone; LIMIT present; WHERE absent or a predicate over C alone that wdb_keepflag can judge;
 no GROUP BY / HAVING / DISTINCT / JOIN; no deleted rows. Anything else -> None (caller scans).
+
+Lore: generalized 2026-10-21 on the ClickBench Q24-Q26 board; the general top-k door on Age took 7.0 s, of it
+6.1 s one argpartition over 95M values, against DuckDB's 0.036 s.
 """
 import numpy as np
 import wdb_qmem
@@ -92,7 +94,9 @@ _HEAD = 1 << 18           # the head window: rows read from the top of the file 
 def _head_first(seg, col, code, need):
     """need, when the file's first window alone holds `need` rows of `code`; else None. On a single zstd stream
     (enc 1) the window grows x4 while it is under half the column: the stream is read on, never re-read, and
-    past half the whole decode is the same price (IsOldCounter <> 0: its 10th row sits at 7.4M of 100M)"""
+    past half the whole decode is the same price (a rare value's 10th row can sit deep in the file)
+
+    Lore: IsOldCounter <> 0: its 10th row sits at 7.4M of 100M."""
     N = int(seg.N)
     hi = min(N, _HEAD)
     grow = seg.cols[col].get('code_enc') == 1
@@ -135,21 +139,23 @@ def execute(seg, spec):
         lo9, hi9 = int(take.min()), int(take.max())
         c9 = seg.cols[col]
         # the head window pays only where the smallest kept value is likely common: a small dictionary, and not the
-        # sparse dress whose low count reads just its literal lane (SearchPhrase, the submitted Q25: 8.8 -> 14.8 ms
-        # with the window, which a 6M-value dictionary's first phrase never fills)
+        # sparse dress whose low count reads just its literal lane (a large dictionary's first value rarely fills it)
+        # lore: SearchPhrase, the submitted Q25: 8.8 -> 14.8 ms with the window, which a 6M-value dictionary's
+        # lore: first phrase never fills
         hc = (_head_first(seg, col, int(take[0]), need)
               if V <= _SMALL_V and c9.get('code_enc') != 8 else None)
         if hc is not None:
             # THE HEAD WINDOW: the first kept value already shows `need` rows in the file's first window -- the
-            # answer is that value `need` times, exact without any count (JavaEnable <> 1: 59 -> ~6 ms)
+            # answer is that value `need` times, exact without any count
+            # lore: JavaEnable <> 1: 59 -> ~6 ms
             cnt = np.asarray([need], np.int64); take = take[:1]
         elif hi9 < _SMALL_V:
             # the codes sit low in the dictionary: the parallel low-count pass (one counter per code below the
             # bound, per lane -- cheap only while the bound is small)
             cnt = np.asarray(seg.low_counts(col, hi9 + 1), np.int64)[take]
         else:
-            # high codes (DESC, or a filter like UserID > x): count just the run lo..hi in one pass over the codes
-            # (UserID > 5e18 ASC: the low-count pass with a 9M-code bound took 680 ms, this road ~85)
+            # high codes (DESC, or a filter like col > x): count just the run lo..hi in one pass over the codes
+            # lore: UserID > 5e18 ASC: the low-count pass with a 9M-code bound took 680 ms, this road ~85
             cnt = _counts_run(seg, col, lo9, hi9)[take - lo9]
         if hc is None and (cnt == 0).any():
             # A CODE WITH NO ROWS breaks the walk's premise (each code holds >= 1 row; a fresh segment's dictionary

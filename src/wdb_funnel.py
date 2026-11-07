@@ -52,8 +52,9 @@ def positions(seg, col, code, lo=0, hi=None, blocks=None):
     hi = int(seg.N) if hi is None else int(hi)
     if plist_ready(seg, col):
         offs, plist = _plist(seg, col)
-        # (no warm_plist here: measured 2026-09-29, CounterID 62's 3 MB list is one stream either
-        # way -- 20-25 ms with the parallel read first vs 17-19 by faults and the kernel's readahead)
+        # (no warm_plist here: measured 2026-09-29, one value's multi-MB list is one stream either
+        # way -- the parallel read first was no faster than faults and the kernel's readahead)
+        # lore: CounterID 62's 3 MB list: 20-25 ms with the parallel read first vs 17-19 by faults
         crumb = plist[int(offs[code]):int(offs[code + 1])]
         a = np.searchsorted(crumb, lo, side='left'); b = np.searchsorted(crumb, hi, side='left')
         return crumb[a:b].astype(np.int64)
@@ -107,7 +108,8 @@ def _pick(seg, weq):
     if not _PICK[0]:
         return ok[0] if ok[0] == weq[0] else None
     if len(ok) == 1:
-        return ok[0]                             # one candidate: no census to consult (~20 ms cold, Q36-Q42)
+        # lore: the census costs ~20 ms cold on Q36-Q42
+        return ok[0]                             # one candidate: no census to consult
     return min(ok, key=lambda cv: _est_rows(seg, cv[0], cv[1]))
 
 
@@ -169,8 +171,9 @@ def _plist(seg, col):
 def warm_plist(seg, col, codes=None, offsets=False):
     """THE COLD READ for the position lists (a memory-mapped sidecar): before a read touches them,
     the offsets (`offsets`, the whole census) and/or the lists of `codes` are brought in by parallel
-    large reads instead of page faults (Q14 cold: the 64 top phrases' lists 78 -> ~13 ms). Resident
-    spans read nothing. Returns the bytes read."""
+    large reads instead of page faults. Resident spans read nothing. Returns the bytes read.
+
+    Lore: Q14 cold: the 64 top phrases' lists 78 -> ~13 ms."""
     import wdb_engine
     offs, pos = _plist(seg, col)
     V9 = offs.size - 1
@@ -279,10 +282,13 @@ def _compile_key(seg, expr, cm):
 
 
 def _at_memo(seg):
-    """codes_at for ONE query: a column read twice at the same rows decodes once (Q39: SearchEngineID
-    and AdvEngineID feed the CASE and are keys themselves -- the same 722,688 rows, ~27 ms twice).
+    """codes_at for ONE query: a column read twice at the same rows decodes once (columns that feed a CASE
+    and are keys themselves).
     A local of execute, so it dies with the query. Keyed by the rows array itself (held, so its id
-    cannot be reused); callers never write into what it returns."""
+    cannot be reused); callers never write into what it returns.
+
+    Lore: Q39: SearchEngineID and AdvEngineID feed the CASE and are keys themselves -- the same 722,688 rows,
+    ~27 ms twice."""
     memo = {}
 
     def at(col, rows):
@@ -365,11 +371,13 @@ def detect(seg, tree, col_map):
                     return None
                 strneq.append(cn); continue
             if isinstance(v9, str):
-                # THE TYPED LITERAL (2026-10-24, the Q36 board): a text or date literal on a dictionary column is one
+                # THE TYPED LITERAL (2026-10-24): a text or date literal on a dictionary column is one
                 # more flag, compared in code space -- its code from wherescan's _code_of (the text bisect; a date in
-                # the column's stored unit). URL <> 'http://...' and EventDate <> '2013-07-21' declined here and
-                # went to wherescan (0.367 / 0.100 s against DuckDB 0.116 / 0.048). Resolved now, so an unparseable
-                # literal declines instead of failing in execute; a column with NULLs keeps declining (NULL <> v).
+                # the column's stored unit). Such literals used to decline here and go to wherescan. Resolved now,
+                # so an unparseable literal declines instead of failing in execute; a column with NULLs keeps
+                # declining (NULL <> v).
+                # lore: the Q36 board: URL <> 'http://...' and EventDate <> '2013-07-21' went to wherescan
+                # lore: (0.367 / 0.100 s against DuckDB 0.116 / 0.048).
                 c9 = seg.cols.get(cn)
                 if c9 is None or c9.get('has_null') or c9.get('mode') not in _DICT_MODES or c9.get('dt') not in (1, 3):
                     return None
@@ -436,10 +444,11 @@ def detect(seg, tree, col_map):
                     unitT = aT
                 if isinstance(aT, E.Column):
                     colT = aT
-            # THE TRUNCATION UNITS (2026-10-24, the Q42 board): second, minute, hour and day are each a fixed number
+            # THE TRUNCATION UNITS (2026-10-24): second, minute, hour and day are each a fixed number
             # of seconds, so the bucket is the epoch second over it and the file order is still bucket order;
-            # 'hour' and 'day' went to fused_agg (0.10-0.18 s against DuckDB 0.05-0.06). Month / year / week are
+            # 'hour' and 'day' used to go to fused_agg. Month / year / week are
             # not fixed lengths: they decline as before.
+            # lore: the Q42 board; fused_agg took 0.10-0.18 s against DuckDB 0.05-0.06.
             uT = str(getattr(unitT, 'this', unitT)).lower() if unitT is not None else None
             secsT = {'second': 1, 'minute': 60, 'hour': 3600, 'day': 86400}.get(uT)
             if secsT is not None and colT is not None:
@@ -631,7 +640,8 @@ def execute(seg, spec):
         crumb = np.empty(0, np.int64)
     else:
         # THE REGION only narrows the vanilla scan -- the position lists ignore it, so its three
-        # load-statistics reads are paid only when the scan will run (4-6 ms hot, Q36-Q41)
+        # load-statistics reads are paid only when the scan will run
+        # lore: the reads cost 4-6 ms hot on Q36-Q41
         crumb = positions(seg, scol, code, wlo, whi,
                           blocks=None if plist_ready(seg, scol) else _eq_blocks(seg, spec))
     _LG.stage('crumb', (_tm.perf_counter() - _t9) * 1000); _t9 = _tm.perf_counter()
@@ -780,14 +790,15 @@ def execute(seg, spec):
     # is (<=3 enc-12 keys, <=2 scalar enc-10 flags, no strneq, dense band),
     # every stage runs numba-to-numba in one entry -- hygiene as mask
     # surgery, lockstep decode, radix, walk -- zero interpreter between.
-    # THE MARGINAL-BOUND LANE (Q14's family): GROUP BY (sparse-default
+    # THE MARGINAL-BOUND LANE: GROUP BY (sparse-default
     # BigKey, small partner) ORDER BY COUNT DESC -- the marginal total of
     # BigKey ceilings every pair it contains, so candidates resolve in
     # descending-marginal order and the k-th resolved pair's count
     # guillotines the tail. Exact by the bound; zipf only sets how early.
+    # lore: Q14's family.
     _mb_done = False
     _mbp = spec['plans']
-    _q14_ok = False
+    _mb_ok = False
     if (crumb.size == 0 and not spec['flags'] and len(_mbp) == 2
             and all(p['kind'] == 'col' for p in _mbp)
             and spec['off'] + spec['k'] <= 1000):
@@ -796,12 +807,14 @@ def execute(seg, spec):
         smi = [i for i, p in enumerate(_mbp)
                if seg.cols.get(p['col'], {}).get('code_enc') == 3
                and int(seg.cols[p['col']].get('V', 1 << 30)) <= 4096]
+        import wdb_policies as _P9
         if len(e8i) == 1 and len(smi) == 1 \
                 and len(spec['strneq']) == 1 \
                 and spec['strneq'][0][0] == _mbp[e8i[0]]['col'] \
-                and spec['strneq'][0][1] == '':
-            _q14_ok = True
-    if _q14_ok:
+                and spec['strneq'][0][1] == '' \
+                and _P9.sparse_default_is(seg, spec['strneq'][0][0], ''):
+            _mb_ok = True                           # (the presence bits are `<> ''` only when the default is '')
+    if _mb_ok:
         import wdb_kernels as _WK
         spB = seg.cols[_mbp[e8i[0]]['col']]
         spS = seg.cols[_mbp[smi[0]]['col']]
@@ -854,10 +867,11 @@ def execute(seg, spec):
         _mb_done = True
         spec = dict(spec)
         spec['strneq'] = []
-    # THE COMPOSED LANE (Q40's shape): stair keys and enc-3 flags join the
+    # THE COMPOSED LANE: stair keys and enc-3 flags join the
     # stream -- every op a measured kernel, the glue microseconds. Fires
     # only when a staircase key or an enc-3 flag is present; pure shapes
     # keep the fused kernel below.
+    # lore: Q40's shape.
     _fs_done = False
     _fsp = spec['plans']
     _fs10 = [f for f in spec['flags'] if f[2] != 'in'
@@ -1091,7 +1105,8 @@ def execute(seg, spec):
     # THE SELECTIVE-FIRST CUT: an enc-12 scalar flag is an equality the
     # SNOWBALL tests word-parallel over the band -- maximally selective
     # predicates run first, and everything downstream touches only their
-    # survivors. (Q41's URLHash = const was buried in per-row hygiene.)
+    # survivors. (An equality on a hash column was buried in per-row hygiene.)
+    # lore: Q41's URLHash = const.
     _sf = [] if (_fs_done or _mo_done or _fb_done) else [f for f in spec['flags']
            if f[2] != 'in' and seg.cols.get(f[0], {}).get('code_enc') == 12]
     if _sf and crumb.size >= (1 << 15):
@@ -1504,12 +1519,15 @@ def _sec_at(seg, ecol, rows):
 
 
 def _execute_trunc(seg, spec):
-    """Q42's shape (Jackson's cut): the window is a staircase span, so we
+    """GROUP BY a truncated time under one equality and a staircase range (Jackson's cut): the window is a
+    staircase span, so we
     walk CHUNKS from its LEFT EDGE -- popping only the selector frames the
     answer needs -- filter to the counter at each chunk, read minute values
     for survivors only, and run-walk minutes in file order (which IS minute
     order). The walk STOPS the moment run off+k closes. OFFSET deep pops
-    almost nothing past its own answer."""
+    almost nothing past its own answer.
+
+    Lore: Q42's shape."""
     global _HITS
     import datetime as _dtm
     scol, sval = spec['sel']

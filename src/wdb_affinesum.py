@@ -1,11 +1,13 @@
-"""wdb_affinesum -- Q29's algebra (the ninety-sums comedy).
+"""wdb_affinesum -- many sums of one column plus a constant, answered from two numbers.
 
-SELECT SUM(col + k0), SUM(col + k1), ... FROM hits   (no WHERE, no GROUP)
+SELECT SUM(col + k0), SUM(col + k1), ... FROM t   (no WHERE, no GROUP)
 
 SUM(col + k) = S + k*N: every projection is an affine fact of two numbers.
 S comes from the census (V-sized dot product, gbc-shelf material), N from
 the segment. Nine billion additions become ninety multiply-adds; no row
 is ever walked, nothing decodes beyond a V-sized dictionary.
+
+Lore: built for ClickBench Q29 (ninety such sums); "the ninety-sums comedy".
 """
 import numpy as np
 from sqlglot import expressions as E
@@ -67,9 +69,10 @@ def execute(seg, spec):
     census = memo.get(col)
     if census is None:
         # THE LOAD'S CENSUS FIRST (2026-09-27): the rows per code were counted at load time
-        # (stats.npz '<col>.vcnt', the census of the load, 2026-09-24). Q29 measured: the full
+        # (stats.npz '<col>.vcnt', the census of the load, 2026-09-24). Measured: the full
         # decode (53 ms) + bincount (166 ms) re-counted them on every run; the load's copy
         # reads in ~1 ms and equals the bincount entry for entry (checked on the kit).
+        # lore: the measurement was on ClickBench Q29.
         try:
             import wdb_blockstats
             vc = wdb_blockstats.vcnt_from_load(seg, col)
@@ -87,8 +90,9 @@ def execute(seg, spec):
                 census = None                            # bincount every single run
     if census is None or census.size < V or int(census.sum()) != int(seg.N):
         # THE PARALLEL CENSUS (2026-09-30, the floor: the load's census no longer answers): numpy's
-        # bincount was one thread over 100M codes (Q29: 166 ms cold and hot); detect admits no nulls,
+        # bincount was one thread over 100M codes (166 ms cold and hot); detect admits no nulls,
         # so every code is < V as the kernel requires
+        # lore: the 166 ms was ClickBench Q29's.
         census = np.asarray(seg.raw_census(col, V), np.int64)   # from the dress where it can (2026-10-01)
     memo[col] = census
     dv = memo.get((col, 'dv'))                           # the dictionary's values, once per segment: the

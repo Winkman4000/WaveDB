@@ -33,8 +33,9 @@ class _State:
         wdb_kernels.warm()
         wdb_preload.preload_all(verbose=True)        # the program loads itself: every kernel we ship
         self.dbdir = dbdir; self._db = None
-        # ClickBench's driver starts the server and polls ./check BEFORE the load (and again after it): a
-        # database not there yet is opened when it is first needed instead of failing the start
+        # a database not there yet is opened when it is first needed instead of failing the start, so the
+        # server can be started (and health-checked) before the data is loaded
+        # lore: ClickBench's driver starts the server and polls ./check BEFORE the load (and again after it)
         if os.path.exists(os.path.join(dbdir, 'catalog.json')):
             self._db = Database.open(dbdir)
         self.lock = threading.Lock(); self.queries = 0; self.started = time.time()

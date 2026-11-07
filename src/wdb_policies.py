@@ -66,8 +66,10 @@ def columns_exist(seg, *cols):
 def sparse_default_is(seg, col, value=''):
     """The column is stored sparse (code_enc 8/9: its planes hold exactly the rows whose value differs from the
     stored default), holds no NULLs, and that default IS `value`. Every read that answers `col <> value` from the
-    planes stands on this -- the planes are the filter only when the default is the excluded value (c129: a column
-    whose most common value is not '' -- BrowserLanguage's 'S0' -- had its 'S0' rows dropped by `<> ''`)."""
+    planes stands on this -- the planes are the filter only when the default is the excluded value (c129: a text
+    column whose most common value is not '' had its default-value rows dropped by `<> ''`).
+
+    Lore: the c129 column was ClickBench's BrowserLanguage, whose default is 'S0'."""
     c = seg.cols.get(col)
     if c is None or c.get('code_enc') not in (8, 9) or c.get('has_null'):
         return False

@@ -6,13 +6,15 @@ column fully, then codes_at the others at scattered survivor positions (re-openi
 most of their blocks anyway). Here every predicate is tested block-by-block in one
 walk -- and before any byte decompresses, the per-block min/max codes (blockstats,
 folded from 32K stat blocks to compression blocks) veto blocks that cannot contain
-the literals. On counter-ordered data an equality like CounterID=62 lives in a
+the literals. On data ordered by a column, an equality on that column lives in a
 handful of blocks; the veto kills the rest for EVERY column at once.
 
 Soundness: the veto is a necessary condition (min<=code<=max), never sufficient --
 false positives decompress and test, false negatives cannot exist. Ranges ride
 code order and are therefore admitted ONLY on mode-2 int dicts (numeric dict
 order); string dicts sort by string, where code ranges lie.
+
+Lore: the motivating case is counter-ordered hits, where CounterID=62 lives in a handful of blocks.
 """
 import numpy as np
 import zstandard

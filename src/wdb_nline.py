@@ -4,11 +4,13 @@ A .nline.<col> sidecar is the column's value-ordered int table written as a flat
 little-endian int64 array -- born mappable: layout IS the compute layout. _int_table
 (wdb_window) memmaps it: one virtual address for the life of the process, the OS
 page cache owns the bytes, and the per-query dict rebuild is abolished (measured:
-0.54s/query -> 1us on UserID at 17.6M values). Sidecars are derived, regenerable,
+0.54s/query -> 1us on a 17.6M-value int column). Sidecars are derived, regenerable,
 optional: no sidecar, old rebuild path, bit-for-bit identical results.
 
 Threshold: int-valued dict columns (modes 0/1/2) with n_dict >= NLINE_MIN -- below
 it the rebuild is microseconds and a line adds file clutter for nothing.
+
+Lore: the 0.54s -> 1us measurement was on UserID (17.6M values).
 """
 import os
 import numpy as np

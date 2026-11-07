@@ -146,7 +146,7 @@ def _flatten_once(outer, cte_sel):
     return cte_sel
 
 
-# THE WITH READ TWICE, RUN ONCE (2026-11-02, TPC-H Q15): WITH c AS (body) SELECT ... FROM base, c WHERE base.k = c.ck
+# THE WITH READ TWICE, RUN ONCE (2026-11-02): WITH c AS (body) SELECT ... FROM base, c WHERE base.k = c.ck
 # AND c.v = (SELECT MAX(v) FROM c) [AND conditions on base only] -- c is read twice (joined, and inside the
 # scalar), so it cannot flatten. Steps: (1) run the body once (its rows live for this query only); (2) the scalar
 # reads only those rows: the largest (or smallest) v; (3) keep the body rows whose v equals it -- our own values
@@ -154,6 +154,7 @@ def _flatten_once(outer, cte_sel):
 # (the kept keys) and base's own conditions, c.ck -> base.k, c.v -> the extreme as a literal (named as before);
 # ORDER / LIMIT unchanged. Any other use of c, another c column, or an outer join shape: None (as before).
 # WDB_CTE_ONCE=0: off. _CTE_ONCE_HITS: diagnostic (tests read it).
+# lore: built for TPC-H Q15.
 import os as _os
 _CTE_ONCE = [_os.environ.get('WDB_CTE_ONCE', '1') == '1']
 _CTE_ONCE_HITS = [0]

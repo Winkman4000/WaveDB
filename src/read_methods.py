@@ -144,7 +144,9 @@ def _lenagg_execute(c, spec):
     return wdb_lenagg.execute(c.seg, spec)
 
 
-# Q27's shape (2026-10-18): it had been a first try hidden inside general_scan
+# an aggregate of a per-value function of a column, grouped by a key (2026-10-18): it had been a first try
+# hidden inside general_scan
+# lore: ClickBench Q27's shape.
 lenagg = Read('lenagg', _lenagg_detect, _lenagg_execute,
               'AVG/SUM(F(S)) GROUP BY K: one pour of stored lengths (or F over the dictionary) against the key')
 
@@ -174,7 +176,8 @@ funnel = Read('funnel',
               lambda c, spec: wdb_funnel.execute(c.seg, spec))
 
 import wdb_pairbound
-pairbound = Read('pairbound',                    # THE PAIR BOUND: count(a, b) <= min(rows of a, rows of b) (Q32's family 1)
+# lore: the pair bound is Q32's family 1.
+pairbound = Read('pairbound',                    # THE PAIR BOUND: count(a, b) <= min(rows of a, rows of b)
                  lambda c: wdb_pairbound.detect(c.seg, c.tree, c.cmap),
                  lambda c, spec: wdb_pairbound.execute(c.seg, spec))
 import wdb_pairfold
@@ -345,9 +348,10 @@ cluster_group_slice = Read('cluster_group_slice',
 
 def _bsi_on():
     # DECIDED (Jackson, 2026-09-30: "we should go without it"): OFF by default. Measured on the pod,
-    # true cold: ClickBench Q1 ~300 ms with it vs ~120 without (hot ~35 either way, same answer); the
-    # TPC-H-shaped SUM WHERE l_discount BETWEEN (60M rows) 800-950 cold with it vs 1,070 without, but
+    # true cold: a COUNT(*) on 100M rows ~300 ms with it vs ~120 without (hot ~35 either way, same
+    # answer); a SUM WHERE x BETWEEN (60M rows) 800-950 cold with it vs 1,070 without, but
     # hot 455 with it vs 136 without. WDB_BSI=1 turns it back on (its tests do, locally).
+    # lore: the COUNT was ClickBench Q1; the SUM was TPC-H-shaped, WHERE l_discount BETWEEN.
     import os
     return os.environ.get('WDB_BSI', '0') == '1'
 
@@ -364,11 +368,12 @@ def _bsi_execute(c, spec):
 
 # DECIDED 2026-09-30: off by default (see _bsi_on). The note it answered:
 # PARKED (Jackson, 2026-09-24 -- see CODEX 'THE BIT-SLICE INDEX, AUDITED'): after the census of the
-# load, no ClickBench query reaches this read on any run (bench/route_census.py). It still serves
-# TPC-H-shaped filtered SUMs (test_path_coverage: bsi_discount_btw, bsi_q6_multi). THE HAZARD: its
+# load, no query of the 100M-row board reaches this read on any run (bench/route_census.py). It still serves
+# filtered SUMs over a range predicate (test_path_coverage: bsi_discount_btw, bsi_q6_multi). THE HAZARD: its
 # index dies with the query (the law), so every query that lands here builds it from scratch -- on
-# 100M rows Q01 paid 188 ms of its 309. TO DECIDE, after measuring TPC-H Q6 with and without it:
-# remove it from _READ_ORDER, or gate it on table size (build only where building beats the scan).
+# 100M rows a COUNT(*) paid 188 ms of its 309. TO DECIDE, after measuring a filtered SUM with and
+# without it: remove it from _READ_ORDER, or gate it on table size (build only where building beats the scan).
+# lore: the board was ClickBench; the SUMs are TPC-H-shaped; the 188 ms was Q01; the SUM to measure is TPC-H Q6.
 bsi_filter = Read('bsi_filter', _bsi_detect, _bsi_execute, 'bit-sliced index filter (throughput)')
 
 
@@ -445,7 +450,8 @@ def general_scan(ctx):
         ec = wdb_gbcount._echo_detect(ctx.seg, ctx.tree, ctx.cmap)
         if ec is not None:                       # SELECT col WHERE col = lit: the
             r = wdb_gbcount.execute(ctx.seg, ec)  # answer is the literal x count --
-            if r is not None:                    # zero row reads (Q19's lane)
+            # lore: Q19's lane.
+            if r is not None:                    # zero row reads
                 return r
     except Exception:
         pass

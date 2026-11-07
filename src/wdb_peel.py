@@ -1,8 +1,7 @@
-"""THE SINGLETON PEEL (2026-10-12, Jackson: "every repeating WatchID gets an R tag ... then whenever we
-group or aggregate we can jump to multiplication without having to eval every instance of the 100M rows").
+"""THE SINGLETON PEEL: GROUP BY with a nearly unique key part -- group only the rows whose key repeats.
 
-A group repeats only if EVERY part of its key repeats. So when one group key is nearly unique (WatchID:
-99,997,493 values over 99,997,497 rows) almost every group is one row: its COUNT is 1 and its SUM, MIN,
+A group repeats only if EVERY part of its key repeats. So when one group key is nearly unique (nearly
+as many values as rows) almost every group is one row: its COUNT is 1 and its SUM, MIN,
 MAX and AVG are that row's own value. The peel, all at query time (nothing stored):
 
   1. CENSUS: count the near-unique key's codes over the survivors -- who repeats (the R tag);
@@ -15,7 +14,11 @@ MAX and AVG are that row's own value. The peel, all at query time (nothing store
 
 It declines (returns None) when repeaters are more than PEEL_MAX_REP of the survivors: then grouping
 is real work and belongs to the fused kernel. Called from wdb_join._fast_pointer_agg's peel door, which
-owns the shape gates and hands over the survivors the cascade already found."""
+owns the shape gates and hands over the survivors the cascade already found.
+
+Lore: 2026-10-12, Jackson: "every repeating WatchID gets an R tag ... then whenever we group or aggregate we
+can jump to multiplication without having to eval every instance of the 100M rows". The near-unique key was
+WatchID: 99,997,493 values over 99,997,497 rows."""
 import numpy as np
 
 import wdb_sql
@@ -63,8 +66,10 @@ def _kcodes(kk, rows):
 
 def map_codes(c, m):
     """an expression key's codes through its map, on every core, into the narrowest unsigned type that holds
-    them (2026-10-14: the minute of EventTime at 100M rows was a serial numpy gather, 182 ms of the Q18
-    board's 0.9 s; the 60 minutes then travel as one byte a row, not eight)"""
+    them (a small code space then travels as one byte a row, not eight)
+
+    Lore: 2026-10-14, the minute of EventTime at 100M rows was a serial numpy gather, 182 ms of the Q18
+    board's 0.9 s; the 60 minutes then travel as one byte a row, not eight."""
     import wdb_kernels
     hi = int(m.max()) if m.size else 0
     dt = np.uint8 if hi < (1 << 8) else np.uint16 if hi < (1 << 16) else np.uint32 if hi < (1 << 32) else np.int64

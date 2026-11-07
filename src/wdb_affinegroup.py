@@ -1,6 +1,6 @@
-"""wdb_affinegroup -- Q35's identity (grouping by x wearing four hats).
+"""wdb_affinegroup -- grouping by several affine faces of one column is grouping by the column.
 
-SELECT f1(col), f2(col), ..., COUNT(*) c FROM hits
+SELECT f1(col), f2(col), ..., COUNT(*) c FROM t
 GROUP BY f1(col), f2(col), ... ORDER BY c DESC LIMIT n
   where every f is affine: col itself or col +/- literal.
 
@@ -8,6 +8,8 @@ All the group keys are determined by col, so the group IS col: one
 bincount over codes, top-n by count, decode exactly n values at the
 pluck, re-derive the affine faces with n arithmetic ops. The composite
 factorize dies; no row is walked twice.
+
+Lore: built for ClickBench Q35 ("grouping by x wearing four hats").
 """
 import numpy as np
 from sqlglot import expressions as E

@@ -35,8 +35,10 @@ def _path(seg, col):
 def _fetchable(seg, col):
     """Can this column's values be point-fetched by code (seg.fetch)? A pure capability
     check -- touches NO data. The old version materialized the ENTIRE dictionary here
-    (dict_vals: 18.3M string reconstructions for URL) so the emit could index ten codes.
-    The rule: only decode when needed, never more than needed -- the emit point-fetches."""
+    (dict_vals: a string reconstruction per dictionary value) so the emit could index ten codes.
+    The rule: only decode when needed, never more than needed -- the emit point-fetches.
+
+    Lore: on URL that was 18.3M string reconstructions."""
     c = seg.cols[col]
     if c['mode'] == 4:
         return False
@@ -45,7 +47,8 @@ def _fetchable(seg, col):
     if c['dt'] == 0 and c['mode'] == 2:                 # high-card int: nline/dict fetch
         return True
     if c['dt'] == 0 and c['mode'] in (0, 1):            # int-valued byte dict: plain point fetch
-        return True                                     # (the j-dim-grp inner: RegionID dt0 mode0)
+        # lore: the j-dim-grp inner: RegionID dt0 mode0
+        return True                                     # (e.g. a small-domain int key, dt0 mode0)
     return False
 
 
@@ -106,9 +109,11 @@ def _census(seg, col):
 
 def counts_of_stored(seg, col):
     """Per-code row counts of the stored codes (no overrides) -- the query's own census. A shelved enc-19
-    column (UserID) counts from its block dictionaries (Segment.raw_census: no 100M decode, no per-thread
+    column counts from its block dictionaries (Segment.raw_census: no 100M decode, no per-thread
     boards); anything else decodes and counts on the parallel boards, as before. Length V for the former,
-    max code + 1 for the latter (trailing zero counts change nothing here). None for an empty column."""
+    max code + 1 for the latter (trailing zero counts change nothing here). None for an empty column.
+
+    Lore: the shelved enc-19 column was UserID."""
     c = seg.cols.get(col) or {}
     if c.get('code_enc') == 19 and 'e19R' in c and int(seg.N) > 0:
         return seg.raw_census(col)
@@ -314,8 +319,9 @@ def _scalar_count_execute(seg, spec):
     import wdb_sidecar
     if (not os.path.exists(_path(seg, spec['col'])) and not wdb_sidecar.may_build(seg.path)
             and _census(seg, spec['col']) is None):
+        # lore: Q20: 480 ms census vs 150 scan
         return None                                  # THE VANILLA LAW: a scalar count with no census on
-                                                     # disk is the frame scan's (Q20: 480 ms census vs 150 scan)
+                                                     # disk is the frame scan's (a census build outweighs the scan)
     got = _load(seg, spec['col'])
     if got is None:
         return None

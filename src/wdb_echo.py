@@ -1,20 +1,23 @@
-"""THE ECHO, DISK-ONLY (2026-10-21, Q19's board): SELECT c FROM t WHERE c = lit [LIMIT k] [OFFSET o].
+"""THE ECHO, DISK-ONLY: SELECT c FROM t WHERE c = lit [LIMIT k] [OFFSET o].
 
 The projection is the filter column, so every row the query emits IS the literal: the answer is the literal's value,
 repeated as many times as its code holds rows. No row is read -- only one code's count.
 
 wdb_gbcount's echo (inside the general scan) took its count from the gbc shelf, which is never born with sidecars off,
-so on the disk-only board the shape fell through to the general SQL path: IsRefresh 0.29 s, Income 0.19 s, Age 0.15 s
-against DuckDB's 0.03 s, and the binary columns (JavaEnable, GoodEvent, IsMobile, SocialNetwork) past the 10 s cap.
+so on the disk-only board the shape fell through to the general SQL path, and the binary columns past the 10 s cap.
 
 Here the count comes from the stored codes, by whichever road needs no row decode:
   - a staircase (enc 2, or a column with steps): the gap between the code's two steps, O(V) (raw_census);
   - a dictionary of at most 64K codes: the census of the stored codes (Segment.raw_census -- from the dress where it
     can, enc 5 by nibbles, enc 10 by run lengths; else the codes counted on per-thread boards). Measured against the
     low count of codes 0..code (Segment.low_counts), the census was the faster on every column of the board, cold
-    and hot: IsRefresh 1.9 against 60.7 ms, IsMobile 20 against 147, Age 11 against 45.
+    and hot.
 A large dictionary with neither is declined at detect: wherescan's equality scan serves it, as before.
-Exact: no deletes (checked), no UPDATE overrides (checked). WDB_ECHO=0 declines."""
+Exact: no deletes (checked), no UPDATE overrides (checked). WDB_ECHO=0 declines.
+
+Lore: 2026-10-21, ClickBench Q19's board. On the general SQL path: IsRefresh 0.29 s, Income 0.19 s, Age 0.15 s
+against DuckDB's 0.03 s; the binary columns (JavaEnable, GoodEvent, IsMobile, SocialNetwork) past the 10 s cap.
+Census against low count: IsRefresh 1.9 against 60.7 ms, IsMobile 20 against 147, Age 11 against 45."""
 import os
 import wdb_sql
 import wdb_policies as P

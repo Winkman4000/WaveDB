@@ -9,8 +9,10 @@ Codes are re-derived from the decoded values in stored row order, so all byte-co
 columns stay aligned. If the cluster key is retyped, the .cluster sidecar's dtype/aux
 are patched (values stay int64 -- slice_for_predicate + _lit_for_col both compare ints).
 
-CLI: python wdb_retype.py <in.wdb> <out.wdb> EventDate=D EventTime=s
+CLI: python wdb_retype.py <in.wdb> <out.wdb> date_col=D time_col=s
   (RHS is the datetime64 unit: D=day, s=second, ms, us, ns, ...)
+
+Lore: written for ClickBench's EventDate=D and EventTime=s.
 """
 import sys, struct, pickle, os, time
 import numpy as np
@@ -176,7 +178,9 @@ def _load_stats_for(out_path):
 
 
 def retype(seg_path, retypes, out_path, verbose=True):
-    """retypes: {colname: unit} e.g. {'EventDate':'D','EventTime':'s'}."""
+    """retypes: {colname: unit} e.g. {'date_col':'D','time_col':'s'}.
+
+    Lore: the example was ClickBench's {'EventDate':'D','EventTime':'s'}."""
     seg = Segment(seg_path)
     spans = _column_spans(seg.buf)
     names = [s[0] for s in spans]

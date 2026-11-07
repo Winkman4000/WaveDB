@@ -38,7 +38,8 @@ def survivor_gate(N, K):
 # --- structural-pushdown eligibility (used by wdb_survgroup) ---
 # Worth pushing `col <op> const` into the filter column's mode-4 exception structure only when the
 # exceptions are few relative to N (processing them must beat reading the whole column). Calibrated
-# from the exception-count survey (AdvEngineID 0.8% wins; SearchEngineID 17% does not).
+# from the exception-count survey (a 0.8% exception share wins; 17% does not).
+# lore: the survey columns were AdvEngineID (0.8%) and SearchEngineID (17%).
 SEQ_EXC_FRAC = 0.05
 
 
@@ -84,8 +85,9 @@ def compound_range_worth_it(nexc):
 
 # --- cube materialization cap (used by wdb_cube) ---
 CUBE_MAX_CELLS = 4096          # prod(dim cardinalities) cap; above this storage cost outweighs the win.
-                               # Measured: a 2,526-cell l_shipdate cube is ~114 KB and answers GROUP BY date
+                               # Measured: a 2,526-cell date-column cube is ~114 KB and answers GROUP BY date
                                # in 0.37ms vs DuckDB 12.4ms (33x/worker). 4096 keeps that in, stays tiny.
+                               # lore: the measured cube was TPC-H's l_shipdate
 
 
 def cube_worth_materializing(cell_count, cap=CUBE_MAX_CELLS):
@@ -113,7 +115,8 @@ def parallel_worth_it(n_rows):
 
 # --- wdb_join dense / fusion ceilings ---
 
-MULTI_GROUP_CEIL = 1 << 21   # max composite groups for dense multi-col GROUP BY (else -> hashing/fallback); 2M x a few f64 slots is ~50MB, far cheaper than factorising 18M rows (Q7: 913K composite codes paid 400ms in pd.factorize)
+# lore: Q7: 913K composite codes paid 400ms in pd.factorize
+MULTI_GROUP_CEIL = 1 << 21   # max composite groups for dense multi-col GROUP BY (else -> hashing/fallback); 2M x a few f64 slots is ~50MB, far cheaper than factorising 18M rows
 
 
 def dense_multigroup_fits(K):

@@ -281,9 +281,12 @@ def may_read(path):
 def may_build(path):
     """THE VANILLA LAW (Jackson, 2026-09-20): with the switch off, a read may USE a structure that
     exists on disk but may never BUILD one to answer -- it declines and the streaming reads serve.
-    Measured with the switch off before this law: AVG(UserID) 1,097 ms (a per-block census built
+    Without it a plain AVG or a point lookup on a wide-vocabulary column rebuilt a census every query.
+    `path` is the structure's or the segment's path.
+
+    Lore: measured with the switch off before this law: AVG(UserID) 1,097 ms (a per-block census built
     in a Python loop, every query), WHERE UserID = k 1,525 ms (the whole group-by census, an
-    argsort of 100M codes, to look up one code). `path` is the structure's or the segment's path."""
+    argsort of 100M codes, to look up one code)."""
     return births_on(os.path.dirname(path))
 
 
@@ -443,8 +446,9 @@ def _catalog_stamp(dbdir, ttl=0.02):
 def is_fresh(dbdir, fname):
     """A sidecar is TRUE only if it is newer than its segment (and its .mark, if any, matches).
     THE FRESHNESS CACHE: the verdict is remembered per process, keyed by the catalog's stamp --
-    a JOB query made 51 stat calls (20ms of 160) re-checking sidecars that cannot have changed
-    while the catalog has not."""
+    sidecars cannot have changed while the catalog has not, so re-checking them is wasted stat calls.
+
+    Lore: a JOB query made 51 stat calls (20ms of 160) re-checking sidecars."""
     stamp = _catalog_stamp(dbdir)
     ck = (dbdir, fname)
     hit = _fresh_cache.get(ck)

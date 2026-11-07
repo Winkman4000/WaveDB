@@ -2,13 +2,15 @@
 
 kway_topk: single-pass loser-tree merge of K sorted (key, count) runs with on-the-fly equal-key
 accumulation feeding a running top-K min-heap -- the merged stream is never materialized. This is
-the counting core of the disk-only GROUP BY path: measured on ClickBench Q16 (100M rows, 13.2M
-non-norm keys in 14 runs) at ~0.21 s, completing a 0.70 s total vs DuckDB's 0.79 s best.
+the counting core of the disk-only GROUP BY path.
 
 top10_i32: single-pass top-K over a dense int32 count table (the norm lane's per-code counts).
 
 Without numba both fall back to numpy (pairwise sorted-merge tournament / argpartition) --
 correct, ~2-4x slower.
+
+Lore: kway_topk was measured on ClickBench Q16 (100M rows, 13.2M non-norm keys in 14 runs) at ~0.21 s,
+completing a 0.70 s total vs DuckDB's 0.79 s best.
 """
 import numpy as np
 
@@ -27,10 +29,12 @@ except Exception:                                     # pragma: no cover
 def _nt():
     """THE CACHEABLE THREAD COUNT (2026-09-24): numba.get_num_threads() or get_thread_id() INSIDE a
     compiled kernel embeds a pointer into the threading layer, which numba cannot write to its
-    cache ("uses dynamic globals") -- so the kernel recompiled in EVERY process: gd_pass2_count
-    2.2 s, sort_keys_par 2.8 s, group_fold_dict 1.9 s, _count_ge 0.9 s of ClickBench's cold runs
-    (Q08/Q09/Q10/Q15/Q16/Q18). The count is read here, in Python, and passed in as an argument;
-    the arithmetic is unchanged (per-thread boards summed, exact for any T)."""
+    cache ("uses dynamic globals") -- so the kernel recompiled in EVERY process, seconds of every cold run.
+    The count is read here, in Python, and passed in as an argument;
+    the arithmetic is unchanged (per-thread boards summed, exact for any T).
+
+    Lore: gd_pass2_count 2.2 s, sort_keys_par 2.8 s, group_fold_dict 1.9 s, _count_ge 0.9 s of ClickBench's
+    cold runs (Q08/Q09/Q10/Q15/Q16/Q18)."""
     return np.int64(numba.get_num_threads()) if HAVE_NUMBA else np.int64(1)
 
 
@@ -614,9 +618,11 @@ def pd_hunt(key, ut, lut, V, npairs):
 
 @njit(nogil=True, parallel=True, cache=True)
 def pd_at_planes(typed, posA, litA, dA, out, L):
-    """THE ZIPPER (2026-10-02, Q11): a sparse/tiered column's codes at sorted rows `typed`, from its planes
+    """THE ZIPPER: a sparse/tiered column's codes at sorted rows `typed`, from its planes
     (posA = its non-default rows ascending, litA their codes, dA the default) -- two sorted lists walked
-    side by side, L lanes each starting by one binary search. No expansion to all N rows."""
+    side by side, L lanes each starting by one binary search. No expansion to all N rows.
+
+    Lore: 2026-10-02, ClickBench Q11."""
     n = typed.size
     for l in prange(L):
         i0 = l * n // L
@@ -636,8 +642,10 @@ def pd_at_planes(typed, posA, litA, dA, out, L):
 
 @njit(nogil=True, parallel=True, cache=True)
 def pd_pair_count(at, bt, Vb, K, L):
-    """Q11's pair key (a * Vb + b, int32) and the row count per pair, one pass, L lanes with private
-    boards summed (exact)."""
+    """A pair key (a * Vb + b, int32) and the row count per pair, one pass, L lanes with private
+    boards summed (exact).
+
+    Lore: Q11's pair key."""
     n = at.size
     key = np.empty(n, np.int32)
     boards = np.zeros((L, K), np.int64)
@@ -655,10 +663,12 @@ def pd_pair_count(at, bt, Vb, K, L):
 
 @njit(nogil=True, parallel=True, cache=True)
 def pd_hunt_lanes(key, ut, lut, nslot, SH, NL, L):
-    """THE HUNT BY USER LANES (2026-10-02, Q11): distinct users per slot (lut[pair] = slot 0..31 or -1).
+    """THE HUNT BY USER LANES: distinct users per slot (lut[pair] = slot 0..31 or -1).
     The candidate rows are bucketed by the user code's top bits into NL lanes (two passes over the rows,
     L row lanes with private counts -> stable offsets); then each lane marks its own users in a table of
-    2^SH entries (cache-sized, one u32 of slot bits per user) -- lanes in parallel, no sharing. Exact."""
+    2^SH entries (cache-sized, one u32 of slot bits per user) -- lanes in parallel, no sharing. Exact.
+
+    Lore: 2026-10-02, ClickBench Q11."""
     n = key.size
     pc = np.zeros((L, NL), np.int64)
     for l in prange(L):
@@ -1813,9 +1823,12 @@ def bp0_scan_fill(buf, base, bits, lo, hi, flag, offs, out, CH):
 
 @njit(nogil=True, parallel=True, cache=True)
 def bp0_eq_count(buf, base, bits, lo, hi, target, neg, counts, CH):
-    """THE ONE-CODE SCAN ON THE PACKED BITS (2026-10-21, Q19's board), pass 1: rows of [lo, hi) whose plain-bitpack
+    """THE ONE-CODE SCAN ON THE PACKED BITS, pass 1: rows of [lo, hi) whose plain-bitpack
     code equals `target` (differs from it, `neg`), counted per chunk. bp0_scan_count's tile reader with the test made
-    against one code held in a register -- no flag table (a WatchID table is 100M entries, looked up at random)."""
+    against one code held in a register -- no flag table (a near-unique column's table is ~N entries, looked up at
+    random).
+
+    Lore: 2026-10-21, ClickBench Q19's board; the WatchID table is 100M entries."""
     mask = (np.int64(1) << bits) - 1
     for cix in prange(counts.size):
         a = lo + cix * CH
@@ -1868,9 +1881,11 @@ def bp0_eq_fill(buf, base, bits, lo, hi, target, neg, offs, out, CH):
 
 @njit(nogil=True, parallel=True, cache=True)
 def bp0_frame_tally(buf, base, bits, N, SH, cnt, csum):
-    """THE REPEATS-PER-FRAME FOLD, step 1 (2026-10-21, Jackson's switch, Q29's WatchID): per lane, per dictionary
+    """THE REPEATS-PER-FRAME FOLD, step 1 (Jackson's switch): per lane, per dictionary
     frame (code >> SH), the rows whose plain-bitpack code falls in it and the sum of those codes. cnt / csum: (lanes,
-    frames) boards -- 12,207 frames x 2 numbers per lane, in cache, where a census board is 100M counters."""
+    frames) boards -- 12,207 frames x 2 numbers per lane, in cache, where a census board is 100M counters.
+
+    Lore: 2026-10-21, from ClickBench Q29's WatchID."""
     P = cnt.shape[0]
     mask = (np.int64(1) << bits) - 1
     for t in prange(P):
@@ -2336,7 +2351,9 @@ def bp10_eq_pos(buf, dirX, pay, bits, N, lo, hi, code, negate):
     """THE ENC-10 SCAN (2026-10-24, Jackson's exceptions road): the rows of [lo, hi) whose code equals `code`
     (differs, when negate), straight from the blocks -- each block counted in parallel, then each written at its
     offset; a matching run is a range, a 1-bit block skips its empty bytes. wherescan decoded the whole column
-    to 100M codes and searched them (IsRefresh's exceptions: 0.20 s)."""
+    to N codes and searched them.
+
+    Lore: wherescan's decode was 100M codes (IsRefresh's exceptions: 0.20 s)."""
     B = 4096
     k0 = lo // B
     k1 = (hi + B - 1) // B
@@ -2493,9 +2510,11 @@ def enc5_counts(packed, hot, patches, N, L, T):
 
 @njit(nogil=True, parallel=True, cache=True)
 def pf_prune(pos, bcol, heavy):
-    """Q30's early stop: keep only typed positions whose b-code is HEAVY
-    (cnt_ip bound: a pair can never outscore its IP's total). Two prange
-    passes -- count, then stable scatter -- return the surviving crumb."""
+    """The early stop: keep only typed positions whose b-code is HEAVY
+    (cnt_ip bound: a pair can never outscore its b value's total). Two prange
+    passes -- count, then stable scatter -- return the surviving crumb.
+
+    Lore: built for ClickBench Q30, where b was the IP."""
     n = pos.size
     T = heavy.size and 16 or 16
     T = 16
@@ -2586,9 +2605,11 @@ def pr_scatter_all(acol, bcol, xcol, ycol, SH, AB, T):
 
 @njit(nogil=True, parallel=True, cache=True)
 def pr_scatter(pos, acol, bcol, xcol, ycol, SH, T):
-    """Q30's fused gather+radix: walk the planes' typed positions ONCE, read all
+    """The fused gather+radix: walk the planes' typed positions ONCE, read all
     four columns at the row, pack key=(b<<8|a) and pay=(x<<16|y), bucket by b's
-    top bits. No intermediate gathers ever materialize."""
+    top bits. No intermediate gathers ever materialize.
+
+    Lore: built for ClickBench Q30."""
     n = pos.size
     NB = 1 << 12
     pc = np.zeros((T, NB), np.int64)
@@ -3476,14 +3497,17 @@ def pr_fold(key, pay, offs, dv1, dv2, ucnt, us1, us2, ukey, nruns):
 def _pr_fold2_nb(key, pay, offs, SH, AB, dv1, dv2, ucnt, us1, us2, ukey, nruns, TC, TA1, TA2, R):
     """pr_fold, but a bucket whose rows outnumber its key range is COUNTED, not sorted (2026-10-17).
     Bucket b holds the keys (b << (SH + AB)) .. +R (R = 2^(SH+AB), AB the small key's bits): with that range
-    small next to the bucket's rows (a heavy b value: SendTiming's 0 is 94% of the rows, one bucket of ~12M
-    on one thread, its argsort 3.9 s) one linear pass into a table of the range emits the runs in key order,
+    small next to the bucket's rows (a heavy b value: one bucket of millions of rows on one thread) one linear
+    pass into a table of the range emits the runs in key order,
     exactly as the sort's run walk does. Small buckets keep the sort.
     THE TABLES ARE THE THREADS' OWN, made before the loop (TC/TA1/TA2: one row per thread, R slots; R = 0
     when the range is too wide to count): the first version allocated a table of the range INSIDE the
     parallel loop, and numba set up that allocation ahead of the range check -- a 2^37-slot table for
-    ClientEventTime x WatchID, MemoryError. Each thread walks its own buckets (b = t, t + T, ...) and
-    clears the slots it emitted, so a table is never shared and never re-zeroed whole."""
+    two near-unique keys, MemoryError. Each thread walks its own buckets (b = t, t + T, ...) and
+    clears the slots it emitted, so a table is never shared and never re-zeroed whole.
+
+    Lore: the heavy b value was SendTiming's 0, 94% of the rows: one bucket of ~12M, its argsort 3.9 s.
+    The 2^37-slot table was for ClientEventTime x WatchID."""
     NB = offs.size - 1
     T = TC.shape[0]
     for t in prange(T):
@@ -3657,7 +3681,9 @@ def _pf_dense_nb(pos, acol, bcol, xcol, ycol, dv1, dv2, VA, cnt2, s1, s2):
     """pairfold's small pair space (2026-10-17): each thread walks its share of the filtered positions and
     adds count + both dictionary-valued sums into ITS OWN table at b*VA + a -- no buckets, no sort.
     (pr_scatter + pr_fold bucket by b: a b of ~6 values made ~6 buckets of millions of rows, six
-    threads each sorting -- Income x JavaEnable 2.2 s.) The tables are summed after."""
+    threads each sorting.) The tables are summed after.
+
+    Lore: the six-bucket case was Income x JavaEnable, 2.2 s."""
     T = cnt2.shape[0]
     n = pos.size
     for t in prange(T):
@@ -3752,10 +3778,12 @@ def wide_threads():
 
 def run_wide(fn, *args, pass_t=False):
     """THE LATENCY-BOUND KERNELS ON EVERY vCPU (2026-10-02): wdb_agg caps numba at 8 threads at import --
-    right for the bandwidth-bound boards (measured on the c6a: 16 threads made Q15/Q16/Q33/Q34 10-20%
+    right for the bandwidth-bound boards (measured on the c6a: 16 threads made bandwidth-bound queries 10-20%
     slower) -- but kernels that wait on memory latency (lookups in cache-resident tables, back-reference
     walks) run faster on the hyperthreads, which hide that latency. This raises numba's thread count for
-    ONE call and restores it. `pass_t`: the kernel takes its lane count as its last argument."""
+    ONE call and restores it. `pass_t`: the kernel takes its lane count as its last argument.
+
+    Lore: the 10-20% slower queries were ClickBench Q15/Q16/Q33/Q34."""
     n = wide_threads()
     if pass_t:
         args = args + (np.int64(n),)
@@ -3773,8 +3801,10 @@ def run_wide(fn, *args, pass_t=False):
 
 def gd_pass2_count(ku, kr, offs, SH, VR):
     """Pass 2 of the distinct-count scatter ON EVERY vCPU (run_wide): per-bucket marker lookups, latency-
-    bound -- Q8's inputs on the c6a 170 ms at 8 threads -> 97 ms at 16, the counts identical. (Pass 1,
-    the scatter, is the other way, 213 -> 240 ms: it stays at the engine's 8.)"""
+    bound -- faster at 16 threads than at 8 on the c6a, the counts identical. (Pass 1,
+    the scatter, is the other way: it stays at the engine's 8.)
+
+    Lore: Q8's inputs on the c6a 170 ms at 8 threads -> 97 ms at 16; pass 1 213 -> 240 ms."""
     return run_wide(_gd_pass2_count_nb, ku, kr, offs, SH, VR, pass_t=True)
 
 
@@ -3787,8 +3817,9 @@ def _gd_pass2_count_nb(ku, kr, offs, SH, VR, T):
     without asking numba for it (get_thread_id made the kernel uncacheable)."""
     NB = offs.size - 1
     LOW = 1 << SH
+    # lore: the 296 MB was for RegionID's 9,040 values
     ans = np.zeros((T, VR + 16), np.int64)       # per-THREAD rows, padded apart (was per-bucket: 4096 x VR, 296 MB
-    for t in prange(T):                           # zeroed and reduced serially for RegionID's 9,040)
+    for t in prange(T):                           # zeroed and reduced serially for a ~9K-value target)
         for b in range(NB * t // T, NB * (t + 1) // T):
             lo = offs[b]
             hi = offs[b + 1]
@@ -3822,9 +3853,11 @@ def _gd_pass2_count_nb(ku, kr, offs, SH, VR, T):
 
 @njit(nogil=True, parallel=True, cache=True)
 def gd_pass1_packed(uc, rc, SH, GB, T):
-    """gd_pass1 writing ONE u32 per row (2026-10-19, Q8): the target's low SH bits above the group's GB bits
+    """gd_pass1 writing ONE u32 per row: the target's low SH bits above the group's GB bits
     (the target's top bits are the bucket, so the low bits are all pass 2 needs of it). Half the scatter's
-    writes and pass 2's reads of the two-array form; the caller checks SH + GB <= 32."""
+    writes and pass 2's reads of the two-array form; the caller checks SH + GB <= 32.
+
+    Lore: 2026-10-19, ClickBench Q8."""
     n = uc.size
     NB = 1 << 12
     pc = np.zeros((T, NB + 16), np.int64)
@@ -3908,10 +3941,12 @@ def _gd_pass2_packed_nb(pk, offs, SH, GB, VR, T):
 
 
 def gd_dense(grp, tgt, KV, VT, tnull):
-    """THE Q13 BOARD'S DENSE LANE (2026-10-13): per-group COUNT(DISTINCT target) when the (group x
+    """THE DENSE LANE: per-group COUNT(DISTINCT target) when the (group x
     target) cell table is small -- per-thread presence boards (T x KV x VT bytes), filled in one
     parallel pass, OR-reduced and counted per group. Returns (distinct counts, rows per group); a
-    null target (tnull >= 0) marks the group present without counting."""
+    null target (tnull >= 0) marks the group present without counting.
+
+    Lore: 2026-10-13, the ClickBench Q13 board's dense lane."""
     return _gd_dense_nb(grp, tgt, np.int64(KV), np.int64(VT), np.int64(tnull), _nt())
 
 
@@ -3920,7 +3955,8 @@ def _gd_dense_nb(grp, tgt, KV, VT, tnull, T):
     n = grp.shape[0]
     cells = KV * VT
     # each thread's board and row counts padded to whole cache lines: a 2 x 2 table packed (T, 4) put
-    # every thread's writes on one line (JavaEnable x a binary D: 1.5 s of false sharing)
+    # every thread's writes on one line (two binary columns: 1.5 s of false sharing)
+    # lore: JavaEnable x a binary D
     PB = ((cells + 127) // 64) * 64
     PR = ((KV + 15) // 8) * 8
     board = np.zeros((T, PB), np.uint8)
@@ -3960,8 +3996,10 @@ def _gd_dense_nb(grp, tgt, KV, VT, tnull, T):
 @njit(nogil=True, parallel=True, cache=True)
 def gd_pass1_skip(uc, rc, SH, T, skip):
     """gd_pass1 for the key lanes, with the rows of one key code left out (WHERE key <> literal): the
-    filtered group never reaches pass 2 -- left in, it is ONE bucket on ONE thread (ResponseEndTiming's
-    0 is 75% of the rows). skip < 0 keeps every row."""
+    filtered group never reaches pass 2 -- left in, it is ONE bucket on ONE thread (a default value that holds
+    most of the rows). skip < 0 keeps every row.
+
+    Lore: ResponseEndTiming's 0 is 75% of the rows."""
     n = uc.size
     NB = 1 << 12
     pc = np.zeros((T, NB), np.int64)
@@ -4045,11 +4083,13 @@ def gd_pass1_skipmask(uc, rc, SH, T, skipm):
 
 
 def gd_heavy(grp, tgt, hidx, H, VT, tnull):
-    """THE HEAVY GROUPS (2026-10-19, the Q8 board's open form): COUNT(DISTINCT target) of the few groups
-    that hold most rows (SearchPhrase's '' is 87% of hits), counted on every core instead of as one run on
+    """THE HEAVY GROUPS: COUNT(DISTINCT target) of the few groups
+    that hold most rows (a default value that fills most of a column), counted on every core instead of as one run on
     one thread: one parallel pass marks each heavy group's targets in its own presence row (H x VT bytes;
     two threads writing the same 1 race harmlessly), then the rows are counted in parallel slices.
-    hidx[code] = the group's heavy index, or -1."""
+    hidx[code] = the group's heavy index, or -1.
+
+    Lore: 2026-10-19, the ClickBench Q8 board's open form; SearchPhrase's '' is 87% of hits."""
     return _gd_heavy_nb(grp, tgt, hidx, np.int64(H), np.int64(VT), np.int64(tnull), _nt())
 
 
@@ -4066,7 +4106,8 @@ def _gd_heavy_nb(grp, tgt, hidx, H, VT, tnull, T):
                     x = h * VT + v
                     if tab[x] == 0:                      # read first: a store to a line every thread holds
                         tab[x] = 1                       # bounces it between cores even when the byte is
-                                                         # already 1 (Robotness x SocialSourcePage 0.31 -> 0.69 s)
+                                                         # already 1 (one measured pair: 0.31 -> 0.69 s)
+                                                         # lore: the pair was Robotness x SocialSourcePage
     part = np.zeros((T, H + 16), np.int64)
     for t in prange(T):
         for h in range(H):
@@ -4087,7 +4128,9 @@ def _gd_heavy_nb(grp, tgt, hidx, H, VT, tnull, T):
 def rows_of_groups(grp, sel, gmax):
     """THE LATE FOLD'S ROWS (2026-10-19): the rows whose group code is in `sel` (sorted, few), in row order,
     with each row's index into sel -- one parallel pass over the codes against a bitset of the chosen
-    groups (gmax/8 bytes: 12.5 MB for WatchID's 100M), a binary search only for the rows that match"""
+    groups (gmax/8 bytes: 12.5 MB for a near-unique key's 100M), a binary search only for the rows that match
+
+    Lore: the 100M-code key was WatchID."""
     sel = np.ascontiguousarray(np.asarray(sel, np.int64))
     bits = np.zeros((int(gmax) >> 3) + 1, np.uint8)
     np.bitwise_or.at(bits, sel >> 3, (np.int64(1) << (sel & 7)).astype(np.uint8))
@@ -4133,23 +4176,27 @@ def _rows_of_groups_nb(grp, sel, bits, T):
 
 def gd_bucket_order(offs, T):
     """Nonempty buckets, biggest first, dealt round-robin: thread t takes order[t::T]. A static split of
-    the 4096 bucket ids leaves every row of a small key space (RegionID's ~9K codes land in buckets
-    0..9039>>SH) on the first few threads."""
+    the 4096 bucket ids leaves every row of a small key space (~9K codes land in buckets
+    0..9039>>SH) on the first few threads.
+
+    Lore: the small key space was RegionID's."""
     sizes = np.diff(offs)
     nz = np.flatnonzero(sizes)
     return np.ascontiguousarray(nz[np.argsort(-sizes[nz], kind='stable')].astype(np.int64))
 
 
 def gd_keymark(ku, kr, offs, SH, KV, VT, tnull, mark=True):
-    """THE Q13 BOARD'S KEY LANES (2026-10-13), pass 2 after gd_pass1 scattered rows by the GROUP code's
+    """THE KEY LANES, pass 2 after gd_pass1 scattered rows by the GROUP code's
     top bits: per bucket, a counting scatter by the low bits puts each group's rows together, then each
     group's distinct targets are counted --
       mark=True  (KEYMARK): one walk with a per-thread marker table over the TARGET space (marker = the
                  group code, so it never needs clearing): linear, no sort; the target space must fit T
                  marker tables (the caller's gate);
       mark=False (KEYSORT): sort each group's own run (insertion sort when short): no table at all, for
-                 a target space too wide to mark (WatchID, UserID as the counted column).
-    -1 = group absent."""
+                 a target space too wide to mark (a near-unique or very wide counted column).
+    -1 = group absent.
+
+    Lore: 2026-10-13, the ClickBench Q13 board's key lanes; the too-wide targets were WatchID, UserID."""
     order = gd_bucket_order(offs, int(wide_threads()))
     return run_wide(_gd_keymark_nb, ku, kr, offs, order, np.int64(SH), np.int64(KV), np.int64(VT),
                     np.int64(tnull), np.int64(1 if mark else 0), pass_t=True)
@@ -4244,9 +4291,11 @@ GD_TOPK_CAP = 1 << 16       # gd_topk's census width; counts above it are picked
 def gd_topk(runs, ecode, k):
     """THE PICK over a per-group count array (-1 = absent): the k groups by count descending, code
     ascending -- exactly the full sort's first k -- without the full sort, the 100M-wide nonzero /
-    maximum / partition passes a near-unique key paid (WatchID: ~1 s of numpy). One parallel census of
+    maximum / partition passes a near-unique key paid (~1 s of numpy). One parallel census of
     the counts finds the k-th count; one walk in code order takes everything above it and the
-    lowest codes on it. Counts taller than GD_TOPK_CAP are settled apart (the capped census)."""
+    lowest codes on it. Counts taller than GD_TOPK_CAP are settled apart (the capped census).
+
+    Lore: the near-unique key was WatchID."""
     T = int(_nt())
     mx = _gd_max_nb(runs, np.int64(ecode), np.int64(T))
     if mx < 0:
@@ -4520,9 +4569,9 @@ def flat_count(P, offs, k, cap=1 << 16):
     big = np.flatnonzero(bmax < 0)                       # buckets whose groups overflowed the shared table
     bigk = []
     for j in big.tolist():
-        # THE OVERFLOW BUCKET (2026-10-15, the Q16 board: Referer x IPNetworkID, one bucket of 3.5M rows holding
-        # more than 512K pairs): counted alone in a table sized to its own rows, its groups kept whole for the
-        # emit -- instead of declining the lane
+        # THE OVERFLOW BUCKET (one bucket holding more than 512K pairs): counted alone in a table sized to its
+        # own rows, its groups kept whole for the emit -- instead of declining the lane
+        # lore: 2026-10-15, the Q16 board: Referer x IPNetworkID, one bucket of 3.5M rows holding more than 512K pairs
         b = int(order[j]); lo = int(offs[b]); hi = int(offs[b + 1])
         m = 16
         while m < 2 * (hi - lo):
@@ -4827,9 +4876,11 @@ def unpack_any(b, n, bits):
 
 @njit(nogil=True, parallel=True, cache=True)
 def e8_lowcount(b, n, bits, T, L):
-    """THE LOW COUNT (2026-10-02, Q25): how many of the sparse dress's n literals (MSB-first, as
+    """THE LOW COUNT: how many of the sparse dress's n literals (MSB-first, as
     unpack_any reads them, any width <= 32) are each code below T -- the lane read once in L
-    lanes, a T-sized board per lane, no array of literals written."""
+    lanes, a T-sized board per lane, no array of literals written.
+
+    Lore: 2026-10-02, ClickBench Q25."""
     boards = np.zeros((L, T), np.int64)
     mask = np.uint64((1 << bits) - 1)
     nb = len(b)
@@ -5031,8 +5082,10 @@ def fc_bytelens(a, R, out):
 
 @njit(nogil=True, cache=True)
 def lenagg_pour(kc, uc, lens, jars, cnts, ec):
-    """Q27's fused pour: one pass, both jars, integer math, no temporaries.
-    jars[k] += lens[u]; cnts[k] += 1 for live rows (u != ec; ec = -1 counts all)."""
+    """The fused pour (per-key length sums and counts): one pass, both jars, integer math, no temporaries.
+    jars[k] += lens[u]; cnts[k] += 1 for live rows (u != ec; ec = -1 counts all).
+
+    Lore: built for ClickBench Q27."""
     for i in range(kc.size):
         u = np.int64(uc[i])
         if u != ec:
@@ -5043,9 +5096,11 @@ def lenagg_pour(kc, uc, lens, jars, cnts, ec):
 
 @njit(nogil=True, parallel=True, cache=True)
 def lenpour_dict(kc, sc, tab, ec, S, C):
-    """THE LENGTH POUR, small key (2026-10-18, Q27's shape): S[t, k] += tab[s], C[t, k] += 1 for every row
+    """THE LENGTH POUR, small key (SUM/AVG of F(col) per key): S[t, k] += tab[s], C[t, k] += 1 for every row
     (k, s) = (kc[i], sc[i]) whose s != ec (ec = -1: every row), on per-thread rows of S and C (the caller pads
-    them apart). tab is the per-code value of F(S) -- the dictionary's lengths for LENGTH."""
+    them apart). tab is the per-code value of F(S) -- the dictionary's lengths for LENGTH.
+
+    Lore: 2026-10-18, ClickBench Q27's shape."""
     T = S.shape[0]
     n = kc.size
     for t in prange(T):
@@ -5060,11 +5115,13 @@ def lenpour_dict(kc, sc, tab, ec, S, C):
 
 @njit(nogil=True, parallel=True, cache=True)
 def lenpour_big(kc, L, sc, tab, use_tab, skip0, ec, SH, T, outS, outC):
-    """THE LENGTH POUR, large key (2026-10-18): a key past the per-thread boards (UserID's 17.6M values: 16
-    boards of 17.6M x 2 x 8 bytes) -- each live row's (key, value) is partitioned by the key's high bits into
+    """THE LENGTH POUR, large key (2026-10-18): a key past the per-thread boards (tens of millions of values:
+    T boards of V x 2 x 8 bytes) -- each live row's (key, value) is partitioned by the key's high bits into
     4096 ranges (bincount_big's method), then every range is summed on its own core into its own slice of
     outS / outC, so no two cores touch one counter. A row's value is tab[sc[i]] (use_tab) or L[i] (stored row
-    lengths). Live: sc[i] != ec (use_tab), or L[i] != 0 when skip0 (a length is 0 only for '')."""
+    lengths). Live: sc[i] != ec (use_tab), or L[i] != 0 when skip0 (a length is 0 only for '').
+
+    Lore: the large key was UserID's 17.6M values: 16 boards of 17.6M x 2 x 8 bytes."""
     n = kc.size
     NB = 4096
     pc = np.zeros((T, NB + 16), np.int64)
@@ -5279,10 +5336,12 @@ def cd_alldistinct(bucketed, offs):
 
 @njit(nogil=True, parallel=True, cache=True)
 def tt_survivors(uc, ucnt, pos8, lits8, spc, ec, mt, e0, emptyc, theta, outs, lens, has_m):
-    """Q18's fused pass: per-thread chunks walk the rows once -- user bound
+    """The triple-key top-k's fused pass: per-thread chunks walk the rows once -- user bound
     from the census, phrase bound via two-pointer merge with the sorted
     sparse planes (no 100M scratch arrays), survivors emit packed 54-bit
-    keys (uid<<29 | minute<<23 | sp) straight into per-thread buffers."""
+    keys (uid<<29 | minute<<23 | sp) straight into per-thread buffers.
+
+    Lore: built for ClickBench Q18."""
     T = outs.shape[0]
     N = uc.size
     step = (N + T - 1) // T
@@ -5324,12 +5383,15 @@ def tt_survivors(uc, ucnt, pos8, lits8, spc, ec, mt, e0, emptyc, theta, outs, le
 
 @njit(nogil=True, parallel=True, cache=True)
 def tt_walk(uc, ubit, uidx, pos8, lits8, pbit, steps, mt, e0, empty_ok, NM, board, kout, koff, klen):
-    """Q18's walk by CHECKLISTS (2026-10-02, Jackson's line items): one pass over the rows in L lanes.
-    ubit/pbit are 1-bit-per-code "has >= theta rows" checklists (UserID 2.2 MB, SearchPhrase 0.75 MB --
-    cache-resident, where the census itself was 141 MB of random reads). The minute comes from the
+    """The triple-key top-k's walk by CHECKLISTS (Jackson's line items): one pass over the rows in L lanes.
+    ubit/pbit are 1-bit-per-code "has >= theta rows" checklists (one bit a code --
+    cache-resident, where the int64 census itself is 8 bytes a code of random reads). The minute comes from the
     staircase's step rows (code = steps <= row) and the code -> minute table: no 100M time decode.
-    Survivors with the empty phrase (99.6% on ClickBench) tick a per-lane TALLY board[l, uidx[u]*NM + m];
-    survivors with a real phrase emit uid<<29 | m<<23 | sp into kout[koff[l]:], klen[l] of them."""
+    Survivors with the empty phrase (most of them, for a sparse phrase) tick a per-lane TALLY board[l, uidx[u]*NM + m];
+    survivors with a real phrase emit uid<<29 | m<<23 | sp into kout[koff[l]:], klen[l] of them.
+
+    Lore: 2026-10-02, ClickBench Q18's walk. Checklists: UserID 2.2 MB, SearchPhrase 0.75 MB, where the census was
+    141 MB. Survivors with the empty phrase: 99.6% on ClickBench."""
     L = board.shape[0]
     N = uc.size
     n8 = pos8.size
@@ -5390,9 +5452,11 @@ def pt_collect(uc, jar, outs, lens):
 
 @njit(nogil=True, parallel=True, cache=True)
 def pt_census_bucketed(ku, kr, offs, SH, outs, lens):
-    """Q32's parallel census on gd_pass1's buckets: each bucket owns a disjoint
+    """The near-unique pair's parallel census on gd_pass1's buckets: each bucket owns a disjoint
     code range, so its jar slice never races. Saturate at 2, collect the rows
-    (companions) of every repeated ticket -- one prange body, no shared writes."""
+    (companions) of every repeated ticket -- one prange body, no shared writes.
+
+    Lore: built for ClickBench Q32."""
     NB = offs.size - 1
     LOW = 1 << SH
     for b in prange(NB):
@@ -5558,9 +5622,11 @@ def pk32_pack(codes, bits, out):
 def pk32_words(buf8):
     """THE WORD VIEW: an inflated enc-18 frame (uint8, 8 slack bytes) as aligned u64 words for the
     readers below -- one load per code, a second only when the code straddles a word. Measured on
-    Title's scan: five byte loads 67.5 ms, one word 48.8 (enc-3's u32 read 63.1). Safe on the
+    one text column's scan: five byte loads 67.5 ms, one word 48.8 (enc-3's u32 read 63.1). Safe on the
     slack: a straddled word ends before the eight slack bytes do, for any prefix length the
-    point reader asks (ceil(n*bits/8) + 8 bytes)."""
+    point reader asks (ceil(n*bits/8) + 8 bytes).
+
+    Lore: the measured scan was Title's."""
     b = np.frombuffer(buf8, np.uint8) if not isinstance(buf8, np.ndarray) else buf8
     return b[:b.size // 8 * 8].view(np.uint64)
 
@@ -5765,7 +5831,9 @@ def block_stats(codes, dvals, has_dvals, nullcode, BR, cnt, nn, bsum, cmin, cmax
     """THE BLOCK STATISTICS (Jackson's metadata per block, written at load): per BR rows the row
     count, the non-null count, the sum of dictionary values (float64), and the min and max CODE.
     has_dvals: 0 = no sum, 1 = sum dvals[code], 2 = the codes ARE the values (mode 4), sum them.
-    Blocks across threads; one pass. Was a Python loop over 3,052 blocks (0.91 s on UserID)."""
+    Blocks across threads; one pass. Was a Python loop over the blocks.
+
+    Lore: the Python loop took 0.91 s over 3,052 blocks on UserID."""
     n = codes.size
     nb = cnt.size
     for j in prange(nb):
@@ -5799,7 +5867,9 @@ def group_fold_dict(grp, codes, dvals, G, out):
 def _group_fold_dict_nb(grp, codes, dvals, G, out, T):
     """THE FOLD ON CODES: out[g] = sum over rows of dvals[codes[i]] for grp[i] == g -- a SUM or AVG
     numerator per group straight from two code streams and a dictionary, per-thread boards
-    (T x G float64) and a reduce. No value array is ever built (Q09 built three, 630 ms)."""
+    (T x G float64) and a reduce. No value array is ever built.
+
+    Lore: ClickBench Q09 built three, 630 ms."""
     n = grp.size
     part = np.zeros((T, G + 16), np.float64)      # rows padded apart (THE PADDED BOARDS)
     for t in prange(T):
@@ -5822,7 +5892,9 @@ def _sort_keys_par_nb(keys, SH, T):
     """THE BUCKETED SORT: non-negative int64 keys, MSD-partitioned by (key >> SH) into 4096
     buckets (per-thread counts -> stable offsets -> scatter), each bucket sorted in place across
     threads. Sorted output, one pass + small sorts: np.sort on 6.2M keys was 217 ms on one
-    thread (Q18's survivors); this is ~30. SH must put every key under 4096 buckets."""
+    thread; this is ~30. SH must put every key under 4096 buckets.
+
+    Lore: the 6.2M keys were Q18's survivors."""
     n = keys.size
     NB = 1 << 12
     pc = np.zeros((T, NB), np.int64)
@@ -6001,8 +6073,10 @@ def topk_bar(a, k):
     A non-negative integer array (a census): the k-th value v_k from one parallel census of the values (all past
     CAP share its last bin, settled exactly among themselves), then the fewer-than-k values above v_k sorted, then
     the first ties at v_k in index order by a scan that stops when it has them (2026-10-18: the bar search before
-    this lowered by doubling steps and overshot v_k on spread plateaus -- HID 0.7 s). Other arrays: lower a bar
-    from the max until k values clear it, then sort those."""
+    this lowered by doubling steps and overshot v_k on spread plateaus). Other arrays: lower a bar
+    from the max until k values clear it, then sort those.
+
+    Lore: the overshoot cost 0.7 s on ClickBench's HID."""
     a = np.ascontiguousarray(a)
     n = int(a.size); k = int(k)
     if k <= 0 or n == 0:
@@ -6013,7 +6087,8 @@ def topk_bar(a, k):
         return np.argsort(_desc_key(a), kind='stable')[:k].astype(np.int64)
     if a.dtype.kind in 'iu' and a.dtype != np.uint64:
         # one parallel pass: min, max and a cache-sized census of min(a, BAR_CAP) (2026-10-18: a census capped at
-        # max(a) up to 1M bins was 16 x 1M boards to zero and fold -- URL's top-10 paid 40-57 ms for it)
+        # max(a) up to 1M bins was 16 x 1M boards to zero and fold -- a top-10 paid 40-57 ms for it)
+        # lore: the top-10 was URL's
         h, mn, mx = _bar_census_nb(a, np.int64(BAR_CAP), _nt())
         mn = int(mn); mx = int(mx)
         if mx == mn:
@@ -6068,9 +6143,11 @@ COUNTING_ORDER_MAX_SPAN = 1 << 24
 def counting_order(key, out_dtype=np.int64):
     """THE CLUSTER ORDER BY COUNTING (2026-09-26): the stable row order of one integer (or datetime)
     key -- the same permutation np.lexsort((key,)) / argsort(kind='stable') gives: rows of equal key
-    keep their file order. One count pass, one prefix, one scatter: EventTime's 100M rows in 0.75 s
+    keep their file order. One count pass, one prefix, one scatter: a timestamp's 100M rows in 0.75 s
     against lexsort's 8.4 s. Returns None when the key's span is past COUNTING_ORDER_MAX_SPAN (the
-    count array would be too large) or the key is not integral: the caller sorts as before."""
+    count array would be too large) or the key is not integral: the caller sorts as before.
+
+    Lore: the measured key was EventTime."""
     k = np.asarray(key)
     if k.dtype.kind == 'M':
         k = k.view(np.int64)
@@ -6094,8 +6171,10 @@ def bincount_big(codes, V):
     """THE BIG CENSUS (2026-10-18, the single-key board): np.bincount for a dictionary past bincount_par's boards
     (T x V x 4 bytes), on every core. The codes are partitioned by their high bits into 4096 code ranges (a
     per-thread count of the ranges, the offsets, one scatter); then every range is counted on its own core into
-    its own slice of the answer, so no two cores ever touch one counter. WatchID's 100M codes: numpy's one thread
-    was the 1.6-2.1 s of its top count. Codes are assumed < V (the caller's contract, as bincount_par)."""
+    its own slice of the answer, so no two cores ever touch one counter. A near-unique key's 100M codes: numpy's
+    one thread was the 1.6-2.1 s of its top count. Codes are assumed < V (the caller's contract, as bincount_par).
+
+    Lore: the near-unique key was WatchID."""
     codes = np.ascontiguousarray(codes)
     V = int(V)
     bits = max(1, (V - 1).bit_length())
@@ -6139,9 +6218,11 @@ def _big_census_nb(codes, SH, T, out):
 
 @njit(cache=True, nogil=True)
 def count_desc_order(cn):
-    """THE COUNT ORDER IN TWO PASSES (2026-10-22, Q7's board): the squares with cn > 0, by count descending and, within
+    """THE COUNT ORDER IN TWO PASSES: the squares with cn > 0, by count descending and, within
     a count, by code ascending (a value-sorted dictionary: value ascending) -- counts are small integers, so one pass
-    buckets them and one places the squares: linear, where a sort of 17.6M groups took 744 ms (this: 104)."""
+    buckets them and one places the squares: linear, where a sort of 17.6M groups took 744 ms (this: 104).
+
+    Lore: 2026-10-22, Q7's board."""
     mx = 0
     for v in cn:
         if v > mx:
@@ -6189,9 +6270,11 @@ def bincount_par(codes, minlength):
 
 def count_codes(codes, K):
     """COUNT(*) per code in the codes' own width -- no widening copy (np.bincount casts uint8 to
-    int64 first: 2.2 ms on Q07's 630k codes against 0.2 ms for the generated parallel loop). Codes
+    int64 first: 2.2 ms on 630k codes against 0.2 ms for the generated parallel loop). Codes
     past K are not counted (the generated kernel's contract: a trailing null slot is dropped).
-    The thread count rides in as an argument so the kernel stays cacheable."""
+    The thread count rides in as an argument so the kernel stays cacheable.
+
+    Lore: the 630k codes were Q07's."""
     return _count_codes_nb(codes, np.int64(K), _nt())
 
 
@@ -6254,8 +6337,10 @@ def plut_u8(codes, lut, out):
 @njit(cache=True, parallel=True, nogil=True)
 def pcmp_dict2(ba, ca, bb, cb, op, out):
     """Column against column of one table, both dictionary-coded numbers: out[i] = ba[ca[i]] OP bb[cb[i]],
-    op 0..5 = '=', '<>', '>', '<', '>=', '<=' (lineitem's l_receiptdate > l_commitdate: the row evaluator
-    took 3.7 s at 60M rows, the two numpy gathers 250 ms)."""
+    op 0..5 = '=', '<>', '>', '<', '>=', '<=' (date column > date column of one table: the row evaluator
+    took 3.7 s at 60M rows, the two numpy gathers 250 ms).
+
+    Lore: the measured comparison was TPC-H lineitem's l_receiptdate > l_commitdate."""
     n = ca.shape[0]
     for i in prange(n):
         a = ba[np.int64(ca[i])]; b = bb[np.int64(cb[i])]
@@ -6653,11 +6738,13 @@ _KEEP_ROWS_MIN = 1 << 16
 
 
 def keep_rows_by_code(rows, codes, keep):
-    """THE KEEP BY CODE (2026-10-31, TPC-H Q6): rows[keep[codes]] -- a join cascade's leftover filter at survivor
+    """THE KEEP BY CODE: rows[keep[codes]] -- a join cascade's leftover filter at survivor
     scale -- as one parallel two-pass compress instead of numpy's two single-thread passes (a gather into the
     keep table, then a boolean compress). Prototype, server: 9M rows 32.6 -> 3.8 ms, 17M 62.4 -> 8.4, the same rows.
     Exactly numpy's answer: below 65,536 rows, switched off, or a code outside the table (numpy then raises as it
-    did), numpy answers itself."""
+    did), numpy answers itself.
+
+    Lore: 2026-10-31, TPC-H Q6."""
     rows = np.asarray(rows); codes = np.asarray(codes); keep = np.asarray(keep)
     if (not HAVE_NUMBA or not _KEEP_ROWS[0] or rows.shape[0] < _KEEP_ROWS_MIN or rows.ndim != 1
             or codes.shape != rows.shape or keep.dtype != np.bool_ or codes.dtype.kind not in 'iu'):
@@ -6689,8 +6776,9 @@ def _stairs_walk_nb(st, rows, out):
 
 
 # THE STAIRS WALKED (2026-11-01): code_enc 2 codes at rows were np.searchsorted (one binary search per row, one
-# thread: TPC-H Q3's l_orderkey at the survivors 22.6 ms). Measured (15M steps, 60M rows): 300k rows 28.0 -> 2.6 ms,
+# thread). Measured (15M steps, 60M rows): 300k rows 28.0 -> 2.6 ms,
 # 1M 28.7 -> 2.7, 3M 71.4 -> 3.7, 10M 205 -> 8.3; 30k rows equal (5.8) -- hence the line. WDB_STAIR_WALK=0: off.
+# lore: the searchsorted cost was TPC-H Q3's l_orderkey at the survivors, 22.6 ms.
 _STAIR_WALK = [__import__('os').environ.get('WDB_STAIR_WALK', '1') == '1']
 _STAIR_WALK_MIN = 1 << 16
 
@@ -6807,11 +6895,13 @@ def _road_run_sums_nb(road, codes, vals, weighted, nch, out, bad):
             out[p] = s
 
 
-# THE RUNS SUM THEMSELVES (2026-11-02): TPC-H Q18's HAVING census was np.bincount(road, weights=vals[codes]) over all
-# 59,986,052 lineitem rows -- the value gather plus one thread, 221 ms. lineitem lies in orderkey order, so its road
-# to orders never decreases: checked in parallel (4.6 ms), then each chunk sums its runs straight from the codes
-# (16.7 ms), equal to the bincount bit for bit. A road that ever steps down, or under _RUN_SUM_MIN rows, or
+# THE RUNS SUM THEMSELVES (2026-11-02): a per-parent weighted census was np.bincount(road, weights=vals[codes]) over
+# all child rows -- the value gather plus one thread. A child table stored in its parent key's order has a road
+# that never decreases: checked in parallel, then each chunk sums its runs straight from the codes,
+# equal to the bincount bit for bit. A road that ever steps down, or under _RUN_SUM_MIN rows, or
 # WDB_RUN_SUM=0: None (the caller's bincount answers).
+# lore: TPC-H Q18's HAVING census over all 59,986,052 lineitem rows, 221 ms; lineitem lies in orderkey order, so
+# lore: its road to orders never decreases: the check 4.6 ms, the run sums 16.7 ms.
 _RUN_SUM = [__import__('os').environ.get('WDB_RUN_SUM', '1') == '1']
 _RUN_SUM_MIN = 1 << 16
 
@@ -7026,7 +7116,9 @@ def pinline_eq_any(blob, off, lb, lo, out):
 def plike2(blob, off, n1, n2, out):
     """Ordered two-needle LIKE over a mode-5 inline stream: out[r] = row r's
     bytes contain n1 and then n2 after it (n2 empty => single needle). The
-    Python-string version of this scan cost 15s on Q13; bytes cost ~150ms."""
+    Python-string version of this scan cost 15s; bytes cost ~150ms.
+
+    Lore: the 15s was measured on Q13."""
     R = off.shape[0] - 1
     L1 = n1.shape[0]; L2 = n2.shape[0]
     for r in prange(R):
@@ -7063,7 +7155,9 @@ def plike2(blob, off, n1, n2, out):
 @njit(cache=True, parallel=True, nogil=True)
 def pprefix2(blob, off, out):
     """out[r] = first two bytes of row r as u16 (b0<<8|b1) -- a 2-byte read,
-    never a Python string (Q22's country code)."""
+    never a Python string (a two-letter code prefix).
+
+    Lore: built for TPC-H Q22's country code."""
     R = off.shape[0] - 1
     for r in prange(R):
         a = off[r]
@@ -7084,7 +7178,8 @@ def _plike_fc_nb(buf, restarts, R, V, n1, n2, keep, NT):
     nb = (V + R - 1) // R
     L1 = n1.shape[0]; L2 = n2.shape[0]
     T = min(nb, NT * 8)                            # one carry buffer per chunk of blocks, not per
-    for t in prange(T):                            # block (1.1M mallocs of 128 KB on an 18M URL dict)
+    # lore: the 18M-value dict was URL's
+    for t in prange(T):                            # block (1.1M mallocs of 128 KB on an 18M-value dict)
         prev = np.empty(131072, np.uint8)          # cp, sl are u16: a value is at most 131070 bytes
         for b in range(nb * t // T, nb * (t + 1) // T):
             o = np.int64(restarts[b])
@@ -7133,9 +7228,11 @@ def _plike_fc_nb(buf, restarts, R, V, n1, n2, keep, NT):
 
 
 @njit(cache=True, parallel=True, nogil=True)
-def pruns_distinct(starts, ptr, supp, flag, nsupp, nflag):
-    """Per contiguous run of ptr (a sorted road): count distinct supp values,
-    and distinct supp values among flagged rows (Q21's blame censuses)."""
+def pruns_distinct(starts, ptr, xs, flag, nx, nflag):
+    """Per contiguous run of ptr (a sorted road): count distinct xs values (nx),
+    and distinct xs values among flagged rows (nflag).
+
+    Lore: TPC-H Q21's blame censuses (xs: the supplier key)."""
     S = starts.shape[0] - 1
     for s in prange(S):
         i = starts[s]; j = starts[s + 1]
@@ -7143,25 +7240,27 @@ def pruns_distinct(starts, ptr, supp, flag, nsupp, nflag):
         for a in range(i, j):
             seen = False
             for b in range(i, a):
-                if supp[b] == supp[a]:
+                if xs[b] == xs[a]:
                     seen = True; break
             if not seen:
                 c += 1
             if flag[a]:
                 seenf = False
                 for b in range(i, a):
-                    if flag[b] and supp[b] == supp[a]:
+                    if flag[b] and xs[b] == xs[a]:
                         seenf = True; break
                 if not seenf:
                     cf += 1
-        nsupp[ptr[i]] = c; nflag[ptr[i]] = cf
+        nx[ptr[i]] = c; nflag[ptr[i]] = cf
 
 
 @njit(cache=True, parallel=True, nogil=True)
 def run_bounds(k):
     """The starts of the runs of equal k (with n appended) when k never decreases; an empty array when it
     does (the groups are not contiguous stretches). Two parallel passes over 64 stripes: count the changes,
-    then write them at each stripe's offset (one thread: 178 ms over lineitem's 60M keys)."""
+    then write them at each stripe's offset (one thread: 178 ms over 60M keys).
+
+    Lore: the 60M keys were TPC-H lineitem's."""
     n = k.shape[0]
     if n == 0:
         return np.zeros(1, np.int64)
@@ -7199,10 +7298,12 @@ def run_bounds(k):
 
 @njit(cache=True, parallel=True, nogil=True)
 def pruns_others(starts, x, p, has_p, neg, out):
-    """THE COUNT INSTEAD OF THE SEARCH (TPC-H Q21): per run of the group key, is there another row of the
+    """THE COUNT INSTEAD OF THE SEARCH: per run of the group key, is there another row of the
     run meeting P (p[j] != 0, or every row when not has_p) whose x differs from this row's x? out[i] = that
     answer for EXISTS, its negation for NOT EXISTS (neg). Short runs look pairwise and stop at the first
-    witness; long runs sort their P-rows' x once and count by bisection."""
+    witness; long runs sort their P-rows' x once and count by bisection.
+
+    Lore: built for TPC-H Q21."""
     S = starts.shape[0] - 1
     for s in prange(S):
         i0 = starts[s]; i1 = starts[s + 1]
@@ -7383,15 +7484,17 @@ def _pf_globalise(idx, base, gid, u0, u1, two, goff, g0, g1):
 def parallel_factorize(w0, w1=None, sbits=None):
     """THE PARALLEL FACTORISE (2026-10-12): dense group ids for one or two int64 key words per row,
     on every core -- the atom under any GROUP BY whose composite is too big for a dense array.
-    Replaces pandas' single-threaded factorize (6.5 s of a 7.9 s UserID x SearchPhrase group,
-    14 s of WatchID x ClientIP on the shifting board) and the serial hcomposite2.
+    Replaces pandas' single-threaded factorize (seconds on a wide pair group) and the serial hcomposite2.
 
     Rows are partitioned by a hash of their key into 2^sbits shards (~16K rows each, a table that
     stays in L2), each shard factorises privately, and shard offsets make the ids global.
     Returns (gid int64[n], keys0 int64[G], keys1 int64[G] or None): row i's group is gid[i], and
     group g's key words are keys0[g] (and keys1[g]). Ids are dense 0..G-1, deterministic for a
     given input; their ORDER is shard-major (not first appearance) -- callers treat it as unordered,
-    as SQL does."""
+    as SQL does.
+
+    Lore: pandas' factorize took 6.5 s of a 7.9 s UserID x SearchPhrase group, 14 s of WatchID x ClientIP on the
+    shifting board."""
     w0 = np.ascontiguousarray(w0, dtype=np.int64)
     n = w0.shape[0]
     two = w1 is not None
@@ -7758,12 +7861,14 @@ def e19_rows_eq(pw, BR, N, lb, poff, lid, b0, b1, lo, hi, out):
 
 
 def e19_rows_eq_all(pw, BR, N, lb, poff, lid, b0, b1, lo, hi):
-    """THE ROW WALK ON EVERY CORE (2026-10-18, the Q14 board): the rows in [lo, hi) of the blocks with
+    """THE ROW WALK ON EVERY CORE: the rows in [lo, hi) of the blocks with
     lid >= 0 whose pointer is that local id, as a sorted int64 array. e19_rows_eq walked the touched blocks one
-    after another on one core -- the cost was the blocks a value is spread over, not its rows (UserID rank 3:
-    7,584 rows in 1,069 of 1,526 blocks, 131 ms; IPNetworkID: every value in nearly all 6,104 blocks, 190-244 ms,
-    where the parallel full decode is 60-105). Here: the touched blocks, each counted on its own core, the
-    offsets, then each block written in place -- ascending, as before."""
+    after another on one core -- the cost was the blocks a value is spread over, not its rows (a value spread over
+    most blocks cost more than the parallel full decode). Here: the touched blocks, each counted on its own core, the
+    offsets, then each block written in place -- ascending, as before.
+
+    Lore: 2026-10-18, the ClickBench Q14 board. UserID rank 3: 7,584 rows in 1,069 of 1,526 blocks, 131 ms;
+    IPNetworkID: every value in nearly all 6,104 blocks, 190-244 ms, where the parallel full decode is 60-105."""
     tb = (np.flatnonzero(np.asarray(lid[b0:b1]) >= 0) + b0).astype(np.int64)
     if tb.size == 0:
         return np.empty(0, np.int64)
@@ -7843,7 +7948,8 @@ def e19_gather(pw, dw, BR, gbits, lb, gw, dcnt, poff, doff, rows, starts, out):
 # pre[r, b] = how many of block b's entries sit on shelves before r (local id = pre[r, b] + k);
 # soff[r, b] = the bit where block b's piece starts on shelf r; SW[r] = shelf r's first u64 word.
 # 'Which blocks hold code t' reads ONE shelf (+ one row of each table) instead of a piece of every
-# label: UserID cold 69-78 ms (the whole 58 MB, in parallel) -> 5.5-7 ms (~0.25 MB), measured.
+# label: cold, the whole label in parallel -> one shelf, measured.
+# lore: UserID cold 69-78 ms (the whole 58 MB, in parallel) -> 5.5-7 ms (~0.25 MB).
 
 @njit(cache=True, parallel=True, nogil=True)
 def e19s_write(codes, BR, lb, poff, pw, LS, L):
@@ -8052,8 +8158,10 @@ def plike_fc_serial(buf, restarts, R, V, n1, n2, keep):
 @njit(cache=True, parallel=True, nogil=True)
 def label_hash(blob, offs, out):
     """a 64-bit hash of each label blob[offs[r]:offs[r+1]] -- a bucket, never an identity. Eight bytes per
-    multiply (byte-at-a-time FNV-1a was one dependent multiply per byte: 0.20 s over Title's 9.4M labels),
-    the length folded in, and murmur's finaliser so the top bits (the partition's) depend on every byte."""
+    multiply (byte-at-a-time FNV-1a was one dependent multiply per byte: 0.20 s over 9.4M labels),
+    the length folded in, and murmur's finaliser so the top bits (the partition's) depend on every byte.
+
+    Lore: the 9.4M labels were Title's."""
     for r in prange(out.size):
         a = offs[r]; b = offs[r + 1]
         h = np.uint64(14695981039346656037) ^ np.uint64(b - a)
@@ -8119,12 +8227,14 @@ def label_groups_par(blob, offs, h, gid, rep):
 
 @njit(cache=True, parallel=True, nogil=True)
 def _label_groups_par_nb(blob, offs, h, gid, rep, T):
-    """EXACT label groups on every core (label_groups' law, without its one-thread argsort of every hash:
-    0.58 s of SearchPhrase's 1.5 s under Q28's pattern, 0.98 s of Title's 2.9 s). Labels are partitioned by
+    """EXACT label groups on every core (label_groups' law, without its one-thread argsort of every hash,
+    over a third of the group's time). Labels are partitioned by
     the top 12 bits of their hash (per-thread counts, padded rows -> offsets -> scatter); each of the 4096
     buckets is sorted by hash and grouped on its own, every equal-hash label compared BYTE FOR BYTE with
     the bucket's representatives, so a collision never merges two labels. Group ids are numbered bucket
-    by bucket. gid[run] = group, rep[group] = a run carrying it. Returns the group count."""
+    by bucket. gid[run] = group, rep[group] = a run carrying it. Returns the group count.
+
+    Lore: the argsort was 0.58 s of SearchPhrase's 1.5 s under ClickBench Q28's pattern, 0.98 s of Title's 2.9 s."""
     n = h.size
     NB = 1 << 12
     SH = np.uint64(52)
@@ -8191,8 +8301,10 @@ def label_fold(lab, w, lens, acc):
     """one pass over a dictionary's codes: per label group g, acc[g, 0] = the row count (+= w), acc[g, 1] =
     the summed length (+= w * len), acc[g, 2] = the first code that carries a row (pre-filled with -1: in a
     value-sorted dictionary, the group's MIN). One row per group, so a scattered group costs one cache line,
-    not three. Was two weighted bincounts, a product array and a first-index pass (0.19 s on SearchPhrase's
-    6.0M values, 0.30 s on Title's 9.4M)."""
+    not three. Was two weighted bincounts, a product array and a first-index pass (0.19 s on 6.0M values,
+    0.30 s on 9.4M).
+
+    Lore: the 6.0M values were SearchPhrase's, the 9.4M Title's."""
     for i in range(lab.size):
         c = w[i]
         if c == 0:
@@ -8641,10 +8753,12 @@ def probe_sorted_id(keys, q, ent, out):
 # reads another; any row is one jump to its block plus a walk to the row. One 8-byte load decodes
 # one row (the widest row is 1 + 32 bits after at most 7 bits of shift).
 # ---------------------------------------------------------------------------------------------
-# THE ONE LOAD (Jackson, 2026-10-27, the Q27 split): the row walk is the whole cost of a decode (RefererHash: the walk
-# alone 92 of 114 ms), and each row's read was 8 single-byte loads glued together. One unaligned 8-byte load at the
+# THE ONE LOAD (Jackson, 2026-10-27): the row walk is the whole cost of a decode, and each row's read was 8
+# single-byte loads glued together. One unaligned 8-byte load at the
 # byte reads the same 8 bytes (little-endian, as the glue built them; 0 of 2M random loads differ). Measured on the
-# PC, whole decode, 8 / 16 threads: RefererHash 108 / 79 -> 59 / 39 ms, URLHash 101 / 72 -> 57 / 39 ms.
+# PC, whole decode, 8 / 16 threads: 1.8-2x faster on both hash columns measured.
+# lore: the Q27 split. RefererHash: the walk alone 92 of 114 ms. Whole decode, 8 / 16 threads: RefererHash
+# lore: 108 / 79 -> 59 / 39 ms, URLHash 101 / 72 -> 57 / 39 ms.
 if HAVE_NUMBA:
     from numba.extending import intrinsic as _intrinsic
     from numba import types as _nbt
@@ -8748,10 +8862,12 @@ def e20_gather(buf, base, BR, N, bits, boff, blocks, starts, rows, out):
 
 @njit(cache=True, parallel=True, nogil=True)
 def e20_low_count(buf, base, BR, N, bits, boff, T, scr, cnt):
-    """THE LOW COUNT THROUGH THE BACK-REFERENCE (2026-10-21, Q25's last 2x): rows per code for codes 0..T-1 of an
+    """THE LOW COUNT THROUGH THE BACK-REFERENCE: rows per code for codes 0..T-1 of an
     enc-20 column without writing its 100M codes -- each lane decodes its blocks into its own board (scr[t], one
-    block: stays in cache) and counts there. The full decode's 400 MB of fresh pages were half its time
-    (RefererHash: e20_decode 105 ms + low_count 12). cnt: (lanes, T)."""
+    block: stays in cache) and counts there. The full decode's 400 MB of fresh pages were half its time.
+    cnt: (lanes, T).
+
+    Lore: 2026-10-21, ClickBench Q25's last 2x. RefererHash: e20_decode 105 ms + low_count 12."""
     nb = boff.size - 1
     P = scr.shape[0]
     for t in prange(P):
@@ -8770,11 +8886,14 @@ def e20_low_count(buf, base, BR, N, bits, boff, T, scr, cnt):
 
 @njit(cache=True, parallel=True, nogil=True)
 def e20_eq_count(buf, base, BR, N, bits, boff, lo, hi, t, neg, scr, cnt):
-    """THE ONE-CODE SCAN THROUGH THE BACK-REFERENCE (2026-10-21, Q19's board), pass 1: rows of [lo, hi) whose enc-20
+    """THE ONE-CODE SCAN THROUGH THE BACK-REFERENCE, pass 1: rows of [lo, hi) whose enc-20
     code equals `t` (differs, `neg`), counted per block of the span. A code enters a block only as a literal, and a
     back-reference copies an earlier row: a row is a hit when it is the literal t or points back at a hit. The hits
-    live on each lane's own board (scr[lane], one block: stays in cache), so the 100M codes are never written (the
-    full decode + compare took RefererHash = k to 0.12 s for one row, DuckDB 0.036 s). cnt: one slot per block."""
+    live on each lane's own board (scr[lane], one block: stays in cache), so the 100M codes are never written.
+    cnt: one slot per block.
+
+    Lore: 2026-10-21, ClickBench Q19's board: the full decode + compare took RefererHash = k to 0.12 s for one
+    row, DuckDB 0.036 s."""
     b0 = lo // BR
     nbk = cnt.size
     P = scr.shape[0]
@@ -8909,11 +9028,13 @@ def e20_eq_list(buf, base, BR, N, bits, boff, blocks, lo, hi, t, offs, out, fill
 
 @njit(cache=True, parallel=True, nogil=True)
 def e20_read_sum(buf, base, BR, N, bits, boff, tab, outhi, outlo):
-    """THE READ-VALUES SUM THROUGH THE BACK-REFERENCE (2026-10-21/22, Q29's RefererHash): exact SUM of an enc-20 column
+    """THE READ-VALUES SUM THROUGH THE BACK-REFERENCE: exact SUM of an enc-20 column
     from its unzipped dictionary `tab`, with no census. Per lane, per block: one walk gives each literal a weight (1, plus
     1 for every row whose root it is -- a back-reference's root is the root of the row it points to); then, in a loop of
     its own, the block's literals read tab[code] x weight. The reads wait on nothing, so they overlap; inside the walk
-    they stalled the row-to-row chain (225 ms against 39). Two limbs per lane, as i2_fold. outhi / outlo: one per lane."""
+    they stalled the row-to-row chain (225 ms against 39). Two limbs per lane, as i2_fold. outhi / outlo: one per lane.
+
+    Lore: 2026-10-21/22, ClickBench Q29's RefererHash."""
     nb = boff.size - 1
     P = outhi.size
     vm = np.uint64((1 << bits) - 1)
@@ -8954,11 +9075,12 @@ def e20_read_sum(buf, base, BR, N, bits, boff, tab, outhi, outlo):
 
 
 # THE FOLD THROUGH THE DICTIONARY'S OWN FRAMES (2026-10-19). An exact SUM over a big integer dictionary
-# used to inflate the whole chunked spine first (WatchID: 100M values, 800 MB written, ~0.5 s) and then
+# used to inflate the whole chunked spine first (100M values, 800 MB written, ~0.5 s) and then
 # fold counts x values in numpy on one thread (0.26 s). Here each thread asks libzstd to inflate one
 # chunk at a time into its own small board (64 KB: stays in cache), turns the chunk's deltas into
 # values and folds them against the census on the spot. No Python runs per chunk and no fresh memory
-# is touched, so the threads scale: WatchID 97 ms, HID 64, UserID 18, URLHash 19 (pod, hot).
+# is touched, so the threads scale.
+# lore: the 100M-value spine was WatchID's; after: WatchID 97 ms, HID 64, UserID 18, URLHash 19 (pod, hot).
 # libzstd is reached through its address, passed in as an argument, so the kernel stays cacheable.
 if HAVE_NUMBA:
     from numba.extending import intrinsic as _intrinsic
@@ -9070,7 +9192,9 @@ if HAVE_NUMBA:
     def i2_inflate(zfn, src, zabs, CH, dctx, out, err):
         """a chunked integer dictionary unzipped into out (len >= frames x CH) in compiled lanes: each lane asks libzstd to
         inflate its frames straight into out (int64 deltas restarting at 0 per frame), then runs the sum in place --
-        RefererHash's 21.6M values in 22 ms, where the one-thread spine took 247. err[t] = 1 as i2_fold."""
+        21.6M values in 22 ms, where the one-thread spine took 247. err[t] = 1 as i2_fold.
+
+        Lore: the 21.6M values were RefererHash's."""
         P = dctx.size
         nch = zabs.size - 1
         base = np.uint64(out.ctypes.data)
@@ -9093,11 +9217,13 @@ if HAVE_NUMBA:
                     out[k0 + i] = v
 
 
-# THE FRAME DECODE IN COMPILED LANES (2026-10-21, the Q25 board's last 2x): an enc-3 / enc-18 full decode ran its
+# THE FRAME DECODE IN COMPILED LANES (2026-10-21): an enc-3 / enc-18 full decode ran its
 # frames through a Python thread pool -- one zstd call, one tobytes copy, one numpy slice per frame under the GIL:
-# UTMSource's 1,527 frames used 1.7 cores (127 ms wall, 219 ms CPU), ClientEventTime's 3.4. Here each lane asks
+# under 2 cores used for a column of ~1.5K frames. Here each lane asks
 # libzstd (through its address, as i2_fold) to inflate its own stretch of frames: enc 3 straight into the output's
 # bytes, enc 18 into the lane's board, unpacked on the spot. No Python runs per frame.
+# lore: the Q25 board's last 2x. UTMSource's 1,527 frames used 1.7 cores (127 ms wall, 219 ms CPU),
+# lore: ClientEventTime's 3.4.
 if HAVE_NUMBA:
     @njit(cache=True, parallel=True)
     def z3_frames(zfn, src, zabs, dctx, dst, rowb, totb, err):
@@ -9122,8 +9248,10 @@ if HAVE_NUMBA:
     @njit(cache=True, parallel=True)
     def z3_low_count(zfn, src, zabs, dctx, scr, isz, rowb, totb, T, cnt, err):
         """enc 3: rows per code for codes 0..T-1, each frame inflated into the lane's board (scr[t], one frame: in
-        cache) and counted there -- no 100M-code array, no fresh pages (LocalEventTime's 400 MB of codes were a
-        third of its Q25 time). isz: bytes per code (1, 2, 4). cnt: (lanes, T)"""
+        cache) and counted there -- no 100M-code array, no fresh pages (400 MB of codes were a
+        third of a low-count query's time). isz: bytes per code (1, 2, 4). cnt: (lanes, T)
+
+        Lore: LocalEventTime's 400 MB of codes were a third of its ClickBench Q25 time."""
         P = dctx.size
         nf = zabs.size - 1
         W = np.uint64(scr.shape[1])
@@ -9265,10 +9393,12 @@ if HAVE_NUMBA:
 
     @njit(cache=True, parallel=True)
     def z18_eq_count(zfn, src, zabs, j0, j1, dctx, scr, bits, BR, N, lo, hi, t, neg, cnt, err):
-        """THE ONE-CODE SCAN IN COMPILED LANES (2026-10-21, Q19's board), enc 18, pass 1: frames j0 .. j1-1 inflate in
+        """THE ONE-CODE SCAN IN COMPILED LANES, enc 18, pass 1: frames j0 .. j1-1 inflate in
         the lane's board (as z18_frames) and their rows in [lo, hi) are tested against the one code `t` (differ,
         `neg`) as they unpack -- counted per frame, nothing written. The scan it replaces inflated every frame through
-        Python's zstandard on a thread pool (ClientEventTime = k: 0.14 s for one row, DuckDB 0.041 s)."""
+        Python's zstandard on a thread pool.
+
+        Lore: 2026-10-21, ClickBench Q19's board: ClientEventTime = k: 0.14 s for one row, DuckDB 0.041 s."""
         P = dctx.size
         nf = j1 - j0
         W = np.uint64(scr.shape[1] * 8)
@@ -9353,9 +9483,10 @@ if HAVE_NUMBA:
 
 # THE FLAG SCAN OVER DECODED CODES (2026-10-19, the LIKE board): the rows whose code's flag is set, in row order.
 # _scan_flag's fallback for encodings with no fused scanner (enc 10 / 9 / 2 ...) built arange(N) for the
-# range read, gathered, and indexed the flag on one thread: UTMContent LIKE '%x%' 250 ms flat, whatever the
+# range read, gathered, and indexed the flag on one thread: a LIKE '%x%' on a text column 250 ms flat, whatever the
 # needle, where the codes decode in 7-12 ms. Two parallel passes: count per lane, then each lane writes its own
 # stretch of the output.
+# lore: the 250 ms LIKE was on UTMContent.
 @njit(cache=True, parallel=True, nogil=True)
 def flag_count_lanes(cc, flag, cnts):
     """cnts[t] = rows in lane t (of cnts.size equal stretches of cc) whose code has flag set"""
@@ -9401,9 +9532,10 @@ def flag_positions(cc, flag, base=0):
 
 
 # THE DENSE FACTORIZATION (2026-10-19, the LIKE board): a dictionary code IS a dense group id. wherescan's
-# GROUP BY sorted the survivors' key codes when their range passed 1M (np.unique: SearchPhrase's 6M codes
-# under Q21 with a one-letter needle, 60M rows, 1.4 s of argsort on one thread). The parallel census counts
+# GROUP BY sorted the survivors' key codes when their range passed 1M (np.unique: a 6M-code key under a
+# one-letter needle, 60M rows, 1.4 s of argsort on one thread). The parallel census counts
 # the codes (bincount_par), the codes present are ranked, and each row's group is the rank of its code.
+# lore: SearchPhrase's 6M codes under ClickBench Q21.
 @njit(cache=True, parallel=True, nogil=True)
 def rank_gather(a, lo, rank, inv):
     """inv[i] = rank[a[i] - lo], in parallel"""
@@ -9427,11 +9559,12 @@ def dense_factorize(a, lo, span):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# THE RUN ORDER (2026-10-22, Q7's WatchID): an answer ordered by count descending, then code ascending, is one run per
+# THE RUN ORDER (2026-10-22): an answer ordered by count descending, then code ascending, is one run per
 # count value, each run "the squares with that count, left to right". The biggest run is left unwritten -- the census
-# board read left to right is already its order -- and only the squares outside it are sorted. WatchID: 99,997,493
-# groups, the biggest count 2; count_desc_order over every square took 0.65-0.91 s on one thread, the gathers of the
-# values and counts in that order 0.3-0.9 s more, for a caller that fetches 10,001 rows.
+# board read left to right is already its order -- and only the squares outside it are sorted. A near-unique key:
+# ~100M groups, the biggest count 2; count_desc_order over every square took 0.65-0.91 s on one thread, the gathers of
+# the values and counts in that order 0.3-0.9 s more, for a caller that fetches 10,001 rows.
+# lore: Q7's WatchID, 99,997,493 groups.
 
 @njit(cache=True, parallel=True, nogil=True)
 def _count_hist_nb(cn, CAP, T):
@@ -9534,7 +9667,9 @@ def _copy_live_nb(src, out, T):
 
 def copy_live(src, out):
     """out[:] = src[:out.size] in parallel, returning how many are above zero -- the census board's copy and its
-    live count in one pass (WatchID: np's one-thread copy 88 ms, then cn > 0 and count_nonzero 37 ms)"""
+    live count in one pass (a near-unique key: np's one-thread copy 88 ms, then cn > 0 and count_nonzero 37 ms)
+
+    Lore: the near-unique key was WatchID."""
     return _copy_live_nb(src, out, _nt())
 
 
@@ -9760,9 +9895,10 @@ def pf_ht_compact(oK, oV, offs, nout, foffs, fK, fV):
 
 
 # THE CENSUS AND THE FOLD IN ONE PASS (2026-10-30, Jackson OK'd). SUM/AVG of a shelved enc-19 column built the whole
-# census (17.6M int64s for UserID: 141 MB written, 7 ms of it first-touch faults) only for i2_fold to read it back.
+# census (8 bytes a code, every page first-touched) only for i2_fold to read it back.
 # Each shelf already owns a range of W codes: it now adds its counts into a small board of its own (cache-sized),
 # inflates just the dictionary frames that hold its codes, and folds count x value on the spot.
+# lore: the census was 17.6M int64s for UserID: 141 MB written, 7 ms of it first-touch faults.
 if HAVE_NUMBA:
     @njit(cache=True, parallel=True)
     def e19s_census_fold(dw, W, wb, gw, pre, soff, SW, eoff, cnt, zfn, src, zabs, CH, nd, dctx, scr, loc,

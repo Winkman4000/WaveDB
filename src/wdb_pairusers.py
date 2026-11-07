@@ -1,4 +1,5 @@
-"""wdb_pairusers -- THE PAIR USERS read (2026-10-25): Q11's shape (before pairdistinct, which takes what it declines).
+"""wdb_pairusers -- THE PAIR USERS read (2026-10-25): top pairs by distinct users (before pairdistinct, which takes
+what it declines).
 
     SELECT a, b, COUNT(DISTINCT u) AS n FROM t [WHERE a|b <> literal] GROUP BY a, b ORDER BY n DESC LIMIT k
 
@@ -18,8 +19,8 @@ Jackson's instant cases (the counts stop it early; a near-unique column is solve
   rows of a value left outside. THE SPARSE STEP: when the box the k-th best would need (values of a with more
   kept rows than it, times values of b with more) is past SPARSE_LINE, rows for every occurring pair instead --
   hashed into 2^12 parts, each counted in its own table, the pairs with more rows than the box's k-th kept -- and
-  the dense walk over them (users <= rows). LocalEventTime x WindowClientHeight needed a box of 2.2 billion
-  pairs; 1,926 pairs have more rows than its 10th best.
+  the dense walk over them (users <= rows). A pair of two wide keys can need a box of billions of pairs while
+  only a few thousand pairs have more rows than its k-th best.
 
   THE SPARSE USERS STEP (2026-10-26) -- users << rows (time x time: one user fires several events a second; the
   top 10 hold 3 users, pairs of 50 rows hold 1): rows per pair cannot narrow the field and the 64-pair rounds never
@@ -31,7 +32,7 @@ Jackson's instant cases (the counts stop it early; a near-unique column is solve
   THE SELF CASE -- u is one of the keys. A group fixes its user: every group holds exactly 1 distinct user, so
   any k groups that pass the filter are a legal top k (all tie at 1). Read the first rows until k groups.
 
-  THE NEAR-UNIQUE CASE -- a key K whose N - V is tiny (WatchID: 99,997,497 rows, 99,997,493 values, 4 extra).
+  THE NEAR-UNIQUE CASE -- a key K whose N - V is tiny (an id column with a handful of repeated values).
   users(x, y) <= rows(x, y) <= rows(x): only a value held by 2+ rows can make a group of 2+ users, and every other
   group is one row = one user. A mode-2 dictionary is exactly the column's values, so every code 0..V-1 holds a
   row: count rows per band of 2^12 codes and extra(band) = rows(band) - codes(band) is that band's repeated rows
@@ -41,6 +42,9 @@ Jackson's instant cases (the counts stop it early; a near-unique column is solve
 
 A filter `key <> literal` names a group key, so it removes whole groups (that key's value) and leaves every other
 group's count alone (group_distinct's rule). Lever: WDB_PAIRUSERS=0.
+
+Lore: built for ClickBench Q11's shape. LocalEventTime x WindowClientHeight needed a box of 2.2 billion pairs; 1,926
+pairs have more rows than its 10th best. The near-unique key was WatchID: 99,997,497 rows, 99,997,493 values, 4 extra.
 """
 import os
 import numpy as np
@@ -51,27 +55,34 @@ import wdb_policies as P
 import wdb_groupdistinct as GD
 
 ON = [os.environ.get('WDB_PAIRUSERS', '1') != '0']
-BAND_SHIFT = 12            # bands of 2^12 codes: measured 40.7 ms on WatchID (2^16: 54.5, 2^10: 56.7, 2^8: 60.2)
-NEAR_SHIFT = 10            # near unique: N - V <= N / 2^10 (PROVISIONAL: on this data only WatchID qualifies, extra 4;
+# lore: measured 40.7 ms on WatchID (2^16: 54.5, 2^10: 56.7, 2^8: 60.2)
+BAND_SHIFT = 12            # bands of 2^12 codes: the fastest band width measured on a near-unique column
+# lore: on ClickBench only WatchID qualifies, extra 4
+NEAR_SHIFT = 10            # near unique: N - V <= N / 2^10 (PROVISIONAL: on this data only one column qualifies;
                            # the line is to be measured against the hashed counts path once that exists)
 FIRST_ROWS = 4096          # the first read for one-row / self groups; x8 until k groups
 CENSUS_V = 1 << 20         # the filter column's census (rows per value) is read when its V is at most this
+# lore: the two partner keys of the measured pairs were Age / Title
 KEPT_LINE = 1 << 20        # THE KEPT CASE when the filter keeps at most this many rows. Measured, the exact count over
-                           # the kept rows vs DuckDB: 177,085 kept 0.32x (x Age) / 0.40x (x Title); 333,781 0.60 /
+                           # the kept rows vs DuckDB, two partner keys: 177,085 kept 0.32x / 0.40x; 333,781 0.60 /
                            # 0.29; 460,217 0.91 / 1.07; 630,500 0.92 / 0.42; 1,561,991 5.1 / 1.29; 5,563,212 3.9 /
                            # 1.93 -- the line sits between 630,500 and 1,561,991 (nothing measured in between)
 _HITS = [0, 0, 0, 0, 0, 0, 0]  # telemetry: self, near-unique, kept, dense, wide box, wide sparse, sparse users
 USERS_ROW_NS = 12.0        # THE SPARSE USERS pass per kept row (measured 7.4-17 ns on 7 pairs, 6.7M-96.5M rows)
 HUNT_ROW_NS = 0.8          # a 64-pair round per row of the table (measured 0.25 sparse, 0.47 dense, 0.8-1.45 box)
 USERS_AFTER = 2            # rounds walked before the line is read (the first round's k-th is often far below)
-COMPACT_SHIFT = 6          # THE KEPT ROWS FIRST, any pair: the filter keeps at most N >> this. Measured on the 136
-                           # slow / sampled Q11 pairs: UTMSource <> '' (1,561,991 kept) wins dense and wide (JavaEnable
-                           # x UTMSource 146 -> 81 ms, IPNetworkID x UTMSource 345 -> 282); 5.6M-33M kept loses on
-                           # dense pairs (OpenerName x MobilePhone 131 -> 222, EventTime x JavaEnable 319 -> 1035:
-                           # gathering EventTime at 33M positions)
+# lore: measured on the 136 slow / sampled ClickBench Q11 pairs: UTMSource <> '' (1,561,991 kept) wins dense and
+# lore: wide (JavaEnable x UTMSource 146 -> 81 ms, IPNetworkID x UTMSource 345 -> 282); 5.6M-33M kept loses on dense
+# lore: pairs (OpenerName x MobilePhone 131 -> 222, EventTime x JavaEnable 319 -> 1035: gathering EventTime at 33M
+# lore: positions)
+COMPACT_SHIFT = 6          # THE KEPT ROWS FIRST, any pair: the filter keeps at most N >> this. Measured: a filter
+                           # keeping ~1.6% of the rows wins dense and wide; 5.6%-33% kept loses on dense pairs
+                           # (gathering a wide column at the kept positions)
+# lore: RefererHash pairs 6.7M-33M kept 0.86 -> 0.34 s, 1.31 -> 0.83; but IPNetworkID x ResponseEndTiming
+# lore: (V 89,907, 25.4M kept) 365 -> 453 ms
 COMPACT_WIDE_SHIFT = 1     # a wide pair up to N >> this when its widest key's census boards (V x threads) outweigh a
-                           # pass over the rows: RefererHash pairs 6.7M-33M kept 0.86 -> 0.34 s, 1.31 -> 0.83; but
-                           # IPNetworkID x ResponseEndTiming (V 89,907, 25.4M kept) 365 -> 453 ms
+                           # pass over the rows: pairs of a key with millions of values win; a key of ~90K values
+                           # lost
 
 
 def _codes3(seg, spec, xcol, xcode, kc):
@@ -94,8 +105,10 @@ def _codes3(seg, spec, xcol, xcode, kc):
 def _top_values(cen, L):
     """THE TOP VALUES BY A COUNT THRESHOLD: the at most L values with the most kept rows, biggest first (ties by
     code, as the full stable sort), and their counts. The counts of counts give the smallest count c with at most L
-    values at c or above; only those values are sorted (RefererHash, 21.6M values: 83-107 ms vs 228-636 for the
-    full sort), and the most kept rows of a value left out"""
+    values at c or above; only those values are sorted (a few times faster than the full sort on a key with
+    millions of values), and the most kept rows of a value left out
+
+    Lore: RefererHash, 21.6M values: 83-107 ms vs 228-636 for the full sort."""
     cap = 1 << 16
     cc = np.bincount(np.minimum(cen, cap))
     above = np.cumsum(cc[::-1])[::-1]           # values with count >= c
@@ -115,8 +128,8 @@ def _rounds_budget(kept, N):
     """THE USERS LINE: the rounds one users pass costs -- kept x USERS_ROW_NS / (N x HUNT_ROW_NS), at least 1"""
     return max(1, int(-(-(kept * USERS_ROW_NS) // (N * HUNT_ROW_NS))))
 WIDE_ON = [os.environ.get('WDB_PAIRUSERS_WIDE', '1') != '0']
-WIDE_BOX = (1 << 20, 1 << 22, 1 << 24)   # the box's pair space, growing. Measured on 26 wide Q11 holes: 21 stopped
-                                         # in 2^20, 1 in 2^22 (Referer x ClientEventTime)
+# lore: measured on 26 wide ClickBench Q11 holes: 21 stopped in 2^20, 1 in 2^22 (Referer x ClientEventTime)
+WIDE_BOX = (1 << 20, 1 << 22, 1 << 24)   # the box's pair space, growing; most wide pairs stop in the first box
 SPARSE_LINE = 1 << 24     # THE SPARSE STEP when the box the k-th best needs is past this (or the last box fails)
 SPARSE_PARTS = 12         # 2^12 hash parts: a part's table stays small
 
@@ -224,12 +237,14 @@ def _row_batches(seg, xcol, xcode):
     """THE FILTER FIRST (Jackson's ordering): batches of candidate rows, ascending. The first FIRST_ROWS rows
     as they are (the caller drops the filter's value); past them, with a filter, ONLY the rows that pass it --
     wherescan's <> scan, frame by frame -- because a filter that removes a tiny column's common value
-    (IsOldCounter <> 0) leaves rows the first reads would wade through: growing range reads cost 0.3-0.4 s
-    there, DuckDB 0.04. Without a filter, growing ranges."""
+    leaves rows the first reads would wade through. Without a filter, growing ranges.
+
+    Lore: IsOldCounter <> 0: growing range reads cost 0.3-0.4 s there, DuckDB 0.04."""
     import wdb_wherescan as WS
     N = int(seg.N)
-    lo, n9 = 0, 64                               # 64 rows usually hold k groups: codes_at on 4,096 rows cost
-    while lo < min(N, FIRST_ROWS):               # 107 ms on MobilePhoneModel (64 rows: ~1 ms)
+    # lore: codes_at on 4,096 rows cost 107 ms on MobilePhoneModel (64 rows: ~1 ms)
+    lo, n9 = 0, 64                               # 64 rows usually hold k groups: codes_at on 4,096 rows can cost
+    while lo < min(N, FIRST_ROWS):               # ~100x what 64 rows cost on a wide sparse text column
         hi = min(N, FIRST_ROWS, lo + n9)
         yield np.arange(lo, hi, dtype=np.int64)
         lo = hi; n9 *= 8
@@ -340,9 +355,11 @@ def _one_row_groups(seg, ck, repc, K, O, a, need, xcol, xcode):
 
 def _kept_count(seg, xcol, xcode):
     """rows the filter keeps. THE CHEAP KEPT COUNT (2026-10-25): a sparse column (enc 8 / 9) excluding its
-    default value keeps exactly its stored non-default rows (e8n / e9n: MobilePhoneModel <> '' keeps 5,563,212 --
-    its census cost 21 ms a query, 209 the first); excluding any other of its values, None (not worth the census).
-    Otherwise the census (enc 2 / 10: under 1 ms; enc 3: 10-15), None past CENSUS_V."""
+    default value keeps exactly its stored non-default rows (e8n / e9n, no census read); excluding any other of its
+    values, None (not worth the census).
+    Otherwise the census (enc 2 / 10: under 1 ms; enc 3: 10-15), None past CENSUS_V.
+
+    Lore: MobilePhoneModel <> '' keeps 5,563,212 -- its census cost 21 ms a query, 209 the first."""
     c = seg.cols[xcol]
     if xcode is None:
         return int(seg.N)
@@ -362,7 +379,9 @@ def _kept_count(seg, xcol, xcode):
 def _kept(seg, spec, xcol, xcode):
     """THE KEPT CASE (the filter first, Jackson's ordering): the filter keeps few rows, so the whole query is those
     rows -- every pair's distinct users counted exactly over them. The pairs are numbered densely first, so (pair,
-    user) is one int64 whatever the keys' widths (a row-wise unique of (a, b, u) cost 0.24-0.42 s with Title)."""
+    user) is one int64 whatever the keys' widths (a row-wise unique of (a, b, u) is the slower road).
+
+    Lore: the row-wise unique of (a, b, u) cost 0.24-0.42 s with Title."""
     import wdb_wherescan as WS
     a, b, u, k = spec['a'], spec['b'], spec['u'], spec['k']
     pos = np.asarray(WS._scan_eq(seg, xcol, int(xcode), 0, int(seg.N), negate=True), np.int64)
@@ -427,15 +446,18 @@ def _stop_early(ka, kb, ku, Va, Vb, Vu, k):
     return out
 
 
-DENSE_CASE = 1 << 24       # THE DENSE CASE: a pair space Va x Vb up to this. Measured on 14 Q11 holes, 2 to 16,104,704
+# lore: the 14 pairs were ClickBench Q11 holes
+DENSE_CASE = 1 << 24       # THE DENSE CASE: a pair space Va x Vb up to this. Measured on 14 pairs, 2 to 16,104,704
                            # pairs: every answer DuckDB's, 0.18-1.69x DuckDB (the largest: T count tables of K int32)
 _DENSE_PAIRS_ROUND = 64    # candidates a round: one bit each in a u64 per user
 
 
 def _defer_narrow(seg, spec, xcol, xcode):
     """pairdistinct's narrow read -- a sparse filter column excluding its default, so only the kept rows are read --
-    beats the dense case's three whole decodes: Q11 itself 55 ms vs 136, JavaEnable x MobilePhoneModel 59 vs 121.
-    (A dense filter column goes the other way: UTMSource-filtered pairs 122-184 ms dense vs 184-274.)"""
+    beats the dense case's three whole decodes. (A dense filter column goes the other way.)
+
+    Lore: ClickBench Q11 itself 55 ms vs 136, JavaEnable x MobilePhoneModel 59 vs 121; UTMSource-filtered pairs
+    122-184 ms dense vs 184-274."""
     if not spec.get('defer') or xcode is None:
         return False
     c = seg.cols[xcol]
@@ -649,8 +671,9 @@ def _sparse(ca, cb, cu, which, xc, Va, Vb, F, k, SH, NL, T, kept):
 def execute(seg, spec):
     a, b, k = spec['a'], spec['b'], spec['k']
     xcol, xcode = _excl_code(seg, spec)
-    # the self case reads the filter's passing rows itself (_row_batches) and needs no census: MobilePhoneModel's
-    # cost 40 ms a query where the self answer takes 1.3
+    # the self case reads the filter's passing rows itself (_row_batches) and needs no census, which can cost
+    # far more than the self answer
+    # lore: MobilePhoneModel's census cost 40 ms a query where the self answer takes 1.3
     kc = (_kept_count(seg, xcol, xcode) if (xcol is not None and xcode is not None and spec['case'][0] != 'self')
           else None)
     if xcol is not None and xcode is not None and int(seg.cols[xcol]['V']) == 1:

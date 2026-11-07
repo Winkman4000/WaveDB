@@ -1,13 +1,15 @@
-"""wdb_mixtop -- Q9's shelf-fed mixed board (Jackson's design).
+"""wdb_mixtop -- a shelf-fed mixed board: top-n groups by count with SUM/AVG/COUNT DISTINCT beside it.
 
 SELECT k, SUM(a), COUNT(*) c, AVG(b), COUNT(DISTINCT t) FROM hits
 GROUP BY k ORDER BY c DESC LIMIT n
 
-Nothing decodes until the pluck: region codes bincount for c (top-n falls
+Nothing decodes until the pluck: key codes bincount for c (top-n falls
 out), SUM/AVG ride 2D code-space bincounts against V-sized dictionaries,
 and COUNT(DISTINCT t) is LOOKED UP off the gdc shelf the realm already
 birthed -- the 2-second walk dies without successor. Only the n winning
 key values are ever fetched.
+
+Lore: built for ClickBench Q9 (Jackson's design), where the key is RegionID ("region codes").
 """
 import numpy as np
 from sqlglot import expressions as E

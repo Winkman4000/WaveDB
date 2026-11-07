@@ -31,8 +31,9 @@ _HITS = 0
 _NT = 16
 _NSHARD = 64
 _TSIZE = 1 << 18
+# lore: Q32 is the case.
 _SORT_MIN = 30_000_000   # above this many survivors the sparse hash oversubscribes (near-unique keys);
-                         # switch to sort + adjacent-run scan, which never melts. Q32 is the case.
+                         # switch to sort + adjacent-run scan, which never melts.
 
 
 def enable():
@@ -250,7 +251,8 @@ def _build_mask(seg, pcol, op, lit):
     literal falls back to the full sorted-dict searchsorted."""
     dt = seg.cols[pcol].get('dt')
     if dt == 3:                                  # a time/date literal: the stored units' code (wherescan's lookup);
-        import wdb_wherescan as WS               # text never reaches the int dict (2026-10-17, EventTime <> '...')
+        # lore: 2026-10-17, EventTime <> '...'
+        import wdb_wherescan as WS               # text never reaches the int dict
         code = WS._code_of(seg, pcol, lit)
         code = -1 if code is None else int(code)
         codes = seg._raw_codes(pcol)

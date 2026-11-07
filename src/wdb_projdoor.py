@@ -1,20 +1,23 @@
-"""THE PROJECTION DOOR (2026-11-03, TPC-H Q2; steps confirmed with Jackson).
+"""THE PROJECTION DOOR: a pointer-chain join that only projects, ordered and limited, answered at the survivors.
 
 A pointer-chain join with no GROUP BY and no aggregate -- every selected and ordered column a plain column of a joined
-table -- was handed to the pandas tail (Q2's outer: 1.64 s against DuckDB's 22 ms). Here:
+table -- was handed to the pandas tail. Here:
   1. recognise the shape (inner joins of plain tables, bare column names unique across them);
   2. the survivors once: the same cascade the aggregate path runs, through the pointers, potency order
      (wdb_join.join_rows) -- only when it spends the whole WHERE;
-  3. THE PER-KEY EXTREME (Q2's  x = (SELECT MIN|MAX(x) FROM <some of the same tables> WHERE k = outer key AND <the
+  3. THE PER-KEY EXTREME (x = (SELECT MIN|MAX(x) FROM <some of the same tables> WHERE k = outer key AND <the
      outer's own conditions on those tables>)): the outer key is unique in its table and every other outer condition
      on the tables outside the subquery reads only those tables, so the subquery's rows for a key ARE the outer's
      survivors with that key; the zoom over the key's runs takes each run's extreme, the rows equal to it stay;
   4. ORDER BY on the kept rows (columns read at those rows only, parents through their pointers; a stable sort);
   5. LIMIT; 6. the selected columns decoded at the winners only.
-c128 (TPC-H Q20): a conjunct 'col [NOT] IN (uncorrelated subquery)' becomes the column's code set before the survivors
+c128: a conjunct 'col [NOT] IN (uncorrelated subquery)' becomes the column's code set before the survivors
 (wdb_insub.serve_conj), and a comparison against a correlated scalar subquery is judged at the survivors (THE VALUE PER
 ROW, wdb_corrrow, step 2c); a single table comes to the door only with such a comparison (single=True, wdb_db).
-Anything else declines to the roads behind it."""
+Anything else declines to the roads behind it.
+
+Lore: 2026-11-03, built for TPC-H Q2 (steps confirmed with Jackson): Q2's outer query took 1.64 s in the pandas tail
+against DuckDB's 22 ms, and step 3 is Q2's correlated-subquery shape. c128 came with TPC-H Q20."""
 import os
 import numpy as np
 import sqlglot.expressions as E
@@ -233,7 +236,8 @@ def try_door(db, tree, single=False, values=False):
     spec = None
     rowval, insub = {}, set()               # conjunct index -> THE VALUE PER ROW's spec; IN conjuncts served as codes
     if any(c.find(E.Subquery) is not None or c.find(E.Exists) is not None for c in conjs):
-        spec = _per_key_spec(db, tree, conjs, own, otabs)      # THE PER-KEY EXTREME first (Q2)
+        # lore: the per-key extreme is TPC-H Q2's shape
+        spec = _per_key_spec(db, tree, conjs, own, otabs)      # THE PER-KEY EXTREME first
     if spec is None and any(c.find(E.Subquery) is not None or c.find(E.Exists) is not None for c in conjs):
         for i, c in enumerate(conjs):
             if c.find(E.Subquery) is None and c.find(E.Exists) is None:

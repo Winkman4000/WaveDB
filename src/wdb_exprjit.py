@@ -2,10 +2,10 @@
 """
 wdb_exprjit -- runtime code generation of fused decode+arithmetic aggregation kernels.
 
-An arithmetic aggregate like SUM(l_extendedprice * (1 - l_discount)) was previously evaluated by
+An arithmetic aggregate like SUM(a * (1 - b)) was previously evaluated by
 MATERIALISING the whole expression into a 6M-row float64 array (decode every column, run each arithmetic
 op full-width, hand the finished array to the group kernel). Shannon says that array is almost all
-redundant memory traffic: the discount column is 3.46 bits of real information smeared across 64-bit
+redundant memory traffic: a low-cardinality column is a few bits of real information smeared across 64-bit
 slots, and the product adds no information beyond the two codes we already hold.
 
 So instead we never build it. Given an expression as a numba-source body over slot variables v0,v1,...
@@ -15,6 +15,8 @@ into the grouped accumulator -- a single pass, no intermediate array. The kernel
 distinct (body, #slots, gathered?, masked?, minmax?) shape and cached in-process; reuse is free.
 
 This mirrors the hand-written decode-fused kernels in wdb_agg, generalised to arbitrary +,-,*,/ trees.
+
+Lore: the example was TPC-H's SUM(l_extendedprice * (1 - l_discount)); the discount column is 3.46 bits.
 """
 import os, re
 import numpy as np
@@ -281,8 +283,9 @@ def grouped_multi(group_keys, inputs, exprs, mask, n, pred=None, mono=False):
             and not pred):
         # THE ISOLATED PERSPECTIVE: COUNT(*) per one direct key is a single operation --
         # nothing to fuse. The generated kernel compiled it in every fresh process (737 ms
-        # measured on Q07); the census kernel is compiled once and cached on disk. [:K] keeps
+        # measured); the census kernel is compiled once and cached on disk. [:K] keeps
         # the generated kernel's contract: codes past K (a trailing null slot) never counted.
+        # lore: the 737 ms was measured on Q07.
         import wdb_kernels
         codes = np.asarray(group_keys[0][0])[:n]
         if n >= (1 << 22):

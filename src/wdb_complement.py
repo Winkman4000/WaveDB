@@ -1,4 +1,4 @@
-"""wdb_complement: THE COMPLEMENT COUNT (2026-10-24, Q1; Jackson's exceptions idea at its simplest).
+"""wdb_complement: THE COMPLEMENT COUNT -- COUNT(*) under one = / <> literal, from a census or one equality scan.
 
     COUNT(*) WHERE k <> v  =  N  -  (rows where k = v)  -  (rows where k IS NULL)       (NULL <> v is not TRUE)
     COUNT(*) WHERE k = v   =  (rows where k = v)
@@ -8,11 +8,13 @@ The rows where k = v come from whichever side is cheap, by a number the column c
              whatever v's share, a staircase's from the gaps between its steps;
   past it:   the equality scan of v (wherescan's per-encoding scanners) -- the census board itself grows
              (0.12-0.25 s) while a large dictionary's literal is usually rare.
-Measured on the Q1 board's failing variants (q1proto.py, hot, every count DuckDB's, both ways): Robotness today
-0.525 s (wherescan listed the ~33M survivors to count them) -> census 0.016; ResponseEndTiming 0.479 -> 0.021;
-UTMSource 0.244 -> 0.016; LocalEventTime (1.43M values) 0.621 -> scan 0.068; ClientEventTime 0.832 -> 0.053;
-RefererHash 0.355 (fused_agg) -> 0.172; WatchID 0.460 (fused_agg) -> 0.037.
-One = / <> conjunct on a dictionary column; COUNT(*) projections only. WDB_COMPLEMENT=0 off."""
+One = / <> conjunct on a dictionary column; COUNT(*) projections only. WDB_COMPLEMENT=0 off.
+
+Lore: 2026-10-24, built for ClickBench Q1 (Jackson's exceptions idea at its simplest). Measured on the Q1 board's
+failing variants (q1proto.py, hot, every count DuckDB's, both ways): Robotness today 0.525 s (wherescan listed the
+~33M survivors to count them) -> census 0.016; ResponseEndTiming 0.479 -> 0.021; UTMSource 0.244 -> 0.016;
+LocalEventTime (1.43M values) 0.621 -> scan 0.068; ClientEventTime 0.832 -> 0.053; RefererHash 0.355 (fused_agg)
+-> 0.172; WatchID 0.460 (fused_agg) -> 0.037."""
 import os
 import numpy as np
 import sqlglot.expressions as E
@@ -68,8 +70,10 @@ def execute(seg, spec):
     if code is not None and nullc is not None and int(code) == nullc:
         return None                                  # the literal decoded to the NULL code: not this read's to judge
     if V <= _CENSUS_V or seg.stairs(col) is not None:
-        # a staircase's census comes from the gaps between its steps, whatever V (EventTime, 1.43M values: the
-        # equality scan decoded the column, 1.6 s against fused_agg's 0.063 -- the Q1 board, 2026-10-24)
+        # a staircase's census comes from the gaps between its steps, whatever V (the equality scan would decode
+        # the column)
+        # lore: EventTime, 1.43M values: the equality scan took 1.6 s against fused_agg's 0.063 -- the Q1 board,
+        # 2026-10-24
         cen = np.asarray(seg.raw_census(col, V))
         eq = int(cen[code]) if code is not None else 0
         nn = int(cen[nullc]) if nullc is not None else 0

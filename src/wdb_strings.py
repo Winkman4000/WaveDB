@@ -158,9 +158,10 @@ def identify_contains_at(seg, col, u, n1, n2=b''):
 
 # THE POTENCY OF A SUBSET (Jackson's law: a filter earns its place only while the work it saves
 # exceeds its own cost). Deciding the whole dictionary inflates every chunk and decides every entry
-# -- the two halves measured about equal (URL 292 / 323 ms). Deciding only codes u inflates the
+# -- the two halves measured about equal (292 / 323 ms on a large text column). Deciding only codes u inflates the
 # chunks holding u and walks, in each restart group holding u, from its restart to its last needed
 # entry. Bill in units of "one whole pass = 2.0"; the subset road is taken below AT_COST_SHARE of it.
+# lore: the 292 / 323 ms halves were measured on ClickBench's URL.
 AT_COST_SHARE = 0.8
 AT_FORCE = [None]                     # tests: 'survivors' | 'whole' pins the road
 

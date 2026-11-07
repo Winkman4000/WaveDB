@@ -1,4 +1,4 @@
-"""THE BOUND HUNT (2026-10-13, the Q18 board; Jackson's double bound from tripletop, made general).
+"""THE BOUND HUNT: top-k groups by COUNT, pruned by per-value row-count bounds (Jackson's double bound).
 
 A group's COUNT can never exceed the row count of any one of its key values: count(a, m, b) <= min(rows with
 a, rows with m, rows with b). Every one of those per-value counts is one census away. So for
@@ -8,13 +8,16 @@ cannot reach theta. Keep only rows with bound >= theta, group them exactly, and 
   c_k >= theta  -> exact: every dropped group counts < theta <= c_k, so none of them is in the top k, nor
                    ties with it (ties at c_k are all kept, for the later ORDER BY terms to decide);
   c_k <  theta  -> run once more at theta = c_k (that keeps every group that can reach c_k: exact).
-Any number of keys, any profiles: bare columns by dictionary code, expression keys (minute of EventTime)
+Any number of keys, any profiles: bare columns by dictionary code, expression keys (e.g. the minute of a timestamp)
 through their dictionary map -- the same key list the singleton peel takes. tripletop did this for exactly
 one pair of encodings and the minute; this is the atom.
 
 Declines (None) when the bounds do not prune: theta's survivors past MAX_SHARE of the rows mean grouping is
 real work for the fused kernel. Aggregates beyond COUNT are computed exactly on the kept rows (every kept
-group is whole: its rows share its key values, hence its bound)."""
+group is whole: its rows share its key values, hence its bound).
+
+Lore: 2026-10-13, the Q18 board; Jackson's double bound from tripletop, made general. The expression key
+was the minute of EventTime."""
 import os, time
 import numpy as np
 
@@ -22,9 +25,11 @@ import wdb_peel
 
 MAX_SHARE = 1.0         # decline when the kept rows pass this share of the survivors
 SAMPLE = 1 << 20        # rows in the threshold's sample
+# lore: 2 x 60 minutes x OpenstatAdID's 47K: the bounds cannot prune -- '' holds 99.5% -- and the factorise
+# lore: over every row was 2.2 s against DuckDB's 0.63
 DENSE_MAX = 1 << 24     # a composite space this small is counted in one parallel census of its cells instead
-                        # (2 x 60 minutes x OpenstatAdID's 47K: the bounds cannot prune -- '' holds 99.5% --
-                        # and the factorise over every row was 2.2 s against DuckDB's 0.63)
+                        # (when one value holds nearly every row the bounds cannot prune, and factorising
+                        # every row costs more than the dense census)
 LEAN = 0.7              # theta = this x the sample's estimate of the k-th count (low: one round, nearly always)
 TARGET = 1 << 21        # aim the first threshold at about this many kept rows
 _HITS = 0
@@ -110,8 +115,10 @@ def _kth_largest(cnt, k):
 def _theta_sampled(codes, n, k):
     """THE SAMPLED THRESHOLD: group a strided sample exactly and scale its k-th count up to the whole -- an
     estimate of the true k-th count c_k; theta sits a little under it, so the first round nearly always
-    proves itself (a theta read off the bounds alone overshoots when one heavy value -- Title's '', Referer's
-    '' -- holds a mass of rows at one bound, and pays a second round)"""
+    proves itself (a theta read off the bounds alone overshoots when one heavy value -- a text column's
+    '' -- holds a mass of rows at one bound, and pays a second round)
+
+    Lore: the heavy values were Title's '' and Referer's ''."""
     st = max(1, n // SAMPLE)
     smp = [c[::st] for c in codes]
     _u, gid = _group(smp)
@@ -247,11 +254,13 @@ HEAVY = 0.5             # a key value holding this share of the rows is the key'
 
 
 def _heavy_split(rows, codes, Vs, cnts, keys, plan, order, k, tick):
-    """THE HEAVY SPLIT: when keys have a value holding most rows (OpenstatAdID's '' 99.5%, SocialSourcePage's
+    """THE HEAVY SPLIT: when keys have a value holding most rows (e.g. a sparse text column's
     ''), the rows where every such key sits on its heavy value differ only in the OTHER keys -- their groups
     are cells of those keys' (small) composite, counted densely; the few remaining rows are grouped exactly.
     The two sets of groups are disjoint (a light row leaves at least one heavy value). COUNT-only plans.
-    None when no split pays (the caller hunts as before)."""
+    None when no split pays (the caller hunts as before).
+
+    Lore: the heavy values were OpenstatAdID's '' (99.5%) and SocialSourcePage's ''."""
     import wdb_kernels
     n = codes[0].size
     H = [j for j in range(len(Vs)) if cnts[j].size and int(cnts[j].max()) >= HEAVY * n]
@@ -318,9 +327,12 @@ def _flat(rows, codes, Vs, cnts, keys, plan, order, k, tick):
     groups.
     WHICH KEY LEADS: the composite's top bits are its first key's (and the next's, when the first is narrower
     than 12 bits), so the leading key decides how evenly rows spread over the buckets. Each key is tried in the
-    lead on a strided sample and the evenest wins (WindowClientHeight's commonest value is 1.67M rows; with the
-    minute in the lead it splits across 60 x 64 buckets).
-    COUNT-only plans. None when the keys pass 64 bits (the caller hunts as before)."""
+    lead on a strided sample and the evenest wins (a key whose commonest value holds a mass of rows leads badly;
+    a time key in the lead can split it across many buckets).
+    COUNT-only plans. None when the keys pass 64 bits (the caller hunts as before).
+
+    Lore: WindowClientHeight's commonest value is 1.67M rows; with the minute in the lead it splits across
+    60 x 64 buckets."""
     got = _flat_candidates(codes, Vs, k, tick)
     if got is None:
         return None

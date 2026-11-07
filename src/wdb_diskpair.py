@@ -3,27 +3,32 @@
 THE COUNT LANE RETIRED (2026-10-23, Jackson). This read was built for SELECT k1..kN, COUNT(*) GROUP BY ...
 ORDER BY COUNT(*) DESC LIMIT k, before the census, the heavy split, the flat bucket scan (wdb_bound) and the
 fused counts existed. Measured against the read behind it (fused_agg -> wdb_bound) on every count query it
-claimed, same counts each time: ResponseEndTiming x minute x Robotness 1.362 -> 0.740 s, Referer x minute x
-TraficSourceID 2.230 -> 1.005, ResponseStartTiming x minute x SilverlightVersion1 1.471 -> 0.379, minute x
-Robotness 0.641 -> 0.252, ResponseEndTiming x Robotness x PageCharset 1.155 -> 0.776 (dpvs.py, dpvs2.py). Its
+claimed, same counts each time, the read behind was faster on every one (dpvs.py, dpvs2.py). Its
 one-thread bill (dpprof.py): the frames' decompress 4%, the minute by a binary search per row 22%, the i64 key
 fold 8%, the concatenate 5%, np.unique's sort 61% -- nowhere near the bytes' floor. It now declines every
 aggregate; the count queries go to the general reads.
 
 ONE PLAIN COLUMN RETIRED TOO (2026-10-24, Jackson): DISTINCT over a single dict column is 5-15x faster on the
-general reads on all 38 enc-3 columns measured, bare and LIMIT 10, the same answers (dpvs3.py): CounterID 0.352 ->
-0.041 s, FetchTiming 0.341 -> 0.045, WindowName 0.445 -> 0.078, LocalEventTime 1.247 -> 0.338, Referer 27.4 ->
-11.0, URL 28.0 -> 10.0. A single DERIVED key stays here -- the general path has no dictionary-level DISTINCT for
-it: extract(minute FROM EventTime) 0.374 s here vs 60.6 s; ResponseEndTiming + 1 0.457 vs 61.1 (dpvs4.py).
+general reads on all 38 enc-3 columns measured, bare and LIMIT 10, the same answers (dpvs3.py). A single DERIVED
+key stays here -- the general path has no dictionary-level DISTINCT for it: a minute extracted from a datetime
+column, or a column plus a constant, is over 100x faster here (dpvs4.py).
 
 What stays: bare DISTINCT (no GROUP BY / ORDER BY, LIMIT optional) over 2-4 keys, or over one derived key, which
-still beats the general path (DISTINCT ResponseEndTiming, Robotness 1.145 s vs 2.370; DuckDB 0.314 -- both
-behind, the dense grid's next).
+still beats the general path (DuckDB is faster on the measured two-key DISTINCT -- both behind, the dense grid's
+next).
 The blocked (enc=3) code frames are streamed -- never touching the codes cache -- keys may be blocked dict
-columns, a scalar over one, or ONE derived minute-of(EventTime) key off the stair column's step rows (the
-1.4M-entry code->minute table: row position IS the timestamp). Parallel per-thread block scan -> mixed-radix
+columns, a scalar over one, or ONE derived minute-of(datetime column) key off the stair column's step rows (the
+code->minute table: row position IS the timestamp). Parallel per-thread block scan -> mixed-radix
 i64 key fold (declines if the key space overflows i64) -> per-thread np.unique (a dense mark when the key
 space is small) -> one merge -> decode.
+
+Lore: the retired count lane, ClickBench pairs: ResponseEndTiming x minute x Robotness 1.362 -> 0.740 s, Referer x
+minute x TraficSourceID 2.230 -> 1.005, ResponseStartTiming x minute x SilverlightVersion1 1.471 -> 0.379, minute x
+Robotness 0.641 -> 0.252, ResponseEndTiming x Robotness x PageCharset 1.155 -> 0.776. The plain column: CounterID
+0.352 -> 0.041 s, FetchTiming 0.341 -> 0.045, WindowName 0.445 -> 0.078, LocalEventTime 1.247 -> 0.338, Referer
+27.4 -> 11.0, URL 28.0 -> 10.0. The derived key: extract(minute FROM EventTime) 0.374 s here vs 60.6 s;
+ResponseEndTiming + 1 0.457 vs 61.1. What stays: DISTINCT ResponseEndTiming, Robotness 1.145 s vs 2.370; DuckDB
+0.314. The stair table for EventTime has 1.4M entries.
 """
 import numpy as np
 import zstandard as zstd
@@ -142,9 +147,11 @@ def _block_geometry(seg, keys):
 def answers(seg, spec):
     """whether execute will answer this spec: a block geometry exists and THE GRID LAW holds -- every blocked
     (enc=3) key column shares the segment's block geometry; an encode where candidates won at different frame
-    sizes (EventTime at 524,288 rows, SearchEngineID at 65,536 -- the code-stream level changed which tag won;
-    IsMobile at 524,288 beside RegionID's 65,536) declines by name instead of broadcasting two grids together
-    (g-exyear2, 2026-09-12). wdb_counted asks this before taking diskpair's shapes (2026-10-24)."""
+    sizes (the code-stream level can change which tag wins) declines by name instead of broadcasting two grids
+    together. wdb_counted asks this before taking diskpair's shapes (2026-10-24).
+
+    Lore: g-exyear2, 2026-09-12: EventTime at 524,288 rows, SearchEngineID at 65,536; IsMobile at 524,288 beside
+    RegionID's 65,536."""
     keys = spec['keys']
     NB, BR = _block_geometry(seg, keys)
     if NB == 0:
@@ -224,7 +231,8 @@ def execute(seg, spec):
         ek = np.concatenate(exc) if exc else np.empty(0, np.int64)
         if 0 < KS <= _DENSE_KS and ek.size > KS // 4:
             # THE DENSE COUNT (2026-10-05): a key space this small is marked in place, no sort -- np.unique
-            # sorted each worker's ~6M keys (a third of GROUP BY SUBSTR(URL, 1, 20) once the keys were cheap)
+            # sorted each worker's keys
+            # lore: ~6M keys a worker; the sort was a third of GROUP BY SUBSTR(URL, 1, 20) once the keys were cheap
             acc = np.zeros(KS, np.int64)
             K.count_into(ek, acc)
             return np.flatnonzero(acc)

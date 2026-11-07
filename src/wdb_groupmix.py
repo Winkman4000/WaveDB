@@ -3,16 +3,18 @@ wdb_groupmix -- single-pass GROUP BY with foldable co-aggregates + one COUNT(DIS
 
   SELECT key, <foldable aggs...>, COUNT(DISTINCT target) FROM t GROUP BY key [ORDER BY ...] [LIMIT n]
 
-The ClickBench Q09 shape: one group key carrying SUM / COUNT(*) / AVG alongside a single non-foldable
+One group key carrying SUM / COUNT(*) / AVG alongside a single non-foldable
 COUNT(DISTINCT). The foldables are per-group reductions (np.bincount over the group codes); the distinct
-rides the exact same code-hashing walk as wdb_groupdistinct. One pass over the segment, exact -- flips the
-Q09 class off the >150s scalar fallback.
+rides the exact same code-hashing walk as wdb_groupdistinct. One pass over the segment, exact -- keeps the
+shape off the scalar fallback.
 
 try_groupmix(seg, tree, col_map) -> (rows, colnames) | None (None => caller falls through).
 v1 scope: single segment, no WHERE/HAVING/JOIN; one value-identity group key (not nullable); projection =
 {bare key} + >=1 foldable in {COUNT(*), SUM(numeric), AVG(numeric)} + exactly one COUNT(DISTINCT target)
 (value-identity). SUM/AVG columns must be non-null (so AVG's denominator is COUNT(*)). ORDER BY any projected
 aggregate/key, optional LIMIT. MIN/MAX/COUNT(col) decline (fall through) in v1.
+
+Lore: the ClickBench Q09 shape; this flipped the Q09 class off the >150s scalar fallback.
 """
 import numpy as np
 import wdb_sql
@@ -27,8 +29,10 @@ _SIDECAR_HITS = 0   # telemetry: distinct component served from a materialized g
 
 def _sidecar_counts(db, table, segment_path, kcol, tcol, gmax):
     """Per-group distinct counts from a fully-materialized gd sidecar (indexed by group code), or None.
-    Lets the multi-aggregate path (Q09) skip the distinct walk when the (kcol,tcol) pair is materialized.
-    Declines on a trimmed sidecar -- groupmix has no WHERE, so it needs every group's count."""
+    Lets the multi-aggregate path skip the distinct walk when the (kcol,tcol) pair is materialized.
+    Declines on a trimmed sidecar -- groupmix has no WHERE, so it needs every group's count.
+
+    Lore: the multi-aggregate path is ClickBench Q09's."""
     global _SIDECAR_HITS
     if db is None or table is None or segment_path is None:
         return None
@@ -123,8 +127,9 @@ def execute(seg, det, tree, db=None, table=None, segment_path=None):
     import wdb_window as WN
     kc = seg.cols[kcol]
     if kc.get('mode') in (0, 1, 2) and not kc.get('has_null'):
-        # THE KEY IS ITS CODE (Q09's line items): the group id is the dictionary code as stored --
-        # no value array (a 100M fancy-index), no astype (630 ms of the 1,781). Decoded at emission.
+        # THE KEY IS ITS CODE: the group id is the dictionary code as stored --
+        # no value array (a 100M fancy-index), no astype. Decoded at emission.
+        # lore: Q09's line items; the astype was 630 ms of the 1,781.
         grp = np.ascontiguousarray(np.asarray(seg._raw_codes(kcol)))
         gmax = int(kc['V'])
         import wdb_gbcount as _GB
@@ -202,9 +207,10 @@ def execute(seg, det, tree, db=None, table=None, segment_path=None):
             k = int(tgt.max()) + 1
         if gmax * k >= (1 << 62):                        # pair-id would overflow int64 -> decline
             return None
-        # THE Q13 BOARD'S LANES, shared (2026-10-19, the Q9 board): dense / scatter / keymark / keysort with
-        # the heavy groups counted apart -- the serial code-hashing walk served every key that was not
-        # small x wide (ClientEventTime x RefererHash 21 s; OriginalURL keys past the board's 60 s)
+        # THE SHARED DISTINCT LANES: dense / scatter / keymark / keysort with the heavy groups counted apart --
+        # before them the serial code-hashing walk served every key that was not small x wide
+        # lore: the Q13 board's lanes, shared 2026-10-19 on the Q9 board (ClientEventTime x RefererHash 21 s;
+        # OriginalURL keys past the board's 60 s)
         _lane, runs = gd.lane_runs(grp, tgt, tnull, int(gmax), k)
         if runs is None:
             return None
@@ -255,13 +261,16 @@ def _order_term(o0, proj):
 
 
 def _late_rows(seg, tree, proj, folds, ci, ki, tcol, grp, gmax, count, kdecode):
-    """THE LATE FOLD (2026-10-19, the Q9 board): when the ORDER BY needs only the row counts or the key, the
+    """THE LATE FOLD: when the ORDER BY needs only the row counts or the key, the
     LIMIT's groups are chosen first, and every other aggregate -- the sums, the averages, the distinct
-    count -- is computed only over those groups' rows. Q9 orders by COUNT(*): a 100M-group key (WatchID)
-    folded two sums over 100M groups and walked 100M distinct runs to return 10 rows; a small key reads its
-    ten biggest groups' rows instead of all. One ORDER BY term: exactly `lim` groups by (value, code) --
+    count -- is computed only over those groups' rows. A near-unique key otherwise folds every sum over as
+    many groups as rows and walks as many distinct runs to return `lim` rows; a small key reads its `lim`
+    biggest groups' rows instead of all. One ORDER BY term: exactly `lim` groups by (value, code) --
     at a tie the lowest codes, a legal answer; more terms: the whole plateau tied with the lim-th value.
-    None (the full fold answers) on anything else."""
+    None (the full fold answers) on anything else.
+
+    Lore: 2026-10-19, the Q9 board. Q9 orders by COUNT(*): a 100M-group key (WatchID) folded two sums over
+    100M groups and walked 100M distinct runs to return 10 rows."""
     global LATE_HITS
     import wdb_kernels as _WK
     import wdb_window as WN
@@ -306,9 +315,10 @@ def _late_rows(seg, tree, proj, folds, ci, ki, tcol, grp, gmax, count, kdecode):
         LATE_HITS += 1
         return []
     if int(count[sel].sum()) * LATE_SHARE > N:
-        return None                                      # the chosen groups hold much of the table (Q9's ten
-                                                         # biggest regions): gathering their rows from every
-                                                         # column costs more than the full fold (0.62 -> 1.05 s)
+        # lore: Q9's ten biggest regions hold that much; gathering them measured 0.62 -> 1.05 s
+        return None                                      # the chosen groups hold much of the table: gathering
+                                                         # their rows from every column costs more than the
+                                                         # full fold
     rows, sub = _WK.rows_of_groups(grp, sel, int(gmax))
     small = rows.size * 64 <= N                          # few rows: read the other columns at them only
 
