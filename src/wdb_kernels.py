@@ -9655,8 +9655,10 @@ def _copy_live_nb(src, out, T):
     n = out.shape[0]
     cnt = np.zeros(T, np.int64)
     for t in prange(T):
+        lo = n * t // T                   # named first: inside range() numba's parfor pass on Python 3.12
+        hi = n * (t + 1) // T             # stops with "unexpected cycle in lookup()" (3.11 compiles either)
         k = 0
-        for i in range(n * t // T, n * (t + 1) // T):
+        for i in range(lo, hi):
             v = src[i]
             out[i] = v
             if v > 0:
