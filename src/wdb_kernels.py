@@ -5936,10 +5936,13 @@ def _count_ge(a, bar):
 @njit(cache=True, parallel=True, nogil=True)
 def _count_ge_nb(a, bar, T):
     n = a.size
+    bnd = np.empty(T + 1, np.int64)          # the slice bounds made before the prange: numba's parfor pass raised
+    for t in range(T + 1):                   # "unexpected cycle in lookup()" on 3.14 with them inline in range()
+        bnd[t] = n * t // T                  # and on 3.12 with them named inside the loop; this form builds on all
     part = np.zeros(T, np.int64)
     for t in prange(T):
         c = 0
-        for i in range(n * t // T, n * (t + 1) // T):
+        for i in range(bnd[t], bnd[t + 1]):
             if a[i] >= bar:
                 c += 1
         part[t] = c
