@@ -33,8 +33,10 @@ C++ engine is compiled at install. DuckDB is installed because the loader can fa
 file; no query is ever executed by DuckDB on this setup.
 
 **Start.** The server loads every compiled kernel the engine ships (`src/wdb_preload.py`) and opens the
-database before it answers `./check` -- program code only; nothing from the data, and no result, is cached
-across the restart. Between hot runs the engine keeps decoded source data (dictionaries, codes) in memory, like
+database before it answers `./check`; opening reads the segment headers and the small plain dictionaries
+(about 28 MB from disk on hits, measured after a page-cache drop). Nothing is cached across the restart: after
+the restart and the page-cache drop of a cold run all of it is read from disk again, and no result is kept.
+Between hot runs the engine keeps decoded source data (dictionaries, codes) in memory, like
 a buffer pool; no query result or intermediate result is kept.
 
 **Queries.** `queries.sql` is the standard set, one statement per line in canonical order; `length()` counts
