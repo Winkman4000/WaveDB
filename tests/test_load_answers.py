@@ -89,20 +89,21 @@ def _check(rows, sql, pq, kind):
 
 def test_answers_equal_duck_with_the_switch_on_and_off():
     d, pq = _db()
-    sw = wdb_blockstats._ANSWERS[0]
+    sw = (wdb_blockstats._ANSWERS[0], wdb_blockstats._SUMS[0])
     try:
         seg = Segment(os.path.join(d, 'hits_0.wdb'))
         assert wdb_blockstats._load_npz(seg) is not None, 'the load wrote no statistics'
         assert seg.cols['w'].get('mode') != 4, ('the toy id became a sequence', seg.cols['w'].get('mode'))
         for on in (True, False):
             wdb_blockstats._ANSWERS[0] = on
+            wdb_blockstats._SUMS[0] = on          # the block sums have their own switch (2026-11-08): both off here
             db = Database.open(d)
             for sql, kind in QS:
                 h0 = wdb_blockstats._HITS
                 rows = db.run(sql)[0]
                 _check(rows, sql, pq, kind)
                 if not on and ('SUM(' in sql or 'AVG(' in sql) and 'GROUP' not in sql:
-                    assert wdb_blockstats._HITS == h0, ('block sums answered with LOAD_ANSWERS off', sql)
+                    assert wdb_blockstats._HITS == h0, ('block sums answered with both switches off', sql)
                 if on and sql.startswith('SELECT SUM(x), COUNT(*)'):
                     assert wdb_blockstats._HITS == h0 + 1, 'block sums did not serve with LOAD_ANSWERS on'
             assert wdb_blockstats.rep_from_load(seg, 'w') is None if not on else True
@@ -111,7 +112,7 @@ def test_answers_equal_duck_with_the_switch_on_and_off():
         wdb_blockstats._ANSWERS[0] = True
         assert wdb_blockstats.rep_from_load(seg, 'w') is not None, 'the load found no repeat list'
     finally:
-        wdb_blockstats._ANSWERS[0] = sw
+        wdb_blockstats._ANSWERS[0], wdb_blockstats._SUMS[0] = sw
         shutil.rmtree(d, ignore_errors=True); os.remove(pq)
 
 

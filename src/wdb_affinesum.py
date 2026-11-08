@@ -3,9 +3,10 @@
 SELECT SUM(col + k0), SUM(col + k1), ... FROM t   (no WHERE, no GROUP)
 
 SUM(col + k) = S + k*N: every projection is an affine fact of two numbers.
-S comes from the census (V-sized dot product, gbc-shelf material), N from
-the segment. Nine billion additions become ninety multiply-adds; no row
-is ever walked, nothing decodes beyond a V-sized dictionary.
+S comes from the load's exact block sums (wdb_blockstats), else from the
+census (V-sized dot product, gbc-shelf material), N from the segment.
+Nine billion additions become ninety multiply-adds; no row is ever walked,
+nothing decodes beyond a V-sized dictionary.
 
 Lore: built for ClickBench Q29 (ninety such sums); "the ninety-sums comedy".
 """
@@ -64,6 +65,16 @@ def detect(seg, tree, col_map):
 def execute(seg, spec):
     global _HITS
     col = spec['col']
+    import wdb_blockstats as _BS
+    if _BS._SUMS[0]:
+        # THE BLOCK SUMS FIRST (2026-11-08): S is the load's exact block sums added, N the rows (detect admits
+        # no NULLs) -- a few thousand numbers, no census
+        st = _BS.build(seg, col)
+        S = _BS.exact_sum(st)
+        if S is not None and int(st['nn'].sum()) == int(seg.N):
+            N = int(seg.N)
+            _HITS += 1
+            return [tuple(S + k * N for k in spec['shifts'])], [wdb_sql._alias(p) for p in spec['proj']]
     V = int(seg.cols[col]['V'])
     memo = seg.__dict__.setdefault('_censusmemo', {})   # V-sized, planes-memo law
     census = memo.get(col)

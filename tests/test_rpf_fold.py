@@ -90,11 +90,18 @@ def test_sql_sum_and_affine():
     con.execute("CREATE TABLE t AS SELECT * FROM read_parquet('%s')" % pq)
     # (AVG is left out here: with the suite's sidecars on, blockstats answers AVG of this table first, and its float
     # per-block sums round big int64 values -- 1493747350946502.2 for DuckDB's ...477.8, the same on the tree before
-    # this fold. A separate open item; on the disk-only board AVG(WatchID) comes through this fold, exact.)
-    for q in ("SELECT SUM(x) FROM t", "SELECT SUM(x), SUM(x + 1), SUM(x + 2), COUNT(*) FROM t"):
-        h0 = EN._RPF_HITS
-        g = db.run(q); g = g[0] if isinstance(g, tuple) else g
-        e = con.execute(q).fetchall()
-        assert controller._SERVED[0] == 'fused_agg' and EN._RPF_HITS > h0, (q, controller._SERVED[0])
-        assert [tuple(float(v) if isinstance(v, float) else int(v) for v in r) for r in g] == \
-               [tuple(float(v) if isinstance(v, float) else int(v) for v in r) for r in e], (q, g, e)
+    # this fold. A separate open item; on the disk-only board AVG(WatchID) comes through this fold, exact.
+    # Closed 2026-11-08: the exact block sums give DuckDB's AVG to the bit -- tests/test_block_sums.py.)
+    import wdb_blockstats as _BS
+    sums = _BS._SUMS[0]
+    _BS._SUMS[0] = False                  # the exact block sums answer these first (2026-11-08): the fold is under test
+    try:
+        for q in ("SELECT SUM(x) FROM t", "SELECT SUM(x), SUM(x + 1), SUM(x + 2), COUNT(*) FROM t"):
+            h0 = EN._RPF_HITS
+            g = db.run(q); g = g[0] if isinstance(g, tuple) else g
+            e = con.execute(q).fetchall()
+            assert controller._SERVED[0] == 'fused_agg' and EN._RPF_HITS > h0, (q, controller._SERVED[0])
+            assert [tuple(float(v) if isinstance(v, float) else int(v) for v in r) for r in g] == \
+                   [tuple(float(v) if isinstance(v, float) else int(v) for v in r) for r in e], (q, g, e)
+    finally:
+        _BS._SUMS[0] = sums

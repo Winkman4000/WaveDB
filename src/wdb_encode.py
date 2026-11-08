@@ -1822,8 +1822,10 @@ def _column_extras(nm, blob, N):
                 try:
                     s9 = _B.compute(seg, nm)
                     for kk in ('cnt', 'nn', 'sum', 'cmin', 'cmax'):
-                        if kk != 'sum' or _B._ANSWERS[0]:             # block sums: only with answers on
+                        if kk != 'sum' or _B._ANSWERS[0]:             # float block sums: only with answers on
                             st[nm + '.' + kk] = s9[kk]
+                    if _B._SUMS[0] and s9['dt'] == 0:                  # the exact block sums (wdb_blockstats)
+                        st[nm + '.shi'], st[nm + '.slo'] = s9['shi'], s9['slo']
                     st[nm + '.mode4'] = np.bool_(s9['mode4']); st[nm + '.maxabs'] = np.float64(s9['maxabs'])
                     st[nm + '.dt'] = np.int64(s9['dt'])
                 except Exception:

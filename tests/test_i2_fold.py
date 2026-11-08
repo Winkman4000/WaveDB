@@ -83,6 +83,16 @@ def test_sql_takes_the_fold_and_matches_duckdb():
     dbs, con, _df, _d = _fixture()
     sqls = ["SELECT SUM(x) FROM t", "SELECT AVG(x) FROM t", "SELECT SUM(y), AVG(y), COUNT(*) FROM t",
             "SELECT SUM(x), AVG(x), MIN(x), MAX(x), COUNT(x), SUM(y) FROM t"]
+    import wdb_blockstats as _BS
+    sums = _BS._SUMS[0]
+    _BS._SUMS[0] = False                  # the exact block sums answer these first (2026-11-08): the fold is under test
+    try:
+        _fold_matches(dbs, con, sqls)
+    finally:
+        _BS._SUMS[0] = sums
+
+
+def _fold_matches(dbs, con, sqls):
     for ch, db in dbs.items():
         calls = []
         orig = Segment.i2_fold_sum

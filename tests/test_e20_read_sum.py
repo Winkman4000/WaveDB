@@ -67,9 +67,11 @@ def test_equals_the_census_and_the_exact_sum():
 
 def test_sql_sum_avg_affine():
     x, db, con, _seg = _fixture()
-    old = EN._E20RS_MIN[0]
+    import wdb_blockstats as _BS
+    old = EN._E20RS_MIN[0]; sums = _BS._SUMS[0]
     try:
         EN._E20RS_MIN[0] = 0
+        _BS._SUMS[0] = False              # the exact block sums answer these first (2026-11-08): the read is under test
         for q in ("SELECT SUM(h) FROM t", "SELECT SUM(h), SUM(h + 1), SUM(h + 7), COUNT(*) FROM t"):
             h0 = EN._E20RS_HITS
             g = db.run(q); g = g[0] if isinstance(g, tuple) else g
@@ -77,4 +79,4 @@ def test_sql_sum_avg_affine():
             assert controller._SERVED[0] == 'fused_agg' and EN._E20RS_HITS > h0, (q, controller._SERVED[0])
             assert [tuple(int(v) for v in r) for r in g] == [tuple(int(v) for v in r) for r in e], (q, g, e)
     finally:
-        EN._E20RS_MIN[0] = old
+        EN._E20RS_MIN[0] = old; _BS._SUMS[0] = sums

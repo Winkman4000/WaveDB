@@ -5827,9 +5827,11 @@ def _hist_par(codes, V, part, out):
 
 
 @njit(cache=True, parallel=True, nogil=True)
-def block_stats(codes, dvals, has_dvals, nullcode, BR, cnt, nn, bsum, cmin, cmax):
+def block_stats(codes, dvals, has_dvals, nullcode, BR, cnt, nn, bsum, cmin, cmax, shi, slo):
     """THE BLOCK STATISTICS (Jackson's metadata per block, written at load): per BR rows the row
-    count, the non-null count, the sum of dictionary values (float64), and the min and max CODE.
+    count, the non-null count, the sum of the values (float64, and exactly as two int64 halves: shi =
+    the sum of value >> 32, slo = the sum of value & 0xFFFFFFFF, so the sum is shi * 2^32 + slo with no
+    rounding -- a block of 2^15 values keeps each half below 2^48), and the min and max CODE.
     has_dvals: 0 = no sum, 1 = sum dvals[code], 2 = the codes ARE the values (mode 4), sum them.
     Blocks across threads; one pass. Was a Python loop over the blocks.
 
@@ -5840,6 +5842,7 @@ def block_stats(codes, dvals, has_dvals, nullcode, BR, cnt, nn, bsum, cmin, cmax
         lo = j * BR
         hi = min(lo + BR, n)
         c = 0; s = 0.0
+        sh = np.int64(0); sl = np.int64(0)
         mn = np.int64(9223372036854775807); mx = np.int64(-9223372036854775807 - 1)
         for i in range(lo, hi):
             v = np.int64(codes[i])
@@ -5849,12 +5852,15 @@ def block_stats(codes, dvals, has_dvals, nullcode, BR, cnt, nn, bsum, cmin, cmax
             if v < mn: mn = v
             if v > mx: mx = v
             if has_dvals == 1:
-                s += dvals[v]
+                x = dvals[v]
+                s += x; sh += x >> 32; sl += x & 0xFFFFFFFF
             elif has_dvals == 2:
-                s += v
+                s += v; sh += v >> 32; sl += v & 0xFFFFFFFF
         cnt[j] = hi - lo
         nn[j] = c
         bsum[j] = s
+        shi[j] = sh
+        slo[j] = sl
         cmin[j] = mn
         cmax[j] = mx if c > 0 else np.int64(-1)   # an empty block: the old convention
 

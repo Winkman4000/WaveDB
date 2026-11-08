@@ -6,9 +6,11 @@ never touches row data at all: COUNT/SUM/AVG/MIN/MAX are arithmetic over ~3K num
 decode exactly one dict entry each (code order == value order). The exception law inverted: the
 summary is the norm, and the compressed rows are opened only for questions the summary can't answer.
 
-Correctness gates: SUM served only when provably exact in float64 (nonnull_count x max|value| < 2^53),
-else declined to the exact paths; AVG always float (matches SQL double semantics); nulls excluded
-from SUM/AVG/MIN/MAX and included in COUNT(*), per SQL. Declines overrides/deleted rows/WHERE/GROUP."""
+Correctness gates: SUM is the exact integer sum (the block sums' int64 halves, added as Python ints) and AVG
+that sum over the non-null count, one correctly rounded division (DuckDB's AVG to the bit); without exact sums
+(an older load) SUM is served only when provably exact in float64 (nonnull_count x max|value| < 2^53), else
+declined to the exact paths; nulls excluded from SUM/AVG/MIN/MAX and included in COUNT(*), per SQL. Declines
+overrides/deleted rows/WHERE/GROUP."""
 import numpy as np
 try:
     import sqlglot.expressions as E
@@ -24,13 +26,21 @@ E = wdb_sql.E
 _ENABLED = True
 _HITS = 0
 # LOAD_ANSWERS (2026-09-29, the no-pre-aggregation rule): off, the load
-# statistics may steer (block min/max skipping, THE PICK's estimates, COUNT from per-block counts,
-# MIN/MAX from zone maps) but never ARE an answer -- no SUM/AVG from block sums, no per-value counts
-# as a GROUP BY's result, no repeat list as a pair board. OFF BY DEFAULT (Jackson, 2026-09-29: "work
-# from the floor"); WDB_LOAD_ANSWERS=1 turns the answers back on (the suite does, to exercise them).
+# statistics may steer (block min/max skipping, THE PICK's estimates) and answer what a block's own
+# numbers answer -- COUNT from per-block counts, MIN/MAX from zone maps, SUM/AVG from the exact block
+# sums (BLOCK_SUMS) -- but never stand in for a GROUP BY or a pair board: no per-value counts as a
+# GROUP BY's result, no repeat list as a pair board. OFF BY DEFAULT (Jackson, 2026-09-29: "work
+# from the floor"); WDB_LOAD_ANSWERS=1 turns those answers back on (the suite does, to exercise them).
 # lore: the rule is ClickBench's: no "pre-aggregated tables or indices"
 import os as _os_la
 _ANSWERS = [_os_la.environ.get('WDB_LOAD_ANSWERS', '0') == '1']
+# BLOCK_SUMS (2026-11-08, Jackson): each block's exact integer sum (two int64 halves, shi/slo) is one more
+# number per block beside its count, min and max, computed in the same pass; SUM/AVG of a column with no
+# WHERE and no GROUP BY is that many numbers added. ON BY DEFAULT; WDB_BLOCK_SUMS=0 writes and reads none.
+# lore: inspired by pgrust's ClickBench entry (2026-10-25, c6a.4xlarge): AVG(UserID) over 100M rows in 3 ms
+# lore: cold -- no scan reads 800 MB in 3 ms, so the hypothesis was a stored number per block (its sum or
+# lore: average) over fixed-size blocks; with these sums our Q4 follows it
+_SUMS = [_os_la.environ.get('WDB_BLOCK_SUMS', '1') != '0']
 _BR = 32768
 _SCACHE = wdb_qmem.register({})          # (seg.path, col, N) -> stats dict; qmem per the
                                          # cold-truth law. Persistence is LAWFUL only on
@@ -80,10 +90,12 @@ def compute(seg, col):
             dvals = np.concatenate([dvals, np.zeros(int(c['V']) - dvals.size, np.int64)])
     cnt = np.empty(nb, np.int64); nn = np.empty(nb, np.int64)
     bsum = np.empty(nb, np.float64)
+    shi = np.zeros(nb, np.int64); slo = np.zeros(nb, np.int64)
     cmin = np.empty(nb, np.int64); cmax = np.empty(nb, np.int64)
     if nb:
-        _WK.block_stats(codes, dvals, np.int64(mode), nullcode, np.int64(_BR), cnt, nn, bsum, cmin, cmax)
-    return {'cnt': cnt, 'nn': nn, 'sum': bsum, 'cmin': cmin, 'cmax': cmax,
+        _WK.block_stats(codes, dvals, np.int64(mode), nullcode, np.int64(_BR), cnt, nn, bsum, cmin, cmax,
+                        shi, slo)
+    return {'cnt': cnt, 'nn': nn, 'sum': bsum, 'shi': shi, 'slo': slo, 'cmin': cmin, 'cmax': cmax,
             'mode4': c['mode'] == 4, 'maxabs': maxabs, 'dt': int(c['dt'])}
 
 
@@ -115,6 +127,8 @@ def _from_load(seg, col):
         return None
     return {'cnt': np.asarray(z[k + 'cnt']), 'nn': np.asarray(z[k + 'nn']),
             'sum': np.asarray(z[k + 'sum']) if (k + 'sum') in z.files else None,   # written only with answers on
+            'shi': np.asarray(z[k + 'shi']) if (k + 'shi') in z.files else None,   # the exact block sums
+            'slo': np.asarray(z[k + 'slo']) if (k + 'slo') in z.files else None,
             'cmin': np.asarray(z[k + 'cmin']), 'cmax': np.asarray(z[k + 'cmax']),
             'mode4': bool(z[k + 'mode4']), 'maxabs': float(z[k + 'maxabs']), 'dt': int(z[k + 'dt'])}
 
@@ -317,6 +331,8 @@ def write_for_segment(seg_path, verbose=False):
         for kk in ('cnt', 'nn', 'sum', 'cmin', 'cmax'):
             if kk != 'sum' or _ANSWERS[0]:
                 out[col + '.' + kk] = st[kk]
+        if _SUMS[0] and st['dt'] == 0:                 # the exact block sums: integer columns
+            out[col + '.shi'], out[col + '.slo'] = st['shi'], st['slo']
         out[col + '.mode4'] = np.bool_(st['mode4']); out[col + '.maxabs'] = np.float64(st['maxabs'])
         out[col + '.dt'] = np.int64(st['dt'])
         seg._codes.pop(col, None); n += 1
@@ -392,6 +408,14 @@ def build(seg, col):
     return st
 
 
+def exact_sum(st):
+    """the column's exact integer sum from its block sums (Python int: shi * 2^32 + slo over every block, no
+    int64 bound), or None when the stats hold none"""
+    if st is None or st.get('shi') is None or st.get('slo') is None:
+        return None
+    return (sum(st['shi'].tolist()) << 32) + sum(st['slo'].tolist())
+
+
 def install(seg_path, N, col, st):
     """Accept eagerly-built stats (prewarm workers) into the cache."""
     _SCACHE[(seg_path, col, int(N))] = st
@@ -427,7 +451,7 @@ def detect(seg, tree, col_map):
         if not eligible(seg, col):          return None
         if seg._effective(col) is not None: return None    # overrides falsify stored stats
         if ak[0] in ('SUM', 'AVG') and seg.cols[col].get('dt') != 0: return None
-        if ak[0] in ('SUM', 'AVG') and not _ANSWERS[0]: return None   # block sums are pre-aggregates
+        if ak[0] in ('SUM', 'AVG') and not (_SUMS[0] or _ANSWERS[0]): return None   # no block sums read
         specs.append((ak[0], col))
     if not P.no_deleted_rows(seg):      return None
     return {'specs': specs, 'proj': proj}
@@ -439,12 +463,23 @@ def execute(seg, spec):
     for kind, col in spec['specs']:
         if kind == 'COUNT_STAR':
             row.append(int(seg.N)); continue
+        c9 = seg.cols[col]
+        if kind in ('MIN', 'MAX') and c9.get('mode') in (0, 2):
+            # THE DICTIONARY'S ENDS (2026-11-08): a column's dictionary is its sorted list of distinct values (the
+            # encoding; detect declines overrides and deleted rows), so MIN is code 0 and MAX the last code before
+            # the NULL code -- the storage's own shape, no statistics read
+            nv = int(c9['V']) - (1 if c9.get('has_null') else 0)
+            row.append(wdb_sql._pyval(seg.fetch(col, 0 if kind == 'MIN' else nv - 1)) if nv > 0 else None)
+            continue
         st = build(seg, col)
         if st is None:
             return None
         tot_nn = int(st['nn'].sum())
         if kind == 'COUNT':
             row.append(tot_nn)
+        elif kind in ('SUM', 'AVG') and _SUMS[0] and exact_sum(st) is not None:
+            S = exact_sum(st)                     # the exact integer sum: SUM as is, AVG one correctly rounded
+            row.append((S if kind == 'SUM' else S / tot_nn) if tot_nn else None)   # division, as DuckDB's
         elif kind in ('SUM', 'AVG') and st.get('sum') is None:
             return None                           # no block sums stored (a load with answers off)
         elif kind == 'SUM':
