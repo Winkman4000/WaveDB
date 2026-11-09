@@ -5,6 +5,8 @@ computed in the one pass where the values were already in hand. A no-WHERE aggre
 never touches row data at all: COUNT/SUM/AVG/MIN/MAX are arithmetic over ~3K numbers, and MIN/MAX
 decode exactly one dict entry each (code order == value order). The exception law inverted: the
 summary is the norm, and the compressed rows are opened only for questions the summary can't answer.
+By default (LOAD_ANSWERS and BLOCK_SUMS off) the statistics only steer, and this read answers only from what the
+storage itself holds -- the row count, COUNT(col) of a column with no NULLs, a dictionary's two ends.
 
 Correctness gates: SUM is the exact integer sum (the block sums' int64 halves, added as Python ints) and AVG
 that sum over the non-null count, one correctly rounded division (DuckDB's AVG to the bit); without exact sums
@@ -25,22 +27,23 @@ E = wdb_sql.E
 
 _ENABLED = True
 _HITS = 0
-# LOAD_ANSWERS (2026-09-29, the no-pre-aggregation rule): off, the load
-# statistics may steer (block min/max skipping, THE PICK's estimates) and answer what a block's own
-# numbers answer -- COUNT from per-block counts, MIN/MAX from zone maps, SUM/AVG from the exact block
-# sums (BLOCK_SUMS) -- but never stand in for a GROUP BY or a pair board: no per-value counts as a
-# GROUP BY's result, no repeat list as a pair board. OFF BY DEFAULT (Jackson, 2026-09-29: "work
-# from the floor"); WDB_LOAD_ANSWERS=1 turns those answers back on (the suite does, to exercise them).
+# LOAD_ANSWERS (2026-09-29, the no-pre-aggregation rule): off, the load statistics only steer (block
+# min/max skipping, THE PICK's estimates) and never ARE an answer -- no COUNT/SUM/AVG/MIN/MAX from them, no
+# per-value counts as a GROUP BY's result, no repeat list as a pair board. What a column's own storage holds
+# still answers: COUNT(*) is the stored row count, COUNT(col) of a column with no NULLs too, MIN/MAX of a
+# dictionary column its dictionary's ends. OFF BY DEFAULT (Jackson, 2026-09-29: "work from the floor");
+# WDB_LOAD_ANSWERS=1 turns the statistics' answers back on (the suite does, to exercise them).
 # lore: the rule is ClickBench's: no "pre-aggregated tables or indices"
 import os as _os_la
 _ANSWERS = [_os_la.environ.get('WDB_LOAD_ANSWERS', '0') == '1']
 # BLOCK_SUMS (2026-11-08, Jackson): each block's exact integer sum (two int64 halves, shi/slo) is one more
 # number per block beside its count, min and max, computed in the same pass; SUM/AVG of a column with no
-# WHERE and no GROUP BY is that many numbers added. ON BY DEFAULT; WDB_BLOCK_SUMS=0 writes and reads none.
+# WHERE and no GROUP BY is that many numbers added. OFF BY DEFAULT (2026-11-09: ClickBench's review counts a
+# sum computed at load as pre-aggregation); WDB_BLOCK_SUMS=1, at load and at query, turns them on.
 # lore: inspired by pgrust's ClickBench entry (2026-10-25, c6a.4xlarge): AVG(UserID) over 100M rows in 3 ms
 # lore: cold -- no scan reads 800 MB in 3 ms, so the hypothesis was a stored number per block (its sum or
 # lore: average) over fixed-size blocks; with these sums our Q4 follows it
-_SUMS = [_os_la.environ.get('WDB_BLOCK_SUMS', '1') != '0']
+_SUMS = [_os_la.environ.get('WDB_BLOCK_SUMS', '0') == '1']
 _BR = 32768
 _SCACHE = wdb_qmem.register({})          # (seg.path, col, N) -> stats dict; qmem per the
                                          # cold-truth law. Persistence is LAWFUL only on
@@ -471,6 +474,10 @@ def execute(seg, spec):
             nv = int(c9['V']) - (1 if c9.get('has_null') else 0)
             row.append(wdb_sql._pyval(seg.fetch(col, 0 if kind == 'MIN' else nv - 1)) if nv > 0 else None)
             continue
+        if kind == 'COUNT' and not c9.get('has_null'):
+            row.append(int(seg.N)); continue       # a column with no NULLs: COUNT(col) is the row count
+        if not (_ANSWERS[0] or _SUMS[0]):
+            return None                            # no stored statistic answers: the rows are read
         st = build(seg, col)
         if st is None:
             return None

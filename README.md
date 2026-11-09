@@ -31,19 +31,17 @@ bin/wdb serve mydb --port 8765                  # a long-lived server (what the 
 - **The data.** Each column is dictionary-encoded with a sorted dictionary and bit-packed codes, or stored with
   a codec chosen from its measurements (front-coded text, block dictionaries, sequences, inline values).
   Lossless: every column decodes byte-exact.
-- **Load statistics** (`<segment>.stats.npz`): per block of rows, the smallest and largest code, the
-  number of non-NULL rows and, for integer columns, the exact sum of the block's values (block skipping, and
-  MIN/MAX/COUNT/SUM/AVG of a column with no filter, the way zone maps answer them); sampled entries of block
-  dictionaries, used to seek inside a column.
+- **Load statistics** (`<segment>.stats.npz`): per block of rows, the smallest and largest code and the
+  number of non-NULL rows, used to skip blocks; sampled entries of block dictionaries, used to seek inside a
+  column. They steer; they never answer a query.
 - **Text lengths**: for every large text column, the character length of each dictionary entry and of each
   row (`--row-lengths COL` adds them for other text columns).
 
 Nothing else. **Sidecars** -- indexes and pre-aggregates the engine can build to make repeated queries faster --
 are an extension that is **off by default**: with it off no derived file is ever written, by a load or by a
-query (`wdb sidecars DB on|off|status|drop`). Per-value counts and repeat lists -- statistics that could stand
-in for a GROUP BY or a pair search rather than steer it -- are neither written nor read by default
-(`WDB_LOAD_ANSWERS=1`, at load and at query, turns them on for experiments only); the block sums are written and
-read by default (`WDB_BLOCK_SUMS=0` turns them off). No query result is cached:
+query (`wdb sidecars DB on|off|status|drop`). Statistics that could answer a query rather than steer it --
+block sums, per-value counts, repeat lists -- are neither written nor read by default (`WDB_BLOCK_SUMS=1` and
+`WDB_LOAD_ANSWERS=1`, at load and at query, turn them on for experiments only). No query result is cached:
 between queries the engine keeps decoded source data in memory (dictionaries, codes), like a buffer pool, and
 drops everything derived when the query ends.
 

@@ -1,12 +1,32 @@
-"""THE EXACT BLOCK SUMS (2026-11-08): the load writes each block's exact integer sum (two int64 halves) for every
+"""THE EXACT BLOCK SUMS (2026-11-08; off by default since 2026-11-09, WDB_BLOCK_SUMS=1 turns them on -- this file
+does, around its load and its queries): the load writes each block's exact integer sum (two int64 halves) for every
 integer column; SUM / AVG with no WHERE and no GROUP BY add a few thousand numbers. SUM is exact past int64 (a
 column of values near 2^62), AVG is the exact sum over the count, correctly rounded -- DuckDB's to the bit; NULLs
 stay out of both; SUM(col + k) is S + k * N; WDB_BLOCK_SUMS off reads none and another read answers the same.
-MIN / MAX of a dictionary column are its dictionary's two ends (no statistics read)."""
-import sys, os, uuid, tempfile
+MIN / MAX of a dictionary column are its dictionary's two ends (no statistics read, both switches off)."""
+import sys, os, uuid, tempfile, contextlib
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 _FX = None
 N = 200_000
+
+
+@contextlib.contextmanager
+def _sums(on, answers=None):
+    """the block sums' switch (and, given, the load answers') for the block inside, at load and at query"""
+    import wdb_blockstats as B
+    keep = (B._SUMS[0], B._ANSWERS[0], os.environ.get('WDB_BLOCK_SUMS'))
+    B._SUMS[0] = on
+    os.environ['WDB_BLOCK_SUMS'] = '1' if on else '0'
+    if answers is not None:
+        B._ANSWERS[0] = answers
+    try:
+        yield
+    finally:
+        B._SUMS[0], B._ANSWERS[0] = keep[0], keep[1]
+        if keep[2] is None:
+            os.environ.pop('WDB_BLOCK_SUMS', None)
+        else:
+            os.environ['WDB_BLOCK_SUMS'] = keep[2]
 
 
 def _fixture():
@@ -36,7 +56,8 @@ def _fixture():
     db = Database.create(d)
     db.cat.add_table('t', [['big', 'int'], ['small', 'int'], ['neg', 'int'], ['nul', 'int'], ['id', 'int'],
                            ['dd', 'date']])
-    wdb_encode.encode(p, os.path.join(d, 't_0.wdb'))
+    with _sums(True):
+        wdb_encode.encode(p, os.path.join(d, 't_0.wdb'))
     db.cat.add_segment('t', 't_0.wdb')
     con = duckdb.connect(); con.execute("CREATE VIEW t AS SELECT * FROM read_parquet('%s')" % p)
     _FX = (db, con, d)
@@ -48,38 +69,41 @@ def _rows(r):
 
 
 def test_the_load_wrote_them():
-    import numpy as np, wdb_join, wdb_blockstats as B
-    db, con, d = _fixture()
-    seg, _x = wdb_join._solo_segment(db, 't')
-    z = np.load(B.stats_path(seg.path))
-    for col in ('big', 'small', 'neg', 'nul'):
-        assert col + '.shi' in z.files and col + '.slo' in z.files, col
+    with _sums(True):
+        import numpy as np, wdb_join, wdb_blockstats as B
+        db, con, d = _fixture()
+        seg, _x = wdb_join._solo_segment(db, 't')
+        z = np.load(B.stats_path(seg.path))
+        for col in ('big', 'small', 'neg', 'nul'):
+            assert col + '.shi' in z.files and col + '.slo' in z.files, col
 
 
 def test_sum_avg_are_duckdbs_to_the_bit():
-    import controller
-    db, con, d = _fixture()
-    for col in ('big', 'small', 'neg', 'nul', 'id'):
-        q = 'SELECT SUM(%s), AVG(%s), COUNT(%s), COUNT(*) FROM t' % (col, col, col)
-        got = _rows(db.run(q))
-        want = con.execute(q.replace('SUM(%s)' % col, 'SUM(%s)::HUGEINT' % col)).fetchall()
-        assert controller._SERVED[0] == 'blockstats', (q, controller._SERVED[0])
-        g, w = got[0], want[0]
-        assert int(g[0]) == int(w[0]) and float(g[1]) == float(w[1]) and int(g[2]) == int(w[2]) \
-            and int(g[3]) == int(w[3]), (q, g, w)
+    with _sums(True):
+        import controller
+        db, con, d = _fixture()
+        for col in ('big', 'small', 'neg', 'nul', 'id'):
+            q = 'SELECT SUM(%s), AVG(%s), COUNT(%s), COUNT(*) FROM t' % (col, col, col)
+            got = _rows(db.run(q))
+            want = con.execute(q.replace('SUM(%s)' % col, 'SUM(%s)::HUGEINT' % col)).fetchall()
+            assert controller._SERVED[0] == 'blockstats', (q, controller._SERVED[0])
+            g, w = got[0], want[0]
+            assert int(g[0]) == int(w[0]) and float(g[1]) == float(w[1]) and int(g[2]) == int(w[2]) \
+                and int(g[3]) == int(w[3]), (q, g, w)
 
 
 def test_affine_sums():
-    import controller
-    db, con, d = _fixture()
-    for col in ('big', 'small', 'neg'):
-        q = 'SELECT SUM(%s), SUM(%s + 1), SUM(%s + 7), SUM(3 + %s) FROM t' % (col, col, col, col)
-        got = [int(v) for v in _rows(db.run(q))[0]]
-        assert controller._SERVED[0] == 'affinesum', (q, controller._SERVED[0])
-        h = 'CAST(%s AS HUGEINT)' % col
-        dq = 'SELECT SUM(%s), SUM(%s + 1), SUM(%s + 7), SUM(3 + %s) FROM t' % (h, h, h, h)
-        want = [int(v) for v in con.execute(dq).fetchall()[0]]
-        assert got == want, (q, got, want)
+    with _sums(True):
+        import controller
+        db, con, d = _fixture()
+        for col in ('big', 'small', 'neg'):
+            q = 'SELECT SUM(%s), SUM(%s + 1), SUM(%s + 7), SUM(3 + %s) FROM t' % (col, col, col, col)
+            got = [int(v) for v in _rows(db.run(q))[0]]
+            assert controller._SERVED[0] == 'affinesum', (q, controller._SERVED[0])
+            h = 'CAST(%s AS HUGEINT)' % col
+            dq = 'SELECT SUM(%s), SUM(%s + 1), SUM(%s + 7), SUM(3 + %s) FROM t' % (h, h, h, h)
+            want = [int(v) for v in con.execute(dq).fetchall()[0]]
+            assert got == want, (q, got, want)
 
 
 def test_min_max_are_the_dictionary_ends():
@@ -92,14 +116,31 @@ def test_min_max_are_the_dictionary_ends():
         return build(seg, col)
     B.build = _no_stats
     try:
-        for col in ('big', 'small', 'neg', 'nul', 'id', 'dd'):
-            q = 'SELECT MIN(%s), MAX(%s) FROM t' % (col, col)
-            got = _rows(db.run(q))[0]
-            assert controller._SERVED[0] == 'blockstats', (q, controller._SERVED[0])
-            w = con.execute(q).fetchall()[0]
-            assert tuple(str(v) for v in got) == tuple(str(v) for v in w), (q, got, w)
+        with _sums(False, answers=False):     # the defaults: no stored statistic answers anything
+            for col in ('big', 'small', 'neg', 'nul', 'id', 'dd'):
+                q = 'SELECT MIN(%s), MAX(%s) FROM t' % (col, col)
+                got = _rows(db.run(q))[0]
+                seg = db._seg_cache and next(e[1] for e in db._seg_cache.values() if col in e[1].cols)
+                if seg.cols[col].get('mode') in (0, 2):
+                    assert controller._SERVED[0] == 'blockstats', (q, controller._SERVED[0])
+                w = con.execute(q).fetchall()[0]
+                assert tuple(str(v) for v in got) == tuple(str(v) for v in w), (q, got, w)
     finally:
         B.build = build
+
+
+def test_counts_from_the_storage_alone():
+    """both switches off: COUNT(*) and COUNT(col) of a column with no NULLs are the row count; COUNT of a column with
+    NULLs and every SUM/AVG are another read's (the rows are read)"""
+    import controller, wdb_blockstats as B
+    db, con, d = _fixture()
+    with _sums(False, answers=False):
+        for q, served in (('SELECT COUNT(*), COUNT(small) FROM t', True), ('SELECT COUNT(nul) FROM t', False),
+                          ('SELECT SUM(small) FROM t', False), ('SELECT AVG(big) FROM t', False)):
+            got = _rows(db.run(q))[0]
+            assert (controller._SERVED[0] == 'blockstats') == served, (q, controller._SERVED[0])
+            w = con.execute(q).fetchall()[0]
+            assert all(abs(float(a) - float(b)) <= 1e-9 * max(1.0, abs(float(b))) for a, b in zip(got, w)), (q, got, w)
 
 
 def test_the_switch_off():
